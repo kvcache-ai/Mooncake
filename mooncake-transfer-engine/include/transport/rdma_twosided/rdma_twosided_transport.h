@@ -67,6 +67,31 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     std::shared_ptr<CtrlChannel> ensureCtrlChannel(
         const std::string &peer_server_name);
 
+    // RAII publisher for one connect attempt. On construction it installs the
+    // placeholder entry and marks the peer as having a connect in flight; on
+    // destruction it always retracts the marker and wakes waiters, and drops
+    // the placeholder unless markSuccess() was called. Callers must hold
+    // ctrl_mutex_ for the whole lifetime of the scope, so a blocking handshake
+    // has to be wrapped in an UnlockGuard rather than releasing the lock by
+    // hand.
+    class ConnectScope {
+       public:
+        ConnectScope(RdmaTwoSidedTransport &transport, std::string peer,
+                     std::shared_ptr<CtrlChannel> channel);
+        ~ConnectScope();
+
+        ConnectScope(const ConnectScope &) = delete;
+        ConnectScope &operator=(const ConnectScope &) = delete;
+
+        void markSuccess() { success_ = true; }
+
+       private:
+        RdmaTwoSidedTransport &transport_;
+        std::string peer_;
+        std::shared_ptr<CtrlChannel> channel_;
+        bool success_ = false;
+    };
+
     void startCtrlWorker();
     void stopCtrlWorker();
     void ctrlWorkerLoop();
@@ -75,6 +100,15 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     std::condition_variable ctrl_cv_;
     std::unordered_map<std::string, std::shared_ptr<CtrlChannel>>
         ctrl_channels_;
+    // Peers with a connect handshake in flight. Only such peers are worth
+    // waiting for: an entry in ctrl_channels_ that is not connected and not
+    // listed here is a dead channel, which the next caller reclaims instead of
+    // waiting for a wakeup that never comes. Refcounted because an active and
+    // a passive connect to the same peer can overlap.
+    std::unordered_map<std::string, int> ctrl_connecting_;
+    // Set once by stopCtrlWorker() to release waiters during shutdown.
+    // Guarded by ctrl_mutex_.
+    bool ctrl_stopping_ = false;
     std::thread ctrl_worker_;
     std::atomic<bool> ctrl_worker_running_{false};
     uint64_t local_ctrl_session_id_ = 0;

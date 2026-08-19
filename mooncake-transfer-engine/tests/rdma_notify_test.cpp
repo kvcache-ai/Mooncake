@@ -28,6 +28,7 @@
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -113,6 +114,7 @@ class RdmaNotifyTest : public ::testing::Test {
         ASSERT_EQ(setenv("MC_USE_RDMA_TWOSIDED", "1", 1), 0);
         ASSERT_EQ(setenv("MC_RDMA_NOTIFY_ENABLED", "1", 1), 0);
         ASSERT_EQ(setenv("MC_RDMA_NOTIFY_OOB_FALLBACK", "0", 1), 0);
+        ASSERT_EQ(setenv("MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS", "2000", 1), 0);
         loadGlobalConfig(globalConfig());
         ASSERT_TRUE(globalConfig().use_rdma_twosided);
         ASSERT_TRUE(globalConfig().rdma_notify_enabled);
@@ -138,6 +140,7 @@ class RdmaNotifyTest : public ::testing::Test {
         unsetenv("MC_USE_RDMA_TWOSIDED");
         unsetenv("MC_RDMA_NOTIFY_ENABLED");
         unsetenv("MC_RDMA_NOTIFY_OOB_FALLBACK");
+        unsetenv("MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS");
         loadGlobalConfig(globalConfig());
     }
 
@@ -224,6 +227,86 @@ TEST_F(RdmaNotifyTest, BurstNotifyCorrectness) {
         EXPECT_EQ(got[i].name, "n" + std::to_string(i));
         EXPECT_EQ(got[i].notify_msg, "payload-" + std::to_string(i));
     }
+}
+
+// Regression for the unbounded ctrl_cv_ wait: a peer that never completes the
+// ctrl handshake must not park the caller forever. With OOB fallback disabled
+// the notify has to report failure within the connect timeout.
+TEST_F(RdmaNotifyTest, UnreachablePeerNotifyIsBounded) {
+    TransferMetadata::NotifyDesc msg{"unreachable", "x"};
+
+    auto start = std::chrono::steady_clock::now();
+    int ret = sender_->sendNotifyByName("127.0.0.1:19999", msg);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed_s =
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+    EXPECT_NE(ret, 0)
+        << "notify to an unreachable peer must not report success";
+    EXPECT_LT(elapsed_s, 30)
+        << "sendNotify blocked far beyond the connect timeout";
+}
+
+// Concurrent notifies to the same unreachable peer: the connect stays
+// serialized, but every waiter must still return. A regression shows up as a
+// hung test rather than a failed assertion.
+TEST_F(RdmaNotifyTest, ConcurrentUnreachablePeerNotifyAllReturn) {
+    constexpr int kThreads = 8;
+    std::atomic<int> finished{0};
+    std::vector<std::thread> threads;
+
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([this, &finished] {
+            TransferMetadata::NotifyDesc msg{"concurrent", "x"};
+            (void)sender_->sendNotifyByName("127.0.0.1:19998", msg);
+            finished.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto &thread : threads) thread.join();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed_s =
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+    EXPECT_EQ(finished.load(), kThreads);
+    EXPECT_LT(elapsed_s, 60)
+        << "concurrent notifies did not settle within the connect timeout";
+}
+
+// Regression for the dead-channel wait: once a connected CtrlChannel fails
+// because the peer is gone, the stale ctrl_channels_ entry must not park later
+// callers forever. Before the fix the entry stayed behind as "not connected"
+// with nobody left to notify ctrl_cv_, so every later notify blocked.
+TEST_F(RdmaNotifyTest, NotifyAfterPeerGoneIsBounded) {
+    TransferMetadata::NotifyDesc first{"before", "x"};
+    ASSERT_EQ(sender_->sendNotifyByName(receiver_name_, first), 0);
+    std::vector<TransferMetadata::NotifyDesc> got;
+    ASSERT_TRUE(waitForNotifies(*receiver_, 1, got));
+
+    // Drop the peer: the ctrl QP moves to error, connected_ flips to false and
+    // the entry is left stale in ctrl_channels_.
+    receiver_.reset();
+
+    // The error WC lands shortly after the peer is gone. Keep notifying until
+    // the transport reports the failure: it must reclaim the stale entry and
+    // return an error rather than block. Before the fix this loop hung.
+    auto start = std::chrono::steady_clock::now();
+    bool reported_failure = false;
+    for (int i = 0; i < 40 && !reported_failure; ++i) {
+        TransferMetadata::NotifyDesc after{"after", "y"};
+        if (sender_->sendNotifyByName(receiver_name_, after) != 0) {
+            reported_failure = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed_s =
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+    EXPECT_TRUE(reported_failure)
+        << "notify kept reporting success after the peer was gone";
+    EXPECT_LT(elapsed_s, 60) << "notify blocked on a stale CtrlChannel entry";
 }
 
 int main(int argc, char **argv) {

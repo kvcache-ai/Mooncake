@@ -471,6 +471,9 @@ int CtrlChannel::sendCtrlFrame(const CtrlFrame &frame_in) {
         }
         pending_sends_++;
     }
+    // Queued, not delivered: the SEND completion (handled in drainCompletions)
+    // decides actual success. A failed WC drops connected_, which routes the
+    // next notify to a fresh channel or to OOB fallback.
     return 0;
 }
 
@@ -560,7 +563,14 @@ int CtrlChannel::drainCompletions(int max_entries, bool log_poll_error) {
                        << " opcode=" << wc[i].opcode
                        << " peer=" << peer_server_name_;
             connected_.store(false, std::memory_order_release);
+            // The channel is dead, so every outstanding SEND is now void.
+            // Clear the in-flight count here (error WCs may not carry a
+            // reliable opcode/wr_id) and wake SQ-full waiters, which re-check
+            // connected_ and bail with ERR_ENDPOINT. Delivery failures thus
+            // surface as the channel going unconnected rather than as a
+            // per-frame return code.
             std::lock_guard<std::mutex> lock(send_mutex_);
+            pending_sends_ = 0;
             send_cv_.notify_all();
             continue;
         }

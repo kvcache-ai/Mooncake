@@ -69,10 +69,16 @@ class CtrlChannel {
     const std::string &peerServerName() const { return peer_server_name_; }
     RdmaContext &context() const { return context_; }
 
-    // Async: post typed CtrlFrame SEND; returns 0 on success.
+    // Fire-and-forget: encode and post a typed CtrlFrame SEND. Returns 0 once
+    // the frame is enqueued on the QP (or an error if it cannot be enqueued).
+    // Delivery is confirmed asynchronously by the SEND completion: a failed WC
+    // marks the channel unconnected, and the next ensureCtrlChannel() reclaims
+    // it and (if enabled) falls back to OOB notify. A 0 return therefore means
+    // "queued", not "delivered".
     int sendCtrlFrame(const CtrlFrame &frame);
 
-    // Compatibility wrapper: encode NotifyDesc as NOTIFY_COMPAT frame.
+    // Compatibility wrapper: encode NotifyDesc as NOTIFY_COMPAT frame. Shares
+    // the fire-and-forget delivery semantics of sendCtrlFrame().
     int sendNotify(const NotifyDesc &notify);
 
     // Poll notify CQ; dispatch inbound frames via transport callbacks.

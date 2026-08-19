@@ -143,6 +143,11 @@ struct GlobalConfig {
     // Fall back to OOB RPC notify when CtrlChannel is unavailable.
     // MC_RDMA_NOTIFY_OOB_FALLBACK.
     bool rdma_notify_oob_fallback = true;
+    // Upper bound for waiting on an in-flight CtrlChannel connect to the same
+    // peer. On expiry the notify falls back to OOB instead of blocking on a
+    // handshake that may never complete.
+    // MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS.
+    uint32_t rdma_notify_connect_timeout_ms = 10000;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
     int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
