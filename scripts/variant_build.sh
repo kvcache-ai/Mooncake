@@ -117,6 +117,38 @@ run_wheel_build() {
     fi
 }
 
+setup_shca_env() {
+    echo "==> Preparing TianLong SHCA environment..."
+
+    # 检查驱动头文件是否已存在
+    if [ -f /usr/include/infiniband/shca_17b_types.h ]; then
+        echo "SHCA driver header found (/usr/include/infiniband/shca_17b_types.h), skipping setup."
+        return 0
+    fi
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        echo "[dry-run] Would download and install SHCA driver."
+        return 0
+    fi
+
+    local SETUP_DIR="/tmp/shca_setup"
+    mkdir -p "${SETUP_DIR}"
+    cd "${SETUP_DIR}"
+
+    # 下载执行脚本
+    wget ${RESOURCE_SERVER_URL}/Jenkins/CompileDep/mooncake/mlxtoshca.sh
+
+    # 下载驱动安装包
+    wget ${RESOURCE_SERVER_URL}/Jenkins/CompileDep/mooncake/shca-tools_2.500.4.B068-Ubuntu22.04_amd64.deb
+
+    # 安装驱动
+    bash "${SETUP_DIR}/mlxtoshca.sh"
+
+    # 验证安装
+    ibv_devinfo
+    echo "SHCA environment setup complete."
+}
+
 build_variant() {
     local variant="$1"
     local package_basename=""
@@ -143,6 +175,7 @@ build_variant() {
         shca)
             package_basename="mooncake_transfer_engine_shca"
             cmake_args=(-DUSE_HYGON=ON -DUSE_SHCA=ON -DUSE_FAKE_HIP_RPC=ON)
+            setup_shca_env
             if [ "${DRY_RUN}" -eq 0 ]; then
                 patch_pyproject \
                     "mooncake-transfer-engine-shca" \

@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: Release HCU
+
+on:
+  push:
+    branches:
+      - v0.3.12.post1_dev
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: [self-hosted]
+    container:
+      image: ${{ vars.BASE_COMPILE_IMAGE_UBUNTU_PY310 }}
+      options: >-
+        --volume /opt/hyhal:/opt/hyhal:ro
+        --device /dev/kfd:/dev/kfd
+        --device /dev/dri:/dev/dri
+        --cap-add=SYS_PTRACE
+        --privileged
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - build_variant: standard
+            dtk_pkg_url: "${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-ubuntu20.04-x86_64.tar.gz"
+          - build_variant: shca
+            dtk_pkg_url: "${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-ubuntu20.04-x86_64.tar.gz"
+          - build_variant: rpc
+            dtk_pkg_url: "${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04.1/DTK-26.04.1-rc1-ubuntu20.04-x86_64.tar.gz"
+    env:
+      CI: "false"
+      FREE_BUILD_DIR: "0"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Mark workspace safe for git (container runs as root)
+        run: git config --global --add safe.directory '*'
+
+      - name: Install DTK
+        run: |
+          cd /opt && wget -q ${{ matrix.dtk_pkg_url }}
+          cd /opt && tar -xzf $(basename ${{ matrix.dtk_pkg_url }}) && mv dtk-* dtk
+
+      - name: Build, repair and upload wheels
+        shell: bash
+        run: |
+          export PIP_INDEX_URL="${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/"
+          export DEVPI_URL="${{ vars.PYPI_URL }}/"
+          PIP_HOST="${PIP_INDEX_URL#*://}"
+          export PIP_TRUSTED_HOST="${PIP_HOST%%[:/]*}"
+          export RESOURCE_SERVER_URL="${{ vars.RESOURCE_SERVER_URL }}"
+          source /opt/dtk/env.sh
+          pip install patchelf==0.14.5
+          bash scripts/variant_build.sh ${{ matrix.build_variant }}
+          pip install ciupload
+          DTK_VER=$(echo ${{ matrix.dtk_pkg_url }} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+          CIUpload REPAIR --dtk_version ${DTK_VER} --git_commit $(git rev-parse --short=6 HEAD) --outputdir repaired -f mooncake-wheel/dist/*.whl
+          CIUpload --devpi_url ${DEVPI_URL} --devpi_user ${{ secrets.DEVPI_NIGHTLY_USER }} --devpi_password ${{ secrets.DEVPI_NIGHTLY_PASSWORD }} --dtk_pkg_name $(basename ${{ matrix.dtk_pkg_url }}) -f repaired/*.whl
+
+      - name: Cleanup environment
+        if: always()
+        run: |
+          rm -rf /opt/dtk /opt/$(basename ${{ matrix.dtk_pkg_url }})
+          rm -rf build mooncake-wheel/dist
