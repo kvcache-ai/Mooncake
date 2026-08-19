@@ -41,6 +41,8 @@ class SpdkWrapper {
     int64_t NvmePollProcessCompletion(nof_seg_handle *seg,
                                       uint32_t complete_per_seg);
 
+    void AbortNofSegment(nof_seg_handle *seg);
+
     /** @brief Open a NoF segment. */
     nof_seg_handle *OpenNofSegment(const std::string &tr_str);
 
@@ -53,6 +55,9 @@ class SpdkWrapper {
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
 #ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+    nof_seg_handle *OpenNofKvSegment(const std::string &tr_str);
+    void CloseNofKvSegment(nof_seg_handle *seg);
+
     bool IsKvNamespace(const nof_seg_handle *seg_handle);
 
     int SubmitKvStore(const nof_seg_handle *seg_handle, const void *key,
@@ -68,6 +73,8 @@ class SpdkWrapper {
 #endif
 
    private:
+    nof_seg_handle *OpenNofSegment(const std::string &tr_str, bool shared);
+
     struct ProbeBuffer {
         void *ptr{nullptr};
         uint32_t size{0};

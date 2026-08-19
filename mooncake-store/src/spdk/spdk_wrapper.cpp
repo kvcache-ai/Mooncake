@@ -1,5 +1,6 @@
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -87,8 +88,11 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
 }  // namespace
 
 struct nof_seg_handle {
-    struct spdk_nvme_qpair *qpair;
-    struct spdk_nvme_ns *ns;
+    struct spdk_nvme_qpair *qpair = nullptr;
+    struct spdk_nvme_ns *ns = nullptr;
+    struct ctrlr_info *owner = nullptr;
+    mutable std::mutex io_mutex;
+    std::atomic<bool> failed{false};
 };
 
 struct tr_info {
@@ -100,6 +104,7 @@ struct tr_info {
 struct ctrlr_info {
     struct spdk_nvme_ctrlr *ctrlr;
     std::map<uint32_t, std::unique_ptr<nof_seg_handle>> ns_seg;
+    std::vector<std::unique_ptr<nof_seg_handle>> dedicated_ns_seg;
     std::mutex ns_mutex;
 };
 
@@ -146,6 +151,13 @@ void SpdkWrapper::Cleanup() {
                     // Free all qpairs and segment handles
                     for (auto &[_, seg] : info->ns_seg) {
                         if (seg && seg->qpair) {
+                            std::lock_guard<std::mutex> io_lock(seg->io_mutex);
+                            spdk_nvme_ctrlr_free_io_qpair(seg->qpair);
+                        }
+                    }
+                    for (auto &seg : info->dedicated_ns_seg) {
+                        if (seg && seg->qpair) {
+                            std::lock_guard<std::mutex> io_lock(seg->io_mutex);
                             spdk_nvme_ctrlr_free_io_qpair(seg->qpair);
                         }
                     }
@@ -237,7 +249,27 @@ void SpdkWrapper::RecycleProbeRequestContext(ProbeRequestContext *ctx) {
 
 int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
                                                uint32_t complete_per_seg) {
+    if (!seg) {
+        return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(seg->io_mutex);
+    if (seg->failed.load(std::memory_order_acquire) || !seg->qpair) {
+        return -ENXIO;
+    }
     return spdk_nvme_qpair_process_completions(seg->qpair, complete_per_seg);
+}
+
+void SpdkWrapper::AbortNofSegment(nof_seg_handle *seg) {
+    if (!seg) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(seg->io_mutex);
+    seg->failed.store(true, std::memory_order_release);
+    if (seg->qpair) {
+        auto *qpair = seg->qpair;
+        seg->qpair = nullptr;
+        spdk_nvme_ctrlr_free_io_qpair(qpair);
+    }
 }
 
 int SpdkWrapper::ParseTransPortStr(const std::string &tr_str, tr_info *info) {
@@ -307,6 +339,38 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
 }
 
 nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
+    return OpenNofSegment(tr_str, true);
+}
+
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+nof_seg_handle *SpdkWrapper::OpenNofKvSegment(const std::string &tr_str) {
+    return OpenNofSegment(tr_str, false);
+}
+
+void SpdkWrapper::CloseNofKvSegment(nof_seg_handle *seg) {
+    if (!seg || !seg->owner) {
+        return;
+    }
+    auto *owner = seg->owner;
+    std::unique_ptr<nof_seg_handle> owned_seg;
+    {
+        std::lock_guard<std::mutex> lock(owner->ns_mutex);
+        auto &segments = owner->dedicated_ns_seg;
+        auto it =
+            std::find_if(segments.begin(), segments.end(),
+                         [&](const auto &entry) { return entry.get() == seg; });
+        if (it == segments.end()) {
+            return;
+        }
+        owned_seg = std::move(*it);
+        segments.erase(it);
+    }
+    AbortNofSegment(owned_seg.get());
+}
+#endif
+
+nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str,
+                                            bool shared) {
     tr_info tr;
     int ret = ParseTransPortStr(tr_str, &tr);
     if (ret != 0) {
@@ -338,9 +402,11 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
     {
         auto &ns_seg = info->ns_seg;
         std::lock_guard<std::mutex> lock(info->ns_mutex);
-        auto ns_it = ns_seg.find(tr.ns);
-        if (ns_it != ns_seg.end()) {
-            return ns_it->second.get();
+        if (shared) {
+            auto ns_it = ns_seg.find(tr.ns);
+            if (ns_it != ns_seg.end()) {
+                return ns_it->second.get();
+            }
         }
 
         if (spdk_nvme_ctrlr_is_active_ns(info->ctrlr, tr.ns)) {
@@ -359,8 +425,13 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         auto new_seg = std::make_unique<nof_seg_handle>();
         new_seg->qpair = qpair;
         new_seg->ns = ns;
+        new_seg->owner = info;
         seg_handle = new_seg.get();
-        ns_seg[tr.ns] = std::move(new_seg);
+        if (shared) {
+            ns_seg[tr.ns] = std::move(new_seg);
+        } else {
+            info->dedicated_ns_seg.push_back(std::move(new_seg));
+        }
     }
 
     return seg_handle;
@@ -377,9 +448,14 @@ uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
 int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
                                uint64_t lba, uint32_t lba_count, int op,
                                spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
-    if (!seg_handle || !ptr || !lba_count || !seg_handle->qpair ||
-        !seg_handle->ns) {
-        return -1;
+    if (!seg_handle || !ptr || !lba_count || !seg_handle->ns) {
+        return -EINVAL;
+    }
+
+    std::lock_guard<std::mutex> lock(seg_handle->io_mutex);
+    if (seg_handle->failed.load(std::memory_order_acquire) ||
+        !seg_handle->qpair) {
+        return -ENXIO;
     }
 
     struct spdk_nvme_qpair *qpair = seg_handle->qpair;
@@ -408,9 +484,14 @@ int SpdkWrapper::SubmitKvStore(const nof_seg_handle *seg_handle,
                                const void *value, uint32_t value_len,
                                uint8_t options, spdk_nvme_cmd_cb cb_fn,
                                void *cb_ctx) {
-    if (!seg_handle || !seg_handle->qpair || !seg_handle->ns || !key ||
-        key_len == 0 || !value || value_len == 0) {
+    if (!seg_handle || !seg_handle->ns || !key || key_len == 0 || !value ||
+        value_len == 0) {
         return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(seg_handle->io_mutex);
+    if (seg_handle->failed.load(std::memory_order_acquire) ||
+        !seg_handle->qpair) {
+        return -ENXIO;
     }
     return spdk_nvme_kv_store(seg_handle->ns, seg_handle->qpair, key, key_len,
                               value, value_len, cb_fn, cb_ctx, options);
@@ -420,9 +501,14 @@ int SpdkWrapper::SubmitKvRetrieve(const nof_seg_handle *seg_handle,
                                   const void *key, uint8_t key_len, void *value,
                                   uint32_t value_len, uint8_t options,
                                   spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
-    if (!seg_handle || !seg_handle->qpair || !seg_handle->ns || !key ||
-        key_len == 0 || !value || value_len == 0) {
+    if (!seg_handle || !seg_handle->ns || !key || key_len == 0 || !value ||
+        value_len == 0) {
         return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(seg_handle->io_mutex);
+    if (seg_handle->failed.load(std::memory_order_acquire) ||
+        !seg_handle->qpair) {
+        return -ENXIO;
     }
     return spdk_nvme_kv_retrieve(seg_handle->ns, seg_handle->qpair, key,
                                  key_len, value, value_len, cb_fn, cb_ctx,
@@ -432,9 +518,13 @@ int SpdkWrapper::SubmitKvRetrieve(const nof_seg_handle *seg_handle,
 int SpdkWrapper::SubmitKvDelete(const nof_seg_handle *seg_handle,
                                 const void *key, uint8_t key_len,
                                 spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
-    if (!seg_handle || !seg_handle->qpair || !seg_handle->ns || !key ||
-        key_len == 0) {
+    if (!seg_handle || !seg_handle->ns || !key || key_len == 0) {
         return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(seg_handle->io_mutex);
+    if (seg_handle->failed.load(std::memory_order_acquire) ||
+        !seg_handle->qpair) {
+        return -ENXIO;
     }
     return spdk_nvme_kv_delete(seg_handle->ns, seg_handle->qpair, key, key_len,
                                cb_fn, cb_ctx);

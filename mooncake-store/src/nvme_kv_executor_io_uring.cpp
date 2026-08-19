@@ -44,14 +44,14 @@ bool CanSubmitCallerBufferDirectly(std::string_view value,
 }
 
 bool IsCharacterDevice(const std::filesystem::path& path) {
-    struct stat st {};
+    struct stat st{};
     return ::stat(path.c_str(), &st) == 0 && S_ISCHR(st.st_mode);
 }
 
 class SharedNvmeUringRing {
    public:
     struct BatchCommand {
-        struct nvme_uring_cmd cmd {};
+        struct nvme_uring_cmd cmd{};
         bool is_write = false;
         size_t context_index = 0;
         uint32_t observed_result = 0;

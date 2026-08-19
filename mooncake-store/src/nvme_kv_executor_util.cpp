@@ -27,6 +27,7 @@ constexpr uint32_t kNvmeKvStatusInvalidKeySize = 0x86;
 constexpr uint32_t kNvmeKvStatusKeyNotFound = 0x87;
 constexpr uint32_t kNvmeKvStatusUnrecoveredRead = 0x88;
 constexpr uint32_t kNvmeKvStatusKeyExists = 0x89;
+constexpr uint32_t kNvmeStatusCodeTypeGeneric = 0x0;
 constexpr char kNvmeKvSysfsRootEnv[] = "MOONCAKE_NVME_KV_SYSFS_ROOT";
 constexpr char kNvmeKvDevRootEnv[] = "MOONCAKE_NVME_KV_DEV_ROOT";
 constexpr char kDefaultNvmeKvSysfsRoot[] = "/sys/class/nvme";
@@ -436,6 +437,17 @@ ErrorCode MapNvmeKvStatus(uint32_t status, bool is_write) {
             return is_write ? ErrorCode::FILE_WRITE_FAIL
                             : ErrorCode::FILE_READ_FAIL;
     }
+}
+
+ErrorCode MapNvmeKvCompletionStatus(uint32_t status_code_type,
+                                    uint32_t status_code, bool is_write) {
+    if (status_code_type == kNvmeStatusCodeTypeGeneric) {
+        if (status_code == 0) {
+            return ErrorCode::OK;
+        }
+        return MapNvmeKvStatus(status_code, is_write);
+    }
+    return is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
 }
 
 ErrorCode MapNvmeKvTransportError(int err, bool is_write) {

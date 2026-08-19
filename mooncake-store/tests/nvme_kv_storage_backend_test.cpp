@@ -250,6 +250,18 @@ TEST_F(NvmeKvStorageBackendTest, StatusMappingHandlesKvSpecificStatusCodes) {
         kDefaultNvmeKvRuntimeTransferLimit));
 }
 
+TEST_F(NvmeKvStorageBackendTest, CompletionStatusPreservesStatusCodeType) {
+    EXPECT_EQ(MapNvmeKvCompletionStatus(0, 0, false), ErrorCode::OK);
+    EXPECT_EQ(MapNvmeKvCompletionStatus(0, 0x87, false),
+              ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(MapNvmeKvCompletionStatus(3, 0, false),
+              ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(MapNvmeKvCompletionStatus(3, 0, true),
+              ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_EQ(MapNvmeKvCompletionStatus(1, 0x87, false),
+              ErrorCode::FILE_READ_FAIL);
+}
+
 TEST_F(NvmeKvStorageBackendTest, BackendLoadsKnownObjectsFromDevice) {
     EnvVarGuard driver_guard("MOONCAKE_NVME_KV_DRIVER", "stub");
 

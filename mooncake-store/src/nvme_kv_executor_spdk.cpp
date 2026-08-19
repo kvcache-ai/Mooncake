@@ -11,12 +11,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -30,23 +32,27 @@ struct SpdkDmaBufferDeleter {
     void operator()(void *ptr) const { SpdkWrapper::GetInstance().Free(ptr); }
 };
 
-using SpdkDmaBuffer = std::unique_ptr<void, SpdkDmaBufferDeleter>;
+using SpdkDmaBuffer = std::shared_ptr<void>;
 
-struct CompletionContext {
+struct CompletionState {
     std::atomic<bool> done{false};
-    bool submitted = false;
-    bool reported = false;
-    bool is_write = false;
-    uint32_t status = 0;
+    uint32_t status_code_type = 0;
+    uint32_t status_code = 0;
+    uint32_t result = 0;
+};
+
+struct CompletionCallbackContext {
+    std::shared_ptr<CompletionState> completion;
+    std::shared_ptr<void> keep_alive;
 };
 
 void KvCommandComplete(void *ctx, const struct spdk_nvme_cpl *cpl) {
-    auto *completion = static_cast<CompletionContext *>(ctx);
-    if (spdk_nvme_cpl_is_error(cpl)) {
-        completion->status = cpl->status.sc;
-    } else {
-        completion->status = 0;
-    }
+    std::unique_ptr<CompletionCallbackContext> callback_context(
+        static_cast<CompletionCallbackContext *>(ctx));
+    auto &completion = callback_context->completion;
+    completion->status_code_type = cpl->status.sct;
+    completion->status_code = cpl->status.sc;
+    completion->result = cpl->cdw0;
     completion->done.store(true, std::memory_order_release);
 }
 
@@ -55,15 +61,6 @@ ErrorCode MapSpdkSubmitError(int ret, bool is_write) {
         return ErrorCode::OK;
     }
     return MapNvmeKvTransportError(ret < 0 ? -ret : ret, is_write);
-}
-
-bool CanUseCallerBuffer(std::string_view value, uint32_t submission_bytes) {
-    if (value.empty() || value.size() != submission_bytes) {
-        return false;
-    }
-    const size_t alignment = std::max<size_t>(
-        kDefaultNvmeKvTransferAlignmentBytes, NvmeKvTransferAlignmentBytes());
-    return reinterpret_cast<uintptr_t>(value.data()) % alignment == 0;
 }
 
 }  // namespace
@@ -75,6 +72,8 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
         : wrapper_(wrapper),
           segment_(segment),
           capabilities_(std::move(capabilities)) {}
+
+    ~NvmeKvSpdkExecutor() override { wrapper_.CloseNofKvSegment(segment_); }
 
     tl::expected<void, ErrorCode> Store(const PhysicalKey &key,
                                         std::string value) override {
@@ -107,11 +106,6 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                 continue;
             }
             submit_sizes[index] = submission_bytes;
-            if (CanUseCallerBuffer(request.value, submission_bytes)) {
-                submit_buffers[index] = request.value.data();
-                continue;
-            }
-
             void *buffer = wrapper_.Alloc(submission_bytes,
                                           NvmeKvTransferAlignmentBytes());
             if (buffer == nullptr) {
@@ -126,16 +120,15 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                 std::memset(static_cast<char *>(buffer) + request.value.size(),
                             0, submission_bytes - request.value.size());
             }
-            dma_buffers[index].reset(buffer);
+            dma_buffers[index] = SpdkDmaBuffer(buffer, SpdkDmaBufferDeleter());
             submit_buffers[index] = buffer;
         }
 
         SubmitBatch(
             requests.size(), true,
-            [&](size_t index, CompletionContext *ctx) {
-                if (submit_buffers[index] == nullptr) {
-                    return false;
-                }
+            [&](size_t index) { return submit_buffers[index] != nullptr; },
+            [&](size_t index, CompletionCallbackContext *ctx) {
+                ctx->keep_alive = dma_buffers[index];
                 const int ret = wrapper_.SubmitKvStore(
                     segment_, requests[index].key.data(),
                     static_cast<uint8_t>(requests[index].key.size()),
@@ -149,7 +142,7 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                 }
                 return true;
             },
-            [&](size_t index, ErrorCode error) {
+            [&](size_t index, ErrorCode error, uint32_t) {
                 if (error == ErrorCode::OK) {
                     requests[index].result = {};
                 } else {
@@ -243,19 +236,18 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
         tl::expected<void, ErrorCode> result =
             tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         SubmitBatch(
-            1, false,
-            [&](size_t, CompletionContext *ctx) {
+            1, true, [](size_t) { return true; },
+            [&](size_t, CompletionCallbackContext *ctx) {
                 const int ret = wrapper_.SubmitKvDelete(
                     segment_, key.data(), static_cast<uint8_t>(key.size()),
                     KvCommandComplete, ctx);
                 if (ret != 0) {
-                    result =
-                        tl::make_unexpected(MapSpdkSubmitError(ret, false));
+                    result = tl::make_unexpected(MapSpdkSubmitError(ret, true));
                     return false;
                 }
                 return true;
             },
-            [&](size_t, ErrorCode error) {
+            [&](size_t, ErrorCode error, uint32_t) {
                 if (error == ErrorCode::OK) {
                     result = {};
                 } else {
@@ -270,25 +262,85 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
     }
 
    private:
-    template <typename SubmitFn, typename CompleteFn>
-    void SubmitBatch(size_t count, bool is_write, SubmitFn submit,
-                     CompleteFn complete) const {
-        std::vector<CompletionContext> contexts(count);
+    template <typename ReadyFn, typename SubmitFn, typename CompleteFn>
+    void SubmitBatch(size_t count, bool is_write, ReadyFn ready,
+                     SubmitFn submit, CompleteFn complete) const {
+        struct BatchContext {
+            std::shared_ptr<CompletionState> completion =
+                std::make_shared<CompletionState>();
+            bool submitted = false;
+            bool reported = false;
+        };
+
+        std::vector<BatchContext> contexts(count);
         size_t next = 0;
         size_t completed = 0;
         size_t inflight = 0;
         const size_t queue_depth =
             std::max<uint32_t>(1, capabilities_.queue_depth);
+        const uint32_t timeout_ms = ParseNvmeKvU32EnvOr(
+            "MOONCAKE_NVME_KV_SPDK_COMPLETION_TIMEOUT_MS", 30000);
+        auto last_progress = std::chrono::steady_clock::now();
 
-        std::lock_guard<std::mutex> lock(qpair_mutex_);
+        for (size_t index = 0; index < count; ++index) {
+            if (!ready(index)) {
+                contexts[index].reported = true;
+                ++completed;
+            }
+        }
+
+        const auto fail_pending = [&](ErrorCode error) {
+            for (size_t index = 0; index < count; ++index) {
+                auto &ctx = contexts[index];
+                if (ctx.reported) {
+                    continue;
+                }
+                ctx.reported = true;
+                complete(index, error, 0);
+            }
+        };
+        const auto drain_completed = [&]() {
+            size_t observed = 0;
+            for (size_t index = 0; index < count; ++index) {
+                auto &ctx = contexts[index];
+                if (!ctx.submitted || ctx.reported ||
+                    !ctx.completion->done.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                ctx.reported = true;
+                --inflight;
+                ++completed;
+                ++observed;
+                complete(index,
+                         MapNvmeKvCompletionStatus(
+                             ctx.completion->status_code_type,
+                             ctx.completion->status_code, is_write),
+                         ctx.completion->result);
+            }
+            return observed;
+        };
+
+        std::lock_guard<std::mutex> batch_lock(batch_mutex_);
         while (completed < count) {
             while (next < count && inflight < queue_depth) {
                 auto &ctx = contexts[next];
-                ctx.is_write = is_write;
-                if (!submit(next, &ctx)) {
-                    if (ctx.done.load(std::memory_order_acquire)) {
-                        complete(next, MapNvmeKvStatus(ctx.status, is_write));
-                    }
+                if (ctx.reported) {
+                    ++next;
+                    continue;
+                }
+                auto *callback_context =
+                    new (std::nothrow) CompletionCallbackContext{
+                        .completion = ctx.completion, .keep_alive = {}};
+                if (callback_context == nullptr) {
+                    ctx.reported = true;
+                    complete(next, ErrorCode::BUFFER_OVERFLOW, 0);
+                    ++completed;
+                    ++next;
+                    continue;
+                }
+                if (!submit(next, callback_context)) {
+                    delete callback_context;
+                    ctx.reported = true;
                     ++completed;
                     ++next;
                     continue;
@@ -296,6 +348,7 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                 ctx.submitted = true;
                 ++inflight;
                 ++next;
+                last_progress = std::chrono::steady_clock::now();
             }
 
             if (inflight == 0) {
@@ -303,24 +356,31 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
             }
             const int rc = static_cast<int>(
                 wrapper_.NvmePollProcessCompletion(segment_, 0));
+            const size_t observed = drain_completed();
             if (rc < 0) {
                 LOG(ERROR) << "SPDK NVMe KV completion polling failed: " << rc;
-            }
-
-            size_t observed = 0;
-            for (size_t index = 0; index < count; ++index) {
-                auto &ctx = contexts[index];
-                if (!ctx.submitted || ctx.reported ||
-                    !ctx.done.load(std::memory_order_acquire)) {
-                    continue;
+                wrapper_.AbortNofSegment(segment_);
+                drain_completed();
+                if (completed < count) {
+                    fail_pending(MapNvmeKvTransportError(-rc, is_write));
+                    return;
                 }
-                ctx.reported = true;
-                --inflight;
-                ++completed;
-                ++observed;
-                complete(index, ctx.status == 0
-                                    ? ErrorCode::OK
-                                    : MapNvmeKvStatus(ctx.status, is_write));
+                break;
+            }
+            if (completed == count) {
+                break;
+            }
+            if (observed != 0) {
+                last_progress = std::chrono::steady_clock::now();
+            } else if (timeout_ms != 0 &&
+                       std::chrono::steady_clock::now() - last_progress >=
+                           std::chrono::milliseconds(timeout_ms)) {
+                LOG(ERROR) << "SPDK NVMe KV completion timed out after "
+                           << timeout_ms << " ms";
+                wrapper_.AbortNofSegment(segment_);
+                drain_completed();
+                fail_pending(MapNvmeKvTransportError(ETIMEDOUT, is_write));
+                return;
             }
             if (observed == 0) {
                 std::this_thread::yield();
@@ -352,16 +412,15 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                     tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
                 continue;
             }
-            dma_buffers[index].reset(buffer);
+            dma_buffers[index] = SpdkDmaBuffer(buffer, SpdkDmaBufferDeleter());
             request_bytes[index] = bytes;
         }
 
         SubmitBatch(
             requests.size(), false,
-            [&](size_t index, CompletionContext *ctx) {
-                if (dma_buffers[index] == nullptr) {
-                    return false;
-                }
+            [&](size_t index) { return dma_buffers[index] != nullptr; },
+            [&](size_t index, CompletionCallbackContext *ctx) {
+                ctx->keep_alive = dma_buffers[index];
                 const int ret = wrapper_.SubmitKvRetrieve(
                     segment_, requests[index].key.data(),
                     static_cast<uint8_t>(requests[index].key.size()),
@@ -374,26 +433,31 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                 }
                 return true;
             },
-            [&](size_t index, ErrorCode error) {
+            [&](size_t index, ErrorCode error, uint32_t reported_size) {
                 if (error != ErrorCode::OK) {
                     requests[index].result = tl::make_unexpected(error);
                     return;
                 }
                 const uint32_t value_size = ResolveNvmeKvRetrievedValueSize(
                     static_cast<const char *>(dma_buffers[index].get()),
-                    request_bytes[index],
-                    capabilities_.effective_max_value_size,
+                    reported_size, capabilities_.effective_max_value_size,
                     requests[index].size_hint);
-                if (value_size == 0 || value_size > request_bytes[index]) {
+                if (value_size == 0) {
                     requests[index].result =
                         tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                     return;
                 }
+                if (value_size > request_bytes[index]) {
+                    requests[index].result = tl::make_unexpected(
+                        value_size > capabilities_.effective_max_value_size
+                            ? ErrorCode::BUFFER_OVERFLOW
+                            : ErrorCode::INVALID_PARAMS);
+                    return;
+                }
                 RetrievedBuffer buffer;
-                void *owned = dma_buffers[index].release();
-                buffer.owner =
-                    std::shared_ptr<void>(owned, SpdkDmaBufferDeleter());
-                buffer.data = static_cast<const char *>(owned);
+                buffer.owner = dma_buffers[index];
+                buffer.data =
+                    static_cast<const char *>(dma_buffers[index].get());
                 buffer.size = value_size;
                 requests[index].result = std::move(buffer);
             });
@@ -402,7 +466,7 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
     SpdkWrapper &wrapper_;
     nof_seg_handle *segment_ = nullptr;
     Capabilities capabilities_;
-    mutable std::mutex qpair_mutex_;
+    mutable std::mutex batch_mutex_;
 };
 
 NvmeKvExecutorResult CreateNvmeKvSpdkExecutor(std::string transport_id,
@@ -415,7 +479,7 @@ NvmeKvExecutorResult CreateNvmeKvSpdkExecutor(std::string transport_id,
     }
     const std::string effective_transport_id =
         NvmeKvTransportIdWithNsid(transport_id, nsid);
-    auto *segment = wrapper.OpenNofSegment(effective_transport_id);
+    auto *segment = wrapper.OpenNofKvSegment(effective_transport_id);
     if (segment == nullptr) {
         LOG(ERROR) << "Failed to open SPDK NVMe-oF segment: "
                    << effective_transport_id;
@@ -424,6 +488,7 @@ NvmeKvExecutorResult CreateNvmeKvSpdkExecutor(std::string transport_id,
     if (!wrapper.IsKvNamespace(segment)) {
         LOG(ERROR) << "SPDK NVMe-oF namespace is not an NVMe KV namespace: "
                    << effective_transport_id;
+        wrapper.CloseNofKvSegment(segment);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto capabilities = BuildNvmeKvCapabilities(
