@@ -16,6 +16,7 @@ class OpLogBatchStorage {
     ErrorCode InitDurablePrefix(DurablePrefix& prefix);
     ErrorCode ClaimProducerView(ViewVersionId producer_view_version);
     ErrorCode ValidateProducerView(ViewVersionId producer_view_version) const;
+    ErrorCode ReadProducerView(ViewVersionId& producer_view_version) const;
     ErrorCode ReadDurablePrefix(DurablePrefix& prefix);
     ErrorCode WriteBatchAndAdvancePrefix(const OpLogBatchRecord& batch,
                                          const DurablePrefix& expected_prefix);
@@ -28,7 +29,6 @@ class OpLogBatchStorage {
 
    private:
     bool IsValidClusterId() const;
-    ErrorCode ReadProducerView(ViewVersionId& producer_view_version) const;
     ErrorCode WriteBatchAndAdvancePrefixImpl(
         const OpLogBatchRecord& batch, const DurablePrefix& expected_prefix,
         const ViewVersionId* producer_view_version);

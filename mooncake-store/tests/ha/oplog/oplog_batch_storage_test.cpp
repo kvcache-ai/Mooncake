@@ -352,6 +352,9 @@ TEST(OpLogBatchStorageTest, RejectsInvalidClusterId) {
 
     DurablePrefix prefix;
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, storage.InitDurablePrefix(prefix));
+    ViewVersionId producer_view = 0;
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              storage.ReadProducerView(producer_view));
 }
 
 TEST(OpLogBatchStorageTest, RereadsDurablePrefixWhenCreateIfAbsentLosesRace) {
