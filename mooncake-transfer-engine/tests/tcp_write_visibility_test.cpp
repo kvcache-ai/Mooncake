@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -674,6 +675,142 @@ class HoldingWriteServer {
     std::atomic<int> max_accepted_count_{0};
 };
 
+class PayloadStallingWriteServer {
+   public:
+    explicit PayloadStallingWriteServer(size_t payload_prefix_to_read)
+        : payload_prefix_to_read_(payload_prefix_to_read) {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) return;
+        int one = 1;
+        if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one,
+                       sizeof(one)) != 0)
+            return;
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
+                 sizeof(addr)) != 0)
+            return;
+        if (listen(listen_fd_, 1) != 0) return;
+
+        socklen_t len = sizeof(addr);
+        if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) !=
+            0)
+            return;
+        port_ = ntohs(addr.sin_port);
+        ok_ = true;
+        thread_ = std::thread([this] { serve(); });
+    }
+
+    ~PayloadStallingWriteServer() { release(); }
+
+    bool ok() const { return ok_; }
+    uint16_t port() const { return port_; }
+
+    bool waitForHeader(std::chrono::seconds timeout) {
+        std::unique_lock<std::mutex> lock(event_mutex_);
+        return event_cv_.wait_for(lock, timeout,
+                                  [this] { return header_received_; });
+    }
+
+    bool waitForPayloadPrefix(std::chrono::seconds timeout) {
+        std::unique_lock<std::mutex> lock(event_mutex_);
+        return event_cv_.wait_for(lock, timeout,
+                                  [this] { return payload_prefix_received_; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(event_mutex_);
+            released_ = true;
+        }
+        event_cv_.notify_all();
+        if (listen_fd_ >= 0) (void)shutdown(listen_fd_, SHUT_RDWR);
+        int accepted = -1;
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            accepted = accepted_fd_;
+        }
+        if (accepted >= 0) (void)shutdown(accepted, SHUT_RDWR);
+        if (thread_.joinable()) thread_.join();
+        if (accepted >= 0) close(accepted);
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            accepted_fd_ = -1;
+        }
+        if (listen_fd_ >= 0) {
+            close(listen_fd_);
+            listen_fd_ = -1;
+        }
+    }
+
+   private:
+    static bool recvExact(int fd, void* buffer, size_t size) {
+        char* out = static_cast<char*>(buffer);
+        while (size) {
+            const ssize_t n = recv(fd, out, size, 0);
+            if (n <= 0) return false;
+            out += n;
+            size -= static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    void serve() {
+        const int fd = accept(listen_fd_, nullptr, nullptr);
+        if (fd < 0) return;
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            accepted_fd_ = fd;
+        }
+        int receive_buffer = 4096;
+        if (payload_prefix_to_read_ == 0) {
+            (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+                             sizeof(receive_buffer));
+        }
+
+        TestSessionHeader header{};
+        if (!recvExact(fd, &header, sizeof(header))) return;
+        {
+            std::lock_guard<std::mutex> lock(event_mutex_);
+            header_received_ = true;
+        }
+        event_cv_.notify_all();
+
+        const size_t prefix =
+            std::min<uint64_t>(payload_prefix_to_read_, le64toh(header.size));
+        std::vector<char> payload(prefix);
+        if (prefix != 0 && !recvExact(fd, payload.data(), prefix)) return;
+        if (prefix != 0) {
+            (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+                             sizeof(receive_buffer));
+        }
+        {
+            std::lock_guard<std::mutex> lock(event_mutex_);
+            payload_prefix_received_ = true;
+        }
+        event_cv_.notify_all();
+
+        std::unique_lock<std::mutex> lock(event_mutex_);
+        event_cv_.wait(lock, [this] { return released_; });
+    }
+
+    const size_t payload_prefix_to_read_;
+    int listen_fd_ = -1;
+    uint16_t port_ = 0;
+    bool ok_ = false;
+    std::thread thread_;
+    std::mutex socket_mutex_;
+    int accepted_fd_ = -1;
+    std::mutex event_mutex_;
+    std::condition_variable event_cv_;
+    bool header_received_ = false;
+    bool payload_prefix_received_ = false;
+    bool released_ = false;
+};
+
 // Keeps a local TCP port bound but deliberately never listens. Linux rejects
 // connect attempts deterministically, without blackhole-address timing.
 class UnavailableTcpPeer {
@@ -1015,8 +1152,26 @@ bool waitForBatchTerminal(TransferEngine* engine, Transport::BatchID batch_id,
     return true;
 }
 
-void expectEverySliceCompletedExactlyOnceAfterShutdown(
-    Transport::BatchID batch_id) {
+template <typename Rep, typename Period>
+bool waitForTaskTerminal(TransferEngine* engine, Transport::BatchID batch_id,
+                         std::chrono::duration<Rep, Period> timeout,
+                         TransferStatusEnum* final_status = nullptr) {
+    TransferStatus status;
+    status.s = TransferStatusEnum::WAITING;
+    const bool terminal = waitForPredicate(
+        [&] {
+            status.s = TransferStatusEnum::WAITING;
+            if (!engine->getTransferStatus(batch_id, 0, status).ok())
+                return false;
+            return status.s == TransferStatusEnum::COMPLETED ||
+                   status.s == TransferStatusEnum::FAILED;
+        },
+        timeout);
+    if (final_status) *final_status = status.s;
+    return terminal;
+}
+
+void expectEverySliceCompletedExactlyOnce(Transport::BatchID batch_id) {
     const auto& batch = Transport::toBatchDesc(batch_id);
     for (size_t task_id = 0; task_id < batch.task_list.size(); ++task_id) {
         const auto& task = batch.task_list[task_id];
@@ -1033,6 +1188,11 @@ void expectEverySliceCompletedExactlyOnceAfterShutdown(
                 << "task " << task_id;
         }
     }
+}
+
+void expectEverySliceCompletedExactlyOnceAfterShutdown(
+    Transport::BatchID batch_id) {
+    expectEverySliceCompletedExactlyOnce(batch_id);
 }
 
 void expectEverySliceSucceededExactlyOnceAfterShutdown(
@@ -2876,5 +3036,129 @@ TEST(TcpWriteVisibilityTest,
     reclaimBatchDescAfterEngineShutdownForTest(busy_batch_id);
     for (const auto batch_id : batch_ids)
         reclaimBatchDescAfterEngineShutdownForTest(batch_id);
+}
+
+TEST(TcpWriteVisibilityTest, WritePayloadNoProgressFailsWithinBoundedDeadline) {
+    constexpr size_t kRequestSize = 64ull << 20;
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar status_timeout("MC_TCP_STATUS_TIMEOUT_SEC", "1");
+    ScopedEnvVar progress_timeout("MC_TCP_PROGRESS_TIMEOUT_SEC", "1");
+    ScopedLaneHooks hooks;
+    PayloadStallingWriteServer fake_peer(/*payload_prefix_to_read=*/0);
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:18044", kRequestSize);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto batch_id = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(batch_id, {makeWriteRequest(h, kRequestSize)})
+            .ok());
+    ASSERT_TRUE(fake_peer.waitForHeader(std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_busy_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+
+    TransferStatusEnum status = TransferStatusEnum::WAITING;
+    const bool terminal = waitForTaskTerminal(
+        h.engine.get(), batch_id, std::chrono::milliseconds(1500), &status);
+    EXPECT_TRUE(terminal)
+        << "RED: a connected WRITE that makes no payload progress has no "
+           "general progress deadline";
+    EXPECT_EQ(status, TransferStatusEnum::FAILED);
+
+    fake_peer.release();
+    if (waitForTaskTerminal(h.engine.get(), batch_id,
+                            std::chrono::seconds(5))) {
+        expectEverySliceCompletedExactlyOnce(batch_id);
+        EXPECT_TRUE(h.engine->freeBatchID(batch_id).ok());
+    } else {
+        h.engine.reset();
+        reclaimBatchDescAfterEngineShutdownForTest(batch_id);
+    }
+}
+
+TEST(TcpWriteVisibilityTest,
+     WritePayloadPartialProgressThenStallFailsWithinBoundedDeadline) {
+    constexpr size_t kRequestSize = 64ull << 20;
+    constexpr size_t kObservedPayloadProgress = 128ull << 10;
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar status_timeout("MC_TCP_STATUS_TIMEOUT_SEC", "1");
+    ScopedEnvVar progress_timeout("MC_TCP_PROGRESS_TIMEOUT_SEC", "1");
+    ScopedLaneHooks hooks;
+    PayloadStallingWriteServer fake_peer(kObservedPayloadProgress);
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:18045", kRequestSize);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto batch_id = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(batch_id, {makeWriteRequest(h, kRequestSize)})
+            .ok());
+    ASSERT_TRUE(fake_peer.waitForHeader(std::chrono::seconds(5)));
+    ASSERT_TRUE(fake_peer.waitForPayloadPrefix(std::chrono::seconds(5)))
+        << "the server must observe real payload progress before stalling";
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_busy_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+
+    TransferStatusEnum status = TransferStatusEnum::WAITING;
+    const bool terminal = waitForTaskTerminal(
+        h.engine.get(), batch_id, std::chrono::milliseconds(1500), &status);
+    EXPECT_TRUE(terminal)
+        << "RED: the status-frame timer is not a payload progress deadline "
+           "after real WRITE progress stops";
+    EXPECT_EQ(status, TransferStatusEnum::FAILED);
+
+    fake_peer.release();
+    if (waitForTaskTerminal(h.engine.get(), batch_id,
+                            std::chrono::seconds(5))) {
+        expectEverySliceCompletedExactlyOnce(batch_id);
+        EXPECT_TRUE(h.engine->freeBatchID(batch_id).ok());
+    } else {
+        h.engine.reset();
+        reclaimBatchDescAfterEngineShutdownForTest(batch_id);
+    }
+}
+
+TEST(TcpWriteVisibilityTest, ShutdownWithArmedProgressDeadlineCompletesOnce) {
+    constexpr size_t kRequestSize = 64ull << 20;
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar progress_timeout("MC_TCP_PROGRESS_TIMEOUT_SEC", "10");
+    ScopedLaneHooks hooks;
+    PayloadStallingWriteServer fake_peer(/*payload_prefix_to_read=*/0);
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:18051", kRequestSize);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto batch_id = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(batch_id, {makeWriteRequest(h, kRequestSize)})
+            .ok());
+    ASSERT_TRUE(fake_peer.waitForHeader(std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_busy_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+
+    auto engine = std::move(h.engine);
+    auto destruction =
+        std::async(std::launch::async,
+                   [engine = std::move(engine)]() mutable { engine.reset(); });
+    ASSERT_EQ(destruction.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    destruction.get();
+
+    expectEverySliceCompletedExactlyOnceAfterShutdown(batch_id);
+    hooks.reset();
+    reclaimBatchDescAfterEngineShutdownForTest(batch_id);
+    fake_peer.release();
 }
 #endif
