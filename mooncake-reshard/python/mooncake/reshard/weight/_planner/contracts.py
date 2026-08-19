@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from math import prod
 from types import MappingProxyType
 from typing import (
+    TYPE_CHECKING,
     ClassVar,
     Generic,
     Iterable,
@@ -11,17 +12,21 @@ from typing import (
     Optional,
     Sequence,
     TypeVar,
+    Union,
     cast,
 )
 
 from ..._compat import _strict_zip
 from ..._typing import TypeAlias
 from ...contracts import (
+    LeaseId,
     ParticipantId,
     PlacementFragmentId,
     PlacementId,
     ResourceId,
     RevisionId,
+    RuntimeFragmentId,
+    RuntimeInstanceId,
     TensorId,
 )
 from ...geometry import box_contains as _box_contains
@@ -43,10 +48,16 @@ from .geometry import (
     _validate_outer_strides,
 )
 from .fragments import (
+    BoundWeightFragment,
+    ExecutableSourceFragment,
+    ExecutableTargetFragment,
     GeometryFragment,
     LogicalSourceFragment,
     LogicalTargetFragment,
 )
+
+if TYPE_CHECKING:
+    from .bound_contracts import ExecutorTransferPlan
 
 
 RuntimeTensorOwner = tuple[tuple[str, int], ...]
@@ -350,6 +361,17 @@ LogicalTransferRegion: TypeAlias = TransferRegion[
 ]
 LogicalTransferOperation: TypeAlias = LogicalTransferRegion
 
+ExecutableTransferRegion: TypeAlias = TransferRegion[
+    ExecutableSourceFragment,
+    ExecutableTargetFragment,
+]
+ExecutableTransferOperation: TypeAlias = ExecutableTransferRegion
+
+LiveTransferOperation: TypeAlias = TransferRegion[
+    BoundWeightFragment, BoundWeightFragment
+]
+StoredLoadOperation: TypeAlias = TransferRegion[StoredFragment, BoundWeightFragment]
+
 
 def _is_canonical_operation(value: object) -> bool:
     return isinstance(value, TransferRegion)
@@ -395,14 +417,27 @@ class PlacementExecutorPlan:
             raise ValueError("placement executor has duplicate fragment IDs")
 
 
+RuntimeExecutorProjectionKey: TypeAlias = tuple[
+    RuntimeInstanceId,
+    PlacementId,
+    ParticipantId,
+    str,
+    Optional[LeaseId],
+    str,
+    ParallelRank,
+    tuple[RuntimeFragmentId, ...],
+]
 PlacementExecutorProjectionKey: TypeAlias = tuple[
     PlacementId,
     ParticipantId,
     ParallelRank,
     tuple[PlacementFragmentId, ...],
 ]
-ExecutorProjectionKey: TypeAlias = PlacementExecutorProjectionKey
-FragmentProjectionKey: TypeAlias = PlacementFragmentId
+ExecutorProjectionKey: TypeAlias = Union[
+    RuntimeExecutorProjectionKey,
+    PlacementExecutorProjectionKey,
+]
+FragmentProjectionKey: TypeAlias = tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -413,7 +448,7 @@ class _OperationViews:
 
     def operation_indices_for(
         self,
-        executor: PlacementExecutorPlan,
+        executor: Union[ExecutorTransferPlan, PlacementExecutorPlan],
         side: str,
     ) -> tuple[int, ...]:
         if side == "source":
@@ -625,25 +660,40 @@ def _canonical_tensor_catalog(
     return tuple(sorted(tensors, key=lambda item: item.tensor_id))
 
 
-def _executor_projection_key(executor: PlacementExecutorPlan) -> ExecutorProjectionKey:
+def _executor_projection_key(
+    executor: Union[ExecutorTransferPlan, PlacementExecutorPlan],
+) -> ExecutorProjectionKey:
+    if isinstance(executor, PlacementExecutorPlan):
+        return (
+            executor.placement_id,
+            executor.participant_id,
+            executor.rank,
+            executor.placement_fragment_ids,
+        )
     return (
+        executor.instance_id,
         executor.placement_id,
         executor.participant_id,
+        executor.placement_digest,
+        executor.runtime_lease_id,
+        executor.worker_id,
         executor.rank,
-        executor.placement_fragment_ids,
+        executor.fragment_ids,
     )
 
 
 def _fragment_projection_key(
     fragment: GeometryFragment,
 ) -> Optional[FragmentProjectionKey]:
+    if isinstance(fragment, BoundWeightFragment):
+        return "runtime", fragment.fragment_id
     if isinstance(fragment, PlacementFragment):
-        return fragment.placement_fragment_id
+        return "placement", fragment.placement_fragment_id
     return None
 
 
 def _index_executors_by_fragment(
-    executors: Sequence[PlacementExecutorPlan],
+    executors: Sequence[Union[ExecutorTransferPlan, PlacementExecutorPlan]],
 ) -> tuple[
     dict[ExecutorProjectionKey, list[int]],
     dict[FragmentProjectionKey, list[ExecutorProjectionKey]],
@@ -655,15 +705,25 @@ def _index_executors_by_fragment(
         if executor_key in indices_by_executor:
             raise ValueError("transfer plan has duplicate executor projection key")
         indices_by_executor[executor_key] = []
-        for fragment_id in executor.placement_fragment_ids:
-            executors_by_fragment.setdefault(fragment_id, []).append(executor_key)
+        fragment_ids: Sequence[str]
+        fragment_kind: str
+        if isinstance(executor, PlacementExecutorPlan):
+            fragment_ids = executor.placement_fragment_ids
+            fragment_kind = "placement"
+        else:
+            fragment_ids = executor.fragment_ids
+            fragment_kind = "runtime"
+        for fragment_id in fragment_ids:
+            executors_by_fragment.setdefault((fragment_kind, fragment_id), []).append(
+                executor_key
+            )
     return indices_by_executor, executors_by_fragment
 
 
 def _build_operation_views(
-    operations: Sequence[LogicalTransferOperation],
-    source_executors: Sequence[PlacementExecutorPlan],
-    target_executors: Sequence[PlacementExecutorPlan],
+    operations: Sequence[Union[LogicalTransferOperation, ExecutableTransferOperation]],
+    source_executors: Sequence[Union[ExecutorTransferPlan, PlacementExecutorPlan]],
+    target_executors: Sequence[Union[ExecutorTransferPlan, PlacementExecutorPlan]],
 ) -> _OperationViews:
     source_indices, source_by_fragment = _index_executors_by_fragment(source_executors)
     target_indices, target_by_fragment = _index_executors_by_fragment(target_executors)
@@ -688,7 +748,7 @@ def _build_operation_views(
 
 
 def _pipeline_routes(
-    operations: Sequence[LogicalTransferOperation],
+    operations: Sequence[Union[LogicalTransferOperation, ExecutableTransferOperation]],
 ) -> tuple[PipelineRouteGroup, ...]:
     indices_by_route: dict[
         tuple[Optional[int], Optional[int], int, Optional[int]],
@@ -697,12 +757,12 @@ def _pipeline_routes(
     for index, operation in enumerate(operations):
         source_pp = (
             operation.source.rank.pp
-            if isinstance(operation.source, PlacementFragment)
+            if isinstance(operation.source, (BoundWeightFragment, PlacementFragment))
             else None
         )
         source_pipeline_stage_id = (
             operation.source.pipeline_stage_id
-            if isinstance(operation.source, PlacementFragment)
+            if isinstance(operation.source, (BoundWeightFragment, PlacementFragment))
             else None
         )
         indices_by_route.setdefault(
@@ -740,12 +800,17 @@ def _pipeline_routes(
 
 
 __all__ = [
+    "BoundWeightFragment",
     "LogicalTransferPlan",
     "PlanningLimits",
     "PipelineRouteGroup",
     "PlacementExecutorPlan",
     "RuntimeTensorOwner",
+    "ExecutableTransferOperation",
+    "ExecutableTransferRegion",
+    "LiveTransferOperation",
     "LogicalTransferOperation",
     "LogicalTransferRegion",
+    "StoredLoadOperation",
     "TransferRegion",
 ]
