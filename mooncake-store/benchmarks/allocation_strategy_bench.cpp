@@ -19,7 +19,7 @@
 
 #include "offset_allocator/offset_allocator.h"
 #include "allocator.h"
-#include "allocation_strategy.h"
+#include "placement/replica_allocator.h"
 
 // --- gflags definitions ---
 DEFINE_int64(segment_capacity, 1024,

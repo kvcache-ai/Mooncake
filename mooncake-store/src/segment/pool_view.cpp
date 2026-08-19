@@ -45,8 +45,8 @@ std::optional<RegionResourceView> SegmentPoolView::GetResourceView(
     if (!resource) {
         return std::nullopt;
     }
-    return RegionResourceView{&resource->spec, resource->allocator.get(),
-                              &resource->target, resource->active};
+    return RegionResourceView{resource->allocator.get(), &resource->target,
+                              resource->active};
 }
 
 std::shared_ptr<BufferAllocatorBase> SegmentPoolView::GetAllocator(

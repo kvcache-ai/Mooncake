@@ -21,7 +21,7 @@ namespace mooncake::ha {
 class SegmentPoolSnapshotCodec final {
    public:
     static tl::expected<std::vector<uint8_t>, SerializationError> Encode(
-        SegmentPool& segment_pool,
+        const SegmentPool& segment_pool,
         const LocalSsdPersistedState& local_ssd_state);
     static tl::expected<LocalSsdPersistedState, SerializationError> Decode(
         SegmentPool& segment_pool, const std::vector<uint8_t>& data);

@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "master_service.h"
-#include "nof_segment_manager.h"
 #include "segment/pool.h"
 #include "serialize/serializer.h"
 #include "ha/snapshot/segment_pool_snapshot_codec.h"
@@ -32,10 +31,10 @@ MasterSnapshotCodec::Encode(MasterSnapshotStateView& state_view) const {
     }
     payloads.metadata = std::move(metadata_result.value());
 
-    // 2. Encode segments (memory segments + NoF segments)
+    // 2. Encode mounted memory regions and LocalSSD state. NoF is outside the
+    // current snapshot wire format.
     auto segments_result =
-        EncodeSegments(state_view.segment_manager, state_view.local_ssd_manager,
-                       state_view.nof_segment_manager);
+        EncodeSegments(state_view.segment_pool, state_view.local_ssd_manager);
     if (!segments_result) {
         return tl::make_unexpected(segments_result.error());
     }
@@ -121,12 +120,10 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeMetadata(
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>
-MasterSnapshotCodec::EncodeSegments(
-    SegmentPool& segment_manager, LocalSsdManager& local_ssd_manager,
-    NoFSegmentManager& nof_segment_manager) const {
-    // Note: NoFSegmentManager is not currently serialized in snapshots
+MasterSnapshotCodec::EncodeSegments(const SegmentPool& segment_pool,
+                                    LocalSsdManager& local_ssd_manager) const {
     return SegmentPoolSnapshotCodec::Encode(
-        segment_manager, local_ssd_manager.ExportPersistedState());
+        segment_pool, local_ssd_manager.ExportPersistedState());
 }
 
 tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeSegments(

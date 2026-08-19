@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
+#include "allocator_import.h"
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.h"
-#include "segment/region.h"
 #include "types.h"
 
 using facebook::cachelib::MemoryAllocator;

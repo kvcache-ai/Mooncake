@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ha/snapshot/segment_pool_snapshot_codec.h"
+#include "master_metric_manager.h"
 #include "segment/region_initial_state.h"
 #include "test_buffer_allocator.h"
 
@@ -226,10 +227,15 @@ TEST_F(SegmentTest, SnapshotRoundTripPreservesMountedRegionHostId) {
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
 
     SegmentPool restored(OffsetDrivers());
+    auto stale = MakeSegment(1, "stale-snapshot-region");
+    ASSERT_EQ(restored.getSegmentPoolAccess().MountSegment(stale, client),
+              ErrorCode::OK);
     auto decoded = ha::SegmentPoolSnapshotCodec::Decode(restored, *encoded);
     ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
 
     MountedRegion mounted;
+    EXPECT_EQ(restored.getView().GetMountedRegion(stale.id, mounted),
+              ErrorCode::SEGMENT_NOT_FOUND);
     ASSERT_EQ(restored.getView().GetMountedRegion(segment.id, mounted),
               ErrorCode::OK);
     EXPECT_EQ(mounted.segment.host_id, segment.host_id);
@@ -373,6 +379,58 @@ TEST_F(SegmentTest, HostOrderingUsesGroupPointersAndTracksSameNameTargets) {
     }
     CommitUnmount(pool, local1, client);
     CommitUnmount(pool, remote, client);
+}
+
+TEST_F(SegmentTest, SameNameRegionsShareLifecycleAndMetrics) {
+    SegmentPool pool(OffsetDrivers());
+    const UUID client = generate_uuid();
+    auto first = MakeSegment(0, "same-name-lifecycle", "tcp", "host-a");
+    auto second = MakeSegment(1, "same-name-lifecycle", "tcp", "host-b");
+    {
+        auto access = pool.getSegmentPoolAccess();
+        ASSERT_EQ(access.MountSegment(first, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(second, client), ErrorCode::OK);
+
+        std::vector<std::string> names;
+        ASSERT_EQ(access.GetAllSegmentNames(names), ErrorCode::OK);
+        EXPECT_EQ(names, std::vector<std::string>{first.name});
+
+        ASSERT_EQ(
+            access.SetSegmentStatusByName(first.name, SegmentStatus::DRAINING),
+            ErrorCode::OK);
+        EXPECT_FALSE(access.IsSegmentAllocatable(first.name));
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        ASSERT_EQ(access.GetSegmentStatusById(first.id, status), ErrorCode::OK);
+        EXPECT_EQ(status, SegmentStatus::DRAINING);
+        ASSERT_EQ(access.GetSegmentStatusById(second.id, status),
+                  ErrorCode::OK);
+        EXPECT_EQ(status, SegmentStatus::DRAINING);
+
+        ASSERT_EQ(access.SetSegmentStatusByName(first.name, SegmentStatus::OK),
+                  ErrorCode::OK);
+        EXPECT_TRUE(access.IsSegmentAllocatable(first.name));
+        ASSERT_EQ(access.PrepareGracefulUnmountSegment(second.id),
+                  ErrorCode::OK);
+        EXPECT_TRUE(access.IsSegmentAllocatable(first.name));
+        ASSERT_EQ(access.GetSegmentStatusByName(first.name, status),
+                  ErrorCode::OK);
+        EXPECT_EQ(status, SegmentStatus::OK);
+    }
+
+    auto& metrics = MasterMetricManager::instance();
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(first.name),
+              2 * static_cast<int64_t>(kRegionSize));
+    {
+        auto access = pool.getSegmentPoolAccess();
+        ASSERT_EQ(access.CommitUnmountSegment(second.id, client, second.size),
+                  ErrorCode::OK);
+        EXPECT_TRUE(access.ExistsSegmentName(first.name));
+    }
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(first.name),
+              static_cast<int64_t>(kRegionSize));
+
+    CommitUnmount(pool, first, client);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(first.name), 0);
 }
 
 TEST_F(SegmentTest, FailedAllocationReportsEnoughLogicalGroups) {

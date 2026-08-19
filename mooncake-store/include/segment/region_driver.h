@@ -10,7 +10,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
-#include "allocation_target.h"
+#include "placement/target.h"
 #include "segment/region.h"
 
 namespace mooncake {

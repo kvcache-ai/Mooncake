@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "allocation_strategy.h"
+#include "placement/replica_allocator.h"
 #include "rpc_types.h"
 #include "segment/pool_types.h"
 

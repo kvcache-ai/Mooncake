@@ -10,7 +10,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include "allocation_strategy.h"
+#include "placement/index.h"
+#include "placement/replica_allocator.h"
 #include "segment/region_driver.h"
 #include "segment/pool_types.h"
 
@@ -65,7 +66,9 @@ class SegmentPool final {
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;
     ClientByRegionName client_by_name_;
-    std::unordered_map<std::string, UUID> segment_id_by_name_;
+    std::unordered_map<std::string, std::vector<UUID>, TransparentStringHash,
+                       std::equal_to<>>
+        region_ids_by_name_;
     HostRegionIndex regions_by_host_;
     std::unordered_set<UUID, boost::hash<UUID>> capacity_accounted_regions_;
 

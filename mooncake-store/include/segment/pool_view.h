@@ -15,7 +15,8 @@ namespace mooncake {
 class SegmentPool;
 
 struct RegionResourceView final {
-    const RegionResourceSpec* spec;
+    // Raw pointers remain valid while the owning SegmentPoolView holds the
+    // pool's shared lock.
     const BufferAllocatorBase* allocator;
     const AllocationTarget* target;
     bool active;

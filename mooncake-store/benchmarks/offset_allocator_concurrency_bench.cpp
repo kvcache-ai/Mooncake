@@ -18,7 +18,7 @@
 
 #include <gflags/gflags.h>
 
-#include "allocation_strategy.h"
+#include "placement/replica_allocator.h"
 #include "allocator.h"
 #include "offset_allocator/offset_allocator.h"
 

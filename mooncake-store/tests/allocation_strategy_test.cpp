@@ -1,4 +1,4 @@
-#include "allocation_strategy.h"
+#include "placement/replica_allocator.h"
 
 #include <gtest/gtest.h>
 

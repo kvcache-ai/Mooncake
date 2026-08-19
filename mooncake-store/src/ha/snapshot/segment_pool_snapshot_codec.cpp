@@ -124,7 +124,8 @@ IndexFields(const msgpack::object& object) {
 
 tl::expected<std::vector<uint8_t>, SerializationError>
 SegmentPoolSnapshotCodec::Encode(
-    SegmentPool& segment_pool, const LocalSsdPersistedState& local_ssd_state) {
+    const SegmentPool& segment_pool,
+    const LocalSsdPersistedState& local_ssd_state) {
     auto view = segment_pool.getView();
     const auto allocator_type = view.GetMemoryAllocatorType();
     if (!allocator_type || *allocator_type != BufferAllocatorType::OFFSET) {
@@ -365,6 +366,17 @@ SegmentPoolSnapshotCodec::Decode(SegmentPool& segment_pool,
                                "snapshot region is missing an owner"));
     }
 
+    std::unordered_map<std::string, UUID> owner_by_name;
+    for (const auto& [_, region] : decoded) {
+        auto [owner, inserted] = owner_by_name.emplace(
+            region.mounted.segment.name, region.mounted.client_id);
+        if (!inserted && owner->second != region.mounted.client_id) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "snapshot logical region group has multiple owners"));
+        }
+    }
+
     std::vector<UUID> order;
     order.reserve(decoded.size());
     for (const auto& name : active_names) {
@@ -384,7 +396,6 @@ SegmentPoolSnapshotCodec::Decode(SegmentPool& segment_pool,
     }
 
     auto access = segment_pool.getSegmentPoolAccess();
-    access.Clear();
     std::vector<PreparedMountedRegion> prepared;
     prepared.reserve(order.size());
     for (const auto& id : order) {
@@ -397,6 +408,9 @@ SegmentPoolSnapshotCodec::Decode(SegmentPool& segment_pool,
         }
         prepared.push_back(std::move(*next));
     }
+    // Preparing is transactional and leaves the currently published pool
+    // untouched. Once every resource is ready, replacement is no-fail.
+    access.Clear();
     for (auto& region : prepared) {
         access.CommitMount(region);
     }

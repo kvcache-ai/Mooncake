@@ -110,14 +110,17 @@ tl::expected<RegionInitialState, ErrorCode> SegmentPool::BuildInitialState(
 }
 
 void SegmentPool::releaseCapacityMetrics() {
+    std::unordered_set<std::string> segment_names;
     for (const auto& id : capacity_accounted_regions_) {
         auto mounted = mounted_regions_.find(id);
         if (mounted != mounted_regions_.end()) {
             MasterMetricManager::instance().dec_total_mem_capacity(
                 mounted->second.segment.name, mounted->second.segment.size);
-            MasterMetricManager::instance().remove_segment_metrics(
-                mounted->second.segment.name);
+            segment_names.insert(mounted->second.segment.name);
         }
+    }
+    for (const auto& name : segment_names) {
+        MasterMetricManager::instance().remove_segment_metrics(name);
     }
     capacity_accounted_regions_.clear();
 }

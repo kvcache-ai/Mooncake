@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <memory>
@@ -12,16 +13,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include <boost/functional/hash.hpp>
-#include <ylt/util/tl/expected.hpp>
-
-#include "allocation_target.h"
-#include "replica.h"
+#include "placement/target.h"
 #include "types.h"
 
 namespace mooncake {
-
-class LocalSsdManager;
 
 struct PlacementGroup final {
     std::string name;
@@ -120,43 +115,5 @@ class ScopedPlacementAccess final {
     const ClientByRegionName* client_by_name_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
-
-class LocalSSDMetricsView final {
-   public:
-    explicit LocalSSDMetricsView(const LocalSsdManager& local_ssd)
-        : local_ssd_(&local_ssd) {}
-
-    std::optional<double> GetFreeRatio(const UUID& client_id) const;
-
-   private:
-    const LocalSsdManager* local_ssd_;
-};
-
-struct ReplicaAllocationRequest final {
-    size_t size{0};
-    size_t replica_count{1};
-    std::string_view preferred_group;
-    std::span<const std::string> preferred_groups;
-    std::span<PlacementGroup* const> resolved_preferred_groups;
-    std::span<const std::string> excluded_groups;
-    ReplicaType replica_type{ReplicaType::MEMORY};
-};
-
-class ReplicaAllocator final {
-   public:
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        ScopedPlacementAccess& placement, PlacementPolicyType policy_type,
-        const ReplicaAllocationRequest& request,
-        std::optional<LocalSSDMetricsView> local_ssd_metrics =
-            std::nullopt) const;
-
-    tl::expected<Replica, ErrorCode> AllocateFrom(
-        ScopedPlacementAccess& placement, size_t size,
-        std::string_view group_name,
-        ReplicaType replica_type = ReplicaType::MEMORY) const;
-};
-
-PlacementPolicyType EffectiveNoFPlacementPolicy(
-    PlacementPolicyType memory_policy);
 
 }  // namespace mooncake

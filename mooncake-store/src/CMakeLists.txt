@@ -13,7 +13,6 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     utils/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
-    allocation_strategy.cpp
     allocator.cpp
     master_service.cpp
     master_snapshot_manager.cpp
@@ -22,6 +21,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/pool.cpp
     segment/pool_access.cpp
     segment/pool_view.cpp
+    placement/index.cpp
+    placement/replica_allocator.cpp
     nof_segment_manager.cpp
     segment/region_driver.cpp
     segment/region_initial_state.cpp

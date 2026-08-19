@@ -17,7 +17,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
-#include "allocation_strategy.h"
+#include "placement/replica_allocator.h"
 #include "tenant_quota_policy_store.h"
 #include "test_buffer_allocator.h"
 #include "types.h"
