@@ -428,6 +428,7 @@ class DataProtoCatalogTransfer:
     def drain(self) -> None:
         for attempt in range(2):
             try:
+                self._retry_publications(strict=True)
                 self._cleanup_retired(self._catalog_call("drain"), strict=True)
                 return
             except Exception:
