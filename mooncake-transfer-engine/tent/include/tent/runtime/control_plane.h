@@ -97,7 +97,7 @@ class ControlClient {
     static Status delegate(const std::string& server_addr,
                            const Request& request);
 
-    using DelegateCallback = std::function<void(Status)>;
+    using DelegateCallback = std::function<void(Status, bool confirmed)>;
     static void delegateAsync(const std::string& server_addr,
                               const Request& request,
                               DelegateCallback callback);

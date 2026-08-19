@@ -32,17 +32,17 @@ RemoteStageOperation::RemoteStageOperation(std::string server_addr,
       remote_buffer_(remote_buffer),
       deferred_cleanup_(std::move(deferred_cleanup)) {}
 
-void RemoteStageOperation::complete(Status status) {
+void RemoteStageOperation::complete(Status status, bool confirmed) {
     DeferredCleanup cleanup;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        result_ = std::move(status);
+        result_ = RemoteStageResult{std::move(status), confirmed};
         cleanup = takeCleanupIfReadyLocked();
     }
     runDeferredCleanup(std::move(cleanup));
 }
 
-std::optional<Status> RemoteStageOperation::tryTakeResult() {
+std::optional<RemoteStageResult> RemoteStageOperation::tryTakeResult() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (abandoned_ || !result_) return std::nullopt;
     auto result = std::move(result_);
@@ -67,7 +67,8 @@ bool RemoteStageOperation::ownsRemoteBuffer(const std::string& server_addr,
 
 RemoteStageOperation::DeferredCleanup
 RemoteStageOperation::takeCleanupIfReadyLocked() {
-    if (!abandoned_ || !result_ || cleanup_started_ || !deferred_cleanup_) {
+    if (!abandoned_ || !result_ || !result_->confirmed || cleanup_started_ ||
+        !deferred_cleanup_) {
         return {};
     }
     cleanup_started_ = true;
@@ -86,9 +87,15 @@ bool pollRemoteOperations(
             ++it;
             continue;
         }
-        if (!result->ok()) {
+        if (!result->confirmed) {
+            LOG(WARNING) << "Remote staging completion is unconfirmed: "
+                         << result->status;
+            ++it;
+            continue;
+        }
+        if (!result->status.ok()) {
             LOG(WARNING) << "Failed to drain remote staging request: "
-                         << *result;
+                         << result->status;
         }
         it = remote_operations.erase(it);
     }

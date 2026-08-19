@@ -165,12 +165,13 @@ void ControlClient::delegateAsync(const std::string& server_addr,
         [callback = std::move(callback)](Status status,
                                          std::string response_raw) mutable {
             if (!status.ok()) {
-                callback(std::move(status));
+                callback(std::move(status), false);
                 return;
             }
             callback(response_raw.empty()
                          ? Status::OK()
-                         : Status::RpcServiceError(response_raw));
+                         : Status::RpcServiceError(response_raw),
+                     true);
         });
 }
 

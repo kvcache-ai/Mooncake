@@ -15,6 +15,11 @@ namespace mooncake {
 namespace tent {
 namespace internal {
 
+struct RemoteStageResult {
+    Status status;
+    bool confirmed;
+};
+
 class RemoteStageOperation {
    public:
     using DeferredCleanup = std::function<void()>;
@@ -23,9 +28,9 @@ class RemoteStageOperation {
     RemoteStageOperation(std::string server_addr, uint64_t remote_buffer,
                          DeferredCleanup deferred_cleanup);
 
-    void complete(Status status);
+    void complete(Status status, bool confirmed);
 
-    std::optional<Status> tryTakeResult();
+    std::optional<RemoteStageResult> tryTakeResult();
 
     void abandonForCleanup();
 
@@ -39,7 +44,7 @@ class RemoteStageOperation {
     uint64_t remote_buffer_{0};
     DeferredCleanup deferred_cleanup_;
     std::mutex mutex_;
-    std::optional<Status> result_;
+    std::optional<RemoteStageResult> result_;
     bool abandoned_{false};
     bool cleanup_started_{false};
 };

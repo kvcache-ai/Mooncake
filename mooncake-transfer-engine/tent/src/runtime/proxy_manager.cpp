@@ -250,8 +250,9 @@ void ProxyManager::submitRemoteStage(
                 });
         });
     ControlClient::delegateAsync(
-        server_addr, remote_stage,
-        [operation](Status status) { operation->complete(std::move(status)); });
+        server_addr, remote_stage, [operation](Status status, bool confirmed) {
+            operation->complete(std::move(status), confirmed);
+        });
 }
 
 Status ProxyManager::waitCrossStage(const Request& request,
@@ -707,8 +708,13 @@ Status ProxyManager::transferEventLoop(
                 }
                 auto result = operation->tryTakeResult();
                 if (result) {
+                    if (!result->confirmed) {
+                        chunk.state = StageState::FAILED;
+                        event_queue.push(id);
+                        break;
+                    }
                     operation.reset();
-                    if (!result->ok()) {
+                    if (!result->status.ok()) {
                         chunk.state = StageState::FAILED;
                         event_queue.push(id);
                         break;

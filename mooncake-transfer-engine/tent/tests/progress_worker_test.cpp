@@ -1096,7 +1096,7 @@ TEST(ProxyManager, RemoteCleanupProbeDoesNotBlockOnPendingOperation) {
     EXPECT_FALSE(internal::pollRemoteOperations(remote_operations));
     ASSERT_EQ(remote_operations.size(), 1);
 
-    operation->complete(Status::OK());
+    operation->complete(Status::OK(), true);
     EXPECT_TRUE(internal::pollRemoteOperations(remote_operations));
     EXPECT_TRUE(remote_operations.empty());
 }
@@ -1114,8 +1114,7 @@ TEST(ProxyManager, UnconfirmedRemoteCompletionKeepsAbandonedBufferPinned) {
         "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
 
     auto operation = std::make_shared<internal::RemoteStageOperation>(
-        server_addr, kRemoteBuffer,
-        [cleanup_calls] {
+        server_addr, kRemoteBuffer, [cleanup_calls] {
             cleanup_calls->fetch_add(1, std::memory_order_relaxed);
         });
     operation->abandonForCleanup();
