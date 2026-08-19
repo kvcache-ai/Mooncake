@@ -416,6 +416,21 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
     }
+    if ((google::GetCommandLineFlagInfo("heartbeat_rpc_port", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.heartbeat_rpc_port = FLAGS_heartbeat_rpc_port;
+    }
+    if ((google::GetCommandLineFlagInfo("heartbeat_rpc_thread_num", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.heartbeat_rpc_thread_num = FLAGS_heartbeat_rpc_thread_num;
+    }
+    if ((google::GetCommandLineFlagInfo("heartbeat_keep_on_main", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.heartbeat_keep_on_main = FLAGS_heartbeat_keep_on_main;
+    }
     if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -846,6 +861,10 @@ int main(int argc, char* argv[]) {
         << ", rpc_conn_timeout_seconds="
         << master_config.rpc_conn_timeout_seconds
         << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
+        << ", heartbeat_rpc_port=" << master_config.heartbeat_rpc_port
+        << ", heartbeat_rpc_thread_num="
+        << master_config.heartbeat_rpc_thread_num
+        << ", heartbeat_keep_on_main=" << master_config.heartbeat_keep_on_main
         << ", rpc protocol=" << protocol
         << ", cluster_id=" << master_config.cluster_id
         << ", root_fs_dir=" << master_config.root_fs_dir
