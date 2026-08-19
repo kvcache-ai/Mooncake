@@ -6051,7 +6051,9 @@ def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
     else:
         group_ids = list(group_ids)
     if not group_ids:
-        return config
+        ungrouped_config = _copy_write_config(config)
+        ungrouped_config.group_ids = None
+        return ungrouped_config
     if len(group_ids) != 1:
         raise ValueError(
             "structured object store config.group_ids must contain exactly one "

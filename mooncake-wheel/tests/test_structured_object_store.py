@@ -592,8 +592,15 @@ def test_structured_object_normalizes_string_group_id() -> None:
     assert config.group_ids == "rollout-group"
 
 
-def test_structured_object_preserves_empty_group_ids_as_ungrouped() -> None:
-    store, transfer = make_transfer()
+def test_structured_object_normalizes_empty_group_ids_as_ungrouped() -> None:
+    class StrictGroupStore(InMemoryStore):
+        def put(self, key: str, value, config=None) -> int:
+            group_ids = getattr(config, "group_ids", None)
+            if group_ids is not None and len(group_ids) != 1:
+                raise ValueError("group_ids must match the number of keys")
+            return super().put(key, value, config=config)
+
+    store, transfer = make_transfer(StrictGroupStore())
     config = GroupConfig([])
 
     ref = transfer.put_structured_object(
@@ -603,8 +610,9 @@ def test_structured_object_preserves_empty_group_ids_as_ungrouped() -> None:
     result = transfer.materialize(transfer.read_spec(ref))
 
     assert result.objects["value"] == b"payload"
-    assert _seen_group_ids(store.put_configs)
-    assert all(group_ids == [] for group_ids in _seen_group_ids(store.put_configs))
+    seen_configs = [seen for seen in store.put_configs if seen is not None]
+    assert seen_configs
+    assert all(seen.group_ids is None for seen in seen_configs)
     assert config.group_ids == []
 
 
