@@ -321,7 +321,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_deduplicates_carryover) {
     ASSERT_EQ(buckets_keys.size(), 1);
     ASSERT_EQ(buckets_keys.front().size(), 10);
     std::unordered_set<std::string> unique_keys(buckets_keys.front().begin(),
-                                                 buckets_keys.front().end());
+                                                buckets_keys.front().end());
     EXPECT_EQ(unique_keys.size(), 10);
     EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
 }

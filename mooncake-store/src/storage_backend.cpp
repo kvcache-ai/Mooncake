@@ -2416,8 +2416,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     auto carryover_objects = std::move(ungrouped_offloading_objects);
     bool carryover_loaded = false;
     auto it = offloading_objects.cbegin();
-    int64_t residue_count = static_cast<int64_t>(
-        offloading_objects.size() + carryover_objects.size());
+    int64_t residue_count = static_cast<int64_t>(offloading_objects.size() +
+                                                 carryover_objects.size());
     int64_t total_count = residue_count;
 
     auto is_exist_func =
