@@ -1,8 +1,8 @@
-#include "segment_pool_view.h"
+#include "segment/segment_pool_view.h"
 
 #include <algorithm>
 
-#include "segment_pool.h"
+#include "segment/segment_pool.h"
 
 namespace mooncake {
 

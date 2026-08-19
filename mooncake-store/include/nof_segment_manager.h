@@ -11,7 +11,7 @@
 
 #include "allocation_strategy.h"
 #include "rpc_types.h"
-#include "segment_pool_types.h"
+#include "segment/segment_pool_types.h"
 
 namespace mooncake {
 

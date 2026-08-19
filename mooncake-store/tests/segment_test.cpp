@@ -1,7 +1,7 @@
 #include "nof_segment_manager.h"
-#include "segment_pool.h"
-#include "segment_pool_access.h"
-#include "segment_pool_view.h"
+#include "segment/segment_pool.h"
+#include "segment/segment_pool_access.h"
+#include "segment/segment_pool_view.h"
 
 #include <gtest/gtest.h>
 
@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "ha/snapshot/segment_pool_snapshot_codec.h"
-#include "region_initial_state.h"
+#include "segment/region_initial_state.h"
 #include "test_buffer_allocator.h"
 
 namespace mooncake {

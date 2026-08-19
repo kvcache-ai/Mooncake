@@ -7,7 +7,7 @@
 
 #include "master_service.h"
 #include "nof_segment_manager.h"
-#include "segment_pool.h"
+#include "segment/segment_pool.h"
 #include "serialize/serializer.h"
 #include "ha/snapshot/segment_pool_snapshot_codec.h"
 #include "task_manager.h"

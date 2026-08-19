@@ -1,7 +1,7 @@
-#include "segment_pool.h"
+#include "segment/segment_pool.h"
 
-#include "segment_pool_access.h"
-#include "segment_pool_view.h"
+#include "segment/segment_pool_access.h"
+#include "segment/segment_pool_view.h"
 
 #include <algorithm>
 #include <limits>
@@ -9,7 +9,7 @@
 
 #include "master_config.h"
 #include "master_metric_manager.h"
-#include "region_initial_state.h"
+#include "segment/region_initial_state.h"
 
 namespace mooncake {
 namespace {

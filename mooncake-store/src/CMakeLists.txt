@@ -19,12 +19,12 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
-    segment_pool.cpp
-    segment_pool_access.cpp
-    segment_pool_view.cpp
+    segment/segment_pool.cpp
+    segment/segment_pool_access.cpp
+    segment/segment_pool_view.cpp
     nof_segment_manager.cpp
-    region_driver.cpp
-    region_initial_state.cpp
+    segment/region_driver.cpp
+    segment/region_initial_state.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp

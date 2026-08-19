@@ -1,10 +1,10 @@
-#include "segment_pool_access.h"
+#include "segment/segment_pool_access.h"
 
 #include <algorithm>
 #include <numeric>
 
 #include "master_metric_manager.h"
-#include "segment_pool.h"
+#include "segment/segment_pool.h"
 
 namespace mooncake {
 namespace {

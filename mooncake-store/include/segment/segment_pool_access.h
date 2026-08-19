@@ -8,8 +8,8 @@
 
 #include <ylt/util/tl/expected.hpp>
 
-#include "region_driver.h"
-#include "segment_pool_types.h"
+#include "segment/region_driver.h"
+#include "segment/segment_pool_types.h"
 
 namespace mooncake {
 

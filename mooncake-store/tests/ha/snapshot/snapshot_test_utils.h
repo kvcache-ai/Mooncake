@@ -20,7 +20,7 @@
 #include "ha/snapshot/segment_pool_snapshot_codec.h"
 #include "master_config.h"
 #include "replica.h"
-#include "segment_pool.h"
+#include "segment/segment_pool.h"
 #include "serialize/serializer.h"
 #include "types.h"
 #include "utils/zstd_util.h"

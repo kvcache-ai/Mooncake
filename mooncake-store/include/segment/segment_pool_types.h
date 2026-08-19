@@ -7,7 +7,7 @@
 #include <unordered_map>
 
 #include "allocator.h"
-#include "region.h"
+#include "segment/region.h"
 #include "types.h"
 
 namespace mooncake {
