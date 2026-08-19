@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from math import prod
 from collections.abc import Mapping, Sequence
 from typing import Optional, Union, cast
@@ -44,6 +45,36 @@ StoredAliasGeometryKey: TypeAlias = tuple[
     tuple[int, ...],
     int,
 ]
+
+
+@dataclass(frozen=True)
+class StoredManifestIdentity:
+    """Stable identity for a committed Store manifest snapshot."""
+
+    namespace: str
+    resource_id: ResourceId
+    revision: RevisionId
+    weight_generation: int
+    group_id: str
+    manifest_key: str
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "namespace",
+            "resource_id",
+            "revision",
+            "group_id",
+            "manifest_key",
+            "content_sha256",
+        ):
+            _require_nonempty_string(getattr(self, name), name)
+        _require_u64(self.weight_generation, "weight_generation")
+        if len(self.content_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.content_sha256
+        ):
+            raise ValueError("content_sha256 must be a SHA-256 hex digest")
 
 
 @dataclass(frozen=True)
@@ -91,6 +122,7 @@ class WeightManifest:
     tensors: tuple[TensorDescriptor, ...]
     fragments: tuple[StoredFragment, ...]
     created_at: str
+    manifest_digest: str = field(init=False)
 
     @property
     def resource_kind(self) -> ResourceKind:
@@ -137,6 +169,25 @@ class WeightManifest:
         _validate_stored_aliases(self.tensors, self.fragments)
         _validate_stored_coverage(self.tensors, self.fragments)
         _validate_stored_object_ranges(self.fragments)
+        object.__setattr__(
+            self,
+            "manifest_digest",
+            hashlib.sha256(self.to_json().encode("utf-8")).hexdigest(),
+        )
+
+    @property
+    def manifest_identity(self) -> StoredManifestIdentity:
+        """Return the Store location plus a canonical content digest."""
+
+        return StoredManifestIdentity(
+            namespace=self.namespace,
+            resource_id=self.resource_id,
+            revision=self.revision,
+            weight_generation=self.weight_generation,
+            group_id=self.group_id,
+            manifest_key=self.manifest_key,
+            content_sha256=self.manifest_digest,
+        )
 
     def to_json(self) -> str:
         tensors: list[dict[str, object]] = []
@@ -319,6 +370,27 @@ class WeightManifest:
             fragments=fragments,
             created_at=_require_nonempty_string(raw["created_at"], "created_at"),
         )
+
+
+def validate_weight_manifest_snapshot(manifest: WeightManifest) -> WeightManifest:
+    """Rebuild a typed manifest before it is trusted at a plan boundary."""
+
+    if not isinstance(manifest, WeightManifest):
+        raise ValueError("weight manifest snapshot is invalid")
+    try:
+        return WeightManifest(
+            namespace=manifest.namespace,
+            resource_id=manifest.resource_id,
+            revision=manifest.revision,
+            weight_generation=manifest.weight_generation,
+            group_id=manifest.group_id,
+            manifest_key=manifest.manifest_key,
+            tensors=manifest.tensors,
+            fragments=manifest.fragments,
+            created_at=manifest.created_at,
+        )
+    except (AttributeError, TypeError) as error:
+        raise ValueError("weight manifest snapshot is invalid") from error
 
 
 def _require_exact_fields(

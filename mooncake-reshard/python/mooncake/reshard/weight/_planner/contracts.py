@@ -31,7 +31,12 @@ from ..manifest import (
     TensorDescriptor,
     WeightPlacementManifest,
 )
-from ..storage_manifest import StoredFragment
+from ..storage_manifest import (
+    StoredFragment,
+    StoredManifestIdentity,
+    WeightManifest,
+    validate_weight_manifest_snapshot,
+)
 from .geometry import (
     _derive_region_geometry,
     _fragment_itemsize,
@@ -429,9 +434,11 @@ class LogicalTransferPlan:
     source_tensors: tuple[TensorDescriptor, ...]
     target_tensors: tuple[TensorDescriptor, ...]
     operations: tuple[LogicalTransferOperation, ...]
+    source_manifest: Optional[WeightManifest] = None
     planning_limits: PlanningLimits = field(default_factory=PlanningLimits)
     source_executors: tuple[PlacementExecutorPlan, ...] = ()
     target_executors: tuple[PlacementExecutorPlan, ...] = ()
+    source_manifest_identity: Optional[StoredManifestIdentity] = field(init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_tensors", tuple(self.source_tensors))
@@ -452,6 +459,24 @@ class LogicalTransferPlan:
             self.source_placement, WeightPlacementManifest
         ):
             raise ValueError("logical transfer plan source placement is invalid")
+        if self.source_manifest is not None and not isinstance(
+            self.source_manifest, WeightManifest
+        ):
+            raise ValueError("logical transfer plan source manifest is invalid")
+        if (self.source_placement is None) == (self.source_manifest is None):
+            raise ValueError(
+                "logical transfer plan requires exactly one source provenance"
+            )
+        if self.source_manifest is not None:
+            source_manifest = validate_weight_manifest_snapshot(self.source_manifest)
+            object.__setattr__(self, "source_manifest", source_manifest)
+            object.__setattr__(
+                self,
+                "source_manifest_identity",
+                source_manifest.manifest_identity,
+            )
+        else:
+            object.__setattr__(self, "source_manifest_identity", None)
         for side, placement in (
             ("source", self.source_placement),
             ("target", self.target_placement),
@@ -470,6 +495,13 @@ class LogicalTransferPlan:
             raise ValueError(
                 "logical transfer plan source and target weight_generation differs"
             )
+        if self.source_manifest is not None and (
+            self.source_manifest.resource_id != self.resource_id
+            or self.source_manifest.revision != self.revision
+            or self.source_manifest.weight_generation
+            != self.target_placement.weight_generation
+        ):
+            raise ValueError("logical transfer plan source manifest identity differs")
         for operation in self.operations:
             _validate_logical_operation(operation, self.source_placement is not None)
             if operation.segment_count > self.planning_limits.max_segments_per_region:
@@ -488,6 +520,7 @@ class LogicalTransferPlan:
             raise ValueError(
                 "logical transfer plan has invalid canonical executor metadata"
             )
+        self.validate_source_manifest_snapshot()
         object.__setattr__(
             self,
             "_operation_views",
@@ -502,6 +535,7 @@ class LogicalTransferPlan:
         from .validation import _validate_logical_target_coverage
 
         _validate_logical_target_coverage(self)
+        self.validate_source_placement_snapshot()
 
     @property
     def total_bytes(self) -> int:
@@ -518,6 +552,41 @@ class LogicalTransferPlan:
     @property
     def target_placement_id(self) -> PlacementId:
         return self.target_placement.placement_id
+
+    def validate_source_manifest_snapshot(self) -> None:
+        """Fail closed if a stored source no longer matches its plan snapshot."""
+
+        if self.source_manifest is None:
+            if self.source_manifest_identity is not None:
+                raise ValueError("logical plan has unexpected source manifest identity")
+            return
+        source_manifest = validate_weight_manifest_snapshot(self.source_manifest)
+        if self.source_manifest_identity != source_manifest.manifest_identity:
+            raise ValueError("logical plan source manifest identity differs")
+        if self.source_tensors != _canonical_tensor_catalog(source_manifest.tensors):
+            raise ValueError("logical plan source tensor catalog differs")
+        source_by_id = {
+            fragment.fragment_id: fragment for fragment in source_manifest.fragments
+        }
+        for operation in self.operations:
+            source = operation.source
+            if (
+                not isinstance(source, StoredFragment)
+                or source_by_id.get(source.fragment_id) != source
+            ):
+                raise ValueError(
+                    "logical plan and source manifest fragment snapshots differ"
+                )
+
+    def validate_source_placement_snapshot(self) -> None:
+        """Fail closed if a placement source no longer matches its plan snapshot."""
+
+        if self.source_placement is None:
+            return
+
+        from .validation import _validate_logical_source_placement
+
+        _validate_logical_source_placement(self)
 
     @property
     def pipeline_routes(self) -> tuple[PipelineRouteGroup, ...]:
@@ -546,6 +615,14 @@ class LogicalTransferPlan:
         for name, value in state.items():
             object.__setattr__(self, name, value)
         self.__post_init__()
+
+
+def _canonical_tensor_catalog(
+    tensors: Sequence[TensorDescriptor],
+) -> tuple[TensorDescriptor, ...]:
+    """Compare tensor catalogs by canonical identity, not exporter order."""
+
+    return tuple(sorted(tensors, key=lambda item: item.tensor_id))
 
 
 def _executor_projection_key(executor: PlacementExecutorPlan) -> ExecutorProjectionKey:
