@@ -1138,6 +1138,19 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
         }
     }
 
+    // RPC locations are cached independently from segment descriptors under
+    // the same logical segment name. Invalidate only successfully refreshed
+    // names before publishing their new descriptors so a subsequent lookup
+    // reloads the authoritative RPC host instead of pairing new segment
+    // metadata with a stale cached location.
+    {
+        RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+        for (const auto &[name, desc] : updates) {
+            (void)desc;
+            rpc_meta_map_.erase(name);
+        }
+    }
+
     {
         // Apply updates with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
