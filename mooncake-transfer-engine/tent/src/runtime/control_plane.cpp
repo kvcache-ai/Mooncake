@@ -321,8 +321,8 @@ void ControlService::finishNotifyCallback() {
     notify_cb_cv_.notify_all();
 }
 
-Status ControlService::start(uint16_t& port, bool ipv6_) {
-    return rpc_server_->start(port, ipv6_);
+Status ControlService::start(uint16_t& port, bool ipv6_, size_t threads) {
+    return rpc_server_->start(port, ipv6_, threads);
 }
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
