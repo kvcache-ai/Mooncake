@@ -253,9 +253,10 @@ class WrappedMasterService {
 
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.
-    void RestoreFromStandby(const std::vector<StandbyObjectEntry>& objects,
-                            uint64_t initial_oplog_sequence_id,
-                            const std::vector<StandbySegmentInfo>& segments);
+    tl::expected<void, ErrorCode> RestoreFromStandby(
+        const std::vector<StandbyObjectEntry>& objects,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
@@ -279,13 +280,28 @@ class WrappedMasterService {
         const std::string& tenant_id, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
+    tl::expected<CopyStartResponse, ErrorCode> DynamicReplicaCopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
+
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key,
                                           const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key,
                                              const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,

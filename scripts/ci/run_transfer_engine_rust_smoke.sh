@@ -17,7 +17,11 @@ esac
 
 cd "$GITHUB_WORKSPACE/mooncake-transfer-engine/rust"
 
-export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-common/etcd:${LD_LIBRARY_PATH:-}"
+# Allow CI jobs that build the project into a non-default directory (e.g.
+# tent-ci's build-tent) to point at the right libraries.
+: "${MOONCAKE_BUILD_DIR:=$GITHUB_WORKSPACE/build}"
+export MOONCAKE_BUILD_DIR
+export LD_LIBRARY_PATH="$MOONCAKE_BUILD_DIR/mooncake-asio:$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/src:$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/src/common/base:$MOONCAKE_BUILD_DIR/mooncake-common:$MOONCAKE_BUILD_DIR/mooncake-common/etcd:${LD_LIBRARY_PATH:-}"
 if [ -d /usr/local/cuda/lib64/stubs ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}"
 fi
@@ -25,8 +29,7 @@ if [ -d /usr/local/cuda/lib64 ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 fi
 
-export MOONCAKE_BUILD_DIR="$GITHUB_WORKSPACE/build"
-export MOONCAKE_TE_LIB_DIR="$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src"
+export MOONCAKE_TE_LIB_DIR="$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/src"
 export MOONCAKE_TE_INCLUDE_DIR="$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
 export MC_METADATA_SERVER="${MC_METADATA_SERVER:-http://127.0.0.1:8080/metadata}"
 export MC_RUST_TE_RUN_INTEGRATION=1

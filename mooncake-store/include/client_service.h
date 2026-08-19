@@ -1000,6 +1000,11 @@ class Client {
                                        const std::string& tenant_id,
                                        const std::string& source,
                                        const std::vector<std::string>& targets);
+    tl::expected<void, ErrorCode> Copy(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& source, const std::vector<std::string>& targets,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Move an object's replica from source segment to target segment

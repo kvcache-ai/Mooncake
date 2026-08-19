@@ -144,14 +144,17 @@ if (WITH_EP)
       set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
     endif()
     if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+      if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+        set(TORCH_CUDA_ARCH_LIST "8.0;9.0;10.3")
+      else()
+        set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+      endif()
     endif()
     set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
         "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
 
-    # Staging directory: EP/PG .so files are placed here during make and later
-    # injected into the wheel AFTER auditwheel, so patchelf never touches the
-    # CUDA fatbins (which would cause cudaErrorInvalidKernelImage at runtime).
+    # Device EP/PG .so files are placed here during make and later injected
+    # into the wheel AFTER auditwheel, so patchelf never touches CUDA fatbins.
     set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
 
     # Convert semicolon-separated lists to pipe-separated strings so they survive
@@ -159,19 +162,17 @@ if (WITH_EP)
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
 
-    # Stage the native EP extension (_ep) into EP_PG_STAGING_DIR so build_wheel.sh
-    # injects it into the wheel the same way PG extensions are staged below.
-    # Without this, _ep.so stays under build/mooncake-ep/src/ and never reaches the
-    # wheel, so the installed package is missing mooncake._ep (post-#2883 native EP).
-    add_custom_target(mooncake_ep_stage ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "$<TARGET_FILE:_ep>"
-              "${EP_PG_STAGING_DIR}/"
-      COMMENT "Staging Mooncake EP native extension (_ep)"
-      DEPENDS _ep
-      VERBATIM
-    )
+    if(USE_CUDA)
+      add_custom_target(mooncake_ep_device_stage ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:mooncake_ep_device>"
+                "${EP_PG_STAGING_DIR}/"
+        COMMENT "Staging Mooncake EP CUDA device library"
+        DEPENDS mooncake_ep_device
+        VERBATIM
+      )
+    endif()
 
     add_custom_target(mooncake_pg_ext ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
