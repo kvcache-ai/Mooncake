@@ -474,7 +474,10 @@ Safe to call more than once.
 ```
 
 `grace_period_seconds` is optional and defaults to `0`, which returns as soon as
-the master has dropped the segment.
+the master has dropped the segment. Must be a non-negative integer no greater
+than 3600 (1 hour); a malformed body or an out-of-range value gets a `400`
+without touching the store, so a mistake here (seconds where milliseconds were
+meant, say) cannot block a preStop hook for hours.
 
 **Success Response**:
 ```json
