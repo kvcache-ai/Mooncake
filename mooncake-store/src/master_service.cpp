@@ -8435,6 +8435,13 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     // Dedup: don't queue twice if a promotion is already in flight or if a
     // MEMORY replica has appeared since GetReplicaList observed only-disk.
     if (tenant_state.promotion_tasks.count(key) > 0) {
+        // A read hit an already in-flight promotion: re-mark the queued
+        // entry's recency so the next heartbeat delivers it ahead of stale
+        // admissions. No-op if the heartbeat already took the entry (the
+        // promotion is executing) or the holder's mailbox is gone.
+        local_ssd_manager_.TouchPromotion(
+            tenant_state.promotion_tasks.at(key).holder_id, object_id.tenant_id,
+            key);
         EraseCandidate(tenant_state, key);
         return PromotionQueueResult::kAlreadyInFlight;
     }
@@ -8824,6 +8831,27 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     MasterMetricManager::instance().dec_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_failed();
+
+    // A transient execution failure (DRAM pressure at AllocStart, a TE write
+    // flake, SSD throttling) must not silently kill the promotion: re-record
+    // a retry candidate so the eviction-thread retry loop re-queues it with
+    // backoff. Bounded by kPromotionCandidateMaxRetries /
+    // kPromotionCandidateTtl, and the retry path erases the candidate on
+    // permanent conditions (not-found, memory-present, no-local-disk-source),
+    // so this cannot spin. Record the current estimate via count()
+    // (read-only), NOT increment(): an executor-side failure is not demand
+    // signal, and bumping the sketch here would pollute the frequency signal
+    // the admission gate relies on.
+    if (!metadata.HasReplica(&Replica::fn_is_memory_replica) &&
+        metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        const auto admission_key =
+            object_id.tenant_id.MakeScopedKey(object_id.user_key);
+        const uint8_t freq =
+            promotion_sketch_ ? promotion_sketch_->count(admission_key) : 0;
+        RecordOrUpdateCandidate(tenant_state, object_id.user_key, freq,
+                                PromotionCandidateReason::kExecutionFailed,
+                                ErrorCode::OK);
+    }
 
     // Clear the holder's per-client promotion mailbox entry. Same
     // best-effort cleanup pattern as NotifyPromotionSuccess — the

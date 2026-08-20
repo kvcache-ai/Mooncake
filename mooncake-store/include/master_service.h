@@ -1530,6 +1530,7 @@ class MasterService {
         kWatermark,
         kQueueCap,
         kPushFailed,
+        kExecutionFailed,
     };
 
     struct PromotionCandidate {
@@ -2424,14 +2425,21 @@ class MasterService {
     std::atomic<uint64_t> promotion_candidate_count_{0};
     std::atomic<size_t> promotion_retry_cursor_{0};
     static constexpr size_t kPromotionCandidateLimit = 50000;
-    static constexpr uint32_t kPromotionCandidateMaxRetries = 8;
+    // Retry budget is sized to the condition it waits on: the watermark /
+    // queue-cap / push-failure gates clear on the client's offload heartbeat
+    // (10s-scale), not in milliseconds. The old budget (8 retries ≈ 2.3s)
+    // expired candidates long before their condition could clear, silently
+    // killing promotions whose only trigger was a one-off read. 64 retries
+    // with a 5s backoff cap spans ~5 minutes (≈ 30 heartbeat ticks); the TTL
+    // bounds how long an unread key can keep a slot.
+    static constexpr uint32_t kPromotionCandidateMaxRetries = 64;
     static constexpr size_t kPromotionRetryBatchSize = 128;
     static constexpr size_t kPromotionRetryShardBatch = 64;
-    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{60000};
+    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{300000};
     static constexpr std::chrono::milliseconds
         kPromotionCandidateInitialBackoff{10};
     static constexpr std::chrono::milliseconds kPromotionCandidateMaxBackoff{
-        1000};
+        5000};
 
     // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
     // true. CountMinSketch is mutex-protected internally so we can call into it
