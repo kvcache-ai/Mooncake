@@ -56,9 +56,8 @@ class FlagCxTransport : public Transport {
     FlagCxTransport();
     ~FlagCxTransport() override;
 
-    Status submitTransfer(
-        BatchID batch_id,
-        const std::vector<TransferRequest> &entries) override;
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest> &entries) override;
 
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
@@ -72,16 +71,14 @@ class FlagCxTransport : public Transport {
                 std::shared_ptr<Topology> topo) override;
 
     int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location,
-                            bool remote_accessible,
+                            const std::string &location, bool remote_accessible,
                             bool update_metadata) override;
 
     int unregisterLocalMemory(void *addr,
                               bool update_metadata = false) override;
 
-    int registerLocalMemoryBatch(
-        const std::vector<BufferEntry> &buffer_list,
-        const std::string &location) override;
+    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
+                                 const std::string &location) override;
 
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;

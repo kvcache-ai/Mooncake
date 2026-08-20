@@ -452,7 +452,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         }
         segmentJSON["buffers"] = buffersJSON;
         segmentJSON["priority_matrix"] = desc.topology.toJson();
-    } else if (segmentJSON["protocol"] == "tcp" || segmentJSON["protocol"] == "flagcx") {
+    } else if (segmentJSON["protocol"] == "tcp" ||
+               segmentJSON["protocol"] == "flagcx") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;

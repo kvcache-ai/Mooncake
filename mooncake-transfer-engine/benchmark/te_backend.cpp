@@ -229,7 +229,7 @@ TEBenchRunner::TEBenchRunner() {
         << "Failed to install SunriseLink transport";
 #endif
     if (XferBenchConfig::xport_type == "flagcx") {
-        auto *xp = engine_->installTransport("flagcx", nullptr);
+        auto* xp = engine_->installTransport("flagcx", nullptr);
         LOG_ASSERT(xp) << "installTransport(flagcx) failed";
         LOG(INFO) << "tebench: FlagCX transport installed";
     }

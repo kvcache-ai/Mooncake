@@ -210,9 +210,8 @@ void FlagCxTransport::submitSlices(const std::vector<Slice *> &slices) {
     std::lock_guard<std::mutex> lk(submit_mu_);
     std::unordered_map<uint64_t, std::vector<Slice *>> groups;
     for (Slice *s : slices) {
-        const uint64_t key =
-            (static_cast<uint64_t>(s->target_id) << 1) |
-            (s->opcode == TransferRequest::WRITE ? 0u : 1u);
+        const uint64_t key = (static_cast<uint64_t>(s->target_id) << 1) |
+                             (s->opcode == TransferRequest::WRITE ? 0u : 1u);
         groups[key].push_back(s);
     }
     for (auto &kv : groups) runSliceGroup(kv.second);
