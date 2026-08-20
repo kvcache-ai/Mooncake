@@ -154,8 +154,8 @@ class SegmentTest : public ::testing::Test {
         const std::shared_ptr<BufferAllocatorBase>& allocator,
         const std::vector<Segment>& segments) {
         if (segment_manager.cxl_global_allocator_ != allocator) {
-            segment_manager.cxl_global_allocator_ = allocator;
             allocator->AttachUsageTracker(segment_manager.usage_tracker_);
+            segment_manager.cxl_global_allocator_ = allocator;
         }
         for (const auto& segment : segments) {
             segment_manager.mounted_segments_[segment.id] = {

@@ -339,16 +339,32 @@ void MasterAdminServer::SetObservedLeader(
 
 void MasterAdminServer::SetServiceDelegate(
     std::shared_ptr<WrappedMasterService> service) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    service_ = std::move(service);
-    if (!service_) {
-        service_available_ = false;
+    std::lock_guard<std::mutex> refresh_lock(storage_metrics_refresh_mutex_);
+    bool clear_storage_metrics = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        service_ = std::move(service);
+        if (!service_) {
+            service_available_ = false;
+        }
+        clear_storage_metrics = !service_available_;
+    }
+    if (clear_storage_metrics) {
+        MasterMetricManager::instance().project_storage_usage({});
     }
 }
 
 void MasterAdminServer::SetServiceAvailable(bool available) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    service_available_ = available && service_ != nullptr;
+    std::lock_guard<std::mutex> refresh_lock(storage_metrics_refresh_mutex_);
+    bool service_available = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        service_available_ = available && service_ != nullptr;
+        service_available = service_available_;
+    }
+    if (!service_available) {
+        MasterMetricManager::instance().project_storage_usage({});
+    }
 }
 
 MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
@@ -528,8 +544,9 @@ std::shared_ptr<WrappedMasterService> MasterAdminServer::GetActiveService()
 }
 
 void MasterAdminServer::RefreshStorageMetrics() const {
+    std::lock_guard<std::mutex> refresh_lock(storage_metrics_refresh_mutex_);
     const auto runtime = SnapshotState();
-    const auto storage = runtime.service
+    const auto storage = runtime.service_available && runtime.service
                              ? runtime.service->GetStorageUsageSnapshot()
                              : TieredStorageUsageSnapshot{};
     MasterMetricManager::instance().project_storage_usage(storage);

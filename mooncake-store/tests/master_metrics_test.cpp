@@ -608,6 +608,27 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               segment.size);
 
+    // Losing service availability must clear the old leader projection even
+    // while the delegate remains installed. A concurrent refresh is
+    // serialized with this transition and cannot restore stale values.
+    admin_server.SetServiceAvailable(false);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+
+    metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_NE(metrics_resp.body.find("master_allocated_bytes 0"),
+              std::string::npos);
+    EXPECT_NE(metrics_resp.body.find("master_total_capacity_bytes 0"),
+              std::string::npos);
+    admin_server.SetServiceAvailable(true);
+    metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), kAllocationSize);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), segment.size);
+
     auto segments_resp = FetchUrl(http_port, "/get_all_segments");
     EXPECT_EQ(segments_resp.http_status, 200);
     EXPECT_NE(segments_resp.body.find(segment.name), std::string::npos);

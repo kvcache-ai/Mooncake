@@ -1666,9 +1666,13 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
               << std::fixed << std::setprecision(2)
               << cxl_size / (1024.0 * 1024 * 1024) << " GB)";
 
-    cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
+    auto allocator = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
-    cxl_global_allocator_->AttachUsageTracker(usage_tracker_);
+    allocator->AttachUsageTracker(usage_tracker_);
+    {
+        std::unique_lock<std::shared_mutex> lock(segment_mutex_);
+        cxl_global_allocator_ = std::move(allocator);
+    }
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
 }
 
