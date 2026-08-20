@@ -13,6 +13,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,6 +64,10 @@ class PromotionOnHitTest : public ::testing::Test {
         return MasterService::kPromotionCandidateMaxRetries;
     }
 
+    static constexpr uint32_t MaxPromotionExecutionFailuresForTesting() {
+        return MasterService::kMaxPromotionExecutionFailures;
+    }
+
     static void ResetCandidateBackoffsForTesting(MasterService* service) {
         service->ResetCandidateBackoffsForTesting();
     }
@@ -99,6 +104,24 @@ class PromotionOnHitTest : public ::testing::Test {
         const auto* tenant_state = accessor.GetTenantState();
         return tenant_state != nullptr &&
                tenant_state->promotion_tasks.contains(key);
+    }
+
+    // std::nullopt when the key has no in-flight promotion task.
+    static std::optional<uint32_t> GetPromotionTaskExecutionFailuresForTesting(
+        MasterService* service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                   .user_key = key});
+        const auto* tenant_state = accessor.GetTenantState();
+        if (tenant_state == nullptr) {
+            return std::nullopt;
+        }
+        auto it = tenant_state->promotion_tasks.find(key);
+        if (it == tenant_state->promotion_tasks.end()) {
+            return std::nullopt;
+        }
+        return it->second.execution_failures;
     }
 
     static bool PromotionAdmissionBlockedByPrimaryWriteForTesting(
@@ -1816,6 +1839,101 @@ TEST_F(PromotionOnHitTest, NotifyFailureRecordsCandidateAndRetries) {
     ASSERT_TRUE(heartbeat.has_value());
     ASSERT_EQ(heartbeat->size(), 1u);
     EXPECT_EQ(heartbeat->front().key, "k_a");
+
+    service->RemoveAll();
+}
+
+// A persistently-failing key (e.g. a broken SSD file that still has a
+// LOCAL_DISK replica) must not re-record -> re-admit -> fail -> re-record
+// forever: each NotifyPromotionFailure re-records with execution_failures+1
+// (propagated candidate -> task at admission), and once the chain reaches
+// kMaxPromotionExecutionFailures the failure stops re-recording. The
+// give-up kills only the self-sustaining cycle — a genuine read afterwards
+// re-admits with a fresh count.
+TEST_F(PromotionOnHitTest, NotifyFailureGivesUpAfterMaxExecutionFailures) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 5000;
+    config.put_start_release_timeout_sec = 300;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_a", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t recorded_pre = mm.get_promotion_candidate_recorded();
+    const int64_t gave_up_pre = mm.get_promotion_execution_gave_up();
+
+    // First admission is driven by a real read (fresh chain, count 0).
+    {
+        auto r = service->GetReplicaList("k_a", TenantId::Default());
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // Fail kMaxPromotionExecutionFailures times. Each failure must re-record
+    // with an incremented count, and each re-admission must show the count
+    // propagated across the candidate's consumption. The background eviction
+    // thread may win the re-admission race against the explicit retry call —
+    // assertions only target the resulting terminal state, which is
+    // identical under both interleavings.
+    for (uint32_t i = 1; i <= MaxPromotionExecutionFailuresForTesting(); ++i) {
+        ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 1u)
+            << "chain must be in-flight at iteration " << i;
+        EXPECT_EQ(GetPromotionTaskExecutionFailuresForTesting(
+                      service.get(), TenantId::Default(), "k_a"),
+                  std::optional<uint32_t>(i - 1))
+            << "execution_failures must propagate candidate -> task";
+        auto alloc = service->PromotionAllocStart(
+            seg.client_id, "k_a", TenantId::Default(), 1024, {});
+        ASSERT_TRUE(alloc.has_value());
+        auto failure = service->NotifyPromotionFailure(seg.client_id, "k_a",
+                                                       TenantId::Default());
+        ASSERT_TRUE(failure.has_value());
+        EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre,
+                  static_cast<int64_t>(i))
+            << "failure " << i << " must re-record (still below the bound)";
+        ResetCandidateBackoffsForTesting(service.get());
+        RunPromotionCandidateRetryForTesting(service.get());
+    }
+
+    // The next failure hits the bound: no re-record, no re-admission.
+    ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(
+        GetPromotionTaskExecutionFailuresForTesting(service.get(),
+                                                    TenantId::Default(), "k_a"),
+        std::optional<uint32_t>(MaxPromotionExecutionFailuresForTesting()));
+    auto alloc = service->PromotionAllocStart(seg.client_id, "k_a",
+                                              TenantId::Default(), 1024, {});
+    ASSERT_TRUE(alloc.has_value());
+    auto failure = service->NotifyPromotionFailure(seg.client_id, "k_a",
+                                                   TenantId::Default());
+    ASSERT_TRUE(failure.has_value());
+    EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre,
+              static_cast<int64_t>(MaxPromotionExecutionFailuresForTesting()))
+        << "the bound-crossing failure must NOT re-record";
+    EXPECT_EQ(mm.get_promotion_execution_gave_up() - gave_up_pre, 1)
+        << "give-up must bump promotion_execution_gave_up";
+    EXPECT_EQ(
+        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
+        0u);
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u)
+        << "the self-sustaining cycle must be dead";
+
+    // Give-up kills only the self-sustaining cycle: a genuine read re-admits
+    // with a fresh chain (count 0).
+    {
+        auto r = service->GetReplicaList("k_a", TenantId::Default());
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(GetPromotionTaskExecutionFailuresForTesting(
+                  service.get(), TenantId::Default(), "k_a"),
+              std::optional<uint32_t>(0u));
 
     service->RemoveAll();
 }

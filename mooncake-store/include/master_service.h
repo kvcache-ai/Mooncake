@@ -1542,6 +1542,12 @@ class MasterService {
             PromotionCandidateReason::kQueueCap};
         ErrorCode last_error{ErrorCode::OK};
         uint32_t retry_count{0};
+        // Execution failures in this admission chain (AllocStart / TE-write /
+        // SSD failures reported via NotifyPromotionFailure). Propagated into
+        // PromotionTask at admission so the bound survives the candidate's
+        // consumption; reset only when a genuinely new chain starts (fresh
+        // insert with 0, e.g. after a give-up or a success).
+        uint32_t execution_failures{0};
     };
 
     // NotifyPromotionSuccess should commit, so a concurrent Put on the
@@ -1568,6 +1574,13 @@ class MasterService {
         uint64_t pending_quota_charge_bytes{0};
         std::chrono::system_clock::time_point start_time;
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
+        // Execution failures so far in this admission chain. Read by
+        // NotifyPromotionFailure before the task is erased and re-recorded as
+        // execution_failures+1 until kMaxPromotionExecutionFailures. Note the
+        // asymmetry with PromotionCandidate::execution_failures: admission
+        // copies candidate -> task verbatim, failure re-record writes
+        // task+1 -> candidate.
+        uint32_t execution_failures{0};
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -1977,7 +1990,8 @@ class MasterService {
     void RecordOrUpdateCandidate(TenantState& tenant_state,
                                  const std::string& key, uint8_t sketch_score,
                                  PromotionCandidateReason reason,
-                                 ErrorCode last_error);
+                                 ErrorCode last_error,
+                                 uint32_t execution_failures = 0);
     void EraseCandidate(TenantState& tenant_state, const std::string& key);
     void EraseCandidate(const ObjectIdentity& object_id);
     void DecrementCandidateCount();
@@ -2440,6 +2454,14 @@ class MasterService {
         kPromotionCandidateInitialBackoff{10};
     static constexpr std::chrono::milliseconds kPromotionCandidateMaxBackoff{
         5000};
+    // Bound on self-sustaining execution-failure cycles: a key whose
+    // promotion keeps failing at execution time (AllocStart under DRAM
+    // pressure, TE-write flake, SSD error) is re-recorded at most this many
+    // times. Bounds a persistently-failing ("poison") key to this many
+    // delivery slots (~this many heartbeat ticks, ~30s at the 10s default)
+    // before it stops re-queueing itself; genuine reads can still re-admit
+    // it afterwards with a fresh count.
+    static constexpr uint32_t kMaxPromotionExecutionFailures = 3;
 
     // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
     // true. CountMinSketch is mutex-protected internally so we can call into it

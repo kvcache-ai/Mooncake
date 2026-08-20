@@ -7506,12 +7506,16 @@ void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
                                             const std::string& key,
                                             uint8_t sketch_score,
                                             PromotionCandidateReason reason,
-                                            ErrorCode last_error) {
+                                            ErrorCode last_error,
+                                            uint32_t execution_failures) {
     const auto now = std::chrono::steady_clock::now();
     auto it = tenant_state.promotion_candidates.find(key);
     if (it != tenant_state.promotion_candidates.end()) {
         // Update existing entry: refresh last_seen, reset
-        // retry_after/retry_count.
+        // retry_after/retry_count. execution_failures is intentionally NOT
+        // updated here: a read refresh is new demand signal and may extend
+        // the budget, but it must not erase the failure history of this
+        // admission chain.
         it->second.last_seen = now;
         it->second.last_reason = reason;
         it->second.last_error = last_error;
@@ -7545,7 +7549,8 @@ void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
                                 .retry_after = now,
                                 .last_reason = reason,
                                 .last_error = last_error,
-                                .retry_count = 0});
+                                .retry_count = 0,
+                                .execution_failures = execution_failures});
     if (inserted) {
         MasterMetricManager::instance().inc_promotion_candidate_recorded();
         VLOG(1) << "promotion_candidate_recorded key=" << key;
@@ -8514,13 +8519,22 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
 
     // Record the in-flight task. alloc_id is filled in by
     // PromotionAllocStart once the new MEMORY replica is staged.
+    // Propagate the execution-failure count across the candidate's
+    // consumption so NotifyPromotionFailure can bound self-sustaining
+    // execution-failure cycles; an absent candidate means a fresh chain (0).
+    uint32_t execution_failures = 0;
+    if (auto cit = tenant_state.promotion_candidates.find(key);
+        cit != tenant_state.promotion_candidates.end()) {
+        execution_failures = cit->second.execution_failures;
+    }
     EraseCandidate(tenant_state, key);
     tenant_state.promotion_tasks.emplace(
         key, PromotionTask{.source_id = source->id(),
                            .alloc_id = 0,
                            .object_size = object_size,
                            .start_time = std::chrono::system_clock::now(),
-                           .holder_id = holder_id});
+                           .holder_id = holder_id,
+                           .execution_failures = execution_failures});
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_admitted();
@@ -8827,6 +8841,9 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     ReleaseTenantQuota(
         GetBoundTenantQuotaHandle(tenant_state),
         std::exchange(task_it->second.pending_quota_charge_bytes, 0));
+    // Capture the chain's execution-failure count BEFORE erasing the task
+    // (the iterator is invalidated by the erase).
+    const uint32_t prior_failures = task_it->second.execution_failures;
     tenant_state.promotion_tasks.erase(task_it);
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     MasterMetricManager::instance().dec_promotion_in_flight();
@@ -8842,15 +8859,29 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // (read-only), NOT increment(): an executor-side failure is not demand
     // signal, and bumping the sketch here would pollute the frequency signal
     // the admission gate relies on.
+    //
+    // The self-sustaining cycle is additionally bounded by
+    // kMaxPromotionExecutionFailures: without it, a persistently-failing key
+    // (e.g. a broken SSD file that still has a LOCAL_DISK replica) would
+    // re-record -> re-admit -> fail -> re-record forever, monopolizing
+    // delivery slots with no read demand. Once the bound is hit we stop
+    // re-recording — a genuine read can still re-admit the key (fresh chain).
     if (!metadata.HasReplica(&Replica::fn_is_memory_replica) &&
         metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
-        const auto admission_key =
-            object_id.tenant_id.MakeScopedKey(object_id.user_key);
-        const uint8_t freq =
-            promotion_sketch_ ? promotion_sketch_->count(admission_key) : 0;
-        RecordOrUpdateCandidate(tenant_state, object_id.user_key, freq,
-                                PromotionCandidateReason::kExecutionFailed,
-                                ErrorCode::OK);
+        if (prior_failures >= kMaxPromotionExecutionFailures) {
+            LOG(WARNING) << "promotion_execution_gave_up key="
+                         << object_id.user_key
+                         << " failures=" << prior_failures;
+            MasterMetricManager::instance().inc_promotion_execution_gave_up();
+        } else {
+            const auto admission_key =
+                object_id.tenant_id.MakeScopedKey(object_id.user_key);
+            const uint8_t freq =
+                promotion_sketch_ ? promotion_sketch_->count(admission_key) : 0;
+            RecordOrUpdateCandidate(tenant_state, object_id.user_key, freq,
+                                    PromotionCandidateReason::kExecutionFailed,
+                                    ErrorCode::OK, prior_failures + 1);
+        }
     }
 
     // Clear the holder's per-client promotion mailbox entry. Same
