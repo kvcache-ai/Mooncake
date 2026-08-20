@@ -4,6 +4,8 @@
 
 #include <memory>
 #include <thread>
+#include <utility>
+
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
 
@@ -151,7 +153,11 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     }
 
     if (cuda_device_index_ >= 0) {
-        enqueue_stream_ = GpuStream::createNonBlocking(cuda_device_index_);
+        auto stream_result = GpuStream::createNonBlocking(cuda_device_index_);
+        PG_ASSERT(stream_result.has_value(),
+                  "create CUDA worker enqueue stream failed: ",
+                  stream_result.error().message);
+        enqueue_stream_.emplace(std::move(stream_result).value());
     }
 
     for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -252,14 +258,21 @@ void MooncakeWorker::putTaskCuda(
                              cudaStream_t)>& copyFromRecvBuffer) {
     size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
 
-    const GpuDeviceGuard guard(cuda_device_index_);
+    auto guard_result = GpuDeviceGuard::create(cuda_device_index_);
+    PG_ASSERT(guard_result.has_value(), "select CUDA worker device failed: ",
+              guard_result.error().message);
+    auto device_guard = std::move(guard_result).value();
     const auto issue_stream =
         GpuStream::borrow(issueStream, cuda_device_index_);
     const auto& enq_stream = enqueue_stream_.value();
 
-    GpuEvent event_start(issue_stream.deviceIndex());
-    event_start.record(issue_stream);
-    enq_stream.waitEvent(event_start);
+    auto event_start_result = GpuEvent::create(issue_stream.deviceIndex());
+    PG_ASSERT(event_start_result.has_value(),
+              "create CUDA worker entry event failed: ",
+              event_start_result.error().message);
+    auto event_start = std::move(event_start_result).value();
+    PG_ASSERT_OK(event_start.record(issue_stream));
+    PG_ASSERT_OK(enq_stream.waitEvent(event_start));
 
     std::vector<CudaTaskSubmissionToken> submitted_tasks;
     submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
@@ -292,13 +305,21 @@ void MooncakeWorker::putTaskCuda(
 
     // During CUDA graph capture the kernels are recorded but not executed, so
     // waiting for the worker thread to observe them would hang.
-    if (!issue_stream.isCapturing()) {
+    const auto capture_status = issue_stream.captureStatus();
+    PG_ASSERT(capture_status.has_value(),
+              "query CUDA Graph capture status failed: ",
+              capture_status.error().message);
+    if (capture_status.value() == cudaStreamCaptureStatusNone) {
         waitUntilTasksSubmitted(submitted_tasks);
     }
 
-    GpuEvent event_end(enq_stream.deviceIndex());
-    event_end.record(enq_stream);
-    issue_stream.waitEvent(event_end);
+    auto event_end_result = GpuEvent::create(enq_stream.deviceIndex());
+    PG_ASSERT(event_end_result.has_value(),
+              "create CUDA worker return event failed: ",
+              event_end_result.error().message);
+    auto event_end = std::move(event_end_result).value();
+    PG_ASSERT_OK(event_end.record(enq_stream));
+    PG_ASSERT_OK(issue_stream.waitEvent(event_end));
 }
 
 }  // namespace mooncake
