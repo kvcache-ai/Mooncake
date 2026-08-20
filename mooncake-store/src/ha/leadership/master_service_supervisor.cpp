@@ -394,9 +394,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         if (promotion_ctx->applied_seq_id > 0 ||
             !promotion_ctx->objects.empty() ||
             !promotion_ctx->segments.empty()) {
-            wrapped_master_service->RestoreFromStandby(
+            auto restore_result = wrapped_master_service->RestoreFromStandby(
                 promotion_ctx->objects, promotion_ctx->applied_seq_id,
                 promotion_ctx->segments);
+            if (!restore_result) {
+                LOG(ERROR) << "Standby restore failed: "
+                           << toString(restore_result.error());
+            }
         }
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
@@ -516,7 +520,7 @@ int MasterServiceSupervisor::Start() {
 
     mooncake::MasterAdminServer admin_server(
         static_cast<uint16_t>(config_.metrics_port),
-        config_.enable_metric_reporting);
+        config_.enable_metric_reporting, config_.metrics_host);
     if (!admin_server.Start()) {
         LOG(ERROR) << "Failed to start master admin server, metrics_port="
                    << config_.metrics_port;

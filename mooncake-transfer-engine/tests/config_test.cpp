@@ -277,6 +277,56 @@ TEST_F(ConnPauseTtlEnvTest, EmptyStringKeepsDefault) {
     EXPECT_EQ(config.conn_pause_ttl_ms, 17);
 }
 
+// MC_IB_PORT names the RDMA port opened on every device. Port numbers are
+// 1-based, so 0 is not a "disable" value: it makes ibv_query_port fail on
+// every device and takes the whole topology down.
+class IbPortEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_IB_PORT"); }
+};
+
+TEST_F(IbPortEnvTest, DefaultIsPortOneWhenUnset) {
+    ::unsetenv("MC_IB_PORT");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
+TEST_F(IbPortEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "2", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 2);
+}
+
+TEST_F(IbPortEnvTest, ZeroIsRejected) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "0", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
+TEST_F(IbPortEnvTest, OutOfRangeIsRejected) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "256", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
+TEST_F(IbPortEnvTest, NegativeIsRejected) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "-1", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
+TEST_F(IbPortEnvTest, NonNumericIsRejected) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "abc", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
 // MC_MAX_CONCURRENT_REG_MR caps how many buffers registerLocalMemoryBatch()
 // registers at once; 0 (the default) means unbounded. 0 is therefore also what
 // a silent atol() fallback would produce on a typo, which would read as "the

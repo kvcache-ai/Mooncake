@@ -504,6 +504,13 @@ class MasterClient {
         const std::string& key, const std::string& tenant_id,
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode>
+    DynamicReplicaCopyStart(const std::string& key,
+                            const std::string& tenant_id,
+                            const std::string& src_segment,
+                            const std::vector<std::string>& tgt_segments,
+                            const UUID& dynamic_replication_lease_id,
+                            uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief End a copy operation
@@ -513,6 +520,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Revoke a copy operation
@@ -523,6 +534,10 @@ class MasterClient {
         const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Start a move operation

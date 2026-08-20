@@ -612,6 +612,10 @@ class TransferSubmitter {
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         uint64_t src_offset);
 
+    std::optional<TransferFuture> submitRangeWrite(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        uint64_t dst_offset);
+
     TransferEngine::ScatterTransferOperation submitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers);
 
@@ -678,6 +682,12 @@ class TransferSubmitter {
     bool validateTransferParams(const AllocatedBuffer::Descriptor& handle,
                                 const std::vector<Slice>& slices) const;
 
+    void appendMemcpyOperations(const AllocatedBuffer::Descriptor& handle,
+                                const std::vector<Slice>& slices,
+                                TransferRequest::OpCode op_code,
+                                uint64_t buffer_offset,
+                                std::vector<MemcpyOperation>& operations);
+
     /**
      * @brief Submit memcpy operation asynchronously
      */
@@ -710,6 +720,10 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitMemoryReadOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, uint64_t src_offset);
+
+    std::optional<TransferFuture> submitMemoryWriteOperation(
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices, uint64_t dst_offset);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,

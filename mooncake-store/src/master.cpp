@@ -36,9 +36,13 @@ static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 10000,
 static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
               "Update kDefaultKvSoftPinTtlFlagValue when "
               "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
+static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS == 24 * 60 * 60 * 1000,
+              "Update kDefaultMaxKvSoftPinTtlFlagValue when "
+              "DEFAULT_MAX_KV_SOFT_PIN_TTL_MS changes");
 
 constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
+constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "86400000";
 
 namespace {
 
@@ -118,17 +122,25 @@ DEFINE_int32(
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
+DEFINE_string(metrics_host, "0.0.0.0",
+              "Address for the HTTP metrics/admin server to listen on. "
+              "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
 DEFINE_string(default_kv_soft_pin_ttl, kDefaultKvSoftPinTtlFlagValue,
               "Default soft pin TTL for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
+DEFINE_string(max_kv_soft_pin_ttl, kDefaultMaxKvSoftPinTtlFlagValue,
+              "Maximum request-level soft pin TTL for kv objects. Supports "
+              "raw milliseconds or duration strings with ms, s, m, or h "
+              "suffixes");
 DEFINE_bool(allow_evict_soft_pinned_objects,
             mooncake::DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
             "Whether to allow eviction of soft pinned objects during eviction");
 DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
 DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
+DEFINE_validator(max_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
               "Ratio of objects to evict when Memory space is full");
 DEFINE_double(eviction_high_watermark_ratio,
@@ -225,6 +237,16 @@ DEFINE_uint32(promotion_max_per_heartbeat, 1,
               "SSD-read + RDMA-write on the client; serializing them avoids "
               "blocking past the client-liveness window. Default 1 is "
               "conservative.");
+DEFINE_string(dynamic_replication_mode, "off",
+              "Dynamic MEMORY replica fanout mode: off, observe, or enforce");
+DEFINE_uint32(dynamic_replication_heat_window_seconds, 10,
+              "Heat observation window for dynamic MEMORY replication");
+DEFINE_double(
+    dynamic_replication_admission_qps_threshold, 0.8,
+    "Per-key access frequency threshold for dynamic MEMORY replication");
+DEFINE_uint64(
+    dynamic_replication_max_memory_replicas, 2,
+    "Maximum MEMORY replicas allowed for one dynamically replicated key");
 DEFINE_bool(enable_kv_events, false,
             "Enable RFC #1527 KV cache event publisher over ZMQ");
 DEFINE_string(kv_events_bind_endpoint, "",
@@ -440,6 +462,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_metric_reporting);
     default_config.GetUInt32("metrics_port", &master_config.metrics_port,
                              FLAGS_metrics_port);
+    default_config.GetString("metrics_host", &master_config.metrics_host,
+                             FLAGS_metrics_host);
     default_config.GetUInt32("rpc_port", &master_config.rpc_port,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
@@ -460,6 +484,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDurationMs("default_kv_soft_pin_ttl",
                                  &master_config.default_kv_soft_pin_ttl,
                                  mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS);
+    default_config.GetDurationMs("max_kv_soft_pin_ttl",
+                                 &master_config.max_kv_soft_pin_ttl,
+                                 mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS);
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
@@ -518,6 +545,26 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("promotion_max_per_heartbeat",
                              &master_config.promotion_max_per_heartbeat,
                              FLAGS_promotion_max_per_heartbeat);
+    default_config.GetString("dynamic_replication_mode",
+                             &master_config.dynamic_replication_mode,
+                             FLAGS_dynamic_replication_mode);
+    default_config.GetUInt32(
+        "dynamic_replication_heat_window_seconds",
+        &master_config.dynamic_replication_heat_window_seconds,
+        FLAGS_dynamic_replication_heat_window_seconds);
+    default_config.GetDouble(
+        "dynamic_replication_admission_qps_threshold",
+        &master_config.dynamic_replication_admission_qps_threshold,
+        FLAGS_dynamic_replication_admission_qps_threshold);
+    {
+        uint64_t tmp_dynamic_replication_max_memory_replicas =
+            FLAGS_dynamic_replication_max_memory_replicas;
+        default_config.GetUInt64("dynamic_replication_max_memory_replicas",
+                                 &tmp_dynamic_replication_max_memory_replicas,
+                                 FLAGS_dynamic_replication_max_memory_replicas);
+        master_config.dynamic_replication_max_memory_replicas =
+            static_cast<size_t>(tmp_dynamic_replication_max_memory_replicas);
+    }
     default_config.GetBool("enable_kv_events", &master_config.enable_kv_events,
                            FLAGS_enable_kv_events);
     default_config.GetString("kv_events_bind_endpoint",
@@ -780,6 +827,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.metrics_port = FLAGS_metrics_port;
     }
+    if ((google::GetCommandLineFlagInfo("metrics_host", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.metrics_host = FLAGS_metrics_host;
+    }
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -791,6 +843,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.default_kv_soft_pin_ttl = ParseDurationFlagOrDie(
             "default_kv_soft_pin_ttl", FLAGS_default_kv_soft_pin_ttl);
+    }
+    if ((google::GetCommandLineFlagInfo("max_kv_soft_pin_ttl", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_kv_soft_pin_ttl = ParseDurationFlagOrDie(
+            "max_kv_soft_pin_ttl", FLAGS_max_kv_soft_pin_ttl);
     }
     if ((google::GetCommandLineFlagInfo("allow_evict_soft_pinned_objects",
                                         &info) &&
@@ -877,6 +935,32 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.promotion_max_per_heartbeat =
             FLAGS_promotion_max_per_heartbeat;
     }
+    if ((google::GetCommandLineFlagInfo("dynamic_replication_mode", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dynamic_replication_mode = FLAGS_dynamic_replication_mode;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "dynamic_replication_heat_window_seconds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dynamic_replication_heat_window_seconds =
+            FLAGS_dynamic_replication_heat_window_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "dynamic_replication_admission_qps_threshold", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dynamic_replication_admission_qps_threshold =
+            FLAGS_dynamic_replication_admission_qps_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "dynamic_replication_max_memory_replicas", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dynamic_replication_max_memory_replicas =
+            static_cast<size_t>(FLAGS_dynamic_replication_max_memory_replicas);
+    }
     if ((google::GetCommandLineFlagInfo("enable_kv_events", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -953,6 +1037,25 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                      << "Clamping to 255. Lower the configured value to "
                      << "silence this warning.";
         master_config.promotion_admission_threshold = 255;
+    }
+    if (master_config.dynamic_replication_mode != "off" &&
+        master_config.dynamic_replication_mode != "observe" &&
+        master_config.dynamic_replication_mode != "enforce") {
+        LOG(FATAL)
+            << "dynamic_replication_mode must be one of off, observe, enforce";
+    }
+    if (master_config.dynamic_replication_heat_window_seconds == 0) {
+        LOG(WARNING)
+            << "dynamic_replication_heat_window_seconds=0; clamping to 1";
+        master_config.dynamic_replication_heat_window_seconds = 1;
+    }
+    if (master_config.dynamic_replication_admission_qps_threshold <= 0.0) {
+        LOG(FATAL) << "dynamic_replication_admission_qps_threshold must be > 0";
+    }
+    if (master_config.dynamic_replication_max_memory_replicas == 0) {
+        LOG(WARNING)
+            << "dynamic_replication_max_memory_replicas=0; clamping to 1";
+        master_config.dynamic_replication_max_memory_replicas = 1;
     }
     if ((google::GetCommandLineFlagInfo("ha_backend_type", &info) &&
          !info.is_default) ||
@@ -1421,8 +1524,10 @@ int main(int argc, char* argv[]) {
         << ", max_threads=" << master_config.rpc_thread_num
         << ", enable_metric_reporting=" << master_config.enable_metric_reporting
         << ", metrics_port=" << master_config.metrics_port
+        << ", metrics_host=" << master_config.metrics_host
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
+        << ", max_kv_soft_pin_ttl=" << master_config.max_kv_soft_pin_ttl
         << ", allow_evict_soft_pinned_objects="
         << master_config.allow_evict_soft_pinned_objects
         << ", eviction_ratio=" << master_config.eviction_ratio
@@ -1541,7 +1646,7 @@ int main(int argc, char* argv[]) {
                 metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
-            master_config.enable_metric_reporting);
+            master_config.enable_metric_reporting, master_config.metrics_host);
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;

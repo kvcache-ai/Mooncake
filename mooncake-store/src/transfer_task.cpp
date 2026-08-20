@@ -19,6 +19,26 @@
 #include "spdk/spdk_wrapper.h"
 #endif
 
+static int GetPositiveEnvOrDefault(const char* name, int default_value) {
+    const char* raw_value = std::getenv(name);
+    if (!raw_value || raw_value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    long parsed = std::strtol(raw_value, &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value ||
+        (end_ptr != nullptr && *end_ptr != '\0') || parsed <= 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+        LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
+                     << ", using default " << default_value;
+        return default_value;
+    }
+
+    return static_cast<int>(parsed);
+}
+
 #ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
     if (!value) {
@@ -52,26 +72,6 @@ static int GetSpdkNofDebugIntervalMs() {
         return static_cast<int>(parsed);
     }();
     return interval_ms;
-}
-
-static int GetPositiveEnvOrDefault(const char* name, int default_value) {
-    const char* raw_value = std::getenv(name);
-    if (!raw_value || raw_value[0] == '\0') {
-        return default_value;
-    }
-
-    errno = 0;
-    char* end_ptr = nullptr;
-    long parsed = std::strtol(raw_value, &end_ptr, 10);
-    if (errno != 0 || end_ptr == raw_value ||
-        (end_ptr != nullptr && *end_ptr != '\0') || parsed <= 0 ||
-        parsed > std::numeric_limits<int>::max()) {
-        LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
-                     << ", using default " << default_value;
-        return default_value;
-    }
-
-    return static_cast<int>(parsed);
 }
 
 static int GetSpdkNofSubmitChunkBytes() {
@@ -197,14 +197,23 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 // threads.
 constexpr int kDefaultFilereadWorkers = 10;
 
+// The number of fileread workers can be tuned via the MC_FILEREAD_WORKERS
+// environment variable. Falls back to kDefaultFilereadWorkers when unset,
+// empty, or invalid.
+static int GetFilereadWorkerCount() {
+    static const int value =
+        GetPositiveEnvOrDefault("MC_FILEREAD_WORKERS", kDefaultFilereadWorkers);
+    return value;
+}
+
 FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     : shutdown_(false) {
-    VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers
-            << " workers";
+    const int num_workers = GetFilereadWorkerCount();
+    VLOG(1) << "Creating FilereadWorkerPool with " << num_workers << " workers";
 
     // Start worker threads
-    workers_.reserve(kDefaultFilereadWorkers);
-    for (int i = 0; i < kDefaultFilereadWorkers; ++i) {
+    workers_.reserve(num_workers);
+    for (int i = 0; i < num_workers; ++i) {
         workers_.emplace_back(&FilereadWorkerPool::workerThread, this);
     }
     backend_ = backend;
@@ -1223,16 +1232,44 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
     TransferRequest::OpCode op_code) {
-    std::optional<TransferFuture> future;
-    std::vector<TransferRequest> requests;
+    if (replicas.size() != all_slices.size()) {
+        LOG(ERROR) << "Mismatched replicas and slice lists";
+        return std::nullopt;
+    }
+
+    bool use_local_memcpy =
+        op_code == TransferRequest::WRITE && !replicas.empty();
+    size_t operation_count = 0;
     for (size_t i = 0; i < replicas.size(); ++i) {
-        auto& replica = replicas[i];
-        auto& slices = all_slices[i];
-        auto& mem_desc = replica.get_memory_descriptor();
-        if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
+        if (!replicas[i].is_memory_replica()) {
+            LOG(ERROR) << "Batch transfer only supports memory replicas";
             return std::nullopt;
         }
-        auto& handle = mem_desc.buffer_descriptor;
+        const auto& handle =
+            replicas[i].get_memory_descriptor().buffer_descriptor;
+        if (!validateTransferParams(handle, all_slices[i])) {
+            return std::nullopt;
+        }
+        use_local_memcpy =
+            use_local_memcpy && canUseLocalMemcpy(handle.transport_endpoint_);
+        operation_count += all_slices[i].size();
+    }
+
+    std::vector<TransferRequest> requests;
+    std::vector<MemcpyOperation> memcpy_operations;
+    if (use_local_memcpy)
+        memcpy_operations.reserve(operation_count);
+    else
+        requests.reserve(operation_count);
+    for (size_t i = 0; i < replicas.size(); ++i) {
+        auto& slices = all_slices[i];
+        const auto& handle =
+            replicas[i].get_memory_descriptor().buffer_descriptor;
+        if (use_local_memcpy) {
+            appendMemcpyOperations(handle, slices, op_code, 0,
+                                   memcpy_operations);
+            continue;
+        }
         uint64_t offset = 0;
         SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
@@ -1240,7 +1277,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
                        << handle.transport_endpoint_;
             return std::nullopt;
         }
-        for (auto slice : slices) {
+        for (const auto& slice : slices) {
             TransferRequest request;
             request.opcode = op_code;
             request.source = static_cast<char*>(slice.ptr);
@@ -1251,7 +1288,9 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             offset += slice.size;
         }
     }
-    future = submitTransfer(requests);
+    auto future = use_local_memcpy
+                      ? submitMemcpyOperations(std::move(memcpy_operations))
+                      : submitTransfer(requests);
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1334,36 +1373,36 @@ TransferSubmitter::submit_batch_get_offload_object(
                             : submitTransfer(requests);
 }
 
+void TransferSubmitter::appendMemcpyOperations(
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    const TransferRequest::OpCode op_code, uint64_t buffer_offset,
+    std::vector<MemcpyOperation>& operations) {
+    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+    uint64_t offset = buffer_offset;
+
+    for (const auto& slice : slices) {
+        if (slice.ptr == nullptr) continue;
+
+        void* dest;
+        const void* src;
+        if (op_code == TransferRequest::READ) {
+            dest = slice.ptr;
+            src = reinterpret_cast<const void*>(base_address + offset);
+        } else {
+            dest = reinterpret_cast<void*>(base_address + offset);
+            src = slice.ptr;
+        }
+        offset += slice.size;
+        operations.emplace_back(dest, src, slice.size);
+    }
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
-    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = src_offset;
-
-    for (size_t i = 0; i < slices.size(); ++i) {
-        const auto& slice = slices[i];
-
-        if (slice.ptr == nullptr) continue;
-
-        void* dest;
-        const void* src;
-
-        if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local buffer)
-            dest = slice.ptr;
-            src = reinterpret_cast<const void*>(base_address + offset);
-        } else {
-            // WRITE: from slice (local buffer) to handle (remote buffer)
-            dest = reinterpret_cast<void*>(base_address + offset);
-            src = slice.ptr;
-        }
-        offset += slice.size;
-
-        operations.emplace_back(dest, src, slice.size);
-    }
-
+    appendMemcpyOperations(handle, slices, op_code, src_offset, operations);
     return submitMemcpyOperations(std::move(operations));
 }
 
@@ -1473,6 +1512,25 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     return std::nullopt;
 }
 
+std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    uint64_t dst_offset) {
+    TransferStrategy strategy = selectStrategy(handle, slices);
+
+    if (strategy == TransferStrategy::LOCAL_MEMCPY) {
+        return submitMemcpyOperation(handle, slices, TransferRequest::WRITE,
+                                     dst_offset);
+    }
+    if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+        return submitTransferEngineOperation(
+            handle, slices, TransferRequest::WRITE, dst_offset);
+    }
+
+    LOG(ERROR) << "Write only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
+               << strategy;
+    return std::nullopt;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     uint64_t src_offset) {
@@ -1484,7 +1542,8 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
         size_t slices_size = 0;
         for (const auto& s : slices) slices_size += s.size;
-        if (src_offset + slices_size > handle.size_) {
+        if (src_offset > std::numeric_limits<uint64_t>::max() - slices_size ||
+            src_offset + slices_size > handle.size_) {
             LOG(ERROR) << "Range read overflow: src_offset=" << src_offset
                        << " + slices_size=" << slices_size
                        << " > handle.size_=" << handle.size_;
@@ -1503,6 +1562,42 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
     if (future.has_value()) {
         updateTransferMetrics(slices, TransferRequest::READ);
+    }
+
+    return future;
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    uint64_t dst_offset) {
+    std::optional<TransferFuture> future;
+
+    if (replica.is_memory_replica()) {
+        auto& mem_desc = replica.get_memory_descriptor();
+        auto& handle = mem_desc.buffer_descriptor;
+
+        size_t slices_size = 0;
+        for (const auto& s : slices) slices_size += s.size;
+        if (dst_offset > std::numeric_limits<uint64_t>::max() - slices_size ||
+            dst_offset + slices_size > handle.size_) {
+            LOG(ERROR) << "Range write overflow: dst_offset=" << dst_offset
+                       << " + slices_size=" << slices_size
+                       << " > handle.size_=" << handle.size_;
+            return std::nullopt;
+        }
+
+        future = submitMemoryWriteOperation(handle, slices, dst_offset);
+    } else if (replica.is_nof_replica()) {
+        LOG(ERROR) << "Range write not supported for NoF replicas";
+        return std::nullopt;
+    } else if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
+        LOG(ERROR)
+            << "Range write not supported for disk replicas (use full write)";
+        return std::nullopt;
+    }
+
+    if (future.has_value()) {
+        updateTransferMetrics(slices, TransferRequest::WRITE);
     }
 
     return future;

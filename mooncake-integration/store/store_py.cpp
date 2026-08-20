@@ -164,12 +164,6 @@ py::tuple tensor_shape_tuple(const TensorMetadata &metadata) {
     return py::cast(shape_vec);
 }
 
-void append_tensor_payload_span(std::vector<std::span<const char>> &values,
-                                uintptr_t data_ptr, size_t tensor_size) {
-    if (tensor_size == 0) return;
-    values.emplace_back(reinterpret_cast<const char *>(data_ptr), tensor_size);
-}
-
 pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
                                   int64_t data_length,
                                   bool own_user_buffer = false) {
@@ -919,23 +913,7 @@ class MooncakeStorePyWrapper {
         // Validation & Metadata extraction (GIL Held)
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
-        if (use_dummy_client_) {
-            return put_tensor_info_impl(key, info, config);
-        }
-
-        // Prepare spans
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            sizeof(TensorMetadata));
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
-        // Store (GIL Released)
-        py::gil_scoped_release release_gil;
-        int ret = store_->put_parts(key, values, config);
-        if (ret != 0)
-            LOG(ERROR) << "put_parts failed for key " << key << " with code "
-                       << ret;
-        return ret;
+        return put_tensor_info_impl(key, info, config);
     }
 
     int put_tensor(const std::string &key, pybind11::object tensor) {
@@ -1049,11 +1027,44 @@ class MooncakeStorePyWrapper {
         return batch_write_tensor_impl(
             keys, infos, config, "put",
             [this](const std::vector<std::string> &write_keys,
-                   const std::vector<void *> &buffer_ptrs,
-                   const std::vector<size_t> &buffer_sizes,
+                   const std::vector<void *> &buffers,
+                   const std::vector<size_t> &sizes,
                    const ReplicateConfig &write_config) {
-                return store_->batch_put_from(write_keys, buffer_ptrs,
-                                              buffer_sizes, write_config);
+                return store_->batch_put_from(write_keys, buffers, sizes,
+                                              write_config);
+            },
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<std::vector<void *>> &buffers,
+                   const std::vector<std::vector<size_t>> &sizes,
+                   const ReplicateConfig &write_config) {
+                return real_client_->batch_put_from_multi_buffers(
+                    write_keys, buffers, sizes, write_config, true);
+            });
+    }
+
+    std::vector<int> batch_upsert_tensor_infos_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<PyTensorInfo> &infos,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (auto cuda_ipc_results = try_dummy_cuda_ipc_batch_upsert_tensor_impl(
+                keys, infos, config)) {
+            return *cuda_ipc_results;
+        }
+        return batch_write_tensor_impl(
+            keys, infos, config, "upsert",
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<void *> &buffers,
+                   const std::vector<size_t> &sizes,
+                   const ReplicateConfig &write_config) {
+                return store_->batch_upsert_from(write_keys, buffers, sizes,
+                                                 write_config);
+            },
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<std::vector<void *>> &buffers,
+                   const std::vector<std::vector<size_t>> &sizes,
+                   const ReplicateConfig &write_config) {
+                return real_client_->batch_upsert_from_multi_buffers(
+                    write_keys, buffers, sizes, write_config, true);
             });
     }
 
@@ -1061,6 +1072,11 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        if (pybind11::len(tensors_list) != keys.size()) {
+            LOG(ERROR) << "batch_put_tensor keys and tensors size mismatch";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
         std::vector<PyTensorInfo> infos(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
@@ -1258,17 +1274,15 @@ class MooncakeStorePyWrapper {
                                    : results[0];
         }
 
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            info.metadata.header.data_offset);
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
-        py::gil_scoped_release release_gil;
-        int ret = store_->put_parts(key, values, config);
-        if (ret != 0)
-            LOG(ERROR) << "put_parts failed for key " << key << " with code "
-                       << ret;
-        return ret;
+        auto results = batch_put_tensor_infos_impl(
+            std::vector<std::string>{key}, std::vector<PyTensorInfo>{info},
+            config);
+        if (results.size() != 1) {
+            LOG(ERROR) << "put returned unexpected result count for key "
+                       << key;
+            return to_py_ret(ErrorCode::RPC_FAIL);
+        }
+        return results[0];
     }
 
     int put_manifest_impl(const std::string &key,
@@ -1465,38 +1479,22 @@ class MooncakeStorePyWrapper {
                                    : results[0];
         }
 
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            info.metadata.header.data_offset);
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
-        py::gil_scoped_release release_gil;
-        int ret = store_->upsert_parts(key, values, config);
-        if (ret != 0)
-            LOG(ERROR) << "upsert_parts failed for key " << key << " with code "
-                       << ret;
-        return ret;
+        auto results = batch_upsert_tensor_infos_impl(
+            std::vector<std::string>{key}, std::vector<PyTensorInfo>{info},
+            config);
+        if (results.size() != 1) {
+            LOG(ERROR) << "upsert returned unexpected result count for key "
+                       << key;
+            return to_py_ret(ErrorCode::RPC_FAIL);
+        }
+        return results[0];
     }
 
     int upsert_tensor_impl(const std::string &key, pybind11::object tensor,
                            const ReplicateConfig &config) {
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
-        if (use_dummy_client_) {
-            return upsert_tensor_info_impl(key, info, config);
-        }
-
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            sizeof(TensorMetadata));
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
-        py::gil_scoped_release release_gil;
-        int ret = store_->upsert_parts(key, values, config);
-        if (ret != 0)
-            LOG(ERROR) << "upsert_parts failed for key " << key << " with code "
-                       << ret;
-        return ret;
+        return upsert_tensor_info_impl(key, info, config);
     }
 
     int upsert_tensor(const std::string &key, pybind11::object tensor) {
@@ -1519,9 +1517,14 @@ class MooncakeStorePyWrapper {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
+            std::vector<std::string> tp_keys;
+            tp_keys.reserve(tp_size);
             for (int rank = 0; rank < tp_size; ++rank) {
-                int ret = upsert_tensor_info_impl(get_tp_key_name(key, rank),
-                                                  (*infos)[rank], config);
+                tp_keys.push_back(get_tp_key_name(key, rank));
+            }
+            auto results =
+                batch_upsert_tensor_infos_impl(tp_keys, *infos, config);
+            for (int ret : results) {
                 if (ret != 0) return ret;
             }
             return 0;
@@ -1581,31 +1584,15 @@ class MooncakeStorePyWrapper {
                                          ReplicateConfig{});
     }
 
-    std::vector<int> batch_upsert_tensor_infos_impl(
-        const std::vector<std::string> &keys,
-        const std::vector<PyTensorInfo> &infos,
-        const ReplicateConfig &config = ReplicateConfig{}) {
-        return batch_write_tensor_impl(
-            keys, infos, config, "upsert",
-            [this](const std::vector<std::string> &write_keys,
-                   const std::vector<void *> &buffer_ptrs,
-                   const std::vector<size_t> &buffer_sizes,
-                   const ReplicateConfig &write_config) {
-                return store_->batch_upsert_from(write_keys, buffer_ptrs,
-                                                 buffer_sizes, write_config);
-            });
-    }
-
     std::vector<int> batch_upsert_tensor_impl(
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
-        auto group_ids_error = ValidateGroupIdsForBatchConfig(
-            config, keys.size(), "batch_upsert_tensor");
-        if (!group_ids_error.empty()) {
-            return group_ids_error;
+        if (pybind11::len(tensors_list) != keys.size()) {
+            LOG(ERROR) << "batch_upsert_tensor keys and tensors size mismatch";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
-
         std::vector<PyTensorInfo> infos(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
@@ -1914,12 +1901,19 @@ PYBIND11_MODULE(store, m) {
         .value("GENERAL", ObjectDataType::GENERAL)
         .export_values();
 
+    py::enum_<SoftPinAction>(m, "SoftPinAction")
+        .value("PRESERVE", SoftPinAction::PRESERVE)
+        .value("ENABLE", SoftPinAction::ENABLE)
+        .value("DISABLE", SoftPinAction::DISABLE);
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
         .def_readwrite("nof_replica_num", &ReplicateConfig::nof_replica_num)
-        .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
+        .def_readwrite("dfs_replica_num", &ReplicateConfig::dfs_replica_num)
+        .def_readwrite("soft_pin_action", &ReplicateConfig::soft_pin_action)
+        .def_readwrite("soft_pin_ttl_ms", &ReplicateConfig::soft_pin_ttl_ms)
         .def_readwrite("with_hard_pin", &ReplicateConfig::with_hard_pin)
         .def_readwrite("preferred_segments",
                        &ReplicateConfig::preferred_segments)
@@ -3019,6 +3013,111 @@ PYBIND11_MODULE(store, m) {
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")
+        .def(
+            "batch_get_session_start",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_start(keys);
+            },
+            py::arg("keys"),
+            "Start a get session: query replicas once and cache them")
+        .def(
+            "batch_get_into_multi_buffer_ranges",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes,
+               const std::vector<std::vector<size_t>> &all_src_offsets) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_multi_buffer_ranges(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
+                    all_src_offsets);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("all_src_offsets"),
+            "Ranged get into multiple buffers using a get session")
+        .def(
+            "batch_get_session_end",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return -1;
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_end(keys);
+            },
+            py::arg("keys"),
+            "End a get session and drop cached replica metadata")
+        .def(
+            "batch_put_session_start",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<size_t> &sizes,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_session_start(keys, sizes,
+                                                            config);
+            },
+            py::arg("keys"), py::arg("sizes"),
+            py::arg("config") = ReplicateConfig{},
+            "Start a put session: reserve objects without transfer")
+        .def(
+            "batch_put_from_multi_buffer_ranges",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes,
+               const std::vector<std::vector<size_t>> &all_dst_offsets) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_from_multi_buffer_ranges(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
+                    all_dst_offsets);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("all_dst_offsets"),
+            "Ranged put from multiple buffers using a put session")
+        .def(
+            "batch_put_session_end",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_session_end(keys);
+            },
+            py::arg("keys"), "Complete a put session and make objects readable")
+        .def(
+            "batch_put_session_revoke",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_session_revoke(keys);
+            },
+            py::arg("keys"), "Revoke an incomplete put session")
         .def(
             "get_replica_desc",
             [](MooncakeStorePyWrapper &self, const std::string &key) {

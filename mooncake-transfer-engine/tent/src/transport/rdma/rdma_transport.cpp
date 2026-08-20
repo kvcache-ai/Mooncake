@@ -378,6 +378,12 @@ Status RdmaTransport::install(std::string& local_segment_name,
 }
 
 Status RdmaTransport::uninstall() {
+    // ControlService may still receive BootstrapRdma RPCs while uninstall is
+    // running. Unregister and drain the callback before destroying workers,
+    // contexts, and other state used by onSetupRdmaConnections(). Keep this
+    // outside installed_ so partially-installed transports are covered too.
+    if (metadata_) metadata_->setBootstrapRdmaCallback(nullptr);
+
     if (installed_) {
         // Stop notification worker thread
         notify_worker_running_ = false;

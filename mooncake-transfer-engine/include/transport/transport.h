@@ -70,7 +70,7 @@ class Transport {
         int advise_retry_cnt = 0;
         // Per-request transport pin, TENT only.
         int transport_hint = 0;
-        // Adjacent requests in the same group are one transport submission.
+        // Adjacent requests in a group may be scheduled as one unit.
         uint64_t task_group_id = kNoTaskGroup;
     };
 
@@ -167,6 +167,7 @@ class Transport {
                 void *dest_addr;
                 void *cuda_stream;  // cudaStream_t, used by async NVLink
                                     // transport
+                int cuda_device;    // device that owns cuda_stream
             } local;
             struct {
                 void *event;  // cudaEvent_t
@@ -203,37 +204,47 @@ class Transport {
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
 
-            check_batch_completion(false);
+            check_batch_completion(task, false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
 
-            check_batch_completion(true);
+            check_batch_completion(task, true);
         }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        static void sealTaskSubmission(TransferTask *task) {
+            __atomic_store_n(&task->submission_sealed, true, __ATOMIC_RELEASE);
+            check_batch_completion(task, false, false);
+        }
+#endif
 
         volatile int64_t ts;
 
        private:
-        inline void check_batch_completion(bool is_failed) {
+        static inline void check_batch_completion(TransferTask *task,
+                                                  bool is_failed,
+                                                  bool count_slice = true) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             auto &batch_desc = toBatchDesc(task->batch_id);
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
             }
 
-            // When the last slice of a task completes, check if the entire task
-            // is done using a single atomic counter to avoid reading
-            // inconsistent results.
-            uint64_t prev_completed = __atomic_fetch_add(
-                &task->completed_slice_count, 1, __ATOMIC_RELAXED);
-
-            // Only the thread completing the final slice will see prev+1 ==
-            // slice_count.
-            if (prev_completed + 1 == task->slice_count) {
+            uint64_t completed =
+                count_slice ? __atomic_add_fetch(&task->completed_slice_count,
+                                                 1, __ATOMIC_ACQ_REL)
+                            : __atomic_load_n(&task->completed_slice_count,
+                                              __ATOMIC_ACQUIRE);
+            if (__atomic_load_n(&task->submission_sealed, __ATOMIC_ACQUIRE) &&
+                completed ==
+                    __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE) &&
+                !__atomic_exchange_n(&task->completion_published, true,
+                                     __ATOMIC_ACQ_REL)) {
                 __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
 
                 // Increment the number of finished tasks in the batch
@@ -341,6 +352,8 @@ class Transport {
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         volatile uint64_t completed_slice_count = 0;
+        volatile bool submission_sealed = true;
+        volatile bool completion_published = false;
 #endif
 
         // record the origin request
@@ -351,6 +364,7 @@ class Transport {
 #else
         const TransferRequest *request = nullptr;
 #endif
+        size_t request_count = 1;
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {
@@ -407,6 +421,10 @@ class Transport {
         const std::vector<TransferTask *> &task_list) {
         return submitTransferTask(task_list);
     }
+
+    // Grouped transports must append slices in request order so scatter can
+    // recover per-request status after a grouped task fails.
+    virtual bool supportsGroupedScatter() const { return false; }
 
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.

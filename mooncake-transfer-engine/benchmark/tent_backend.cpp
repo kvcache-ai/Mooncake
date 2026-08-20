@@ -65,7 +65,8 @@ std::shared_ptr<Config> loadConfig() {
             {"gds", "gds"},
             {"mnnvl", "mnnvl"},
             {"nvlink", "nvlink"},
-            {"sunrise_link", "sunrise_link"}};
+            {"sunrise_link", "sunrise_link"},
+            {"mpcomm", "mpcomm"}};
 
         // Disable all transports by default
         for (const auto& entry : transport_map) {
@@ -91,6 +92,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "tcp") return TCP;
     if (xport_type == "iouring") return IOURING;
     if (xport_type == "sunrise_link") return SUNRISE_LINK;
+    if (xport_type == "mpcomm") return MPCOMM;
     return UNSPEC;
 }
 
@@ -304,14 +306,48 @@ int TENTBenchRunner::runTarget() {
     return 0;
 }
 
+size_t TENTBenchRunner::targetIndex(int thread_id) const {
+    LOG_ASSERT(!target_handles_.empty());
+    return static_cast<size_t>(thread_id) % target_handles_.size();
+}
+
+int TENTBenchRunner::localTargetThreadId(int thread_id) const {
+    LOG_ASSERT(!target_handles_.empty());
+    return thread_id / static_cast<int>(target_handles_.size());
+}
+
+uint64_t TENTBenchRunner::getTargetSegmentId(int thread_id) const {
+    return target_handles_[targetIndex(thread_id)];
+}
+
+size_t TENTBenchRunner::getTargetCount() const {
+    return std::max<size_t>(target_handles_.size(), 1);
+}
+
 int TENTBenchRunner::startInitiator(int num_threads) {
-    CHECK_FAIL(engine_->openSegment(handle_, XferBenchConfig::target_seg_name));
-    info_.buffers.clear();
-    CHECK_FAIL(engine_->getSegmentInfo(handle_, info_));
-    std::sort(info_.buffers.begin(), info_.buffers.end(),
-              [](const SegmentInfo::Buffer& a, const SegmentInfo::Buffer& b) {
-                  return a.location < b.location;
-              });
+    auto names = splitCommaSeparated(XferBenchConfig::target_seg_name);
+    if (names.empty()) {
+        LOG(ERROR) << "No target segment name specified";
+        return -1;
+    }
+    target_handles_.clear();
+    target_infos_.clear();
+    target_handles_.reserve(names.size());
+    target_infos_.reserve(names.size());
+    for (const auto& name : names) {
+        SegmentID handle = 0;
+        CHECK_FAIL(engine_->openSegment(handle, name));
+        SegmentInfo info;
+        CHECK_FAIL(engine_->getSegmentInfo(handle, info));
+        std::sort(
+            info.buffers.begin(), info.buffers.end(),
+            [](const SegmentInfo::Buffer& a, const SegmentInfo::Buffer& b) {
+                return a.location < b.location;
+            });
+        target_handles_.push_back(handle);
+        target_infos_.push_back(std::move(info));
+    }
+    LOG(INFO) << "Opened " << target_handles_.size() << " target segments";
     threads_.resize(num_threads);
     current_task_.resize(threads_.size());
     g_tent_running = true;
@@ -427,12 +463,10 @@ int TENTBenchRunner::runInitiatorTasks(
     return g_tent_running ? 0 : -1;
 }
 
-double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
-                                          uint64_t target_addr,
-                                          uint64_t block_size,
-                                          uint64_t batch_size, OpCode opcode,
-                                          uint64_t deadline_ns,
-                                          IntentType intent_type) {
+double TENTBenchRunner::runSingleTransfer(
+    uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
+    uint64_t block_size, uint64_t batch_size, OpCode opcode,
+    uint64_t deadline_ns, IntentType intent_type) {
     auto batch_id = engine_->allocateBatch(batch_size);
     std::vector<Request> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -440,7 +474,7 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.opcode = opcode == READ ? Request::READ : Request::WRITE;
         entry.length = block_size;
         entry.source = (void*)(local_addr + block_size * i);
-        entry.target_id = handle_;
+        entry.target_id = target_id;
         entry.target_offset = target_addr + block_size * i;
         entry.transport_hint = transport_hint_;
         entry.deadline_ns = deadline_ns;

@@ -7,8 +7,10 @@
 # 2026-07-30 | 绿算技术 | ISAL库链接修复
 # Find Python package
 add_subdirectory(cachelib_memory_allocator)
+add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SOURCES
+    allocation_strategy.cpp
     allocator.cpp
     master_service.cpp
     master_snapshot_manager.cpp
@@ -21,11 +23,20 @@ set(MOONCAKE_STORE_SOURCES
     mmap_arena.cpp
     master_metric_manager.cpp
     storage_backend.cpp
+    nvme_kv_backend.cpp
+    nvme_kv_connector.cpp
+    nvme_kv_executor_io_uring.cpp
+    nvme_kv_executor_ioctl.cpp
+    nvme_kv_executor_util.cpp
+    nvme_kv_key_codec.cpp
+    nvme_kv_key_conflict_policy.cpp
+    nvme_kv_object_layout.cpp
     thread_pool.cpp
     etcd_helper.cpp
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp
+    tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp
     rpc_service.cpp
     master_admin_service.cpp
@@ -41,7 +52,9 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
+    storage/distributed/dfs_global_allocator.cpp
     storage/distributed/distributed_storage_backend.cpp
+    storage/distributed/posix_fs_adapter.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -57,8 +70,11 @@ set(MOONCAKE_STORE_SOURCES
     ha/leadership/master_service_supervisor.cpp
     ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
+    ha/standby_metadata_store.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
+    ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/master_snapshot_codec.cpp
+    ha/snapshot/local_ssd_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
@@ -83,6 +99,10 @@ set(MOONCAKE_STORE_SOURCES
     memory_alloc.cpp
     ssd_register_client.cpp
     engram/engram_store.cpp)
+
+if(BUILD_UNIT_TESTS)
+  list(APPEND MOONCAKE_STORE_SOURCES nvme_kv_executor_stub.cpp)
+endif()
 
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -180,10 +200,38 @@ endif()
 find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib
                                    /usr/local/lib64)
 find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
+set(MOONCAKE_HAVE_NVME_URING_CMD OFF)
 if(URING_LIB AND URING_INCLUDE)
   message(STATUS "io_uring: Enabled for mooncake_store")
   list(APPEND MOONCAKE_STORE_SOURCES uring_file.cpp)
   list(APPEND EXTRA_LIBS ${URING_LIB})
+
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES_SAVE ${CMAKE_REQUIRED_INCLUDES})
+  set(CMAKE_REQUIRED_INCLUDES ${URING_INCLUDE})
+  check_cxx_source_compiles(
+    "
+#include <liburing.h>
+#include <linux/nvme_ioctl.h>
+int main() {
+    struct nvme_uring_cmd cmd{};
+    io_uring_sqe sqe{};
+    sqe.cmd_op = NVME_URING_CMD_IO;
+    (void)sqe.cmd;
+    io_uring_cqe cqe{};
+    (void)cqe.big_cqe;
+    unsigned flags = IORING_OP_URING_CMD | IORING_SETUP_CQE32;
+    return static_cast<int>(flags) + cmd.opcode;
+}
+"
+    MOONCAKE_NVME_URING_CMD_COMPILES)
+  set(CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES_SAVE})
+  if(MOONCAKE_NVME_URING_CMD_COMPILES)
+    set(MOONCAKE_HAVE_NVME_URING_CMD ON)
+    message(STATUS "io_uring: NVMe uring command support enabled")
+  else()
+    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+  endif()
 else()
   message(STATUS "io_uring: Disabled (liburing not found)")
 endif()
@@ -287,6 +335,10 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
+if(BUILD_UNIT_TESTS)
+  target_compile_definitions(mooncake_store
+                             PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
+endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
 endif()
@@ -309,7 +361,8 @@ endif()
 # mooncake_master). Targets that need transfer_engine should link it explicitly.
 target_link_libraries(
   mooncake_store
-  PUBLIC cachelib_memory_allocator
+  PUBLIC mooncake_local_ssd
+         cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB}
          glog::glog
          gflags::gflags
@@ -331,6 +384,9 @@ endif()
 if(URING_LIB AND URING_INCLUDE)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
+  if(MOONCAKE_HAVE_NVME_URING_CMD)
+    target_compile_definitions(mooncake_store PRIVATE MOONCAKE_HAVE_NVME_URING_CMD=1)
+  endif()
 endif()
 
 if(BUILD_SHARED_LIBS)
@@ -453,8 +509,8 @@ endif()
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
 
 # ---------------------------------------------------------------------------
-# Optional: a self-contained libmooncake_store.so exporting only the store_c.h
-# C ABI, for consumers that dlopen the store (e.g. the Rust crate's `dlopen`
+# Optional: a self-contained libmooncake_store.so exporting only the store_c.h C
+# ABI, for consumers that dlopen the store (e.g. the Rust crate's `dlopen`
 # feature). Whole-archives the static mooncake_store + asio_static (objects are
 # -fPIC, see mooncake-common/common.cmake) and localizes everything else via the
 # version script; only system/toolkit libs (and the Go etcd/k8s backends when
@@ -464,15 +520,13 @@ if(WITH_STORE_C_SHARED)
   # ELF/GNU-ld features (--whole-archive, --as-needed, version script, $ORIGIN);
   # supported by GNU ld, gold, and lld. Linux only.
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(
-      FATAL_ERROR
-        "WITH_STORE_C_SHARED currently supports Linux/ELF only "
-        "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
+    message(FATAL_ERROR "WITH_STORE_C_SHARED currently supports Linux/ELF only "
+                        "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
   endif()
 
-  # We whole-archive mooncake_store and reuse its name, so require it to be static
-  # (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some backends
-  # force ON).
+  # We whole-archive mooncake_store and reuse its name, so require it to be
+  # static (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some
+  # backends force ON).
   get_target_property(_mooncake_store_type mooncake_store TYPE)
   if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
     message(

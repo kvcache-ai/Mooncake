@@ -119,8 +119,6 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     ASSERT_EQ(1u, exported.size());
     EXPECT_EQ(kDefaultTestObjectKey, exported.front().key);
     EXPECT_EQ(kDefaultTestObjectSize, exported.front().metadata.size);
-    EXPECT_EQ(descriptor_.last_included_seq,
-              exported.front().metadata.last_sequence_id);
 }
 
 TEST_P(HotStandbySnapshotBootstrapTest,

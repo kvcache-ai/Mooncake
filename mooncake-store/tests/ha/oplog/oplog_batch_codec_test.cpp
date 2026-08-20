@@ -127,6 +127,11 @@ TEST(OpLogBatchKeyLayoutTest, BuildsDurablePrefixKey) {
               BuildDurablePrefixKey("clusterA"));
 }
 
+TEST(OpLogBatchKeyLayoutTest, BuildsProducerViewKey) {
+    EXPECT_EQ("/oplog/clusterA/producer_view",
+              BuildProducerViewKey("clusterA"));
+}
+
 TEST(OpLogBatchKeyLayoutTest, BuildsBatchRangeBounds) {
     auto bounds = BuildBatchRecordRange("clusterA", 7);
     EXPECT_EQ("/oplog/clusterA/batches/00000000000000000008", bounds.begin_key);
@@ -144,6 +149,7 @@ TEST(OpLogBatchKeyLayoutTest, RejectsInvalidClusterId) {
     EXPECT_FALSE(reason.empty());
     EXPECT_TRUE(BuildBatchRecordKey("bad/cluster", 1).empty());
     EXPECT_TRUE(BuildDurablePrefixKey("bad/cluster").empty());
+    EXPECT_TRUE(BuildProducerViewKey("bad/cluster").empty());
     auto bounds = BuildBatchRecordRange("bad/cluster", 1);
     EXPECT_TRUE(bounds.begin_key.empty());
     EXPECT_TRUE(bounds.end_key.empty());
@@ -176,6 +182,52 @@ TEST(OpLogDurablePrefixCodecTest, RoundTripsNonZeroPrefix) {
     EXPECT_EQ(in.batch_id, out.batch_id);
     EXPECT_EQ(in.last_seq, out.last_seq);
     EXPECT_TRUE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, PreservesCanonicalEncoding) {
+    const std::string encoded =
+        R"({"batch_id":9,"last_seq":1024,"schema_version":1})";
+
+    DurablePrefix prefix;
+    std::string reason;
+    ASSERT_TRUE(DecodeDurablePrefix(encoded, &prefix, &reason));
+    EXPECT_EQ(encoded, EncodeDurablePrefix(prefix));
+    EXPECT_TRUE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, IgnoresDetachedProducerViewField) {
+    const std::string with_view =
+        R"({"batch_id":9,"last_seq":1024,"producer_view_version":7,"schema_version":1})";
+    const std::string canonical =
+        R"({"batch_id":9,"last_seq":1024,"schema_version":1})";
+
+    DurablePrefix prefix;
+    std::string reason;
+    ASSERT_TRUE(DecodeDurablePrefix(with_view, &prefix, &reason));
+    EXPECT_EQ(canonical, EncodeDurablePrefix(prefix));
+    EXPECT_TRUE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, IgnoresUnknownFields) {
+    DurablePrefix prefix;
+    std::string reason;
+    ASSERT_TRUE(DecodeDurablePrefix(
+        R"({"batch_id":9,"last_seq":1024,"producer_view_version":7,"schema_version":1,"unknown":"ignored"})",
+        &prefix, &reason));
+    EXPECT_EQ(9u, prefix.batch_id);
+    EXPECT_EQ(1024u, prefix.last_seq);
+    EXPECT_TRUE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, InvalidLastSeqLeavesOutputUnchanged) {
+    DurablePrefix prefix{.batch_id = 11, .last_seq = 22};
+    std::string reason;
+    EXPECT_FALSE(DecodeDurablePrefix(
+        R"({"batch_id":9,"last_seq":"invalid","schema_version":1})", &prefix,
+        &reason));
+    EXPECT_EQ(11u, prefix.batch_id);
+    EXPECT_EQ(22u, prefix.last_seq);
+    EXPECT_FALSE(reason.empty());
 }
 
 TEST(OpLogDurablePrefixCodecTest, RejectsMalformedPayload) {

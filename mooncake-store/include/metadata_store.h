@@ -31,8 +31,8 @@ struct StandbyObjectMetadata {
     // 1. Standby does not perform eviction, so lease info is not used
     // 2. After promotion, new Primary should grant fresh leases, not restore
     // old ones
-    uint64_t last_sequence_id{
-        0};                // Last OpLog sequence ID that modified this key
+    // Soft pin is also omitted because it is runtime-only eviction-priority
+    // state; promoted objects resume as ordinary cache.
     std::string group_id;  // Tenant group identifier
     ObjectDataType data_type{
         ObjectDataType::UNKNOWN};  // Data type classification
@@ -101,12 +101,11 @@ struct MetadataPayload {
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type);
 
     // Convert to StandbyObjectMetadata
-    StandbyObjectMetadata ToStandbyMetadata(uint64_t sequence_id) const {
+    StandbyObjectMetadata ToStandbyMetadata() const {
         StandbyObjectMetadata meta;
         meta.client_id = client_id;
         meta.size = size;
         meta.replicas = replicas;
-        meta.last_sequence_id = sequence_id;
         meta.group_id = group_id.value_or("");
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         return meta;

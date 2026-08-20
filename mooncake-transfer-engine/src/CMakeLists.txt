@@ -1,4 +1,4 @@
-file(GLOB ENGINE_SOURCES "*.cpp")
+file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -11,6 +11,10 @@ if(USE_HIP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+# Private headers live next to the .cpp sources. USE_HIP hipifies into the build
+# tree and needs this path explicitly.
+target_include_directories(transfer_engine
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment)
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
@@ -48,6 +52,7 @@ target_link_libraries(
   PUBLIC base
          transport
          rdma_transport
+         rdma_twosided
          mooncake_common
          ibverbs
          glog::glog
@@ -63,11 +68,14 @@ if(USE_BAREX)
 endif()
 
 if(USE_CUDA)
-  target_include_directories(transfer_engine PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_include_directories(transfer_engine
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   if(USE_CXI)
-    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart rt)
+    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+                                                 rt)
   else()
-    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart rt mlx5)
+    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+                                                 rt mlx5)
   endif()
   if(USE_NVMEOF)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
@@ -119,9 +127,9 @@ if(USE_HIP)
       # compiled in the rdma_transport OBJECT library and pulled into
       # transfer_engine via $<TARGET_OBJECTS:transport>. A PRIVATE define on
       # transfer_engine never reaches that object compilation, so the dmabuf
-      # path is silently compiled out and GPU MRs fall back to plain
-      # ibv_reg_mr (EINVAL on device memory). Put the define (and the hsa
-      # include/link usage requirements) on the target that actually compiles
+      # path is silently compiled out and GPU MRs fall back to plain ibv_reg_mr
+      # (EINVAL on device memory). Put the define (and the hsa include/link
+      # usage requirements) on the target that actually compiles
       # rdma_context.cpp.
       target_compile_definitions(rdma_transport PRIVATE USE_HIP_DMABUF)
       target_link_libraries(rdma_transport PUBLIC hsa-runtime64::hsa-runtime64)

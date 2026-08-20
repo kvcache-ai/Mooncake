@@ -175,16 +175,14 @@ struct HttpTenantQuotaSnapshot {
     std::string tenant_id;
     uint64_t requested_quota_bytes{0};
     uint64_t effective_quota_bytes{0};
-    uint64_t used_bytes{0};
-    uint64_t reserved_bytes{0};
-    uint64_t committed_count{0};
-    uint64_t metadata_object_count{0};
+    uint64_t charged_bytes{0};
+    bool admission_closed{true};
     bool over_quota{false};
     bool has_explicit_policy{false};
 };
 YLT_REFL(HttpTenantQuotaSnapshot, tenant_id, requested_quota_bytes,
-         effective_quota_bytes, used_bytes, reserved_bytes, committed_count,
-         metadata_object_count, over_quota, has_explicit_policy);
+         effective_quota_bytes, charged_bytes, admission_closed, over_quota,
+         has_explicit_policy);
 
 HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
     const TenantQuotaSnapshot& snapshot) {
@@ -192,10 +190,8 @@ HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
         .tenant_id = snapshot.tenant_id.value(),
         .requested_quota_bytes = snapshot.requested_quota_bytes,
         .effective_quota_bytes = snapshot.effective_quota_bytes,
-        .used_bytes = snapshot.used_bytes,
-        .reserved_bytes = snapshot.reserved_bytes,
-        .committed_count = snapshot.committed_count,
-        .metadata_object_count = snapshot.metadata_object_count,
+        .charged_bytes = snapshot.charged_bytes,
+        .admission_closed = snapshot.admission_closed,
         .over_quota = snapshot.over_quota,
         .has_explicit_policy = snapshot.has_explicit_policy,
     };
@@ -252,10 +248,12 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
 }  // namespace
 
 MasterAdminServer::MasterAdminServer(uint16_t http_port,
-                                     bool enable_metric_reporting)
+                                     bool enable_metric_reporting,
+                                     std::string http_host)
     : http_port_(http_port),
+      http_host_(std::move(http_host)),
       enable_metric_reporting_(enable_metric_reporting),
-      http_server_(4, http_port) {}
+      http_server_(4, http_port, http_host_) {}
 
 MasterAdminServer::~MasterAdminServer() { Stop(); }
 
@@ -268,8 +266,8 @@ bool MasterAdminServer::Start() {
 
     auto ec = http_server_.async_start();
     if (ec.hasResult()) {
-        LOG(ERROR) << "Failed to start master admin server on port "
-                   << http_port_;
+        LOG(ERROR) << "Failed to start master admin server on " << http_host_
+                   << ":" << http_port_ << ": " << ec.value().message();
         return false;
     }
 
@@ -391,18 +389,12 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
         << "# HELP mooncake_tenant_quota_effective_bytes Effective tenant "
            "quota in bytes\n"
         << "# TYPE mooncake_tenant_quota_effective_bytes gauge\n"
-        << "# HELP mooncake_tenant_quota_used_bytes Tenant committed quota "
-           "usage in bytes\n"
-        << "# TYPE mooncake_tenant_quota_used_bytes gauge\n"
-        << "# HELP mooncake_tenant_quota_reserved_bytes Tenant reserved quota "
-           "usage in bytes\n"
-        << "# TYPE mooncake_tenant_quota_reserved_bytes gauge\n"
-        << "# HELP mooncake_tenant_quota_committed_count Tenant committed "
-           "object count\n"
-        << "# TYPE mooncake_tenant_quota_committed_count gauge\n"
-        << "# HELP mooncake_tenant_quota_metadata_object_count Tenant "
-           "metadata object count\n"
-        << "# TYPE mooncake_tenant_quota_metadata_object_count gauge\n"
+        << "# HELP mooncake_tenant_quota_charged_bytes Tenant quota charge in "
+           "bytes\n"
+        << "# TYPE mooncake_tenant_quota_charged_bytes gauge\n"
+        << "# HELP mooncake_tenant_quota_admission_closed Tenant quota "
+           "admission-closed flag\n"
+        << "# TYPE mooncake_tenant_quota_admission_closed gauge\n"
         << "# HELP mooncake_tenant_quota_over_quota Tenant over-quota flag\n"
         << "# TYPE mooncake_tenant_quota_over_quota gauge\n"
         << "# HELP mooncake_tenant_quota_explicit_policy Tenant explicit "
@@ -418,15 +410,11 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
         tenant_metrics << "mooncake_tenant_quota_effective_bytes{tenant_id=\""
                        << tenant << "\"} " << snapshot.effective_quota_bytes
                        << "\n";
-        tenant_metrics << "mooncake_tenant_quota_used_bytes{tenant_id=\""
-                       << tenant << "\"} " << snapshot.used_bytes << "\n";
-        tenant_metrics << "mooncake_tenant_quota_reserved_bytes{tenant_id=\""
-                       << tenant << "\"} " << snapshot.reserved_bytes << "\n";
-        tenant_metrics << "mooncake_tenant_quota_committed_count{tenant_id=\""
-                       << tenant << "\"} " << snapshot.committed_count << "\n";
-        tenant_metrics
-            << "mooncake_tenant_quota_metadata_object_count{tenant_id=\""
-            << tenant << "\"} " << snapshot.metadata_object_count << "\n";
+        tenant_metrics << "mooncake_tenant_quota_charged_bytes{tenant_id=\""
+                       << tenant << "\"} " << snapshot.charged_bytes << "\n";
+        tenant_metrics << "mooncake_tenant_quota_admission_closed{tenant_id=\""
+                       << tenant << "\"} "
+                       << (snapshot.admission_closed ? 1 : 0) << "\n";
         tenant_metrics << "mooncake_tenant_quota_over_quota{tenant_id=\""
                        << tenant << "\"} " << (snapshot.over_quota ? 1 : 0)
                        << "\n";
@@ -1109,10 +1097,12 @@ void MasterAdminServer::HandleUpsertTenantQuota(
                            ErrorCode::INVALID_PARAMS, body_result.error());
         return;
     }
-    if (body_result->requested_quota_bytes == 0) {
+    if (body_result->requested_quota_bytes == 0 ||
+        body_result->requested_quota_bytes >
+            TenantQuotaAccount::kMaxChargedBytes) {
         WriteErrorResponse(resp, coro_http::status_type::bad_request,
                            ErrorCode::INVALID_PARAMS,
-                           "Tenant quota must be positive");
+                           "Tenant quota must be in [1, 2^63 - 1] bytes");
         return;
     }
 

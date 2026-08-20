@@ -526,6 +526,27 @@ def test_put_object_torch_tensor_raw_fallback_roundtrip() -> None:
     assert store.batch_get_into_calls > 0
 
 
+def test_dataproto_torch_save_fallback_supports_row_selection(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(sos, "_has_tensor_codec_helpers", lambda: False)
+    _store, transfer = make_transfer(NoTensorFastPathStore())
+    tensor = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"tensor": tensor}))
+    payload = ref.stage_refs["default"].manifest["buffers"]["batch.tensor"]
+
+    assert payload["format"] == "torch_save"
+    for rows in (slice(1, 6, 2), [4, 1, 4], [], [-1, 0]):
+        assert torch.equal(
+            transfer.get_dataproto(ref, rows=rows)["batch"]["tensor"],
+            tensor[rows],
+        )
+    with pytest.raises(ValueError, match="does not support destinations"):
+        transfer.get_dataproto(
+            ref, rows=[1], destinations={"tensor": object()}
+        )
+
+
 def test_bundle_read_spec_full_read_is_partial_special_case() -> None:
     store, transfer = make_transfer()
     array = np.arange(16, dtype=np.int32).reshape(4, 4)
@@ -2107,6 +2128,26 @@ def test_dataproto_ref_handle_rejects_unknown_field_stage() -> None:
     handle["field_index"]["input_ids"]["stage"] = "missing"
 
     with pytest.raises(ValueError, match="unknown stage"):
+        import_dataproto_ref(handle)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("stage_refs", "default", "manifest_key"), ""),
+        (("field_index", "input_ids", "member"), ""),
+    ],
+)
+def test_dataproto_ref_handle_rejects_empty_locations(path, value) -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"input_ids": np.arange(4)}))
+    handle = export_dataproto_ref(ref)
+    target = handle
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+    with pytest.raises(ValueError, match="non-empty"):
         import_dataproto_ref(handle)
 
 

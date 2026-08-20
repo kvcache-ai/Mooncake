@@ -111,6 +111,8 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
         params.auto_connect = true;
         LOG(INFO) << "AutoConnect enabled by capability probe";
     }
+    params.client_server_mode =
+        adxl::IsAdxlFeatureSupported(adxl::CLIENT_SERVER_COMM);
     char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
     if (buffer_pool && std::strcmp(buffer_pool, "0:0") != 0) {
         params.use_buffer_pool = true;
@@ -173,6 +175,10 @@ int TransferExecutorBase::initEngines() {
     if (local_comm_res) {
         options["adxl.LocalCommRes"] = local_comm_res;
         LOG(INFO) << "Set LocalCommRes to:" << local_comm_res;
+    } else if (params_.client_server_mode) {
+        options["adxl.LocalCommRes"] = R"({"version":"1.3"})";
+        LOG(INFO) << "Client-Server mode enabled, set LocalCommRes to "
+                     "{\"version\":\"1.3\"}";
     }
 
     options[kAutoConnect] = params_.auto_connect ? kEnabled : kDisabled;
@@ -604,8 +610,15 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
 
         auto local_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
         const auto& remote_host_ip = segment_desc->rank_info.hostIp;
-        if (local_desc && !local_desc->rank_info.hostIp.empty() &&
-            !remote_host_ip.empty() &&
+
+        // CS mode (CANN 9.1+) supports same-device connections natively.
+        // The same-host +1 offset was a workaround for older HIXL that did
+        // not support same-device links. When CS mode is available, skip
+        // the offset to allow the optimal same-device HCCS path.
+        bool cs_mode_available =
+            adxl::IsAdxlFeatureSupported(adxl::CLIENT_SERVER_COMM);
+        if (!cs_mode_available && local_desc &&
+            !local_desc->rank_info.hostIp.empty() && !remote_host_ip.empty() &&
             local_desc->rank_info.hostIp == remote_host_ip &&
             endpoints.size() > 1) {
             base_idx = (base_idx + 1) % endpoints.size();

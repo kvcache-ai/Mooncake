@@ -30,6 +30,7 @@ inline std::string ResolveConfiguredHABackendConnstring(
 struct MasterConfig {
     bool enable_metric_reporting;
     uint32_t metrics_port;
+    std::string metrics_host;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
@@ -39,6 +40,7 @@ struct MasterConfig {
 
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
+    uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
@@ -139,6 +141,13 @@ struct MasterConfig {
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
 
+    // Dynamic MEMORY replica fanout for hot read-only objects.
+    // Kept intentionally small: mode + frequency window + max replicas.
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
+
     // KV Events publisher (RFC #1527) for cache-aware indexers.
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
@@ -181,7 +190,9 @@ class MasterServiceSupervisorConfig {
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
 
     // Parameters with default values (optional parameters)
+    uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";
+    std::string metrics_host = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
@@ -238,6 +249,10 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -269,8 +284,10 @@ class MasterServiceSupervisorConfig {
         // Set required parameters using RequiredParam
         enable_metric_reporting = config.enable_metric_reporting;
         metrics_port = static_cast<int>(config.metrics_port);
+        metrics_host = config.metrics_host;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
@@ -292,6 +309,13 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -453,6 +477,7 @@ class WrappedMasterServiceConfig {
 
     // Optional parameters (with default values)
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
@@ -480,6 +505,10 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -544,6 +573,7 @@ class WrappedMasterServiceConfig {
 
         // Set optional parameters (these have default values)
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
@@ -569,6 +599,13 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -659,6 +696,7 @@ class WrappedMasterServiceConfig {
 
         // Set optional parameters (these have default values)
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
@@ -685,6 +723,13 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -748,6 +793,7 @@ class MasterServiceConfigBuilder {
    private:
     uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    uint64_t max_kv_soft_pin_ttl_ = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
@@ -815,6 +861,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_default_kv_soft_pin_ttl(uint64_t ttl) {
         default_kv_soft_pin_ttl_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_kv_soft_pin_ttl(uint64_t ttl) {
+        max_kv_soft_pin_ttl_ = ttl;
         return *this;
     }
 
@@ -1105,6 +1156,7 @@ class MasterServiceConfig {
    public:
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
@@ -1130,6 +1182,10 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::string dynamic_replication_mode = "off";
+    uint32_t dynamic_replication_heat_window_seconds = 10;
+    double dynamic_replication_admission_qps_threshold = 0.8;
+    size_t dynamic_replication_max_memory_replicas = 2;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -1192,6 +1248,7 @@ class MasterServiceConfig {
 
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
+        max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
@@ -1215,6 +1272,13 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dynamic_replication_mode = config.dynamic_replication_mode;
+        dynamic_replication_heat_window_seconds =
+            config.dynamic_replication_heat_window_seconds;
+        dynamic_replication_admission_qps_threshold =
+            config.dynamic_replication_admission_qps_threshold;
+        dynamic_replication_max_memory_replicas =
+            config.dynamic_replication_max_memory_replicas;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -1282,6 +1346,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     MasterServiceConfig config;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
+    config.max_kv_soft_pin_ttl = max_kv_soft_pin_ttl_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;

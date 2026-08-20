@@ -1,8 +1,13 @@
 #pragma once
 
-#include <string>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
+#include <optional>
+#include <string>
+
+#include "environment_variable.h"
+#include "environment_value_parser.h"
 
 namespace mooncake {
 
@@ -91,11 +96,12 @@ class Environ {
         return transfer_engine_rpc_client_io_threads_;
     }
 
-    // Helper method to get int from env
+    // Helper methods to get numeric values from env
     static int GetInt(const char* name, int default_value);
     static int64_t GetInt64(const char* name, int64_t default_value);
     static uint32_t GetUInt32(const char* name, uint32_t default_value);
     static uint64_t GetUInt64(const char* name, uint64_t default_value);
+    static double GetDouble(const char* name, double default_value);
     // Helper method to get size_t from env
     static size_t GetSizeT(const char* name, size_t default_value);
     // Helper method to get a canonical boolean from env. Invalid values use the
@@ -104,6 +110,35 @@ class Environ {
     // Helper method to get string from env
     static std::string GetString(const char* name,
                                  const std::string& default_value);
+
+    // Read a typed variable definition from the process environment. Missing
+    // or invalid typed values return nullopt; string variables preserve an
+    // explicitly empty value.
+    template <typename T>
+    static std::optional<T> Read(const EnvironmentVariable<T>& variable) {
+        const char* value = std::getenv(variable.name);
+        if (value == nullptr) {
+            return std::nullopt;
+        }
+        return TryParseEnvironmentValue<T>(value);
+    }
+
+    template <typename T>
+    static T ReadOr(const EnvironmentVariable<T>& variable, T default_value) {
+        const char* value = std::getenv(variable.name);
+        if (value == nullptr) {
+            return default_value;
+        }
+
+        const auto parsed = TryParseEnvironmentValue<T>(value);
+        if (parsed.has_value()) {
+            return *parsed;
+        }
+        std::cerr << "[Mooncake] Warning: invalid value '" << value
+                  << "' for env " << variable.name << ", using default "
+                  << default_value << std::endl;
+        return default_value;
+    }
 
    private:
     // Member variables

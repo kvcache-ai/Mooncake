@@ -1,18 +1,39 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
-#include <fmt/format.h>
-
 #include <algorithm>
-#include <cstdlib>
-#include <xxhash.h>
 #include <filesystem>
+#include <limits>
+#include <sstream>
 
 #include "environ.h"
+#include "storage/distributed/dfs_global_allocator.h"
+#include "types.h"
 #include "utils.h"
 
 namespace mooncake {
 
-// === DistributedStorageConfig ===
+namespace {
+
+bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
+                               const DistributedStorageConfig& config) {
+    if (config.alignment == 0 || desc.object_size == 0 ||
+        desc.aligned_size < desc.object_size ||
+        desc.offset % config.alignment != 0 ||
+        desc.aligned_size % config.alignment != 0) {
+        return false;
+    }
+    if (desc.offset > config.shard_capacity ||
+        desc.aligned_size > config.shard_capacity - desc.offset) {
+        return false;
+    }
+
+    constexpr uint64_t kMaxFileOffset =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    return desc.offset <= kMaxFileOffset &&
+           desc.aligned_size <= kMaxFileOffset - desc.offset;
+}
+
+}  // namespace
 
 bool DistributedStorageConfig::Validate() const {
     if (fsdir.empty()) {
@@ -25,17 +46,57 @@ bool DistributedStorageConfig::Validate() const {
             << fsdir;
         return false;
     }
-    if (fs_adapter_type.empty()) {
-        LOG(ERROR) << "DistributedStorageConfig: fs_adapter_type is empty";
-        return false;
-    }
-    if (fs_adapter_type != "hf3fs") {
+    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix") {
         LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
                    << fs_adapter_type;
         return false;
     }
-    if (hash_bucket_count <= 0) {
-        LOG(ERROR) << "DistributedStorageConfig: hash_bucket_count must > 0";
+    if (shard_count <= 0) {
+        LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
+        return false;
+    }
+    if (shard_capacity == 0) {
+        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must > 0";
+        return false;
+    }
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        LOG(ERROR) << "DistributedStorageConfig: alignment must be power of 2";
+        return false;
+    }
+    if (shard_capacity % alignment != 0) {
+        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must align";
+        return false;
+    }
+    if (!single_tenant) {
+        LOG(ERROR) << "DistributedStorageConfig: Currently, DFS requires "
+                      "single_tenant=true";
+        return false;
+    }
+    return true;
+}
+
+bool DistributedStorageConfig::ValidateForAllocator() const {
+    if (!Validate()) return false;
+
+    if (eviction_low_watermark < 0.0 || eviction_low_watermark > 1.0 ||
+        eviction_high_watermark < 0.0 || eviction_high_watermark > 1.0 ||
+        eviction_low_watermark >= eviction_high_watermark) {
+        LOG(ERROR) << "DistributedStorageConfig: eviction watermarks must "
+                      "satisfy 0 <= low < high <= 1, low="
+                   << eviction_low_watermark
+                   << ", high=" << eviction_high_watermark;
+        return false;
+    }
+    if (deferred_free_duration.count() < 0) {
+        LOG(ERROR) << "DistributedStorageConfig: deferred_free_duration must "
+                      "be non-negative, seconds="
+                   << deferred_free_duration.count();
+        return false;
+    }
+    if (eviction_enabled && eviction_check_interval.count() <= 0) {
+        LOG(ERROR) << "DistributedStorageConfig: eviction_check_interval must "
+                      "be positive when eviction is enabled, seconds="
+                   << eviction_check_interval.count();
         return false;
     }
     return true;
@@ -43,31 +104,90 @@ bool DistributedStorageConfig::Validate() const {
 
 DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     DistributedStorageConfig config;
-    config.fsdir =
-        Environ::GetString("MOONCAKE_DISTRIBUTED_ROOT_DIR", config.fsdir);
+    config.fsdir = Environ::GetString(
+        "MOONCAKE_DFS_ROOT_DIR",
+        Environ::GetString("MOONCAKE_DISTRIBUTED_ROOT_DIR", config.fsdir));
     if (!std::filesystem::path(config.fsdir).is_absolute()) {
         config.fsdir = std::filesystem::absolute(config.fsdir).string();
     }
-    config.fs_adapter_type = Environ::GetString("MOONCAKE_DISTRIBUTED_FS_TYPE",
-                                                config.fs_adapter_type);
+    config.fs_adapter_type =
+        Environ::GetString("MOONCAKE_DFS_FS_ADAPTER",
+                           Environ::GetString("MOONCAKE_DISTRIBUTED_FS_TYPE",
+                                              config.fs_adapter_type));
     config.enable_health_check =
         Environ::GetBool("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", false);
-    config.hash_bucket_count =
-        Environ::GetInt("MOONCAKE_DISTRIBUTED_HASH_BUCKET_COUNT", 256);
+    config.shard_count =
+        Environ::GetInt("MOONCAKE_DFS_SHARD_COUNT", config.shard_count);
+    config.shard_capacity = Environ::GetUInt64("MOONCAKE_DFS_SHARD_CAPACITY",
+                                               config.shard_capacity);
+    config.alignment =
+        Environ::GetUInt64("MOONCAKE_DFS_ALIGNMENT", config.alignment);
+    config.single_tenant =
+        Environ::GetBool("MOONCAKE_DFS_SINGLE_TENANT", config.single_tenant);
+    config.eviction_enabled = Environ::GetBool("MOONCAKE_DFS_EVICTION_ENABLED",
+                                               config.eviction_enabled);
+    config.eviction_high_watermark = Environ::GetDouble(
+        "MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", config.eviction_high_watermark);
+    config.eviction_low_watermark = Environ::GetDouble(
+        "MOONCAKE_DFS_EVICTION_LOW_WATERMARK", config.eviction_low_watermark);
+    config.deferred_free_duration = std::chrono::seconds(Environ::GetInt(
+        "MOONCAKE_DFS_DEFERRED_FREE_SECONDS",
+        static_cast<int>(config.deferred_free_duration.count())));
+    config.eviction_check_interval = std::chrono::seconds(Environ::GetInt(
+        "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+        static_cast<int>(config.eviction_check_interval.count())));
     return config;
 }
 
-// === DistributedStorageBackend ===
+std::string DistributedStorageConfig::FormatStr() const {
+    std::ostringstream oss;
+    oss << "fsdir=" << fsdir << ", fs_adapter_type=" << fs_adapter_type
+        << ", enable_health_check=" << enable_health_check
+        << ", shard_count=" << shard_count
+        << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment
+        << ", single_tenant=" << single_tenant
+        << ", eviction_enabled=" << eviction_enabled
+        << ", eviction_high_watermark=" << eviction_high_watermark
+        << ", eviction_low_watermark=" << eviction_low_watermark
+        << ", deferred_free_seconds=" << deferred_free_duration.count()
+        << ", eviction_check_interval_seconds="
+        << eviction_check_interval.count();
+    return oss.str();
+}
 
 DistributedStorageBackend::DistributedStorageBackend(
     const FileStorageConfig& file_storage_config,
     const DistributedStorageConfig& distributed_config,
     std::unique_ptr<FileSystemAdapter> fs_adapter)
+    : DistributedStorageBackend(file_storage_config, distributed_config,
+                                std::move(fs_adapter), nullptr) {}
+
+DistributedStorageBackend::DistributedStorageBackend(
+    const FileStorageConfig& file_storage_config,
+    const DistributedStorageConfig& distributed_config,
+    std::unique_ptr<FileSystemAdapter> fs_adapter,
+    std::unique_ptr<ObjectStorageAdapter> object_storage_adapter)
     : StorageBackendInterface(file_storage_config),
       fs_adapter_(std::move(fs_adapter)),
+      object_storage_adapter_(std::move(object_storage_adapter)),
       distributed_config_(distributed_config),
-      root_dir_(distributed_config.fsdir),
-      hash_bucket_count_(distributed_config.hash_bucket_count) {}
+      root_dir_(distributed_config.fsdir) {
+    CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
+        << "DistributedStorageBackend: exactly one I/O adapter is required";
+    if (object_storage_adapter_) {
+        storage_mode_ = DistributedStorageMode::kObjectStorage;
+    }
+}
+
+DistributedStorageBackend::~DistributedStorageBackend() {
+    for (auto& shard : shard_files_) {
+        if (shard && shard->fd >= 0 && fs_adapter_) {
+            fs_adapter_->CloseFile(shard->fd);
+            shard->fd = -1;
+        }
+    }
+    if (fs_adapter_) fs_adapter_->Shutdown();
+}
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     if (initialized_) {
@@ -75,60 +195,42 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
         return {};
     }
 
-    auto init_result = fs_adapter_->Init(root_dir_);
-    if (!init_result) return init_result;
+    if (UsesObjectStorage()) {
+        auto init_result = object_storage_adapter_->Init();
+        if (!init_result) return init_result;
+        initialized_ = true;
+        LOG(INFO) << "DistributedStorageBackend initialized, object adapter="
+                  << object_storage_adapter_->GetName();
+        return {};
+    }
 
-    // Ensure root directory exists before health check
     std::error_code ec;
     std::filesystem::create_directories(root_dir_, ec);
     if (ec) {
-        LOG(ERROR) << "Failed to create root directory " << root_dir_ << ": "
-                   << ec.message();
+        LOG(ERROR) << "Failed to create DFS root directory " << root_dir_
+                   << ": " << ec.message();
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    if (distributed_config_.enable_health_check) {
-        std::string probe_path =
-            fmt::format("{}/.mooncake_health_probe_{}", root_dir_,
-                        UuidToString(generate_uuid()));
-        std::string probe_data = "health_check";
-        auto write_result = fs_adapter_->WriteFile(
-            probe_path,
-            std::span<const char>(probe_data.data(), probe_data.size()));
-        if (!write_result) {
-            LOG(ERROR) << "DFS health check failed (write): "
-                       << static_cast<int>(write_result.error());
-            return tl::make_unexpected(write_result.error());
-        }
+    auto init_result = fs_adapter_->Init(root_dir_);
+    if (!init_result) return init_result;
 
-        std::vector<char> read_buf(probe_data.size());
-        auto read_result =
-            fs_adapter_->ReadFile(probe_path, read_buf.data(), read_buf.size());
-        if (!read_result || *read_result != probe_data.size() ||
-            std::string(read_buf.data(), read_buf.size()) != probe_data) {
-            LOG(ERROR) << "DFS health check failed (read back mismatch)";
-            auto del_err = fs_adapter_->DeleteFile(probe_path);
-            if (!del_err) {
-                LOG(WARNING) << "Failed to delete health-check probe: "
-                             << static_cast<int>(del_err.error());
-            }
-            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    shard_files_.reserve(distributed_config_.shard_count);
+    for (int i = 0; i < distributed_config_.shard_count; ++i) {
+        std::string path = root_dir_ + "/dfs_shard_" +
+                           DfsGlobalAllocator::FormatShardIdx(
+                               i, distributed_config_.shard_count) +
+                           ".data";
+        auto fd_result = fs_adapter_->OpenFile(path);
+        if (!fd_result) {
+            LOG(ERROR) << "Failed to open DFS shard " << path << ": "
+                       << fd_result.error();
+            return tl::make_unexpected(fd_result.error());
         }
-
-        fs_adapter_->DeleteFile(probe_path);
-        LOG(INFO) << "DFS health check passed, adapter="
-                  << fs_adapter_->GetName();
-    }
-
-    // Ensure hash bucket directories exist
-    for (int i = 0; i < hash_bucket_count_; ++i) {
-        std::string bucket_dir = fmt::format("{}/{:02x}", root_dir_, i);
-        std::filesystem::create_directories(bucket_dir, ec);
-        if (ec) {
-            LOG(ERROR) << "Failed to create bucket directory " << bucket_dir
-                       << ": " << ec.message();
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
+        auto shard = std::make_unique<ShardFile>();
+        shard->path = std::move(path);
+        shard->fd = *fd_result;
+        shard_files_.push_back(std::move(shard));
     }
 
     initialized_ = true;
@@ -141,11 +243,13 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     EvictionHandler eviction_handler) {
+    if (!UsesObjectStorage()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
     if (eviction_handler) {
         LOG_FIRST_N(WARNING, 1)
             << "DistributedStorageBackend does not support eviction, "
@@ -154,17 +258,34 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
 
     std::vector<std::string> success_keys;
     std::vector<StorageObjectMetadata> success_metas;
-
     for (const auto& [key, slices] : batch_object) {
-        auto path = GetObjectPath(key);
+        if (slices.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            LOG(WARNING) << "Failed to offload key " << key
+                         << ": slice count exceeds INT_MAX";
+            continue;
+        }
+        const int iovcnt = static_cast<int>(slices.size());
 
         std::vector<iovec> iovs;
+        iovs.reserve(slices.size());
+        size_t total_size = 0;
+        bool total_size_overflow = false;
         for (const auto& slice : slices) {
+            if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
+                total_size_overflow = true;
+                break;
+            }
             iovs.push_back({slice.ptr, slice.size});
+            total_size += slice.size;
+        }
+        if (total_size_overflow) {
+            LOG(WARNING) << "Failed to offload key " << key
+                         << ": total slice size overflows size_t";
+            continue;
         }
 
-        auto result =
-            fs_adapter_->VectorWriteFile(path, iovs.data(), iovs.size(), 0);
+        auto result = object_storage_adapter_->PutV(key, iovs.data(), iovcnt);
         if (!result) {
             LOG(WARNING) << "Failed to offload key " << key << ": "
                          << static_cast<int>(result.error());
@@ -172,32 +293,230 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
         }
 
         success_keys.push_back(key);
-        StorageObjectMetadata meta{-1, 0, static_cast<int64_t>(key.size()),
-                                   static_cast<int64_t>(*result), ""};
-        success_metas.push_back(meta);
+        success_metas.emplace_back(-1, 0, static_cast<int64_t>(key.size()),
+                                   static_cast<int64_t>(total_size), "");
     }
 
-    if (!success_keys.empty()) {
+    if (complete_handler && !success_keys.empty()) {
         auto err = complete_handler(success_keys, success_metas);
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
     }
-
     return static_cast<int64_t>(success_keys.size());
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchWrite(
+    const std::vector<DfsWriteRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(requests.size());
+
+    if (UsesObjectStorage()) {
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
+        return results;
+    }
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+
+    for (const auto& request : requests) {
+        const auto& desc = request.descriptor;
+        if (desc.shard_idx < 0 ||
+            desc.shard_idx >= static_cast<int>(shard_files_.size())) {
+            LOG(ERROR) << "Invalid DFS shard_idx " << desc.shard_idx
+                       << " for key " << request.key;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        auto& shard = *shard_files_[desc.shard_idx];
+        if (desc.file_path != shard.path) {
+            LOG(ERROR) << "DFS path mismatch for key " << request.key
+                       << ", descriptor=" << desc.file_path
+                       << ", configured=" << shard.path;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        if (!IsDfsDescriptorRangeValid(desc, distributed_config_)) {
+            LOG(ERROR) << "Invalid DFS descriptor range for key " << request.key
+                       << ", offset=" << desc.offset
+                       << ", object_size=" << desc.object_size
+                       << ", aligned_size=" << desc.aligned_size
+                       << ", shard_capacity="
+                       << distributed_config_.shard_capacity;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        std::vector<iovec> iovs;
+        iovs.reserve(request.slices.size());
+        uint64_t total_size = 0;
+        bool invalid = false;
+        for (const auto& slice : request.slices) {
+            if ((!slice.ptr && slice.size > 0) ||
+                slice.size >
+                    std::numeric_limits<uint64_t>::max() - total_size) {
+                invalid = true;
+                break;
+            }
+            total_size += slice.size;
+            iovs.push_back({slice.ptr, slice.size});
+        }
+        if (invalid || total_size != desc.object_size) {
+            LOG(WARNING) << "Invalid DFS write request for key " << request.key
+                         << ", expected=" << desc.object_size
+                         << ", actual=" << total_size;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        std::lock_guard lock(shard.mutex);
+        auto write_result =
+            fs_adapter_->WriteAt(shard.fd, iovs.data(), iovs.size(),
+                                 static_cast<int64_t>(desc.offset));
+        if (!write_result) {
+            LOG(WARNING) << "DFS write failed for key " << request.key
+                         << ", error=" << write_result.error();
+            results.emplace_back(tl::make_unexpected(write_result.error()));
+            continue;
+        }
+        if (*write_result != total_size) {
+            LOG(WARNING) << "DFS short write for key " << request.key
+                         << ", expected=" << total_size
+                         << ", actual=" << *write_result;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL));
+            continue;
+        }
+        results.emplace_back();
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
+    const std::vector<DfsReadRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(requests.size());
+
+    if (UsesObjectStorage()) {
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
+        return results;
+    }
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+
+    for (const auto& request : requests) {
+        const auto& desc = request.descriptor;
+        if (desc.shard_idx < 0 ||
+            desc.shard_idx >= static_cast<int>(shard_files_.size())) {
+            LOG(ERROR) << "Invalid DFS shard_idx " << desc.shard_idx
+                       << " for key " << request.key;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        auto& shard = *shard_files_[desc.shard_idx];
+        if (desc.file_path != shard.path) {
+            LOG(ERROR) << "DFS path mismatch for key " << request.key
+                       << ", descriptor=" << desc.file_path
+                       << ", configured=" << shard.path;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        if (!IsDfsDescriptorRangeValid(desc, distributed_config_)) {
+            LOG(ERROR) << "Invalid DFS descriptor range for key " << request.key
+                       << ", offset=" << desc.offset
+                       << ", object_size=" << desc.object_size
+                       << ", aligned_size=" << desc.aligned_size
+                       << ", shard_capacity="
+                       << distributed_config_.shard_capacity;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        if (desc.object_size > std::numeric_limits<size_t>::max() ||
+            request.slices.size() >
+                static_cast<size_t>(std::numeric_limits<int>::max())) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        std::vector<iovec> iovs;
+        iovs.reserve(request.slices.size());
+        size_t remaining = static_cast<size_t>(desc.object_size);
+        bool invalid = false;
+        for (const auto& slice : request.slices) {
+            if (!slice.ptr && slice.size > 0) {
+                invalid = true;
+                break;
+            }
+            if (remaining == 0 || slice.size == 0) {
+                continue;
+            }
+            const size_t read_size = std::min(slice.size, remaining);
+            iovs.push_back({slice.ptr, read_size});
+            remaining -= read_size;
+        }
+        if (invalid || remaining != 0) {
+            LOG(WARNING) << "Invalid DFS read request for key " << request.key
+                         << ", expected capacity at least=" << desc.object_size;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        std::lock_guard lock(shard.mutex);
+        auto read_result = fs_adapter_->ReadAt(
+            shard.fd, iovs.data(), static_cast<int>(iovs.size()),
+            static_cast<int64_t>(desc.offset));
+        if (!read_result) {
+            LOG(WARNING) << "DFS read failed for key " << request.key
+                         << ", error=" << read_result.error();
+            results.emplace_back(tl::make_unexpected(read_result.error()));
+            continue;
+        }
+        if (*read_result != desc.object_size) {
+            LOG(WARNING) << "DFS short read for key " << request.key
+                         << ", expected=" << desc.object_size
+                         << ", actual=" << *read_result;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::FILE_READ_FAIL));
+            continue;
+        }
+        results.emplace_back();
+    }
+    return results;
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    if (!UsesObjectStorage()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     for (auto& [key, slice] : batched_slices) {
-        auto path = GetObjectPath(key);
-
-        auto result = fs_adapter_->ReadFile(path, slice.ptr, slice.size);
+        auto result = object_storage_adapter_->Get(key, slice.ptr, slice.size);
         if (!result) {
             return tl::make_unexpected(result.error());
         }
@@ -210,23 +529,27 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
 
 tl::expected<bool, ErrorCode> DistributedStorageBackend::IsExist(
     const std::string& key) {
+    if (!UsesObjectStorage()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
-    auto path = GetObjectPath(key);
-    return fs_adapter_->FileExists(path);
+    return object_storage_adapter_->Exists(key);
 }
 
 tl::expected<bool, ErrorCode> DistributedStorageBackend::IsEnableOffloading() {
-    return true;
+    return UsesObjectStorage();
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
     const std::function<
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    if (!UsesObjectStorage()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -237,31 +560,23 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
     const size_t batch_limit = static_cast<size_t>(std::max<int64_t>(
         1, file_storage_config_.scanmeta_iterator_keys_limit));
 
-    for (int i = 0; i < hash_bucket_count_; ++i) {
-        std::string bucket_dir = fmt::format("{}/{:02x}", root_dir_, i);
-        auto file_infos = fs_adapter_->ListFilesWithInfo(bucket_dir);
-        if (!file_infos) {
-            if (file_infos.error() == ErrorCode::FILE_NOT_FOUND) {
-                continue;
-            }
-            LOG(ERROR) << "Failed to list files in bucket " << bucket_dir
-                       << ": " << static_cast<int>(file_infos.error());
-            return tl::make_unexpected(file_infos.error());
-        }
+    auto key_infos = object_storage_adapter_->ListKeys();
+    if (!key_infos) {
+        LOG(ERROR) << "Failed to list keys from object storage adapter: "
+                   << static_cast<int>(key_infos.error());
+        return tl::make_unexpected(key_infos.error());
+    }
 
-        for (const auto& info : *file_infos) {
-            std::string key = UnescapeFilename(info.name);
-            batch_keys.push_back(key);
-            StorageObjectMetadata meta{-1, 0, static_cast<int64_t>(key.size()),
-                                       static_cast<int64_t>(info.size), ""};
-            batch_metas.push_back(meta);
-
-            if (batch_keys.size() >= batch_limit) {
-                auto err = handler(batch_keys, batch_metas);
-                if (err != ErrorCode::OK) return tl::make_unexpected(err);
-                batch_keys.clear();
-                batch_metas.clear();
-            }
+    for (const auto& info : *key_infos) {
+        batch_keys.push_back(info.logical_key);
+        batch_metas.emplace_back(-1, 0,
+                                 static_cast<int64_t>(info.logical_key.size()),
+                                 static_cast<int64_t>(info.size), "");
+        if (batch_keys.size() >= batch_limit) {
+            auto err = handler(batch_keys, batch_metas);
+            if (err != ErrorCode::OK) return tl::make_unexpected(err);
+            batch_keys.clear();
+            batch_metas.clear();
         }
     }
     if (!batch_keys.empty()) {
@@ -269,52 +584,6 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
         if (err != ErrorCode::OK) return tl::make_unexpected(err);
     }
     return {};
-}
-
-// === Key -> Path mapping ===
-
-std::string DistributedStorageBackend::GetObjectPath(
-    const std::string& key) const {
-    uint64_t hash = XXH64(key.data(), key.size(), 0);
-    std::string bucket = fmt::format("{:02x}", hash % hash_bucket_count_);
-    std::string safe_key = EscapeFilename(key);
-    return (std::filesystem::path(root_dir_) / bucket / safe_key).string();
-}
-
-std::string DistributedStorageBackend::EscapeFilename(const std::string& key) {
-    std::string result;
-    result.reserve(key.size() + 16);
-    for (unsigned char c : key) {
-        if (c == '@' || c == ':' || c == '/' || c == '\\' || c == '%' ||
-            c < 0x20 || c > 0x7e) {
-            result += fmt::format("%{:02x}", static_cast<unsigned>(c));
-        } else {
-            result += static_cast<char>(c);
-        }
-    }
-    return result;
-}
-
-std::string DistributedStorageBackend::UnescapeFilename(
-    const std::string& name) {
-    auto is_hex = [](char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-               (c >= 'A' && c <= 'F');
-    };
-    std::string result;
-    result.reserve(name.size());
-    for (size_t i = 0; i < name.size(); ++i) {
-        if (name[i] == '%' && i + 2 < name.size() && is_hex(name[i + 1]) &&
-            is_hex(name[i + 2])) {
-            char hex[3] = {name[i + 1], name[i + 2], 0};
-            unsigned long val = strtoul(hex, nullptr, 16);
-            result += static_cast<char>(val);
-            i += 2;
-        } else {
-            result += name[i];
-        }
-    }
-    return result;
 }
 
 }  // namespace mooncake
