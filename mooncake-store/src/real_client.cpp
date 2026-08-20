@@ -85,6 +85,25 @@ bool IsHostStoreSegmentProtocol(const std::string &protocol) {
            protocol == "efa" || protocol == "cxi" || protocol == "rpc_only";
 }
 
+#ifdef USE_ASCEND_DIRECT
+// Split standalone store capacity across NPUs: cap each mount at total/n.
+size_t AgentModeStoreChunkCap(size_t total_size) {
+    const uint32_t n = ContextManager::getInstance().getDeviceCount();
+    if (n <= 1 || total_size == 0) {
+        return 0;
+    }
+    return total_size / n;
+}
+
+bool RestoreAgentModeDeviceZero() {
+    if (!ContextManager::getInstance().setCurrentContext(0)) {
+        LOG(ERROR) << "Failed to restore current context for device 0";
+        return false;
+    }
+    return true;
+}
+#endif
+
 std::shared_ptr<RegisteredPinnedRegion> TryPinStoreSegment(
     void *ptr, size_t size, const std::string &protocol,
     const char *segment_owner) {
@@ -914,8 +933,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
 
-        const auto split_limit = GetTransportRegistrationLimit(protocol);
+        auto split_limit = GetTransportRegistrationLimit(protocol);
         const size_t alignment = facebook::cachelib::Slab::kSize;
+#ifdef USE_ASCEND_DIRECT
+        if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
+            const size_t cap = AgentModeStoreChunkCap(global_segment_size);
+            if (cap > 0) {
+                if (!split_limit.has_value() || cap < *split_limit) {
+                    split_limit = cap;
+                }
+                LOG(INFO) << "Agent-mode store chunk cap: " << cap
+                          << " bytes across "
+                          << ContextManager::getInstance().getDeviceCount()
+                          << " device(s)";
+            }
+        }
+#endif
 
         // For RDMA, auto-discover NUMA nodes with NICs and distribute
         // global_segment across them for full NIC utilization.
@@ -1054,6 +1087,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         if (total_glbseg_size == 0) {
             LOG(INFO) << "Global segment size is 0, skip mounting segment";
         }
+#ifdef USE_ASCEND_DIRECT
+        if (protocol == "ascend" && globalConfig().ascend_agent_mode &&
+            !RestoreAgentModeDeviceZero()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+#endif
     }
 
     // Start IPC server to accept FD from dummy clients
