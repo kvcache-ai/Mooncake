@@ -8,7 +8,6 @@
 #include <variant>
 #include <ylt/util/tl/expected.hpp>
 
-// TODO: P2P HA Oplog - oplog_manager_ not yet added to MasterService base
 #include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/ha/oplog/oplog_store_factory.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"

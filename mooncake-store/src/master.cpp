@@ -707,7 +707,7 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("pending_task_timeout_sec",
                              &master_config.pending_task_timeout_sec,
                              FLAGS_pending_task_timeout_sec);
-default_config.GetUInt64("processing_task_timeout_sec",
+    default_config.GetUInt64("processing_task_timeout_sec",
                               &master_config.processing_task_timeout_sec,
                               FLAGS_processing_task_timeout_sec);
     default_config.GetUInt32("max_retry_attempts",
@@ -1392,8 +1392,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (master_config.enable_oplog && master_config.ha_backend_type != "etcd") {
-        LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd";
-        return 1;
+        // P2P mode supports oplog hot-standby with the redis backend via
+        // P2PStandbyController; central mode still requires etcd.
+        if (master_config.deployment_mode != "P2P") {
+            LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd"
+                       << " (or deployment_mode=P2P with redis)";
+            return 1;
+        }
+        if (master_config.ha_backend_type != "redis") {
+            LOG(FATAL) << "enable_oplog for P2P requires ha_backend_type=redis";
+            return 1;
+        }
     }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
                                      !master_config.etcd_endpoints.empty())) {
@@ -1598,7 +1607,14 @@ int main(int argc, char* argv[]) {
                 std::make_unique<mooncake::WrappedP2PMasterService>(
                     mooncake::WrappedMasterServiceConfig(master_config, version));
             mooncake::RegisterP2PRpcService(server, *p2p_service);
-            // wrapped_master_service = std::move(p2p_service);
+            // P2P admin delegate is intentionally null: WrappedP2PMasterService
+            // does not inherit WrappedMasterService (design §2.1 self-contained),
+            // so it cannot be passed to MasterAdminServer::SetServiceDelegate.
+            // P2P exposes its own HTTP endpoints (metrics/keys/health, see
+            // WrappedP2PMasterService::init_http_server); the centralized
+            // advanced admin endpoints (segment detail/drain job/tenant quota)
+            // are unavailable in P2P mode. A dedicated P2PMasterAdminService
+            // adapter is tracked as future work.
         }
 
         mooncake::MasterAdminServer admin_server(
@@ -1610,8 +1626,12 @@ int main(int argc, char* argv[]) {
         }
         admin_server.SetRuntimeState(
             mooncake::ha::MasterRuntimeState::kServing);
-        admin_server.SetServiceDelegate(wrapped_master_service);
-        admin_server.SetServiceAvailable(true);
+        if (master_config.deployment_mode == "Centralization") {
+            admin_server.SetServiceDelegate(wrapped_master_service);
+            admin_server.SetServiceAvailable(true);
+        }
+        // P2P mode: no centralized admin delegate; advanced admin endpoints
+        // (segment detail/drain/quota) are unavailable (see comment above).
 
         static std::atomic<bool> shutdown_requested{false};
         auto signal_handler = [](int /* signum */) {

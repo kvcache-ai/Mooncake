@@ -46,7 +46,7 @@ namespace mooncake {
  *     │  PROMOTED   │────────────────────────────────────┘
  *     └─────────────┘
  */
-enum class StandbyState : uint8_t {
+enum class P2PStandbyState : uint8_t {
     // Initial state, service not started
     STOPPED = 0,
 
@@ -78,25 +78,25 @@ enum class StandbyState : uint8_t {
 /**
  * @brief Get human-readable state name
  */
-inline const char* StandbyStateToString(StandbyState state) {
+inline const char* P2PStandbyStateToString(P2PStandbyState state) {
     switch (state) {
-        case StandbyState::STOPPED:
+        case P2PStandbyState::STOPPED:
             return "STOPPED";
-        case StandbyState::CONNECTING:
+        case P2PStandbyState::CONNECTING:
             return "CONNECTING";
-        case StandbyState::SYNCING:
+        case P2PStandbyState::SYNCING:
             return "SYNCING";
-        case StandbyState::WATCHING:
+        case P2PStandbyState::WATCHING:
             return "WATCHING";
-        case StandbyState::RECOVERING:
+        case P2PStandbyState::RECOVERING:
             return "RECOVERING";
-        case StandbyState::RECONNECTING:
+        case P2PStandbyState::RECONNECTING:
             return "RECONNECTING";
-        case StandbyState::PROMOTING:
+        case P2PStandbyState::PROMOTING:
             return "PROMOTING";
-        case StandbyState::PROMOTED:
+        case P2PStandbyState::PROMOTED:
             return "PROMOTED";
-        case StandbyState::FAILED:
+        case P2PStandbyState::FAILED:
             return "FAILED";
         default:
             return "UNKNOWN";
@@ -106,7 +106,7 @@ inline const char* StandbyStateToString(StandbyState state) {
 /**
  * @brief Events that trigger state transitions
  */
-enum class StandbyEvent : uint8_t {
+enum class P2PStandbyEvent : uint8_t {
     // User/system actions
     START,          // Start() called
     STOP,           // Stop() called
@@ -140,43 +140,43 @@ enum class StandbyEvent : uint8_t {
     FATAL_ERROR,         // Unrecoverable error
 };
 
-inline const char* StandbyEventToString(StandbyEvent event) {
+inline const char* P2PStandbyEventToString(P2PStandbyEvent event) {
     switch (event) {
-        case StandbyEvent::START:
+        case P2PStandbyEvent::START:
             return "START";
-        case StandbyEvent::STOP:
+        case P2PStandbyEvent::STOP:
             return "STOP";
-        case StandbyEvent::PROMOTE:
+        case P2PStandbyEvent::PROMOTE:
             return "PROMOTE";
-        case StandbyEvent::FORCE_PROMOTE:
+        case P2PStandbyEvent::FORCE_PROMOTE:
             return "FORCE_PROMOTE";
-        case StandbyEvent::CONNECTED:
+        case P2PStandbyEvent::CONNECTED:
             return "CONNECTED";
-        case StandbyEvent::CONNECTION_FAILED:
+        case P2PStandbyEvent::CONNECTION_FAILED:
             return "CONNECTION_FAILED";
-        case StandbyEvent::DISCONNECTED:
+        case P2PStandbyEvent::DISCONNECTED:
             return "DISCONNECTED";
-        case StandbyEvent::SYNC_COMPLETE:
+        case P2PStandbyEvent::SYNC_COMPLETE:
             return "SYNC_COMPLETE";
-        case StandbyEvent::SYNC_FAILED:
+        case P2PStandbyEvent::SYNC_FAILED:
             return "SYNC_FAILED";
-        case StandbyEvent::WATCH_HEALTHY:
+        case P2PStandbyEvent::WATCH_HEALTHY:
             return "WATCH_HEALTHY";
-        case StandbyEvent::WATCH_BROKEN:
+        case P2PStandbyEvent::WATCH_BROKEN:
             return "WATCH_BROKEN";
-        case StandbyEvent::RESYNC_REQUIRED:
+        case P2PStandbyEvent::RESYNC_REQUIRED:
             return "RESYNC_REQUIRED";
-        case StandbyEvent::RECOVERY_SUCCESS:
+        case P2PStandbyEvent::RECOVERY_SUCCESS:
             return "RECOVERY_SUCCESS";
-        case StandbyEvent::RECOVERY_FAILED:
+        case P2PStandbyEvent::RECOVERY_FAILED:
             return "RECOVERY_FAILED";
-        case StandbyEvent::PROMOTION_SUCCESS:
+        case P2PStandbyEvent::PROMOTION_SUCCESS:
             return "PROMOTION_SUCCESS";
-        case StandbyEvent::PROMOTION_FAILED:
+        case P2PStandbyEvent::PROMOTION_FAILED:
             return "PROMOTION_FAILED";
-        case StandbyEvent::MAX_ERRORS_REACHED:
+        case P2PStandbyEvent::MAX_ERRORS_REACHED:
             return "MAX_ERRORS_REACHED";
-        case StandbyEvent::FATAL_ERROR:
+        case P2PStandbyEvent::FATAL_ERROR:
             return "FATAL_ERROR";
         default:
             return "UNKNOWN";
@@ -188,8 +188,8 @@ inline const char* StandbyEventToString(StandbyEvent event) {
  */
 struct StateTransitionResult {
     bool allowed{false};
-    StandbyState old_state{StandbyState::STOPPED};
-    StandbyState new_state{StandbyState::STOPPED};
+    P2PStandbyState old_state{P2PStandbyState::STOPPED};
+    P2PStandbyState new_state{P2PStandbyState::STOPPED};
     std::string reason;
 };
 
@@ -197,7 +197,7 @@ struct StateTransitionResult {
  * @brief Callback for state transition notifications
  */
 using StateChangeCallback = std::function<void(
-    StandbyState old_state, StandbyState new_state, StandbyEvent event)>;
+    P2PStandbyState old_state, P2PStandbyState new_state, P2PStandbyEvent event)>;
 
 /**
  * @brief Standby State Machine
@@ -212,45 +212,45 @@ class P2PStandbyStateMachine {
     /**
      * @brief Get current state (thread-safe)
      */
-    StandbyState GetState() const {
+    P2PStandbyState GetState() const {
         return current_state_.load(std::memory_order_acquire);
     }
 
     /**
      * @brief Check if in a specific state
      */
-    bool IsInState(StandbyState state) const { return GetState() == state; }
+    bool IsInState(P2PStandbyState state) const { return GetState() == state; }
 
     /**
      * @brief Check if service is running (SYNCING, WATCHING, RECOVERING,
      * RECONNECTING, PROMOTING)
      */
     bool IsRunning() const {
-        StandbyState s = GetState();
-        return s == StandbyState::SYNCING || s == StandbyState::WATCHING ||
-               s == StandbyState::RECOVERING ||
-               s == StandbyState::RECONNECTING || s == StandbyState::PROMOTING;
+        P2PStandbyState s = GetState();
+        return s == P2PStandbyState::SYNCING || s == P2PStandbyState::WATCHING ||
+               s == P2PStandbyState::RECOVERING ||
+               s == P2PStandbyState::RECONNECTING || s == P2PStandbyState::PROMOTING;
     }
 
     /**
      * @brief Check if connected to etcd
      */
     bool IsConnected() const {
-        StandbyState s = GetState();
-        return s == StandbyState::SYNCING || s == StandbyState::WATCHING ||
-               s == StandbyState::RECOVERING || s == StandbyState::PROMOTING;
+        P2PStandbyState s = GetState();
+        return s == P2PStandbyState::SYNCING || s == P2PStandbyState::WATCHING ||
+               s == P2PStandbyState::RECOVERING || s == P2PStandbyState::PROMOTING;
     }
 
     /**
      * @brief Check if watch is healthy
      */
-    bool IsWatchHealthy() const { return GetState() == StandbyState::WATCHING; }
+    bool IsWatchHealthy() const { return GetState() == P2PStandbyState::WATCHING; }
 
     /**
      * @brief Check if ready for promotion
      */
     bool IsReadyForPromotion() const {
-        return GetState() == StandbyState::WATCHING;
+        return GetState() == P2PStandbyState::WATCHING;
     }
 
     /**
@@ -258,7 +258,7 @@ class P2PStandbyStateMachine {
      * @param event The event to process
      * @return Result indicating if transition was allowed and new state
      */
-    StateTransitionResult ProcessEvent(StandbyEvent event);
+    StateTransitionResult ProcessEvent(P2PStandbyEvent event);
 
     /**
      * @brief Register a callback for state change notifications
@@ -270,9 +270,9 @@ class P2PStandbyStateMachine {
      */
     struct TransitionRecord {
         std::chrono::steady_clock::time_point timestamp;
-        StandbyState from_state;
-        StandbyState to_state;
-        StandbyEvent event;
+        P2PStandbyState from_state;
+        P2PStandbyState to_state;
+        P2PStandbyEvent event;
     };
 
     /**
@@ -325,16 +325,16 @@ class P2PStandbyStateMachine {
     /**
      * @brief Check if a transition is valid and get new state
      */
-    StateTransitionResult ValidateTransition(StandbyState from,
-                                             StandbyEvent event) const;
+    StateTransitionResult ValidateTransition(P2PStandbyState from,
+                                             P2PStandbyEvent event) const;
 
     /**
      * @brief Notify all registered callbacks
      */
-    void NotifyCallbacks(StandbyState old_state, StandbyState new_state,
-                         StandbyEvent event);
+    void NotifyCallbacks(P2PStandbyState old_state, P2PStandbyState new_state,
+                         P2PStandbyEvent event);
 
-    std::atomic<StandbyState> current_state_{StandbyState::STOPPED};
+    std::atomic<P2PStandbyState> current_state_{P2PStandbyState::STOPPED};
     std::atomic<int> consecutive_errors_{0};
     std::atomic<int> reconnect_count_{0};
     std::chrono::steady_clock::time_point state_enter_time_;

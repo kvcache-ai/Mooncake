@@ -1,5 +1,6 @@
 #pragma once
 
+#include <any>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -18,11 +19,16 @@ namespace ha {
 /**
  * Context exported from standby at promotion time.
  * Contains everything needed to restore primary's state.
+ *
+ * `p2p_promotion_data` is a type-erased payload (P2PPromotionData) used only
+ * by the P2P deployment mode; central path leaves it empty. Kept as
+ * std::any so this central header does not depend on P2P types.
  */
 struct PromotionContext {
     uint64_t applied_seq_id{0};
     std::vector<StandbyObjectEntry> objects;
     std::vector<StandbySegmentInfo> segments;
+    std::any p2p_promotion_data;
 };
 
 class StandbyController {

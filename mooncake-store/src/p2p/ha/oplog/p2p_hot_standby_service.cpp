@@ -31,14 +31,14 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
         return ErrorCode::OK;
     }
 
-    auto start_result = state_machine_.ProcessEvent(StandbyEvent::START);
+    auto start_result = state_machine_.ProcessEvent(P2PStandbyEvent::START);
     if (!start_result.allowed) {
         LOG(ERROR) << "P2PHotStandbyService: cannot start: "
                    << start_result.reason;
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
+    state_machine_.ProcessEvent(P2PStandbyEvent::CONNECTED);
     snapshot_resync_required_.store(false);
     metadata_store_->RemoveAllMetadata();
     oplog_applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
@@ -50,7 +50,7 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
     if (!probe_store || probe_store->GetTrimmedSequenceId(
                             trimmed_sequence_id) != ErrorCode::OK) {
         LOG(ERROR) << "P2PHotStandbyService: failed to read trim horizon";
-        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        state_machine_.ProcessEvent(P2PStandbyEvent::FATAL_ERROR);
         return ErrorCode::INTERNAL_ERROR;
     }
     std::vector<std::string> discovered_snapshot_sources;
@@ -101,7 +101,7 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
                               "bootstrap failed"
                            << ", baseline_sequence_id=" << baseline_sequence_id
                            << ", trimmed_sequence_id=" << trimmed_sequence_id;
-                state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                state_machine_.ProcessEvent(P2PStandbyEvent::FATAL_ERROR);
                 return bootstrap_err;
             }
             LOG(WARNING) << "P2PHotStandbyService: optional peer bootstrap "
@@ -113,7 +113,7 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
     auto latest_err = probe_store->GetLatestSequenceId(initial_sync_target);
     if (latest_err != ErrorCode::OK) {
         LOG(ERROR) << "P2PHotStandbyService: failed to get initial sync target";
-        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        state_machine_.ProcessEvent(P2PStandbyEvent::FATAL_ERROR);
         return latest_err;
     }
     if (snapshot_bootstrap_succeeded) {
@@ -132,7 +132,7 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
         LOG(ERROR) << "P2PHotStandbyService: failed to start oplog following"
                    << ", baseline_sequence_id=" << baseline_sequence_id
                    << ", err=" << err;
-        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        state_machine_.ProcessEvent(P2PStandbyEvent::FATAL_ERROR);
         ResetOplogFollowingLocked();
         return err;
     }
@@ -151,14 +151,14 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
                 LOG(ERROR) << "P2PHotStandbyService: initial snapshot resync "
                               "failed"
                            << ", error=" << toString(resync_err);
-                state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                state_machine_.ProcessEvent(P2PStandbyEvent::FATAL_ERROR);
                 ResetOplogFollowingLocked();
                 return resync_err;
             }
             snapshot_resync_required_.store(false);
         } else {
             if (oplog_applier_ && !oplog_applier_->IsHealthy() &&
-                state_machine_.GetState() == StandbyState::FAILED) {
+                state_machine_.GetState() == P2PStandbyState::FAILED) {
                 // TODO(P2P HA): Decide whether supervisor startup should fail
                 // here instead of joining election with a FAILED standby.
                 LOG(ERROR) << "P2PHotStandbyService: initial apply failed; "
@@ -171,7 +171,7 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
                        << ", target_sequence_id=" << initial_sync_target
                        << ", applied_sequence_id="
                        << GetLocalLastAppliedSequenceIdLocked();
-            state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+            state_machine_.ProcessEvent(P2PStandbyEvent::FATAL_ERROR);
             ResetOplogFollowingLocked();
             return ErrorCode::INTERNAL_ERROR;
         }
@@ -182,13 +182,13 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
                   << GetLocalLastAppliedSequenceIdLocked();
     }
 
-    state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
+    state_machine_.ProcessEvent(P2PStandbyEvent::SYNC_COMPLETE);
     StartRecoveryWorker();
     auto snapshot_server_err = StartSnapshotServer();
     if (snapshot_server_err != ErrorCode::OK) {
         StopRecoveryWorker();
         ResetOplogFollowingLocked();
-        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        state_machine_.ProcessEvent(P2PStandbyEvent::FATAL_ERROR);
         return snapshot_server_err;
     }
     LOG(INFO) << "P2PHotStandbyService started"
@@ -225,7 +225,7 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
     oplog_replicator_ = std::make_unique<OpLogReplicator>(
         oplog_change_notifier_.get(), oplog_applier_.get());
     oplog_replicator_->SetStateCallback(
-        [this](StandbyEvent event) { OnWatcherEvent(event); });
+        [this](P2PStandbyEvent event) { OnWatcherEvent(event); });
 
     static constexpr int kMaxStartRetries = 3;
     for (int attempt = 0; attempt < kMaxStartRetries; ++attempt) {
@@ -275,9 +275,9 @@ void P2PHotStandbyService::Stop() {
 
     ResetOplogFollowingLocked();
 
-    StandbyState state = state_machine_.GetState();
-    if (state != StandbyState::STOPPED) {
-        auto result = state_machine_.ProcessEvent(StandbyEvent::STOP);
+    P2PStandbyState state = state_machine_.GetState();
+    if (state != P2PStandbyState::STOPPED) {
+        auto result = state_machine_.ProcessEvent(P2PStandbyEvent::STOP);
         if (!result.allowed) {
             LOG(WARNING) << "P2PHotStandbyService: stop transition rejected: "
                          << result.reason;
@@ -292,10 +292,10 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
         const bool apply_failed =
             oplog_applier_ != nullptr && !oplog_applier_->IsHealthy();
         const bool force_apply_failure =
-            force && apply_failed && GetState() == StandbyState::FAILED;
+            force && apply_failed && GetState() == P2PStandbyState::FAILED;
         if (!IsReadyForPromotion() && !force_apply_failure) {
             LOG(ERROR) << "P2PHotStandbyService: not ready for promotion"
-                       << ", state=" << StandbyStateToString(GetState())
+                       << ", state=" << P2PStandbyStateToString(GetState())
                        << ", apply_healthy=" << !apply_failed;
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
@@ -306,18 +306,18 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
     const bool apply_failed =
         oplog_applier_ != nullptr && !oplog_applier_->IsHealthy();
     const bool force_apply_failure =
-        force && apply_failed && GetState() == StandbyState::FAILED;
+        force && apply_failed && GetState() == P2PStandbyState::FAILED;
     if (!IsReadyForPromotion() && !force_apply_failure) {
         LOG(ERROR) << "P2PHotStandbyService: not ready for promotion"
-                   << ", state=" << StandbyStateToString(GetState())
+                   << ", state=" << P2PStandbyStateToString(GetState())
                    << ", apply_healthy=" << !apply_failed;
         RestoreRecoveryWorker();
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
     auto promote_result = state_machine_.ProcessEvent(
-        force_apply_failure ? StandbyEvent::FORCE_PROMOTE
-                            : StandbyEvent::PROMOTE);
+        force_apply_failure ? P2PStandbyEvent::FORCE_PROMOTE
+                            : P2PStandbyEvent::PROMOTE);
     if (!promote_result.allowed) {
         LOG(ERROR) << "P2PHotStandbyService: cannot promote: "
                    << promote_result.reason;
@@ -359,12 +359,12 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
                       "failed"
                    << ", applied_before_catch_up=" << applied_before_catch_up
                    << ", err=" << err;
-        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        state_machine_.ProcessEvent(P2PStandbyEvent::PROMOTION_FAILED);
         ResetOplogFollowingLocked();
         return err;
     }
 
-    auto success = state_machine_.ProcessEvent(StandbyEvent::PROMOTION_SUCCESS);
+    auto success = state_machine_.ProcessEvent(P2PStandbyEvent::PROMOTION_SUCCESS);
     if (!success.allowed) {
         LOG(ERROR) << "P2PHotStandbyService: cannot finish promotion: "
                    << success.reason;
@@ -691,7 +691,7 @@ bool P2PHotStandbyService::WaitForAppliedSequenceLocked(
         if (stop_on_snapshot_resync && snapshot_resync_required_.load()) {
             return false;
         }
-        if (state_machine_.GetState() == StandbyState::FAILED) {
+        if (state_machine_.GetState() == P2PStandbyState::FAILED) {
             return false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -777,20 +777,20 @@ std::vector<std::string> P2PHotStandbyService::DiscoverSnapshotSources() const {
     return endpoints;
 }
 
-void P2PHotStandbyService::OnWatcherEvent(StandbyEvent event) {
+void P2PHotStandbyService::OnWatcherEvent(P2PStandbyEvent event) {
     auto result = state_machine_.ProcessEvent(event);
     if (!result.allowed) {
         VLOG(1) << "P2PHotStandbyService: watcher event rejected"
-                << ", event=" << StandbyEventToString(event)
+                << ", event=" << P2PStandbyEventToString(event)
                 << ", reason=" << result.reason;
     }
-    if (event == StandbyEvent::RESYNC_REQUIRED && result.allowed) {
+    if (event == P2PStandbyEvent::RESYNC_REQUIRED && result.allowed) {
         snapshot_resync_required_.store(true);
         LOG(WARNING) << "P2PHotStandbyService: OpLog trim horizon passed; "
                         "switching to snapshot bootstrap";
         RequestRecovery();
     } else if (result.allowed &&
-               result.new_state == StandbyState::RECONNECTING) {
+               result.new_state == P2PStandbyState::RECONNECTING) {
         RequestRecovery();
     }
 }
@@ -818,7 +818,7 @@ void P2PHotStandbyService::StopRecoveryWorker() {
 
 void P2PHotStandbyService::RestoreRecoveryWorker() {
     StartRecoveryWorker();
-    if (state_machine_.GetState() == StandbyState::RECONNECTING) {
+    if (state_machine_.GetState() == P2PStandbyState::RECONNECTING) {
         RequestRecovery();
     }
 }
@@ -859,7 +859,7 @@ void P2PHotStandbyService::RecoveryLoop() {
                 std::lock_guard<std::mutex> lock(mutex_);
                 const bool snapshot_resync = snapshot_resync_required_.load();
                 if (!snapshot_resync &&
-                    state_machine_.GetState() != StandbyState::RECONNECTING) {
+                    state_machine_.GetState() != P2PStandbyState::RECONNECTING) {
                     recovery_lock.lock();
                     break;
                 }
@@ -872,21 +872,21 @@ void P2PHotStandbyService::RecoveryLoop() {
                     if (err == ErrorCode::OK) {
                         snapshot_resync_required_.store(false);
                         auto result = state_machine_.ProcessEvent(
-                            StandbyEvent::SYNC_COMPLETE);
+                            P2PStandbyEvent::SYNC_COMPLETE);
                         const bool watching =
-                            state_machine_.GetState() == StandbyState::WATCHING;
+                            state_machine_.GetState() == P2PStandbyState::WATCHING;
                         const bool healthy =
                             oplog_replicator_ && oplog_replicator_->IsHealthy();
                         if ((!result.allowed && !watching) || !healthy) {
                             if (watching) {
                                 state_machine_.ProcessEvent(
-                                    StandbyEvent::WATCH_BROKEN);
+                                    P2PStandbyEvent::WATCH_BROKEN);
                             }
                             LOG(ERROR)
                                 << "P2PHotStandbyService: snapshot resync "
                                    "reader is not healthy"
                                 << ", state="
-                                << StandbyStateToString(
+                                << P2PStandbyStateToString(
                                        state_machine_.GetState())
                                 << ", transition_allowed=" << result.allowed;
                             err = ErrorCode::INTERNAL_ERROR;
@@ -899,25 +899,25 @@ void P2PHotStandbyService::RecoveryLoop() {
                     err = StartOplogFollowingLocked(resume_sequence_id);
                     if (err == ErrorCode::OK) {
                         const bool watching =
-                            state_machine_.GetState() == StandbyState::WATCHING;
+                            state_machine_.GetState() == P2PStandbyState::WATCHING;
                         const bool healthy =
                             oplog_replicator_ && oplog_replicator_->IsHealthy();
                         if (!watching || !healthy) {
                             if (watching) {
                                 state_machine_.ProcessEvent(
-                                    StandbyEvent::WATCH_BROKEN);
+                                    P2PStandbyEvent::WATCH_BROKEN);
                             }
                             LOG(ERROR)
                                 << "P2PHotStandbyService: recovered OpLog "
                                    "reader is not healthy"
                                 << ", state="
-                                << StandbyStateToString(
+                                << P2PStandbyStateToString(
                                        state_machine_.GetState());
                             err = ErrorCode::INTERNAL_ERROR;
                         }
                     } else {
                         state_machine_.ProcessEvent(
-                            StandbyEvent::RECOVERY_FAILED);
+                            P2PStandbyEvent::RECOVERY_FAILED);
                     }
                 }
             }

@@ -51,7 +51,7 @@ struct P2PStandbySyncStatus {
     uint64_t failed_sequence_id{0};
     int failed_op_type{-1};
     std::string failure_reason;
-    StandbyState state{StandbyState::STOPPED};
+    P2PStandbyState state{P2PStandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
 };
 
@@ -90,7 +90,7 @@ class P2PHotStandbyService {
         uint64_t sequence_id,
         std::chrono::milliseconds timeout = std::chrono::seconds(5)) const;
 
-    StandbyState GetState() const { return state_machine_.GetState(); }
+    P2PStandbyState GetState() const { return state_machine_.GetState(); }
     P2PStandbyMetadataStore* GetMetadataStore() const {
         return metadata_store_.get();
     }
@@ -105,7 +105,7 @@ class P2PHotStandbyService {
     void ResetOplogFollowingLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
-    void OnWatcherEvent(StandbyEvent event);
+    void OnWatcherEvent(P2PStandbyEvent event);
     void StartRecoveryWorker();
     void StopRecoveryWorker();
     void RestoreRecoveryWorker();

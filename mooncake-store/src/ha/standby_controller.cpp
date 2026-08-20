@@ -7,6 +7,7 @@
 
 #include <glog/logging.h>
 
+#include "ha/p2p_standby_controller.h"
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "hot_standby_service.h"
 
@@ -351,6 +352,10 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
 std::unique_ptr<StandbyController> CreateStandbyController(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
+    if (config.deployment_mode == DeploymentMode::P2P) {
+        return std::make_unique<P2PStandbyController>(spec, config);
+    }
+
     const auto capabilities = BuildStandbyRuntimeCapabilities(spec, config);
     if (capabilities.has_snapshot_bootstrap ||
         capabilities.has_oplog_following) {

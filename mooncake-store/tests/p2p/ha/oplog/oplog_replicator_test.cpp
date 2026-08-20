@@ -14,7 +14,6 @@
 #include <xxhash.h>
 
 #include "metadata_store.h"
-#include "p2p/ha/oplog/oplog_applier.h"
 #include "p2p/ha/oplog/oplog_change_notifier.h"
 #include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/ha/oplog/oplog_serializer.h"
@@ -182,8 +181,8 @@ TEST_F(OpLogReplicatorTest, InjectMultipleEntries_SequenceTracking) {
 
 TEST_F(OpLogReplicatorTest, InjectError_NotifiesCallback) {
     bool error_received = false;
-    replicator_->SetStateCallback([&](StandbyEvent event) {
-        if (event == StandbyEvent::WATCH_BROKEN) {
+    replicator_->SetStateCallback([&](P2PStandbyEvent event) {
+        if (event == P2PStandbyEvent::WATCH_BROKEN) {
             error_received = true;
         }
     });
@@ -196,8 +195,8 @@ TEST_F(OpLogReplicatorTest, InjectError_NotifiesCallback) {
 
 TEST_F(OpLogReplicatorTest, FatalApplyFailureMarksReplicatorUnhealthy) {
     bool fatal_error_received = false;
-    replicator_->SetStateCallback([&](StandbyEvent event) {
-        if (event == StandbyEvent::FATAL_ERROR) {
+    replicator_->SetStateCallback([&](P2PStandbyEvent event) {
+        if (event == P2PStandbyEvent::FATAL_ERROR) {
             fatal_error_received = true;
         }
     });

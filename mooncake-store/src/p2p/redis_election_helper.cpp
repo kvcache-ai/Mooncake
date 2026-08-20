@@ -196,14 +196,14 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
     ScopeGuard operation([this] { EndBlockingOperation(); });
     const auto election_start = std::chrono::steady_clock::now();
     while (!cancel_election_) {
-        HAMetricManager::instance().inc_election_attempts();
+        P2PHAMetricManager::instance().inc_election_attempts();
         bool connected = false;
         {
             std::lock_guard<std::mutex> lock(election_mutex_);
             if (!election_ctx_) {
                 election_ctx_ = CreateConnection();
                 if (!election_ctx_) {
-                    HAMetricManager::instance().inc_election_failures();
+                    P2PHAMetricManager::instance().inc_election_failures();
                     LOG(ERROR) << "ElectLeader: connect failed, retry in 1s";
                 }
             }
@@ -229,8 +229,8 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
                 std::lock_guard<std::mutex> lock(election_mutex_);
                 PublishLeaderEvent(master_address, version);
             }
-            HAMetricManager::instance().set_election_is_leader(true);
-            HAMetricManager::instance().observe_election_duration_ms(
+            P2PHAMetricManager::instance().set_election_is_leader(true);
+            P2PHAMetricManager::instance().observe_election_duration_ms(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - election_start)
                     .count());
@@ -281,7 +281,7 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
         candidate_id.size()));
 
     if (!reply) {
-        HAMetricManager::instance().inc_election_failures();
+        P2PHAMetricManager::instance().inc_election_failures();
 
         // The script may have completed before the response was lost. After
         // reconnecting, identify our write by its per-attempt candidate ID.
@@ -326,7 +326,7 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
 
     if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2 ||
         element_type(0) != REDIS_REPLY_INTEGER) {
-        HAMetricManager::instance().inc_election_failures();
+        P2PHAMetricManager::instance().inc_election_failures();
         LOG(WARNING) << "TryElectOnce: unexpected election script reply"
                      << ", type=" << reply->type
                      << ", elements=" << reply->elements
@@ -378,8 +378,8 @@ void RedisElectionHelper::WatchLeader() {
     }
 
     // Slow path (fallback): pure polling — use a separate connection
-    HAMetricManager::instance().inc_election_watch_failures();
-    HAMetricManager::instance().inc_election_polling_fallbacks();
+    P2PHAMetricManager::instance().inc_election_watch_failures();
+    P2PHAMetricManager::instance().inc_election_polling_fallbacks();
     WatchLeaderPolling();
 }
 
@@ -609,7 +609,7 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
         }
 
         if (!renewed) {
-            HAMetricManager::instance().inc_election_leadership_lost();
+            P2PHAMetricManager::instance().inc_election_leadership_lost();
             break;  // Lost leadership
         }
 
@@ -618,7 +618,7 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
     }
 
     keep_alive_running_ = false;
-    HAMetricManager::instance().set_election_is_leader(false);
+    P2PHAMetricManager::instance().set_election_is_leader(false);
     LOG(INFO) << "KeepLeader: exited renewal loop";
 }
 
@@ -721,7 +721,7 @@ bool RedisElectionHelper::Reconnect(redisContext*& ctx) {
     }
 
     LOG(INFO) << "Reconnect: successfully reconnected to Redis";
-    HAMetricManager::instance().inc_election_reconnects();
+    P2PHAMetricManager::instance().inc_election_reconnects();
     return true;
 }
 
@@ -737,7 +737,7 @@ bool RedisElectionHelper::ReconnectSubscribeLocked(bool record_metric) {
     }
     LOG(INFO) << "ReconnectSubscribe: subscribe connection ready";
     if (record_metric) {
-        HAMetricManager::instance().inc_election_reconnects();
+        P2PHAMetricManager::instance().inc_election_reconnects();
     }
     return true;
 }

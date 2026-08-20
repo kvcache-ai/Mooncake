@@ -17,7 +17,7 @@ namespace mooncake {
 class P2POpLogApplierBase;
 
 // Callback type for state events
-using ReplicatorStateCallback = std::function<void(StandbyEvent)>;
+using ReplicatorStateCallback = std::function<void(P2PStandbyEvent)>;
 
 /**
  * @brief Replicate OpLog entries from a remote source and apply them locally.
@@ -73,7 +73,7 @@ class OpLogReplicator {
     void AdvanceLastProcessedSequenceId(uint64_t sequence_id);
     void ReportApplyFailureIfNeeded();
 
-    void NotifyStateEvent(StandbyEvent event) {
+    void NotifyStateEvent(P2PStandbyEvent event) {
         if (state_callback_) {
             state_callback_(event);
         }

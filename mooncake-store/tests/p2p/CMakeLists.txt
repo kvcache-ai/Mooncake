@@ -47,3 +47,11 @@ add_store_test(p2p_oplog_replicator_test ha/oplog/oplog_replicator_test.cpp)
 add_store_test(p2p_oplog_serializer_test ha/oplog/oplog_serializer_test.cpp)
 add_store_test(p2p_localfs_oplog_store_test ha/oplog/localfs_oplog_store_test.cpp)
 # add_store_test(p2p_redis_oplog_store_test ha/oplog/redis_oplog_store_test.cpp)  # requires Redis
+
+# P2P HA integration tests (no external deps; uses InProcP2PMaster)
+add_store_test(ha_integration_test ha_integration_test.cpp)
+
+# P2P client HA test (requires Redis for some sub-tests; gated)
+if(STORE_USE_REDIS)
+    add_store_test(p2p_client_ha_test client/p2p_client_ha_test.cpp)
+endif()

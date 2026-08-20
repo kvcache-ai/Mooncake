@@ -342,10 +342,17 @@ int TcpTransport::install(std::string& local_server_name,
     close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
     auto metadata = metadata_;
-    context_ = new TcpContext(tcp_port, [metadata = std::move(metadata)](
-                                            uint64_t addr, uint64_t size) {
-        return validateTcpAddress(metadata, addr, size);
-    });
+    // In P2P handshake mode (trusted peer endpoints) skip the registered-buffer
+    // address validation that the centralized deployment enforces; P2P reverse
+    // read/write paths pass caller-supplied raw buffers directly.
+    std::function<bool(uint64_t, uint64_t)> validator = nullptr;
+    if (!metadata->p2pHandshakeMode()) {
+        validator = [metadata = std::move(metadata)](
+            uint64_t addr, uint64_t size) {
+            return validateTcpAddress(metadata, addr, size);
+        };
+    }
+    context_ = new TcpContext(tcp_port, std::move(validator));
     lane_runtime_ =
         std::make_shared<ConnectionLaneRuntime>(context_->io_context);
     lane_state_->runtime = lane_runtime_;

@@ -54,6 +54,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/leadership/master_service_supervisor.cpp
     ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
+    ha/p2p_standby_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/master_snapshot_codec.cpp
@@ -238,6 +239,7 @@ if(STORE_USE_REDIS)
   list(APPEND MOONCAKE_STORE_SOURCES p2p/ha/oplog/redis_oplog_store.cpp)
   list(APPEND MOONCAKE_STORE_SOURCES p2p/redis_election_helper.cpp)
   list(APPEND MOONCAKE_STORE_SOURCES p2p/redis_master_view_helper.cpp)
+  list(APPEND MOONCAKE_STORE_SOURCES p2p/redis_util.cpp)
   list(APPEND EXTRA_LIBS ${MOONCAKE_STORE_HIREDIS_LIBRARY})
 endif()
 

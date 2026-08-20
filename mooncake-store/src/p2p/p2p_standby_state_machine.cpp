@@ -10,7 +10,7 @@ P2PStandbyStateMachine::P2PStandbyStateMachine()
     : state_enter_time_(std::chrono::steady_clock::now()) {}
 
 StateTransitionResult P2PStandbyStateMachine::ValidateTransition(
-    StandbyState from, StandbyEvent event) const {
+    P2PStandbyState from, P2PStandbyEvent event) const {
     StateTransitionResult result;
     result.allowed = false;
     result.old_state = from;
@@ -18,213 +18,213 @@ StateTransitionResult P2PStandbyStateMachine::ValidateTransition(
 
     // State transition table
     switch (from) {
-        case StandbyState::STOPPED:
-            if (event == StandbyEvent::START) {
+        case P2PStandbyState::STOPPED:
+            if (event == P2PStandbyEvent::START) {
                 result.allowed = true;
-                result.new_state = StandbyState::CONNECTING;
+                result.new_state = P2PStandbyState::CONNECTING;
             }
             break;
 
-        case StandbyState::CONNECTING:
+        case P2PStandbyState::CONNECTING:
             switch (event) {
-                case StandbyEvent::CONNECTED:
+                case P2PStandbyEvent::CONNECTED:
                     result.allowed = true;
-                    result.new_state = StandbyState::SYNCING;
+                    result.new_state = P2PStandbyState::SYNCING;
                     break;
-                case StandbyEvent::CONNECTION_FAILED:
-                case StandbyEvent::FATAL_ERROR:
+                case P2PStandbyEvent::CONNECTION_FAILED:
+                case P2PStandbyEvent::FATAL_ERROR:
                     result.allowed = true;
-                    result.new_state = StandbyState::FAILED;
+                    result.new_state = P2PStandbyState::FAILED;
                     break;
-                case StandbyEvent::STOP:
+                case P2PStandbyEvent::STOP:
                     result.allowed = true;
-                    result.new_state = StandbyState::STOPPED;
+                    result.new_state = P2PStandbyState::STOPPED;
                     break;
                 default:
                     break;
             }
             break;
 
-        case StandbyState::SYNCING:
+        case P2PStandbyState::SYNCING:
             switch (event) {
-                case StandbyEvent::SYNC_COMPLETE:
+                case P2PStandbyEvent::SYNC_COMPLETE:
                     result.allowed = true;
-                    result.new_state = StandbyState::WATCHING;
+                    result.new_state = P2PStandbyState::WATCHING;
                     break;
-                case StandbyEvent::SYNC_FAILED:
-                case StandbyEvent::DISCONNECTED:
+                case P2PStandbyEvent::SYNC_FAILED:
+                case P2PStandbyEvent::DISCONNECTED:
                     result.allowed = true;
-                    result.new_state = StandbyState::RECONNECTING;
+                    result.new_state = P2PStandbyState::RECONNECTING;
                     break;
-                case StandbyEvent::RESYNC_REQUIRED:
+                case P2PStandbyEvent::RESYNC_REQUIRED:
                     result.allowed = true;
-                    result.new_state = StandbyState::SYNCING;
+                    result.new_state = P2PStandbyState::SYNCING;
                     break;
-                case StandbyEvent::STOP:
+                case P2PStandbyEvent::STOP:
                     result.allowed = true;
-                    result.new_state = StandbyState::STOPPED;
+                    result.new_state = P2PStandbyState::STOPPED;
                     break;
-                case StandbyEvent::FATAL_ERROR:
+                case P2PStandbyEvent::FATAL_ERROR:
                     result.allowed = true;
-                    result.new_state = StandbyState::FAILED;
+                    result.new_state = P2PStandbyState::FAILED;
                     break;
                 default:
                     break;
             }
             break;
 
-        case StandbyState::WATCHING:
+        case P2PStandbyState::WATCHING:
             switch (event) {
-                case StandbyEvent::WATCH_BROKEN:
-                case StandbyEvent::DISCONNECTED:
+                case P2PStandbyEvent::WATCH_BROKEN:
+                case P2PStandbyEvent::DISCONNECTED:
                     result.allowed = true;
-                    result.new_state = StandbyState::RECONNECTING;
+                    result.new_state = P2PStandbyState::RECONNECTING;
                     break;
-                case StandbyEvent::RESYNC_REQUIRED:
+                case P2PStandbyEvent::RESYNC_REQUIRED:
                     result.allowed = true;
-                    result.new_state = StandbyState::SYNCING;
+                    result.new_state = P2PStandbyState::SYNCING;
                     break;
-                case StandbyEvent::MAX_ERRORS_REACHED:
+                case P2PStandbyEvent::MAX_ERRORS_REACHED:
                     result.allowed = true;
-                    result.new_state = StandbyState::RECOVERING;
+                    result.new_state = P2PStandbyState::RECOVERING;
                     break;
-                case StandbyEvent::PROMOTE:
+                case P2PStandbyEvent::PROMOTE:
                     result.allowed = true;
-                    result.new_state = StandbyState::PROMOTING;
+                    result.new_state = P2PStandbyState::PROMOTING;
                     break;
-                case StandbyEvent::STOP:
+                case P2PStandbyEvent::STOP:
                     result.allowed = true;
-                    result.new_state = StandbyState::STOPPED;
+                    result.new_state = P2PStandbyState::STOPPED;
                     break;
-                case StandbyEvent::FATAL_ERROR:
+                case P2PStandbyEvent::FATAL_ERROR:
                     result.allowed = true;
-                    result.new_state = StandbyState::FAILED;
+                    result.new_state = P2PStandbyState::FAILED;
                     break;
                 // WATCH_HEALTHY in WATCHING state is a no-op (stay in WATCHING)
-                case StandbyEvent::WATCH_HEALTHY:
+                case P2PStandbyEvent::WATCH_HEALTHY:
                     result.allowed = true;
-                    result.new_state = StandbyState::WATCHING;
+                    result.new_state = P2PStandbyState::WATCHING;
                     break;
                 default:
                     break;
             }
             break;
 
-        case StandbyState::RECOVERING:
+        case P2PStandbyState::RECOVERING:
             switch (event) {
-                case StandbyEvent::RECOVERY_SUCCESS:
+                case P2PStandbyEvent::RECOVERY_SUCCESS:
                     result.allowed = true;
-                    result.new_state = StandbyState::WATCHING;
+                    result.new_state = P2PStandbyState::WATCHING;
                     break;
-                case StandbyEvent::RECOVERY_FAILED:
-                case StandbyEvent::DISCONNECTED:
+                case P2PStandbyEvent::RECOVERY_FAILED:
+                case P2PStandbyEvent::DISCONNECTED:
                     result.allowed = true;
-                    result.new_state = StandbyState::RECONNECTING;
+                    result.new_state = P2PStandbyState::RECONNECTING;
                     break;
-                case StandbyEvent::STOP:
+                case P2PStandbyEvent::STOP:
                     result.allowed = true;
-                    result.new_state = StandbyState::STOPPED;
+                    result.new_state = P2PStandbyState::STOPPED;
                     break;
-                case StandbyEvent::FATAL_ERROR:
+                case P2PStandbyEvent::FATAL_ERROR:
                     result.allowed = true;
-                    result.new_state = StandbyState::FAILED;
+                    result.new_state = P2PStandbyState::FAILED;
                     break;
                 default:
                     break;
             }
             break;
 
-        case StandbyState::RECONNECTING:
+        case P2PStandbyState::RECONNECTING:
             switch (event) {
-                case StandbyEvent::RESYNC_REQUIRED:
+                case P2PStandbyEvent::RESYNC_REQUIRED:
                     result.allowed = true;
-                    result.new_state = StandbyState::SYNCING;
+                    result.new_state = P2PStandbyState::SYNCING;
                     break;
-                case StandbyEvent::CONNECTED:
+                case P2PStandbyEvent::CONNECTED:
                     result.allowed = true;
-                    result.new_state = StandbyState::SYNCING;
+                    result.new_state = P2PStandbyState::SYNCING;
                     break;
-                case StandbyEvent::WATCH_HEALTHY:
+                case P2PStandbyEvent::WATCH_HEALTHY:
                     // Watch successfully re-established after reconnect
                     result.allowed = true;
-                    result.new_state = StandbyState::WATCHING;
+                    result.new_state = P2PStandbyState::WATCHING;
                     break;
-                case StandbyEvent::RECOVERY_SUCCESS:
+                case P2PStandbyEvent::RECOVERY_SUCCESS:
                     // Missed entries synced — ready to watch again
                     result.allowed = true;
-                    result.new_state = StandbyState::WATCHING;
+                    result.new_state = P2PStandbyState::WATCHING;
                     break;
-                case StandbyEvent::RECOVERY_FAILED:
+                case P2PStandbyEvent::RECOVERY_FAILED:
                     // Sync failed — stay in RECONNECTING and retry
                     result.allowed = true;
-                    result.new_state = StandbyState::RECONNECTING;
+                    result.new_state = P2PStandbyState::RECONNECTING;
                     break;
-                case StandbyEvent::MAX_ERRORS_REACHED:
-                case StandbyEvent::FATAL_ERROR:
+                case P2PStandbyEvent::MAX_ERRORS_REACHED:
+                case P2PStandbyEvent::FATAL_ERROR:
                     result.allowed = true;
-                    result.new_state = StandbyState::FAILED;
+                    result.new_state = P2PStandbyState::FAILED;
                     break;
-                case StandbyEvent::STOP:
+                case P2PStandbyEvent::STOP:
                     result.allowed = true;
-                    result.new_state = StandbyState::STOPPED;
+                    result.new_state = P2PStandbyState::STOPPED;
                     break;
                 default:
                     break;
             }
             break;
 
-        case StandbyState::PROMOTING:
+        case P2PStandbyState::PROMOTING:
             switch (event) {
-                case StandbyEvent::PROMOTION_SUCCESS:
+                case P2PStandbyEvent::PROMOTION_SUCCESS:
                     result.allowed = true;
-                    result.new_state = StandbyState::PROMOTED;
+                    result.new_state = P2PStandbyState::PROMOTED;
                     break;
-                case StandbyEvent::PROMOTION_FAILED:
+                case P2PStandbyEvent::PROMOTION_FAILED:
                     result.allowed = true;
-                    result.new_state = StandbyState::FAILED;
+                    result.new_state = P2PStandbyState::FAILED;
                     break;
-                case StandbyEvent::STOP:
+                case P2PStandbyEvent::STOP:
                     result.allowed = true;
-                    result.new_state = StandbyState::STOPPED;
+                    result.new_state = P2PStandbyState::STOPPED;
                     break;
                 default:
                     break;
             }
             break;
 
-        case StandbyState::PROMOTED:
-            if (event == StandbyEvent::STOP) {
+        case P2PStandbyState::PROMOTED:
+            if (event == P2PStandbyEvent::STOP) {
                 result.allowed = true;
-                result.new_state = StandbyState::STOPPED;
+                result.new_state = P2PStandbyState::STOPPED;
             }
             break;
 
-        case StandbyState::FAILED:
-            if (event == StandbyEvent::STOP) {
+        case P2PStandbyState::FAILED:
+            if (event == P2PStandbyEvent::STOP) {
                 result.allowed = true;
-                result.new_state = StandbyState::STOPPED;
-            } else if (event == StandbyEvent::START) {
+                result.new_state = P2PStandbyState::STOPPED;
+            } else if (event == P2PStandbyEvent::START) {
                 // Allow restart from FAILED state
                 result.allowed = true;
-                result.new_state = StandbyState::CONNECTING;
-            } else if (event == StandbyEvent::FORCE_PROMOTE) {
+                result.new_state = P2PStandbyState::CONNECTING;
+            } else if (event == P2PStandbyEvent::FORCE_PROMOTE) {
                 result.allowed = true;
-                result.new_state = StandbyState::PROMOTING;
+                result.new_state = P2PStandbyState::PROMOTING;
             }
             break;
     }
 
     if (!result.allowed) {
         result.reason = std::string("Invalid transition from ") +
-                        StandbyStateToString(from) + " on event " +
-                        StandbyEventToString(event);
+                        P2PStandbyStateToString(from) + " on event " +
+                        P2PStandbyEventToString(event);
     }
 
     return result;
 }
 
-StateTransitionResult P2PStandbyStateMachine::ProcessEvent(StandbyEvent event) {
-    StandbyState old_state = current_state_.load(std::memory_order_acquire);
+StateTransitionResult P2PStandbyStateMachine::ProcessEvent(P2PStandbyEvent event) {
+    P2PStandbyState old_state = current_state_.load(std::memory_order_acquire);
     StateTransitionResult result = ValidateTransition(old_state, event);
 
     std::vector<StateChangeCallback> callbacks_copy;
@@ -232,7 +232,7 @@ StateTransitionResult P2PStandbyStateMachine::ProcessEvent(StandbyEvent event) {
         std::lock_guard<std::mutex> lock(mutex_);
 
         // Double-check state hasn't changed (compare-and-swap pattern)
-        StandbyState current = current_state_.load(std::memory_order_acquire);
+        P2PStandbyState current = current_state_.load(std::memory_order_acquire);
         if (current != old_state) {
             // State changed by another thread, re-validate
             result = ValidateTransition(current, event);
@@ -263,9 +263,9 @@ StateTransitionResult P2PStandbyStateMachine::ProcessEvent(StandbyEvent event) {
         P2PHAMetricManager::instance().inc_state_transitions();
 
         LOG(INFO) << "Standby state transition: "
-                  << StandbyStateToString(old_state) << " -> "
-                  << StandbyStateToString(result.new_state)
-                  << " (event: " << StandbyEventToString(event) << ")";
+                  << P2PStandbyStateToString(old_state) << " -> "
+                  << P2PStandbyStateToString(result.new_state)
+                  << " (event: " << P2PStandbyEventToString(event) << ")";
 
         // Copy callbacks while holding the lock; invoke them after releasing
         // the lock to avoid deadlock (callbacks may re-enter ProcessEvent).
@@ -313,7 +313,7 @@ int P2PStandbyStateMachine::IncrementErrors() {
     int new_count = consecutive_errors_.fetch_add(1) + 1;
     if (new_count >= kMaxConsecutiveErrors) {
         // Trigger MAX_ERRORS_REACHED event
-        ProcessEvent(StandbyEvent::MAX_ERRORS_REACHED);
+        ProcessEvent(P2PStandbyEvent::MAX_ERRORS_REACHED);
     }
     return new_count;
 }

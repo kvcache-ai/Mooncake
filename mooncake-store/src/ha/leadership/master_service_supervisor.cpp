@@ -17,6 +17,8 @@
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
+#include "p2p/ha/p2p_promotion_data.h"
+#include "p2p/p2p_master_service.h"
 #include "p2p/p2p_rpc_service.h"
 #include "rpc_service.h"
 
@@ -159,8 +161,13 @@ void SetRuntimeState(MasterAdminServer& admin_server,
 void ActivateServingState(MasterAdminServer& admin_server,
                           const std::shared_ptr<WrappedMasterService>& service,
                           LeaderLabelReconciler& label_reconciler) {
-    admin_server.SetServiceDelegate(service);
-    admin_server.SetServiceAvailable(true);
+    if (service) {
+        admin_server.SetServiceDelegate(service);
+        admin_server.SetServiceAvailable(true);
+    }
+    // P2P mode passes a null delegate (WrappedP2PMasterService does not
+    // inherit WrappedMasterService, design §2.1); advanced admin endpoints
+    // are unavailable in P2P mode, basic runtime/health endpoints still work.
     SetRuntimeState(admin_server, MasterRuntimeState::kServing);
     label_reconciler.SetLeader(true);
 }
@@ -408,6 +415,32 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         } else {
             auto p2p_wrapped = std::make_unique<WrappedP2PMasterService>(
                 wrapped_config);
+            if (promotion_ctx->p2p_promotion_data.has_value()) {
+                auto p2p_data = std::any_cast<P2PPromotionData>(
+                    &(promotion_ctx->p2p_promotion_data));
+                if (p2p_data) {
+                    auto& p2p_master_service =
+                        static_cast<P2PMasterService&>(
+                            p2p_wrapped->GetMasterService());
+                    auto restore_err =
+                        p2p_master_service.RestoreFromStandbyMetadata(
+                            p2p_data->metadata, p2p_data->applied_sequence_id);
+                    if (restore_err != ErrorCode::OK) {
+                        LOG(ERROR) << "Failed to restore P2P promoted metadata"
+                                   << ", error=" << toString(restore_err);
+                        DeactivateServingState(admin_server, label_reconciler);
+                        EnterStandbyMode(admin_server, *standby_controller,
+                                         accept_standby_runtime_updates,
+                                         leadership_session->view);
+                        if (HandleSupervisorError(
+                                "restore P2P promoted metadata", restore_err,
+                                spec.type)) {
+                            return -1;
+                        }
+                        continue;
+                    }
+                }
+            }
             mooncake::RegisterP2PRpcService(server, *p2p_wrapped);
         }
 

@@ -46,8 +46,8 @@ bool OpLogReplicator::StartFromSequenceId(uint64_t start_seq_id) {
         LOG(ERROR) << "OpLogReplicator: notifier error="
                    << static_cast<int>(err);
         NotifyStateEvent(err == ErrorCode::OPLOG_TRIMMED
-                             ? StandbyEvent::RESYNC_REQUIRED
-                             : StandbyEvent::WATCH_BROKEN);
+                             ? P2PStandbyEvent::RESYNC_REQUIRED
+                             : P2PStandbyEvent::WATCH_BROKEN);
     };
 
     auto on_maintenance =
@@ -75,7 +75,7 @@ bool OpLogReplicator::StartFromSequenceId(uint64_t start_seq_id) {
     }
 
     running_.store(true);
-    NotifyStateEvent(StandbyEvent::WATCH_HEALTHY);
+    NotifyStateEvent(P2PStandbyEvent::WATCH_HEALTHY);
     LOG(INFO) << "OpLogReplicator started from sequence_id=" << start_seq_id;
     return true;
 }
@@ -104,7 +104,7 @@ void OpLogReplicator::ReportApplyFailureIfNeeded() {
     }
     LOG(ERROR) << "OpLogReplicator: critical apply failure"
                << ", sequence_id=" << applier_->GetFailedSequenceId();
-    NotifyStateEvent(StandbyEvent::FATAL_ERROR);
+    NotifyStateEvent(P2PStandbyEvent::FATAL_ERROR);
 }
 
 uint64_t OpLogReplicator::GetLastProcessedSequenceId() const {

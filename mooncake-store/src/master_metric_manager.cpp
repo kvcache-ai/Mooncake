@@ -2128,6 +2128,14 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(add_replica_failures_);
     serialize_metric(remove_replica_requests_);
     serialize_metric(remove_replica_failures_);
+    // Serialize client lifecycle counters
+    serialize_metric(register_client_requests_);
+    serialize_metric(register_client_failures_);
+    serialize_metric(unregister_client_requests_);
+    serialize_metric(unregister_client_failures_);
+    serialize_metric(clients_disconnected_total_);
+    serialize_metric(clients_recovered_total_);
+    serialize_metric(clients_crashed_total_);
 
     // Serialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
     // Counters
@@ -2907,6 +2915,25 @@ std::string MasterMetricManager::get_summary_string(
     ss << " | Snapshots: "
        << "Success=" << snapshot_success_.value() << ", "
        << "Fail=" << snapshot_fail_.value();
+
+    // P2P-RPC counters (cumulative)
+    ss << " | P2P-RPC: Heartbeat=" << heartbeat_requests_.value()
+       << "/" << heartbeat_failures_.value()
+       << " GetWriteRoute=" << get_write_route_requests_.value()
+       << "/" << get_write_route_failures_.value()
+       << " AddReplica=" << add_replica_requests_.value()
+       << "/" << add_replica_failures_.value()
+       << " RemoveReplica=" << remove_replica_requests_.value()
+       << "/" << remove_replica_failures_.value();
+
+    // Client lifecycle counters (cumulative)
+    ss << " | ClientLifecycle: Register=" << register_client_requests_.value()
+       << "/" << register_client_failures_.value()
+       << " Unregister=" << unregister_client_requests_.value()
+       << "/" << unregister_client_failures_.value()
+       << " Disconnected=" << clients_disconnected_total_.value()
+       << " Recovered=" << clients_recovered_total_.value()
+       << " Crashed=" << clients_crashed_total_.value();
 
     return ss.str();
 }

@@ -193,6 +193,9 @@ class P2PClientService final : public ClientService {
     tl::expected<RegisterClientResponse, ErrorCode> InnerRegisterClient()
         override REQUIRES(registration_mutex_);
 
+   protected:
+    // Exposed as protected (not private) so that P2P client HA tests can
+    // reach them via `#define protected public` (see p2p_client_ha_test.cpp).
     bool IsHAMode(const std::string& master_server_entry) const;
 
     ErrorCode ResolveMasterAddress(const std::string& master_server_entry,
@@ -485,9 +488,11 @@ class P2PClientService final : public ClientService {
     TransferDirectionMode transfer_direction_mode_ =
         TransferDirectionMode::REVERSE;
 
+   protected:
     std::unique_ptr<MasterViewHelper> master_view_helper_;
     std::string master_view_helper_entry_;
     ClientMasterDiscoveryConfig master_discovery_config_;
+   private:
     std::thread heartbeat_thread_;
     std::atomic<bool> heartbeat_running_{false};
     std::condition_variable heartbeat_cv_;

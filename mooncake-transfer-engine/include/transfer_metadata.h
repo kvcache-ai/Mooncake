@@ -192,6 +192,12 @@ class TransferMetadata {
 
     ~TransferMetadata();
 
+    // True when the metadata connstring is P2PHANDSHAKE (peer-to-peer, trusted
+    // endpoints). In this mode the tcp transport skips the registered-buffer
+    // address validation that the centralized deployment enforces, since P2P
+    // reverse read/write paths pass caller-supplied raw buffers directly.
+    bool p2pHandshakeMode() const { return p2p_handshake_mode_; }
+
     std::shared_ptr<SegmentDesc> getSegmentDescByName(
         const std::string &segment_name, bool force_update = false);
 

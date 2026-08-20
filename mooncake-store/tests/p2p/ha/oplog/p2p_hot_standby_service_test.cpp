@@ -419,12 +419,12 @@ TEST_F(P2PHotStandbyServiceTest, TrimSignalSwitchesToSnapshotResync) {
             std::lock_guard<std::mutex> lock(states_mutex);
             state_count = states.size();
         }
-        if (state_count >= 3 && target.GetState() == StandbyState::WATCHING) {
+        if (state_count >= 3 && target.GetState() == P2PStandbyState::WATCHING) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    EXPECT_EQ(target.GetState(), StandbyState::WATCHING);
+    EXPECT_EQ(target.GetState(), P2PStandbyState::WATCHING);
     auto exported = target.ExportMetadata();
     EXPECT_NE(exported.objects.find("trim-resync-key"), exported.objects.end());
 }
@@ -467,7 +467,7 @@ TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
             std::lock_guard<std::mutex> lock(states_mutex);
             state_count = states.size();
         }
-        if (state_count >= 2 && standby.GetState() == StandbyState::WATCHING) {
+        if (state_count >= 2 && standby.GetState() == P2PStandbyState::WATCHING) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -484,7 +484,7 @@ TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
         EXPECT_EQ(second_state->start_sequence_id, 7);
         EXPECT_TRUE(second_state->healthy);
     }
-    EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+    EXPECT_EQ(standby.GetState(), P2PStandbyState::WATCHING);
     standby.Stop();
 }
 
@@ -516,13 +516,13 @@ TEST_F(P2PHotStandbyServiceTest, CoalescesRepeatedWatchErrors) {
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (std::chrono::steady_clock::now() < deadline &&
            (factory_calls.load() < 2 ||
-            standby.GetState() != StandbyState::WATCHING)) {
+            standby.GetState() != P2PStandbyState::WATCHING)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     EXPECT_EQ(factory_calls.load(), 2);
-    EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+    EXPECT_EQ(standby.GetState(), P2PStandbyState::WATCHING);
     standby.Stop();
 }
 
@@ -560,7 +560,7 @@ TEST_F(P2PHotStandbyServiceTest, StopInterruptsReconnectBackoff) {
             std::chrono::steady_clock::now() - stop_start);
 
     EXPECT_LT(stop_elapsed, std::chrono::milliseconds(250));
-    EXPECT_EQ(standby.GetState(), StandbyState::STOPPED);
+    EXPECT_EQ(standby.GetState(), P2PStandbyState::STOPPED);
     const int calls_after_stop = factory_calls.load();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EXPECT_EQ(factory_calls.load(), calls_after_stop);
@@ -606,7 +606,7 @@ TEST_F(P2PHotStandbyServiceTest, SerializesConcurrentPromoteAndStop) {
 
     EXPECT_TRUE(promote_result == ErrorCode::OK ||
                 promote_result == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    EXPECT_EQ(standby.GetState(), StandbyState::STOPPED);
+    EXPECT_EQ(standby.GetState(), P2PStandbyState::STOPPED);
 }
 
 TEST_F(P2PHotStandbyServiceTest, UnmountSegmentCascadeIsReplayed) {
@@ -647,7 +647,7 @@ TEST_F(P2PHotStandbyServiceTest, PromoteFinalCatchUpExportsLateEntry) {
     AddReplica(master, "key-late", client_id, segment_id, 8192);
     ASSERT_TRUE(WaitForPersistedEntry(2, std::chrono::milliseconds(2000)));
     ASSERT_EQ(standby.Promote(), ErrorCode::OK);
-    EXPECT_EQ(standby.GetState(), StandbyState::PROMOTED);
+    EXPECT_EQ(standby.GetState(), P2PStandbyState::PROMOTED);
     EXPECT_GE(standby.GetLatestAppliedSequenceId(), 2);
 
     auto exported = standby.ExportMetadata();
@@ -676,7 +676,7 @@ TEST_F(P2PHotStandbyServiceTest, PromotionFailsOnFinalCatchUpApplyFailure) {
     ASSERT_EQ(writer.WriteOpLog(invalid_entry, /*sync=*/true), ErrorCode::OK);
 
     EXPECT_EQ(standby.Promote(), ErrorCode::INTERNAL_ERROR);
-    EXPECT_EQ(standby.GetState(), StandbyState::FAILED);
+    EXPECT_EQ(standby.GetState(), P2PStandbyState::FAILED);
     EXPECT_FALSE(standby.GetSyncStatus().apply_healthy);
 }
 
@@ -696,13 +696,13 @@ TEST_F(P2PHotStandbyServiceTest, ForcePromoteAfterApplyFailure) {
 
     P2PHotStandbyService standby(MakeStandbyConfig());
     ASSERT_EQ(standby.Start(), ErrorCode::OK);
-    for (int i = 0; i < 100 && standby.GetState() != StandbyState::FAILED;
+    for (int i = 0; i < 100 && standby.GetState() != P2PStandbyState::FAILED;
          ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     auto status = standby.GetSyncStatus();
-    ASSERT_EQ(status.state, StandbyState::FAILED);
+    ASSERT_EQ(status.state, P2PStandbyState::FAILED);
     EXPECT_FALSE(status.apply_healthy);
     EXPECT_EQ(status.failed_sequence_id, 1u);
     EXPECT_EQ(status.failed_op_type, static_cast<int>(OpType_REGISTER_CLIENT));
@@ -710,7 +710,7 @@ TEST_F(P2PHotStandbyServiceTest, ForcePromoteAfterApplyFailure) {
     EXPECT_EQ(standby.Promote(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 
     EXPECT_EQ(standby.Promote(/*force=*/true), ErrorCode::OK);
-    EXPECT_EQ(standby.GetState(), StandbyState::PROMOTED);
+    EXPECT_EQ(standby.GetState(), P2PStandbyState::PROMOTED);
     EXPECT_EQ(standby.GetLatestAppliedSequenceId(), 0u);
 }
 

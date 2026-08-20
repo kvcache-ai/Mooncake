@@ -187,7 +187,7 @@ class P2PHAMetricManager {
 
     /**
      * @brief Set the current Standby state (as integer for Prometheus)
-     * @param state_value Integer representation of StandbyState
+     * @param state_value Integer representation of P2PStandbyState
      */
     void set_standby_state(int64_t state_value);
     int64_t get_standby_state();
