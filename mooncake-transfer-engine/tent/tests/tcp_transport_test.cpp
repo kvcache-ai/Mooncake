@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -38,6 +39,7 @@ TEST(TcpParamsTest, DefaultValues) {
     EXPECT_EQ(params.retry_base_delay_ms, 100ULL);
     EXPECT_EQ(params.retry_max_delay_ms, 2'000ULL);
     EXPECT_EQ(params.max_concurrent_tasks, 16);
+    EXPECT_EQ(params.data_rpc_timeout_ms, 30'000);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,11 +141,13 @@ TEST(TcpTransportConfigTest, ConfigOverridesDefaults) {
     conf->set("transports/tcp/retry_base_delay_ms", 200ULL);
     conf->set("transports/tcp/retry_max_delay_ms", 4000ULL);
     conf->set("transports/tcp/max_concurrent_tasks", 32);
+    conf->set("transports/tcp/data_rpc_timeout_ms", 1500LL);
 
     EXPECT_EQ(conf->get("transports/tcp/max_retry_count", 0), 5);
     EXPECT_EQ(conf->get("transports/tcp/retry_base_delay_ms", 0ULL), 200ULL);
     EXPECT_EQ(conf->get("transports/tcp/retry_max_delay_ms", 0ULL), 4000ULL);
     EXPECT_EQ(conf->get("transports/tcp/max_concurrent_tasks", 0), 32);
+    EXPECT_EQ(conf->get("transports/tcp/data_rpc_timeout_ms", 0LL), 1500LL);
 }
 
 TEST(TcpTransportConfigTest, MissingConfigUsesDefaults) {
@@ -156,6 +160,90 @@ TEST(TcpTransportConfigTest, MissingConfigUsesDefaults) {
     EXPECT_EQ(conf->get("transports/tcp/max_concurrent_tasks",
                         defaults.max_concurrent_tasks),
               16);
+    EXPECT_EQ(conf->get("transports/tcp/data_rpc_timeout_ms",
+                        defaults.data_rpc_timeout_ms),
+              30'000);
+}
+
+TEST(TcpTransportConfigTest, RejectsInvalidDataRpcTimeout) {
+    for (int64_t timeout_ms : {0LL, -2LL}) {
+        auto conf = std::make_shared<Config>();
+        conf->set("transports/tcp/data_rpc_timeout_ms", timeout_ms);
+
+        TcpTransport transport;
+        std::string local_segment_name = "127.0.0.1:16001";
+        auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+        auto topology = std::make_shared<Topology>();
+        auto status =
+            transport.install(local_segment_name, metadata, topology, conf);
+
+        EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
+    }
+}
+
+TEST(TcpTransportConfigTest, AllowsDisabledDataRpcTimeout) {
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/tcp/data_rpc_timeout_ms", -1LL);
+
+    TcpTransport transport;
+    std::string local_segment_name = "127.0.0.1:16002";
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto topology = std::make_shared<Topology>();
+    auto status =
+        transport.install(local_segment_name, metadata, topology, conf);
+
+    EXPECT_TRUE(status.ok()) << status.ToString();
+}
+
+TEST(TcpTransportConfigTest, DataRpcTimeoutBoundsSlowSendData) {
+    CoroRpcAgent server;
+    server.registerFunction(
+        SendData, [](const std::string_view&, std::string&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        });
+
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port).ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    std::array<char, 4> payload{};
+    const auto started_at = std::chrono::steady_clock::now();
+    auto status = ControlClient::sendData("127.0.0.1:" + std::to_string(port),
+                                          0, payload.data(), payload.size(),
+                                          std::chrono::milliseconds(100));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started_at);
+
+    EXPECT_TRUE(status.IsRpcServiceError()) << status.ToString();
+    EXPECT_LT(elapsed.count(), 400);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_TRUE(server.stop().ok());
+}
+
+TEST(TcpTransportConfigTest, DisabledDataRpcTimeoutAllowsSlowSendData) {
+    CoroRpcAgent server;
+    server.registerFunction(
+        SendData, [](const std::string_view&, std::string&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        });
+
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port).ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    std::array<char, 4> payload{};
+    const auto started_at = std::chrono::steady_clock::now();
+    auto status = ControlClient::sendData("127.0.0.1:" + std::to_string(port),
+                                          0, payload.data(), payload.size(),
+                                          std::chrono::milliseconds(-1));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started_at);
+
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_GE(elapsed.count(), 200);
+
+    EXPECT_TRUE(server.stop().ok());
 }
 
 // ---------------------------------------------------------------------------

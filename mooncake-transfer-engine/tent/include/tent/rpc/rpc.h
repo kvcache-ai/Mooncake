@@ -16,10 +16,12 @@
 #define TENT_YLT_RPC_H
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -80,15 +82,18 @@ class CoroRpcAgent {
 
     Status stop();
 
-    Status call(const std::string &server_addr, int func_id,
-                const std::string_view &request, std::string &response);
+    Status call(
+        const std::string &server_addr, int func_id,
+        const std::string_view &request, std::string &response,
+        std::optional<std::chrono::milliseconds> call_timeout = std::nullopt);
 
     using AsyncCallback = std::function<void(Status, std::string)>;
     void callAsync(const std::string &server_addr, int func_id,
                    const std::string &request, AsyncCallback callback);
 
     async_simple::coro::Lazy<std::pair<Status, std::string>> callCoroutine(
-        std::string server_addr, int func_id, std::string request);
+        std::string server_addr, int func_id, std::string request,
+        std::optional<std::chrono::milliseconds> call_timeout = std::nullopt);
 
    private:
     async_simple::coro::Lazy<void> process(int func_id);

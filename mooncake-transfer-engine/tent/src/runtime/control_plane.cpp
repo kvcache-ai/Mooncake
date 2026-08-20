@@ -69,33 +69,49 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     return Status::OK();
 }
 
-Status ControlClient::sendData(const std::string& server_addr,
-                               uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
+Status ControlClient::sendData(
+    const std::string& server_addr, uint64_t peer_mem_addr,
+    void* local_mem_addr, size_t length,
+    std::optional<std::chrono::milliseconds> call_timeout) {
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc) + length);
     memcpy(&request[0], &desc, sizeof(desc));
-    Platform::getLoader().copy(&request[sizeof(desc)], local_mem_addr, length);
-    auto status = tl_rpc_agent.call(server_addr, SendData, request, response);
+    if (length > 0) {
+        Platform::getLoader().copy(&request[sizeof(desc)], local_mem_addr,
+                                   length);
+    }
+    auto status = tl_rpc_agent.call(server_addr, SendData, request, response,
+                                    call_timeout);
     if (!status.ok()) return status;
     if (!response.empty()) return Status::RpcServiceError(response);
     return Status::OK();
 }
 
-Status ControlClient::recvData(const std::string& server_addr,
-                               uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
+Status ControlClient::recvData(
+    const std::string& server_addr, uint64_t peer_mem_addr,
+    void* local_mem_addr, size_t length,
+    std::optional<std::chrono::milliseconds> call_timeout) {
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc));
     memcpy(&request[0], &desc, sizeof(desc));
-    auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
+    auto status = tl_rpc_agent.call(server_addr, RecvData, request, response,
+                                    call_timeout);
     if (!status.ok()) return status;
-    if (response.size() != length)
+    if (response.empty()) {
+        return Status::RpcServiceError("RecvData returned an empty response");
+    }
+    if (response[0] != '\0') {
+        return Status::RpcServiceError(response.substr(1));
+    }
+    if (response.size() != length + 1) {
         return Status::RpcServiceError(
-            "RecvData failed: target address not in registered buffer");
-    Platform::getLoader().copy(local_mem_addr, response.data(), length);
+            "RecvData returned an invalid payload size");
+    }
+    if (length > 0) {
+        Platform::getLoader().copy(local_mem_addr, response.data() + 1, length);
+    }
     return Status::OK();
 }
 
@@ -397,7 +413,12 @@ void ControlService::onSendData(const std::string_view& request,
     }
 
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
+        if (length > 0) {
+            Platform::getLoader().copy(
+                (void*)peer_mem_addr,
+                const_cast<char*>(request.data() + sizeof(XferDataDesc)),
+                length);
+        }
     } else {
         response = "SendData failed: target address not in registered buffer";
     }
@@ -405,8 +426,12 @@ void ControlService::onSendData(const std::string_view& request,
 
 void ControlService::onRecvData(const std::string_view& request,
                                 std::string& response) {
+    auto set_error = [&](const std::string& message) {
+        response.assign(1, '\1');
+        response.append(message);
+    };
     if (request.size() < sizeof(XferDataDesc)) {
-        response = "RecvData failed: request too short";
+        set_error("RecvData failed: request too short");
         return;
     }
     XferDataDesc* desc = (XferDataDesc*)request.data();
@@ -414,19 +439,22 @@ void ControlService::onRecvData(const std::string_view& request,
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
 
-    // Validate length to prevent DoS via excessive memory allocation
+    // Validate length to prevent DoS via excessive memory allocation.
     constexpr size_t kMaxTransferSize = 1ULL << 30;  // 1GB max per RPC
     if (length > kMaxTransferSize) {
-        response = "RecvData failed: length exceeds maximum allowed";
+        set_error("RecvData failed: length exceeds maximum allowed");
         return;
     }
 
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        response.resize(length);
-        Platform::getLoader().copy(response.data(), (void*)peer_mem_addr,
-                                   length);
+        response.resize(length + 1);
+        response[0] = '\0';
+        if (length > 0) {
+            Platform::getLoader().copy(response.data() + 1,
+                                       (void*)peer_mem_addr, length);
+        }
     } else {
-        response = "RecvData failed: target address not in registered buffer";
+        set_error("RecvData failed: target address not in registered buffer");
     }
 }
 

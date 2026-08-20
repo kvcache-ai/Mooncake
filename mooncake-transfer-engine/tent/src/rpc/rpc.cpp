@@ -16,6 +16,9 @@
 #include <glog/logging.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
+#include <chrono>
+#include <optional>
+
 #include "transfer_engine_rpc_client_io_context.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
@@ -186,7 +189,8 @@ std::shared_ptr<ClientPool> CoroRpcAgent::getOrCreatePool(
 }
 
 Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
-    std::string server_addr, int func_id, std::string request) {
+    std::string server_addr, int func_id, std::string request,
+    std::optional<std::chrono::milliseconds> call_timeout) {
     if (tl_inside_rpc_handler) {
         co_return std::make_pair(
             Status::InvalidArgument(
@@ -194,13 +198,36 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
             "");
     }
 
+    const auto started_at = std::chrono::steady_clock::now();
+    auto remainingTimeout = [&]() -> std::optional<std::chrono::milliseconds> {
+        if (!call_timeout.has_value()) return std::nullopt;
+        if (call_timeout->count() < 0) return call_timeout;
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started_at);
+        if (elapsed >= *call_timeout) return std::chrono::milliseconds(0);
+        return *call_timeout - elapsed;
+    };
+
     auto pool = getOrCreatePool(server_addr);
     ClientLease lease{pool->acquire(), pool, false};
 
     if (!lease.client) {
         lease.client = std::make_unique<coro_rpc_client>(
             GetTransferEngineRpcClientIoContextPool().get_executor());
-        auto conn_result = co_await lease.client->connect(server_addr);
+        const auto connect_timeout = remainingTimeout();
+        if (connect_timeout.has_value() && connect_timeout->count() == 0) {
+            lease.broken = true;
+            auto msg =
+                "RPC timed out before connecting. server: " + server_addr +
+                ", func_id: " + std::to_string(func_id);
+            co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK),
+                                     "");
+        }
+        auto conn_result =
+            connect_timeout.has_value()
+                ? co_await lease.client->connect(server_addr, *connect_timeout)
+                : co_await lease.client->connect(server_addr);
         if (conn_result.val() != 0) {
             lease.broken = true;
             auto msg = "Failed to connect RPC server. server: " + server_addr +
@@ -211,9 +238,20 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         }
     }
 
-    lease->set_req_attachment(request);
+    auto request_config = coro_rpc::request_config_t{};
+    request_config.request_timeout_duration = remainingTimeout();
+    if (request_config.request_timeout_duration.has_value() &&
+        request_config.request_timeout_duration->count() == 0) {
+        lease.broken = true;
+        auto msg =
+            "RPC timed out before sending request. server: " + server_addr +
+            ", func_id: " + std::to_string(func_id);
+        co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK), "");
+    }
+    request_config.request_attachment = request;
 
-    auto call_result = co_await lease->call<&CoroRpcAgent::process>(func_id);
+    auto call_result = co_await lease->call<&CoroRpcAgent::process>(
+        std::move(request_config), func_id);
 
     if (!call_result.has_value()) {
         lease.broken = true;
@@ -229,11 +267,12 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     co_return std::make_pair(Status::OK(), std::move(response));
 }
 
-Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
-                          const std::string_view& request,
-                          std::string& response) {
-    auto [status, resp] = async_simple::coro::syncAwait(
-        callCoroutine(server_addr, func_id, std::string(request)));
+Status CoroRpcAgent::call(
+    const std::string& server_addr, int func_id,
+    const std::string_view& request, std::string& response,
+    std::optional<std::chrono::milliseconds> call_timeout) {
+    auto [status, resp] = async_simple::coro::syncAwait(callCoroutine(
+        server_addr, func_id, std::string(request), call_timeout));
 
     if (status.ok()) {
         response = std::move(resp);

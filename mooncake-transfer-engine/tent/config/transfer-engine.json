@@ -80,7 +80,8 @@
             "max_retry_count": 3,
             "retry_base_delay_ms": 100,
             "retry_max_delay_ms": 2000,
-            "max_concurrent_tasks": 16
+            "max_concurrent_tasks": 16,
+            "data_rpc_timeout_ms": 30000
         },
         "gds": {
             "enable" : true

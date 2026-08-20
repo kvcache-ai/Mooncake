@@ -25,6 +25,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -81,13 +82,15 @@ class ControlClient {
                             const BootstrapDesc& request,
                             BootstrapDesc& response);
 
-    static Status sendData(const std::string& server_addr,
-                           uint64_t peer_mem_addr, void* local_mem_addr,
-                           size_t length);
+    static Status sendData(
+        const std::string& server_addr, uint64_t peer_mem_addr,
+        void* local_mem_addr, size_t length,
+        std::optional<std::chrono::milliseconds> call_timeout = std::nullopt);
 
-    static Status recvData(const std::string& server_addr,
-                           uint64_t peer_mem_addr, void* local_mem_addr,
-                           size_t length);
+    static Status recvData(
+        const std::string& server_addr, uint64_t peer_mem_addr,
+        void* local_mem_addr, size_t length,
+        std::optional<std::chrono::milliseconds> call_timeout = std::nullopt);
 
     static Status notify(const std::string& server_addr,
                          const Notification& message);
