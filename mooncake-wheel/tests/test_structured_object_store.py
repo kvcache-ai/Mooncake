@@ -2782,6 +2782,12 @@ def test_dataproto_ref_handle_roundtrip_materializes_and_cleans_up() -> None:
     invalid_handle["storage_group_id"] = ""
     with pytest.raises(ValueError, match="storage_group_id"):
         import_dataproto_ref(invalid_handle)
+    transitional_v2_handle = dict(handle)
+    transitional_v2_handle["version"] = 2
+    assert (
+        import_dataproto_ref(transitional_v2_handle)._storage_group_id
+        == ref._storage_group_id
+    )
 
     result = transfer.get_dataproto(handle)
     assert np.array_equal(result["batch"]["input_ids"], input_ids)

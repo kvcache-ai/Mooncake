@@ -356,7 +356,7 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
     if not is_dataproto_ref_handle(handle):
         raise ValueError("not a Mooncake DataProto ref handle")
     version = int(handle.get("version", -1))
-    if version != DATAPROTO_REF_HANDLE_VERSION:
+    if version not in (DATAPROTO_REF_HANDLE_VERSION, 2):
         raise ValueError(
             f"unsupported DataProto ref handle version: {handle.get('version')!r}"
         )
@@ -400,8 +400,9 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
             stage=stage, member=member, section=section
         )
     storage_group_id = handle.get(STORAGE_GROUP_ID)
-    if storage_group_id is not None and (
-        not isinstance(storage_group_id, str) or not storage_group_id
+    if (version == 2 and storage_group_id is None) or (
+        storage_group_id is not None
+        and (not isinstance(storage_group_id, str) or not storage_group_id)
     ):
         raise ValueError("DataProto ref handle has invalid storage_group_id")
     return MooncakeDataProtoRef(
