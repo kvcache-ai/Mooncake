@@ -109,6 +109,9 @@ class TcpTransport : public Transport {
     const char *getName() const override { return "tcp"; }
 
    private:
+    // Opaque identity generated once per transport lifetime and published in
+    // the local TCP segment descriptor.
+    std::string tcp_instance_id_;
     TcpContext *context_;
     std::atomic_bool running_;
     std::thread thread_;
@@ -118,16 +121,21 @@ class TcpTransport : public Transport {
     struct ConnectionKey {
         std::string host;
         uint16_t port;
+        std::string tcp_instance_id;
 
         bool operator==(const ConnectionKey &other) const {
-            return host == other.host && port == other.port;
+            return host == other.host && port == other.port &&
+                   tcp_instance_id == other.tcp_instance_id;
         }
     };
 
     struct ConnectionKeyHash {
         std::size_t operator()(const ConnectionKey &key) const {
-            return std::hash<std::string>()(key.host) ^
-                   (std::hash<uint16_t>()(key.port) << 1);
+            const auto host_hash = std::hash<std::string>()(key.host);
+            const auto port_hash = std::hash<uint16_t>()(key.port);
+            const auto instance_hash =
+                std::hash<std::string>()(key.tcp_instance_id);
+            return host_hash ^ (port_hash << 1) ^ (instance_hash << 2);
         }
     };
 

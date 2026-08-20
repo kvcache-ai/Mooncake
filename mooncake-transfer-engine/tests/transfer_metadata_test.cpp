@@ -347,6 +347,42 @@ TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {
     EXPECT_TRUE(remote_desc->buffers[1].rkey.empty());
 }
 
+TEST(TransferMetadataCompatibilityTest,
+     LegacySegmentWithoutTcpInstanceIdDecodesEmpty) {
+    TransferMetadata server(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string host = globalConfig().use_ipv6 ? "::1" : "127.0.0.1";
+    const std::string server_name =
+        maybeWrapIpV6(host) + ":" + std::to_string(port);
+
+    auto server_segment = makeRdmaSegmentDesc(server_name, 0x1000);
+    server_segment->tcp_data_port = port;
+    server_segment->tcp_proto_version = 1;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, server_name,
+                                     std::move(server_segment)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc;
+    rpc.ip_or_host_name = host;
+    rpc.rpc_port = port;
+    rpc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(server_name, rpc), 0);
+
+    TransferMetadata client(P2PHANDSHAKE);
+    auto client_segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    client_segment->name = "client";
+    client_segment->protocol = "rdma";
+    ASSERT_EQ(client.addLocalSegment(LOCAL_SEGMENT_ID, "client",
+                                     std::move(client_segment)),
+              0);
+
+    auto decoded = client.getSegmentDesc(server_name);
+    ASSERT_NE(decoded, nullptr);
+    EXPECT_TRUE(decoded->tcp_instance_id.empty());
+    EXPECT_EQ(decoded->tcp_proto_version, 1);
+}
+
 // A peer descriptor whose key vector is longer than its device list lets the
 // topology-selected device_id pass the rkey bound in selectPeerDevice() and
 // still index devices[] out of bounds. Such a descriptor must be rejected at

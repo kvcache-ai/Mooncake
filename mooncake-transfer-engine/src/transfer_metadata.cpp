@@ -352,6 +352,9 @@ static int encodeMultiProtocolSegmentDesc(
     segmentJSON["protocol"] = protocolJSON;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
+    if (!desc.tcp_instance_id.empty()) {
+        segmentJSON["tcp_instance_id"] = desc.tcp_instance_id;
+    }
     segmentJSON["timestamp"] = getCurrentDateTime();
 
     return 0;
@@ -395,6 +398,9 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
+    if (!desc.tcp_instance_id.empty()) {
+        segmentJSON["tcp_instance_id"] = desc.tcp_instance_id;
+    }
     segmentJSON["timestamp"] = getCurrentDateTime();
     if (!desc.rdma_server_name.empty()) {
         segmentJSON["rdma_server_name"] = desc.rdma_server_name;
@@ -606,6 +612,10 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
                                   ? segmentJSON["tcp_proto_version"].asInt()
                                   : 1;
+    if (segmentJSON.isMember("tcp_instance_id") &&
+        segmentJSON["tcp_instance_id"].isString()) {
+        desc->tcp_instance_id = segmentJSON["tcp_instance_id"].asString();
+    }
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
     if (segmentJSON.isMember("rdma_server_name"))
@@ -771,6 +781,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
                                   ? segmentJSON["tcp_proto_version"].asInt()
                                   : 1;
+    if (segmentJSON.isMember("tcp_instance_id") &&
+        segmentJSON["tcp_instance_id"].isString()) {
+        desc->tcp_instance_id = segmentJSON["tcp_instance_id"].asString();
+    }
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
     if (segmentJSON.isMember("rdma_server_name"))
@@ -1101,6 +1115,7 @@ bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
            cxl_name == other.cxl_name && cxl_base_addr == other.cxl_base_addr &&
            rank_info == other.rank_info &&
            tcp_data_port == other.tcp_data_port &&
+           tcp_instance_id == other.tcp_instance_id &&
            rdma_server_name == other.rdma_server_name;
 }
 
