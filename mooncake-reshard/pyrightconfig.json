@@ -8,7 +8,16 @@
     "python/mooncake/reshard/weight/runtime.py",
     "python/mooncake/reshard/weight/validation.py",
     "python/mooncake/reshard/weight/binding.py",
-    "python/mooncake/reshard/weight/serde.py"
+    "python/mooncake/reshard/weight/serde.py",
+    "python/mooncake/reshard/kv_cache/types.py",
+    "python/mooncake/reshard/kv_cache/topology.py",
+    "python/mooncake/reshard/kv_cache/part.py",
+    "python/mooncake/reshard/kv_cache/placement.py",
+    "python/mooncake/reshard/kv_cache/runtime.py",
+    "python/mooncake/reshard/kv_cache/binding.py",
+    "python/mooncake/reshard/kv_cache/serde.py",
+    "python/mooncake/reshard/kv_cache/planner.py",
+    "python/mooncake/reshard/kv_cache/plan_serde.py"
   ],
   "extraPaths": ["python"],
   "pythonVersion": "3.10",

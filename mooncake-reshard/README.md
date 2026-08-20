@@ -17,6 +17,8 @@ The public Python API is split by responsibility:
   contracts for resource-neutral identity and lifecycle;
 - `mooncake.reshard.weight` defines model-weight placement, runtime-binding
   input contracts, and address-free N-D planning.
+- `mooncake.reshard.kv_cache` defines KV-cache topology, placement, runtime
+  binding, serialization, and logical transfer planning.
 
 ## Weight Placement Model
 
@@ -92,9 +94,25 @@ names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 - `planner.py` exposes the address-free public planning API.
 - `manifest.py` preserves the public import surface.
 
-`kv_cache` remains reserved as a resource discriminator. This change does not
-define a KVCache manifest; a future KVCache reshard adapter can reuse the
-resource/placement/binding boundary without changing the model-weight planner.
+## KV Cache Placement Model
+
+`KVCachePlacementManifest` describes an address-free KV-cache placement over a
+selected topology. Each participant contributes a `KVCachePlacementPart`, and
+`KVCacheRuntimeBindingManifest` binds that logical placement to live buffers.
+The planner produces logical transfer edges and can prepare their static byte
+ranges before execution.
+
+The KV-cache implementation is split by responsibility:
+
+- `topology.py`, `part.py`, and `placement.py` define logical placement;
+- `runtime.py` and `binding.py` define and validate live buffer bindings;
+- `planner.py` defines logical and prepared transfer plans;
+- `serde.py` and `plan_serde.py` define the JSON wire formats.
+
+KV planning is source/target-role agnostic. A placement may expose one or more
+complete DP replicas, and each local-target plan selects exactly one source DP
+replica. Callers may choose that source rank explicitly; otherwise the planner
+maps target DP ranks round-robin over the source placement's available DP ranks.
 
 `weight_placement_to_json` and `weight_placement_from_json` are the explicit
 public JSON APIs. Their wire format contains only canonical fields, and

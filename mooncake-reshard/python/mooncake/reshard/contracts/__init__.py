@@ -35,6 +35,7 @@ __all__ = [
     "ResourceKind",
     "ResourceManifest",
     "RevisionId",
+    "RuntimeBindingFragment",
     "RuntimeBindingManifest",
     "RuntimeBindingFragment",
     "RuntimeFragmentId",

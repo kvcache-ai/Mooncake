@@ -26,22 +26,19 @@ from mooncake.reshard.weight.placement import (
 from mooncake.reshard.weight.runtime import (
     WeightRuntimeBindingManifest as RuntimeBindingContract,
 )
-from mooncake.reshard.weight.types import (
-    ParallelRank as ParallelRankContract,
-)
-from mooncake.reshard.weight.types import (
-    PlacementFragment as PlacementFragmentContract,
-)
-from mooncake.reshard.weight.types import (
-    RuntimeBindingFragment as RuntimeBindingFragmentContract,
-)
-from mooncake.reshard.weight.types import TensorDescriptor as TensorContract
 from mooncake.reshard.weight.topology import (
     ParallelTopology as ParallelTopologyContract,
 )
 from mooncake.reshard.weight.topology import (
     TopologyParticipant as TopologyParticipantContract,
 )
+from mooncake.reshard.weight.types import (
+    ParallelRank as ParallelRankContract,
+)
+from mooncake.reshard.weight.types import (
+    PlacementFragment as PlacementFragmentContract,
+)
+from mooncake.reshard.weight.types import TensorDescriptor as TensorContract
 
 
 def test_responsibility_modules_preserve_public_contract_identity() -> None:

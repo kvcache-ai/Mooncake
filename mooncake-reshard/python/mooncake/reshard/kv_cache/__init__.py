@@ -1,0 +1,71 @@
+"""Framework-neutral KV-cache reshard contracts and planning API."""
+
+from .manifest import (
+    KVCacheBufferBinding,
+    KVCacheComponent,
+    KVCacheDescriptor,
+    KVCacheLayout,
+    KVCachePlacementManifest,
+    KVCachePlacementPart,
+    KVCacheRank,
+    KVCacheRuntimeBindingManifest,
+    KVCacheRuntimeBuffer,
+    KVCacheTopology,
+    KVCacheTopologyParticipant,
+    assemble_kv_cache_placement,
+    placement_fragment_id,
+    validate_runtime_binding,
+    validate_runtime_bindings,
+)
+from .plan_serde import (
+    kv_cache_logical_plan_from_json,
+    kv_cache_logical_plan_to_json,
+)
+from .planner import (
+    KVCacheLogicalTransferPlan,
+    KVCachePreparedTransferEdge,
+    KVCachePreparedTransferPlan,
+    KVCacheTransferEdge,
+    plan_kv_cache_transfer_to_local_target,
+    prepare_kv_cache_transfer,
+)
+from .serde import (
+    kv_cache_part_from_json,
+    kv_cache_part_to_json,
+    kv_cache_placement_from_json,
+    kv_cache_placement_to_json,
+    kv_cache_runtime_binding_from_json,
+    kv_cache_runtime_binding_to_json,
+)
+
+__all__ = [
+    "KVCacheBufferBinding",
+    "KVCacheComponent",
+    "KVCacheDescriptor",
+    "KVCacheLayout",
+    "KVCacheLogicalTransferPlan",
+    "KVCachePlacementManifest",
+    "KVCachePlacementPart",
+    "KVCachePreparedTransferEdge",
+    "KVCachePreparedTransferPlan",
+    "KVCacheRank",
+    "KVCacheRuntimeBindingManifest",
+    "KVCacheRuntimeBuffer",
+    "KVCacheTopology",
+    "KVCacheTopologyParticipant",
+    "KVCacheTransferEdge",
+    "assemble_kv_cache_placement",
+    "kv_cache_logical_plan_from_json",
+    "kv_cache_logical_plan_to_json",
+    "kv_cache_part_from_json",
+    "kv_cache_part_to_json",
+    "kv_cache_placement_from_json",
+    "kv_cache_placement_to_json",
+    "kv_cache_runtime_binding_from_json",
+    "kv_cache_runtime_binding_to_json",
+    "placement_fragment_id",
+    "plan_kv_cache_transfer_to_local_target",
+    "prepare_kv_cache_transfer",
+    "validate_runtime_binding",
+    "validate_runtime_bindings",
+]
