@@ -25,7 +25,8 @@ namespace mooncake {
 WrappedMasterService::WrappedMasterService(
     const WrappedMasterServiceConfig& config)
     : http_server_(4, config.http_port),
-      metric_report_running_(config.enable_metric_reporting) {}
+      metric_report_running_(config.enable_metric_reporting),
+      heartbeat_rpc_port_(config.heartbeat_rpc_port) {}
 
 void WrappedMasterService::init() {
     init_http_server();
@@ -471,6 +472,13 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+tl::expected<HeartbeatServiceReadyResponse, ErrorCode>
+WrappedMasterService::HeartbeatServiceReady() {
+    HeartbeatServiceReadyResponse response;
+    response.heartbeat_rpc_port = heartbeat_rpc_port_;
+    return response;
+}
+
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                         mooncake::WrappedMasterService& wrapped_master_service,
                         bool include_heartbeat) {
@@ -509,6 +517,12 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
+        &wrapped_master_service);
+    // HeartbeatServiceReady is always on the main server so legacy clients
+    // (which only talk to the main server) can discover the master's heartbeat
+    // routing and fail fast on a client/master port mismatch at Connect time.
+    server.register_handler<
+        &mooncake::WrappedMasterService::HeartbeatServiceReady>(
         &wrapped_master_service);
 }
 

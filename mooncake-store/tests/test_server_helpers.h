@@ -81,6 +81,7 @@ class InProcMaster {
             wms_cfg.eviction_high_watermark_ratio =
                 DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
             wms_cfg.view_version = 0;
+            wms_cfg.heartbeat_rpc_port = config.heartbeat_rpc_port.value_or(0);
             wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
             wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
 

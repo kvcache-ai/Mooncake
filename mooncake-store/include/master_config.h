@@ -343,6 +343,10 @@ class WrappedMasterServiceConfig {
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
     uint16_t http_port = 9003;
+    // Dedicated heartbeat RPC server port (0 = legacy: Heartbeat served on the
+    // main server). Exposed to clients via HeartbeatServiceReady so they can
+    // detect a client/master heartbeat-routing mismatch at Connect time.
+    uint32_t heartbeat_rpc_port = 0;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -396,6 +400,7 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
+        heartbeat_rpc_port = config.heartbeat_rpc_port;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;
@@ -454,6 +459,7 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
+        heartbeat_rpc_port = config.heartbeat_rpc_port;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;

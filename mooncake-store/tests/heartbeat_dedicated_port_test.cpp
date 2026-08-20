@@ -10,19 +10,20 @@
 //
 // Coverage:
 //   1. Heartbeat reaches the dedicated port and succeeds.
-//   2. Heartbeat is NOT registered on the main port when the dedicated server
-//      is enabled.
+//   2. Reverse mismatch: legacy client vs dedicated master -> Connect fails
+//      fast with HEARTBEAT_ROUTING_MISMATCH.
+//   2b. Dedicated-port value mismatch (both dedicated, different ports) ->
+//       Connect fails fast with HEARTBEAT_RPC_UNREACHABLE at the reachability
+//       probe.
 //   3. Non-heartbeat RPCs still work via the main port.
 //   4. With the dedicated server disabled (port=0), Heartbeat is served on the
 //      main port as the legacy fallback.
-//   5. Client/master port mismatch (client expects a dedicated heartbeat
-//      server the master never opened) fails fast at Connect with
-//      HEARTBEAT_RPC_UNREACHABLE.
+//   5. Forward mismatch: dedicated client vs legacy master -> Connect fails
+//      fast with HEARTBEAT_ROUTING_MISMATCH.
 //   6. Reconnect after a master restart (same ports) rebuilds the stale main
 //      AND heartbeat connection pools via the is_same_addr retry instead of
 //      spuriously failing.
-//   7. The HEARTBEAT_RPC_UNREACHABLE error code round-trips through
-//      toString/fromInt.
+//   7. The heartbeat fail-fast error codes round-trip through toString/fromInt.
 //
 // Tests 1-6 are parameterized over CENTRALIZED and P2P: both modes share
 // RegisterHeartbeatRpcService, WrappedMasterService::ServiceReady and
@@ -152,9 +153,10 @@ class HeartbeatDedicatedPortTest : public ::testing::TestWithParam<TestMode> {
 
 // 1. Client configured with the dedicated port sends Heartbeat there and it
 // succeeds (the dedicated server has the Heartbeat handler registered). This
-// also implicitly proves ServiceReady is registered on the dedicated port:
-// Connect probes the heartbeat endpoint with ServiceReady and would fail
-// (HEARTBEAT_RPC_UNREACHABLE) otherwise.
+// also implicitly proves both that HeartbeatServiceReady is registered on the
+// main server (Connect queries it for the master's heartbeat port) and that
+// ServiceReady is registered on the dedicated server (Connect's reachability
+// probe would otherwise return HEARTBEAT_RPC_UNREACHABLE).
 TEST_P(HeartbeatDedicatedPortTest, HeartbeatRoutedToDedicatedPort) {
     UUID client_id = generate_uuid();
     auto client = MakeClient(mode_, client_id);
@@ -166,18 +168,37 @@ TEST_P(HeartbeatDedicatedPortTest, HeartbeatRoutedToDedicatedPort) {
         << "Heartbeat should succeed via the dedicated heartbeat port";
 }
 
-// 2. When the dedicated server is enabled, the main server must NOT have the
-// Heartbeat handler. A client that forces heartbeat_rpc_port=0 sends Heartbeat
-// to the main port and must fail.
-TEST_P(HeartbeatDedicatedPortTest, HeartbeatNotRegisteredOnMainPort) {
+// 2. Reverse mismatch: the master runs a dedicated heartbeat server, but the
+// client is legacy (heartbeat_rpc_port=0). Connect must fail fast with
+// HEARTBEAT_ROUTING_MISMATCH — otherwise the client would route heartbeats to
+// the main server, which dropped the Heartbeat handler when the dedicated
+// server was enabled, and silently starve.
+TEST_P(HeartbeatDedicatedPortTest,
+       LegacyClientAgainstDedicatedMasterFailsConnect) {
     UUID client_id = generate_uuid();
     auto client = MakeClient(mode_, client_id);  // heartbeat_rpc_port_ == 0
-    ASSERT_EQ(client->Connect(master_->master_address()), ErrorCode::OK);
+    EXPECT_EQ(client->Connect(master_->master_address()),
+              ErrorCode::HEARTBEAT_ROUTING_MISMATCH)
+        << "A legacy client must fail fast against a dedicated-port master "
+        << "instead of routing heartbeats to a main server that no longer "
+        << "serves Heartbeat";
+}
 
-    auto hb = client->Heartbeat(MakeHeartbeatRequest(client_id));
-    EXPECT_FALSE(hb.has_value())
-        << "Heartbeat must not be served on the main port when a dedicated "
-        << "heartbeat server is enabled";
+// 2b. Dedicated-port value mismatch: both sides are dedicated, but the client
+// points at a different dedicated port than the master opened. This is not a
+// routing-mode mismatch (both report dedicated), so it falls through to the
+// dedicated-server reachability probe and fails with HEARTBEAT_RPC_UNREACHABLE.
+TEST_P(HeartbeatDedicatedPortTest, DedicatedPortValueMismatchFailsConnect) {
+    int wrong_port = getFreeTcpPort();
+    ASSERT_NE(wrong_port, master_->heartbeat_rpc_port());
+    UUID client_id = generate_uuid();
+    auto client = MakeClient(mode_, client_id);
+    client->SetHeartbeatRpcPort(PortOf(wrong_port));
+
+    EXPECT_EQ(client->Connect(master_->master_address()),
+              ErrorCode::HEARTBEAT_RPC_UNREACHABLE)
+        << "A client pointed at the wrong dedicated port must fail fast at the "
+        << "reachability probe rather than silently failing heartbeats";
 }
 
 // 3. Non-heartbeat RPCs still reach the main port and succeed, proving the
@@ -225,23 +246,22 @@ TEST_P(HeartbeatLegacyMasterTest, HeartbeatServedOnMainPortWhenDisabled) {
         << "server is disabled (legacy fallback)";
 }
 
-// 5. Mismatch: the master is started WITHOUT a dedicated heartbeat port
-// (legacy fallback), but the client is configured with a heartbeat port
-// pointing at a port the master never opened. Connect must fail fast with
-// HEARTBEAT_RPC_UNREACHABLE instead of appearing to succeed and then silently
-// starving heartbeats.
+// 5. Forward mismatch: the master is started WITHOUT a dedicated heartbeat
+// port (legacy fallback), but the client is configured with a heartbeat port
+// (dedicated). Connect must fail fast with HEARTBEAT_ROUTING_MISMATCH instead
+// of appearing to succeed and then silently starving heartbeats.
 TEST_P(HeartbeatLegacyMasterTest, HeartbeatPortMismatchFailsConnect) {
-    // Client believes there is a dedicated heartbeat server on this free port;
-    // the master never opened it (this is a fresh is_same_addr=false Connect).
+    // Client believes it is dedicated; the master reports legacy (port=0) via
+    // HeartbeatServiceReady, so the routing-mode comparison catches it.
     int phantom_port = getFreeTcpPort();
     UUID client_id = generate_uuid();
     auto client = MakeClient(mode_, client_id);
     client->SetHeartbeatRpcPort(PortOf(phantom_port));
 
     EXPECT_EQ(client->Connect(master_->master_address()),
-              ErrorCode::HEARTBEAT_RPC_UNREACHABLE)
-        << "Connect must fail fast when the client's heartbeat_rpc_port does "
-        << "not match a dedicated heartbeat server the master actually opened";
+              ErrorCode::HEARTBEAT_ROUTING_MISMATCH)
+        << "Connect must fail fast when the client is dedicated but the master "
+        << "runs in legacy heartbeat mode";
 }
 
 // ---------------------------------------------------------------------------
@@ -307,13 +327,17 @@ INSTANTIATE_TEST_SUITE_P(AllModes, HeartbeatDedicatedPortReconnectTest,
 // ---------------------------------------------------------------------------
 // Error code serialization (mode-independent).
 // ---------------------------------------------------------------------------
-// 7. The HEARTBEAT_RPC_UNREACHABLE error code added for the fail-fast path
-// round-trips through toString/fromInt.
-TEST(HeartbeatErrorCodeTest, HeartbeatRpcUnreachableRoundTrip) {
+// 7. The heartbeat fail-fast error codes round-trip through toString/fromInt.
+TEST(HeartbeatErrorCodeTest, HeartbeatErrorCodesRoundTrip) {
     EXPECT_EQ(toString(ErrorCode::HEARTBEAT_RPC_UNREACHABLE),
               "HEARTBEAT_RPC_UNREACHABLE");
     EXPECT_EQ(fromInt(toInt(ErrorCode::HEARTBEAT_RPC_UNREACHABLE)),
               ErrorCode::HEARTBEAT_RPC_UNREACHABLE);
+
+    EXPECT_EQ(toString(ErrorCode::HEARTBEAT_ROUTING_MISMATCH),
+              "HEARTBEAT_ROUTING_MISMATCH");
+    EXPECT_EQ(fromInt(toInt(ErrorCode::HEARTBEAT_ROUTING_MISMATCH)),
+              ErrorCode::HEARTBEAT_ROUTING_MISMATCH);
 }
 
 }  // namespace testing

@@ -123,6 +123,21 @@ struct HeartbeatResponse {
 YLT_REFL(HeartbeatResponse, status, view_version, task_results);
 
 /**
+ * @brief Response for HeartbeatServiceReady.
+ *
+ * Reports the master's heartbeat routing so a client can detect a
+ * client/master heartbeat-port mismatch at Connect time:
+ *   heartbeat_rpc_port > 0 -> master serves Heartbeat on a dedicated server
+ *                             (Heartbeat is NOT on the main server)
+ *   heartbeat_rpc_port == 0 -> master serves Heartbeat on the main server
+ *                              (legacy fallback)
+ */
+struct HeartbeatServiceReadyResponse {
+    uint32_t heartbeat_rpc_port = 0;
+};
+YLT_REFL(HeartbeatServiceReadyResponse, heartbeat_rpc_port);
+
+/**
  * @brief Response structure for the DummyClient ping RPC (RealClient::ping).
  */
 struct DummyHeartbeatResponse {

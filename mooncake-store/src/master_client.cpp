@@ -103,6 +103,11 @@ struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
     static constexpr const char* value = "ServiceReady";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::HeartbeatServiceReady> {
+    static constexpr const char* value = "HeartbeatServiceReady";
+};
+
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
@@ -158,29 +163,50 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
         return ErrorCode::INVALID_VERSION;
     }
-    // When a dedicated heartbeat port is configured, verify the master
-    // actually opened it. A failure here means the client expects a dedicated
-    // heartbeat server the master never started (heartbeat_rpc_port > 0 on the
-    // client, but the master runs with the legacy fallback) — fail fast instead
-    // of letting heartbeats silently starve and the client get reaped.
-    if (heartbeat_rpc_port_ > 0) {
+    // Ask the master how it routes heartbeats, then verify it matches the
+    // client's expectation. Catches both mismatch directions at startup:
+    //   - client expects a dedicated heartbeat server the master never opened
+    //   - client is legacy but the master dropped Heartbeat from the main
+    //     server in favor of a dedicated port
+    // Either direction would otherwise silently starve heartbeats until the
+    // client gets reaped (client_live_ttl expiry, segment reclaim).
+    auto hb_ready = invoke_rpc<&WrappedMasterService::HeartbeatServiceReady,
+                               HeartbeatServiceReadyResponse>();
+    if (!hb_ready.has_value()) {
+        LOG(ERROR) << "HeartbeatServiceReady probe failed: error_code="
+                   << hb_ready.error()
+                   << " (master may predate this RPC; upgrade master first)";
+        timer.LogResponse("error_code=", hb_ready.error());
+        client_addr_param_.clear();
+        return hb_ready.error();
+    }
+    const bool client_dedicated = heartbeat_rpc_port_ > 0;
+    const bool master_dedicated = hb_ready->heartbeat_rpc_port > 0;
+    if (client_dedicated != master_dedicated) {
+        LOG(ERROR) << "Heartbeat routing mismatch: client_hb_port="
+                   << heartbeat_rpc_port_
+                   << " master_hb_port=" << hb_ready->heartbeat_rpc_port
+                   << " (one side is dedicated, the other is legacy)";
+        timer.LogResponse("error_code=", ErrorCode::HEARTBEAT_ROUTING_MISMATCH);
+        client_addr_param_.clear();
+        return ErrorCode::HEARTBEAT_ROUTING_MISMATCH;
+    }
+    // Both sides dedicated: confirm the dedicated heartbeat server is actually
+    // reachable (catches a configured-but-dead dedicated server). Mirrors the
+    // main-pool stale-connection retry above when reconnecting to the same
+    // address.
+    if (client_dedicated) {
         auto hb_result =
             invoke_rpc_via<&WrappedMasterService::ServiceReady, std::string>(
                 heartbeat_accessor_);
         if (!hb_result.has_value() && is_same_addr) {
-            // Stale heartbeat connection pool might still exist (mirrors the
-            // main-pool retry above). Retrying once forces the pool to
-            // re-establish a new connection before declaring the heartbeat
-            // server unreachable. Skipped when !is_same_addr because a fresh
-            // pool was just obtained — a failure there is a real mismatch.
             hb_result = invoke_rpc_via<&WrappedMasterService::ServiceReady,
                                        std::string>(heartbeat_accessor_);
         }
         if (!hb_result.has_value()) {
             LOG(ERROR) << "Dedicated heartbeat RPC server unreachable at"
                        << " heartbeat_rpc_port=" << heartbeat_rpc_port_
-                       << " (master may not have enabled it): error_code="
-                       << hb_result.error();
+                       << ": error_code=" << hb_result.error();
             timer.LogResponse("error_code=",
                               ErrorCode::HEARTBEAT_RPC_UNREACHABLE);
             client_addr_param_.clear();
