@@ -167,6 +167,15 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         auto hb_result =
             invoke_rpc_via<&WrappedMasterService::ServiceReady, std::string>(
                 heartbeat_accessor_);
+        if (!hb_result.has_value() && is_same_addr) {
+            // Stale heartbeat connection pool might still exist (mirrors the
+            // main-pool retry above). Retrying once forces the pool to
+            // re-establish a new connection before declaring the heartbeat
+            // server unreachable. Skipped when !is_same_addr because a fresh
+            // pool was just obtained — a failure there is a real mismatch.
+            hb_result = invoke_rpc_via<&WrappedMasterService::ServiceReady,
+                                       std::string>(heartbeat_accessor_);
+        }
         if (!hb_result.has_value()) {
             LOG(ERROR) << "Dedicated heartbeat RPC server unreachable at"
                        << " heartbeat_rpc_port=" << heartbeat_rpc_port_
