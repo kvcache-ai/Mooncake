@@ -10,3 +10,4 @@ list(
 
 # # Build all the source files of base dir into a static lib('base')
 add_library(base STATIC ${SRC})
+target_link_libraries(base PRIVATE glog::glog)

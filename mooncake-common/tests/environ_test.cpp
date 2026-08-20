@@ -13,11 +13,13 @@
 // limitations under the License.
 
 #include "environ.h"
+#include "environment_variable.h"
 
 #include <gtest/gtest.h>
 
 #include <climits>
 #include <cstdlib>
+#include <optional>
 
 using mooncake::Environ;
 
@@ -295,6 +297,36 @@ TEST_F(EnvironTest, GetStringEmpty) {
 TEST_F(EnvironTest, GetStringWithSpaces) {
     setenv("MC_TEST_STRING", "hello world", 1);
     EXPECT_EQ(Environ::GetString("MC_TEST_STRING", ""), "hello world");
+}
+
+TEST_F(EnvironTest, ReadsTypedEnvironmentVariableDefinitions) {
+    constexpr mooncake::EnvironmentVariable<int64_t> number{"MC_TEST_INT64"};
+    constexpr mooncake::EnvironmentVariable<bool> enabled{"MC_TEST_BOOL"};
+    constexpr mooncake::EnvironmentVariable<std::string> text{"MC_TEST_STRING"};
+
+    EXPECT_FALSE(Environ::Read(number).has_value());
+    EXPECT_EQ(Environ::ReadOr(number, int64_t{17}), 17);
+
+    setenv(number.name, "42", 1);
+    setenv(enabled.name, "off", 1);
+    setenv(text.name, "", 1);
+
+    EXPECT_EQ(Environ::Read(number), 42);
+    EXPECT_EQ(Environ::Read(enabled), false);
+    ASSERT_TRUE(Environ::Read(text).has_value());
+    EXPECT_TRUE(Environ::Read(text)->empty());
+}
+
+TEST_F(EnvironTest, TypedReadOrWarnsAndUsesDefaultForInvalidValues) {
+    constexpr mooncake::EnvironmentVariable<int64_t> number{"MC_TEST_INT64"};
+    setenv(number.name, "invalid", 1);
+
+    testing::internal::CaptureStderr();
+    EXPECT_EQ(Environ::ReadOr(number, int64_t{17}), 17);
+    const std::string logs = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(logs.find("MC_TEST_INT64"), std::string::npos);
+    EXPECT_NE(logs.find("using default 17"), std::string::npos);
 }
 
 int main(int argc, char** argv) {

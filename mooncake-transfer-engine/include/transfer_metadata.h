@@ -57,7 +57,7 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
-        int32_t device_id = -1;  // CUDA device for NCCL buffers
+        int32_t device_id = -1;  // CUDA device (NCCL) or Ascend engine index
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif

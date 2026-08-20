@@ -133,7 +133,7 @@ class ControlService {
 
     void setNotifyCallback(const OnNotify& callback);
 
-    Status start(uint16_t& port, bool ipv6_ = false);
+    Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
 
    private:
     void onGetSegmentDesc(const std::string_view& request,

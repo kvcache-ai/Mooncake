@@ -444,6 +444,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         ha::MasterSnapshotCodec codec;
         ha::MasterSnapshotStateView state_view(
             *master_service_, master_service_->segment_manager_,
+            master_service_->local_ssd_manager_,
             master_service_->nof_segment_manager_,
             master_service_->task_manager_);
 

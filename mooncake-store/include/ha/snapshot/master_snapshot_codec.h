@@ -13,6 +13,7 @@ namespace mooncake {
 // Forward declarations
 class MasterService;
 class SegmentManager;
+class LocalSsdManager;
 class NoFSegmentManager;
 class ClientTaskManager;
 
@@ -28,13 +29,16 @@ namespace ha {
 struct MasterSnapshotStateView {
     MasterService& master_service;
     SegmentManager& segment_manager;
+    LocalSsdManager& local_ssd_manager;
     NoFSegmentManager& nof_segment_manager;
     ClientTaskManager& task_manager;
 
     MasterSnapshotStateView(MasterService& ms, SegmentManager& sm,
-                            NoFSegmentManager& nsm, ClientTaskManager& tm)
+                            LocalSsdManager& lsm, NoFSegmentManager& nsm,
+                            ClientTaskManager& tm)
         : master_service(ms),
           segment_manager(sm),
+          local_ssd_manager(lsm),
           nof_segment_manager(nsm),
           task_manager(tm) {}
 };
@@ -137,7 +141,7 @@ class MasterSnapshotCodec {
 
     // Segment encoding/decoding
     tl::expected<std::vector<uint8_t>, SerializationError> EncodeSegments(
-        SegmentManager& segment_manager,
+        SegmentManager& segment_manager, LocalSsdManager& local_ssd_manager,
         NoFSegmentManager& nof_segment_manager) const;
     tl::expected<void, SerializationError> DecodeSegments(
         MasterService* master_service, const std::vector<uint8_t>& data) const;

@@ -147,6 +147,47 @@ Status getRpcServerPortFromConfig(const Config& config, uint16_t default_value,
         "rpc_server_port must be an integer or integer string" LOC_MARK);
 }
 
+Status getRpcServerThreadsFromConfig(const Config& config, size_t default_value,
+                                     size_t& threads) {
+    constexpr const char* kKey = "rpc_server_threads";
+    constexpr long long kMinThreads = 1;
+    constexpr long long kMaxThreads = 1024;
+    auto validate = [&](long long value, const std::string& source) -> Status {
+        if (value < kMinThreads || value > kMaxThreads) {
+            return Status::InvalidArgument(
+                "Invalid rpc_server_threads '" + source +
+                "', expected value in range [1, " +
+                std::to_string(kMaxThreads) + "]" LOC_MARK);
+        }
+        threads = static_cast<size_t>(value);
+        return Status::OK();
+    };
+    if (!config.contains(kKey)) {
+        threads = default_value;
+        return Status::OK();
+    }
+
+    json raw_value = config.get<json>(kKey, json());
+    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
+        long long numeric_value = raw_value.get<long long>();
+        return validate(numeric_value, std::to_string(numeric_value));
+    }
+    if (raw_value.is_string()) {
+        auto string_value = raw_value.get<std::string>();
+        auto parsed_value = tryParseConfigIntString(string_value);
+        if (!parsed_value.has_value()) {
+            return Status::InvalidArgument(
+                "Invalid rpc_server_threads '" + string_value +
+                "', expected integer in range [1, " +
+                std::to_string(kMaxThreads) + "]" LOC_MARK);
+        }
+        return validate(*parsed_value, string_value);
+    }
+
+    return Status::InvalidArgument(
+        "rpc_server_threads must be an integer or integer string" LOC_MARK);
+}
+
 PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
     const Config& config) {
     PreservedTentConfigOverrides preserved;
@@ -288,6 +329,8 @@ Status TransferEngineImpl::construct() {
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
+    size_t rpc_server_threads = 1;
+    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, 1, rpc_server_threads));
     merge_requests_ = conf_->get("merge_requests", true);
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     enable_auto_failover_on_poll_ =
@@ -336,7 +379,7 @@ Status TransferEngineImpl::construct() {
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);
 
-    CHECK_STATUS(metadata_->start(port_, ipv6_));
+    CHECK_STATUS(metadata_->start(port_, ipv6_, rpc_server_threads));
 
     if (metadata_type == "p2p")
         local_segment_name_ = buildIpAddrWithPort(hostname_, port_, ipv6_);
@@ -1927,10 +1970,11 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
             for (size_t tid = hook.start_task_id; tid < hook.end_task_id;
                  ++tid) {
                 auto& t = batch->task_list[tid];
-                if (t.status == PENDING) {
-                    all_completed = false;
-                    break;
-                }
+                // Merged requests are carried by one owning task; the derived
+                // ones keep their initial status forever, so checking them
+                // would make this hook never fire. getBatchStatus() skips them
+                // for the same reason.
+                if (t.derived) continue;
                 if (t.status != COMPLETED) {
                     all_completed = false;
                     break;
@@ -2333,7 +2377,13 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         overall_status.s = worst_failure;
     }
     // else: some tasks still PENDING → overall_status.s stays PENDING
-    CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
+    // Transfer-bound notifications may only be delivered once the transfer
+    // they are attached to has actually completed. The second parameter is
+    // "verify completion before sending", so passing the batch's completion
+    // into it inverted the guard: for a batch still in flight, or one that
+    // ended in failure, check was false and every hook fired anyway.
+    if (overall_status.s == COMPLETED)
+        CHECK_STATUS(maybeFireSubmitHooks(batch, /*check=*/false));
     return Status::OK();
 }
 

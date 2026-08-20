@@ -335,7 +335,8 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               static_cast<int64_t>(segment.size));
 
-    auto snapshot = SegmentSerializer(&source_manager).Serialize();
+    auto snapshot =
+        SegmentSerializer(&source_manager).Serialize(LocalSsdPersistedState{});
     ASSERT_TRUE(snapshot.has_value());
 
     {

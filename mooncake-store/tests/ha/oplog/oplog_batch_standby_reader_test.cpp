@@ -270,11 +270,32 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     ASSERT_EQ(ErrorCode::OK, first.error);
     EXPECT_EQ(2u, first.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(reader.GetLastAppliedDurablePrefix().has_value());
 
     auto second = reader.PollOnce(/*max_batches=*/2);
     ASSERT_EQ(ErrorCode::OK, second.error);
     EXPECT_EQ(1u, second.applied_entries);
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+    auto applied_prefix = reader.GetLastAppliedDurablePrefix();
+    ASSERT_TRUE(applied_prefix.has_value());
+    EXPECT_EQ(3u, applied_prefix->batch_id);
+    EXPECT_EQ(3u, applied_prefix->last_seq);
+}
+
+TEST(OpLogBatchStandbyReaderTest, ReportsValidZeroBoundaryAsComplete) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    ASSERT_EQ(ErrorCode::OK, reader.PollOnce().error);
+    auto applied_prefix = reader.GetLastAppliedDurablePrefix();
+    ASSERT_TRUE(applied_prefix.has_value());
+    EXPECT_EQ(0u, applied_prefix->batch_id);
+    EXPECT_EQ(0u, applied_prefix->last_seq);
 }
 
 TEST(OpLogBatchStandbyReaderTest, RejectsPrefixPointingIntoBatch) {
@@ -316,6 +337,10 @@ TEST(OpLogBatchStandbyReaderTest, AppliesExpandedEntriesInSequenceOrder) {
     ASSERT_EQ(ErrorCode::OK, result.error);
     EXPECT_EQ(3u, result.applied_entries);
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+    auto applied_prefix = reader.GetLastAppliedDurablePrefix();
+    ASSERT_TRUE(applied_prefix.has_value());
+    EXPECT_EQ(2u, applied_prefix->batch_id);
+    EXPECT_EQ(3u, applied_prefix->last_seq);
 }
 
 TEST(OpLogBatchStandbyReaderTest, AcceptsFirstBatchAfterSnapshotBaseline) {
@@ -358,6 +383,7 @@ TEST(OpLogBatchStandbyReaderTest, FailsWhenLaterBatchHasSequenceGap) {
     EXPECT_NE(ErrorCode::OK, result.error);
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(reader.GetLastAppliedDurablePrefix().has_value());
 }
 
 TEST(OpLogBatchStandbyReaderTest, MissingBatchMarksReaderUnhealthy) {

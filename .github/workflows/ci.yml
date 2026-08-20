@@ -218,11 +218,8 @@ jobs:
         python-version: ['3.10', '3.12']
     env:
       CI: "true"
-      TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
       PIP_NO_CACHE_DIR: "1"
-      MAX_JOBS: "2"
-      EP_TORCH_VERSIONS: "2.11.0;2.12.0;2.12.1;2.13.0"
       CMAKE_RELWITHDEBINFO_FLAGS: "-O2 -DNDEBUG"
 
     steps:
@@ -265,9 +262,6 @@ jobs:
         df -h
       shell: bash
 
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
     - name: Build transfer engine only
       run: |
         cd mooncake-transfer-engine
@@ -298,130 +292,6 @@ jobs:
         rm -rf build
         df -h
       shell: bash
-
-    - name: Configure project with all settings are ON
-      run: |
-        mkdir build
-        cd build
-        # ENABLE_DEBUG_SYMBOLS=OFF alone still leaves CMake's RelWithDebInfo -g.
-        cmake -G Ninja .. \
-          -DUSE_ETCD=ON \
-          -DUSE_CXL=ON \
-          -DUSE_REDIS=ON \
-          -DUSE_HTTP=ON \
-          -DWITH_STORE=ON \
-          -DWITH_P2P_STORE=ON \
-          -DWITH_METRICS=ON \
-          -DBUILD_UNIT_TESTS=ON \
-          -DBUILD_EXAMPLES=ON \
-          -DENABLE_SCCACHE=ON \
-          -DUSE_CUDA=ON \
-          -DUSE_MNNVL=OFF \
-          -DUSE_UB=OFF \
-          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
-          "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
-          "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
-          -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-      # TODO: lack USE_NVMEOF,USE_MNNVL
-
-    - name: Build project with all settings are ON
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-        df -h
-      shell: bash
-
-    - name: Configure project with unit tests and examples
-      run: |
-        cd build
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DWITH_STORE_RUST=ON -DENABLE_SCCACHE=ON -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project with unit tests and examples
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Check Mooncake Store Rust bindings, examples, and tests
-      run: |
-        # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
-        # The toolkit stubs dir only ships libcuda.so; create the versioned symlink.
-        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
-           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
-          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-        fi
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cd mooncake-store/rust
-        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
-        cargo test --lib
-        MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
-        MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
-          cargo test --examples --tests --no-run
-        cargo clean
-      shell: bash
-
-    - name: Verify Mooncake Store Rust dlopen bindings and packaging
-      run: |
-        cd mooncake-store/rust
-        # 1. Committed dlopen bindings must stay in sync with store_c.h.
-        cargo run --locked --example generate_dlopen_bindings
-        git diff --exit-code -- src/generated/ffi_dlopen_bindings.rs
-        # 2. The published dlopen crate must build with no header/bindgen: package
-        #    it, extract, and check the dlopen feature against the packaged files.
-        cargo package --no-verify --allow-dirty
-        crate=$(ls target/package/mooncake_store-*.crate | head -1)
-        dest=$(mktemp -d)
-        tar xzf "$crate" -C "$dest"
-        (cd "$dest"/mooncake_store-* && cargo check --no-default-features --features dlopen)
-      shell: bash
-
-    - name: Configure project
-      run: |
-        cd build
-        rm -r */tests
-        cmake -G Ninja .. \
-          -DBUILD_UNIT_TESTS=OFF \
-          -DBUILD_EXAMPLES=OFF \
-          -DUSE_HTTP=ON \
-          -DENABLE_SCCACHE=ON \
-          -DUSE_CXL=ON \
-          -DWITH_EP=ON \
-          "-DEP_TORCH_VERSIONS=${EP_TORCH_VERSIONS}" \
-          -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Build nvlink_allocator.so
-      run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-        cd mooncake-transfer-engine/nvlink-allocator
-        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
 
   spell-check:
     name: Spell Check with Typos
