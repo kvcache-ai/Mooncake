@@ -11,8 +11,7 @@
 
 namespace mooncake {
 
-std::atomic<void (*)()> BufferAllocatorBase::record_deallocation_hook_{
-    nullptr};
+std::atomic<void (*)()> BufferAllocatorBase::record_deallocation_hook_{nullptr};
 
 void BufferAllocatorBase::AttachUsageTracker(
     const std::shared_ptr<StorageUsageTracker>& usage_tracker) {

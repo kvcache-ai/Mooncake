@@ -89,9 +89,7 @@ class StorageUsageRegistration {
     StorageUsageRegistration& operator=(const StorageUsageRegistration&) =
         delete;
 
-    void AddUsedBytes(size_t bytes) noexcept {
-        tracker_->AddUsedBytes(bytes);
-    }
+    void AddUsedBytes(size_t bytes) noexcept { tracker_->AddUsedBytes(bytes); }
 
     void RemoveUsedBytes(size_t bytes) noexcept {
         tracker_->RemoveUsedBytes(bytes);
