@@ -95,18 +95,20 @@ Status CoroRpcAgent::registerFunction(int func_id, const Function& func,
     return Status::OK();
 }
 
-Status CoroRpcAgent::start(uint16_t& port, bool ipv6) {
+Status CoroRpcAgent::start(uint16_t& port, bool ipv6, size_t threads) {
     const static uint16_t kStartPort = 15000;
     const static uint16_t kPortRange = 2000;
     const static int kMaxRetry = 10;
     if (running_)
         return Status::InvalidArgument("RPC server already started" LOC_MARK);
     easylog::set_min_severity(easylog::Severity::FATAL);
+    if (threads > 1)
+        LOG(INFO) << "CoroRpcAgent: RPC server threads set to " << threads;
     for (int retry = 0; retry < kMaxRetry; ++retry) {
         try {
             if (port == 0)
                 port = kStartPort + SimpleRandom::Get().next(kPortRange);
-            server_ = new coro_rpc::coro_rpc_server(kRpcThreads, port,
+            server_ = new coro_rpc::coro_rpc_server(threads, port,
                                                     ipv6 ? "::" : "0.0.0.0");
             server_->register_handler<&CoroRpcAgent::process>(this);
             server_->async_start();
