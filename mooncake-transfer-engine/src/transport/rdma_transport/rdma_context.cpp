@@ -477,14 +477,14 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
             exportOffset = (uintptr_t)addr - aligned;
             exportSize =
                 (exportOffset + length + page - 1) & ~(size_t)(page - 1);
-            LOG(INFO) << "dma_buf: reported allocation for " << (uintptr_t)addr
-                      << " (base=" << (uintptr_t)allocBase
-                      << " size=" << allocSize << ") does not cover length "
-                      << length << "; exporting the requested range instead"
-                      << " (base=" << (uintptr_t)exportBase
-                      << " size=" << exportSize
-                      << "). Expected for CUDA VMM allocations such as PyTorch"
-                         " expandable_segments.";
+            VLOG(1) << "dma_buf: reported allocation for " << (uintptr_t)addr
+                    << " (base=" << (uintptr_t)allocBase
+                    << " size=" << allocSize << ") does not cover length "
+                    << length << "; exporting the requested range instead"
+                    << " (base=" << (uintptr_t)exportBase
+                    << " size=" << exportSize
+                    << "). Expected for CUDA VMM allocations such as PyTorch"
+                       " expandable_segments.";
         }
 
         // flags must be 0: the PCIE-BAR1 mapping flag is rejected (error 801)
