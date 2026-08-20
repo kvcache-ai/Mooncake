@@ -21,9 +21,9 @@ usage() {
 Usage: ./scripts/build_transfer_engine_variants.sh [options] <standard|rpc|shca>
 
 Build variants:
-  standard  mooncake_transfer_engine       (normal NIC, no hylink; USE_HYGON=ON, USE_FAKE_HIP_RPC=ON)
-  rpc       mooncake_transfer_engine_rpc   (normal NIC, hylink enabled; USE_HYGON=ON)
-  shca      mooncake_transfer_engine_shca  (TianLong NIC, no hylink; USE_HYGON=ON, USE_SHCA=ON, USE_FAKE_HIP_RPC=ON)
+  standard  mooncake_transfer_engine       (normal NIC, no hylink; USE_HYGON=ON, USE_FAKE_HIP_RPC=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
+  rpc       mooncake_transfer_engine_rpc   (normal NIC, hylink enabled; USE_HYGON=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
+  shca      mooncake_transfer_engine_shca  (TianLong NIC, no hylink; USE_HYGON=ON, USE_SHCA=ON, USE_FAKE_HIP_RPC=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
 
 Options:
   --skip-deps   Skip `bash dependencies.sh`
@@ -152,19 +152,19 @@ setup_shca_env() {
 build_variant() {
     local variant="$1"
     local package_basename=""
-    local -a cmake_args=()
+    local -a cmake_args=(-DUSE_ETCD=ON -DSTORE_USE_ETCD=ON)
 
     case "${variant}" in
         standard)
             package_basename="mooncake_transfer_engine"
-            cmake_args=(-DUSE_HYGON=ON -DUSE_FAKE_HIP_RPC=ON)
+            cmake_args+=(-DUSE_HYGON=ON -DUSE_FAKE_HIP_RPC=ON)
             if [ "${DRY_RUN}" -eq 0 ]; then
                 restore_pyproject
             fi
             ;;
         rpc)
             package_basename="mooncake_transfer_engine_rpc"
-            cmake_args=(-DUSE_HYGON=ON -DUSE_FAKE_HIP_RPC=OFF)
+            cmake_args+=(-DUSE_HYGON=ON -DUSE_FAKE_HIP_RPC=OFF)
             if [ "${DRY_RUN}" -eq 0 ]; then
                 patch_pyproject \
                     "mooncake-transfer-engine-rpc" \
@@ -174,7 +174,7 @@ build_variant() {
             ;;
         shca)
             package_basename="mooncake_transfer_engine_shca"
-            cmake_args=(-DUSE_HYGON=ON -DUSE_SHCA=ON -DUSE_FAKE_HIP_RPC=ON)
+            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=ON -DUSE_FAKE_HIP_RPC=ON)
             setup_shca_env
             if [ "${DRY_RUN}" -eq 0 ]; then
                 patch_pyproject \
