@@ -1280,7 +1280,11 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
 }
 
 TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
-    service_.reset(new MasterService());
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
 
     // Mount two large segments
     constexpr size_t buffer1 = 0x300000000;
