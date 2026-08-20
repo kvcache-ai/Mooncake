@@ -64,6 +64,12 @@ namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 
+// Time the client needs, on top of the announced grace period, to observe that
+// the master has released every segment: Client checks 10s after the period
+// elapses and then retries up to three times at 10s intervals, so 40s plus a
+// small margin. Used when CloseOptions::timeout is left unset.
+constexpr std::chrono::seconds kGracefulCloseConfirmationBudget{45};
+
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
 }
@@ -587,13 +593,28 @@ ResourceTracker &ResourceTracker::getInstance() {
     return *instance;
 }
 
+namespace {
+// Set by ResourceTracker::DisableSignalHandling() before the singleton is
+// constructed, when the surrounding process owns the termination signals.
+std::atomic<bool> g_resource_tracker_signals_disabled{false};
+}  // namespace
+
+void ResourceTracker::DisableSignalHandling() {
+    g_resource_tracker_signals_disabled.store(true, std::memory_order_release);
+}
+
 ResourceTracker::ResourceTracker() {
     // In embedded environments (e.g. Python), the host runtime owns signal
     // handling.  Blocking SIGINT with pthread_sigmask (done inside
     // startSignalThread) would prevent Python from raising KeyboardInterrupt,
     // causing the process to hang on Ctrl-C.  Detect Python at runtime via
     // dlsym so we don't need to include <Python.h> or change any public API.
-    if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
+    //
+    // A process that installs its own handlers opts out explicitly, because a
+    // signal must have a single consumer: POSIX does not define the behaviour
+    // when sigaction and sigwait handle the same signal concurrently.
+    if (!g_resource_tracker_signals_disabled.load(std::memory_order_acquire) &&
+        !dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
         // Standalone C/C++ process – install our own signal handling.
         startSignalThread();
     }
@@ -1347,11 +1368,34 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    // Immediate shutdown: the zero-grace-period case of Close().
+    return Close(CloseOptions{});
+}
+
+tl::expected<void, ErrorCode> RealClient::Close(const CloseOptions &options) {
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
         return {};
+    }
+
+    // Graceful phase, before anything is torn down. The Client object owns the
+    // thread pool that drives the graceful-unmount timers and holds the memory
+    // registrations that keep remote reads working, so it has to stay alive for
+    // the whole wait, i.e. this must run before client_.reset() below.
+    if (options.grace_period > std::chrono::milliseconds::zero() && client_) {
+        client_->GracefulUnmountAll(options.grace_period.count());
+        // Waits for the entire pending set, so segments that a caller had
+        // already started unmounting with a grace period are covered as well.
+        // On expiry we simply continue: ~Client() releases whatever is left and
+        // the master still applies its own scheduler and client expiry.
+        const auto timeout =
+            options.timeout > std::chrono::milliseconds::zero()
+                ? options.timeout
+                : options.grace_period + kGracefulCloseConfirmationBudget;
+        client_->WaitForGracefulUnmountAll(std::chrono::steady_clock::now() +
+                                           timeout);
     }
 
     stop_ipc_server();

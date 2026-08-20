@@ -385,6 +385,35 @@ class Client {
         std::function<void(const UUID&)> cleanup_callback = {});
 
     /**
+     * @brief Requests graceful unmount for all currently mounted segments.
+     *
+     * The master stops allocating on these segments but keeps the replicas
+     * readable, so remote reads keep working as long as this process stays
+     * alive and its memory registrations are held. This only initiates the
+     * operation; use WaitForGracefulUnmountAll() to await completion.
+     *
+     * @param grace_period_ms grace period announced to the master.
+     * @return number of segments for which graceful unmount was accepted.
+     *         Segments that failed stay mounted and are unmounted immediately
+     *         by ~Client() as the fallback path.
+     */
+    size_t GracefulUnmountAll(uint64_t grace_period_ms);
+
+    /**
+     * @brief Waits until every gracefully unmounting segment has been released.
+     *
+     * Event-driven: blocks on a condition variable that is notified whenever a
+     * segment is erased from the gracefully-unmounting set, so it returns as
+     * soon as the last one completes. The caller owns the timeout policy.
+     *
+     * @param deadline absolute deadline supplied by the caller.
+     * @return true if all segments were released, false on deadline expiry
+     *         (leftovers are handled by ~Client() and master-side expiry).
+     */
+    bool WaitForGracefulUnmountAll(
+        std::chrono::steady_clock::time_point deadline);
+
+    /**
      * @brief Registers memory buffer with TransferEngine for data transfer
      * @param addr Memory address to register
      * @param length Size of the memory region
@@ -918,6 +947,10 @@ class Client {
     std::unordered_map<UUID, std::function<void(const UUID&)>,
                        boost::hash<UUID>>
         graceful_unmount_cleanup_callbacks_;
+    // Notified (under mounted_segments_mutex_) whenever a segment leaves
+    // gracefully_unmounting_segments_, so WaitForGracefulUnmountAll() can
+    // return as soon as the set drains instead of polling.
+    std::condition_variable gracefully_unmounting_done_cv_;
 
     /**
      * @brief Internal helper to unmount a segment by iterator.

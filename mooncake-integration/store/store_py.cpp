@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
+#include <chrono>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -2379,13 +2380,42 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
-        .def("close",
-             [](MooncakeStorePyWrapper &self) {
-                 if (!self.store_) return 0;
-                 int rc = self.store_->tearDownAll();
-                 self.store_.reset();
-                 return rc;
-             })
+        .def(
+            "close",
+            [](MooncakeStorePyWrapper &self, uint64_t grace_period_seconds) {
+                if (!self.store_) return 0;
+                CloseOptions options;
+                options.grace_period =
+                    std::chrono::seconds(grace_period_seconds);
+                // timeout is left at zero on purpose: the upper bound depends
+                // on the client's own confirmation schedule, so the client is
+                // the only party able to derive a value that can actually
+                // observe completion.
+                // Only RealClient owns segments, so it is the only one with a
+                // graceful phase; other clients tear down immediately.
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                int rc = 0;
+                {
+                    // Close() may wait for the grace period to elapse, so the
+                    // interpreter must not be blocked while it runs.
+                    py::gil_scoped_release release;
+                    if (real_client) {
+                        rc = static_cast<int>(
+                            to_py_ret(real_client->Close(options)));
+                    } else {
+                        rc = self.store_->tearDownAll();
+                    }
+                }
+                self.store_.reset();
+                return rc;
+            },
+            py::arg("grace_period_seconds") = 0,
+            "Close the store. With grace_period_seconds > 0 the master is "
+            "asked to stop allocating on this client's segments while they "
+            "stay readable, and the call waits for them to be released, so "
+            "peers holding segment information can finish their reads. Zero "
+            "(the default) tears down immediately.")
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "

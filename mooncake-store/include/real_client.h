@@ -42,6 +42,15 @@ class ResourceTracker {
     // Get the singleton instance
     static ResourceTracker &getInstance();
 
+    // Opt out of the built-in sigwait consumer for SIGINT/SIGTERM/SIGHUP.
+    //
+    // Must be called before the first getInstance(). Processes that install
+    // their own handlers for these signals have to call this: POSIX leaves the
+    // behaviour unspecified when the same signal is consumed by a sigaction
+    // handler and by sigwait at the same time, so exactly one owner may exist.
+    // The atexit fallback is unaffected.
+    static void DisableSignalHandling();
+
     // Register a DistributedObjectStore instance for cleanup
     void registerInstance(const std::shared_ptr<PyClient> &instance);
 
@@ -344,6 +353,21 @@ class RealClient : public PyClient {
                                  bool force = false);
 
     int tearDownAll();
+
+    /**
+     * @brief Shuts the client down, running the whole transition exactly once.
+     *
+     * This is the single shutdown implementation shared by every frontend: it
+     * atomically enters the closing state, initiates graceful unmount for the
+     * mounted segments when a grace period is requested, waits for all pending
+     * unmounts (including any started earlier through UnmountSegmentById),
+     * falls back to the regular teardown on timeout, and then tears everything
+     * down.
+     *
+     * A default-constructed CloseOptions shuts down immediately, which is what
+     * destructors and the C API want; tearDownAll() is exactly that case.
+     */
+    tl::expected<void, ErrorCode> Close(const CloseOptions &options);
 
     int health_check() override;
 

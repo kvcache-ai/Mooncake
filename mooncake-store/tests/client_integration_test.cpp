@@ -20,6 +20,7 @@
 
 #include "allocator.h"
 #include "client_service.h"
+#include "pyclient.h"
 #include "types.h"
 #include "utils.h"
 #include "test_server_helpers.h"
@@ -2045,6 +2046,86 @@ TEST_F(ClientIntegrationTest, MountSegmentAndGetIdAndUnmountSegmentById) {
         << "UnmountSegment failed: " << toString(unmount2.error());
 
     free(test_buffer);
+}
+
+// Verifies the mechanism/policy split: GracefulUnmountAll() only initiates, and
+// WaitForGracefulUnmountAll() returns as soon as the last segment is released
+// rather than after a fixed polling interval.
+//
+// Uses a dedicated client so the suite-wide segment mounted by SetUpTestSuite()
+// is not affected: GracefulUnmountAll() acts on every segment the client has
+// mounted.
+TEST_F(ClientIntegrationTest, GracefulUnmountAllCompletesWithoutPolling) {
+    auto client = CreateClient("127.0.0.1:17821");
+    ASSERT_NE(client, nullptr);
+
+    const size_t test_size = 16 * 1024 * 1024;  // 16 MB
+    void* test_buffer = allocate_buffer_allocator_memory(test_size);
+    ASSERT_NE(test_buffer, nullptr);
+
+    auto mount_result =
+        client->MountSegmentAndGetId(test_buffer, test_size, FLAGS_protocol);
+    ASSERT_TRUE(mount_result.has_value())
+        << "MountSegmentAndGetId failed: " << toString(mount_result.error());
+
+    // A short grace period keeps the test fast; the client-side confirmation
+    // timer fires 10s after the announced period, so the deadline must exceed
+    // that for the wait to observe completion.
+    const uint64_t grace_period_ms = 1000;
+    const size_t requested = client->GracefulUnmountAll(grace_period_ms);
+    EXPECT_EQ(requested, 1u) << "expected the mounted segment to be accepted";
+
+    const auto start = std::chrono::steady_clock::now();
+    const bool drained =
+        client->WaitForGracefulUnmountAll(start + std::chrono::seconds(60));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(drained) << "graceful unmount did not complete before deadline";
+    // The wait is condition-variable driven, so it must not linger past the
+    // moment the segment is released.
+    EXPECT_LT(elapsed, std::chrono::seconds(45));
+
+    free(test_buffer);
+}
+
+// The caller owns the timeout policy: an already-elapsed deadline must return
+// false immediately instead of blocking. Also uses a dedicated client to avoid
+// touching the suite-wide segment.
+TEST_F(ClientIntegrationTest, WaitForGracefulUnmountAllRespectsDeadline) {
+    auto client = CreateClient("127.0.0.1:17822");
+    ASSERT_NE(client, nullptr);
+
+    const size_t test_size = 16 * 1024 * 1024;  // 16 MB
+    void* test_buffer = allocate_buffer_allocator_memory(test_size);
+    ASSERT_NE(test_buffer, nullptr);
+
+    auto mount_result =
+        client->MountSegmentAndGetId(test_buffer, test_size, FLAGS_protocol);
+    ASSERT_TRUE(mount_result.has_value())
+        << "MountSegmentAndGetId failed: " << toString(mount_result.error());
+
+    // A long grace period guarantees the segment is still pending below.
+    const uint64_t grace_period_ms = 60000;
+    ASSERT_EQ(client->GracefulUnmountAll(grace_period_ms), 1u);
+
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client->WaitForGracefulUnmountAll(start))
+        << "an expired deadline must not report completion";
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(5));
+
+    // No mounted segments remain, so this is a no-op that must not block.
+    EXPECT_EQ(client->GracefulUnmountAll(grace_period_ms), 0u);
+
+    free(test_buffer);
+}
+
+// CloseOptions defaults must keep the immediate, deterministic shutdown that
+// destructors, the C API and plain tearDownAll() rely on.
+TEST_F(ClientIntegrationTest, CloseOptionsDefaultToImmediateShutdown) {
+    CloseOptions options;
+    EXPECT_EQ(options.grace_period, std::chrono::milliseconds::zero());
+    EXPECT_EQ(options.timeout, std::chrono::milliseconds::zero());
 }
 
 }  // namespace testing
