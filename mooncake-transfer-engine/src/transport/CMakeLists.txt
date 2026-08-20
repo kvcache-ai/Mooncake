@@ -116,8 +116,8 @@ if(USE_CUDA
   endif()
 endif()
 
-if (USE_FLAGCX)
+if(USE_FLAGCX)
   add_subdirectory(flagcx_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:flagcx_transport>)
-  target_link_libraries(transport PRIVATE flagcx)
+  target_link_libraries(transport PRIVATE FlagCX::flagcx)
 endif()
