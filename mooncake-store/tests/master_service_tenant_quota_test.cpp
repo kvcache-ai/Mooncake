@@ -391,6 +391,25 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             entry, removed_ids, MasterService::QuotaEraseMode::kFull);
     }
 
+    void InvalidateSegmentAllocatorWithoutCleanup(MasterService& service,
+                                                  const UUID& segment_id) {
+        size_t ignored_capacity = 0;
+        auto segment_access = service.segment_manager_.getSegmentAccess();
+        ASSERT_EQ(
+            segment_access.PrepareUnmountSegment(segment_id, ignored_capacity),
+            ErrorCode::OK);
+    }
+
+    void TriggerMetadataAccessorCleanupForRemovedSource(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        EXPECT_FALSE(accessor.Exists());
+        ASSERT_TRUE(accessor.HasReplicationTask());
+        EXPECT_TRUE(accessor.GetReplicationTask().source_removed);
+    }
+
     void AddCompletedDiskReplica(MasterService& service, const UUID& client_id,
                                  const std::string& key,
                                  const TenantId& tenant_id, uint64_t size) {
@@ -1225,8 +1244,116 @@ TEST_F(MasterServiceTenantQuotaTest, CopySourceCleanupWaitsForOpLogDurability) {
         service.UnmountSegment(source_segment_id, source_client).has_value());
     EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
 
+    auto blocked_copy_end =
+        service.CopyEnd(source_client, "key", TenantId("tenant-a"));
+    ASSERT_FALSE(blocked_copy_end.has_value());
+    EXPECT_EQ(blocked_copy_end.error(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    auto blocked_copy_revoke =
+        service.CopyRevoke(source_client, "key", TenantId("tenant-a"));
+    ASSERT_FALSE(blocked_copy_revoke.has_value());
+    EXPECT_EQ(blocked_copy_revoke.error(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_TRUE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
     backend->AllowTransactions();
     ASSERT_TRUE(WaitForChargedBytes(service, TenantId("tenant-a"), 0));
+    auto copy_end = service.CopyEnd(source_client, "key", TenantId("tenant-a"));
+    ASSERT_FALSE(copy_end.has_value());
+    EXPECT_EQ(copy_end.error(), ErrorCode::REPLICA_IS_GONE);
+    EXPECT_FALSE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    PutComplete(service, source_client, "replacement", TenantId("tenant-a"),
+                200);
+}
+
+TEST_F(MasterServiceTenantQuotaTest, MoveSourceCleanupWaitsForOpLogDurability) {
+    auto config = MakeConfig({{TenantId("tenant-a"), 200}});
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.cluster_id = "quota_move_source_cleanup";
+    config.oplog_batch_max_entries = 16;
+    MasterService service(config);
+    auto backend = std::make_shared<BlockingQuotaOpLogBackend>();
+    ASSERT_EQ(service.SetBatchOpLogBackendForTesting(backend), ErrorCode::OK);
+
+    UUID source_segment_id;
+    UUID source_client =
+        MountSegment(service, 4096, "segment-a", &source_segment_id);
+    MountSegment(service, 4096, "segment-b");
+
+    ReplicateConfig replicate_config = MemoryConfig();
+    replicate_config.preferred_segment = "segment-a";
+    ASSERT_TRUE(service
+                    .PutStart(source_client, "key", TenantId("tenant-a"), 100,
+                              replicate_config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(source_client, "key", TenantId("tenant-a"),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .MoveStart(source_client, "key", TenantId("tenant-a"),
+                               "segment-a", "segment-b")
+                    .has_value());
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    backend->BlockTransactions();
+    ASSERT_TRUE(
+        service.UnmountSegment(source_segment_id, source_client).has_value());
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    auto blocked_move_end =
+        service.MoveEnd(source_client, "key", TenantId("tenant-a"));
+    ASSERT_FALSE(blocked_move_end.has_value());
+    EXPECT_EQ(blocked_move_end.error(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    auto blocked_move_revoke =
+        service.MoveRevoke(source_client, "key", TenantId("tenant-a"));
+    ASSERT_FALSE(blocked_move_revoke.has_value());
+    EXPECT_EQ(blocked_move_revoke.error(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_TRUE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    backend->AllowTransactions();
+    ASSERT_TRUE(WaitForChargedBytes(service, TenantId("tenant-a"), 0));
+    ASSERT_TRUE(service.MoveRevoke(source_client, "key", TenantId("tenant-a"))
+                    .has_value());
+    EXPECT_FALSE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    PutComplete(service, source_client, "replacement", TenantId("tenant-a"),
+                200);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       MetadataAccessorCleanupCancelsReplicationForRemovedSource) {
+    MasterService service(MakeConfig({{TenantId("tenant-a"), 200}}));
+    UUID source_segment_id;
+    UUID source_client =
+        MountSegment(service, 4096, "segment-a", &source_segment_id);
+    MountSegment(service, 4096, "segment-b");
+
+    ReplicateConfig replicate_config = MemoryConfig();
+    replicate_config.preferred_segment = "segment-a";
+    ASSERT_TRUE(service
+                    .PutStart(source_client, "key", TenantId("tenant-a"), 100,
+                              replicate_config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(source_client, "key", TenantId("tenant-a"),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .CopyStart(source_client, "key", TenantId("tenant-a"),
+                               "segment-a", {"segment-b"})
+                    .has_value());
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    InvalidateSegmentAllocatorWithoutCleanup(service, source_segment_id);
+    TriggerMetadataAccessorCleanupForRemovedSource(service,
+                                                   TenantId("tenant-a"), "key");
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 0);
+
     auto copy_end = service.CopyEnd(source_client, "key", TenantId("tenant-a"));
     ASSERT_FALSE(copy_end.has_value());
     EXPECT_EQ(copy_end.error(), ErrorCode::REPLICA_IS_GONE);

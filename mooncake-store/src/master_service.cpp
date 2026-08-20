@@ -2048,7 +2048,8 @@ MasterService::BuildStaleHandleCleanupPlan(
 
 tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     const std::string& why, const TenantId& tenant_id, const std::string& key,
-    ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan) {
+    TenantState& tenant_state, ObjectMetadata& metadata,
+    const StaleHandleCleanupPlan& plan) {
     if (plan.removed_ids.empty() || !enable_oplog_) {
         return {};
     }
@@ -2066,6 +2067,13 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     }
     const std::unordered_set<ReplicaID> ids(plan.removed_ids.begin(),
                                             plan.removed_ids.end());
+    auto task_it = tenant_state.replication_tasks.find(key);
+    const bool replication_source_pending =
+        task_it != tenant_state.replication_tasks.end() &&
+        ids.contains(task_it->second.source_id);
+    if (replication_source_pending) {
+        task_it->second.durable_cleanup_pending = true;
+    }
     metadata.VisitReplicas(
         [&ids](const Replica& replica) { return ids.contains(replica.id()); },
         [](Replica& replica) { replica.mark_removed(); });
@@ -2078,6 +2086,9 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
                                                 QuotaEraseMode::kFull);
         });
     if (!result) {
+        if (replication_source_pending) {
+            task_it->second.durable_cleanup_pending = false;
+        }
         LOG(WARNING) << why
                      << ": stale cleanup OpLog queue failed for key=" << key
                      << ", err=" << static_cast<int>(result.error());
@@ -2535,7 +2546,8 @@ void MasterService::ClearStaleHandles(
                             auto persist_result =
                                 PersistStaleHandleCleanupForHA(
                                     "ClearStaleHandles", tenant_it->first,
-                                    it->first, it->second, cleanup_plan);
+                                    it->first, tenant_state, it->second,
+                                    cleanup_plan);
                             if (!persist_result) {
                                 ++it;
                                 continue;
@@ -4411,7 +4423,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "PutStart(stale cleanup)", object_id.tenant_id, key,
-                        it->second, cleanup_plan);
+                        tenant_state, it->second, cleanup_plan);
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
                     }
@@ -5079,7 +5091,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "UpsertStart(stale cleanup)", object_id.tenant_id, key,
-                        it->second, cleanup_plan);
+                        tenant_state, it->second, cleanup_plan);
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
                     }
@@ -6213,6 +6225,9 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (task.durable_cleanup_pending) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (!object_exists && task.source_removed) {
         accessor.Erase();
         return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
@@ -6402,6 +6417,9 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     if (task.type != ReplicationTask::Type::MOVE) {
         LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (task.durable_cleanup_pending) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (!object_exists && task.source_removed) {
         accessor.Erase();
@@ -6843,7 +6861,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             if (!cleanup_plan.removed_ids.empty()) {
                 auto persist_result = PersistStaleHandleCleanupForHA(
                     "BatchRemove(stale cleanup)", normalized_tenant, key,
-                    it->second, cleanup_plan);
+                    tenant_state, it->second, cleanup_plan);
                 if (!persist_result) {
                     results[original_idx] =
                         tl::make_unexpected(persist_result.error());

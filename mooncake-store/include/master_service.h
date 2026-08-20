@@ -1907,8 +1907,8 @@ class MasterService {
         const std::function<bool(const Replica&)>& is_stale) const;
     tl::expected<void, ErrorCode> PersistStaleHandleCleanupForHA(
         const std::string& why, const TenantId& tenant_id,
-        const std::string& key, ObjectMetadata& metadata,
-        const StaleHandleCleanupPlan& plan);
+        const std::string& key, TenantState& tenant_state,
+        ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
@@ -2160,6 +2160,8 @@ class MasterService {
                     },
                     &removed_replica_ids);
                 service_->CancelPromotionTaskForRemovedReplicas(
+                    *tenant_state_, it_->second, removed_replica_ids);
+                service_->CancelReplicationTaskForRemovedSource(
                     *tenant_state_, it_->second, removed_replica_ids);
                 const uint64_t after_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
