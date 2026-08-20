@@ -59,15 +59,9 @@ DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
 DEFINE_uint32(heartbeat_rpc_port, 0,
               "Port for a dedicated heartbeat RPC server (0 = disabled, "
-              "heartbeat served on the main RPC server)");
+              "heartbeat served on the main RPC server as a legacy fallback)");
 DEFINE_uint32(heartbeat_rpc_thread_num, 1,
               "Thread count for the dedicated heartbeat RPC server");
-DEFINE_bool(heartbeat_keep_on_main, false,
-            "Dual-mode rollout flag. When true and heartbeat_rpc_port > 0, "
-            "Heartbeat is ALSO kept on the main RPC server so legacy clients "
-            "(heartbeat_rpc_port=0) keep working during migration. Set false "
-            "once all clients are migrated. No effect when "
-            "heartbeat_rpc_port == 0.");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
@@ -211,9 +205,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("heartbeat_rpc_thread_num",
                              &master_config.heartbeat_rpc_thread_num,
                              FLAGS_heartbeat_rpc_thread_num);
-    default_config.GetBool("heartbeat_keep_on_main",
-                           &master_config.heartbeat_keep_on_main,
-                           FLAGS_heartbeat_keep_on_main);
     default_config.GetUInt64("default_kv_lease_ttl",
                              &master_config.default_kv_lease_ttl,
                              FLAGS_default_kv_lease_ttl);
@@ -425,11 +416,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.heartbeat_rpc_thread_num = FLAGS_heartbeat_rpc_thread_num;
-    }
-    if ((google::GetCommandLineFlagInfo("heartbeat_keep_on_main", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.heartbeat_keep_on_main = FLAGS_heartbeat_keep_on_main;
     }
     if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
          !info.is_default) ||
@@ -864,7 +850,6 @@ int main(int argc, char* argv[]) {
         << ", heartbeat_rpc_port=" << master_config.heartbeat_rpc_port
         << ", heartbeat_rpc_thread_num="
         << master_config.heartbeat_rpc_thread_num
-        << ", heartbeat_keep_on_main=" << master_config.heartbeat_keep_on_main
         << ", rpc protocol=" << protocol
         << ", cluster_id=" << master_config.cluster_id
         << ", root_fs_dir=" << master_config.root_fs_dir
@@ -939,12 +924,11 @@ int main(int argc, char* argv[]) {
         // separate coro_rpc_server with its own thread pool so heavy metadata
         // RPCs on the main server cannot head-of-line-block heartbeats. The
         // heartbeat server always runs plain TCP (no init_ibv) to avoid
-        // contending for IB resources with the main server.
+        // contending for IB resources with the main server. The main server
+        // serves Heartbeat only as a legacy fallback when no dedicated
+        // heartbeat port is configured (heartbeat_rpc_port == 0).
         const bool dedicated_heartbeat = master_config.heartbeat_rpc_port > 0;
-        // In dual mode (heartbeat_keep_on_main), keep Heartbeat on the main
-        // server too so legacy clients keep working during migration.
-        const bool main_includes_heartbeat =
-            !dedicated_heartbeat || master_config.heartbeat_keep_on_main;
+        const bool main_includes_heartbeat = !dedicated_heartbeat;
         std::optional<coro_rpc::coro_rpc_server> heartbeat_server;
         if (dedicated_heartbeat) {
             heartbeat_server.emplace(

@@ -2,16 +2,19 @@
 //
 // When the master is started with a dedicated heartbeat port, Heartbeat is
 // served on a separate coro_rpc_server and removed from the main server, so
-// heavy metadata RPCs cannot head-of-line-block heartbeats. These tests verify
-// the routing (deterministic); the actual isolation-under-load property is a
-// perf concern covered separately.
+// heavy metadata RPCs cannot head-of-line-block heartbeats. When no dedicated
+// port is configured (heartbeat_rpc_port == 0), Heartbeat is served on the
+// main server as a legacy fallback. These tests verify the routing
+// (deterministic); the actual isolation-under-load property is a perf concern
+// covered separately.
 //
 // Coverage:
 //   1. Heartbeat reaches the dedicated port and succeeds.
-//   2. Heartbeat is NOT registered on the main port (include_heartbeat=false).
+//   2. Heartbeat is NOT registered on the main port when the dedicated server
+//      is enabled.
 //   3. Non-heartbeat RPCs still work via the main port.
 //   4. With the dedicated server disabled (port=0), Heartbeat is served on the
-//      main port (legacy behavior).
+//      main port as the legacy fallback.
 
 #include <gtest/gtest.h>
 
@@ -66,8 +69,8 @@ TEST_F(HeartbeatDedicatedPortTest, HeartbeatRoutedToDedicatedPort) {
 }
 
 // 2. When the dedicated server is enabled, the main server must NOT have the
-// Heartbeat handler (include_heartbeat=false). A client that forces
-// heartbeat_rpc_port=0 sends Heartbeat to the main port and must fail.
+// Heartbeat handler. A client that forces heartbeat_rpc_port=0 sends Heartbeat
+// to the main port and must fail.
 TEST_F(HeartbeatDedicatedPortTest, HeartbeatNotRegisteredOnMainPort) {
     UUID client_id = generate_uuid();
     CentralizedMasterClient client(client_id);  // heartbeat_rpc_port_ == 0
@@ -94,10 +97,9 @@ TEST_F(HeartbeatDedicatedPortTest, NonHeartbeatRpcStillServedOnMainPort) {
 }
 
 // 4. With no dedicated heartbeat server configured (port=0, default), the
-// master registers Heartbeat on the main server (legacy behavior) and a client
+// master falls back to serving Heartbeat on the main RPC server, so a client
 // without a heartbeat port succeeds.
-TEST(HeartbeatDedicatedPortDisabledTest,
-     HeartbeatServedOnMainPortWhenDisabled) {
+TEST(HeartbeatDedicatedPortDisabledTest, HeartbeatServedOnMainPortWhenDisabled) {
     InProcMaster master;
     ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start InProcMaster";
@@ -109,39 +111,7 @@ TEST(HeartbeatDedicatedPortDisabledTest,
     auto hb = client.Heartbeat(MakeHeartbeatRequest(client_id));
     EXPECT_TRUE(hb.has_value())
         << "Heartbeat should succeed on the main port when the dedicated "
-        << "server is disabled (legacy behavior)";
-
-    master.Stop();
-}
-
-// Dual-mode (heartbeat_keep_on_main=true): during migration the master serves
-// Heartbeat on BOTH the dedicated port and the main port, so legacy clients
-// (heartbeat_rpc_port=0) and migrated clients (heartbeat_rpc_port=P) both work.
-TEST(HeartbeatDedicatedPortDualModeTest, HeartbeatServedOnBothPorts) {
-    const int heartbeat_port = getFreeTcpPort();
-    InProcMaster master;
-    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
-                                 .set_heartbeat_rpc_port(heartbeat_port)
-                                 .set_heartbeat_keep_on_main(true)
-                                 .build()))
-        << "Failed to start InProcMaster in dual mode";
-
-    // Migrated client -> dedicated port: succeeds.
-    UUID migrated_id = generate_uuid();
-    CentralizedMasterClient migrated(migrated_id);
-    migrated.SetHeartbeatRpcPort(static_cast<uint16_t>(heartbeat_port));
-    ASSERT_EQ(migrated.Connect(master.master_address()), ErrorCode::OK);
-    auto hb_dedicated = migrated.Heartbeat(MakeHeartbeatRequest(migrated_id));
-    EXPECT_TRUE(hb_dedicated.has_value())
-        << "Heartbeat via the dedicated port should succeed in dual mode";
-
-    // Legacy client -> main port: also succeeds (dual mode keeps it on main).
-    UUID legacy_id = generate_uuid();
-    CentralizedMasterClient legacy(legacy_id);  // heartbeat_rpc_port_ == 0
-    ASSERT_EQ(legacy.Connect(master.master_address()), ErrorCode::OK);
-    auto hb_main = legacy.Heartbeat(MakeHeartbeatRequest(legacy_id));
-    EXPECT_TRUE(hb_main.has_value())
-        << "Heartbeat via the main port should still succeed in dual mode";
+        << "server is disabled (legacy fallback)";
 
     master.Stop();
 }

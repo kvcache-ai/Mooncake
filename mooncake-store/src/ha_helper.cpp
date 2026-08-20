@@ -352,12 +352,11 @@ int MasterServiceSupervisor::Start() {
         // a separate coro_rpc_server so heavy metadata RPCs cannot
         // head-of-line-block heartbeats. The heartbeat server runs plain TCP
         // (no init_ibv) to avoid contending for IB resources with the main
-        // server.
+        // server. The main server serves Heartbeat only as a legacy fallback
+        // when no dedicated heartbeat port is configured (heartbeat_rpc_port
+        // == 0).
         const bool dedicated_heartbeat = config_.heartbeat_rpc_port > 0;
-        // In dual mode (heartbeat_keep_on_main), keep Heartbeat on the main
-        // server too so legacy clients keep working during migration.
-        const bool main_includes_heartbeat =
-            !dedicated_heartbeat || config_.heartbeat_keep_on_main;
+        const bool main_includes_heartbeat = !dedicated_heartbeat;
         std::unique_ptr<WrappedMasterService> wrapped_master_service;
         if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {
             wrapped_master_service =

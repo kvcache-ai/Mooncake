@@ -23,16 +23,9 @@ struct MasterConfig {
     // Dedicated heartbeat RPC server. When heartbeat_rpc_port > 0, Heartbeat is
     // served by a separate coro_rpc_server with its own thread pool so that
     // heavy metadata RPCs cannot head-of-line-block heartbeats. 0 = disabled,
-    // heartbeat is served on the main RPC server (legacy behavior).
+    // heartbeat is served on the main RPC server as a legacy fallback.
     uint32_t heartbeat_rpc_port = 0;
     uint32_t heartbeat_rpc_thread_num = 1;
-    // Transitional dual-mode flag for smooth rollout. When true (and
-    // heartbeat_rpc_port > 0), Heartbeat is ALSO kept registered on the main
-    // RPC server, so legacy clients (heartbeat_rpc_port=0) and migrated clients
-    // (heartbeat_rpc_port=P) both work during the upgrade. Set to false once
-    // all clients are migrated to drop heartbeat from the main server. No
-    // effect when heartbeat_rpc_port == 0.
-    bool heartbeat_keep_on_main = false;
 
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
@@ -138,9 +131,6 @@ class MasterServiceSupervisorConfig {
     // Dedicated heartbeat RPC server (0 = disabled, serve on main server).
     uint32_t heartbeat_rpc_port = 0;
     uint32_t heartbeat_rpc_thread_num = 1;
-    // Transitional dual-mode: also keep Heartbeat on the main server during
-    // rollout (see MasterConfig::heartbeat_keep_on_main).
-    bool heartbeat_keep_on_main = false;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -210,7 +200,6 @@ class MasterServiceSupervisorConfig {
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
         heartbeat_rpc_port = config.heartbeat_rpc_port;
         heartbeat_rpc_thread_num = config.heartbeat_rpc_thread_num;
-        heartbeat_keep_on_main = config.heartbeat_keep_on_main;
         etcd_endpoints = config.etcd_endpoints;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
@@ -912,7 +901,6 @@ struct InProcMasterConfig {
     // only honored when explicitly requested via Start).
     std::optional<int> heartbeat_rpc_port;
     std::optional<uint32_t> heartbeat_rpc_thread_num;
-    std::optional<bool> heartbeat_keep_on_main;
 };
 
 // Builder class for InProcMasterConfig
@@ -929,7 +917,6 @@ class InProcMasterConfigBuilder {
     std::optional<int64_t> client_crashed_ttl_sec_ = std::nullopt;
     std::optional<int> heartbeat_rpc_port_ = std::nullopt;
     std::optional<uint32_t> heartbeat_rpc_thread_num_ = std::nullopt;
-    std::optional<bool> heartbeat_keep_on_main_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -989,8 +976,8 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
-    InProcMasterConfigBuilder& set_heartbeat_keep_on_main(bool keep) {
-        heartbeat_keep_on_main_ = keep;
+    InProcMasterConfigBuilder& set_heartbeat_rpc_thread_num(uint32_t num) {
+        heartbeat_rpc_thread_num_ = num;
         return *this;
     }
 
@@ -1011,7 +998,6 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.client_crashed_ttl_sec = client_crashed_ttl_sec_;
     config.heartbeat_rpc_port = heartbeat_rpc_port_;
     config.heartbeat_rpc_thread_num = heartbeat_rpc_thread_num_;
-    config.heartbeat_keep_on_main = heartbeat_keep_on_main_;
     return config;
 }
 

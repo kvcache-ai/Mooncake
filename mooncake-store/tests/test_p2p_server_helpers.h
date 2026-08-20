@@ -73,10 +73,7 @@ class InProcP2PMaster {
             const bool dedicated_heartbeat =
                 config.heartbeat_rpc_port.has_value() &&
                 config.heartbeat_rpc_port.value() > 0;
-            const bool keep_on_main =
-                config.heartbeat_keep_on_main.value_or(false);
-            const bool main_includes_heartbeat =
-                !dedicated_heartbeat || keep_on_main;
+            const bool main_includes_heartbeat = !dedicated_heartbeat;
             RegisterP2PRpcService(
                 *server_, *wrapped_,
                 /*include_heartbeat=*/main_includes_heartbeat);
