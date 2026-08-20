@@ -2035,11 +2035,9 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     const auto op_type =
         plan.would_invalidate ? OpType::REMOVE : OpType::PUT_END;
     const std::string payload =
-        plan.would_invalidate
-            ? std::string{}
-            : SerializeMetadataForOpLogFromReplicaDescriptors(
-                  metadata.client_id, metadata.size, plan.remaining,
-                  metadata.group_id, metadata.data_type);
+        plan.would_invalidate ? std::string{}
+                              : SerializeMetadataForOpLogFromReplicaDescriptors(
+                                    metadata, plan.remaining);
 
     auto reservation = ReserveBatchOpLogSlot();
     if (!reservation) {
@@ -3189,7 +3187,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                 std::forward_as_tuple(object.user_key),
                 std::forward_as_tuple(
                     standby_meta.client_id, now, standby_meta.size,
-                    std::move(object.replicas), std::nullopt, false,
+                    std::move(object.replicas), std::nullopt,
+                    standby_meta.hard_pinned.value_or(false),
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
             if (!standby_meta.group_id.empty()) {
@@ -3442,8 +3441,7 @@ auto MasterService::BatchReplicaClear(
                             std::move(reservation.value()), OpType::PUT_END,
                             normalized_tenant.value(), key,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
-                                metadata.client_id, metadata.size, remaining,
-                                metadata.group_id, metadata.data_type),
+                                metadata, remaining),
                             [this, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
@@ -4675,9 +4673,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
 
         auto persist_result = AppendOpLogVisibleBeforeDurable(
             OpType::PUT_END, object_id.tenant_id.value(), key,
-            SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, post, metadata.group_id,
-                metadata.data_type));
+            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -4791,9 +4787,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
             persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::PUT_END,
                 tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, remaining,
-                    metadata.group_id, metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                remaining),
                 [this, removed_ids = std::move(removed_ids)](
                     const OpLogEntry& durable_entry) {
                     FinalizeRemovedReplicasAfterDurable(
@@ -5485,9 +5480,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                 persist_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::PUT_END,
                     metadata.tenant_id.value(), key,
-                    SerializeMetadataForOpLogFromReplicaDescriptors(
-                        metadata.client_id, metadata.size, remaining,
-                        metadata.group_id, metadata.data_type),
+                    SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                    remaining),
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
                         FinalizeRemovedReplicasAfterDurable(
@@ -5507,9 +5501,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
                 OpType::PUT_END, metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, remaining,
-                    metadata.group_id, metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                remaining),
                 nullptr);
         }
         if (!persist_result) {
@@ -5872,9 +5865,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
                                [&post](const Replica& replica) {
                                    post.push_back(replica.get_descriptor());
                                });
-        auto payload = SerializeMetadataForOpLogFromReplicaDescriptors(
-            metadata.client_id, metadata.size, post, metadata.group_id,
-            metadata.data_type);
+        auto payload =
+            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post);
         if (batch_reservation) {
             auto persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(*batch_reservation), OpType::PUT_END,
@@ -6230,9 +6222,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::PUT_END,
                 metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, post, metadata.group_id,
-                    metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
                 [this, removed_ids = std::vector<ReplicaID>{source_id}](
                     const OpLogEntry& durable_entry) {
                     FinalizeRemovedReplicasAfterDurable(
@@ -6241,9 +6231,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
                 OpType::PUT_END, metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, post, metadata.group_id,
-                    metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
                 nullptr);
         }
         if (!persist_result) {
@@ -8705,9 +8693,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
                                    });
 
             const auto payload =
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, post, metadata.group_id,
-                    metadata.data_type);
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post);
             if (batch_reservation) {
                 auto persist_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(*batch_reservation), OpType::PUT_END,
@@ -8978,9 +8964,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         persist_result = AppendOpLogWithDurableFinalize(
                             OpType::PUT_END, tenant_it->first.value(), *key_it,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
-                                metadata.client_id, metadata.size,
-                                post_descriptors, metadata.group_id,
-                                metadata.data_type),
+                                metadata, post_descriptors),
                             enable_oplog_
                                 ? [this, ttl](const OpLogEntry& durable_entry) {
                                       FinalizeExpiredProcessingReplicasAfterDurable(
@@ -9095,8 +9079,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         OpType::PUT_END, tenant_it->first.value(),
                         task_it->first,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
-                            metadata.client_id, metadata.size, post_descriptors,
-                            metadata.group_id, metadata.data_type),
+                            metadata, post_descriptors),
                         enable_oplog_
                             ? [this, source_id,
                                target_ids = std::move(target_ids),
@@ -9922,9 +9905,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 persist_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::PUT_END,
                     tenant_id.value(), key,
-                    SerializeMetadataForOpLogFromReplicaDescriptors(
-                        metadata.client_id, metadata.size, remaining,
-                        metadata.group_id, metadata.data_type),
+                    SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                    remaining),
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
                         FinalizeRemovedReplicasAfterDurable(
@@ -9948,9 +9930,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
                 OpType::PUT_END, tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, remaining,
-                    metadata.group_id, metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                remaining),
                 nullptr);
         }
         if (!persist_result) {
@@ -10686,9 +10667,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                 std::move(reservation.value()), OpType::PUT_END,
                                 tenant_it->first.value(), it->first,
                                 SerializeMetadataForOpLogFromReplicaDescriptors(
-                                    metadata.client_id, metadata.size,
-                                    remaining, metadata.group_id,
-                                    metadata.data_type),
+                                    metadata, remaining),
                                 [this, removed_ids = std::move(removed_ids)](
                                     const OpLogEntry& durable_entry) {
                                     FinalizeRemovedReplicasAfterDurable(
@@ -10722,8 +10701,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                             OpType::PUT_END, tenant_it->first.value(),
                             it->first,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
-                                metadata.client_id, metadata.size, remaining,
-                                metadata.group_id, metadata.data_type),
+                                metadata, remaining),
                             nullptr);
                     }
                     if (!persist_result) {
@@ -12814,6 +12792,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.size = metadata.size;
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
+    payload.hard_pinned = metadata.IsHardPinned();
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -12839,6 +12818,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.size = metadata.size;
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
+    payload.hard_pinned = metadata.IsHardPinned();
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -12854,15 +12834,15 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
 }
 
 std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
-    const UUID& client_id, uint64_t size,
-    const std::vector<Replica::Descriptor>& replicas,
-    const std::string& group_id, ObjectDataType data_type) const {
+    const ObjectMetadata& metadata,
+    const std::vector<Replica::Descriptor>& replicas) const {
     MetadataPayload payload;
-    payload.client_id = client_id;
-    payload.size = size;
+    payload.client_id = metadata.client_id;
+    payload.size = metadata.size;
     payload.replicas = replicas;
-    payload.group_id = group_id;
-    payload.data_type = data_type;
+    payload.group_id = metadata.group_id;
+    payload.data_type = metadata.data_type;
+    payload.hard_pinned = metadata.IsHardPinned();
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

@@ -597,6 +597,14 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
     }
 
+    static bool IsHardPinnedForTesting(MasterService& service,
+                                       const TenantId& tenant_id,
+                                       const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() && accessor.Get().IsHardPinned();
+    }
+
     static std::vector<Replica::Descriptor> ReplicaDescriptorsForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
@@ -908,6 +916,22 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.buffer_address_, address);
     EXPECT_EQ(restored.protocol_, "tcp");
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
+}
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesHardPinned) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_restore_hard_pinned";
+    const std::string endpoint = "standby_restore_hard_pinned_segment";
+    auto object = MakeStandbyObject(key, endpoint);
+    object.metadata.hard_pinned = true;
+
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    EXPECT_TRUE(IsHardPinnedForTesting(service, kDefaultTenant, key));
 }
 
 TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
@@ -2858,6 +2882,7 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.preferred_segments = {"batch_put_end_segment"};
+    config.with_hard_pin = true;
     const std::string key = "batch_put_end_key";
     auto put_start =
         service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config);
@@ -2879,6 +2904,10 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
     EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
+    MetadataPayload payload;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(payload, batch.entries[0].payload));
+    EXPECT_TRUE(payload.hard_pinned.value_or(false));
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
 
     DurablePrefix prefix;

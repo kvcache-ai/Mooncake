@@ -182,6 +182,9 @@ OpLogBatchRecord MakeObjectBatch(size_t object_count) {
         MetadataPayload metadata;
         metadata.client_id = {0, i + 1};
         metadata.size = 1024 + i;
+        if (i == 1) {
+            metadata.hard_pinned = true;
+        }
         auto encoded = struct_pack::serialize(metadata);
 
         OpLogEntry entry;
@@ -224,8 +227,9 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
                   backend_->Put(BuildDurablePrefixKey(kClusterId),
                                 EncodeDurablePrefix(
                                     {.batch_id = object_count == 0 ? 0u : 1u,
-                                     .last_seq = object_count,
-                                     .producer_view_version = 7})));
+                                     .last_seq = object_count})));
+        EXPECT_EQ(ErrorCode::OK,
+                  backend_->Put(BuildProducerViewKey(kClusterId), "7"));
 
         HotStandbyConfig config;
         config.enable_oplog_following = true;
@@ -268,6 +272,17 @@ TEST_F(BatchOpLogSnapshotWriterTest, WritesAndVerifiesMultipleChunks) {
     ASSERT_EQ(2u, manifest->object_chunks.size());
     EXPECT_EQ(2u, manifest->object_chunks[0].object_count);
     EXPECT_EQ(1u, manifest->object_chunks[1].object_count);
+    for (const auto& chunk : manifest->object_chunks) {
+        std::vector<uint8_t> encoded_chunk;
+        ASSERT_TRUE(object_store.DownloadBuffer(chunk.key, encoded_chunk));
+        auto decoded_chunk = DecodeBatchOpLogSnapshotObjectChunk(
+            encoded_chunk, chunk.chunk_index, chunk.object_count);
+        ASSERT_TRUE(decoded_chunk) << decoded_chunk.error();
+        for (const auto& object : decoded_chunk->objects) {
+            EXPECT_EQ(object.key == "key-1",
+                      object.metadata.hard_pinned.value_or(false));
+        }
+    }
     EXPECT_EQ(5u, object_store.size());
     EXPECT_GT(object_store.download_attempts, 0u);
 }
