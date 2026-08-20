@@ -158,6 +158,26 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
         return ErrorCode::INVALID_VERSION;
     }
+    // When a dedicated heartbeat port is configured, verify the master
+    // actually opened it. A failure here means the client expects a dedicated
+    // heartbeat server the master never started (heartbeat_rpc_port > 0 on the
+    // client, but the master runs with the legacy fallback) — fail fast instead
+    // of letting heartbeats silently starve and the client get reaped.
+    if (heartbeat_rpc_port_ > 0) {
+        auto hb_result =
+            invoke_rpc_via<&WrappedMasterService::ServiceReady, std::string>(
+                heartbeat_accessor_);
+        if (!hb_result.has_value()) {
+            LOG(ERROR) << "Dedicated heartbeat RPC server unreachable at"
+                       << " heartbeat_rpc_port=" << heartbeat_rpc_port_
+                       << " (master may not have enabled it): error_code="
+                       << hb_result.error();
+            timer.LogResponse("error_code=",
+                              ErrorCode::HEARTBEAT_RPC_UNREACHABLE);
+            client_addr_param_.clear();
+            return ErrorCode::HEARTBEAT_RPC_UNREACHABLE;
+        }
+    }
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }

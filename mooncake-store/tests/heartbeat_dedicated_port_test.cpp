@@ -56,7 +56,10 @@ class HeartbeatDedicatedPortTest : public ::testing::Test {
 };
 
 // 1. Client configured with the dedicated port sends Heartbeat there and it
-// succeeds (the dedicated server has the Heartbeat handler registered).
+// succeeds (the dedicated server has the Heartbeat handler registered). This
+// also implicitly proves ServiceReady is registered on the dedicated port:
+// Connect probes the heartbeat endpoint with ServiceReady and would fail
+// (HEARTBEAT_RPC_UNREACHABLE) otherwise.
 TEST_F(HeartbeatDedicatedPortTest, HeartbeatRoutedToDedicatedPort) {
     UUID client_id = generate_uuid();
     CentralizedMasterClient client(client_id);
@@ -113,6 +116,31 @@ TEST(HeartbeatDedicatedPortDisabledTest,
     EXPECT_TRUE(hb.has_value())
         << "Heartbeat should succeed on the main port when the dedicated "
         << "server is disabled (legacy fallback)";
+
+    master.Stop();
+}
+
+// 5. Mismatch: the master is started WITHOUT a dedicated heartbeat port
+// (legacy fallback), but the client is configured with a heartbeat port
+// pointing at a port the master never opened. Connect must fail fast with
+// HEARTBEAT_RPC_UNREACHABLE instead of appearing to succeed and then silently
+// starving heartbeats.
+TEST(HeartbeatDedicatedPortDisabledTest, HeartbeatPortMismatchFailsConnect) {
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start InProcMaster (no dedicated heartbeat port)";
+
+    // Client believes there is a dedicated heartbeat server on this free port;
+    // the master never opened it.
+    int phantom_port = getFreeTcpPort();
+    UUID client_id = generate_uuid();
+    CentralizedMasterClient client(client_id);
+    client.SetHeartbeatRpcPort(static_cast<uint16_t>(phantom_port));
+
+    EXPECT_EQ(client.Connect(master.master_address()),
+              ErrorCode::HEARTBEAT_RPC_UNREACHABLE)
+        << "Connect must fail fast when the client's heartbeat_rpc_port does "
+        << "not match a dedicated heartbeat server the master actually opened";
 
     master.Stop();
 }

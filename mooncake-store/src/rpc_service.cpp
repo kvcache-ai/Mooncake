@@ -517,6 +517,11 @@ void RegisterHeartbeatRpcService(
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::Heartbeat>(
         &wrapped_master_service);
+    // ServiceReady gives clients a lightweight, side-effect-free probe to
+    // verify the dedicated heartbeat server is actually listening (used by
+    // MasterClient::Connect to fail fast on a client/master port mismatch).
+    server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

@@ -173,6 +173,8 @@ enum class ErrorCode : int32_t {
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,  ///< RPC operation failed.
+    HEARTBEAT_RPC_UNREACHABLE =
+        -901,  ///< Dedicated heartbeat RPC server unreachable.
 
     // High availability errors (Range: -1000 to -1099)
     ETCD_OPERATION_ERROR = -1000,   ///< etcd operation failed.
