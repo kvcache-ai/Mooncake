@@ -70,6 +70,8 @@ void tcpTransportSetLaneFailureReasonHookForTest(
     void (*hook)(int) noexcept) noexcept;
 void tcpTransportSetSessionProgressHookForTest(
     int (*hook)(int, bool) noexcept) noexcept;
+void tcpTransportSetStartTransferMetadataHookForTest(
+    void (*hook)() noexcept) noexcept;
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept;
 }  // namespace mooncake
 #endif
@@ -179,6 +181,8 @@ std::atomic<bool> session_timeout_commit_entered{false};
 std::atomic<bool> session_timeout_commit_had_write_in_flight{false};
 std::atomic<bool> hold_session_timeout_commit{false};
 std::atomic<bool> release_session_timeout_commit{false};
+std::atomic<bool> start_transfer_metadata_hook_entered{false};
+std::atomic<bool> release_start_transfer_metadata_hook{false};
 
 template <typename Predicate, typename Rep, typename Period>
 bool waitForPredicate(Predicate&& predicate,
@@ -412,6 +416,43 @@ int observeSessionProgress(int event, bool detail) noexcept {
     return session_progress_action.exchange(kSessionProgressNoAction,
                                             std::memory_order_acq_rel);
 }
+
+void blockStartTransferAfterMetadataLookup() noexcept {
+    start_transfer_metadata_hook_entered.store(true, std::memory_order_release);
+    while (
+        !release_start_transfer_metadata_hook.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+class ScopedStartTransferMetadataHook {
+   public:
+    ScopedStartTransferMetadataHook() {
+        start_transfer_metadata_hook_entered.store(false,
+                                                   std::memory_order_release);
+        release_start_transfer_metadata_hook.store(false,
+                                                   std::memory_order_release);
+        tcpTransportSetStartTransferMetadataHookForTest(
+            blockStartTransferAfterMetadataLookup);
+    }
+
+    ~ScopedStartTransferMetadataHook() { reset(); }
+
+    void release() noexcept {
+        release_start_transfer_metadata_hook.store(true,
+                                                   std::memory_order_release);
+    }
+
+    void reset() noexcept {
+        if (!active_) return;
+        release();
+        tcpTransportSetStartTransferMetadataHookForTest(nullptr);
+        active_ = false;
+    }
+
+   private:
+    bool active_ = true;
+};
 
 class ScopedLaneHooks {
    public:
@@ -1172,7 +1213,8 @@ class UnavailableTcpPeer {
 // multiple request/ack exchanges on each one.
 class ReusingWriteServer {
    public:
-    explicit ReusingWriteServer(bool hold_first_ack = false)
+    explicit ReusingWriteServer(bool hold_first_ack = false,
+                                const char* bind_address = nullptr)
         : hold_first_ack_(hold_first_ack) {
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) return;
@@ -1184,7 +1226,11 @@ class ReusingWriteServer {
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind_address) {
+            if (inet_pton(AF_INET, bind_address, &addr.sin_addr) != 1) return;
+        } else {
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        }
         if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
                  sizeof(addr)) != 0)
             return;
@@ -1429,12 +1475,14 @@ void pointTcpSegmentAt(EngineHandle& handle, uint16_t port) {
 
 std::string publishAndRefreshTcpEndpoint(EngineHandle& handle,
                                          Transport::SegmentID segment_id,
-                                         uint16_t port) {
+                                         uint16_t port,
+                                         const std::string& host = {}) {
     auto metadata = handle.engine->getMetadata();
     auto current = metadata->getSegmentDescByID(segment_id);
     EXPECT_NE(current, nullptr);
     if (!current) return {};
     auto authoritative = *current;
+    if (!host.empty()) authoritative.tcp_data_host = host;
     authoritative.tcp_data_port = port;
     authoritative.tcp_proto_version = 2;
     EXPECT_EQ(metadata->updateSegmentDesc(current->name, authoritative), 0);
@@ -1442,6 +1490,9 @@ std::string publishAndRefreshTcpEndpoint(EngineHandle& handle,
     auto refreshed = metadata->getSegmentDescByID(segment_id);
     EXPECT_NE(refreshed, nullptr);
     if (refreshed) {
+        if (!host.empty()) {
+            EXPECT_EQ(refreshed->tcp_data_host, host);
+        }
         EXPECT_EQ(refreshed->tcp_data_port, port);
     }
     return current->name;
@@ -3721,6 +3772,70 @@ TEST(TcpWriteVisibilityTest, EndpointRefreshRoutesNewWorkToNewTcpEndpoint) {
            "retirement";
 }
 
+TEST(TcpWriteVisibilityTest,
+     ConcurrentEndpointRefreshNeverCombinesHostAndPortSnapshots) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint_a(false, "127.0.0.1");
+    ReusingWriteServer endpoint_b(false, "127.0.0.2");
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint_a.ok());
+    ASSERT_TRUE(endpoint_b.ok());
+
+    const std::string logical_peer = "127.0.0.2:18051";
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18151", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+    ASSERT_TRUE(
+        metadata_server.rewriteStoredRpcHost(logical_peer, "127.0.0.1"));
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, h.segment_id, endpoint_a.port(),
+                                           "127.0.0.1"),
+              logical_peer);
+
+    // Declare the future first so the hook's destructor releases a blocked
+    // submitter before the future is destroyed on any fatal assertion path.
+    std::future<TransferStatusEnum> transfer;
+    ScopedStartTransferMetadataHook hook;
+    transfer = std::async(std::launch::async, [&] {
+        return runOne(h.engine.get(), makeWriteRequest(h, 1));
+    });
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return start_transfer_metadata_hook_entered.load(
+                std::memory_order_acquire);
+        },
+        std::chrono::seconds(5)));
+
+    auto metadata = h.engine->getMetadata();
+    auto old_snapshot = metadata->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(old_snapshot, nullptr);
+    auto authoritative = *old_snapshot;
+    authoritative.tcp_data_host = "127.0.0.2";
+    authoritative.tcp_data_port = endpoint_b.port();
+    ASSERT_TRUE(
+        metadata_server.rewriteStoredRpcHost(logical_peer, "127.0.0.2"));
+    ASSERT_EQ(metadata->updateSegmentDesc(logical_peer, authoritative), 0);
+    ASSERT_EQ(h.engine->syncSegmentCache(logical_peer), 0);
+
+    hook.release();
+    ASSERT_EQ(transfer.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_EQ(transfer.get(), TransferStatusEnum::COMPLETED)
+        << "a transfer that captured endpoint A before refresh must not use "
+           "the new host with endpoint A's old port";
+    EXPECT_TRUE(endpoint_a.waitForRequests(1, std::chrono::seconds(5)));
+
+    hook.reset();
+    EXPECT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(endpoint_b.waitForRequests(1, std::chrono::seconds(5)));
+    EXPECT_EQ(endpoint_a.acceptedCount(), 1);
+    EXPECT_EQ(endpoint_b.acceptedCount(), 1);
+}
+
 TEST(TcpWriteVisibilityTest, EndpointRefreshRetiresOldTcpGroup) {
     ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
     LocalHttpMetadataServer metadata_server;
@@ -3943,12 +4058,17 @@ TEST(TcpWriteVisibilityTest, RpcMetadataRefreshInvalidatesCachedHost) {
         metadata_server.rewriteStoredRpcHost(logical_peer, endpoint_b_host));
 
     auto authoritative = *segment;
+    // Model a peer that predates tcp_data_host publication. Refresh must
+    // resolve the authoritative RPC host once and freeze it into the local
+    // SegmentDesc snapshot before startTransfer can consume it.
+    authoritative.tcp_data_host.clear();
     authoritative.tcp_data_port =
         segment->tcp_data_port == 65534 ? 65533 : 65534;
     ASSERT_EQ(metadata->updateSegmentDesc(logical_peer, authoritative), 0);
     ASSERT_EQ(h.engine->syncSegmentCache(logical_peer), 0);
     auto refreshed_segment = metadata->getSegmentDescByID(h.segment_id);
     ASSERT_NE(refreshed_segment, nullptr);
+    ASSERT_EQ(refreshed_segment->tcp_data_host, endpoint_b_host);
     ASSERT_EQ(refreshed_segment->tcp_data_port, authoritative.tcp_data_port);
 
     TransferMetadata::RpcMetaDesc refreshed_rpc;
