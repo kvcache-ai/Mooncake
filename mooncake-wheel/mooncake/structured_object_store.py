@@ -8,6 +8,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
@@ -128,6 +129,7 @@ class MooncakeDataProtoRef:
     partition: str = "default"
     global_indexes: list[int] | None = None
     encoded_non_tensor: dict[str, Any] = field(default_factory=dict)
+    _storage_group_id: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -306,7 +308,8 @@ class _DataProtoRowSelection:
 
 
 DATAPROTO_REF_HANDLE_TYPE = "mooncake_dataproto_ref"
-DATAPROTO_REF_HANDLE_VERSION = 1
+DATAPROTO_REF_HANDLE_VERSION = 2
+STORAGE_GROUP_ID = "storage_group_id"
 DataProtoRefLike = MooncakeDataProtoRef | Mapping[str, Any]
 
 
@@ -320,7 +323,7 @@ def export_dataproto_ref(ref: MooncakeDataProtoRef) -> dict[str, Any]:
         raise TypeError(f"expected MooncakeDataProtoRef, got {type(ref).__name__}")
     handle = {
         "type": DATAPROTO_REF_HANDLE_TYPE,
-        "version": DATAPROTO_REF_HANDLE_VERSION,
+        "version": DATAPROTO_REF_HANDLE_VERSION if ref._storage_group_id is not None else 1,
         "kind": "bundle_stages",
         "batch_size": int(ref.batch_size),
         "namespace": ref.namespace,
@@ -341,6 +344,8 @@ def export_dataproto_ref(ref: MooncakeDataProtoRef) -> dict[str, Any]:
         "meta_info": _json_safe_value(ref.meta_info),
         "encoded_non_tensor": _json_safe_value(ref.encoded_non_tensor),
     }
+    if ref._storage_group_id is not None:
+        handle[STORAGE_GROUP_ID] = ref._storage_group_id
     json.dumps(handle, ensure_ascii=False)
     return handle
 
@@ -349,7 +354,8 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
     """Import a JSON-safe DataProto transport handle into a lazy ref."""
     if not is_dataproto_ref_handle(handle):
         raise ValueError("not a Mooncake DataProto ref handle")
-    if int(handle.get("version", -1)) != DATAPROTO_REF_HANDLE_VERSION:
+    version = int(handle.get("version", -1))
+    if version not in (1, DATAPROTO_REF_HANDLE_VERSION):
         raise ValueError(
             f"unsupported DataProto ref handle version: {handle.get('version')!r}"
         )
@@ -392,6 +398,11 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
         field_index[name] = StructuredFieldLocation(
             stage=stage, member=member, section=section
         )
+    storage_group_id = handle.get(STORAGE_GROUP_ID) if version == 2 else None
+    if version == 2 and (
+        not isinstance(storage_group_id, str) or not storage_group_id
+    ):
+        raise ValueError("DataProto ref handle requires storage_group_id")
     return MooncakeDataProtoRef(
         batch_size=int(handle["batch_size"]),
         stage_refs=stage_refs,
@@ -403,6 +414,7 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
         encoded_non_tensor=dict(
             _require_mapping(handle.get("encoded_non_tensor", {}), "encoded_non_tensor")
         ),
+        _storage_group_id=storage_group_id,
     )
 
 
@@ -479,6 +491,35 @@ class MooncakeBundleTransfer:
             default_chunk_bytes=self.default_chunk_bytes,
         )
         self._structured_store = _StructuredObjectLayer(self._bundle_store)
+
+    def _new_storage_group_id(self, config: Any) -> str:
+        raw_group_ids = getattr(config, "group_ids", None)
+        if raw_group_ids is None:
+            group_id = None
+        elif isinstance(raw_group_ids, str):
+            group_id = raw_group_ids
+        else:
+            try:
+                group_ids = list(raw_group_ids)
+            except TypeError as error:
+                raise ValueError(
+                    "structured object store config.group_ids must contain strings"
+                ) from error
+            if len(group_ids) > 1:
+                raise ValueError(
+                    "structured object store config.group_ids must contain exactly one "
+                    "logical group id; it is expanded across internal Mooncake keys"
+                )
+            group_id = group_ids[0] if group_ids else None
+        if group_id is None:
+            return f"structured-{uuid.uuid4().hex}"
+        if not isinstance(group_id, str):
+            raise ValueError(
+                "structured object store config.group_ids must contain strings"
+            )
+        if not group_id:
+            return f"structured-{uuid.uuid4().hex}"
+        return group_id
 
     def put_bundle(
         self,
@@ -1599,7 +1640,9 @@ class MooncakeBundleTransfer:
                     partition=ref.partition,
                     global_indexes=ref.global_indexes,
                     encoded_non_tensor=dict(ref.encoded_non_tensor),
+                    _storage_group_id=ref._storage_group_id,
                 )
+            group_id = self._new_storage_group_id(config)
             return MooncakeDataProtoRef(
                 batch_size=batch_size,
                 stage_refs={},
@@ -1608,6 +1651,7 @@ class MooncakeBundleTransfer:
                 namespace=namespace,
                 partition=partition,
                 encoded_non_tensor={},
+                _storage_group_id=group_id,
             )
         duplicates = (
             sorted(set(ref.field_index) & set(field_updates)) if ref is not None else []
@@ -1624,6 +1668,16 @@ class MooncakeBundleTransfer:
                 raise ValueError(
                     f"DataProto overwrite for stage {stage!r} must include existing fields: {sorted(dangling)}"
                 )
+        if ref is None:
+            group_id = self._new_storage_group_id(config)
+            effective_config = _config_with_group_id(config, group_id)
+        else:
+            group_id = ref._storage_group_id
+            effective_config = (
+                config
+                if group_id is None
+                else _config_with_group_id(config, group_id)
+            )
         payload = StructuredObjectPayload(
             metadata={
                 "layout": "dataproto_stage",
@@ -1645,7 +1699,7 @@ class MooncakeBundleTransfer:
                 partition=partition,
                 chunk_bytes=chunk_bytes,
                 policy=policy,
-                config=config,
+                config=effective_config,
             )
         else:
             stage_ref = self.put_structured_object(
@@ -1653,7 +1707,7 @@ class MooncakeBundleTransfer:
                 partition=partition,
                 chunk_bytes=chunk_bytes,
                 policy=policy,
-                config=config,
+                config=effective_config,
             )
             if (
                 existing_stage_ref is not None
@@ -1686,6 +1740,7 @@ class MooncakeBundleTransfer:
             partition=partition,
             global_indexes=None if ref is None else ref.global_indexes,
             encoded_non_tensor=encoded_non_tensor,
+            _storage_group_id=group_id,
         )
 
 
@@ -6095,6 +6150,21 @@ def _copy_write_config(config: Any) -> Any:
                 f"structured object store config field {name!r} is not writable"
             ) from error
     return copied
+
+
+def _config_with_group_id(config: Any, group_id: str) -> Any:
+    configured_ids = getattr(_config_for_grouped_keys(config, 1), "group_ids", None)
+    if configured_ids and configured_ids[0] and configured_ids[0] != group_id:
+        raise ValueError(
+            "config.group_ids conflicts with the DataProto storage group"
+        )
+    grouped_config = (
+        getattr(_mooncake_store, "ReplicateConfig", SimpleNamespace)()
+        if config is None
+        else _copy_write_config(config)
+    )
+    grouped_config.group_ids = [group_id]
+    return grouped_config
 
 
 def _put_with_optional_config(
