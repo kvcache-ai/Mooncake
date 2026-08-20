@@ -73,8 +73,10 @@ class InMemoryStore:
         self.put_tensor_from_calls = 0
         self.batch_remove_calls = 0
         self.put_tensor_calls = 0
+        self.pub_tensor_calls = 0
         self.get_tensor_calls = 0
         self.put_configs: list[object] = []
+        self.pub_tensor_configs: list[object] = []
         self.batch_put_from_configs: list[object] = []
         self.events: list[tuple[str, str]] = []
 
@@ -126,6 +128,13 @@ class InMemoryStore:
 
     def put_tensor(self, key: str, value) -> int:
         self.put_tensor_calls += 1
+        with self.lock:
+            self.tensor_objects[key] = value.detach().clone()
+        return 0
+
+    def pub_tensor(self, key: str, value, config=None) -> int:
+        self.pub_tensor_calls += 1
+        self.pub_tensor_configs.append(config)
         with self.lock:
             self.tensor_objects[key] = value.detach().clone()
         return 0
@@ -318,6 +327,7 @@ class PutTensorOnlyStore(InMemoryStore):
 
 class NoTensorFastPathStore(InMemoryStore):
     put_tensor = None
+    pub_tensor = None
     get_tensor = None
 
 
@@ -831,6 +841,99 @@ def test_high_level_put_replaces_empty_group_id_without_mutating_config() -> Non
     )
     assert config.group_ids == [""]
     assert config.replica_num == 2
+
+
+@pytest.mark.parametrize("object_type", ["dict", "dataproto"])
+def test_high_level_put_preserves_grouped_tensor_fast_path(object_type) -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer()
+    tensor = torch.arange(12, dtype=torch.int64).reshape(4, 3)
+
+    if object_type == "dict":
+        ref = transfer.put({"input_ids": tensor}, type="dict", stage="rollout")
+        result = transfer.get(ref, type="dict")
+        actual = result["input_ids"]
+    else:
+        ref = transfer.put_dataproto(
+            SimpleDataProto(batch={"input_ids": tensor}),
+            stage="rollout",
+        )
+        result = transfer.get_dataproto(ref)
+        actual = result["batch"]["input_ids"]
+
+    group_id = _storage_group_id(ref)
+    payload = ref.stage_refs["rollout"].manifest["buffers"]["batch.input_ids"]
+    assert payload["kind"] == "tensor"
+    assert store.pub_tensor_calls == 1
+    assert store.put_tensor_calls == 0
+    assert store.batch_put_from_calls == 0
+    assert store.get_tensor_calls == 1
+    assert _seen_group_ids(store.pub_tensor_configs) == [[group_id]]
+    assert torch.equal(actual, tensor)
+
+
+def test_high_level_append_preserves_grouped_tensor_fast_path() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer()
+    input_ids = torch.arange(12, dtype=torch.int64).reshape(4, 3)
+    rewards = torch.arange(4, dtype=torch.float32)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"input_ids": input_ids}),
+        stage="rollout",
+    )
+    group_id = _storage_group_id(ref)
+    old_payload_key = ref.stage_refs["rollout"].manifest["buffers"][
+        "batch.input_ids"
+    ]["key"]
+
+    ref = transfer.append_dataproto_fields(
+        ref,
+        SimpleDataProto(batch={"rewards": rewards}),
+        stage="rollout",
+    )
+    result = transfer.get_dataproto(ref)
+    buffers = ref.stage_refs["rollout"].manifest["buffers"]
+
+    assert ref._storage_group_id == group_id
+    assert buffers["batch.input_ids"]["key"] == old_payload_key
+    assert buffers["batch.input_ids"]["kind"] == "tensor"
+    assert buffers["batch.rewards"]["kind"] == "tensor"
+    assert store.pub_tensor_calls == 2
+    assert store.put_tensor_calls == 0
+    assert store.batch_put_from_calls == 0
+    assert store.get_tensor_calls == 2
+    assert _seen_group_ids(store.pub_tensor_configs) == [[group_id], [group_id]]
+    assert torch.equal(result["batch"]["input_ids"], input_ids)
+    assert torch.equal(result["batch"]["rewards"], rewards)
+
+    transfer.cleanup_dataproto(ref)
+    assert store.objects == {}
+    assert store.tensor_objects == {}
+
+
+def test_grouped_tensor_falls_back_when_pub_tensor_is_unavailable() -> None:
+    torch = pytest.importorskip("torch")
+    store, transfer = make_transfer(NoTensorFastPathStore())
+    tensor = torch.arange(12, dtype=torch.int64).reshape(4, 3)
+
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"input_ids": tensor}),
+        stage="rollout",
+    )
+    result = transfer.get_dataproto(ref)
+
+    group_id = _storage_group_id(ref)
+    payload = ref.stage_refs["rollout"].manifest["buffers"]["batch.input_ids"]
+    assert payload.get("kind") != "tensor"
+    assert store.put_tensor_calls == 0
+    assert store.pub_tensor_calls == 0
+    assert store.get_tensor_calls == 0
+    assert _seen_group_ids(store.put_configs) == [
+        [group_id],
+        [group_id],
+        [group_id],
+    ]
+    assert torch.equal(result["batch"]["input_ids"], tensor)
 
 
 @pytest.mark.parametrize(

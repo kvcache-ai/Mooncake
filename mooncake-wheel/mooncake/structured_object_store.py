@@ -4415,16 +4415,25 @@ class _MooncakePayloadTransport:
         value: _TensorPayload,
         config: Any = None,
     ) -> dict[str, Any] | None:
-        if config is not None:
-            return None
-        put_tensor = getattr(self._store, "put_tensor", None)
+        put_tensor = getattr(
+            self._store, "put_tensor" if config is None else "pub_tensor", None
+        )
         if not callable(put_tensor):
             return None
         tensor = value.tensor
         nbytes = int(getattr(tensor, "nbytes", 0))
         metadata_bytes = _tensor_metadata_size()
         total_bytes = metadata_bytes + nbytes
-        _check_status(put_tensor(key, tensor), "put_tensor", key)
+        _check_status(
+            _call_write_with_optional_config(
+                put_tensor,
+                key,
+                tensor,
+                config=_config_for_grouped_keys(config, 1),
+            ),
+            "put_tensor",
+            key,
+        )
         return {
             "key": key,
             "kind": "tensor",
