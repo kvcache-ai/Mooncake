@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import io
 import json
+import threading
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -24,6 +25,15 @@ try:
 except Exception:  # pragma: no cover
     _concat_arrays_into = None
 
+try:
+    from mooncake._fast_copy import (
+        export_arrow_u8 as _export_arrow_u8,
+        pillow_arrow_view as _pillow_arrow_view,
+    )
+except Exception:  # pragma: no cover
+    _export_arrow_u8 = None
+    _pillow_arrow_view = None
+
 DEFAULT_BUNDLE_CHUNK_BYTES = 64 * 1024**2
 AUTO_PARALLEL_MIN_BYTES = DEFAULT_BUNDLE_CHUNK_BYTES
 AUTO_PARALLEL_MIN_CHUNKS = 8
@@ -40,6 +50,20 @@ _ENCODING_FALLBACK_ERRORS = (
     RuntimeError,
     RecursionError,
 )
+_PIL_MEDIA_STATE_MAX_BYTES = 8 * 1024**2
+_PIL_MEDIA_TUPLE_EXT = 1
+_PIL_MEDIA_FRAMING = "pil_v2"
+_MEDIA_KIND_BYTES = 0
+_MEDIA_KIND_PIL = 1
+_PIL_MEDIA_FORMAT_MODES = {
+    None: frozenset({"1", "L", "LA", "P", "RGB", "RGBA", "CMYK", "I", "I;16"}),
+    "PNG": frozenset({"1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"}),
+    "JPEG": frozenset({"L", "RGB", "CMYK"}),
+}
+_PIL_MEDIA_BYTES_PER_PIXEL = {
+    "L": 1, "P": 1, "LA": 2, "I;16": 2, "RGB": 3,
+    "RGBA": 4, "CMYK": 4, "I": 4,
+}
 
 
 class BundleStore(Protocol):
@@ -201,6 +225,48 @@ class _PoolLeaseOwner:
         if not self.released:
             self.lease.release()
             self.released = True
+
+    def __del__(self) -> None:
+        self.release()
+
+
+class _SharedPoolOwner:
+    def __init__(self, owner: _PoolLeaseOwner) -> None:
+        self._owner = owner
+        self._references = 0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> "_SharedPoolOwnerToken":
+        with self._lock:
+            if self._owner is None:
+                raise RuntimeError("BufferPool owner has already been released")
+            self._references += 1
+        return _SharedPoolOwnerToken(self)
+
+    def release(self) -> None:
+        owner = None
+        with self._lock:
+            if self._references <= 0:
+                return
+            self._references -= 1
+            if self._references == 0:
+                owner, self._owner = self._owner, None
+        if owner is not None:
+            owner.release()
+
+
+class _SharedPoolOwnerToken:
+    def __init__(self, shared: _SharedPoolOwner) -> None:
+        self._shared = shared
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._shared.release()
 
     def __del__(self) -> None:
         self.release()
@@ -589,8 +655,10 @@ class MooncakeBundleTransfer:
         """Release pool-backed buffers in a GET result.
 
         After get_dataproto / get_dict, ndarray payloads may be backed by
-        the BufferPool. Call this to release those leases deterministically
-        instead of waiting for GC ``__del__``.
+        the BufferPool. PIL images decoded from selected raw modes may retain
+        the same backing memory. Call this after the result is no longer in use
+        to release those leases deterministically instead of waiting for GC
+        ``__del__``. Access after release is invalid.
 
         Works for both flat dicts and nested envelope dicts
         (dataproto: {batch: {...}, non_tensor_batch: {...}, meta_info: {...}}).
@@ -1230,10 +1298,6 @@ class MooncakeBundleTransfer:
                 if count:
                     ranges.append((int(begin), destination_offset, count))
                 destination_offset += count
-            if "media_encodings" in metadata:
-                metadata["media_encodings"] = [
-                    metadata["media_encodings"][index] for index in indices
-                ]
             return {
                 "data": read_data_ranges("data", ranges),
                 "offsets": gathered_offsets,
@@ -1267,7 +1331,6 @@ class MooncakeBundleTransfer:
             destination_offset = 0
             source_index = 0
             destination_boundary = 1
-            media_encodings = []
             for begin, count in zip(item_begins, item_counts):
                 for item in range(count):
                     byte_begin = int(byte_offsets[source_index + item])
@@ -1278,13 +1341,7 @@ class MooncakeBundleTransfer:
                     destination_offset += byte_count
                     gathered_byte_offsets[destination_boundary] = destination_offset
                     destination_boundary += 1
-                if "media_encodings" in metadata:
-                    media_encodings.extend(
-                        metadata["media_encodings"][int(begin) : int(begin) + count]
-                    )
                 source_index += count + 1
-            if "media_encodings" in metadata:
-                metadata["media_encodings"] = media_encodings
             return {
                 "data": read_data_ranges("data", ranges),
                 "row_offsets": gathered_row_offsets,
@@ -1394,8 +1451,6 @@ class MooncakeBundleTransfer:
             base = int(offsets[0])
             limit = int(offsets[-1])
             offsets = offsets - base
-            if "media_encodings" in metadata:
-                metadata["media_encodings"] = metadata["media_encodings"][start:end]
             return {
                 "data": read_bytes("data", base, limit),
                 "offsets": offsets,
@@ -1411,10 +1466,6 @@ class MooncakeBundleTransfer:
             byte_start = int(byte_offsets[0])
             byte_end = int(byte_offsets[-1])
             byte_offsets = byte_offsets - byte_start
-            if "media_encodings" in metadata:
-                metadata["media_encodings"] = metadata["media_encodings"][
-                    item_start:item_end
-                ]
             return {
                 "data": read_bytes("data", byte_start, byte_end),
                 "row_offsets": row_offsets,
@@ -1907,7 +1958,8 @@ def _coerce_flat_dict_non_tensor_field(
                 f"flat dict non_tensor_batch field {name!r} has batch size {len(value)}, expected {row_count}"
             )
         array = np.empty(row_count, dtype=object)
-        array[:] = list(value)
+        for index, item in enumerate(value):
+            array[index] = item
         return array
     raise TypeError(
         f"flat dict non_tensor_batch field {name!r} must be an ndarray or non-string sequence"
@@ -3013,44 +3065,187 @@ def _decode_numeric_scalar_values(payload: dict[str, Any]) -> list[Any]:
     return values.tolist()
 
 
-def _value_to_media_bytes(value: Any) -> tuple[bytes, str | None, dict[str, Any]]:
+def _encode_pil_state_default(value: Any) -> Any:
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, tuple):
+        return _msgpack.ExtType(
+            _PIL_MEDIA_TUPLE_EXT,
+            _msgpack.packb(
+                list(value),
+                use_bin_type=True,
+                strict_types=True,
+                default=_encode_pil_state_default,
+            ),
+        )
+    raise TypeError(
+        f"PIL image info contains unsupported {type(value).__name__}; "
+        "pass encoded PNG or JPEG bytes to preserve custom image state"
+    )
+
+
+def _decode_pil_state_ext(code: int, data: bytes) -> Any:
+    if code != _PIL_MEDIA_TUPLE_EXT:
+        raise ValueError(f"unsupported PIL image state extension: {code}")
+    values = _msgpack.unpackb(
+        data,
+        raw=False,
+        ext_hook=_decode_pil_state_ext,
+        max_str_len=_PIL_MEDIA_STATE_MAX_BYTES,
+        max_bin_len=_PIL_MEDIA_STATE_MAX_BYTES,
+        max_array_len=1024,
+        max_map_len=1024,
+        max_ext_len=_PIL_MEDIA_STATE_MAX_BYTES,
+    )
+    if not isinstance(values, list):
+        raise ValueError("invalid PIL image tuple state")
+    return tuple(values)
+
+
+def _validate_pil_state_tree(value: Any) -> None:
+    stack = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > 4096 or depth > 16:
+            raise ValueError("PIL image state is too complex")
+        if isinstance(item, dict):
+            if len(item) > 1024 or any(not isinstance(key, str) for key in item):
+                raise ValueError("PIL image state keys must be strings")
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, (list, tuple)):
+            if len(item) > 1024:
+                raise ValueError("PIL image state collection is too large")
+            stack.extend((child, depth + 1) for child in item)
+        elif not isinstance(item, (str, bool, int, float, bytes, type(None))):
+            raise ValueError(
+                f"PIL image state contains unsupported {type(item).__name__}"
+            )
+
+
+def _encode_pil_image(value: Any) -> tuple[bytes | memoryview, bytes]:
+    frame_count = int(getattr(value, "n_frames", 1))
+    if frame_count != 1:
+        raise ValueError(
+            "multi-frame PIL images are not supported; pass the encoded image bytes"
+        )
+    value.load()
+    image_format = getattr(value, "format", None)
+    if image_format is not None:
+        image_format = str(image_format).upper()
+        if image_format == "JPG":
+            image_format = "JPEG"
+    supported_modes = _PIL_MEDIA_FORMAT_MODES.get(image_format)
+    width, height = value.size
+    if (
+        supported_modes is None
+        or value.mode not in supported_modes
+        or width <= 0
+        or height <= 0
+    ):
+        raise ValueError(
+            f"unsupported PIL image format/mode: {image_format!r}/{value.mode!r}; "
+            "pass the encoded image bytes"
+        )
+    palette = None
+    if value.palette is not None:
+        palette_mode, palette_data = value.palette.getdata()
+        if palette_mode not in {"RGB", "RGBA"}:
+            raise ValueError(f"unsupported PIL palette mode: {palette_mode!r}")
+        palette_data = bytes(palette_data)
+        palette = [palette_mode, palette_data] if palette_data else None
+        if (
+            palette is not None
+            and (
+                value.mode != "P"
+                or len(palette_data) > 256 * len(palette_mode)
+                or len(palette_data) % len(palette_mode)
+            )
+        ):
+            raise ValueError("invalid PIL image palette")
+    pixels = None
+    storage = None
+    if value.mode == "RGB" and _pillow_arrow_view is not None:
+        try:
+            pixels = memoryview(_pillow_arrow_view(value))
+        except (
+            AttributeError,
+            NotImplementedError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            pass
+        else:
+            if len(pixels) == width * height * 4:
+                storage = "RGBX"
+            else:
+                pixels = None
+    state = [
+        2 if storage is not None else 1,
+        value.mode,
+        int(width),
+        int(height),
+        image_format,
+        palette,
+        dict(value.info),
+    ]
+    if storage is not None:
+        state.append(storage)
+    _validate_pil_state_tree(state)
+    state_bytes = _msgpack.packb(
+        state,
+        use_bin_type=True,
+        strict_types=True,
+        default=_encode_pil_state_default,
+    )
+    if len(state_bytes) > _PIL_MEDIA_STATE_MAX_BYTES:
+        raise ValueError(f"PIL image state is too large: {len(state_bytes)} bytes")
+    return (pixels if pixels is not None else value.tobytes()), state_bytes
+
+
+def _value_to_media_parts(
+    value: Any,
+) -> tuple[bytes | bytearray | memoryview, bytes, str | None, int]:
     if value is None:
-        return b"", None, {"kind": "null"}
+        return b"", b"", None, _MEDIA_KIND_BYTES
     if _is_bytes_like(value):
-        return bytes(value), None, {"kind": "bytes"}
+        encoded = value if isinstance(value, bytes) else bytes(value)
+        return encoded, b"", None, _MEDIA_KIND_BYTES
     if _is_pil_image(value):
-        image = (
-            value.convert(value.mode) if getattr(value, "readonly", False) else value
-        )
-        return (
-            image.tobytes(),
-            "image/raw",
-            {
-                "kind": "pil_raw",
-                "mode": image.mode,
-                "size": list(image.size),
-                "format": getattr(value, "format", None),
-            },
-        )
-    return bytes(value), None, {"kind": "bytes"}
+        pixels, state = _encode_pil_image(value)
+        return pixels, state, "image/raw", _MEDIA_KIND_PIL
+    return bytes(value), b"", None, _MEDIA_KIND_BYTES
+
+
+def _pil_pixel_bytes(mode: str, width: int, height: int) -> int:
+    if mode == "1":
+        return ((width + 7) // 8) * height
+    return width * height * _PIL_MEDIA_BYTES_PER_PIXEL[mode]
+
 
 def _encode_bytes_like_values(
     values: list[Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     offsets = [0]
-    parts = []
+    items = []
     media_types = []
-    encodings = []
     for value in values:
-        data, media_type, encoding = _value_to_media_bytes(value)
-        parts.append(data)
+        data, state, media_type, kind = _value_to_media_parts(value)
+        items.append((data, state, kind))
         media_types.append(media_type)
-        encodings.append(encoding)
-        offsets.append(offsets[-1] + len(data))
-    payload_bytes = _multi_buffer_bytes_payload(parts)
+    framed = any(kind == _MEDIA_KIND_PIL for _data, _state, kind in items)
+    parts = []
+    for data, state, kind in items:
+        item_parts = _framed_media_parts(data, state, kind) if framed else (data,)
+        parts.extend(item_parts)
+        offsets.append(offsets[-1] + sum(len(part) for part in item_parts))
     metadata: dict[str, Any] = {}
-    if any(encoding.get("kind") == "pil_raw" for encoding in encodings):
-        metadata["media_encodings"] = encodings
+    if framed:
+        metadata["media_framing"] = _PIL_MEDIA_FRAMING
     non_null_media_types = sorted(
         {media_type for media_type in media_types if media_type}
     )
@@ -3059,7 +3254,7 @@ def _encode_bytes_like_values(
         metadata["encode_source"] = "raw_pixels_from_object"
     return (
         {
-            "data": payload_bytes,
+            "data": _multi_buffer_bytes_payload(parts),
             "offsets": np.asarray(offsets, dtype=np.int64),
             "nulls": np.asarray([value is None for value in values], dtype=np.bool_),
         },
@@ -3067,25 +3262,175 @@ def _encode_bytes_like_values(
     )
 
 
+def _framed_media_parts(
+    data: bytes | bytearray | memoryview, state: bytes, kind: int
+) -> tuple[bytes | bytearray | memoryview, ...]:
+    if kind == _MEDIA_KIND_BYTES:
+        return (bytes((_MEDIA_KIND_BYTES,)), data)
+    header = bytes((_MEDIA_KIND_PIL,)) + len(state).to_bytes(4, "little")
+    return header, state, data
+
+
 def _multi_buffer_bytes_payload(
-    parts: Sequence[bytes | memoryview],
+    parts: Sequence[bytes | bytearray | memoryview],
 ) -> _MultiBufferPayload:
     buffers = tuple(_bytes_view(part, "payload part") for part in parts if part)
     return _MultiBufferPayload(buffers, tuple(parts))
 
 
-def _decode_media_bytes(data: Any, encoding: Optional[Mapping[str, Any]]) -> Any:
-    if not encoding or encoding.get("kind") != "pil_raw":
-        return bytes(data)
+class _ArrowU8Provider:
+    def __init__(self, data: Any) -> None:
+        self._data = data
+
+    def __arrow_c_array__(self, requested_schema: Any = None) -> Any:
+        if _export_arrow_u8 is None:
+            raise NotImplementedError("Pillow Arrow support is unavailable")
+        return _export_arrow_u8(self._data, requested_schema)
+
+
+def _decode_pil_image(
+    data: Any, state_bytes: Any, *, raw_fallback: bool = False
+) -> Any:
+    try:
+        if len(state_bytes) > _PIL_MEDIA_STATE_MAX_BYTES:
+            raise ValueError("PIL image state is too large")
+        state = _msgpack.unpackb(
+            state_bytes,
+            raw=False,
+            ext_hook=_decode_pil_state_ext,
+            max_str_len=_PIL_MEDIA_STATE_MAX_BYTES,
+            max_bin_len=_PIL_MEDIA_STATE_MAX_BYTES,
+            max_array_len=1024,
+            max_map_len=1024,
+            max_ext_len=_PIL_MEDIA_STATE_MAX_BYTES,
+        )
+        _validate_pil_state_tree(state)
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+        _msgpack.UnpackException,
+    ) as exc:
+        raise ValueError("invalid PIL image state") from exc
+    if not isinstance(state, list) or len(state) not in {7, 8}:
+        raise ValueError("unsupported PIL image state")
+    version = state[0]
+    if type(version) is not int or version not in {1, 2} or len(state) != version + 6:
+        raise ValueError("unsupported PIL image state")
+    _, mode, width, height, image_format, palette, info, *storage_state = state
+    storage = storage_state[0] if storage_state else None
+    if not isinstance(mode, str) or (
+        image_format is not None and not isinstance(image_format, str)
+    ):
+        raise ValueError("invalid PIL image mode or format")
+    supported_modes = _PIL_MEDIA_FORMAT_MODES.get(image_format)
+    if (
+        supported_modes is None
+        or mode not in supported_modes
+        or isinstance(width, bool)
+        or not isinstance(width, int)
+        or width <= 0
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height <= 0
+    ):
+        raise ValueError("invalid PIL image mode, format, or dimensions")
+    pixels = data
+    if storage not in {None, "RGBX"} or (storage == "RGBX" and mode != "RGB"):
+        raise ValueError("invalid PIL image storage")
+    expected_pixel_bytes = (
+        width * height * 4
+        if storage == "RGBX"
+        else _pil_pixel_bytes(mode, width, height)
+    )
+    if len(pixels) != expected_pixel_bytes:
+        raise ValueError(
+            f"invalid PIL image pixel length: {len(pixels)}, "
+            f"expected {expected_pixel_bytes}"
+        )
+    if palette is not None:
+        valid_palette = isinstance(palette, list) and len(palette) == 2
+        palette_mode = palette[0] if valid_palette else None
+        palette_data = palette[1] if valid_palette else None
+        if (
+            mode != "P"
+            or palette_mode not in {"RGB", "RGBA"}
+            or not isinstance(palette_data, bytes)
+            or not 0 < len(palette_data) <= 256 * len(palette_mode)
+            or len(palette_data) % len(palette_mode)
+        ):
+            raise ValueError("invalid PIL image palette")
+    if not isinstance(info, dict):
+        raise ValueError("invalid PIL image info")
     try:
         from PIL import Image
-    except ImportError:
-        return bytes(data)
-    image = Image.frombuffer(
-        encoding["mode"], tuple(encoding["size"]), data, "raw", encoding["mode"], 0, 1
-    )
-    image.format = encoding.get("format")
+    except ImportError as exc:
+        if not raw_fallback:
+            raise ImportError(
+                "Pillow is required to decode PIL image payloads"
+            ) from exc
+        if storage == "RGBX":
+            return (
+                np.frombuffer(pixels, dtype=np.uint8)
+                .reshape(-1, 4)[:, :3]
+                .tobytes()
+            )
+        return bytes(pixels)
+    if storage == "RGBX":
+        fromarrow = getattr(Image, "fromarrow", None)
+        if _export_arrow_u8 is not None and callable(fromarrow):
+            try:
+                image = fromarrow(_ArrowU8Provider(pixels), mode, (width, height))
+            except (AttributeError, NotImplementedError, TypeError, ValueError):
+                image = Image.frombytes(
+                    mode, (width, height), pixels, "raw", "RGBX", 0, 1
+                )
+        else:
+            image = Image.frombytes(
+                mode, (width, height), pixels, "raw", "RGBX", 0, 1
+            )
+    else:
+        image = Image.frombuffer(mode, (width, height), pixels, "raw", mode, 0, 1)
+    if palette is not None:
+        image.putpalette(palette_data, palette_mode)
+    image.info = info
+    image.format = image_format
     return image
+
+
+def _decode_media_bytes(
+    data: Any,
+    framed: bool = False,
+    owner: _SharedPoolOwner | None = None,
+) -> Any:
+    if not framed:
+        return bytes(data)
+    if not data:
+        raise ValueError("invalid framed media payload")
+    kind = int(data[0])
+    if kind == _MEDIA_KIND_BYTES:
+        return bytes(data[1:])
+    if kind != _MEDIA_KIND_PIL:
+        raise ValueError(f"unsupported media encoding: {kind!r}")
+    if len(data) < 5:
+        raise ValueError("invalid framed PIL payload")
+    state_size = int.from_bytes(data[1:5], "little")
+    state_end = 5 + state_size
+    if state_size > _PIL_MEDIA_STATE_MAX_BYTES or state_end > len(data):
+        raise ValueError("invalid framed PIL state")
+    pixels = data[state_end:]
+    image = _decode_pil_image(pixels, data[5:state_end], raw_fallback=True)
+    if owner is not None and bool(getattr(image, "readonly", False)):
+        image._mooncake_pool_owner = owner.acquire()
+    return image
+
+
+def _media_framed(metadata: Optional[Mapping[str, Any]]) -> bool:
+    framing = (metadata or {}).get("media_framing")
+    if framing not in {None, _PIL_MEDIA_FRAMING}:
+        raise ValueError(f"unsupported media framing: {framing!r}")
+    return framing == _PIL_MEDIA_FRAMING
 
 
 def _decode_bytes_like_values(
@@ -3094,15 +3439,17 @@ def _decode_bytes_like_values(
     data = payload["data"]
     offsets = payload["offsets"]
     nulls = payload["nulls"]
-    encodings = (metadata or {}).get("media_encodings", [])
+    framed = _media_framed(metadata)
+    owner = getattr(data, "_mooncake_pool_owner", None)
+    shared_owner = _SharedPoolOwner(owner) if owner is not None else None
     values = []
     for row in range(rows):
         if bool(nulls[row]):
             values.append(None)
             continue
         item = memoryview(data)[int(offsets[row]) : int(offsets[row + 1])]
-        encoding = encodings[row] if row < len(encodings) else None
-        values.append(_decode_media_bytes(item, encoding))
+        value = _decode_media_bytes(item, framed, shared_owner)
+        values.append(value)
     return values
 
 
@@ -3111,30 +3458,34 @@ def _encode_media_list_values(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     row_offsets = [0]
     byte_offsets = [0]
-    parts = []
+    encoded_items = []
     media_types = []
-    encodings = []
     for value in values:
-        items = [] if value is None else list(value)
-        for item in items:
-            data, media_type, encoding = _value_to_media_bytes(item)
-            parts.append(data)
+        row_items = [] if value is None else list(value)
+        for item in row_items:
+            data, state, media_type, kind = _value_to_media_parts(item)
+            encoded_items.append((data, state, kind))
             media_types.append(media_type)
-            encodings.append(encoding)
-            byte_offsets.append(byte_offsets[-1] + len(data))
-        row_offsets.append(row_offsets[-1] + len(items))
-    metadata: dict[str, Any] = {
-        "encode_source": "raw_pixels_from_object",
-        "media_encodings": encodings,
-    }
+        row_offsets.append(len(encoded_items))
+    framed = any(
+        kind == _MEDIA_KIND_PIL for _data, _state, kind in encoded_items
+    )
+    parts = []
+    for data, state, kind in encoded_items:
+        item_parts = _framed_media_parts(data, state, kind) if framed else (data,)
+        parts.extend(item_parts)
+        byte_offsets.append(byte_offsets[-1] + sum(len(part) for part in item_parts))
+    metadata: dict[str, Any] = {"encode_source": "raw_pixels_from_object"}
     non_null_media_types = sorted(
         {media_type for media_type in media_types if media_type}
     )
     if non_null_media_types:
         metadata["media_types"] = non_null_media_types
+    if framed:
+        metadata["media_framing"] = _PIL_MEDIA_FRAMING
     return (
         {
-            "data": b"".join(parts),
+            "data": _multi_buffer_bytes_payload(parts),
             "row_offsets": np.asarray(row_offsets, dtype=np.int64),
             "byte_offsets": np.asarray(byte_offsets, dtype=np.int64),
             "nulls": np.asarray([value is None for value in values], dtype=np.bool_),
@@ -3150,7 +3501,9 @@ def _decode_media_list_values(
     row_offsets = payload["row_offsets"]
     byte_offsets = payload["byte_offsets"]
     nulls = payload["nulls"]
-    encodings = (metadata or {}).get("media_encodings", [])
+    framed = _media_framed(metadata)
+    owner = getattr(data, "_mooncake_pool_owner", None)
+    shared_owner = _SharedPoolOwner(owner) if owner is not None else None
     values = []
     for row in range(rows):
         if bool(nulls[row]):
@@ -3161,8 +3514,8 @@ def _decode_media_list_values(
             item = memoryview(data)[
                 int(byte_offsets[item_index]) : int(byte_offsets[item_index + 1])
             ]
-            encoding = encodings[item_index] if item_index < len(encodings) else None
-            items.append(_decode_media_bytes(item, encoding))
+            value = _decode_media_bytes(item, framed, shared_owner)
+            items.append(value)
         values.append(items)
     return values
 
@@ -5833,7 +6186,7 @@ def _object_array_from_decoded_values(values: list[Any]) -> np.ndarray:
     owner = getattr(values, "_mooncake_pool_owner", None) or next(
         (getattr(v, "_mooncake_pool_owner", None) for v in values if v is not None), None
     )
-    if owner is None:
+    if owner is None or isinstance(owner, _SharedPoolOwnerToken):
         return array
     result = array.view(_OwnerBackedObjectArray)
     result._mooncake_pool_owner = owner
