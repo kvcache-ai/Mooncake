@@ -1,6 +1,7 @@
 #include "ha/snapshot/batch_oplog/codec.h"
 
 #include <limits>
+#include <utility>
 
 #include <ylt/struct_pack.hpp>
 
@@ -21,8 +22,7 @@ tl::expected<T, std::string> Decode(const std::vector<uint8_t>& encoded,
 
 template <typename T>
 std::vector<uint8_t> Encode(const T& value) {
-    auto encoded = struct_pack::serialize(value);
-    return {encoded.begin(), encoded.end()};
+    return struct_pack::serialize<std::vector<uint8_t>>(value);
 }
 
 }  // namespace
@@ -39,8 +39,9 @@ DecodeBatchOpLogSnapshotSegments(const std::vector<uint8_t>& encoded) {
 }
 
 std::vector<uint8_t> EncodeBatchOpLogSnapshotObjectChunk(
-    uint64_t chunk_index, const std::vector<StandbyObjectEntry>& objects) {
-    return Encode(BatchOpLogSnapshotObjectChunk{chunk_index, objects});
+    uint64_t chunk_index, std::vector<StandbyObjectEntry> objects) {
+    return Encode(
+        BatchOpLogSnapshotObjectChunk{chunk_index, std::move(objects)});
 }
 
 tl::expected<BatchOpLogSnapshotObjectChunk, std::string>

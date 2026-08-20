@@ -1,6 +1,5 @@
 #include "ha/snapshot/batch_oplog/writer.h"
 
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -15,10 +14,6 @@
 namespace mooncake {
 
 namespace {
-
-std::vector<uint8_t> ToBytes(std::string_view value) {
-    return {value.begin(), value.end()};
-}
 
 tl::expected<void, std::string> VerifyObject(SnapshotObjectStore& object_store,
                                              const std::string& key,
@@ -135,19 +130,18 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
             return fail("Batch OpLog snapshot capture returned an empty chunk");
         }
 
-        auto encoded =
-            EncodeBatchOpLogSnapshotObjectChunk(chunk_index, objects);
+        const size_t object_count = objects.size();
+        auto encoded = EncodeBatchOpLogSnapshotObjectChunk(chunk_index,
+                                                           std::move(objects));
         const std::string key = ha::BuildBatchOpLogSnapshotObjectChunkKey(
             snapshot_root, snapshot_id, chunk_index);
         ha::BatchOpLogSnapshotChunkDescriptor descriptor{
             .chunk_index = chunk_index,
             .key = key,
-            .object_count = objects.size(),
+            .object_count = object_count,
             .stored_size = encoded.size(),
             .crc32c = Crc32cValue(encoded.data(), encoded.size()),
         };
-        std::vector<StandbyObjectEntry>().swap(objects);
-
         upload = object_store_.UploadBuffer(key, encoded);
         if (!upload) {
             return fail("Failed to upload snapshot object chunk: " +
@@ -176,14 +170,13 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         ha::BuildBatchOpLogSnapshotManifestKey(snapshot_root, snapshot_id);
     const std::string manifest_json =
         ha::EncodeBatchOpLogSnapshotManifest(manifest);
-    auto manifest_bytes = ToBytes(manifest_json);
     const uint32_t manifest_crc32c =
-        Crc32cValue(manifest_bytes.data(), manifest_bytes.size());
-    upload = object_store_.UploadBuffer(manifest_key, manifest_bytes);
+        Crc32cValue(manifest_json.data(), manifest_json.size());
+    upload = object_store_.UploadString(manifest_key, manifest_json);
     if (!upload) {
         return fail("Failed to upload snapshot manifest: " + upload.error());
     }
-    verify = VerifyObject(object_store_, manifest_key, manifest_bytes.size(),
+    verify = VerifyObject(object_store_, manifest_key, manifest_json.size(),
                           manifest_crc32c);
     if (!verify) {
         return fail(std::move(verify.error()));
@@ -195,22 +188,21 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     descriptor.last_included_batch_id = capture.last_included_batch_id;
     descriptor.producer_view_version = capture.producer_view_version;
     descriptor.manifest_key = manifest_key;
-    descriptor.manifest_size = manifest_bytes.size();
+    descriptor.manifest_size = manifest_json.size();
     descriptor.manifest_crc32c = manifest_crc32c;
     descriptor.created_at_ms = created_at_ms;
 
     const std::string descriptor_json =
         ha::EncodeBatchOpLogSnapshotDescriptor(descriptor);
-    auto descriptor_bytes = ToBytes(descriptor_json);
     const std::string descriptor_key =
         ha::BuildBatchOpLogSnapshotDescriptorKey(snapshot_root, snapshot_id);
-    upload = object_store_.UploadBuffer(descriptor_key, descriptor_bytes);
+    upload = object_store_.UploadString(descriptor_key, descriptor_json);
     if (!upload) {
         return fail("Failed to upload snapshot descriptor: " + upload.error());
     }
     verify = VerifyObject(
-        object_store_, descriptor_key, descriptor_bytes.size(),
-        Crc32cValue(descriptor_bytes.data(), descriptor_bytes.size()));
+        object_store_, descriptor_key, descriptor_json.size(),
+        Crc32cValue(descriptor_json.data(), descriptor_json.size()));
     if (!verify) {
         return fail(std::move(verify.error()));
     }

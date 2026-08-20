@@ -95,6 +95,7 @@ class FakeObjectStore final : public SnapshotObjectStore {
 
     tl::expected<void, std::string> UploadString(
         const std::string& key, const std::string& data) override {
+        ++string_upload_attempts;
         return UploadBuffer(key, {data.begin(), data.end()});
     }
 
@@ -168,6 +169,7 @@ class FakeObjectStore final : public SnapshotObjectStore {
     size_t upload_attempts{0};
     size_t download_attempts{0};
     size_t cleanup_attempts{0};
+    size_t string_upload_attempts{0};
 
    private:
     std::map<std::string, std::vector<uint8_t>> objects_;
@@ -284,6 +286,7 @@ TEST_F(BatchOpLogSnapshotWriterTest, WritesAndVerifiesMultipleChunks) {
         }
     }
     EXPECT_EQ(5u, object_store.size());
+    EXPECT_EQ(2u, object_store.string_upload_attempts);
     EXPECT_GT(object_store.download_attempts, 0u);
 }
 

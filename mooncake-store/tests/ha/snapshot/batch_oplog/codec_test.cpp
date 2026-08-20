@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mooncake::test {
@@ -65,7 +66,7 @@ TEST(BatchOpLogSnapshotCodecTest, ObjectChunkRoundTripsAndChecksEnvelope) {
     metadata.hard_pinned = true;
     std::vector<StandbyObjectEntry> objects{
         {.tenant_id = "tenant", .key = "key", .metadata = metadata}};
-    auto encoded = EncodeBatchOpLogSnapshotObjectChunk(7, objects);
+    auto encoded = EncodeBatchOpLogSnapshotObjectChunk(7, std::move(objects));
 
     auto decoded = DecodeBatchOpLogSnapshotObjectChunk(encoded, 7, 1);
 

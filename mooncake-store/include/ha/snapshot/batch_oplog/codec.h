@@ -23,7 +23,7 @@ tl::expected<std::vector<StandbySegmentInfo>, std::string>
 DecodeBatchOpLogSnapshotSegments(const std::vector<uint8_t>& encoded);
 
 std::vector<uint8_t> EncodeBatchOpLogSnapshotObjectChunk(
-    uint64_t chunk_index, const std::vector<StandbyObjectEntry>& objects);
+    uint64_t chunk_index, std::vector<StandbyObjectEntry> objects);
 tl::expected<BatchOpLogSnapshotObjectChunk, std::string>
 DecodeBatchOpLogSnapshotObjectChunk(const std::vector<uint8_t>& encoded,
                                     uint64_t expected_chunk_index,
