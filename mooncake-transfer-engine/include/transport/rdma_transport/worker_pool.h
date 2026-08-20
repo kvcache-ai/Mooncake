@@ -17,6 +17,7 @@
 
 #include <queue>
 #include <unordered_set>
+#include <vector>
 
 #include "config.h"
 #include "rdma_context.h"
@@ -58,6 +59,11 @@ class WorkerPool {
 
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
                     bool handoff_to_local_worker = false);
+    void delayRedispatch(Transport::Slice *slice, bool handoff_to_local_worker,
+                         const char *reason);
+    void releaseReadyDelayedSlices(int thread_id);
+    bool hasDelayedSlices() const;
+    uint64_t nextDelayedSliceDueNs() const;
 
     void transferWorker(int thread_id);
 
@@ -78,6 +84,8 @@ class WorkerPool {
     void markRailFailed(const std::string &peer_nic_path,
                         bool immediate_pause = false);
     bool isRailAvailable(const std::string &peer_nic_path);
+    uint64_t peerRailPauseRemainingNs(const std::string &peer_nic_path,
+                                      uint64_t now);
 
     // Retry helper: increment retry count and return whether retry is allowed
     static bool shouldRetrySlice(Transport::Slice *slice);
@@ -165,6 +173,14 @@ class WorkerPool {
     std::unordered_map<std::string, RailState> rail_states_;
     std::mutex rail_state_lock_;
 
+    struct DelayedSlice {
+        Transport::Slice *slice = nullptr;
+        uint64_t due_ns = 0;
+        bool handoff_to_local_worker = false;
+    };
+    mutable std::mutex delayed_slices_lock_;
+    std::vector<DelayedSlice> delayed_slices_;
+
     // Rail monitor configuration
     const static int kRailErrorThreshold = 5;  // Errors before pause
     // Errors further apart than this are not consecutive, so error_count is
@@ -173,6 +189,11 @@ class WorkerPool {
     const static uint64_t kRailErrorWindowNs = 5000000000ull;  // 5 seconds
     const static uint64_t kContextRecoveryDelayNs =
         30000000000ull;  // 30 seconds before a recovered local RNIC is reused
+    const static uint64_t kDelayedRedispatchMinBackoffNs =
+        100000000ull;  // 100 ms
+    const static uint64_t kDelayedRedispatchMaxBackoffNs =
+        2000000000ull;  // 2 seconds
+    const static uint64_t kDelayedRedispatchWakeCapNs = 100000000ull;  // 100 ms
 
     // Context-level health tracking
     std::atomic<int> context_failure_count_{0};
