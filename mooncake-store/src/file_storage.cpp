@@ -1,6 +1,7 @@
 #include "file_storage.h"
 
 #include <cmath>
+#include <exception>
 #include <locale>
 #include <memory>
 #include <optional>
@@ -439,13 +440,27 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
+    const int offload_threads = GetEnvOr<int>("MC_OFFLOAD_WRITE_THREADS", 0);
+    if (offload_threads > 1) {
+        offload_write_pool_ =
+            std::make_unique<ThreadPool>(static_cast<size_t>(offload_threads));
+        LOG(INFO) << "FileStorage: offload write pool created, "
+                  << offload_threads << " threads";
+    }
+
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
         LOG(INFO) << "Starting periodic task with interval: "
                   << config_.heartbeat_interval_seconds
                   << "s, running is: " << heartbeat_running_.load();
         while (heartbeat_running_.load()) {
-            Heartbeat();
+            try {
+                Heartbeat();
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Heartbeat threw exception: " << e.what();
+            } catch (...) {
+                LOG(ERROR) << "Heartbeat threw unknown exception";
+            }
             std::this_thread::sleep_for(
                 std::chrono::seconds(config_.heartbeat_interval_seconds));
         }
@@ -533,6 +548,175 @@ bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
            error == ErrorCode::OBJECT_ALREADY_EXISTS;
 }
 
+namespace {
+// Append a failed task to the shared vector, guarding with the caller's
+// mutex when running concurrently (parallel offload path).  failed_mutex is
+// null on the sequential path where no concurrency exists.
+void PushFailedTask(const OffloadTaskItem& task,
+                    std::vector<OffloadTaskItem>& failed_tasks,
+                    Mutex* failed_mutex) {
+    if (failed_mutex) {
+        MutexLocker lk(failed_mutex);
+        failed_tasks.push_back(task);
+    } else {
+        failed_tasks.push_back(task);
+    }
+}
+}  // namespace
+
+tl::expected<void, ErrorCode> FileStorage::ProcessOneBucket(
+    const std::vector<std::string>& keys,
+    const std::unordered_map<std::string, OffloadTaskItem>& task_by_storage_key,
+    std::vector<OffloadTaskItem>& failed_tasks, Mutex* failed_mutex,
+    const std::function<ErrorCode(const std::vector<std::string>&,
+                                  std::vector<StorageObjectMetadata>&)>&
+        complete_handler) {
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    std::unordered_map<std::string, std::vector<std::string>>
+        storage_keys_by_tenant;
+    for (const auto& storage_key : keys) {
+        const auto it = task_by_storage_key.find(storage_key);
+        if (it != task_by_storage_key.end()) {
+            storage_keys_by_tenant[it->second.tenant_id].push_back(storage_key);
+        }
+    }
+    for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
+        std::vector<std::string> user_keys;
+        user_keys.reserve(storage_keys.size());
+        for (const auto& storage_key : storage_keys) {
+            user_keys.push_back(task_by_storage_key.at(storage_key).key);
+        }
+        std::unordered_map<std::string, std::vector<Slice>> user_batch_object;
+        [[maybe_unused]] auto query_result =
+            BatchQuerySegmentSlices(user_keys, tenant_id, user_batch_object);
+        // BatchQuerySegmentSlices is now best-effort: it always returns OK.
+        // Keys present in user_batch_object go to batch_object; the rest are
+        // reported as failed.
+        for (const auto& storage_key : storage_keys) {
+            const auto& task = task_by_storage_key.at(storage_key);
+            auto it = user_batch_object.find(task.key);
+            if (it != user_batch_object.end()) {
+                batch_object.emplace(storage_key, std::move(it->second));
+            } else {
+                PushFailedTask(task, failed_tasks, failed_mutex);
+            }
+        }
+    }
+    if (batch_object.empty()) return {};
+
+    // D2H staging: replace device slices with host memory slices so that
+    // storage_backend (ConcatSlicesToString / BuildBucket / WriteBucket)
+    // always receives host pointers.
+    std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
+    std::vector<PinnedBufferPool::Buffer> staging_bufs;
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (auto& [obj_key, slices] : batch_object) {
+        std::vector<Slice> host_slices;
+        bool obj_success = true;
+        for (const auto& slice : slices) {
+            device::PointerInfo info{};
+            auto* device =
+                runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
+            if (device) {
+                device->SetContext(info.device_id);
+                auto buf = pinned_buffer_pool_->Acquire(slice.size);
+                if (!device->Copy(buf.data, slice.ptr, slice.size,
+                                  device::CopyDirection::kDeviceToHost)) {
+                    LOG(ERROR) << "D2H staging failed for key: " << obj_key;
+                    pinned_buffer_pool_->Release(std::move(buf));
+                    obj_success = false;
+                    PushFailedTask(task_by_storage_key.at(obj_key),
+                                   failed_tasks, failed_mutex);
+                    break;
+                }
+                host_slices.emplace_back(Slice{buf.data, slice.size});
+                staging_bufs.push_back(std::move(buf));
+            } else {
+                host_slices.push_back(slice);
+            }
+        }
+        if (obj_success) {
+            host_batch_object[obj_key] = std::move(host_slices);
+        }
+    }
+
+    // If every object in this bucket failed D2H staging, host_batch_object is
+    // empty (those keys are already in failed_tasks).  Skip BatchOffload, which
+    // rejects an empty map as INVALID_KEY and would otherwise trip the
+    // whole-cycle abort for a bucket that has nothing left to persist.
+    // staging_bufs can still be non-empty here (an object whose first slices
+    // copied fine but a later one failed), so hand those buffers back before
+    // returning: the release loop after BatchOffload is unreachable on this
+    // path.
+    if (host_batch_object.empty()) {
+        for (auto& buf : staging_bufs) {
+            pinned_buffer_pool_->Release(std::move(buf));
+        }
+        return {};
+    }
+
+    auto offload_start = std::chrono::steady_clock::now();
+    auto bucket_complete_handler =
+        [this, offload_start, complete_handler](
+            const std::vector<std::string>& bk_keys,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        auto res = complete_handler(bk_keys, metadatas);
+        if (res == ErrorCode::OK && ssd_metric_) {
+            auto elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - offload_start)
+                    .count();
+            int64_t total_bytes = 0;
+            for (const auto& metadata : metadatas) {
+                total_bytes += metadata.data_size;
+            }
+            ssd_metric_->ssd_write_ops.inc(bk_keys.size());
+            ssd_metric_->ssd_write_bytes.inc(total_bytes);
+            ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
+            ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
+            ssd_metric_->ssd_total_ops.inc(bk_keys.size());
+            ssd_metric_->ssd_total_bytes.inc(total_bytes);
+            ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
+            ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
+        }
+        return res;
+    };
+    auto offload_res = storage_backend_->BatchOffload(
+        host_batch_object, bucket_complete_handler,
+        [this](const std::vector<std::string>& evicted_keys) {
+            return NotifyEvictedDiskReplicas(evicted_keys);
+        });
+
+    // Release staging buffers back to pool.
+    for (auto& buf : staging_bufs) {
+        pinned_buffer_pool_->Release(std::move(buf));
+    }
+    if (!offload_res) {
+        LOG(ERROR) << "Failed to store objects with error: "
+                   << offload_res.error();
+        // Report this bucket's keys back to the master as failed regardless of
+        // whether we continue or abort, so their offloading tasks and
+        // source-replica refcounts don't leak until the TTL reaper fires.
+        for (const auto& [key, _] : host_batch_object) {
+            PushFailedTask(task_by_storage_key.at(key), failed_tasks,
+                           failed_mutex);
+        }
+        if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+            // Disk is over the key-count limit: stop offloading entirely.
+            MutexLocker locker(&offloading_mutex_);
+            enable_offloading_ = false;
+        }
+        if (!IsPerBucketSoftOffloadError(offload_res.error())) {
+            // Whole-cycle error (KEYS_ULTRA_LIMIT or any hard failure).
+            return tl::make_unexpected(offload_res.error());
+        }
+        // Soft per-bucket error (INVALID_READ / OBJECT_ALREADY_EXISTS): keep
+        // processing the remaining buckets.
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
     if (offloading_objects.empty()) {
@@ -605,159 +789,116 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // left waiting on the TTL reaper.
     std::optional<ErrorCode> abort_error;
 
+    if (offload_write_pool_ && buckets_keys.size() > 1) {
+        // --- Parallel path: dispatch each bucket to the offload write pool ---
+        // Every bucket is dispatched up front, so pre-populate all_bucket_keys
+        // with all of them: the sweep at the tail must only NACK keys skipped
+        // by GroupOffloadingKeysByBucket, not the dispatched ones.
+        for (const auto& keys : buckets_keys) {
+            for (const auto& k : keys) all_bucket_keys.insert(k);
+        }
+        Mutex failed_mutex;
+        Mutex fatal_mutex;
+        std::optional<ErrorCode> fatal_error;
+        std::vector<std::future<void>> futures;
+        futures.reserve(buckets_keys.size());
+
+        try {
+            for (const auto& keys : buckets_keys) {
+                auto task = std::make_shared<std::packaged_task<void()>>(
+                    [this, keys, &task_by_storage_key, &failed_tasks,
+                     &failed_mutex, &fatal_error, &fatal_mutex,
+                     complete_handler]() {
+                        auto result = ProcessOneBucket(
+                            keys, task_by_storage_key, failed_tasks,
+                            &failed_mutex, complete_handler);
+                        if (!result) {
+                            MutexLocker lk(&fatal_mutex);
+                            if (!fatal_error) fatal_error = result.error();
+                        }
+                    });
+                futures.push_back(task->get_future());
+                offload_write_pool_->enqueue([task]() { (*task)(); });
+            }
+        } catch (...) {
+            // Dispatch failed (e.g. bad_alloc in make_shared / push_back /
+            // enqueue).  Drain the futures already dispatched so queued
+            // workers never outlive the stack locals they captured, then
+            // rethrow.
+            std::exception_ptr pending = std::current_exception();
+            for (auto& f : futures) {
+                try {
+                    f.get();
+                } catch (...) {
+                }
+            }
+            std::rethrow_exception(pending);
+        }
+
+        // Drain ALL futures before unwinding, even if one throws (e.g.
+        // std::bad_alloc while allocating a staging buffer).  Otherwise a
+        // queued worker keeps running against captured references to stack
+        // locals after OffloadObjects unwinds — use-after-free.  Capture the
+        // first exception and rethrow it after every future is consumed.
+        std::exception_ptr first_exception;
+        for (auto& f : futures) {
+            try {
+                f.get();
+            } catch (...) {
+                if (!first_exception)
+                    first_exception = std::current_exception();
+            }
+        }
+        if (first_exception) std::rethrow_exception(first_exception);
+
+        // Propagate fatal error if any thread hit one.  Do not return here:
+        // fall through to the skipped-keys sweep and NACK flush below so no
+        // drained key is left waiting on the TTL reaper (same semantics as the
+        // sequential path's abort_error).
+        if (fatal_error) abort_error = fatal_error;
+
+        // Keys skipped by GroupOffloadingKeysByBucket: report as failed.
+        for (const auto& [storage_key, task] : task_by_storage_key) {
+            if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
+                failed_tasks.push_back(task);
+            }
+        }
+
+        // Report failed tasks and return (skip sequential fallthrough).
+        if (!failed_tasks.empty()) {
+            std::vector<StorageObjectMetadata> failed_metadatas;
+            failed_metadatas.reserve(failed_tasks.size());
+            for (size_t i = 0; i < failed_tasks.size(); ++i) {
+                failed_metadatas.push_back(
+                    StorageObjectMetadata{-1, 0, 0, -1, ""});
+            }
+            auto result =
+                client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
+            if (!result) {
+                LOG(WARNING) << "[OFFLOAD] NotifyOffloadSuccess for failed "
+                             << "tasks returned error: " << result.error()
+                             << " count: " << failed_tasks.size();
+            }
+        }
+        // Return the aggregated fatal error after the NACK flush, or success.
+        return abort_error ? tl::make_unexpected(*abort_error)
+                           : tl::expected<void, ErrorCode>{};
+    }
+
+    // --- Sequential path (original behavior, unchanged) ---
+    // Insert each bucket's keys into all_bucket_keys incrementally, right
+    // before processing it (same as main).  On a whole-cycle abort, buckets
+    // not yet reached are absent from all_bucket_keys, so the tail sweep NACKs
+    // them and their offloading tasks / source-replica refcounts are released
+    // immediately rather than waiting on the TTL reaper.
     for (const auto& keys : buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
-        std::unordered_map<std::string, std::vector<Slice>> batch_object;
-        std::unordered_map<std::string, std::vector<std::string>>
-            storage_keys_by_tenant;
-        for (const auto& storage_key : keys) {
-            const auto it = task_by_storage_key.find(storage_key);
-            if (it != task_by_storage_key.end()) {
-                storage_keys_by_tenant[it->second.tenant_id].push_back(
-                    storage_key);
-            }
-        }
-        for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
-            std::vector<std::string> user_keys;
-            user_keys.reserve(storage_keys.size());
-            for (const auto& storage_key : storage_keys) {
-                user_keys.push_back(task_by_storage_key.at(storage_key).key);
-            }
-            std::unordered_map<std::string, std::vector<Slice>>
-                user_batch_object;
-            [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
-                user_keys, tenant_id, user_batch_object);
-            // BatchQuerySegmentSlices is now best-effort: it always returns
-            // OK. Keys present in user_batch_object go to batch_object; the
-            // rest are reported as failed.
-            for (const auto& storage_key : storage_keys) {
-                const auto& task = task_by_storage_key.at(storage_key);
-                auto it = user_batch_object.find(task.key);
-                if (it != user_batch_object.end()) {
-                    batch_object.emplace(storage_key, std::move(it->second));
-                } else {
-                    failed_tasks.push_back(task);
-                }
-            }
-        }
-        if (batch_object.empty()) {
-            continue;
-        }
-
-        // D2H staging: replace device slices with host memory slices
-        // so that storage_backend (ConcatSlicesToString / BuildBucket /
-        // WriteBucket) always receives host pointers.
-        std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
-        std::vector<PinnedBufferPool::Buffer> staging_bufs;
-        auto runtime_accelerator =
-            device::GetAcceleratorRegistry().RuntimeAccelerators();
-
-        for (auto& [obj_key, slices] : batch_object) {
-            std::vector<Slice> host_slices;
-            bool obj_success = true;
-            for (const auto& slice : slices) {
-                device::PointerInfo info{};
-                auto* device =
-                    runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
-                if (device) {
-                    device->SetContext(info.device_id);
-                    auto buf = pinned_buffer_pool_->Acquire(slice.size);
-                    if (!device->Copy(buf.data, slice.ptr, slice.size,
-                                      device::CopyDirection::kDeviceToHost)) {
-                        LOG(ERROR) << "D2H staging failed for key: " << obj_key;
-                        pinned_buffer_pool_->Release(std::move(buf));
-                        obj_success = false;
-                        failed_tasks.push_back(task_by_storage_key.at(obj_key));
-                        break;
-                    }
-                    host_slices.emplace_back(Slice{buf.data, slice.size});
-                    staging_bufs.push_back(std::move(buf));
-                } else {
-                    host_slices.push_back(slice);
-                }
-            }
-            if (obj_success) {
-                host_batch_object[obj_key] = std::move(host_slices);
-            }
-        }
-
-        // If every object in this bucket failed D2H staging, host_batch_object
-        // is empty (those keys are already in failed_tasks). Skip BatchOffload,
-        // which rejects an empty map as INVALID_KEY and would otherwise trip
-        // the whole-cycle abort below for a bucket that has nothing left to
-        // persist. staging_bufs can still be non-empty here (an object whose
-        // first slices copied fine but a later one failed), so hand those
-        // buffers back before continuing: the release loop after BatchOffload
-        // is unreachable on this path.
-        if (host_batch_object.empty()) {
-            for (auto& buf : staging_bufs) {
-                pinned_buffer_pool_->Release(std::move(buf));
-            }
-            continue;
-        }
-
-        auto offload_start = std::chrono::steady_clock::now();
-        auto bucket_complete_handler =
-            [this, offload_start, complete_handler](
-                const std::vector<std::string>& keys,
-                std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
-            auto res = complete_handler(keys, metadatas);
-            if (res == ErrorCode::OK && ssd_metric_) {
-                auto elapsed_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - offload_start)
-                        .count();
-                int64_t total_bytes = 0;
-                for (const auto& metadata : metadatas) {
-                    total_bytes += metadata.data_size;
-                }
-                ssd_metric_->ssd_write_ops.inc(keys.size());
-                ssd_metric_->ssd_write_bytes.inc(total_bytes);
-                ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
-                ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
-                ssd_metric_->ssd_total_ops.inc(keys.size());
-                ssd_metric_->ssd_total_bytes.inc(total_bytes);
-                ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
-                ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
-            }
-            return res;
-        };
-        auto offload_res = storage_backend_->BatchOffload(
-            host_batch_object, bucket_complete_handler,
-            [this](const std::vector<std::string>& evicted_keys) {
-                return NotifyEvictedDiskReplicas(evicted_keys);
-            });
-
-        // Release staging buffers back to pool.
-        for (auto& buf : staging_bufs) {
-            pinned_buffer_pool_->Release(std::move(buf));
-        }
-        if (!offload_res) {
-            LOG(ERROR) << "Failed to store objects with error: "
-                       << offload_res.error();
-            // This bucket did not persist, so report its keys back to the
-            // master as failed regardless of whether we continue or abort.
-            // Doing it here (rather than only on the soft path) keeps their
-            // offloading tasks and source-replica refcounts from leaking until
-            // the put_start_release_timeout_sec_ TTL reaper fires.
-            for (const auto& [key, _] : host_batch_object) {
-                failed_tasks.push_back(task_by_storage_key.at(key));
-            }
-            if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
-                // Disk is over the key-count limit: stop offloading entirely.
-                MutexLocker locker(&offloading_mutex_);
-                enable_offloading_ = false;
-            }
-            if (!IsPerBucketSoftOffloadError(offload_res.error())) {
-                // Whole-cycle error (KEYS_ULTRA_LIMIT or any hard failure):
-                // stop processing further buckets, but fall through to the NACK
-                // flush below so every drained key is released. Unvisited
-                // buckets are not yet in all_bucket_keys, so the sweep NACKs
-                // them too; this bucket's keys were just pushed above.
-                abort_error = offload_res.error();
-                break;
-            }
-            // Soft per-bucket error: keep processing the remaining buckets.
+        auto result =
+            ProcessOneBucket(keys, task_by_storage_key, failed_tasks,
+                             /*failed_mutex=*/nullptr, complete_handler);
+        if (!result) {
+            abort_error = result.error();
+            break;
         }
     }
 

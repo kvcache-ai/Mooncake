@@ -7,6 +7,7 @@
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -48,6 +49,33 @@ struct FdGuard {
         return r;
     }
 };
+
+// Per-thread aligned buffer for O_DIRECT WriteBucket.  Thread-local so
+// concurrent offload workers (MC_OFFLOAD_WRITE_THREADS) never share a write
+// buffer — a shared buffer would be overwritten by one worker while another
+// is still writing from it, corrupting bucket data.  Grown on demand and
+// freed automatically on thread exit.
+struct ThreadLocalAlignedBuffer {
+    void* data = nullptr;
+    size_t capacity = 0;
+
+    ~ThreadLocalAlignedBuffer() { free(data); }
+
+    // Returns a buffer of at least @p size bytes aligned to @p alignment,
+    // reallocating the per-thread buffer when it must grow.  Returns nullptr
+    // on allocation failure.
+    void* Get(size_t size, size_t alignment) {
+        if (size > capacity) {
+            void* buf = nullptr;
+            if (posix_memalign(&buf, alignment, size) != 0) return nullptr;
+            free(data);
+            data = buf;
+            capacity = size;
+        }
+        return data;
+    }
+};
+thread_local ThreadLocalAlignedBuffer tls_write_buffer;
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
@@ -1708,23 +1736,7 @@ BucketStorageBackend::BucketStorageBackend(
     const BucketBackendConfig& bucket_backend_config_)
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
-      bucket_backend_config_(bucket_backend_config_) {
-    // Allocate aligned buffer for O_DIRECT I/O operations
-    void* buf = nullptr;
-    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
-    if (ret != 0) {
-        LOG(ERROR)
-            << "BucketStorageBackend: Failed to allocate aligned buffer: "
-            << strerror(ret);
-    } else {
-        aligned_io_buffer_.reset(buf);
-        // Update the deleter to use free
-        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
-            buf, [](void* p) { free(p); });
-        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
-                  << " bytes aligned buffer at " << buf;
-    }
-}
+      bucket_backend_config_(bucket_backend_config_) {}
 
 BucketStorageBackend::~BucketStorageBackend() {
     // Clear file cache to release UringFile instances before destruction
@@ -2593,32 +2605,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
-        // Allocate aligned buffer if needed
-        void* write_buffer = nullptr;
-        std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
-                                                           [](void*) {}};
-
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
-        } else {
-            // Allocate a temporary larger buffer
-            void* buf = nullptr;
-            int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
-            if (ret != 0) {
-                LOG(ERROR)
-                    << "Failed to allocate aligned buffer for WriteBucket: "
-                    << strerror(ret);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            temp_buffer.reset(buf);
-            temp_buffer = std::unique_ptr<void, void (*)(void*)>(
-                buf, [](void* p) { free(p); });
-            write_buffer = buf;
-            LOG(WARNING) << "WriteBucket: bucket_id=" << bucket_id
-                         << " requires " << aligned_size
-                         << " bytes, exceeds buffer size " << kAlignedBufferSize
-                         << ", using temporary allocation";
+        // Use a per-thread aligned buffer so concurrent offload workers
+        // (MC_OFFLOAD_WRITE_THREADS) never share a write buffer — a shared
+        // buffer would be overwritten by one worker while another is still
+        // writing from it, corrupting bucket data.
+        void* write_buffer =
+            tls_write_buffer.Get(aligned_size, kDirectIOAlignment);
+        if (!write_buffer) {
+            LOG(ERROR) << "Failed to allocate aligned buffer for WriteBucket";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
         // Aggregate all iovs data into the aligned buffer

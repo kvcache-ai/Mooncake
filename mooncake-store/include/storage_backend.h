@@ -1191,11 +1191,6 @@ class BucketStorageBackend : public StorageBackendInterface {
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 
-    // Aligned buffer for O_DIRECT I/O operations
-    // We use a fixed-size buffer to avoid frequent allocations
-    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 16MB
-    std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
-                                                              [](void*) {}};
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *
