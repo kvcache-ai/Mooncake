@@ -99,7 +99,8 @@ TEST_F(HeartbeatDedicatedPortTest, NonHeartbeatRpcStillServedOnMainPort) {
 // 4. With no dedicated heartbeat server configured (port=0, default), the
 // master falls back to serving Heartbeat on the main RPC server, so a client
 // without a heartbeat port succeeds.
-TEST(HeartbeatDedicatedPortDisabledTest, HeartbeatServedOnMainPortWhenDisabled) {
+TEST(HeartbeatDedicatedPortDisabledTest,
+     HeartbeatServedOnMainPortWhenDisabled) {
     InProcMaster master;
     ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start InProcMaster";
