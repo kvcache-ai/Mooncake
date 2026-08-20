@@ -809,7 +809,7 @@ def test_high_level_put_auto_creates_opaque_storage_group(payload_type) -> None:
     group_id = _storage_group_id(ref)
     handle = export_dataproto_ref(ref)
     assert group_id.startswith("structured-")
-    assert handle["version"] == 2
+    assert handle["version"] == 1
     assert handle["storage_group_id"] == group_id
     assert all(
         list(write_config.group_ids) == [group_id]
@@ -823,7 +823,7 @@ def test_high_level_put_auto_creates_opaque_storage_group(payload_type) -> None:
     assert config.replica_num == 2
 
 
-def test_high_level_put_replaces_empty_group_id_without_mutating_config() -> None:
+def test_high_level_put_preserves_explicit_ungrouped_config() -> None:
     store, transfer = make_transfer()
     config = GroupConfig([""], replica_num=2)
 
@@ -832,13 +832,32 @@ def test_high_level_put_replaces_empty_group_id_without_mutating_config() -> Non
         type="dict",
         config=config,
     )
-
-    group_id = _storage_group_id(ref)
-    assert group_id.startswith("structured-")
-    assert all(
-        list(write_config.group_ids) == [group_id]
-        for write_config in store.put_configs
+    handle = export_dataproto_ref(ref)
+    first_put_count = len(store.put_configs)
+    appended = MooncakeBundleTransfer(
+        store, key_prefix=transfer.key_prefix
+    ).append_dataproto_fields(
+        handle,
+        SimpleDataProto(batch={"values": np.arange(4) + 10}),
+        stage="value",
     )
+    result = transfer.get_dataproto(appended)
+
+    assert ref._storage_group_id is None
+    assert handle["version"] == 1
+    assert "storage_group_id" not in handle
+    assert all(
+        list(write_config.group_ids) == [""]
+        for write_config in store.put_configs
+        if write_config is not None
+    )
+    assert all(
+        seen_config is None
+        for seen_config in store.put_configs[first_put_count:]
+    )
+    assert appended._storage_group_id is None
+    assert np.array_equal(result["batch"]["input_ids"], np.arange(4))
+    assert np.array_equal(result["batch"]["values"], np.arange(4) + 10)
     assert config.group_ids == [""]
     assert config.replica_num == 2
 
@@ -2759,10 +2778,10 @@ def test_dataproto_ref_handle_roundtrip_materializes_and_cleans_up() -> None:
     legacy_handle["version"] = 1
     legacy_handle.pop("storage_group_id")
     assert import_dataproto_ref(legacy_handle)._storage_group_id is None
-    invalid_v2_handle = dict(handle)
-    invalid_v2_handle["storage_group_id"] = ""
+    invalid_handle = dict(handle)
+    invalid_handle["storage_group_id"] = ""
     with pytest.raises(ValueError, match="storage_group_id"):
-        import_dataproto_ref(invalid_v2_handle)
+        import_dataproto_ref(invalid_handle)
 
     result = transfer.get_dataproto(handle)
     assert np.array_equal(result["batch"]["input_ids"], input_ids)

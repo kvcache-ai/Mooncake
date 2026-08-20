@@ -308,7 +308,8 @@ class _DataProtoRowSelection:
 
 
 DATAPROTO_REF_HANDLE_TYPE = "mooncake_dataproto_ref"
-DATAPROTO_REF_HANDLE_VERSION = 2
+DATAPROTO_REF_HANDLE_VERSION = 1
+# Optional v1 extension; older readers ignore unknown top-level fields.
 STORAGE_GROUP_ID = "storage_group_id"
 DataProtoRefLike = MooncakeDataProtoRef | Mapping[str, Any]
 
@@ -323,7 +324,7 @@ def export_dataproto_ref(ref: MooncakeDataProtoRef) -> dict[str, Any]:
         raise TypeError(f"expected MooncakeDataProtoRef, got {type(ref).__name__}")
     handle = {
         "type": DATAPROTO_REF_HANDLE_TYPE,
-        "version": DATAPROTO_REF_HANDLE_VERSION if ref._storage_group_id is not None else 1,
+        "version": DATAPROTO_REF_HANDLE_VERSION,
         "kind": "bundle_stages",
         "batch_size": int(ref.batch_size),
         "namespace": ref.namespace,
@@ -355,7 +356,7 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
     if not is_dataproto_ref_handle(handle):
         raise ValueError("not a Mooncake DataProto ref handle")
     version = int(handle.get("version", -1))
-    if version not in (1, DATAPROTO_REF_HANDLE_VERSION):
+    if version != DATAPROTO_REF_HANDLE_VERSION:
         raise ValueError(
             f"unsupported DataProto ref handle version: {handle.get('version')!r}"
         )
@@ -398,11 +399,11 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
         field_index[name] = StructuredFieldLocation(
             stage=stage, member=member, section=section
         )
-    storage_group_id = handle.get(STORAGE_GROUP_ID) if version == 2 else None
-    if version == 2 and (
+    storage_group_id = handle.get(STORAGE_GROUP_ID)
+    if storage_group_id is not None and (
         not isinstance(storage_group_id, str) or not storage_group_id
     ):
-        raise ValueError("DataProto ref handle requires storage_group_id")
+        raise ValueError("DataProto ref handle has invalid storage_group_id")
     return MooncakeDataProtoRef(
         batch_size=int(handle["batch_size"]),
         stage_refs=stage_refs,
@@ -492,7 +493,7 @@ class MooncakeBundleTransfer:
         )
         self._structured_store = _StructuredObjectLayer(self._bundle_store)
 
-    def _new_storage_group_id(self, config: Any) -> str:
+    def _new_storage_group_id(self, config: Any) -> str | None:
         raw_group_ids = getattr(config, "group_ids", None)
         if raw_group_ids is None:
             group_id = None
@@ -517,8 +518,8 @@ class MooncakeBundleTransfer:
             raise ValueError(
                 "structured object store config.group_ids must contain strings"
             )
-        if not group_id:
-            return f"structured-{uuid.uuid4().hex}"
+        if group_id == "":
+            return None
         return group_id
 
     def put_bundle(
@@ -1670,7 +1671,11 @@ class MooncakeBundleTransfer:
                 )
         if ref is None:
             group_id = self._new_storage_group_id(config)
-            effective_config = _config_with_group_id(config, group_id)
+            effective_config = (
+                config
+                if group_id is None
+                else _config_with_group_id(config, group_id)
+            )
         else:
             group_id = ref._storage_group_id
             effective_config = (
