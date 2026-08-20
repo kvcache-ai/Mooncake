@@ -62,6 +62,11 @@ def _sink(meta, result):
     for view in views:
         value = int(view[0])
         observed.append(value if bool(torch.all(view == value)) else "mixed")
+
+    # Every sub-range holds a reference to the one shared IPC registration.
+    for view in views:
+        assert engine.unregister_memory(view.data_ptr()) == 0
+
     result.put(observed)
 
 

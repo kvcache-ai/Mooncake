@@ -697,8 +697,10 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             return -1;
         }
 
-        // Skip if this hipMalloc block is already registered
-        if (registered_base_addrs_.count((uint64_t)base_ptr)) {
+        // Count aliases so the registration outlives every sub-range but one
+        auto it = registered_base_refs_.find((uint64_t)base_ptr);
+        if (it != registered_base_refs_.end()) {
+            it->second++;
             return 0;
         }
 
@@ -721,7 +723,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 #endif
         int rc = metadata_->addLocalMemoryBuffer(desc, true);
         if (rc == 0) {
-            registered_base_addrs_.insert((uint64_t)base_ptr);
+            registered_base_refs_[(uint64_t)base_ptr] = 1;
         }
         return rc;
     }
@@ -788,8 +790,11 @@ int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
                          << "); memory may already be freed, using the "
                          << "provided address";
         }
+        // Keep the registration alive until the last sub-range releases it
         std::lock_guard<std::mutex> lock(register_mutex_);
-        registered_base_addrs_.erase((uint64_t)key_ptr);
+        auto it = registered_base_refs_.find((uint64_t)key_ptr);
+        if (it != registered_base_refs_.end() && --it->second > 0) return 0;
+        registered_base_refs_.erase((uint64_t)key_ptr);
     }
     return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata);
 }

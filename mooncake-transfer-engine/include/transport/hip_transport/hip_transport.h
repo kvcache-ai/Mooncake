@@ -9,7 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 #include <utility>
 
@@ -91,7 +91,8 @@ class HipTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
-    std::unordered_set<uint64_t> registered_base_addrs_;
+    // Sub-ranges of one hipMalloc block share a single IPC registration.
+    std::unordered_map<uint64_t, size_t> registered_base_refs_;
 
     // Stream and event pools for async operations
     StreamPool stream_pool_;
