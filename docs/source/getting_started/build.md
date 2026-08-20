@@ -31,11 +31,11 @@ sudo make install
 
 ### Build with VRAM Segment
 
-To enable VRAM Segment, install CUDA toolkit and build Mooncake with 
+To enable VRAM Segment, install CUDA toolkit and build Mooncake with
 `USE_VRAM_SEGMENT` enabled:
 
 ```bash
-sudo bash dependencies.sh 
+sudo bash dependencies.sh
 
 mkdir build
 cd build
@@ -44,7 +44,7 @@ make -j
 sudo make install
 ```
 
-If NVLink is available in your environment, you can also enable it 
+If NVLink is available in your environment, you can also enable it
 with `-DUSE_INTRA_NVLINK=ON`:
 
 ```bash
@@ -211,6 +211,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_INTRA_NVLINK=ON/OFF` | `OFF` | Enable intranode NVLink transport. |
 | `-DUSE_VRAM_SEGMENT=ON/OFF` | `OFF` | Enable create VRAM Segment instead of (default) DRAM Segment. |
 | `-DUSE_CXL=ON/OFF` | `OFF` | Enable CXL support. |
+| `-DUSE_MPCOMM=ON/OFF` | `OFF` | Enable the MPComm transport in TENT (multi-NIC memory pooling over RDMA). Requires `-DUSE_TENT=ON` and `-DMPCOMM_ROOT=<prefix>`. See [MPComm Transport](../design/transfer-engine/mpcomm_transport.md). |
 
 ### Vendor SDK Path Overrides
 
@@ -229,6 +230,7 @@ The following options can be passed to `cmake ..`.
 | `-DNEUWARE_ROOT=/path/to/neuware` | `-DUSE_MLU=ON` | Override the Neuware SDK root. `NEUWARE_HOME` is also honored; default is `/usr/local/neuware`. |
 | `-DMLU_INCLUDE_DIR=/path/to/include` | `-DUSE_MLU=ON` | Override the Neuware include directory. |
 | `-DMLU_LIB_DIR=/path/to/lib64` | `-DUSE_MLU=ON` | Override the Neuware library directory. |
+| `-DMPCOMM_ROOT=/path/to/mpcomm` | `-DUSE_MPCOMM=ON` | **Required.** MPComm install prefix; must contain `include/mpcomm.h` and `lib/libmpcomm.so`. Configuration fails if unset or if either file is missing. |
 
 ### Transport and Metadata Options
 

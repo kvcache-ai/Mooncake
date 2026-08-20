@@ -336,6 +336,17 @@ TEST(TransferEngineConfigOverrideTest, FilterNicUnsetLeavesWhitelistEmpty) {
         config.getArray<std::string>("topology/rdma_whitelist").empty());
 }
 
+TEST(TransferEngineConfigOverrideTest, CustomTopoJsonEnvLoadsPath) {
+    EnvVarGuard guard("MC_CUSTOM_TOPO_JSON",
+                      "/tmp/mooncake-nic-priority-matrix.json");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("topology/custom_json_path", ""),
+              "/tmp/mooncake-nic-priority-matrix.json");
+}
+
 TEST(TransferEngineConfigOverrideTest,
      ExplicitMetadataOverridesDriveSuccessfulHttpInitialization) {
 #ifdef _WIN32

@@ -108,7 +108,10 @@ jobs:
         run: |
           cd build
           source ~/.bashrc
-          cmake --build . --parallel 1
+          # Limit concurrency of Mooncake PG's setup.py build to avoid OOM
+          export MAX_JOBS=2
+          # Does not affect the Ninja system
+          cmake --build .
           cmake --install .
         shell: bash
 
@@ -245,6 +248,7 @@ jobs:
           mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
+            -DWITH_P2P_STORE=ON \
             -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
 
@@ -286,6 +290,9 @@ jobs:
 
       - name: Run CTest unit tests
         run: |
+          # Keep ephemeral TIME_WAIT sockets off mooncake_client's RPC port.
+          reserved_ports=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+          sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
           cd build
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
@@ -297,6 +304,31 @@ jobs:
           MOONCAKE_STORE_CLUSTER_ID: nightly_rust_cluster
           MOONCAKE_STORE_RUST_LINK_ASAN: "0"
         run: ./scripts/ci/run_store_rust_smoke.sh
+
+      - name: Check Mooncake Store Rust bindings, examples, and tests
+        env:
+          MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build
+          MOONCAKE_STORE_LIB_DIR: ${{ github.workspace }}/build/mooncake-store/src
+          MOONCAKE_STORE_INCLUDE_DIR: ${{ github.workspace }}/mooncake-store/include
+        run: |
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          cd mooncake-store/rust
+          cargo test --lib
+          cargo test --examples --tests --no-run
+          cargo clean
+
+      - name: Verify Mooncake Store Rust dlopen bindings and packaging
+        env:
+          MOONCAKE_STORE_INCLUDE_DIR: ${{ github.workspace }}/mooncake-store/include
+        run: |
+          cd mooncake-store/rust
+          cargo run --locked --example generate_dlopen_bindings
+          git diff --exit-code -- src/generated/ffi_dlopen_bindings.rs
+          cargo package --no-verify --allow-dirty
+          crate=$(ls target/package/mooncake_store-*.crate | head -1)
+          dest=$(mktemp -d)
+          tar xzf "$crate" -C "$dest"
+          (cd "$dest"/mooncake_store-* && cargo check --no-default-features --features dlopen)
 
       - name: Run Go store binding integration tests
         env:
@@ -372,6 +404,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lcov gcovr ninja-build
 
+      - name: Test HugeTLB sizing helper
+        run: python3 scripts/test_hicache_hugepage_requirements.py
+
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -410,6 +445,18 @@ jobs:
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
           DEFAULT_KV_LEASE_TTL=500 \
             ctest --parallel $(nproc) --output-on-failure
+
+      - name: Run Mooncake Store Rust sanitizer smoke test
+        env:
+          MOONCAKE_STORE_CLUSTER_ID: nightly_asan_rust_cluster
+          MOONCAKE_STORE_RUST_LINK_ASAN: "1"
+        run: ./scripts/ci/run_store_rust_smoke.sh
+
+      - name: Run Go store binding sanitizer integration tests
+        env:
+          MOONCAKE_STORE_CLUSTER_ID: nightly_asan_go_cluster
+          MOONCAKE_STORE_GO_SANITIZED: "1"
+        run: ./scripts/ci/run_store_go_integration.sh
 
       - name: Generate coverage report
         id: coverage

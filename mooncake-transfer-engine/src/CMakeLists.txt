@@ -1,4 +1,7 @@
-file(GLOB ENGINE_SOURCES "*.cpp")
+file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
+set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
+list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -10,12 +13,19 @@ if(USE_HIP)
   hipify_files(ENGINE_SOURCES)
 endif()
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
-if(BUILD_SHARED_LIBS)
-  install(TARGETS transfer_engine DESTINATION lib)
-endif()
-
-add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD CMAKE_INCLUDE)
+add_library(transfer_metadata_plugin OBJECT ${TRANSFER_METADATA_PLUGIN_SOURCES})
+set_target_properties(transfer_metadata_plugin
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(
+  transfer_metadata_plugin
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+         $<INSTALL_INTERFACE:include>)
+target_compile_definitions(transfer_metadata_plugin PRIVATE MOONCAKE_USE_ETCD
+                                                            CMAKE_INCLUDE)
+target_link_libraries(
+  transfer_metadata_plugin
+  PUBLIC glog::glog JsonCpp::JsonCpp
+  PRIVATE pthread)
 if(USE_ETCD)
   if(USE_ETCD_LEGACY)
     if(USE_STATIC_ETCD_CPP_API)
@@ -23,31 +33,40 @@ if(USE_ETCD)
       pkg_check_modules(GRPCPP REQUIRED grpc++)
       pkg_check_modules(GRPC REQUIRED grpc)
       target_link_libraries(
-        transfer_engine PUBLIC etcd-cpp-api-core protobuf ${GRPC_LDFLAGS}
-                               ${GRPCPP_LDFLAGS})
+        transfer_metadata_plugin PRIVATE etcd-cpp-api-core protobuf
+                                         ${GRPC_LDFLAGS} ${GRPCPP_LDFLAGS})
     else()
-      target_link_libraries(transfer_engine PUBLIC etcd-cpp-api)
+      target_link_libraries(transfer_metadata_plugin PRIVATE etcd-cpp-api)
     endif()
   else()
-    add_dependencies(transfer_engine build_etcd_wrapper)
+    add_dependencies(transfer_metadata_plugin build_etcd_wrapper)
     set(ETCD_WRAPPER_LIB
         ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so
     )
-    target_link_libraries(transfer_engine PRIVATE ${ETCD_WRAPPER_LIB})
+    target_link_libraries(transfer_metadata_plugin PRIVATE ${ETCD_WRAPPER_LIB})
   endif()
 endif()
 if(USE_REDIS)
-  target_link_libraries(transfer_engine PUBLIC hiredis)
+  target_link_libraries(transfer_metadata_plugin PRIVATE Mooncake::hiredis)
 endif()
 if(USE_HTTP)
   find_package(CURL REQUIRED)
-  target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
+  target_link_libraries(transfer_metadata_plugin PRIVATE ${CURL_LIBRARIES})
 endif()
+
+add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+target_include_directories(
+  transfer_engine
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+         $<INSTALL_INTERFACE:include>
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment)
+target_compile_definitions(transfer_engine PRIVATE MOONCAKE_USE_ETCD
+                                                   CMAKE_INCLUDE)
 target_link_libraries(
   transfer_engine
   PUBLIC base
-         transport
          rdma_transport
+         rdma_twosided
          mooncake_common
          ibverbs
          glog::glog
@@ -56,18 +75,25 @@ target_link_libraries(
          JsonCpp::JsonCpp
          numa
          asio_shared
-         yalantinglibs::yalantinglibs)
+         yalantinglibs::yalantinglibs
+  PRIVATE transport transfer_metadata_plugin)
+if(BUILD_SHARED_LIBS)
+  install(TARGETS transfer_engine DESTINATION lib)
+endif()
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)
 endif()
 
 if(USE_CUDA)
-  target_include_directories(transfer_engine PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_include_directories(transfer_engine
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   if(USE_CXI)
-    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart rt)
+    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+                                                 rt)
   else()
-    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart rt mlx5)
+    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+                                                 rt mlx5)
   endif()
   if(USE_NVMEOF)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
@@ -119,9 +145,9 @@ if(USE_HIP)
       # compiled in the rdma_transport OBJECT library and pulled into
       # transfer_engine via $<TARGET_OBJECTS:transport>. A PRIVATE define on
       # transfer_engine never reaches that object compilation, so the dmabuf
-      # path is silently compiled out and GPU MRs fall back to plain
-      # ibv_reg_mr (EINVAL on device memory). Put the define (and the hsa
-      # include/link usage requirements) on the target that actually compiles
+      # path is silently compiled out and GPU MRs fall back to plain ibv_reg_mr
+      # (EINVAL on device memory). Put the define (and the hsa include/link
+      # usage requirements) on the target that actually compiles
       # rdma_context.cpp.
       target_compile_definitions(rdma_transport PRIVATE USE_HIP_DMABUF)
       target_link_libraries(rdma_transport PUBLIC hsa-runtime64::hsa-runtime64)
@@ -187,5 +213,8 @@ endif()
 
 if(USE_UB)
   message(STATUS "Enabled USE_UB protocol support")
-  target_link_libraries(transfer_engine PUBLIC ub_transport)
+  target_link_libraries(
+    transfer_engine
+    PUBLIC ub_transport
+    PRIVATE ub_allocator)
 endif()

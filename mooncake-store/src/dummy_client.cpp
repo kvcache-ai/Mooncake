@@ -1297,6 +1297,51 @@ std::vector<int> DummyClient::batch_put_from_cuda_ipc(
     return results;
 }
 
+std::vector<int> DummyClient::batch_upsert_from_cuda_ipc(
+    const std::vector<mooncake::CudaIpcWriteRequest>& requests,
+    const ReplicateConfig& config) {
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_upsert_from_cuda_ipc_dummy_helper,
+                         void>(requests.size(), requests, config, client_id_);
+    auto results = expected_results_to_py<int>(internal_results);
+    const size_t successful_bytes =
+        sum_successful_cuda_ipc_sizes(results, requests);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite,
+                              "batch_upsert_from_cuda_ipc", successful_bytes,
+                              elapsed_us_since(start_time), true);
+    }
+    return results;
+}
+
+std::vector<int> DummyClient::batch_upsert_from_multi_buffers(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffer_ptrs,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const ReplicateConfig& config) {
+    std::vector<std::vector<uint64_t>> dummy_nested =
+        void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results = invoke_batch_rpc<
+        &RealClient::batch_upsert_from_multi_buffers_dummy_helper, void>(
+        keys.size(), keys, dummy_nested, all_sizes, config, device_id_,
+        client_id_);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    const size_t successful_bytes =
+        sum_successful_nested_sizes(results, all_sizes);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(
+            TransferOperationKind::kWrite, "batch_upsert_from_multi_buffers",
+            successful_bytes, elapsed_us_since(start_time), true);
+    }
+    return results;
+}
+
 std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,

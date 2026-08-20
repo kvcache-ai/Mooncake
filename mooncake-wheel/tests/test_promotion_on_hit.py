@@ -110,6 +110,17 @@ class TestPromotionOnHit(unittest.TestCase):
         cls.store = MooncakeDistributedStore()
         get_client(cls.store)
 
+    @classmethod
+    def tearDownClass(cls):
+        # Unmount this class's segment from the master. Without this, each
+        # test class's segment stays mounted for the rest of the run,
+        # inflating the master's mem_total_capacity and pushing used_ratio
+        # right onto the eviction high-watermark boundary — the promotion
+        # watermark gate then becomes timing-dependent (flaky).
+        if getattr(cls, "store", None) is not None:
+            cls.store.close()
+            cls.store = None
+
     def test_promotion_after_repeated_hits(self):
         """A LOCAL_DISK-only key must regain a MEMORY replica after
         clearing the admission threshold via repeated reads.
@@ -269,6 +280,17 @@ class TestPromotionDoesNotFire(unittest.TestCase):
         cls.store = MooncakeDistributedStore()
         get_client(cls.store)
 
+    @classmethod
+    def tearDownClass(cls):
+        # Unmount this class's segment from the master. Without this, each
+        # test class's segment stays mounted for the rest of the run,
+        # inflating the master's mem_total_capacity and pushing used_ratio
+        # right onto the eviction high-watermark boundary — the promotion
+        # watermark gate then becomes timing-dependent (flaky).
+        if getattr(cls, "store", None) is not None:
+            cls.store.close()
+            cls.store = None
+
     def test_below_watermark_workload_stays_memory_only(self):
         VALUE_SIZE = 1024  # 1 KB
         NUM_KEYS = 16  # 16 KB total, well below the 32 MB segment
@@ -345,6 +367,17 @@ class BenchPromotionLatency(unittest.TestCase):
     def setUpClass(cls):
         cls.store = MooncakeDistributedStore()
         get_client(cls.store)
+
+    @classmethod
+    def tearDownClass(cls):
+        # Unmount this class's segment from the master. Without this, each
+        # test class's segment stays mounted for the rest of the run,
+        # inflating the master's mem_total_capacity and pushing used_ratio
+        # right onto the eviction high-watermark boundary — the promotion
+        # watermark gate then becomes timing-dependent (flaky).
+        if getattr(cls, "store", None) is not None:
+            cls.store.close()
+            cls.store = None
 
     def test_latency_comparison(self):
         VALUE_SIZE = 1024 * 1024  # 1 MB

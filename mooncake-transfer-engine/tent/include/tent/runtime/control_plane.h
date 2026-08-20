@@ -19,9 +19,12 @@
 #include <netdb.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -94,6 +97,11 @@ class ControlClient {
     static Status delegate(const std::string& server_addr,
                            const Request& request);
 
+    using DelegateCallback = std::function<void(Status)>;
+    static void delegateAsync(const std::string& server_addr,
+                              const Request& request,
+                              DelegateCallback callback);
+
     static Status pinStageBuffer(const std::string& server_addr,
                                  const std::string& location, uint64_t& addr);
 
@@ -121,15 +129,11 @@ class ControlService {
 
     SegmentManager& segmentManager() { return *manager_.get(); }
 
-    void setBootstrapRdmaCallback(const OnReceiveBootstrap& callback) {
-        bootstrap_callback_ = callback;
-    }
+    void setBootstrapRdmaCallback(const OnReceiveBootstrap& callback);
 
-    void setNotifyCallback(const OnNotify& callback) {
-        notify_callback_ = callback;
-    }
+    void setNotifyCallback(const OnNotify& callback);
 
-    Status start(uint16_t& port, bool ipv6_ = false);
+    Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
 
    private:
     void onGetSegmentDesc(const std::string_view& request,
@@ -160,12 +164,27 @@ class ControlService {
     void onSegmentUpdated(const std::string_view& request,
                           std::string& response);
 
+    void finishBootstrapCallback();
+
+    void finishNotifyCallback();
+
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
 
+    std::mutex bootstrap_cb_mutex_;
+    std::condition_variable bootstrap_cb_cv_;
+    size_t bootstrap_callbacks_in_flight_ = 0;
+    std::chrono::milliseconds callback_drain_timeout_{std::chrono::seconds(5)};
     OnReceiveBootstrap bootstrap_callback_;
+    static thread_local const ControlService* active_bootstrap_service_;
+
+    std::mutex notify_cb_mutex_;
+    std::condition_variable notify_cb_cv_;
+    size_t notify_callbacks_in_flight_ = 0;
     OnNotify notify_callback_;
+    static thread_local const ControlService* active_notify_service_;
+
     TransferEngineImpl* impl_;
 };
 

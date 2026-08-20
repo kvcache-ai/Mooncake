@@ -95,7 +95,10 @@ void signalWatcher() {
     _Exit(1);
 }
 
-bool startSignalWatcherLocked(pid_t current_pid) {
+bool startSignalWatcherLocked(pid_t current_pid, sigset_t* saved_mask,
+                              bool* mask_blocked) {
+    *mask_blocked = false;
+
     if (g_signal_pipe[0] >= 0) close(g_signal_pipe[0]);
     if (g_signal_pipe[1] >= 0) close(g_signal_pipe[1]);
     g_signal_pipe[0] = -1;
@@ -107,16 +110,16 @@ bool startSignalWatcherLocked(pid_t current_pid) {
     // The watcher must never take SIGTERM/SIGINT itself: the handler writes
     // to the pipe and then pauses forever, so if it ran on the watcher
     // thread no reader would be left and cleanup would never run. Block both
-    // signals around thread creation so the watcher inherits the mask, and
-    // restore the caller's original mask on every path (it may have had its
-    // own reasons to block these signals).
+    // signals before creating the watcher so it inherits the mask; the caller
+    // restores the original mask once sigaction() has installed the handlers,
+    // so a signal arriving mid-install is not delivered while the disposition
+    // is still SIG_DFL.
     sigset_t watcher_block_set;
-    sigset_t saved_mask;
     sigemptyset(&watcher_block_set);
     sigaddset(&watcher_block_set, SIGTERM);
     sigaddset(&watcher_block_set, SIGINT);
-    const bool mask_blocked =
-        pthread_sigmask(SIG_BLOCK, &watcher_block_set, &saved_mask) == 0;
+    *mask_blocked =
+        pthread_sigmask(SIG_BLOCK, &watcher_block_set, saved_mask) == 0;
 
     bool watcher_started = false;
     try {
@@ -127,8 +130,6 @@ bool startSignalWatcherLocked(pid_t current_pid) {
                      << e.what();
     } catch (...) {
     }
-
-    if (mask_blocked) pthread_sigmask(SIG_SETMASK, &saved_mask, nullptr);
 
     if (!watcher_started) {
         close(g_signal_pipe[0]);
@@ -189,18 +190,24 @@ void installGracefulShutdownHandlers() {
         g_atexit_registered = true;
     }
 
-    if (!startSignalWatcherLocked(current_pid)) return;
+    sigset_t saved_mask;
+    bool mask_blocked = false;
+    if (startSignalWatcherLocked(current_pid, &saved_mask, &mask_blocked)) {
+        struct sigaction sa{};
+        sa.sa_handler = shutdownSignalHandler;
+        sigemptyset(&sa.sa_mask);
+        sigaddset(&sa.sa_mask, SIGTERM);
+        sigaddset(&sa.sa_mask, SIGINT);
+        sa.sa_flags = 0;
+        sigaction(SIGTERM, &sa, nullptr);
+        sigaction(SIGINT, &sa, nullptr);
 
-    struct sigaction sa{};
-    sa.sa_handler = shutdownSignalHandler;
-    sigemptyset(&sa.sa_mask);
-    sigaddset(&sa.sa_mask, SIGTERM);
-    sigaddset(&sa.sa_mask, SIGINT);
-    sa.sa_flags = 0;
-    sigaction(SIGTERM, &sa, nullptr);
-    sigaction(SIGINT, &sa, nullptr);
+        g_handlers_installed = true;
+    }
 
-    g_handlers_installed = true;
+    // Restore last: a signal that arrived mid-install stays pending until the
+    // handlers above are in place.
+    if (mask_blocked) pthread_sigmask(SIG_SETMASK, &saved_mask, nullptr);
 }
 
 }  // namespace mooncake

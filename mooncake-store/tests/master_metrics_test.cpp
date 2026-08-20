@@ -259,11 +259,24 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_TRUE(unmount_result.has_value());
     ASSERT_EQ(metrics.get_unmount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_unmount_segment_failures(), 0);
+    ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+
+    // Unmount removes the segment capacity synchronously, but invalid replica
+    // metadata and its allocation metrics are reclaimed by the background
+    // cleanup worker.
+    const auto cleanup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while ((metrics.get_key_count() != 0 ||
+            metrics.get_allocated_mem_size() != 0 ||
+            metrics.get_segment_allocated_mem_size(segment.name) != 0) &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
-    ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
-    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+
 }
 
 TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
@@ -324,7 +337,8 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     auto source_buffer = source_allocator->allocate(kAllocationSize);
     ASSERT_NE(source_buffer, nullptr);
 
-    auto snapshot = SegmentSerializer(&source_manager).Serialize();
+    auto snapshot =
+        SegmentSerializer(&source_manager).Serialize(LocalSsdPersistedState{});
     ASSERT_TRUE(snapshot.has_value());
 
     {

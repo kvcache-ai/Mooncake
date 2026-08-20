@@ -54,6 +54,8 @@ option(STORE_USE_REDIS "build mooncake store with redis" OFF)
 if (STORE_USE_REDIS)
   add_compile_definitions(STORE_USE_REDIS)
 endif()
+option(ENABLE_KV_EVENTS
+       "Build master KV events ZMQ publisher (requires libzmq when ON)" OFF)
 option(STORE_USE_K8S_LEASE "build mooncake store with K8s Lease leader election" OFF)
 if (STORE_USE_K8S_LEASE)
   if (STORE_USE_ETCD)
@@ -72,6 +74,23 @@ else()
 endif()
 
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Dependencies.cmake)
+if(WITH_STORE)
+  mooncake_provide_zstd()
+  mooncake_provide_xxhash()
+  if(ENABLE_KV_EVENTS)
+    mooncake_provide_libzmq()
+  endif()
+endif()
+if(WITH_STORE OR (WITH_TE AND USE_TENT))
+  mooncake_provide_liburing()
+endif()
+if((WITH_TE AND USE_REDIS) OR (WITH_STORE AND STORE_USE_REDIS))
+  mooncake_provide_hiredis(REQUIRED)
+elseif(WITH_TE AND USE_TENT)
+  mooncake_provide_hiredis()
+endif()
 
 # Define ASIO macros before building targets that include ASIO headers.
 add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
@@ -119,13 +138,16 @@ if (WITH_EP)
       mooncake_pg_torch_ide
       PRIVATE mooncake-pg/torch/include
               mooncake-pg/include
-              $<TARGET_PROPERTY:mooncake_ep,INCLUDE_DIRECTORIES>)
+              $<TARGET_PROPERTY:_ep,INCLUDE_DIRECTORIES>)
   else ()
-    message(STATUS "WITH_EP enabled: building Mooncake EP and PG Python extensions")
+    message(STATUS "WITH_EP enabled: building Mooncake EP natively and PG via setup.py")
     if(USE_CUDA)
       find_package(CUDAToolkit REQUIRED)
       message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
     endif()
+
+    add_subdirectory(mooncake-ep)
+    include_directories(mooncake-ep/include)
 
     # EP_TORCH_VERSIONS: semicolon-separated list of PyTorch versions to build for.
     # Can be set via -DEP_TORCH_VERSIONS="2.9.1;2.8.0" or the EP_TORCH_VERSIONS env var.
@@ -141,14 +163,17 @@ if (WITH_EP)
       set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
     endif()
     if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+      if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+        set(TORCH_CUDA_ARCH_LIST "8.0;9.0;10.3")
+      else()
+        set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+      endif()
     endif()
     set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
         "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
 
-    # Staging directory: EP/PG .so files are placed here during make and later
-    # injected into the wheel AFTER auditwheel, so patchelf never touches the
-    # CUDA fatbins (which would cause cudaErrorInvalidKernelImage at runtime).
+    # Device EP/PG .so files are placed here during make and later injected
+    # into the wheel AFTER auditwheel, so patchelf never touches CUDA fatbins.
     set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
 
     # Convert semicolon-separated lists to pipe-separated strings so they survive
@@ -156,24 +181,17 @@ if (WITH_EP)
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
 
-    add_custom_target(mooncake_ep_ext ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-      COMMAND ${CMAKE_COMMAND}
-        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep"
-        "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
-        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
-        "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
-        "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
-        "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
-        "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
-        "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
-        "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
-        "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
-      COMMENT "Building Mooncake EP Python extension(s)"
-      DEPENDS engine
-      VERBATIM
-    )
+    if(USE_CUDA)
+      add_custom_target(mooncake_ep_device_stage ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:mooncake_ep_device>"
+                "${EP_PG_STAGING_DIR}/"
+        COMMENT "Staging Mooncake EP CUDA device library"
+        DEPENDS mooncake_ep_device
+        VERBATIM
+      )
+    endif()
 
     add_custom_target(mooncake_pg_ext ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
@@ -190,7 +208,7 @@ if (WITH_EP)
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
-      DEPENDS mooncake_pg mooncake_pg_device mooncake_ep_ext
+      DEPENDS mooncake_pg mooncake_pg_device
       VERBATIM
     )
   endif ()

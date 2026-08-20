@@ -31,7 +31,11 @@
 namespace mooncake {
 
 class PutOperation;
+class DistributedStorageBackend;
 class RealClient;
+
+std::optional<size_t> GetTransportRegistrationLimit(
+    const std::string& protocol);
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -68,6 +72,10 @@ class QueryResult {
 class Client {
    public:
     virtual ~Client();
+
+    using WriteBufferStager =
+        std::function<tl::expected<std::vector<Slice>, ErrorCode>(
+            const std::vector<Slice>&)>;
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
@@ -226,6 +234,10 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+    std::vector<tl::expected<void, ErrorCode>> BatchPut(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config, const WriteBufferStager& stager);
 
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
@@ -279,6 +291,10 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config, const WriteBufferStager& stager);
 
     /**
      * @brief Removes an object and all its replicas
@@ -556,6 +572,8 @@ class Client {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+    void SetDfsStorageBackend(
+        std::shared_ptr<DistributedStorageBackend> backend);
 
     /**
      * @brief Fetch tasks assigned to a client
@@ -775,6 +793,9 @@ class Client {
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
+    ErrorCode ReadDfsReplica(const std::string& key,
+                             const Replica::Descriptor& replica_descriptor,
+                             std::vector<Slice>& slices);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -850,8 +871,11 @@ class Client {
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
+    void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
+                                            const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
+    void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -859,8 +883,13 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
-    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
-        std::vector<PutOperation>& ops);
+    std::vector<ErrorCode> WriteDfsReplicas(
+        const std::vector<std::string>& keys,
+        const std::vector<const std::vector<Slice>*>& slice_lists,
+        const std::vector<DistributedFSDescriptor>& descriptors);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
+        std::vector<PutOperation>& ops, bool is_upsert);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
@@ -918,6 +947,7 @@ class Client {
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
+    std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
@@ -973,6 +1003,11 @@ class Client {
                                        const std::string& tenant_id,
                                        const std::string& source,
                                        const std::vector<std::string>& targets);
+    tl::expected<void, ErrorCode> Copy(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& source, const std::vector<std::string>& targets,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Move an object's replica from source segment to target segment

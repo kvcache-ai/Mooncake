@@ -18,9 +18,6 @@
 #include "ylt/struct_json/json_writer.h"
 #include "ylt/struct_pack.hpp"
 
-#ifdef STORE_USE_ETCD
-#include "libetcd_wrapper.h"
-#endif
 namespace mooncake {
 
 // Constants
@@ -190,16 +187,11 @@ using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocatorBase>>>;
-// Mapping between c++ and go types
-#ifdef STORE_USE_ETCD
-using EtcdRevisionId = GoInt64;
-using ViewVersionId = EtcdRevisionId;
-using EtcdLeaseId = GoInt64;
-#else
+// Keep store-facing IDs independent from the generated Go C ABI header.
+// EtcdHelper performs the conversion to GoInt64 at the wrapper boundary.
 using EtcdRevisionId = int64_t;
-using ViewVersionId = int64_t;
+using ViewVersionId = EtcdRevisionId;
 using EtcdLeaseId = int64_t;
-#endif
 
 using UUID = std::pair<uint64_t, uint64_t>;
 
@@ -361,7 +353,8 @@ enum class ErrorCode : int32_t {
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
-        -1011,  ///< Request cannot be done in current mode.
+        -1011,              ///< Request cannot be done in current mode.
+    NOT_SUPPORTED = -1012,  ///< Operation is not supported in current mode.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.

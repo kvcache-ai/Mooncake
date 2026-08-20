@@ -24,10 +24,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <numeric>
+#include <map>
 #include <unistd.h>
 
-#include "ascend_allocator.h"
 #include "common.h"
 #include "config.h"
 #include "transfer_metadata.h"
@@ -43,6 +42,48 @@ void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
     for (auto* slice : slice_list) {
         slice->markFailed();
     }
+}
+
+std::string EngineNameForDestAddr(
+    const std::vector<TransferMetadata::BufferDesc>& buffers,
+    const std::vector<std::string>& endpoints, uint64_t dest_addr) {
+    for (const auto& buf : buffers) {
+        if (dest_addr < buf.addr || dest_addr - buf.addr >= buf.length) {
+            continue;
+        }
+        if (buf.device_id < 0) {
+            LOG(WARNING) << "Dest buffer at " << dest_addr
+                         << " has device_id=" << buf.device_id
+                         << ", falling back to " << endpoints.front();
+            return endpoints.front();
+        }
+        const auto idx = static_cast<size_t>(buf.device_id);
+        if (idx < endpoints.size()) {
+            return endpoints[idx];
+        }
+        LOG(WARNING) << "Dest buffer device_id=" << buf.device_id
+                     << " >= endpoint count " << endpoints.size()
+                     << ", falling back to " << endpoints.front();
+        return endpoints.front();
+    }
+    LOG(WARNING) << "Dest addr " << dest_addr
+                 << " matches no buffer, falling back to " << endpoints.front();
+    return endpoints.front();
+}
+
+int CurrentEngineIndex(size_t engine_count, size_t& engine_idx) {
+    if (engine_count == 1) {
+        engine_idx = 0;
+        return 0;
+    }
+    int32_t current_device_id = 0;
+    CHECK_ACL(aclrtGetDevice(&current_device_id));
+    engine_idx = static_cast<size_t>(current_device_id);
+    if (engine_idx >= engine_count) {
+        LOG(ERROR) << "Invalid device id:" << current_device_id;
+        return -1;
+    }
+    return 0;
 }
 }  // namespace
 
@@ -427,8 +468,7 @@ void TransferExecutorBase::rollbackRegisteredMem(
 
 int TransferExecutorBase::registerMem(void* addr, size_t length,
                                       adxl::MemType mem_type,
-                                      bool use_buffer_pool, bool roce_mode,
-                                      bool agent_mode) {
+                                      bool use_buffer_pool) {
     if (mem_type == adxl::MEM_HOST && use_buffer_pool) {
         LOG(INFO) << "Ignore register host mem:" << addr
                   << " when buffer pool is enabled.";
@@ -449,21 +489,11 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
                [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
 
     std::vector<size_t> engine_indices;
-    bool register_to_all =
-        (roce_mode && agent_mode && ascend_is_store_memory(addr, length));
-    if (register_to_all || adxl_engines_.size() == 1U) {
-        engine_indices.resize(adxl_engines_.size());
-        std::iota(engine_indices.begin(), engine_indices.end(), 0);
-    } else {
-        int32_t current_device_id = 0;
-        CHECK_ACL(aclrtGetDevice(&current_device_id));
-        size_t engine_idx = static_cast<size_t>(current_device_id);
-        if (engine_idx >= adxl_engines_.size()) {
-            LOG(ERROR) << "Invalid device id:" << current_device_id;
-            return -1;
-        }
-        engine_indices = {engine_idx};
+    size_t engine_idx = 0;
+    if (CurrentEngineIndex(adxl_engines_.size(), engine_idx) != 0) {
+        return -1;
     }
+    engine_indices = {engine_idx};
 
     adxl::MemDesc mem_desc{};
     mem_desc.addr = reinterpret_cast<uintptr_t>(addr);
@@ -554,79 +584,38 @@ int TransferExecutorBase::deregisterMem(void* addr) {
 
 std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
-    size_t engine_idx) const {
+    uint64_t dest_addr) const {
     const auto& endpoints = segment_desc->rank_info.endpoints;
     if (endpoints.empty()) return {};
-
-    // Standard dummy-real RoCE: same-index pairing (unchanged)
-    if (params_.agent_mode && params_.roce_mode) {
-        if (engine_idx >= endpoints.size()) return {};
-        return endpoints[engine_idx];
-    }
-
-    // Standalone mode: non-dummy-real thin client without fabric mem.
-    // RoCE/HCCS all use phy_dev mapping; same-host offset +1 avoids
-    // connecting to the same physical device across processes.
-    if (!params_.agent_mode && !params_.use_fabric_mem) {
-        aclrtContext saved_ctx = nullptr;
-        if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-            LOG(ERROR) << "aclrtGetCurrentContext failed in standalone resolve";
-            return endpoints.front();
-        }
-        MAKE_GUARD(ctx_restore,
-                   [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
-
-        int32_t logic_dev = 0;
-        if (engine_idx < local_engine_contexts_.size() &&
-            local_engine_contexts_[engine_idx] != nullptr) {
-            if (aclrtSetCurrentContext(local_engine_contexts_[engine_idx]) !=
-                ACL_ERROR_NONE) {
-                LOG(ERROR) << "aclrtSetCurrentContext failed in standalone "
-                              "resolve, engine_idx="
-                           << engine_idx;
-                return endpoints.front();
-            }
-        }
-        if (aclrtGetDevice(&logic_dev) != ACL_ERROR_NONE) {
-            LOG(ERROR) << "aclrtGetDevice failed in standalone resolve";
-            return endpoints.front();
-        }
-        if (logic_dev < 0) {
-            LOG(ERROR) << "Invalid logic device ID: " << logic_dev;
-            return endpoints.front();
-        }
-
-        int32_t phy_dev = logic_dev;
-        auto acl_ret = aclrtGetPhyDevIdByLogicDevId(logic_dev, &phy_dev);
-        if (acl_ret != ACL_ERROR_NONE) {
-            LOG(WARNING)
-                << "aclrtGetPhyDevIdByLogicDevId failed, using logic dev id";
-        }
-        if (phy_dev < 0) {
-            LOG(ERROR) << "Invalid physical device ID: " << phy_dev;
-            return endpoints.front();
-        }
-        size_t base_idx = static_cast<size_t>(phy_dev);
-
-        auto local_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-        const auto& remote_host_ip = segment_desc->rank_info.hostIp;
-        if (local_desc && !local_desc->rank_info.hostIp.empty() &&
-            !remote_host_ip.empty() &&
-            local_desc->rank_info.hostIp == remote_host_ip &&
-            endpoints.size() > 1) {
-            base_idx = (base_idx + 1) % endpoints.size();
-            VLOG(1) << "Standalone same-host offset: phy_dev=" << phy_dev
-                    << " -> target_idx=" << base_idx;
-        }
-        if (base_idx >= endpoints.size()) return endpoints.front();
-        return endpoints[base_idx];
-    }
-
-    // Default: dummy-real non-RoCE or fabric-mem standalone
-    return endpoints.front();
+    return EngineNameForDestAddr(segment_desc->buffers, endpoints, dest_addr);
 }
 
 void TransferExecutorBase::processSliceList(
+    const std::vector<Transport::Slice*>& slice_list) {
+    if (slice_list.empty()) {
+        return;
+    }
+    auto target_segment_desc =
+        metadata_->getSegmentDescByID(slice_list[0]->target_id);
+    if (!target_segment_desc) {
+        LOG(ERROR) << "Cannot find segment descriptor for target_id: "
+                   << slice_list[0]->target_id;
+        markSlicesFailed(slice_list);
+        return;
+    }
+
+    std::map<std::string, std::vector<Transport::Slice*>> groups;
+    for (auto* slice : slice_list) {
+        groups[resolveTargetAdxlEngineName(target_segment_desc,
+                                           slice->ascend_direct.dest_addr)]
+            .push_back(slice);
+    }
+    for (auto& [_, group] : groups) {
+        processHomogeneousSliceList(group);
+    }
+}
+
+void TransferExecutorBase::processHomogeneousSliceList(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {
         return;
@@ -667,8 +656,8 @@ void TransferExecutorBase::processSliceList(
             markSlicesFailed(slice_list);
             return;
         }
-        target_adxl_engine_name =
-            resolveTargetAdxlEngineName(target_segment_desc, local_engine_idx);
+        target_adxl_engine_name = resolveTargetAdxlEngineName(
+            target_segment_desc, slice_list[0]->ascend_direct.dest_addr);
         if (target_adxl_engine_name.empty()) {
             LOG(ERROR) << "Invalid local_engine_idx: " << local_engine_idx
                        << " target endpoint size:"

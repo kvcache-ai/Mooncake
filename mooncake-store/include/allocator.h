@@ -21,11 +21,12 @@ namespace mooncake {
  * @brief Type of buffer allocator used in the system
  */
 enum class ReplicaType {
-    MEMORY,      // Memory replica
-    DISK,        // Disk replica
-    LOCAL_DISK,  // Local disk replica
-    NOF_SSD,     // Nvme-oF SSD replica
-    ALL,         // All memory and NoF replicas in put finalize path
+    MEMORY = 0,      // Memory replica
+    DISK = 1,        // Disk replica
+    LOCAL_DISK = 2,  // Local disk replica
+    NOF_SSD = 3,     // Nvme-oF SSD replica
+    ALL = 4,         // All synchronous replicas in put finalize path
+    DFS = 100,       // Distributed filesystem page-offset replica
 };
 
 // Constant for unknown free space in allocators that don't track it precisely
@@ -331,17 +332,7 @@ class OffsetBufferAllocator
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
 
-    // Keeps address gaps occupied after descriptor-based reconstruction.
-    std::vector<std::unique_ptr<AllocatedBuffer>> restored_gap_buffers_;
-
     friend class Serializer<OffsetBufferAllocator>;
-    friend struct RestoredOffsetBufferAllocator;
-    friend std::optional<struct RestoredOffsetBufferAllocator>
-    RestoreOffsetBufferAllocator(
-        std::string segment_name, size_t base, size_t size,
-        std::string transport_endpoint,
-        const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-        ReplicaType replica_type);
 };
 
 struct RestoredOffsetBufferAllocator {
