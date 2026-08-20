@@ -88,6 +88,11 @@ class CoroRpcAgent {
     Status call(const std::string &server_addr, int func_id,
                 const std::string_view &request, std::string &response);
 
+    // Same as call(), but moves the request into the coroutine instead of
+    // copying it, for large payloads.
+    Status callOwned(const std::string &server_addr, int func_id,
+                     std::string request, std::string &response);
+
     using AsyncCallback = std::function<void(Status, std::string)>;
     void callAsync(const std::string &server_addr, int func_id,
                    const std::string &request, AsyncCallback callback);
