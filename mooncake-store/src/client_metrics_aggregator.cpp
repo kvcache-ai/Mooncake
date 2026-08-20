@@ -1,8 +1,11 @@
 #include "client_metrics_aggregator.h"
 
+#include <glog/logging.h>
+
 #include <iomanip>
 #include <sstream>
 
+#include "p2p_client_metric.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -66,9 +69,23 @@ ClientMetricsAggregator::ClientMetricsAggregator()
           "Cluster-wide remote read retries (route-based remote flow)"),
       remote_write_retries_(
           "master_cluster_remote_write_retries",
-          "Cluster-wide remote write retries (route-based remote flow)") {
+          "Cluster-wide remote write retries (route-based remote flow)"),
+      key_live_count_(
+          "master_cluster_key_retention_live_count",
+          "Cluster-wide number of keys currently retained on clients"),
+      key_removed_count_(
+          "master_cluster_key_retention_removed_total",
+          "Cluster-wide cumulative number of keys removed from clients "
+          "(deleted, evicted or cleared)") {
     remote_read_retries_.inc(0);
     remote_write_retries_.inc(0);
+    // Mark retention gauges changed once so zero values are serialized.
+    key_live_count_.inc(0);
+    key_removed_count_.inc(0);
+    key_live_age_buckets_.assign(
+        KeyRetentionMetric::LifetimeBuckets().size() + 1, 0);
+    key_removed_age_buckets_.assign(
+        KeyRetentionMetric::LifetimeBuckets().size() + 1, 0);
 }
 
 void ClientMetricsAggregator::Update(const UUID& client_id,
@@ -89,6 +106,7 @@ void ClientMetricsAggregator::Update(const UUID& client_id,
                    old_v.remote_request.write_retries,
                remote_write_retries_);
     client_snapshots_[client_id] = snapshot;
+    RefreshRetentionAggregates();
 }
 
 void ClientMetricsAggregator::ApplyDataMetricDelta(
@@ -124,6 +142,47 @@ void ClientMetricsAggregator::OnClientRemoved(const UUID& client_id) {
     ApplyDelta(-snap.remote_request.read_retries, remote_read_retries_);
     ApplyDelta(-snap.remote_request.write_retries, remote_write_retries_);
     client_snapshots_.erase(it);
+    RefreshRetentionAggregates();
+}
+
+void ClientMetricsAggregator::RefreshRetentionAggregates() {
+    const size_t num_buckets = KeyRetentionMetric::LifetimeBuckets().size() + 1;
+
+    int64_t live_sum = 0;
+    int64_t removed_sum = 0;
+    key_live_age_buckets_.assign(num_buckets, 0);
+    key_removed_age_buckets_.assign(num_buckets, 0);
+
+    auto accumulate = [&](std::vector<int64_t>& dst,
+                          const std::vector<int64_t>& src,
+                          const UUID& client_id, const char* what) {
+        if (src.empty()) {
+            return;  // client does not report retention data
+        }
+        if (src.size() != num_buckets) {
+            LOG(ERROR) << "ClientMetricsAggregator: key retention " << what
+                       << " bucket count mismatch, client_id=" << client_id
+                       << ", expected=" << num_buckets << ", got=" << src.size()
+                       << "; treated as zero contribution";
+            return;
+        }
+        for (size_t i = 0; i < num_buckets; ++i) {
+            dst[i] += src[i];
+        }
+    };
+
+    for (const auto& [client_id, snap] : client_snapshots_) {
+        const KeyRetentionSnapshot& r = snap.key_retention;
+        live_sum += r.live_count;
+        removed_sum += r.removed_total;
+        accumulate(key_live_age_buckets_, r.live_age_buckets, client_id,
+                   "live_age");
+        accumulate(key_removed_age_buckets_, r.removed_buckets, client_id,
+                   "removed");
+    }
+
+    key_live_count_.update(live_sum);
+    key_removed_count_.update(removed_sum);
 }
 
 void ClientMetricsAggregator::ApplyDelta(int64_t delta,
@@ -173,6 +232,33 @@ void ClientMetricsAggregator::Serialize(std::string& out) {
 
     serialize_metric(remote_read_retries_);
     serialize_metric(remote_write_retries_);
+
+    serialize_metric(key_live_count_);
+    serialize_metric(key_removed_count_);
+    // Merged retention distributions, rendered as scrape-time histograms
+    // (quantiles via histogram_quantile() at query time).
+    KeyRetentionMetric::SerializeBucketHistogram(
+        out, "master_cluster_key_retention_live_age_seconds",
+        "Cluster-wide current age distribution of live keys on clients "
+        "(seconds; approximate, merged from per-client birth cohorts; sum "
+        "estimated from bucket midpoints)",
+        {}, KeyRetentionMetric::LifetimeBuckets(), key_live_age_buckets_);
+    KeyRetentionMetric::SerializeBucketHistogram(
+        out, "master_cluster_key_retention_removed_age_seconds",
+        "Cluster-wide lifetime distribution of removed keys on clients "
+        "(seconds; sum estimated from bucket midpoints)",
+        {}, KeyRetentionMetric::LifetimeBuckets(), key_removed_age_buckets_);
+    std::vector<int64_t> all_buckets(key_live_age_buckets_.size(), 0);
+    for (size_t i = 0;
+         i < all_buckets.size() && i < key_removed_age_buckets_.size(); ++i) {
+        all_buckets[i] = key_live_age_buckets_[i] + key_removed_age_buckets_[i];
+    }
+    KeyRetentionMetric::SerializeBucketHistogram(
+        out, "master_cluster_key_retention_all_lifetime_seconds",
+        "Cluster-wide lifetime distribution of all keys seen by clients "
+        "(seconds): live keys censored at current age + removed keys' "
+        "exact lifetime; sum estimated from bucket midpoints)",
+        {}, KeyRetentionMetric::LifetimeBuckets(), all_buckets);
 }
 
 std::string ClientMetricsAggregator::Summary() {
@@ -215,6 +301,28 @@ std::string ClientMetricsAggregator::Summary() {
     append_put("Put(remote)", remote_);
     ss << " | Retries: read=" << remote_read_retries_.value()
        << ", write=" << remote_write_retries_.value();
+
+    const std::vector<double> kQuantiles = {0.30, 0.50, 0.80, 0.95};
+    const std::vector<double>& lifetime_buckets =
+        KeyRetentionMetric::LifetimeBuckets();
+    std::vector<int64_t> all_buckets(key_live_age_buckets_.size(), 0);
+    for (size_t i = 0;
+         i < all_buckets.size() && i < key_removed_age_buckets_.size(); ++i) {
+        all_buckets[i] = key_live_age_buckets_[i] + key_removed_age_buckets_[i];
+    }
+    const std::vector<int64_t> live_q =
+        KeyRetentionMetric::InterpolateQuantiles(
+            lifetime_buckets, key_live_age_buckets_, kQuantiles);
+    const std::vector<int64_t> removed_q =
+        KeyRetentionMetric::InterpolateQuantiles(
+            lifetime_buckets, key_removed_age_buckets_, kQuantiles);
+    const std::vector<int64_t> all_q = KeyRetentionMetric::InterpolateQuantiles(
+        lifetime_buckets, all_buckets, kQuantiles);
+    ss << " | Retention: live=" << key_live_count_.value()
+       << ", removed=" << key_removed_count_.value()
+       << ", live_age p50=" << live_q[1] << "s, p95=" << live_q[3]
+       << "s, removed_age p50=" << removed_q[1] << "s, p95=" << removed_q[3]
+       << "s, all_lifetime p50=" << all_q[1] << "s, p95=" << all_q[3] << "s";
     return ss.str();
 }
 

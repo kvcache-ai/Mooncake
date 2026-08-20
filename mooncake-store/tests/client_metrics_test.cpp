@@ -6,7 +6,10 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <ylt/struct_pack.hpp>
 
 #include "client_metric.h"
 #include "p2p_client_metric.h"
@@ -883,6 +886,294 @@ TEST_F(ClientMetricsTest, TierMetricMovementCountersTest) {
     metric.serialize(serialized);
     EXPECT_TRUE(serialized.find("mooncake_p2p_tier_evicted_keys_total") !=
                 std::string::npos);
+}
+
+// ============================================================================
+// KeyRetentionMetric::InterpolateQuantiles
+// ============================================================================
+
+namespace {
+
+// Alias to keep the golden-value assertions readable.
+int64_t Quantile(const std::vector<double>& boundaries,
+                 const std::vector<int64_t>& bucket_counts, double q) {
+    return KeyRetentionMetric::InterpolateQuantiles(boundaries, bucket_counts,
+                                                    {q})[0];
+}
+
+}  // namespace
+
+TEST(InterpolateQuantilesTest, EmptyDistributionReturnsZero) {
+    const std::vector<double> boundaries = {10, 20};
+    EXPECT_EQ(Quantile(boundaries, {0, 0, 0}, 0.5), 0);
+    EXPECT_EQ(Quantile(boundaries, {}, 0.5), 0);
+}
+
+TEST(InterpolateQuantilesTest, SingleBucketInterpolates) {
+    const std::vector<double> boundaries = {10, 20};
+    const std::vector<int64_t> buckets = {0, 4, 0};  // 4 values in (10, 20]
+    EXPECT_EQ(Quantile(boundaries, buckets, 0.5), 15);
+    EXPECT_EQ(Quantile(boundaries, buckets, 0.25), 12);  // 12.5 -> 12
+}
+
+TEST(InterpolateQuantilesTest, PlusInfBucketClampsToLargestBoundary) {
+    const std::vector<double> boundaries = {10};
+    const std::vector<int64_t> buckets = {0, 5};  // 5 values above 10
+    EXPECT_EQ(Quantile(boundaries, buckets, 0.5), 10);
+    EXPECT_EQ(Quantile(boundaries, buckets, 0.95), 10);
+}
+
+TEST(InterpolateQuantilesTest, SkewedDistributionQuantiles) {
+    const std::vector<double> boundaries = {10, 50, 100};
+    // 4 values in (0, 10], 1 value in (50, 100].
+    const std::vector<int64_t> buckets = {4, 0, 1};
+    EXPECT_EQ(Quantile(boundaries, buckets, 0.5), 6);
+    EXPECT_EQ(Quantile(boundaries, buckets, 0.95), 87);
+}
+
+TEST(InterpolateQuantilesTest, ResolvesAllRequestedQuantilesInOrder) {
+    const std::vector<double> boundaries = {10, 50, 100};
+    const std::vector<int64_t> buckets = {4, 0, 1};
+    const std::vector<int64_t> result =
+        KeyRetentionMetric::InterpolateQuantiles(boundaries, buckets,
+                                                 {0.30, 0.50, 0.80, 0.95});
+    EXPECT_EQ(result, (std::vector<int64_t>{3, 6, 10, 87}));
+}
+
+TEST(InterpolateQuantilesTest, RejectsUnsortedOrOutOfRangeQuantiles) {
+    const std::vector<double> boundaries = {10, 20};
+    const std::vector<int64_t> buckets = {1, 2, 3};
+    EXPECT_EQ(KeyRetentionMetric::InterpolateQuantiles(boundaries, buckets,
+                                                       {0.80, 0.50}),
+              (std::vector<int64_t>{0, 0}));
+    EXPECT_EQ(KeyRetentionMetric::InterpolateQuantiles(boundaries, buckets,
+                                                       {0.0, 0.50}),
+              (std::vector<int64_t>{0, 0}));
+    EXPECT_TRUE(
+        KeyRetentionMetric::InterpolateQuantiles(boundaries, buckets, {})
+            .empty());
+}
+
+// ============================================================================
+// KeyRetentionMetric
+// ============================================================================
+
+namespace {
+
+int64_t SumBuckets(const std::vector<int64_t>& buckets) {
+    int64_t sum = 0;
+    for (const int64_t count : buckets) {
+        sum += count;
+    }
+    return sum;
+}
+
+size_t NumRetentionBuckets() {
+    return KeyRetentionMetric::LifetimeBuckets().size() + 1;
+}
+
+}  // namespace
+
+TEST_F(ClientMetricsTest, KeyRetentionCountsAndSnapshot) {
+    using Clock = std::chrono::steady_clock;
+    const auto anchor = Clock::now() - std::chrono::seconds(1000);
+    KeyRetentionMetric metric("test_retention", {}, anchor);
+
+    EXPECT_EQ(metric.Snapshot().live_count, 0);
+
+    metric.OnKeyCreated(Clock::now() - std::chrono::seconds(500));
+    metric.OnKeyCreated(Clock::now() - std::chrono::seconds(3));
+
+    auto snap = metric.Snapshot();
+    EXPECT_EQ(snap.live_count, 2);
+    EXPECT_EQ(snap.removed_total, 0);
+    ASSERT_EQ(snap.live_age_buckets.size(), NumRetentionBuckets());
+    ASSERT_EQ(snap.removed_buckets.size(), NumRetentionBuckets());
+    EXPECT_EQ(SumBuckets(snap.live_age_buckets), 2);
+
+    // Removal with lifetime ~500s lands in the (300, 600] bucket.
+    metric.OnKeyRemoved(Clock::now() - std::chrono::seconds(500));
+    snap = metric.Snapshot();
+    EXPECT_EQ(snap.live_count, 1);
+    EXPECT_EQ(snap.removed_total, 1);
+    EXPECT_EQ(SumBuckets(snap.removed_buckets), 1);
+    EXPECT_EQ(snap.removed_buckets[7], 1);  // bucket le=600
+    EXPECT_EQ(SumBuckets(snap.live_age_buckets), 1);
+}
+
+TEST_F(ClientMetricsTest, KeyRetentionRemovalRecordsLifetime) {
+    using Clock = std::chrono::steady_clock;
+    const auto anchor = Clock::now() - std::chrono::seconds(1000);
+    KeyRetentionMetric metric("test_retention", {}, anchor);
+
+    metric.OnKeyCreated(Clock::now() - std::chrono::seconds(120));
+    metric.OnKeyRemoved(Clock::now() - std::chrono::seconds(120));
+    auto snap = metric.Snapshot();
+    EXPECT_EQ(snap.live_count, 0);
+    EXPECT_EQ(snap.removed_total, 1);
+    // Removal records the exact lifetime: ~120s lands in the (60, 300]
+    // bucket.
+    EXPECT_EQ(SumBuckets(snap.removed_buckets), 1);
+    EXPECT_EQ(snap.removed_buckets[6], 1);
+    EXPECT_EQ(SumBuckets(snap.live_age_buckets), 0);
+}
+
+TEST_F(ClientMetricsTest, KeyRetentionClampsNegativeLifetime) {
+    using Clock = std::chrono::steady_clock;
+    KeyRetentionMetric metric("test_retention", {});
+    const auto future_birth = Clock::now() + std::chrono::seconds(100);
+    metric.OnKeyCreated(future_birth);
+    metric.OnKeyRemoved(future_birth);
+    auto snap = metric.Snapshot();
+    EXPECT_EQ(snap.removed_total, 1);
+    // Lifetime clamped to 0 -> first bucket (le=1).
+    EXPECT_EQ(snap.removed_buckets[0], 1);
+}
+
+TEST_F(ClientMetricsTest, KeyRetentionConcurrentHooksStayConsistent) {
+    using Clock = std::chrono::steady_clock;
+    KeyRetentionMetric metric("test_retention", {});
+
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 250;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&metric]() {
+            for (int i = 0; i < kPerThread; ++i) {
+                const auto birth = Clock::now();
+                metric.OnKeyCreated(birth);
+                metric.OnKeyRemoved(birth);
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    auto snap = metric.Snapshot();
+    EXPECT_EQ(snap.live_count, 0);
+    EXPECT_EQ(snap.removed_total, kThreads * kPerThread);
+    EXPECT_EQ(SumBuckets(snap.live_age_buckets), 0);
+    EXPECT_EQ(SumBuckets(snap.removed_buckets), kThreads * kPerThread);
+}
+
+TEST_F(ClientMetricsTest, KeyRetentionSerializeAndSummary) {
+    using Clock = std::chrono::steady_clock;
+    const auto anchor = Clock::now() - std::chrono::seconds(1000);
+    KeyRetentionMetric metric("test_retention", {}, anchor);
+    // One key stays alive so the live-age histogram is non-empty.
+    metric.OnKeyCreated(Clock::now() - std::chrono::seconds(500));
+    metric.OnKeyCreated(Clock::now() - std::chrono::seconds(500));
+    metric.OnKeyRemoved(Clock::now() - std::chrono::seconds(500));
+
+    std::string serialized;
+    metric.serialize(serialized);
+    EXPECT_TRUE(serialized.find("test_retention_live_count 1") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("test_retention_removed_total 1") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("test_retention_removed_age_seconds_bucket") !=
+                std::string::npos);
+    // Live age is exposed as a scrape-time histogram instead of quantile
+    // gauges.
+    EXPECT_TRUE(serialized.find("# TYPE test_retention_live_age_seconds "
+                                "histogram") != std::string::npos);
+    EXPECT_TRUE(serialized.find("test_retention_live_age_seconds_bucket") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("test_retention_live_age_seconds_count 1") !=
+                std::string::npos);
+    // all_lifetime mirrors the summary report: live + removed as one
+    // histogram (here 1 live + 1 removed = 2 samples).
+    EXPECT_TRUE(serialized.find("test_retention_all_lifetime_seconds_bucket") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("test_retention_all_lifetime_seconds_count "
+                                "2") != std::string::npos);
+    // The quantile gauges are gone; quantiles are derived at query time.
+    EXPECT_TRUE(serialized.find("_p30_seconds") == std::string::npos);
+    EXPECT_TRUE(serialized.find("_p50_seconds") == std::string::npos);
+    EXPECT_TRUE(serialized.find("_p80_seconds") == std::string::npos);
+    EXPECT_TRUE(serialized.find("_p95_seconds") == std::string::npos);
+
+    const std::string summary = metric.summary_metrics();
+    EXPECT_TRUE(summary.find("live=1, removed=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("live_age: p30=") != std::string::npos);
+    EXPECT_TRUE(summary.find("removed_age: p95=") != std::string::npos);
+    EXPECT_TRUE(summary.find("all_lifetime: p95=") != std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, SerializeBucketHistogramFormat) {
+    const std::vector<double> boundaries = {1, 10};
+    // Non-cumulative counts: 2 in (0,1], 0 in (1,10], 3 in (10,+Inf).
+    std::string out;
+    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "help text", {},
+                                                 boundaries, {2, 0, 3});
+    EXPECT_TRUE(out.find("# HELP m help text") != std::string::npos);
+    EXPECT_TRUE(out.find("# TYPE m histogram") != std::string::npos);
+    // Exposition is cumulative: 2, 2, 5.
+    EXPECT_TRUE(out.find("m_bucket{le=\"1.000000\"} 2") != std::string::npos);
+    EXPECT_TRUE(out.find("m_bucket{le=\"10.000000\"} 2") != std::string::npos);
+    EXPECT_TRUE(out.find("m_bucket{le=\"+Inf\"} 5") != std::string::npos);
+    EXPECT_TRUE(out.find("m_count 5") != std::string::npos);
+    // _sum estimate: 2 * 0.5 + 0 * 5.5 + 3 * 10 (midpoints; +Inf resolves
+    // to the largest finite boundary).
+    EXPECT_TRUE(out.find("m_sum 31.000000") != std::string::npos);
+
+    // Labels are rendered on every sample.
+    out.clear();
+    KeyRetentionMetric::SerializeBucketHistogram(
+        out, "m", "h", {{"client", "c1"}}, boundaries, {2, 0, 3});
+    EXPECT_TRUE(out.find("m_bucket{client=\"c1\",le=\"1.000000\"} 2") !=
+                std::string::npos);
+    EXPECT_TRUE(out.find("m_sum{client=\"c1\"} ") != std::string::npos);
+    EXPECT_TRUE(out.find("m_count{client=\"c1\"} 5") != std::string::npos);
+
+    // Empty distribution emits nothing (consistent with ylt histograms).
+    out.clear();
+    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "h", {}, boundaries,
+                                                 {0, 0, 0});
+    EXPECT_TRUE(out.empty());
+
+    // Malformed bucket arrays are rejected with an error log, no output.
+    out.clear();
+    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "h", {}, boundaries,
+                                                 {1, 2});
+    EXPECT_TRUE(out.empty());
+}
+
+TEST_F(ClientMetricsTest, BuildSyncSnapshotIncludesKeyRetention) {
+    P2PClientMetric metrics;
+    metrics.key_retention->OnKeyCreated(std::chrono::steady_clock::now());
+
+    const auto snap = metrics.BuildSyncSnapshot();
+    EXPECT_EQ(snap.key_retention.live_count, 1);
+    EXPECT_EQ(snap.key_retention.removed_total, 0);
+    EXPECT_EQ(snap.key_retention.live_age_buckets.size(),
+              NumRetentionBuckets());
+
+    const std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("=== P2P Key Retention ===") != std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, ClientMetricSnapshotStructPackRoundTrip) {
+    ClientMetricSnapshot snap;
+    snap.total_request.get_requests = 3;
+    snap.key_retention.live_count = 7;
+    snap.key_retention.removed_total = 2;
+    snap.key_retention.live_age_buckets.assign(NumRetentionBuckets(), 0);
+    snap.key_retention.live_age_buckets[4] = 7;
+    snap.key_retention.removed_buckets.assign(NumRetentionBuckets(), 1);
+
+    auto buffer = struct_pack::serialize(snap);
+    auto res = struct_pack::deserialize<ClientMetricSnapshot>(buffer);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res.value().total_request.get_requests, 3);
+    EXPECT_EQ(res.value().key_retention.live_count, 7);
+    EXPECT_EQ(res.value().key_retention.removed_total, 2);
+    ASSERT_EQ(res.value().key_retention.live_age_buckets.size(),
+              NumRetentionBuckets());
+    EXPECT_EQ(res.value().key_retention.live_age_buckets[4], 7);
+    EXPECT_EQ(res.value().key_retention.removed_buckets[0], 1);
 }
 
 }  // namespace mooncake::test

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,9 +20,10 @@
 
 namespace mooncake {
 
-class TieredBackend;     // Forward declaration
-class IClientScheduler;  // Forward declaration
-struct TierMetric;       // Optional per-tier metrics sink (p2p_client_metric.h)
+class TieredBackend;        // Forward declaration
+class IClientScheduler;     // Forward declaration
+struct TierMetric;          // p2p_client_metric.h
+struct KeyRetentionMetric;  // p2p_client_metric.h
 
 /**
  * @struct TieredLocation
@@ -148,7 +150,8 @@ class TieredBackend {
         AddReplicaCallback add_replica_callback,
         RemoveReplicaCallback remove_replica_callback,
         SegmentSyncCallback segment_sync_callback,
-        std::shared_ptr<TierMetric> tier_metric = nullptr);
+        std::shared_ptr<TierMetric> tier_metric = nullptr,
+        std::shared_ptr<KeyRetentionMetric> retention_metric = nullptr);
 
     // --- Client-Centric Operations ---
     // All the following operations are designed for Client-Centric, Client
@@ -339,6 +342,7 @@ class TieredBackend {
         std::vector<std::pair<UUID, AllocationHandle>>
             replicas;          // tier_id -> handle
         uint64_t version = 0;  // Monotonically increasing version
+        std::chrono::steady_clock::time_point created_at{};  // retention
     };
 
     // Get list of Tier IDs sorted by priority (descending)
@@ -386,8 +390,9 @@ class TieredBackend {
     RemoveReplicaCallback remove_replica_callback_;
     // Callback for segment lifecycle synchronization with Master
     SegmentSyncCallback segment_sync_callback_;
-    // Optional per-tier metrics; null when metric collection is disabled
+    // Optional metrics sinks; null when metric collection is disabled
     std::shared_ptr<TierMetric> tier_metric_;
+    std::shared_ptr<KeyRetentionMetric> retention_metric_;
 
     // Scheduler
     std::unique_ptr<IClientScheduler> scheduler_;

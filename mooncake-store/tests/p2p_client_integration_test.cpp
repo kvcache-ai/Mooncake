@@ -1443,5 +1443,63 @@ TEST_F(P2PClientIntegrationTest, MetricPutFailure) {
     EXPECT_EQ(m->local_request.put_requests.value(), before_local_put_req);
 }
 
+TEST_F(P2PClientIntegrationTest, KeyRetentionMetricsLifecycle) {
+    auto* m = GetP2PMetrics(client_.get());
+    ASSERT_NE(m, nullptr);
+    ASSERT_NE(m->key_retention, nullptr);
+
+    const std::string key = "p2p_key_retention_metric";
+    const std::string data = "retention payload";
+    const auto before = m->key_retention->Snapshot();
+
+    std::vector<Slice> put_slices;
+    put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    ASSERT_TRUE(
+        client_->Put(key, put_slices, WriteRouteRequestConfig{}).has_value());
+
+    // Let the key age into a non-zero bucket.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    const auto mid = m->key_retention->Snapshot();
+    EXPECT_EQ(mid.live_count, before.live_count + 1);
+    EXPECT_EQ(mid.removed_total, before.removed_total);
+
+    ASSERT_TRUE(client_->RemoveLocal(key).has_value());
+
+    // RemoveLocal ends the key's lifetime and records it in the removed
+    // lifetime distribution.
+    const auto after = m->key_retention->Snapshot();
+    EXPECT_EQ(after.live_count, before.live_count);
+    EXPECT_EQ(after.removed_total, before.removed_total + 1);
+
+    auto serialized = client_->SerializeMetrics();
+    ASSERT_TRUE(serialized.has_value());
+    const std::string& text = serialized.value();
+    EXPECT_NE(text.find("mooncake_p2p_key_retention_live_count"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_p2p_key_retention_removed_total"),
+              std::string::npos);
+    // The RemoveLocal above fed the histogram, so buckets are serialized.
+    EXPECT_NE(text.find("mooncake_p2p_key_retention_removed_age_"
+                        "seconds_bucket"),
+              std::string::npos);
+    // The quantile gauges were replaced by scrape-time histograms; the
+    // live-age histogram is present only while keys are alive.
+    EXPECT_EQ(text.find("mooncake_p2p_key_retention_live_age_p"),
+              std::string::npos);
+    EXPECT_EQ(text.find("mooncake_p2p_key_retention_removed_age_p"),
+              std::string::npos);
+    EXPECT_EQ(text.find("mooncake_p2p_key_retention_all_lifetime_p"),
+              std::string::npos);
+    // The RemoveLocal above guarantees at least one removed sample, so
+    // the all-lifetime histogram is present.
+    EXPECT_NE(text.find("mooncake_p2p_key_retention_all_lifetime_seconds_"
+                        "bucket"),
+              std::string::npos);
+    EXPECT_EQ(text.find("mooncake_p2p_key_retention_live_age_seconds_"
+                        "bucket") != std::string::npos,
+              after.live_count > 0);
+}
+
 }  // namespace testing
 }  // namespace mooncake

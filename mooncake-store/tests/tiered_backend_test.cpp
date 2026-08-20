@@ -1708,4 +1708,141 @@ TEST_F(TieredBackendTest, TierMetricCountsStorageSelfEviction) {
     fs::remove_all(storage_path);
 }
 
+namespace {
+
+int64_t SumRetentionBuckets(const std::vector<int64_t>& buckets) {
+    int64_t sum = 0;
+    for (const int64_t count : buckets) {
+        sum += count;
+    }
+    return sum;
+}
+
+}  // namespace
+
+// Creation counts once (overwrite does not re-count), reads do not touch
+// retention, full-key deletion ends the lifetime and records it.
+TEST_F(TieredBackendTest, KeyRetentionCreateDeleteLifecycle) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto retention = std::make_shared<KeyRetentionMetric>("test_retention");
+    ASSERT_TRUE(backend
+                    .Init(config, /*engine=*/nullptr,
+                          /*add_replica_callback=*/nullptr,
+                          /*remove_replica_callback=*/nullptr,
+                          /*segment_sync_callback=*/nullptr,
+                          /*tier_metric=*/nullptr,
+                          /*retention_metric=*/retention)
+                    .has_value());
+
+    auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto handle1 =
+        AllocateAndWrite(backend, SMALL_DATA_SIZE, test_buffer.get());
+    ASSERT_TRUE(handle1.has_value());
+    ASSERT_TRUE(backend.Commit("key1", handle1.value()).has_value());
+
+    auto snap = retention->Snapshot();
+    EXPECT_EQ(snap.live_count, 1);
+    EXPECT_EQ(snap.removed_total, 0);
+    EXPECT_EQ(SumRetentionBuckets(snap.live_age_buckets), 1);
+
+    auto handle2 =
+        AllocateAndWrite(backend, SMALL_DATA_SIZE, test_buffer.get());
+    ASSERT_TRUE(handle2.has_value());
+    ASSERT_TRUE(backend.Commit("key1", handle2.value()).has_value());
+    snap = retention->Snapshot();
+    EXPECT_EQ(snap.live_count, 1);
+
+    ASSERT_TRUE(backend.Get("key1").has_value());
+    snap = retention->Snapshot();
+    EXPECT_EQ(snap.live_count, 1);
+    EXPECT_EQ(snap.removed_total, 0);
+
+    ASSERT_TRUE(backend.Delete("key1").has_value());
+    snap = retention->Snapshot();
+    EXPECT_EQ(snap.live_count, 0);
+    EXPECT_EQ(snap.removed_total, 1);
+    EXPECT_EQ(SumRetentionBuckets(snap.removed_buckets), 1);
+}
+
+// Every removal path (delete/evict/clear) records the removed lifetime.
+TEST_F(TieredBackendTest, KeyRetentionAllRemovalPathsRecord) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto retention = std::make_shared<KeyRetentionMetric>("test_retention");
+    ASSERT_TRUE(backend
+                    .Init(config, /*engine=*/nullptr,
+                          /*add_replica_callback=*/nullptr,
+                          /*remove_replica_callback=*/nullptr,
+                          /*segment_sync_callback=*/nullptr,
+                          /*tier_metric=*/nullptr,
+                          /*retention_metric=*/retention)
+                    .has_value());
+
+    auto buffer1 = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto handle1 = AllocateAndWrite(backend, SMALL_DATA_SIZE, buffer1.get());
+    ASSERT_TRUE(handle1.has_value());
+    ASSERT_TRUE(backend.Commit("key1", handle1.value()).has_value());
+
+    auto buffer2 = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto handle2 = AllocateAndWrite(backend, SMALL_DATA_SIZE, buffer2.get());
+    ASSERT_TRUE(handle2.has_value());
+    ASSERT_TRUE(backend.Commit("key2", handle2.value()).has_value());
+
+    auto views = backend.GetTierViews();
+    ASSERT_EQ(views.size(), 1u);
+    const UUID tier_id = views[0].id;
+
+    EXPECT_EQ(backend.NotifyBucketEviction({"key1"}, tier_id), 1u);
+    auto snap = retention->Snapshot();
+    EXPECT_EQ(snap.live_count, 1);
+    EXPECT_EQ(snap.removed_total, 1);
+    EXPECT_EQ(SumRetentionBuckets(snap.removed_buckets), 1);
+
+    // Deletion records too.
+    ASSERT_TRUE(backend.Delete("key2").has_value());
+    snap = retention->Snapshot();
+    EXPECT_EQ(snap.live_count, 0);
+    EXPECT_EQ(snap.removed_total, 2);
+    EXPECT_EQ(SumRetentionBuckets(snap.removed_buckets), 2);
+
+    // Clear records too.
+    auto buffer3 = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto handle3 = AllocateAndWrite(backend, SMALL_DATA_SIZE, buffer3.get());
+    ASSERT_TRUE(handle3.has_value());
+    ASSERT_TRUE(backend.Commit("key3", handle3.value()).has_value());
+    auto removed = backend.RemoveAll();
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(removed.value(), 1);
+    snap = retention->Snapshot();
+    EXPECT_EQ(snap.live_count, 0);
+    EXPECT_EQ(snap.removed_total, 3);
+    EXPECT_EQ(SumRetentionBuckets(snap.removed_buckets), 3);
+    EXPECT_EQ(SumRetentionBuckets(snap.live_age_buckets), 0);
+}
+
 }  // namespace mooncake

@@ -67,6 +67,15 @@ struct RemoteDataMetricSnapshot {
 };
 YLT_REFL(RemoteDataMetricSnapshot, data, read_retries, write_retries);
 
+struct KeyRetentionSnapshot {
+    int64_t live_count = 0;
+    int64_t removed_total = 0;
+    std::vector<int64_t> live_age_buckets;  // approximate (birth cohorts)
+    std::vector<int64_t> removed_buckets;
+};
+YLT_REFL(KeyRetentionSnapshot, live_count, removed_total, live_age_buckets,
+         removed_buckets);
+
 // Metric snapshot carried by the SYNC_CLIENT_METRIC heartbeat task.
 // Granularity:
 // - total_request: request (batch) granularity; one BatchPut/BatchGet counts
@@ -77,8 +86,10 @@ struct ClientMetricSnapshot {
     DataMetricSnapshot total_request;
     DataMetricSnapshot local_request;
     RemoteDataMetricSnapshot remote_request;
+    KeyRetentionSnapshot key_retention;
 };
-YLT_REFL(ClientMetricSnapshot, total_request, local_request, remote_request);
+YLT_REFL(ClientMetricSnapshot, total_request, local_request, remote_request,
+         key_retention);
 
 /**
  * @brief Param for SYNC_CLIENT_METRIC task.

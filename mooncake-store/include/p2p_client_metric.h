@@ -1,9 +1,12 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <ylt/metric/gauge.hpp>
 
@@ -200,6 +203,78 @@ struct TierMetric {
     std::unordered_map<UUID, TierEntry> tiers_;
 };
 
+// record how long keys live on this client
+struct KeyRetentionMetric {
+   public:
+    explicit KeyRetentionMetric(
+        const std::string& prefix,
+        const std::map<std::string, std::string>& labels = {},
+        std::chrono::steady_clock::time_point anchor =
+            std::chrono::steady_clock::now());
+
+    // Data path hooks: lock-free, O(1).
+    void OnKeyCreated(std::chrono::steady_clock::time_point birth);
+    void OnKeyRemoved(std::chrono::steady_clock::time_point birth);
+
+    KeyRetentionSnapshot Snapshot();
+    void serialize(std::string& str);
+    std::string summary_metrics();
+
+    // Bucket boundaries (seconds) for lifetime / live-age distributions.
+    static const std::vector<double>& LifetimeBuckets();
+
+    // Interpolates the quantiles qs (each in (0,1], sorted ascending) from
+    // non-cumulative bucket counts in a single pass (histogram semantics:
+    // bucket j counts values <= boundaries[j]).
+    // Returns one value per q, in input order. Empty distribution -> zeros;
+    // quantiles in the open +Inf bucket resolve to the largest finite boundary.
+    static std::vector<int64_t> InterpolateQuantiles(
+        const std::vector<double>& boundaries,
+        const std::vector<int64_t>& bucket_counts,
+        const std::vector<double>& quantiles);
+
+    // Renders a classic-format Prometheus histogram from non-cumulative
+    // per-bucket counts over `boundaries` (implicit +Inf bucket last).
+    // Used for scrape-time distributions that cannot be expressed as
+    // cumulative observe() histograms (e.g. the current age of live keys).
+    // `_sum` is estimated from bucket midpoints (+Inf resolves to the
+    // largest finite boundary).
+    static void SerializeBucketHistogram(
+        std::string& str, const std::string& name, const std::string& help,
+        const std::map<std::string, std::string>& labels,
+        const std::vector<double>& boundaries,
+        const std::vector<int64_t>& bucket_counts);
+
+   private:
+    void CollectBuckets(std::vector<int64_t>& live_age_buckets,
+                        std::vector<int64_t>& removed_buckets);
+    std::vector<int64_t> BuildLiveAgeBuckets(int64_t t) const;
+    int64_t ToOffsetSeconds(std::chrono::steady_clock::time_point tp) const;
+    size_t CohortIndex(int64_t birth_offset_seconds) const;
+
+   private:
+    const std::chrono::steady_clock::time_point anchor_;
+    // Retained to render the scrape-time live-age histogram.
+    const std::string prefix_;
+    const std::map<std::string, std::string> labels_;
+
+    ylt::metric::gauge_t live_keys;
+    ylt::metric::counter_t removed_keys;
+    ylt::metric::histogram_t removed_age;
+
+    // Birth cohorts for the live-age distribution. cohorts_[i] counts
+    // live keys whose birth offset (seconds since anchor_) falls in
+    // [cohort_bounds_[i], cohort_bounds_[i+1]); the last slot extends to
+    // +inf (births beyond kCohortCoverageSeconds clamp into it).
+    // At scrape time a slot's keys are all estimated at "now - midpoint(slot)",
+    // so the error is at most one slot width.
+    // Example: a key born 100s after anchor lands in slot [81, 106);
+    // at t=1000s its age is estimated as 1000 - 93 = 907s (true: 900s).
+    static constexpr int64_t kCohortCoverageSeconds = 365 * 24 * 3600;
+    std::vector<int64_t> cohort_bounds_;
+    std::vector<std::atomic<int64_t>> cohorts_;
+};
+
 struct P2PClientMetric : public ClientMetric {
    public:
     // total_request is recorded at request (Batch) granularity:
@@ -215,6 +290,7 @@ struct P2PClientMetric : public ClientMetric {
     PeerRequestMetrics peer_request_metrics;
     // Per-tier storage metrics; initially empty. Shared with TieredBackend.
     std::shared_ptr<TierMetric> tier_metric;
+    std::shared_ptr<KeyRetentionMetric> key_retention;
 
    public:
     static std::unique_ptr<P2PClientMetric> Create(

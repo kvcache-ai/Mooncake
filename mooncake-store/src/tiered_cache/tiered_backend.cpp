@@ -148,7 +148,8 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     AddReplicaCallback add_replica_callback,
     RemoveReplicaCallback remove_replica_callback,
     SegmentSyncCallback segment_sync_callback,
-    std::shared_ptr<TierMetric> tier_metric) {
+    std::shared_ptr<TierMetric> tier_metric,
+    std::shared_ptr<KeyRetentionMetric> retention_metric) {
     // Initialize DataCopier
     try {
         DataCopierBuilder builder;
@@ -165,6 +166,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     segment_sync_callback_ = segment_sync_callback;
     // Optional per-tier metrics sink
     tier_metric_ = std::move(tier_metric);
+    retention_metric_ = std::move(retention_metric);
 
     // Initialize Tiers
     if (!root.isMember("tiers")) {
@@ -559,7 +561,11 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
             entry = it->second;
         } else {
             entry = std::make_shared<MetadataEntry>();
+            entry->created_at = std::chrono::steady_clock::now();
             shard.index.emplace(std::string(key), entry);
+            if (retention_metric_) {
+                retention_metric_->OnKeyCreated(entry->created_at);
+            }
         }
     }
 
@@ -751,6 +757,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
     AllocationHandle handle_ref = nullptr;
     std::vector<AllocationHandle> handles_to_free;
     std::vector<UUID> removed_tier_ids;
+    std::optional<std::chrono::steady_clock::time_point> removed_birth;
 
     if (tier_id.has_value()) {
         // Delete Specific Replica
@@ -820,12 +827,16 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
                 std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
 
                 if (entry->replicas.empty()) {
+                    removed_birth = entry->created_at;
                     shard.index.erase(it);
                 }
             }
         }
 
         if (found_tier) {
+            if (removed_birth && retention_metric_) {
+                retention_metric_->OnKeyRemoved(*removed_birth);
+            }
             if (tier_metric_) {
                 tier_metric_->OnReplicaRemoved(*tier_id);
             }
@@ -871,7 +882,12 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
             entry->replicas.clear();
         }
 
+        removed_birth = entry->created_at;
         shard.index.erase(it);
+    }
+
+    if (removed_birth && retention_metric_) {
+        retention_metric_->OnKeyRemoved(*removed_birth);
     }
 
     // Per-tier key-count accounting for the removed replicas.
@@ -942,6 +958,7 @@ size_t TieredBackend::NotifyBucketEviction(const std::vector<std::string>& keys,
 
         // Remove an emptied entry under the shard write lock (zombie cleanup),
         // double-checking that no replica was re-added concurrently.
+        std::optional<std::chrono::steady_clock::time_point> removed_birth;
         if (need_cleanup) {
             std::unique_lock<std::shared_mutex> write_lock(shard.mutex);
             auto it = shard.index.find(key);
@@ -949,6 +966,7 @@ size_t TieredBackend::NotifyBucketEviction(const std::vector<std::string>& keys,
                 auto entry = it->second;
                 std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
                 if (entry->replicas.empty()) {
+                    removed_birth = entry->created_at;
                     shard.index.erase(it);
                 }
             }
@@ -956,6 +974,9 @@ size_t TieredBackend::NotifyBucketEviction(const std::vector<std::string>& keys,
 
         if (found_tier) {
             ++removed;
+            if (removed_birth && retention_metric_) {
+                retention_metric_->OnKeyRemoved(*removed_birth);
+            }
             if (tier_metric_) {
                 tier_metric_->OnReplicaRemoved(tier_id);
                 tier_metric_->OnEvicted(tier_id);
@@ -1041,6 +1062,11 @@ tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
 
             if (scheduler_) {
                 scheduler_->OnDelete(DeleteContext{key, std::nullopt});
+            }
+
+            // Includes zombie entries: each drained entry ends its lifetime.
+            if (retention_metric_) {
+                retention_metric_->OnKeyRemoved(entry->created_at);
             }
 
             ++total_removed;
