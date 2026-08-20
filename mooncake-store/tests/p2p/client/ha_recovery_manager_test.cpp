@@ -89,7 +89,7 @@ class HARecoveryManagerTest : public ::testing::Test {
         // Connect P2PMasterClient to in-proc master
         master_client_ = std::make_unique<P2PMasterClient>(client_id_);
         auto ec = master_client_->Connect(master_addr_);
-        ASSERT_EQ(ec, ErrorCode::OK) << "Connect failed";
+        ASSERT_TRUE(ec.has_value()) << "Connect failed";
 
         view_version_ = 0;
         // Initialise with an empty TieredBackend (no tiers, no keys) and a
@@ -110,7 +110,7 @@ class HARecoveryManagerTest : public ::testing::Test {
         seg.id = generate_uuid();
         seg.name = "test_segment";
         seg.size = size;
-        seg.extra = P2PSegmentExtraData{
+        seg.p2p_extra = P2PSegmentExtraData{
             .priority = 0,
             .tags = {},
             .memory_type = MemoryType::DRAM,
