@@ -4,6 +4,7 @@
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <memory>  // For std::unique_ptr
+#include <optional>
 #include <thread>  // For std::thread
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
@@ -13,6 +14,7 @@
 #include "http_metadata_server.h"
 #include "centralized_rpc_service.h"
 #include "p2p_rpc_service.h"
+#include "rpc_service.h"
 #include "types.h"
 
 #include "master_config.h"
@@ -55,6 +57,11 @@ DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
+DEFINE_uint32(heartbeat_rpc_port, 0,
+              "Port for a dedicated heartbeat RPC server (0 = disabled, "
+              "heartbeat served on the main RPC server as a legacy fallback)");
+DEFINE_uint32(heartbeat_rpc_thread_num, 1,
+              "Thread count for the dedicated heartbeat RPC server");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
@@ -192,6 +199,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("rpc_enable_tcp_no_delay",
                            &master_config.rpc_enable_tcp_no_delay,
                            FLAGS_rpc_enable_tcp_no_delay);
+    default_config.GetUInt32("heartbeat_rpc_port",
+                             &master_config.heartbeat_rpc_port,
+                             FLAGS_heartbeat_rpc_port);
+    default_config.GetUInt32("heartbeat_rpc_thread_num",
+                             &master_config.heartbeat_rpc_thread_num,
+                             FLAGS_heartbeat_rpc_thread_num);
     default_config.GetUInt64("default_kv_lease_ttl",
                              &master_config.default_kv_lease_ttl,
                              FLAGS_default_kv_lease_ttl);
@@ -393,6 +406,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
+    }
+    if ((google::GetCommandLineFlagInfo("heartbeat_rpc_port", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.heartbeat_rpc_port = FLAGS_heartbeat_rpc_port;
+    }
+    if ((google::GetCommandLineFlagInfo("heartbeat_rpc_thread_num", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.heartbeat_rpc_thread_num = FLAGS_heartbeat_rpc_thread_num;
     }
     if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
          !info.is_default) ||
@@ -824,6 +847,9 @@ int main(int argc, char* argv[]) {
         << ", rpc_conn_timeout_seconds="
         << master_config.rpc_conn_timeout_seconds
         << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
+        << ", heartbeat_rpc_port=" << master_config.heartbeat_rpc_port
+        << ", heartbeat_rpc_thread_num="
+        << master_config.heartbeat_rpc_thread_num
         << ", rpc protocol=" << protocol
         << ", cluster_id=" << master_config.cluster_id
         << ", root_fs_dir=" << master_config.root_fs_dir
@@ -894,6 +920,24 @@ int main(int argc, char* argv[]) {
             server.init_ibv();
         }
 
+        // When a dedicated heartbeat port is configured, serve Heartbeat on a
+        // separate coro_rpc_server with its own thread pool so heavy metadata
+        // RPCs on the main server cannot head-of-line-block heartbeats. The
+        // heartbeat server always runs plain TCP (no init_ibv) to avoid
+        // contending for IB resources with the main server. The main server
+        // serves Heartbeat only as a legacy fallback when no dedicated
+        // heartbeat port is configured (heartbeat_rpc_port == 0).
+        const bool dedicated_heartbeat = master_config.heartbeat_rpc_port > 0;
+        const bool main_includes_heartbeat = !dedicated_heartbeat;
+        std::optional<coro_rpc::coro_rpc_server> heartbeat_server;
+        if (dedicated_heartbeat) {
+            heartbeat_server.emplace(
+                std::max<uint32_t>(1u, master_config.heartbeat_rpc_thread_num),
+                master_config.heartbeat_rpc_port, master_config.rpc_address,
+                std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
+                master_config.rpc_enable_tcp_no_delay);
+        }
+
         // Declare service object outside if block to ensure it lives until
         // server.start() completes
         std::unique_ptr<mooncake::WrappedMasterService> master_service;
@@ -906,8 +950,10 @@ int main(int argc, char* argv[]) {
             master_service->init();
 
             mooncake::RegisterCentralizedRpcService(
-                server, static_cast<mooncake::WrappedCentralizedMasterService&>(
-                            *master_service));
+                server,
+                static_cast<mooncake::WrappedCentralizedMasterService&>(
+                    *master_service),
+                /*include_heartbeat=*/main_includes_heartbeat);
         } else {
             master_service =
                 std::make_unique<mooncake::WrappedP2PMasterService>(
@@ -916,8 +962,23 @@ int main(int argc, char* argv[]) {
             master_service->init();
 
             mooncake::RegisterP2PRpcService(
-                server, static_cast<mooncake::WrappedP2PMasterService&>(
-                            *master_service));
+                server,
+                static_cast<mooncake::WrappedP2PMasterService&>(
+                    *master_service),
+                /*include_heartbeat=*/main_includes_heartbeat);
+        }
+
+        if (dedicated_heartbeat) {
+            mooncake::RegisterHeartbeatRpcService(*heartbeat_server,
+                                                  *master_service);
+            LOG(INFO) << "Starting dedicated heartbeat RPC server on port "
+                      << master_config.heartbeat_rpc_port;
+            auto heartbeat_ec = heartbeat_server->async_start();
+            if (heartbeat_ec.hasResult()) {
+                LOG(ERROR) << "Failed to start heartbeat RPC server: "
+                           << heartbeat_ec.result().value();
+                return -1;
+            }
         }
         return server.start();
     }

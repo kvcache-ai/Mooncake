@@ -64,6 +64,18 @@ class SegmentClient {
                                         master_server + ", ec=" + toString(ec));
         }
 
+        // Register client with master before mounting segments.
+        // Required since the refactored MountSegment checks ClientManager for
+        // the client_id (commit 48d3a47c).
+        mooncake::RegisterClientRequest reg_req;
+        reg_req.client_id = client_id_;
+        reg_req.deployment_mode = mooncake::DeploymentMode::CENTRALIZATION;
+        auto reg_ec = master_client_.RegisterClient(reg_req);
+        if (!reg_ec.has_value()) {
+            throw std::runtime_error("Failed to register client " + name +
+                                     ", ec=" + toString(reg_ec.error()));
+        }
+
         segment_.id = mooncake::generate_uuid();
         segment_.name = name;
         segment_.size = segment_size;

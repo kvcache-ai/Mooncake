@@ -115,6 +115,7 @@ class MooncakeConfig:
     protocol: str
     device_name: Optional[str]
     master_server_address: str
+    heartbeat_rpc_port: int = 0
 
     @staticmethod
     def from_file(file_path: str) -> 'MooncakeConfig':
@@ -141,6 +142,7 @@ class MooncakeConfig:
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
+            heartbeat_rpc_port=int(config.get("heartbeat_rpc_port", 0)),
         )
 
     @staticmethod
@@ -167,5 +169,6 @@ class MooncakeConfig:
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),
                 master_server_address=os.getenv("MOONCAKE_MASTER"),
+                heartbeat_rpc_port=int(os.getenv("MOONCAKE_HEARTBEAT_RPC_PORT", "0")),
             )
         return MooncakeConfig.from_file(config_file_path)

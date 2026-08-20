@@ -150,6 +150,7 @@ P2PClientService::~P2PClientService() {
 ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     client_rpc_port_ = config.client_rpc_port;
     transfer_direction_mode_ = config.transfer_direction_mode;
+    master_client_.SetHeartbeatRpcPort(config.heartbeat_rpc_port);
     // Saved so a later re-registration (after UnregisterClient) can restart
     // the heartbeat with the same master entry.
     master_server_entry_ = config.master_server_entry;

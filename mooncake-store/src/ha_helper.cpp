@@ -3,6 +3,7 @@
 #include "centralized_rpc_service.h"
 #include "ha/oplog/p2p_hot_standby_service.h"
 #include "p2p_rpc_service.h"
+#include "rpc_service.h"
 #include "utils.h"
 #ifdef STORE_USE_REDIS
 #include "redis_master_view_helper.h"
@@ -347,6 +348,15 @@ int MasterServiceSupervisor::Start() {
         }
 
         LOG(INFO) << "Starting master service...";
+        // When a dedicated heartbeat port is configured, Heartbeat is served on
+        // a separate coro_rpc_server so heavy metadata RPCs cannot
+        // head-of-line-block heartbeats. The heartbeat server runs plain TCP
+        // (no init_ibv) to avoid contending for IB resources with the main
+        // server. The main server serves Heartbeat only as a legacy fallback
+        // when no dedicated heartbeat port is configured (heartbeat_rpc_port
+        // == 0).
+        const bool dedicated_heartbeat = config_.heartbeat_rpc_port > 0;
+        const bool main_includes_heartbeat = !dedicated_heartbeat;
         std::unique_ptr<WrappedMasterService> wrapped_master_service;
         if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {
             wrapped_master_service =
@@ -354,8 +364,10 @@ int MasterServiceSupervisor::Start() {
                     WrappedMasterServiceConfig(config_, view_version));
             wrapped_master_service->init();
             RegisterCentralizedRpcService(
-                server, static_cast<WrappedCentralizedMasterService&>(
-                            *wrapped_master_service));
+                server,
+                static_cast<WrappedCentralizedMasterService&>(
+                    *wrapped_master_service),
+                /*include_heartbeat=*/main_includes_heartbeat);
         } else {
             auto p2p_wrapped_service =
                 std::make_unique<WrappedP2PMasterService>(
@@ -376,7 +388,9 @@ int MasterServiceSupervisor::Start() {
                     return -1;
                 }
             }
-            RegisterP2PRpcService(server, *p2p_wrapped_service);
+            RegisterP2PRpcService(
+                server, *p2p_wrapped_service,
+                /*include_heartbeat=*/main_includes_heartbeat);
             wrapped_master_service = std::move(p2p_wrapped_service);
         }
 #ifdef STORE_USE_REDIS
@@ -386,11 +400,35 @@ int MasterServiceSupervisor::Start() {
 #endif
         // Metric reporting is now handled by WrappedMasterService.
 
+        // Start the dedicated heartbeat server alongside the main server. It
+        // shares the wrapped_master_service, so it must be stopped before that
+        // service object is destroyed (below, after the main server stops).
+        std::optional<coro_rpc::coro_rpc_server> heartbeat_server;
+        if (dedicated_heartbeat) {
+            heartbeat_server.emplace(
+                std::max<size_t>(1, config_.heartbeat_rpc_thread_num),
+                config_.heartbeat_rpc_port, config_.rpc_address,
+                config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
+            RegisterHeartbeatRpcService(*heartbeat_server,
+                                        *wrapped_master_service);
+            LOG(INFO) << "Starting dedicated heartbeat RPC server on port "
+                      << config_.heartbeat_rpc_port;
+            auto heartbeat_ec = heartbeat_server->async_start();
+            if (heartbeat_ec.hasResult()) {
+                LOG(ERROR) << "Failed to start heartbeat RPC server: "
+                           << heartbeat_ec.result().value();
+                mv_helper->CancelKeepAlive(lease_id);
+                keep_leader_thread.join();
+                return -1;
+            }
+        }
+
         async_simple::Future<coro_rpc::err_code> ec =
             server.async_start();  // won't block here
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
+            heartbeat_server.reset();
             mv_helper->CancelKeepAlive(lease_id);
             keep_leader_thread.join();
             return -1;
@@ -398,6 +436,9 @@ int MasterServiceSupervisor::Start() {
         // Block until the server is stopped
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
+        // Stop the heartbeat server before wrapped_master_service (declared
+        // above) is destroyed at the end of this loop iteration.
+        heartbeat_server.reset();
 
         // If the server is closed due to internal errors, we need to manually
         // stop keep leader alive.

@@ -45,6 +45,15 @@ class MasterClient {
         const std::string& master_addr = kDefaultMasterAddress);
 
     /**
+     * @brief Configures a dedicated heartbeat server port.
+     * When > 0, Heartbeat is sent to host:heartbeat_rpc_port (derived from the
+     * current master address at Connect time) instead of the main RPC port, so
+     * heartbeats are not head-of-line-blocked by heavy metadata RPCs. Must be
+     * set before Connect. 0 = legacy behavior (heartbeat on main pool).
+     */
+    void SetHeartbeatRpcPort(uint16_t port) { heartbeat_rpc_port_ = port; }
+
+    /**
      * @brief Checks if an object exists
      * @param object_key Key to query
      * @return tl::expected<bool, ErrorCode> indicating exist or not
@@ -214,8 +223,15 @@ class MasterClient {
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
     invoke_rpc_async(Args&&... args) {
-        auto pool = client_accessor_.GetClientPool();
+        return invoke_rpc_async_with_pool<ServiceMethod, ReturnType>(
+            client_accessor_.GetClientPool(), std::forward<Args>(args)...);
+    }
 
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
+    invoke_rpc_async_with_pool(
+        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>> pool,
+        Args&&... args) {
         // Increment RPC counter
         if (metrics_) {
             metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
@@ -340,9 +356,21 @@ class MasterClient {
         std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
             client_pool_;
     };
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_via(
+        RpcClientAccessor& accessor, Args&&... args) {
+        return async_simple::coro::syncAwait(
+            invoke_rpc_async_with_pool<ServiceMethod, ReturnType>(
+                accessor.GetClientPool(), std::forward<Args>(args)...));
+    }
 
    protected:
     RpcClientAccessor client_accessor_;
+    // Dedicated pool for Heartbeat. When heartbeat_rpc_port_ > 0 it points at
+    // the master's dedicated heartbeat server (host:heartbeat_rpc_port_); when
+    // 0 it mirrors client_accessor_ so heartbeats ride the main pool (legacy).
+    RpcClientAccessor heartbeat_accessor_;
+    uint16_t heartbeat_rpc_port_ = 0;
 
     // The client identification.
     const UUID client_id_;

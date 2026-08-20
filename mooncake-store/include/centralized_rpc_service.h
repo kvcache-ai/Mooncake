@@ -102,6 +102,7 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
 
 void RegisterCentralizedRpcService(
     coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedCentralizedMasterService& wrapped_master_service);
+    mooncake::WrappedCentralizedMasterService& wrapped_master_service,
+    bool include_heartbeat = true);
 
 }  // namespace mooncake

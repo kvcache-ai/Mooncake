@@ -83,6 +83,11 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    // Reports the master's heartbeat routing (dedicated port vs legacy main
+    // server) so clients can detect a heartbeat-port mismatch at Connect time.
+    tl::expected<HeartbeatServiceReadyResponse, ErrorCode>
+    HeartbeatServiceReady();
+
    protected:
     void init_http_server();
     virtual MasterService& GetMasterService() = 0;
@@ -93,9 +98,20 @@ class WrappedMasterService {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
+    // Dedicated heartbeat RPC server port configured on this master
+    // (0 = legacy: Heartbeat served on the main server).
+    uint32_t heartbeat_rpc_port_ = 0;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
-                        mooncake::WrappedMasterService& wrapped_master_service);
+                        mooncake::WrappedMasterService& wrapped_master_service,
+                        bool include_heartbeat = true);
+
+// Registers only the Heartbeat handler on a dedicated heartbeat server. Used
+// by the priority-scheduling path to serve heartbeats on a separate
+// coro_rpc_server so heavy RPCs cannot head-of-line-block them.
+void RegisterHeartbeatRpcService(
+    coro_rpc::coro_rpc_server& server,
+    mooncake::WrappedMasterService& wrapped_master_service);
 
 }  // namespace mooncake

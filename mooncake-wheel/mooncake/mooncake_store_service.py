@@ -113,7 +113,8 @@ class MooncakeStoreService:
                     self.config.local_buffer_size,
                     self.config.protocol,
                     self.config.device_name,
-                    self.config.master_server_address
+                    self.config.master_server_address,
+                    heartbeat_rpc_port=self.config.heartbeat_rpc_port,
                 )
 
                 if ret != 0:

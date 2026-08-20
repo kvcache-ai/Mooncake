@@ -28,6 +28,12 @@ DEFINE_int32(redis_master_view_ttl_sec, 4,
              "Redis master view TTL for redis:// master discovery");
 DEFINE_int32(redis_heartbeat_interval_sec, 1,
              "Redis heartbeat interval for redis:// master discovery");
+DEFINE_uint32(
+    heartbeat_rpc_port, 0,
+    "Port of the master's dedicated heartbeat RPC server. When > 0, "
+    "heartbeats are sent to <master host>:heartbeat_rpc_port instead of "
+    "the main RPC port so heavy metadata RPCs cannot head-of-line-block "
+    "them. Must match the master's --heartbeat_rpc_port. 0 = disabled.");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_int32(threads, 1, "Number of rpc threads for dummy client");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
@@ -159,7 +165,8 @@ int main(int argc, char* argv[]) {
                 FLAGS_metric_report_interval_seconds, FLAGS_redis_cluster_id,
                 FLAGS_redis_password, FLAGS_redis_db_index,
                 FLAGS_redis_master_view_ttl_sec,
-                FLAGS_redis_heartbeat_interval_sec, FLAGS_redis_username);
+                FLAGS_redis_heartbeat_interval_sec, FLAGS_redis_username,
+                static_cast<uint16_t>(FLAGS_heartbeat_rpc_port));
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)
@@ -180,7 +187,8 @@ int main(int argc, char* argv[]) {
                 FLAGS_metric_report_interval_seconds, FLAGS_redis_cluster_id,
                 FLAGS_redis_password, FLAGS_redis_db_index,
                 FLAGS_redis_master_view_ttl_sec,
-                FLAGS_redis_heartbeat_interval_sec, FLAGS_redis_username);
+                FLAGS_redis_heartbeat_interval_sec, FLAGS_redis_username,
+                static_cast<uint16_t>(FLAGS_heartbeat_rpc_port));
         }
     }();
 

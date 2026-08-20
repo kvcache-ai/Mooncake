@@ -20,6 +20,13 @@ struct MasterConfig {
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
 
+    // Dedicated heartbeat RPC server. When heartbeat_rpc_port > 0, Heartbeat is
+    // served by a separate coro_rpc_server with its own thread pool so that
+    // heavy metadata RPCs cannot head-of-line-block heartbeats. 0 = disabled,
+    // heartbeat is served on the main RPC server as a legacy fallback.
+    uint32_t heartbeat_rpc_port = 0;
+    uint32_t heartbeat_rpc_thread_num = 1;
+
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
     bool allow_evict_soft_pinned_objects;
@@ -121,6 +128,9 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+    // Dedicated heartbeat RPC server (0 = disabled, serve on main server).
+    uint32_t heartbeat_rpc_port = 0;
+    uint32_t heartbeat_rpc_thread_num = 1;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -188,6 +198,8 @@ class MasterServiceSupervisorConfig {
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
+        heartbeat_rpc_port = config.heartbeat_rpc_port;
+        heartbeat_rpc_thread_num = config.heartbeat_rpc_thread_num;
         etcd_endpoints = config.etcd_endpoints;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
@@ -331,6 +343,10 @@ class WrappedMasterServiceConfig {
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
     uint16_t http_port = 9003;
+    // Dedicated heartbeat RPC server port (0 = legacy: Heartbeat served on the
+    // main server). Exposed to clients via HeartbeatServiceReady so they can
+    // detect a client/master heartbeat-routing mismatch at Connect time.
+    uint32_t heartbeat_rpc_port = 0;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -384,6 +400,7 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
+        heartbeat_rpc_port = config.heartbeat_rpc_port;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;
@@ -442,6 +459,7 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
+        heartbeat_rpc_port = config.heartbeat_rpc_port;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;
@@ -885,6 +903,10 @@ struct InProcMasterConfig {
     std::optional<size_t> cxl_size;
     std::optional<int64_t> client_live_ttl_sec;
     std::optional<int64_t> client_crashed_ttl_sec;
+    // Dedicated heartbeat RPC server port (>0 enables; nullopt => free port
+    // only honored when explicitly requested via Start).
+    std::optional<int> heartbeat_rpc_port;
+    std::optional<uint32_t> heartbeat_rpc_thread_num;
 };
 
 // Builder class for InProcMasterConfig
@@ -899,6 +921,8 @@ class InProcMasterConfigBuilder {
     std::optional<size_t> cxl_size_ = std::nullopt;
     std::optional<int64_t> client_live_ttl_sec_ = std::nullopt;
     std::optional<int64_t> client_crashed_ttl_sec_ = std::nullopt;
+    std::optional<int> heartbeat_rpc_port_ = std::nullopt;
+    std::optional<uint32_t> heartbeat_rpc_thread_num_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -948,6 +972,16 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_heartbeat_rpc_port(int port) {
+        heartbeat_rpc_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_heartbeat_rpc_thread_num(uint32_t num) {
+        heartbeat_rpc_thread_num_ = num;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -963,6 +997,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.cxl_size = cxl_size_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.client_crashed_ttl_sec = client_crashed_ttl_sec_;
+    config.heartbeat_rpc_port = heartbeat_rpc_port_;
+    config.heartbeat_rpc_thread_num = heartbeat_rpc_thread_num_;
     return config;
 }
 

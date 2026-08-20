@@ -103,6 +103,11 @@ struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
     static constexpr const char* value = "ServiceReady";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::HeartbeatServiceReady> {
+    static constexpr const char* value = "HeartbeatServiceReady";
+};
+
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
@@ -115,6 +120,23 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         auto client_pool = client_pools_->at(master_addr);
         client_accessor_.SetClientPool(client_pool);
         client_addr_param_ = master_addr;
+        // Route heartbeats to the dedicated heartbeat server when configured.
+        // The heartbeat endpoint is the same host as the master with the
+        // dedicated heartbeat port, so it follows the leader automatically on
+        // HA failover. When no dedicated port is set, heartbeats use the main
+        // pool (legacy behavior).
+        if (heartbeat_rpc_port_ > 0) {
+            auto colon = master_addr.rfind(':');
+            std::string host = (colon == std::string::npos)
+                                   ? master_addr
+                                   : master_addr.substr(0, colon);
+            std::string heartbeat_addr =
+                host + ":" + std::to_string(heartbeat_rpc_port_);
+            heartbeat_accessor_.SetClientPool(
+                client_pools_->at(heartbeat_addr));
+        } else {
+            heartbeat_accessor_.SetClientPool(client_pool);
+        }
     }
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
@@ -140,6 +162,56 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
                    << " client=" << client_version;
         timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
         return ErrorCode::INVALID_VERSION;
+    }
+    // Ask the master how it routes heartbeats, then verify it matches the
+    // client's expectation. Catches both mismatch directions at startup:
+    //   - client expects a dedicated heartbeat server the master never opened
+    //   - client is legacy but the master dropped Heartbeat from the main
+    //     server in favor of a dedicated port
+    // Either direction would otherwise silently starve heartbeats until the
+    // client gets reaped (client_live_ttl expiry, segment reclaim).
+    auto hb_ready = invoke_rpc<&WrappedMasterService::HeartbeatServiceReady,
+                               HeartbeatServiceReadyResponse>();
+    if (!hb_ready.has_value()) {
+        LOG(ERROR) << "HeartbeatServiceReady probe failed: error_code="
+                   << hb_ready.error()
+                   << " (master may predate this RPC; upgrade master first)";
+        timer.LogResponse("error_code=", hb_ready.error());
+        client_addr_param_.clear();
+        return hb_ready.error();
+    }
+    const bool client_dedicated = heartbeat_rpc_port_ > 0;
+    const bool master_dedicated = hb_ready->heartbeat_rpc_port > 0;
+    if (client_dedicated != master_dedicated) {
+        LOG(ERROR) << "Heartbeat routing mismatch: client_hb_port="
+                   << heartbeat_rpc_port_
+                   << " master_hb_port=" << hb_ready->heartbeat_rpc_port
+                   << " (one side is dedicated, the other is legacy)";
+        timer.LogResponse("error_code=", ErrorCode::HEARTBEAT_ROUTING_MISMATCH);
+        client_addr_param_.clear();
+        return ErrorCode::HEARTBEAT_ROUTING_MISMATCH;
+    }
+    // Both sides dedicated: confirm the dedicated heartbeat server is actually
+    // reachable (catches a configured-but-dead dedicated server). Mirrors the
+    // main-pool stale-connection retry above when reconnecting to the same
+    // address.
+    if (client_dedicated) {
+        auto hb_result =
+            invoke_rpc_via<&WrappedMasterService::ServiceReady, std::string>(
+                heartbeat_accessor_);
+        if (!hb_result.has_value() && is_same_addr) {
+            hb_result = invoke_rpc_via<&WrappedMasterService::ServiceReady,
+                                       std::string>(heartbeat_accessor_);
+        }
+        if (!hb_result.has_value()) {
+            LOG(ERROR) << "Dedicated heartbeat RPC server unreachable at"
+                       << " heartbeat_rpc_port=" << heartbeat_rpc_port_
+                       << ": error_code=" << hb_result.error();
+            timer.LogResponse("error_code=",
+                              ErrorCode::HEARTBEAT_RPC_UNREACHABLE);
+            client_addr_param_.clear();
+            return ErrorCode::HEARTBEAT_RPC_UNREACHABLE;
+        }
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
@@ -288,8 +360,11 @@ tl::expected<HeartbeatResponse, ErrorCode> MasterClient::Heartbeat(
     ScopedVLogTimer timer(1, "MasterClient::Heartbeat");
     timer.LogRequest("client_id=", client_id_);
 
+    // Send via the dedicated heartbeat accessor (separate pool that targets the
+    // master's heartbeat server when configured, else the main pool).
     auto result =
-        invoke_rpc<&WrappedMasterService::Heartbeat, HeartbeatResponse>(req);
+        invoke_rpc_via<&WrappedMasterService::Heartbeat, HeartbeatResponse>(
+            heartbeat_accessor_, req);
     timer.LogResponseExpected(result);
     return result;
 }

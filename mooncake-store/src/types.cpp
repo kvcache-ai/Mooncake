@@ -43,6 +43,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::REPLICA_IS_PROCESSING, "REPLICA_IS_PROCESSING"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
+        {ErrorCode::HEARTBEAT_RPC_UNREACHABLE, "HEARTBEAT_RPC_UNREACHABLE"},
+        {ErrorCode::HEARTBEAT_ROUTING_MISMATCH, "HEARTBEAT_ROUTING_MISMATCH"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},
         {ErrorCode::ETCD_KEY_NOT_EXIST, "ETCD_KEY_NOT_EXIST"},
         {ErrorCode::ETCD_TRANSACTION_FAIL, "ETCD_TRANSACTION_FAIL"},

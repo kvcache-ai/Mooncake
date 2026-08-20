@@ -87,6 +87,12 @@ struct RealClientConfigBase {
     // 3. "redis://IP:Port" for Redis-based HA mode
     std::string master_server_entry = "127.0.0.1:50051";
 
+    // Port of the master's dedicated heartbeat RPC server. When > 0,
+    // heartbeats are sent to <master host>:heartbeat_rpc_port instead of the
+    // main RPC port, so they are not head-of-line-blocked by heavy metadata
+    // RPCs. Must match the master's --heartbeat_rpc_port. 0 = legacy behavior.
+    uint16_t heartbeat_rpc_port = 0;
+
     // Size of the local buffer (0 to skip).
     // For the case which separately deploys real client and dummy client,
     // the `local_buffer_size` could be 0, which means the local buffer is
@@ -253,7 +259,8 @@ class ClientConfigBuilder {
         const std::string& redis_cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& redis_password = "", int redis_db_index = 0,
         int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
-        const std::string& redis_username = "") {
+        const std::string& redis_username = "",
+        uint16_t heartbeat_rpc_port = 0) {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -268,6 +275,7 @@ class ClientConfigBuilder {
         config.global_segment_size = global_segment_size;
         config.enable_offload = enable_offload;
         config.local_rpc_port = local_rpc_port;
+        config.heartbeat_rpc_port = heartbeat_rpc_port;
         return config;
     }
 
@@ -305,6 +313,9 @@ class ClientConfigBuilder {
             get_config_size(config, DictCommon::kMetricReportIntervalSeconds,
                             DictCommon::kDefaultMetricReportIntervalSeconds);
         RedisDiscoveryConfig redis_config = get_redis_discovery_config(config);
+        uint16_t heartbeat_rpc_port = static_cast<uint16_t>(
+            get_config_size(config, DictCommon::kHeartbeatRpcPort,
+                            DictCommon::kDefaultHeartbeatRpcPort));
 
         return build_centralized_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,
@@ -313,7 +324,8 @@ class ClientConfigBuilder {
             enable_metric_collection, metric_report_interval_seconds,
             redis_config.cluster_id, redis_config.password,
             redis_config.db_index, redis_config.master_view_ttl_sec,
-            redis_config.heartbeat_interval_sec, redis_config.username);
+            redis_config.heartbeat_interval_sec, redis_config.username,
+            heartbeat_rpc_port);
     }
 
     static P2PClientConfig build_p2p_real_client(
@@ -346,7 +358,8 @@ class ClientConfigBuilder {
         const std::string& redis_cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& redis_password = "", int redis_db_index = 0,
         int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
-        const std::string& redis_username = "") {
+        const std::string& redis_username = "",
+        uint16_t heartbeat_rpc_port = 0) {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -394,6 +407,7 @@ class ClientConfigBuilder {
         config.transfer_direction_mode =
             parse_p2p_transfer_direction_mode(p2p_transfer_direction_mode);
 
+        config.heartbeat_rpc_port = heartbeat_rpc_port;
         return config;
     }
 
@@ -456,6 +470,9 @@ class ClientConfigBuilder {
             get_config_size(config, DictCommon::kMetricReportIntervalSeconds,
                             DictCommon::kDefaultMetricReportIntervalSeconds);
         RedisDiscoveryConfig redis_config = get_redis_discovery_config(config);
+        uint16_t heartbeat_rpc_port = static_cast<uint16_t>(
+            get_config_size(config, DictCommon::kHeartbeatRpcPort,
+                            DictCommon::kDefaultHeartbeatRpcPort));
 
         return build_p2p_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,
@@ -468,7 +485,8 @@ class ClientConfigBuilder {
             metric_report_interval_seconds, redis_config.cluster_id,
             redis_config.password, redis_config.db_index,
             redis_config.master_view_ttl_sec,
-            redis_config.heartbeat_interval_sec, redis_config.username);
+            redis_config.heartbeat_interval_sec, redis_config.username,
+            heartbeat_rpc_port);
     }
 
    private:
@@ -505,6 +523,7 @@ class ClientConfigBuilder {
             "metric_report_interval_seconds";
         static constexpr const char* kEnableMetricCollection =
             "enable_metric_collection";
+        static constexpr const char* kHeartbeatRpcPort = "heartbeat_rpc_port";
         // Defaults
         static constexpr size_t kDefaultLocalBufferSize = 1024 * 1024 * 16;
         static constexpr const char* kDefaultProtocol = "tcp";
@@ -512,6 +531,7 @@ class ClientConfigBuilder {
             "127.0.0.1:50051";
         static constexpr uint64_t kDefaultMetricReportIntervalSeconds = 60;
         static constexpr bool kDefaultEnableMetricCollection = true;
+        static constexpr uint16_t kDefaultHeartbeatRpcPort = 0;
         // Limits
         static constexpr size_t kMinSegmentSize = 1024;
         static constexpr size_t kMaxSegmentSize = 1024ULL * 1024 * 1024 * 1024;

@@ -102,6 +102,7 @@ ErrorCode CentralizedClientService::Init(
     const CentralizedClientConfig& config) {
     auto master_server_entry = config.master_server_entry;
     master_server_entry_ = master_server_entry;
+    master_client_.SetHeartbeatRpcPort(config.heartbeat_rpc_port);
     SetMasterDiscoveryConfig(config);
 
     ErrorCode err = ConnectToMaster(master_server_entry);
