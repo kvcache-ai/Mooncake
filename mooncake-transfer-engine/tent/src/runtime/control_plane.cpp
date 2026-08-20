@@ -95,8 +95,7 @@ Status ControlClient::recvData(const std::string& server_addr,
     if (response.size() != length)
         return Status::RpcServiceError(
             "RecvData failed: target address not in registered buffer");
-    Platform::getLoader().copy(local_mem_addr, response.data(), length);
-    return Status::OK();
+    return Platform::getLoader().copy(local_mem_addr, response.data(), length);
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {
@@ -397,7 +396,15 @@ void ControlService::onSendData(const std::string_view& request,
     }
 
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
+        auto status = Platform::getLoader().copy((void*)peer_mem_addr, &desc[1],
+                                                 length);
+        if (!status.ok()) {
+            // A non-empty response is interpreted as an RPC error by the
+            // client (see ControlClient::sendData). Without this the sender's
+            // transfer would be reported COMPLETED even though the destination
+            // buffer was never written.
+            response = "SendData failed: copy: " + status.ToString();
+        }
     } else {
         response = "SendData failed: target address not in registered buffer";
     }
@@ -423,8 +430,15 @@ void ControlService::onRecvData(const std::string_view& request,
 
     if (local_desc->findBuffer(peer_mem_addr, length)) {
         response.resize(length);
-        Platform::getLoader().copy(response.data(), (void*)peer_mem_addr,
-                                   length);
+        auto status = Platform::getLoader().copy(response.data(),
+                                                 (void*)peer_mem_addr, length);
+        if (!status.ok()) {
+            // Clear the payload so the client sees a length mismatch (see
+            // ControlClient::recvData) rather than copying partial/garbage
+            // bytes into its local buffer.
+            response.clear();
+            response = "RecvData failed: copy: " + status.ToString();
+        }
     } else {
         response = "RecvData failed: target address not in registered buffer";
     }
