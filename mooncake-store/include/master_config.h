@@ -976,11 +976,6 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
-    InProcMasterConfigBuilder& set_heartbeat_rpc_thread_num(uint32_t num) {
-        heartbeat_rpc_thread_num_ = num;
-        return *this;
-    }
-
     InProcMasterConfig build() const;
 };
 
