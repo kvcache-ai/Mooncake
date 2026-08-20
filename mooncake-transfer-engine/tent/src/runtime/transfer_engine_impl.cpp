@@ -48,6 +48,12 @@ namespace tent {
 namespace {
 constexpr uint8_t kRedisMaxDbIndex = 255;
 constexpr uint8_t kRedisDefaultDbIndex = 0;
+
+// After this many consecutive failed reclaim attempts, lazyFreeBatch stops
+// retrying a batch (see Batch::reclaim_abandoned). Transient errors heal in a
+// pass or two and a healthy-but-inflight batch reports PENDING (which resets
+// the counter), so only a permanently failing poll or queue retire gets here.
+constexpr size_t kMaxReclaimAttempts = 4096;
 }  // namespace
 
 struct Batch {
@@ -61,6 +67,13 @@ struct Batch {
     size_t runtime_refs{0};
     bool free_requested{false};
     uint64_t queue_token{0};
+    // Consecutive lazyFreeBatch passes that failed to reclaim this batch
+    // (poll error or queue retire error). Reset when a pass observes the
+    // batch healthy (PENDING). At kMaxReclaimAttempts the batch is marked
+    // reclaim_abandoned: the sweep stops retrying (and warning) and leaves
+    // it for deconstruct(), which reclaims the freelist unconditionally.
+    size_t reclaim_failures{0};
+    bool reclaim_abandoned{false};
 
     struct SubmitHook {
         size_t start_task_id{0};
@@ -846,13 +859,14 @@ Status TransferEngineImpl::lazyFreeBatch() {
     for (auto it = batch_set_.freelist.begin();
          it != batch_set_.freelist.end();) {
         auto& batch = *it;
-        if (batch->runtime_refs > 0) {
+        if (batch->runtime_refs > 0 || batch->reclaim_abandoned) {
             it++;
             continue;
         }
         TransferStatus overall_status;
         auto status = getTransferStatus((BatchID)batch, overall_status);
         if (status.ok() && overall_status.s == PENDING) {
+            batch->reclaim_failures = 0;
             it++;
             continue;
         }
@@ -861,10 +875,21 @@ Status TransferEngineImpl::lazyFreeBatch() {
             status = retireQueueForBatch(batch);
         }
         if (!status.ok()) {
-            LOG_EVERY_N(WARNING, 100)
-                << "lazyFreeBatch: batch " << batch
-                << " cannot be reclaimed yet, left in freelist: "
-                << status.ToString();
+            if (++batch->reclaim_failures >= kMaxReclaimAttempts) {
+                batch->reclaim_abandoned = true;
+                TENT_RECORD_BATCH_QUARANTINED();
+                LOG(ERROR) << "lazyFreeBatch: batch " << batch << " failed "
+                           << batch->reclaim_failures
+                           << " consecutive reclaim attempts; giving up until "
+                              "engine teardown reclaims it unconditionally. "
+                              "Last error: "
+                           << status.ToString();
+            } else {
+                LOG_EVERY_N(WARNING, 100)
+                    << "lazyFreeBatch: batch " << batch
+                    << " cannot be reclaimed yet, left in freelist: "
+                    << status.ToString();
+            }
             if (first_error.ok()) first_error = status;
             it++;
             continue;
