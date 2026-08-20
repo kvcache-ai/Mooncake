@@ -10,6 +10,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -22,6 +23,7 @@
 #include "tent/thirdparty/nlohmann/json.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
+#include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/endpoint_store.h"
 #include "tent/transport/ub/params.h"
@@ -146,6 +148,16 @@ struct UbTransport::Impl {
             by_topology_name.emplace(device.topology_name, std::move(device));
         }
 
+        const bool explicit_filter = !params.device_filter.empty();
+        const bool prefer_bonding =
+            !explicit_filter &&
+            std::any_of(by_topology_name.begin(), by_topology_name.end(),
+                        [](const auto& entry) {
+                            return ub::isBondingDevice(entry.second);
+                        });
+        std::vector<std::string> preferred_names;
+        std::vector<std::string> skipped_names;
+
         for (size_t id = 0; id < local_topology->getNicCount(); ++id) {
             const auto* nic = local_topology->getNicEntry(static_cast<int>(id));
             if (!nic || nic->type != Topology::NIC_UB) continue;
@@ -154,6 +166,10 @@ struct UbTransport::Impl {
                 continue;
             }
             if (!filterAllows(params.device_filter, found->second)) continue;
+            if (prefer_bonding && !ub::isBondingDevice(found->second)) {
+                skipped_names.push_back(found->second.native_device_name);
+                continue;
+            }
 
             ub::JfcOptions jfc_options;
             const auto& device_caps = found->second.capabilities;
@@ -175,12 +191,42 @@ struct UbTransport::Impl {
                              << status.ToString();
                 continue;
             }
+            preferred_names.push_back(found->second.native_device_name);
             context_by_topology_id.emplace(static_cast<int>(id), context);
             context_by_topology_name.emplace(nic->name, context);
             jfc_depth_by_device.emplace(static_cast<Topology::NicID>(id),
                                         jfc_options.depth);
             contexts.push_back(std::move(context));
         }
+
+        {
+            std::ostringstream selection_log;
+            if (explicit_filter) {
+                selection_log << "UB device selection: mode=explicit-filter";
+            } else if (prefer_bonding) {
+                selection_log << "UB device selection: mode=auto-prefer-bonding";
+            } else {
+                selection_log << "UB device selection: mode=all-devices";
+            }
+            if (!preferred_names.empty()) {
+                selection_log << " preferred=[";
+                for (size_t i = 0; i < preferred_names.size(); ++i) {
+                    if (i != 0) selection_log << ", ";
+                    selection_log << preferred_names[i];
+                }
+                selection_log << "]";
+            }
+            if (!skipped_names.empty()) {
+                selection_log << " skipped=[";
+                for (size_t i = 0; i < skipped_names.size(); ++i) {
+                    if (i != 0) selection_log << ", ";
+                    selection_log << skipped_names[i];
+                }
+                selection_log << "]";
+            }
+            LOG(INFO) << selection_log.str();
+        }
+
         if (contexts.empty()) {
             return failInstall(Status::DeviceNotFound(
                 "No UB context initialized successfully" LOC_MARK));

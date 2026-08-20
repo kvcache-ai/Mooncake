@@ -23,6 +23,7 @@
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/slice.h"
+#include "tent/transport/ub/device_selection.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -298,6 +299,65 @@ TEST(UbRailMonitorTest, OutOfOrderExpiredErrorDoesNotTriggerPause) {
     EXPECT_EQ(stats.last_error_ns, 200U);
     EXPECT_EQ(stats.pauses, 0U);
     EXPECT_EQ(stats.recoveries, 0U);
+}
+
+DeviceInfo makeDevice(std::string native_name, std::string topology_name = "") {
+    DeviceInfo info;
+    info.native_device_name = std::move(native_name);
+    info.topology_name = topology_name.empty()
+                             ? ("ub:" + info.native_device_name + ":eid0")
+                             : std::move(topology_name);
+    info.active = true;
+    return info;
+}
+
+TEST(UbDeviceSelectionTest, DetectsBondingNamesCaseInsensitively) {
+    EXPECT_TRUE(isBondingDeviceName("bonding_dev_0"));
+    EXPECT_TRUE(isBondingDeviceName("Bonding_Dev_0"));
+    EXPECT_TRUE(isBondingDeviceName("ub:bonding_dev_0:eid0"));
+    EXPECT_TRUE(isBondingDeviceName("foo_bond_bar"));
+    EXPECT_FALSE(isBondingDeviceName("udmac1d1e2"));
+    EXPECT_FALSE(isBondingDeviceName("ub:udmac1d1e2:eid0"));
+}
+
+TEST(UbDeviceSelectionTest, PrefersBondingWhenPresentAndFilterEmpty) {
+    const std::vector<DeviceInfo> devices = {
+        makeDevice("udmac1d1e2"),
+        makeDevice("bonding_dev_0"),
+        makeDevice("udmac0d0e1"),
+    };
+    const auto selected =
+        preferBondingDevicesIfPresent(devices, /*explicit_filter=*/false);
+    ASSERT_EQ(selected.size(), 1U);
+    EXPECT_EQ(selected[0].native_device_name, "bonding_dev_0");
+}
+
+TEST(UbDeviceSelectionTest, KeepsAllDevicesWhenNoBondingPresent) {
+    const std::vector<DeviceInfo> devices = {
+        makeDevice("udmac1d1e2"),
+        makeDevice("udmac0d0e1"),
+    };
+    const auto selected =
+        preferBondingDevicesIfPresent(devices, /*explicit_filter=*/false);
+    ASSERT_EQ(selected.size(), 2U);
+    EXPECT_EQ(selected[0].native_device_name, "udmac1d1e2");
+    EXPECT_EQ(selected[1].native_device_name, "udmac0d0e1");
+}
+
+TEST(UbDeviceSelectionTest, ExplicitFilterSkipsAutoPrefer) {
+    const std::vector<DeviceInfo> devices = {
+        makeDevice("udmac1d1e2"),
+        makeDevice("bonding_dev_0"),
+    };
+    const auto selected =
+        preferBondingDevicesIfPresent(devices, /*explicit_filter=*/true);
+    ASSERT_EQ(selected.size(), 2U);
+}
+
+TEST(UbDeviceSelectionTest, EmptyInputStaysEmpty) {
+    const auto selected =
+        preferBondingDevicesIfPresent({}, /*explicit_filter=*/false);
+    EXPECT_TRUE(selected.empty());
 }
 
 }  // namespace
