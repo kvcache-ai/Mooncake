@@ -8,12 +8,14 @@
 
 #include "transport/flagcx_transport/flagcx_transport.h"
 
+#include "transport/flagcx_transport/flagcx_transport_internal.h"
+
 #include <glog/logging.h>
 
 #include <cassert>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -68,35 +70,52 @@ int FlagCxTransport::install(std::string &local_server_name,
         return -1;
     }
 
+    bool rpc_server_started = false;
+    auto cleanup_engine = [this, &rpc_server_started]() {
+        if (!engine_) return;
+        if (rpc_server_started) flagcxP2pEngineStopAccept(engine_);
+        flagcxP2pEngineDestroy(engine_);
+        engine_ = nullptr;
+        flagcx_endpoint_.clear();
+    };
+
     // Bring up the accept daemon so peers can RDMA into our registered
     // regions.  Idempotent; safe even though buffers register later.
     if (flagcxP2pEngineStartRpcServer(engine_) != 0) {
         LOG(ERROR) << "FlagCxTransport: flagcxP2pEngineStartRpcServer failed";
+        cleanup_engine();
         return -1;
     }
+    rpc_server_started = true;
 
     // The engine metadata string is "ip:rdma_port?gpu_index?notif_port";
     // the leading "ip:rdma_port" doubles as the GetConn session id, and
     // rdma_port == the RPC/handshake port (flagcxP2pEngineGetRpcPort).
     char *meta_str = nullptr;
-    if (flagcxP2pEngineGetMetadata(engine_, &meta_str) != 0 || !meta_str) {
+    const int metadata_rc = flagcxP2pEngineGetMetadata(engine_, &meta_str);
+    std::unique_ptr<char[]> meta_owner(meta_str);
+    if (metadata_rc != 0 || !meta_owner) {
         LOG(ERROR) << "FlagCxTransport: flagcxP2pEngineGetMetadata failed";
+        cleanup_engine();
         return -1;
     }
-    std::string md(meta_str);
-    std::free(meta_str);
+    std::string md(meta_owner.get());
     auto q = md.find('?');
     flagcx_endpoint_ = (q == std::string::npos) ? md : md.substr(0, q);
     if (flagcx_endpoint_.empty()) {
         LOG(ERROR) << "FlagCxTransport: empty flagcx endpoint from metadata '"
                    << md << "'";
+        cleanup_engine();
         return -1;
     }
 
     LOG(INFO) << "FlagCxTransport: engine up, endpoint=" << flagcx_endpoint_
               << " (rpc_port=" << flagcxP2pEngineGetRpcPort(engine_) << ")";
 
-    if (allocateLocalSegment() != 0) return -1;
+    if (allocateLocalSegment() != 0) {
+        cleanup_engine();
+        return -1;
+    }
 
     completion_running_.store(true, std::memory_order_release);
     completion_thread_ = std::thread(&FlagCxTransport::completionLoop, this);
@@ -139,9 +158,10 @@ void FlagCxTransport::runSliceGroup(const std::vector<Slice *> &group) {
             break;
         }
         FlagcxP2pRdmaDesc desc;
+        const uint32_t descriptor_length =
+            flagcx_internal::descriptorLength(s->length);
         if (flagcxP2pEngineMakeDesc(conn, s->flagcx.dest_offset,
-                                    static_cast<uint32_t>(s->length),
-                                    &desc) != 0) {
+                                    descriptor_length, &desc) != 0) {
             LOG(ERROR) << "FlagCxTransport: MakeDesc failed for remote VA 0x"
                        << std::hex << s->flagcx.dest_offset << std::dec;
             ok = false;
@@ -317,24 +337,33 @@ int FlagCxTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 
 int FlagCxTransport::registerLocalMemoryBatch(
     const std::vector<BufferEntry> &buffer_list, const std::string &location) {
-    for (const auto &b : buffer_list)
-        registerLocalMemory(b.addr, b.length, location, true, false);
-    return metadata_->updateLocalSegmentDesc();
+    int first_error = 0;
+    for (const auto &b : buffer_list) {
+        int rc = registerLocalMemory(b.addr, b.length, location, true, false);
+        if (first_error == 0 && rc != 0) first_error = rc;
+    }
+    int metadata_rc = metadata_->updateLocalSegmentDesc();
+    return first_error != 0 ? first_error : metadata_rc;
 }
 
 int FlagCxTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    for (auto a : addr_list) unregisterLocalMemory(a, false);
-    return metadata_->updateLocalSegmentDesc();
+    int first_error = 0;
+    for (auto a : addr_list) {
+        int rc = unregisterLocalMemory(a, false);
+        if (first_error == 0 && rc != 0) first_error = rc;
+    }
+    int metadata_rc = metadata_->updateLocalSegmentDesc();
+    return first_error != 0 ? first_error : metadata_rc;
 }
 
 bool FlagCxTransport::resolveLocalMr(void *addr, size_t length,
                                      FlagcxP2pMr &mr_out) {
     std::lock_guard<std::mutex> lk(reg_mu_);
     for (const auto &r : regs_) {
-        char *base = reinterpret_cast<char *>(r.addr);
-        char *hit = reinterpret_cast<char *>(addr);
-        if (hit >= base && hit + length <= base + r.length) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(r.addr);
+        const uintptr_t hit = reinterpret_cast<uintptr_t>(addr);
+        if (flagcx_internal::containsRange(base, r.length, hit, length)) {
             mr_out = r.mr;
             return true;
         }
