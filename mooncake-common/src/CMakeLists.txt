@@ -46,8 +46,7 @@ target_include_directories(
          $<INSTALL_INTERFACE:include>)
 
 target_link_libraries(
-  mooncake_common PUBLIC asio_shared yaml-cpp JsonCpp::JsonCpp
-                         yalantinglibs::yalantinglibs)
+  mooncake_common PUBLIC asio_shared yaml-cpp JsonCpp::JsonCpp)
 
 if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_common DESTINATION lib)

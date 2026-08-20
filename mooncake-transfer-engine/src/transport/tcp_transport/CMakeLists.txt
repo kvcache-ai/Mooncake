@@ -9,7 +9,7 @@ endif()
 add_library(tcp_transport OBJECT ${TCP_SOURCES})
 target_link_libraries(
   tcp_transport
-  PUBLIC asio_shared JsonCpp::JsonCpp yalantinglibs::yalantinglibs
+  PUBLIC asio_shared JsonCpp::JsonCpp
   PRIVATE glog::glog)
 
 if(BUILD_UNIT_TESTS)

@@ -666,5 +666,6 @@ if(NOT TARGET gflags::gflags)
     endif()
   endforeach()
 endif()
-find_package(yalantinglibs CONFIG REQUIRED)
+
+include(${CMAKE_CURRENT_LIST_DIR}/FindYLT.cmake)
 add_compile_definitions(YLT_ENABLE_IBV)
