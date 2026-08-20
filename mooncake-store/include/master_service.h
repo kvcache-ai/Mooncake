@@ -4,7 +4,6 @@
 #include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
-#include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -29,6 +28,8 @@
 
 #include "allocation_strategy.h"
 #include "background_worker.h"
+#include "client_liveness.h"
+#include "client_offboarding.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
@@ -95,6 +96,7 @@ class MasterServiceHATest;
 // invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
 // ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
 class MasterServiceProcessingKeyDoubleEraseTest;
+class MasterServiceTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -110,6 +112,10 @@ class BatchEvictBench;
  * 5. tenant_quota_recompute_mutex_
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
+ *
+ * A ClientLivenessRecord transition mutex may be acquired after
+ * client_mutex_ and snapshot_mutex_. It must not be held across metadata-shard
+ * scans, and callbacks executed under it must not reacquire client_mutex_.
  *
  * Strict tenant admission and policy mutation paths that need both
  * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
@@ -132,8 +138,10 @@ class MasterService {
     friend class test::MasterScenario;
     // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
     friend class test::MasterServiceProcessingKeyDoubleEraseTest;
+    friend class test::MasterServiceTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
+    friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
@@ -912,6 +920,7 @@ class MasterService {
 
     // Restore master state
     void RestoreState();
+    void RebuildClientLivenessAfterRestore();
     void ResetStateAfterFailedRestoreAttempt();
 
     /**
@@ -941,6 +950,10 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
 
+    std::shared_ptr<ClientLivenessRecord> FindClientRecord(
+        const UUID& client_id) const;
+    std::unordered_set<UUID, boost::hash<UUID>>
+    GetRetainedClientIdsSnapshot() const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
@@ -1208,6 +1221,13 @@ class MasterService {
             return it != replicas_.end() ? &(*it) : nullptr;
         }
 
+        const Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
         Replica* GetReplicaByID(const ReplicaID& id) {
             return GetFirstReplica(
                 [&id](const Replica& replica) { return replica.id() == id; });
@@ -1254,6 +1274,17 @@ class MasterService {
                     }
                 }
                 return false;
+            });
+        }
+
+        const Replica* GetReplicaBySegmentName(
+            const std::string& segment_name) const {
+            return GetFirstReplica([&segment_name](const Replica& replica) {
+                const auto names = replica.get_segment_names();
+                return std::any_of(
+                    names.begin(), names.end(), [&](const auto& name_opt) {
+                        return name_opt == segment_name;
+                    });
             });
         }
 
@@ -1482,6 +1513,43 @@ class MasterService {
         int64_t expire_at_ms_epoch{0};
         UUID task_id{};
     };
+
+    class ClientServingReadView {
+       public:
+        explicit ClientServingReadView(const MasterService* service)
+            : service_(service), lock_(service->client_mutex_) {}
+
+        [[nodiscard]] bool IsServing(const UUID& client_id) const {
+            const auto it =
+                service_->client_liveness_records_.find(client_id);
+            return it != service_->client_liveness_records_.end() &&
+                   it->second->IsServing();
+        }
+
+        [[nodiscard]] std::shared_ptr<ClientLivenessRecord> FindRecord(
+            const UUID& client_id) const {
+            const auto it =
+                service_->client_liveness_records_.find(client_id);
+            return it == service_->client_liveness_records_.end()
+                       ? nullptr
+                       : it->second;
+        }
+
+       private:
+        const MasterService* service_;
+        std::shared_lock<std::shared_mutex> lock_;
+    };
+
+    [[nodiscard]] bool IsReplicaServing(
+        const Replica& replica,
+        const ClientServingReadView& clients) const;
+    [[nodiscard]] bool HasVisibleCompletedReplica(
+        const ObjectMetadata& metadata,
+        const ClientServingReadView& clients) const;
+    [[nodiscard]] std::vector<Replica::Descriptor>
+    GetVisibleReplicaDescriptors(
+        const ObjectMetadata& metadata,
+        const ClientServingReadView& clients) const;
 
     struct ReplicationTask {
         UUID client_id;
@@ -2354,6 +2422,9 @@ class MasterService {
 
     // Client related members
     mutable std::shared_mutex client_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        client_liveness_records_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
@@ -2362,15 +2433,12 @@ class MasterService {
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    // boost lockfree queue requires trivial assignment operator
-    struct PodUUID {
-        uint64_t first;
-        uint64_t second;
-    };
-    static constexpr size_t kClientPingQueueSize =
-        128 * 1024;  // Size of the client ping queue
-    boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
-    const int64_t client_live_ttl_sec_;
+    [[nodiscard]] bool ShouldSkipSnapshotForClientOffboarding() {
+        return client_offboarding_worker_.ShouldSkipSnapshot();
+    }
+    ClientOffboardingWorker client_offboarding_worker_{this};
+    const int64_t client_active_ttl_sec_;
+    const int64_t client_suspicion_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;

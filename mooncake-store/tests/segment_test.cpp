@@ -15,6 +15,10 @@ namespace mooncake {
 // Test fixture for Segment tests
 class SegmentTest : public ::testing::Test {
    protected:
+    std::shared_ptr<ClientLivenessRecord> client_liveness_ =
+        std::make_shared<ClientLivenessRecord>(
+            ClientLivenessRecord::Clock::now());
+
     void SetUp() override {
         // Initialize glog for logging
         google::InitGoogleLogging("EvictionStrategyTest");
@@ -77,9 +81,8 @@ class SegmentTest : public ::testing::Test {
             // validate allocator exist in allocator_manager
             MountedSegment mounted_segment =
                 segment_manager.mounted_segments_.at(segment.id);
-            auto allocator = mounted_segment.buf_allocator;
             ASSERT_NE(std::find(allocators->begin(), allocators->end(),
-                                mounted_segment.buf_allocator),
+                                mounted_segment.allocator_registration),
                       allocators->end());
         }
     }
@@ -110,7 +113,8 @@ class SegmentTest : public ::testing::Test {
         }
 
         return std::find(allocators->begin(), allocators->end(),
-                         mounted_segment.buf_allocator) != allocators->end();
+                         mounted_segment.allocator_registration) !=
+               allocators->end();
     }
 };
 
@@ -128,7 +132,7 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
 
     // Get segment access and attempt to mount
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_), ErrorCode::OK);
 
     // Verify segment is properly mounted
     ValidateMountedSegment(segment_manager, segment, client_id);
@@ -153,13 +157,13 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
 
     // Get segment access and mount first time
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_), ErrorCode::OK);
 
     // Verify first mount
     ValidateMountedSegment(segment_manager, segment, client_id);
 
     // Test duplicate mount - mount the same segment again
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
               ErrorCode::SEGMENT_ALREADY_EXISTS);
 
     // Verify state remains the same after duplicate mount
@@ -173,7 +177,7 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
     segment2.base = segment.base + segment.size;
 
     // Mount the second segment
-    ASSERT_EQ(segment_access.MountSegment(segment2, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment2, client_id, client_liveness_), ErrorCode::OK);
 
     // Verify both segments are mounted correctly
     std::vector<Segment> segments = {segment, segment2};
@@ -199,7 +203,7 @@ TEST_F(SegmentTest, UnmountSegmentSuccess) {
 
     // Get segment access and mount
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_), ErrorCode::OK);
 
     // Verify segment is mounted correctly
     ValidateMountedSegment(segment_manager, segment, client_id);
@@ -242,7 +246,7 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
 
     // Get segment access and mount
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_), ErrorCode::OK);
 
     // Verify initial mounted state
     ValidateMountedSegment(segment_manager, segment, client_id);
@@ -285,7 +289,7 @@ TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
     UUID client_id = generate_uuid();
 
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_), ErrorCode::OK);
 
     SegmentStatus status = SegmentStatus::UNDEFINED;
     ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
@@ -343,9 +347,9 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
 
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment0, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment0, client_id, client_liveness_),
                   ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountSegment(segment1, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment1, client_id, client_liveness_),
                   ErrorCode::OK);
     }
 
@@ -415,9 +419,9 @@ TEST_F(SegmentTest, HostOrderedSegmentsKeepsNameUntilLastSameNameSegmentGone) {
     UUID client_id = generate_uuid();
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment0, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment0, client_id, client_liveness_),
                   ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountSegment(segment1, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment1, client_id, client_liveness_),
                   ErrorCode::OK);
     }
 
@@ -469,9 +473,9 @@ TEST_F(SegmentTest, HostOrderedSegmentsRotateWithinSameHostByKey) {
     UUID client_id = generate_uuid();
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment_a, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment_a, client_id, client_liveness_),
                   ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountSegment(segment_b, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment_b, client_id, client_liveness_),
                   ErrorCode::OK);
     }
 
@@ -500,7 +504,7 @@ TEST_F(SegmentTest, PrepareUnmountDrainedSegment) {
     UUID client_id = generate_uuid();
 
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_), ErrorCode::OK);
     ASSERT_EQ(segment_access.SetSegmentStatusByName(segment.name,
                                                     SegmentStatus::DRAINED),
               ErrorCode::OK);
@@ -538,7 +542,7 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
 
     // Get segment access and mount segment A
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment_a, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment_a, client_id, client_liveness_), ErrorCode::OK);
 
     // Verify segment A is mounted correctly
     ValidateMountedSegment(segment_manager, segment_a, client_id);
@@ -552,7 +556,7 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
 
     // Remount both segments A and B
     std::vector<Segment> segments_to_remount = {segment_a, segment_b};
-    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id),
+    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id, client_liveness_),
               ErrorCode::OK);
 
     // Verify both segments are mounted correctly
@@ -582,7 +586,7 @@ TEST_F(SegmentTest, ReMountUnmountingSegment) {
 
     // Get segment access and mount segment A
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment_a, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment_a, client_id, client_liveness_), ErrorCode::OK);
 
     // Verify segment A is mounted correctly
     ValidateMountedSegment(segment_manager, segment_a, client_id);
@@ -595,7 +599,7 @@ TEST_F(SegmentTest, ReMountUnmountingSegment) {
 
     // Attempt to remount segment A while it's in UNMOUNTING state
     std::vector<Segment> segments_to_remount = {segment_a};
-    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id),
+    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id, client_liveness_),
               ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 
     // Complete the unmount process
@@ -638,7 +642,7 @@ TEST_F(SegmentTest, QuerySegments) {
         UUID client_id = generate_uuid();
 
         // Mount segment
-        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
                   ErrorCode::OK);
 
         // Store for verification

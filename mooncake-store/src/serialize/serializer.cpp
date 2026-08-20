@@ -643,6 +643,12 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // Create AllocatedBuffer object
     auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
                                                     std::move(offsetHandle));
+    if (mountedSegment.allocator_registration) {
+        buffer->bindSegmentLifetime(
+            mountedSegment.allocator_registration->lifetime);
+        buffer->bindClientLiveness(
+            mountedSegment.allocator_registration->client_liveness);
+    }
     // buffer->status = status;
 
     return buffer;

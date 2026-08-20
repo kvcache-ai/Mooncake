@@ -32,6 +32,15 @@ const auto kStrategyTypes = ::testing::Values(
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
 
+void AddTestAllocator(
+    AllocatorManager& manager, const std::string& name,
+    const std::shared_ptr<BufferAllocatorBase>& allocator,
+    std::shared_ptr<ClientLivenessRecord> client_liveness =
+        std::make_shared<ClientLivenessRecord>(
+            ClientLivenessRecord::Clock::now())) {
+    manager.addAllocator(name, allocator, std::move(client_liveness));
+}
+
 // Base class for non-parameterized tests
 class AllocationStrategyTest : public ::testing::Test {
    protected:
@@ -127,14 +136,83 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
+TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    auto suspected = std::make_shared<ClientLivenessRecord>(initial);
+    ASSERT_EQ(suspected->Evaluate(initial + std::chrono::seconds(1),
+                                  std::chrono::seconds(1),
+                                  std::chrono::seconds(10)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    auto active = std::make_shared<ClientLivenessRecord>(initial);
+
+    auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared", 0x100000000ULL, 64 * MiB, "suspected");
+    auto active_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared", 0x110000000ULL, 64 * MiB, "active");
+    AllocatorManager allocator_manager;
+    AddTestAllocator(allocator_manager, "shared", suspected_allocator,
+                     suspected);
+    AddTestAllocator(allocator_manager, "shared", active_allocator, active);
+
+    // No SSD usage is registered: the SSD strategy still picks the serving
+    // registration.
+    LocalSsdManager local_ssd;
+    for (const auto strategy_type :
+         {AllocationStrategyType::RANDOM,
+          AllocationStrategyType::FREE_RATIO_FIRST,
+          AllocationStrategyType::SSD_FREE_RATIO_FIRST}) {
+        auto strategy = CreateAllocationStrategy(strategy_type, local_ssd);
+        auto result = strategy->Allocate(allocator_manager, 1024, 1,
+                                         {"shared"}, {});
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->size(), 1);
+        EXPECT_EQ((*result)[0]
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "active");
+    }
+}
+
+TEST_F(AllocationStrategyTest, CxlSkipsSuspectedRegistrationWithSameName) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    auto suspected = std::make_shared<ClientLivenessRecord>(initial);
+    ASSERT_EQ(suspected->Evaluate(initial + std::chrono::seconds(1),
+                                  std::chrono::seconds(1),
+                                  std::chrono::seconds(10)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    auto active = std::make_shared<ClientLivenessRecord>(initial);
+
+    AllocatorManager allocator_manager;
+    AddTestAllocator(allocator_manager,
+        "cxl", std::make_shared<OffsetBufferAllocator>(
+                   "cxl", DEFAULT_CXL_BASE, 64 * MiB, "suspected"),
+        suspected);
+    AddTestAllocator(allocator_manager,
+        "cxl", std::make_shared<OffsetBufferAllocator>(
+                   "cxl", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active"),
+        active);
+
+    CxlAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, 1024, 1, {"cxl"}, {});
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ((*result)[0]
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "cxl");
+}
+
 // Test preferred segment allocation when available
 TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentAllocation) {
     auto allocator1 = CreateTestAllocator("segment1", 0);
     auto allocator2 = CreateTestAllocator("preferred", 0x10000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("preferred", allocator2);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "preferred", allocator2);
 
     size_t slice_length = 1024;
     std::vector<std::string> preferred_segments = {"preferred"};
@@ -159,8 +237,8 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentNotFound) {
     auto allocator2 = CreateTestAllocator("segment2", 0x10000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("segment2", allocator2);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "segment2", allocator2);
 
     size_t slice_length = 1024;
     std::vector<std::string> preferred_segments = {"nonexistent"};
@@ -185,8 +263,8 @@ TEST_P(AllocationStrategyParameterizedTest, SingleSliceAllocation) {
     auto allocator2 = CreateTestAllocator("segment2", 0x10000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("segment2", allocator2);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "segment2", allocator2);
 
     size_t slice_length = 1024;
 
@@ -209,9 +287,9 @@ TEST_P(AllocationStrategyParameterizedTest, MultipleReplicasAllocation) {
     auto allocator3 = CreateTestAllocator("segment3", 0x20000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("segment2", allocator2);
-    allocator_manager.addAllocator("segment3", allocator3);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "segment2", allocator2);
+    AddTestAllocator(allocator_manager, "segment3", allocator3);
 
     size_t slice_length = 1024;
 
@@ -246,8 +324,8 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     auto allocator2 = CreateTestAllocator("preferred", 0x10000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("preferred", allocator2);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "preferred", allocator2);
 
     // First, fill up the preferred allocator
     std::vector<std::string> preferred_segments = {"preferred"};
@@ -287,8 +365,8 @@ TEST_P(AllocationStrategyParameterizedTest, AllAllocatorsFull) {
     auto allocator2 = CreateTestAllocator("segment2", 0x10000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("segment2", allocator2);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "segment2", allocator2);
 
     // Fill up both allocators
     size_t large_slice = 15 * 1024 * 1024;  // 15MB
@@ -316,7 +394,7 @@ TEST_P(AllocationStrategyParameterizedTest, ZeroSizeAllocation) {
     auto allocator = CreateTestAllocator("segment1", 0);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator);
+    AddTestAllocator(allocator_manager, "segment1", allocator);
 
     size_t zero_slice = 0;
 
@@ -330,7 +408,7 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
     auto allocator = CreateTestAllocator("segment1", 0);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator);
+    AddTestAllocator(allocator_manager, "segment1", allocator);
 
     size_t huge_slice = 100 * 1024 * 1024;  // 100MB (larger than 64MB capacity)
 
@@ -347,7 +425,7 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
         "segment1", 0x100000000ULL, 64 * MiB, "segment1");
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator);
+    AddTestAllocator(allocator_manager, "segment1", allocator);
 
     size_t slice_length = 1024;
 
@@ -366,8 +444,8 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
         "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2");
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("segment2", allocator2);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "segment2", allocator2);
 
     size_t slice_length = 1024;
 
@@ -406,10 +484,10 @@ TEST_P(AllocationStrategyParameterizedTest,
     auto allocator4 = CreateTestAllocator("segment4", 0x30000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("preferred1", allocator2);
-    allocator_manager.addAllocator("preferred2", allocator3);
-    allocator_manager.addAllocator("segment4", allocator4);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "preferred1", allocator2);
+    AddTestAllocator(allocator_manager, "preferred2", allocator3);
+    AddTestAllocator(allocator_manager, "segment4", allocator4);
 
     size_t slice_length = 1024;
     std::vector<std::string> preferred_segments = {
@@ -438,10 +516,10 @@ TEST_P(AllocationStrategyParameterizedTest, ExcludedSegmentsAllocation) {
     auto allocator4 = CreateTestAllocator("segment4", 0x30000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("segment2", allocator2);
-    allocator_manager.addAllocator("segment3", allocator3);
-    allocator_manager.addAllocator("segment4", allocator4);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "segment2", allocator2);
+    AddTestAllocator(allocator_manager, "segment3", allocator3);
+    AddTestAllocator(allocator_manager, "segment4", allocator4);
 
     size_t slice_length = 1024;
     std::set<std::string> excluded_segments = {"segment1", "segment3"};
@@ -471,7 +549,7 @@ TEST_F(AllocationStrategyTest, AllSegmentsExcluded) {
         "segment1", 0x100000000ULL, 64 * MiB, "segment1");
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
 
     size_t slice_length = 1024;
     std::set<std::string> excluded_segments = {"segment1"};
@@ -491,10 +569,10 @@ TEST_P(AllocationStrategyParameterizedTest,
     auto allocator4 = CreateTestAllocator("segment4", 0x30000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("preferred", allocator2);
-    allocator_manager.addAllocator("segment3", allocator3);
-    allocator_manager.addAllocator("segment4", allocator4);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "preferred", allocator2);
+    AddTestAllocator(allocator_manager, "segment3", allocator3);
+    AddTestAllocator(allocator_manager, "segment4", allocator4);
 
     size_t slice_length = 1024;
     std::vector<std::string> preferred_segments = {"preferred"};
@@ -532,9 +610,9 @@ TEST_P(AllocationStrategyParameterizedTest,
     auto allocator3 = CreateTestAllocator("segment3", 0x20000000ULL);
 
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("segment1", allocator1);
-    allocator_manager.addAllocator("segment2", allocator2);
-    allocator_manager.addAllocator("segment3", allocator3);
+    AddTestAllocator(allocator_manager, "segment1", allocator1);
+    AddTestAllocator(allocator_manager, "segment2", allocator2);
+    AddTestAllocator(allocator_manager, "segment3", allocator3);
 
     size_t slice_length = 1024;
     std::vector<std::string> preferred_segments = {
@@ -580,7 +658,7 @@ TEST_P(AllocationStrategyParameterizedTest,
     AllocatorManager allocator_manager;
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = std::to_string(i) + "-segment";
-        allocator_manager.addAllocator(
+        AddTestAllocator(allocator_manager,
             name, CreateTestAllocator(name, i * 128 * MiB, kSegmentSizes[i]));
     }
 
@@ -664,7 +742,7 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
     AllocatorManager allocator_manager;
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
-        allocator_manager.addAllocator(
+        AddTestAllocator(allocator_manager,
             name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
                                                           kSegmentSize, name));
     }
@@ -727,7 +805,7 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
     AllocatorManager allocator_manager;
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
-        allocator_manager.addAllocator(
+        AddTestAllocator(allocator_manager,
             name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
                                                           kSegmentSize, name));
     }
@@ -762,7 +840,7 @@ class SsdPlacementTestState {
    public:
     void AddSegment(const std::string& name, size_t index, size_t segment_size,
                     int64_t total_capacity, int64_t used_bytes) {
-        allocators.addAllocator(
+        allocators.addIndependentAllocator(
             name, std::make_shared<OffsetBufferAllocator>(
                       name, 0x100000000ULL + index * segment_size, segment_size,
                       name));
@@ -775,7 +853,7 @@ class SsdPlacementTestState {
     }
 
     void AddSegmentWithoutSsd(const std::string& name, size_t segment_size) {
-        allocators.addAllocator(
+        allocators.addIndependentAllocator(
             name, std::make_shared<OffsetBufferAllocator>(name, 0x100000000ULL,
                                                           segment_size, name));
         client_by_name.emplace(name, UUID{1, 100});
