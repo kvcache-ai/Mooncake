@@ -471,10 +471,9 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
-void RegisterRpcService(
-    coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedMasterService& wrapped_master_service,
-    bool include_heartbeat) {
+void RegisterRpcService(coro_rpc::coro_rpc_server& server,
+                        mooncake::WrappedMasterService& wrapped_master_service,
+                        bool include_heartbeat) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(

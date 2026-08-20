@@ -307,8 +307,9 @@ tl::expected<HeartbeatResponse, ErrorCode> MasterClient::Heartbeat(
 
     // Send via the dedicated heartbeat accessor (separate pool that targets the
     // master's heartbeat server when configured, else the main pool).
-    auto result = invoke_rpc_via<&WrappedMasterService::Heartbeat,
-                                 HeartbeatResponse>(heartbeat_accessor_, req);
+    auto result =
+        invoke_rpc_via<&WrappedMasterService::Heartbeat, HeartbeatResponse>(
+            heartbeat_accessor_, req);
     timer.LogResponseExpected(result);
     return result;
 }

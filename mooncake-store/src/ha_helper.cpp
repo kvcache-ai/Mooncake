@@ -365,8 +365,9 @@ int MasterServiceSupervisor::Start() {
                     WrappedMasterServiceConfig(config_, view_version));
             wrapped_master_service->init();
             RegisterCentralizedRpcService(
-                server, static_cast<WrappedCentralizedMasterService&>(
-                            *wrapped_master_service),
+                server,
+                static_cast<WrappedCentralizedMasterService&>(
+                    *wrapped_master_service),
                 /*include_heartbeat=*/main_includes_heartbeat);
         } else {
             auto p2p_wrapped_service =
@@ -388,8 +389,9 @@ int MasterServiceSupervisor::Start() {
                     return -1;
                 }
             }
-            RegisterP2PRpcService(server, *p2p_wrapped_service,
-                                  /*include_heartbeat=*/main_includes_heartbeat);
+            RegisterP2PRpcService(
+                server, *p2p_wrapped_service,
+                /*include_heartbeat=*/main_includes_heartbeat);
             wrapped_master_service = std::move(p2p_wrapped_service);
         }
 #ifdef STORE_USE_REDIS

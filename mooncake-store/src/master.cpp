@@ -940,8 +940,7 @@ int main(int argc, char* argv[]) {
         // RPCs on the main server cannot head-of-line-block heartbeats. The
         // heartbeat server always runs plain TCP (no init_ibv) to avoid
         // contending for IB resources with the main server.
-        const bool dedicated_heartbeat =
-            master_config.heartbeat_rpc_port > 0;
+        const bool dedicated_heartbeat = master_config.heartbeat_rpc_port > 0;
         // In dual mode (heartbeat_keep_on_main), keep Heartbeat on the main
         // server too so legacy clients keep working during migration.
         const bool main_includes_heartbeat =
@@ -967,8 +966,9 @@ int main(int argc, char* argv[]) {
             master_service->init();
 
             mooncake::RegisterCentralizedRpcService(
-                server, static_cast<mooncake::WrappedCentralizedMasterService&>(
-                            *master_service),
+                server,
+                static_cast<mooncake::WrappedCentralizedMasterService&>(
+                    *master_service),
                 /*include_heartbeat=*/main_includes_heartbeat);
         } else {
             master_service =
@@ -978,8 +978,9 @@ int main(int argc, char* argv[]) {
             master_service->init();
 
             mooncake::RegisterP2PRpcService(
-                server, static_cast<mooncake::WrappedP2PMasterService&>(
-                            *master_service),
+                server,
+                static_cast<mooncake::WrappedP2PMasterService&>(
+                    *master_service),
                 /*include_heartbeat=*/main_includes_heartbeat);
         }
 

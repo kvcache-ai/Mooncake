@@ -313,9 +313,9 @@ class ClientConfigBuilder {
             get_config_size(config, DictCommon::kMetricReportIntervalSeconds,
                             DictCommon::kDefaultMetricReportIntervalSeconds);
         RedisDiscoveryConfig redis_config = get_redis_discovery_config(config);
-        uint16_t heartbeat_rpc_port = static_cast<uint16_t>(get_config_size(
-            config, DictCommon::kHeartbeatRpcPort,
-            DictCommon::kDefaultHeartbeatRpcPort));
+        uint16_t heartbeat_rpc_port = static_cast<uint16_t>(
+            get_config_size(config, DictCommon::kHeartbeatRpcPort,
+                            DictCommon::kDefaultHeartbeatRpcPort));
 
         return build_centralized_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,
@@ -470,9 +470,9 @@ class ClientConfigBuilder {
             get_config_size(config, DictCommon::kMetricReportIntervalSeconds,
                             DictCommon::kDefaultMetricReportIntervalSeconds);
         RedisDiscoveryConfig redis_config = get_redis_discovery_config(config);
-        uint16_t heartbeat_rpc_port = static_cast<uint16_t>(get_config_size(
-            config, DictCommon::kHeartbeatRpcPort,
-            DictCommon::kDefaultHeartbeatRpcPort));
+        uint16_t heartbeat_rpc_port = static_cast<uint16_t>(
+            get_config_size(config, DictCommon::kHeartbeatRpcPort,
+                            DictCommon::kDefaultHeartbeatRpcPort));
 
         return build_p2p_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,

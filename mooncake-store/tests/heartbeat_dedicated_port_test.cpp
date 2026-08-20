@@ -42,8 +42,8 @@ class HeartbeatDedicatedPortTest : public ::testing::Test {
     void SetUp() override {
         heartbeat_port_ = getFreeTcpPort();
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
-                                       .set_heartbeat_rpc_port(heartbeat_port_)
-                                       .build()))
+                                      .set_heartbeat_rpc_port(heartbeat_port_)
+                                      .build()))
             << "Failed to start InProcMaster with dedicated heartbeat port";
     }
     void TearDown() override { master_.Stop(); }
