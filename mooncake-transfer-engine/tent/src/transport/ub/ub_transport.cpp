@@ -142,19 +142,28 @@ struct UbTransport::Impl {
         std::vector<ub::DeviceInfo> discovered;
         status = adapter->discoverDevices(discovered);
         if (!status.ok()) return failInstall(status);
+
+        const bool explicit_filter = !params.device_filter.empty();
+        const auto preferred_devices =
+            ub::preferBondingDevicesIfPresent(discovered, explicit_filter);
+        const bool prefer_bonding =
+            !explicit_filter &&
+            std::any_of(discovered.begin(), discovered.end(),
+                        [](const ub::DeviceInfo& device) {
+                            return ub::isBondingDevice(device);
+                        });
+        std::unordered_set<std::string> preferred_topology_names;
+        preferred_topology_names.reserve(preferred_devices.size());
+        for (const auto& device : preferred_devices) {
+            preferred_topology_names.insert(device.topology_name);
+        }
+
         std::unordered_map<std::string, ub::DeviceInfo> by_topology_name;
         std::unordered_map<Topology::NicID, uint32_t> jfc_depth_by_device;
         for (auto& device : discovered) {
             by_topology_name.emplace(device.topology_name, std::move(device));
         }
 
-        const bool explicit_filter = !params.device_filter.empty();
-        const bool prefer_bonding =
-            !explicit_filter &&
-            std::any_of(by_topology_name.begin(), by_topology_name.end(),
-                        [](const auto& entry) {
-                            return ub::isBondingDevice(entry.second);
-                        });
         std::vector<std::string> preferred_names;
         std::vector<std::string> skipped_names;
 
@@ -166,7 +175,8 @@ struct UbTransport::Impl {
                 continue;
             }
             if (!filterAllows(params.device_filter, found->second)) continue;
-            if (prefer_bonding && !ub::isBondingDevice(found->second)) {
+            if (preferred_topology_names.find(found->second.topology_name) ==
+                preferred_topology_names.end()) {
                 skipped_names.push_back(found->second.native_device_name);
                 continue;
             }

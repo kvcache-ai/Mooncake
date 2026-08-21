@@ -32,6 +32,8 @@
 
 #include <glog/logging.h>
 
+#include "tent/transport/ub/device_selection.h"
+
 #if defined(TENT_HAS_REAL_URMA) && TENT_HAS_REAL_URMA
 #include <urma_api.h>
 #include <urma_ubagg.h>
@@ -372,7 +374,7 @@ class RealContext final : public Context {
     urma_context_t* native() const noexcept { return native_; }
 
     bool isBondingDevice() const noexcept {
-        return info_.native_device_name.rfind("bonding", 0) == 0;
+        return ::mooncake::tent::ub::isBondingDevice(info_);
     }
 
     uint32_t ctpPriority() const noexcept { return ctp_priority_; }
@@ -589,12 +591,14 @@ class RealLocalSegment final : public LocalSegment {
     }
 
     Status close() {
+        Status status = Status::OK();
         if (native_ != nullptr) {
             const int rc = urma_unregister_seg(native_);
             if (rc != URMA_SUCCESS) {
-                return nativeError("urma_unregister_seg", rc);
+                status = nativeError("urma_unregister_seg", rc);
+            } else {
+                native_ = nullptr;
             }
-            native_ = nullptr;
         }
 
         if (token_id_ != nullptr) {
@@ -602,7 +606,7 @@ class RealLocalSegment final : public LocalSegment {
             token_id_ = nullptr;
         }
 
-        return Status::OK();
+        return status;
     }
 
    private:
@@ -1137,7 +1141,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
                 return nativePointerError("urma_create_context");
             }
 
-            if (requested.native_device_name.rfind("bonding", 0) == 0) {
+            if (isBondingDevice(requested)) {
                 bondp_set_bonding_mode_in_t bonding_mode{};
                 bonding_mode.bonding_mode = BONDP_BONDING_MODE_STANDALONE;
                 bonding_mode.bonding_level = BONDP_BONDING_LEVEL_IODIE;
@@ -1172,8 +1176,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
                 }
             }
 
-            if (requested.native_device_name.rfind("bonding", 0) == 0 &&
-                !ctp_priority_found) {
+            if (isBondingDevice(requested) && !ctp_priority_found) {
                 (void)urma_delete_context(native_context);
                 return Status::InvalidArgument(
                     "bonding URMA device has no CTP priority");
