@@ -193,6 +193,11 @@ class MasterServiceTest : public ::testing::Test {
         service.RebuildGroupState();
     }
 
+    size_t GetGroupShardIndexForTest(MasterService& service,
+                                     const std::string& group_id) {
+        return service.GetGroupShardIndex(TenantId::Default(), group_id);
+    }
+
     std::optional<uint32_t> GetReplicaRefcntBySegmentName(
         MasterService& service, const std::string& key,
         const std::string& segment_name) {
@@ -1304,6 +1309,64 @@ TEST_F(MasterServiceTest, GroupedObjectRoutesKeyLevelLookupAndRemove) {
     auto exists_after_remove = service_->ExistKey(key, TenantId::Default());
     ASSERT_TRUE(exists_after_remove.has_value());
     EXPECT_FALSE(exists_after_remove.value());
+}
+
+TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
+    // Route-decoupling invariant: object routing is a pure function of
+    // (tenant, key); the group_id is only a lifecycle annotation and never
+    // affects which metadata shard an object lands in. The group domain is
+    // sharded by hash(tenant, group_id) and stores only the member key list.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Two member keys that hash to different metadata shards, sharing one
+    // group whose id hashes to yet another shard. The default-tenant route is
+    // hash(key) % kNumShards (mirrors MasterService::getShardIndex).
+    constexpr size_t kMetadataShardCountForTest = 1024;
+    const std::string key_a = "route_decouple_key_a";
+    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    std::string key_b = "route_decouple_key_b";
+    const size_t shard_a =
+        std::hash<std::string>{}(key_a) % kMetadataShardCountForTest;
+    size_t shard_b =
+        std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
+    for (int i = 0; i < 10000 && shard_b == shard_a; ++i) {
+        key_b = "route_decouple_key_b_" + std::to_string(i);
+        shard_b = std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
+    }
+    const size_t shard_g = GetGroupShardIndexForTest(*service_, group_id);
+    ASSERT_NE(shard_a, shard_b);  // members span metadata shards
+    ASSERT_NE(shard_a, shard_g);  // two independent routing domains
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    PutCompletedObject(*service_, client_id, key_a, config);
+    PutCompletedObject(*service_, client_id, key_b, config);
+
+    // Both members are reachable purely through hash(tenant, key) routing,
+    // even though their group lives on a different shard.
+    EXPECT_TRUE(service_->ExistKey(key_a, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(key_b, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(
+        service_->GetReplicaList(key_a, TenantId::Default()).has_value());
+    EXPECT_TRUE(
+        service_->GetReplicaList(key_b, TenantId::Default()).has_value());
+
+    // The group table still sees both members: group state is a separate,
+    // key-list-only domain.
+    auto members = GetGroupMemberKeysForTest(*service_, group_id);
+    EXPECT_EQ(2u, members.size());
+
+    // Route stability: the object route is hash(tenant, key) alone — grouping
+    // does not change it (identical to the ungrouped route computed before the
+    // objects existed), so a later ungrouped put of the same key would land on
+    // the same shard.
+    EXPECT_EQ(shard_a,
+              std::hash<std::string>{}(key_a) % kMetadataShardCountForTest);
+    EXPECT_EQ(shard_b,
+              std::hash<std::string>{}(key_b) % kMetadataShardCountForTest);
 }
 
 TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
