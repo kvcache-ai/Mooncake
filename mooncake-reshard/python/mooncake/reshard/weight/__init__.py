@@ -17,6 +17,18 @@ from .manifest import (
     validate_runtime_bindings,
 )
 from .serde import weight_placement_from_json, weight_placement_to_json
+from .planner import (
+    LogicalTransferPlan,
+    LogicalTransferOperation,
+    PipelineRouteGroup,
+    PlacementExecutorPlan,
+    PlanningLimits,
+    TransferRegion,
+    plan_placement_transfer,
+    plan_placement_transfer_to_local_target,
+    plan_stored_transfer_to_target_placement,
+)
+from .storage_manifest import StoredFragment, WeightManifest
 
 __all__ = [
     "ParallelRank",
@@ -35,4 +47,15 @@ __all__ = [
     "validate_runtime_bindings",
     "weight_placement_from_json",
     "weight_placement_to_json",
+    "StoredFragment",
+    "WeightManifest",
+    "LogicalTransferPlan",
+    "LogicalTransferOperation",
+    "PipelineRouteGroup",
+    "PlacementExecutorPlan",
+    "PlanningLimits",
+    "TransferRegion",
+    "plan_placement_transfer",
+    "plan_placement_transfer_to_local_target",
+    "plan_stored_transfer_to_target_placement",
 ]

@@ -10,7 +10,7 @@ add_library(tent_metrics STATIC ${TENT_METRICS_SOURCES})
 # ODR violations")
 target_link_libraries(
   tent_metrics PUBLIC tent_common tent_interface yalantinglibs::yalantinglibs
-                      glog pthread)
+                      glog::glog pthread)
 
 # Pass compile definition based on option
 if(TENT_METRICS_ENABLED)

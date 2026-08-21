@@ -10,6 +10,19 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/FindJsonCpp.cmake)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
+  include(../cmake/Dependencies.cmake)
+
+  if(USE_REDIS)
+    mooncake_provide_hiredis(REQUIRED)
+  elseif(USE_TENT)
+    mooncake_provide_hiredis()
+  endif()
+  if(USE_TENT)
+    mooncake_provide_liburing()
+  endif()
+
+  add_subdirectory(../extern/pybind11
+                   ${CMAKE_CURRENT_BINARY_DIR}/extern/pybind11)
 
   # Build asio_shared in mooncake-common for standalone builds.
   # Set compile definitions before adding targets that include ASIO headers.
@@ -42,7 +55,6 @@ if (USE_CUDA)
       "CUDA IBGDA DMA-BUF DevX UMEM support disabled: the installed mlx5 headers or libmlx5 do not provide MLX5DV_UMEM_MASK_DMABUF, mlx5dv_devx_umem_in::dmabuf_fd, and mlx5dv_devx_umem_reg_ex. Update rdma-core/libmlx5 to enable DMA-BUF control memory; Device API will use GPU-VA and host-mapped fallback.")
   endif()
 endif()
-
 if (USE_ASCEND)
   include(../mooncake-common/FindMpi.cmake)
   file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")

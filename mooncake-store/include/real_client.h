@@ -835,6 +835,14 @@ class RealClient : public PyClient {
     int unmountAndFreeSegment(const std::vector<std::string> &segment_ids,
                               uint64_t grace_period_seconds = 0);
 
+    /**
+     * @brief Deregister this store's disk tier from the master and wait out a
+     * grace period, so a planned shutdown stops being advertised as an owner
+     * of offloaded keys before it stops serving them. No-op when SSD offload
+     * is not enabled on this client.
+     */
+    int drainLocalDiskSegment(uint64_t grace_period_seconds = 0);
+
     struct MountedSegmentRecord {
         void *mmap_base = nullptr;
         size_t size = 0;

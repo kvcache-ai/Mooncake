@@ -262,7 +262,15 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 
 **Requirements:**
 - NVIDIA NVLink hardware
-- Compiled with `USE_INTRA_NVLINK=ON`
+- Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
+
+**Configuration:**
+```bash
+# Select the intra-node NVLink transport. Cannot be combined with MC_FORCE_MNNVL.
+export MC_INTRANODE_NVLINK=true
+```
+
+**Note:** On a build without `USE_MNNVL=ON`, leaving `MC_INTRANODE_NVLINK` unset keeps the usual RDMA (or TCP, when no HCA is detected) selection.
 
 ### HIP Transport (hip)
 

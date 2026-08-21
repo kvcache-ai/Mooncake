@@ -73,6 +73,8 @@ std::string BuildBatchOpLogSnapshotFallbackKey(const std::string& cluster_id);
 std::string BuildBatchOpLogSnapshotCompactionFloorKey(
     const std::string& cluster_id);
 
+std::string BuildBatchOpLogSnapshotArtifactPrefix(
+    const std::string& snapshot_root, std::string_view snapshot_id);
 std::string BuildBatchOpLogSnapshotDescriptorKey(
     const std::string& snapshot_root, std::string_view snapshot_id);
 std::string BuildBatchOpLogSnapshotManifestKey(const std::string& snapshot_root,

@@ -214,11 +214,10 @@ DeserializeStandbyObjectMetadata(
             return std::optional<StandbyObjectMetadata>();
         }
 
-        // Read hard_pinned and group_id if present. Standby does not need
-        // hard_pinned, but promotion needs group_id to rebuild group indexes.
+        bool hard_pinned = false;
         if (index < total_elements &&
             array[index].type == msgpack::type::BOOLEAN) {
-            ++index;  // hard_pinned
+            hard_pinned = array[index++].as<bool>();
         }
 
         std::string group_id;
@@ -232,6 +231,7 @@ DeserializeStandbyObjectMetadata(
         metadata.replicas = std::move(replicas);
         metadata.data_type = data_type;
         metadata.group_id = std::move(group_id);
+        metadata.hard_pinned = hard_pinned;
         return std::optional<StandbyObjectMetadata>(std::move(metadata));
     } catch (const std::exception& ex) {
         LOG(ERROR) << "Failed to parse snapshot metadata entry: " << ex.what();
