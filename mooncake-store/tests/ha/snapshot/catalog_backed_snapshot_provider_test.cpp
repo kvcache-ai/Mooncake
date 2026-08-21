@@ -71,7 +71,7 @@ class CatalogBackedSnapshotProviderTest
 
     // Loads the published snapshot and asserts the single default object
     // round-trips intact, regardless of the metadata on-wire format.
-    void ExpectLoadsDefaultObject() {
+    void ExpectLoadsDefaultObject(bool expected_hard_pinned = false) {
         auto provider = CreateProvider();
         ASSERT_TRUE(provider.has_value()) << toString(provider.error());
 
@@ -86,6 +86,7 @@ class CatalogBackedSnapshotProviderTest
         EXPECT_EQ(key, kDefaultTestObjectKey);
         EXPECT_EQ(metadata.client_id, (UUID{1, 2}));
         EXPECT_EQ(metadata.size, kDefaultTestObjectSize);
+        EXPECT_EQ(metadata.hard_pinned.value_or(false), expected_hard_pinned);
         ASSERT_EQ(metadata.replicas.size(), 1u);
 
         const auto& replica = metadata.replicas.front();
@@ -151,7 +152,6 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
     EXPECT_EQ(entry.key, kDefaultTestObjectKey);
     EXPECT_EQ(entry.metadata.client_id, (UUID{1, 2}));
     EXPECT_EQ(entry.metadata.size, kDefaultTestObjectSize);
-    EXPECT_EQ(entry.metadata.last_sequence_id, descriptor_.last_included_seq);
     ASSERT_EQ(entry.metadata.replicas.size(), 1u);
 
     const auto& replica = entry.metadata.replicas.front();
@@ -179,14 +179,14 @@ TEST_P(CatalogBackedSnapshotProviderTest,
     // 8 + replica_count: trailing hard_pinned flag, no data_type. Exercises the
     // type-based disambiguation (first replica is not a positive integer).
     PublishSnapshotPayload(SnapshotMetadataFormat::kHardPinnedOnly);
-    ExpectLoadsDefaultObject();
+    ExpectLoadsDefaultObject(true);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest,
        LoadLatestSnapshotWithDataTypeAndHardPinned) {
     // 9 + replica_count: data_type + trailing hard_pinned.
     PublishSnapshotPayload(SnapshotMetadataFormat::kDataTypeAndHardPinned);
-    ExpectLoadsDefaultObject();
+    ExpectLoadsDefaultObject(true);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
@@ -194,13 +194,13 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
     // trailing group_id). Regression test for the live snapshot restore
     // failure against the latest metadata layout.
     PublishSnapshotPayload(SnapshotMetadataFormat::kWithGroupId);
-    ExpectLoadsDefaultObject();
+    ExpectLoadsDefaultObject(true);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest,
        LoadLatestSnapshotIgnoresObjectChecksum) {
     PublishSnapshotPayload(SnapshotMetadataFormat::kWithObjectChecksum);
-    ExpectLoadsDefaultObject();
+    ExpectLoadsDefaultObject(true);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest,

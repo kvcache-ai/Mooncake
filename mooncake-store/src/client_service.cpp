@@ -51,6 +51,17 @@
 
 namespace mooncake {
 
+std::optional<size_t> GetTransportRegistrationLimit(
+    const std::string& protocol) {
+    if (protocol == "efa" || protocol == "cxi") {
+        return globalConfig().max_mr_size;
+    }
+    if (protocol == "ub") {
+        return globalConfig().max_seg_size;
+    }
+    return std::nullopt;
+}
+
 namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
@@ -603,8 +614,8 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
     }};
 }
 
-tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
-                                                        size_t length) {
+tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
+    const void* addr, size_t length, const std::string& protocol) {
     if (addr == nullptr) {
         LOG(ERROR) << "addr is nullptr";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -613,11 +624,10 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
         LOG(ERROR) << "length is 0";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // Tcp is not limited by max_mr_size, but we ignore it for now.
-    auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
-    if (length > max_mr_size) {
-        LOG(ERROR) << "length " << length
-                   << " is larger than max_mr_size: " << max_mr_size;
+    if (auto limit = GetTransportRegistrationLimit(protocol);
+        limit.has_value() && length > *limit) {
+        LOG(ERROR) << "length " << length << " exceeds registration limit "
+                   << *limit << " for protocol " << protocol;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
@@ -3483,7 +3493,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
-    auto check_result = CheckRegisterMemoryParams(buffer, size);
+    auto check_result = CheckRegisterMemoryParams(buffer, size, protocol);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
@@ -3668,7 +3678,7 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
-    auto check_result = CheckRegisterMemoryParams(addr, length);
+    auto check_result = CheckRegisterMemoryParams(addr, length, protocol_);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
@@ -3729,6 +3739,15 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     }
 
     EnsureStorageControlPlaneStarted();
+    return response;
+}
+
+tl::expected<void, ErrorCode> Client::UnmountLocalDiskSegment() {
+    auto response = master_client_.UnmountLocalDiskSegment(client_id_);
+    if (!response) {
+        LOG(ERROR) << "UnmountLocalDiskSegment failed, error code is "
+                   << response.error();
+    }
     return response;
 }
 

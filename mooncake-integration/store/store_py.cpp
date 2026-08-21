@@ -506,6 +506,16 @@ class MooncakeStorePyWrapper {
                                                   grace_period_seconds);
     }
 
+    int unmount_local_disk_segment(uint64_t grace_period_seconds = 0) {
+        auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
+        if (!real_client) {
+            LOG(ERROR) << "unmount_local_disk_segment requires RealClient";
+            return -1;
+        }
+        py::gil_scoped_release release;
+        return real_client->drainLocalDiskSegment(grace_period_seconds);
+    }
+
     std::string get_tp_key_name(const std::string &base_key, int rank) const {
         return base_key + "_tp_" + std::to_string(rank);
     }
@@ -2295,6 +2305,9 @@ PYBIND11_MODULE(store, m) {
         .def("unmount_and_free_segment",
              &MooncakeStorePyWrapper::unmount_and_free_segment,
              py::arg("segment_ids"), py::arg("grace_period_seconds") = 0)
+        .def("unmount_local_disk_segment",
+             &MooncakeStorePyWrapper::unmount_local_disk_segment,
+             py::arg("grace_period_seconds") = 0)
         .def("alloc_from_mem_pool",
              [](MooncakeStorePyWrapper &self, size_t size) {
                  py::gil_scoped_release release;

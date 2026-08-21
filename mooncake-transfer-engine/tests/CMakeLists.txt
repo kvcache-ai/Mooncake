@@ -209,6 +209,12 @@ if(USE_EFA)
   target_link_libraries(efa_single_nic_large_mr_test
                         PUBLIC transfer_engine gflags::gflags glog::glog)
 
+  add_executable(efa_large_mr_test ${WORKSPACE}/efa_large_mr_test.cpp)
+  target_link_libraries(efa_large_mr_test PUBLIC transfer_engine gtest
+                                                 gtest_main)
+  # No add_test(): needs EFA hardware plus MC_MAX_MR_SIZE=67108864 in the
+  # environment, same as rdma_large_mr_test.
+
   add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
   target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags
                                                  glog::glog)

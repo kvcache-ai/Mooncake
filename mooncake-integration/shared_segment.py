@@ -19,7 +19,7 @@ here; C++ only shares the raw span.
         },
         world_size=tp_size,
         rank_id=tp_rank,
-        tp_group=tp_group,
+        comm_group=tp_group,
         mmap=False,  # Ascend VMM; tensors() are NPU views of the SVM VA
     )
     k_caches = seg.tensors("k")
@@ -58,15 +58,19 @@ def create_shared_segment(
     rank_id: int,
     owner_rank: int = 0,
     device_id: int | None = None,
-    tp_group: Any = None,
+    comm_group: Any = None,
     mmap: bool = True,
     host_register: bool = False,
+    *,
+    tp_group: Any = None,
 ) -> SharedSegment:
     """Creates a shared host segment and returns it ready to use.
 
     Every rank of the group must call this with an identical declaration; a
     disagreement is reported here rather than silently producing wrong reads.
-    ``tp_group`` may be omitted only when ``world_size`` is 1. ``device_id``
+    ``comm_group`` is the torch process group (or vLLM GroupCoordinator) used
+    to all-gather export blobs; it may be omitted only when ``world_size`` is
+    1. ``tp_group`` is a deprecated alias of ``comm_group``. ``device_id``
     defaults to the rank's current accelerator.
 
     ``mmap`` (default True) uses POSIX shm. Set ``mmap=False`` for the platform
@@ -77,6 +81,7 @@ def create_shared_segment(
     device-accessible after ``MemSetAccess`` (owner ``MallocMem``, peer
     ``ImportAndMap``), so ``tensors().data_ptr()`` is that same VA.
     """
+    comm_group = _select_comm_group(comm_group, tp_group)
     if host_register and not mmap:
         raise SharedSegmentError("host_register requires mmap=True")
     if not shared_segment_supported(mmap=mmap, host_register=host_register):
@@ -122,7 +127,9 @@ def create_shared_segment(
     except RuntimeError as exc:
         create_error = str(exc)
 
-    _raise_if_any_rank_failed(create_error, world_size, rank_id, tp_group, "create")
+    _raise_if_any_rank_failed(
+        create_error, world_size, rank_id, comm_group, "create"
+    )
     if segment is None:
         raise SharedSegmentError("Shared segment create returned no segment")
 
@@ -131,12 +138,14 @@ def create_shared_segment(
         if world_size == 1:
             blobs = [blob]
         else:
-            blobs = _all_gather_blob(blob, world_size, tp_group)
+            blobs = _all_gather_blob(blob, world_size, comm_group)
         segment.complete(blobs)
     except (RuntimeError, SharedSegmentError) as exc:
         complete_error = str(exc)
 
-    _raise_if_any_rank_failed(complete_error, world_size, rank_id, tp_group, "complete")
+    _raise_if_any_rank_failed(
+        complete_error, world_size, rank_id, comm_group, "complete"
+    )
     return SharedSegment(segment, specs, offsets, stride, device)
 
 
@@ -276,21 +285,32 @@ def _current_device_index() -> int:
     return 0
 
 
-def _resolve_cpu_group(tp_group: Any) -> Any:
+def _select_comm_group(comm_group: Any, tp_group: Any) -> Any:
+    """``tp_group`` is a deprecated alias of ``comm_group``."""
+    if tp_group is None:
+        return comm_group
+    if comm_group is None or comm_group is tp_group:
+        return tp_group
+    raise SharedSegmentError(
+        "pass only comm_group; tp_group is a deprecated alias of comm_group"
+    )
+
+
+def _resolve_cpu_group(comm_group: Any) -> Any:
     """Accepts a vLLM GroupCoordinator or a plain process group.
 
     The blobs are exchanged as CPU byte tensors, so a gloo group is required; a
     coordinator exposes one as ``cpu_group``.
     """
-    cpu_group = getattr(tp_group, "cpu_group", None)
-    return cpu_group if cpu_group is not None else tp_group
+    cpu_group = getattr(comm_group, "cpu_group", None)
+    return cpu_group if cpu_group is not None else comm_group
 
 
 def _raise_if_any_rank_failed(
     local_error: str,
     world_size: int,
     rank_id: int,
-    tp_group: Any,
+    comm_group: Any,
     phase: str,
 ) -> None:
     """Makes every rank leave a failed collective phase with the same error."""
@@ -298,12 +318,14 @@ def _raise_if_any_rank_failed(
         if local_error:
             raise SharedSegmentError(local_error)
         return
-    if tp_group is None:
-        raise SharedSegmentError("tp_group is required when world_size > 1")
+    if comm_group is None:
+        raise SharedSegmentError("comm_group is required when world_size > 1")
 
     failures: list[tuple[int, str] | None] = [None] * world_size
     local_failure = (rank_id, local_error) if local_error else None
-    dist.all_gather_object(failures, local_failure, group=_resolve_cpu_group(tp_group))
+    dist.all_gather_object(
+        failures, local_failure, group=_resolve_cpu_group(comm_group)
+    )
     errors = [failure for failure in failures if failure is not None]
     if errors:
         detail = "; ".join(
@@ -312,10 +334,10 @@ def _raise_if_any_rank_failed(
         raise SharedSegmentError(f"Shared segment {phase} failed: {detail}")
 
 
-def _all_gather_blob(blob: bytes, world_size: int, tp_group: Any) -> list[bytes]:
+def _all_gather_blob(blob: bytes, world_size: int, comm_group: Any) -> list[bytes]:
     local = torch.frombuffer(bytearray(blob), dtype=torch.uint8)
     gathered = [torch.empty_like(local) for _ in range(world_size)]
-    dist.all_gather(gathered, local, group=_resolve_cpu_group(tp_group))
+    dist.all_gather(gathered, local, group=_resolve_cpu_group(comm_group))
     return [bytes(tensor.numpy()) for tensor in gathered]
 
 

@@ -26,6 +26,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <chrono>
+#include <limits>
 
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/random.h"
@@ -71,6 +72,8 @@ struct XferBenchConfig {
     static int duration;
     static int max_num_threads;
     static int start_num_threads;
+    static size_t target_offset;
+    static size_t target_range_size;
     static std::string qos_classes;
     static std::string qos_classes_json;
     static std::string workload_classes_json;
@@ -183,6 +186,31 @@ void printDeadlineGroupStats(const char* group, size_t block_size,
                              size_t batch_size, XferBenchStats& stats,
                              int num_threads, uint64_t deadline_us);
 
+std::vector<std::string> splitCommaSeparated(const std::string& value);
+
+uint8_t stableDataSeed(uint64_t target_addr);
+
+static inline uint64_t checkedMul(uint64_t lhs, uint64_t rhs,
+                                  const char* label) {
+    if (rhs != 0 && lhs > std::numeric_limits<uint64_t>::max() / rhs) {
+        LOG(FATAL) << label << " overflows uint64_t: " << lhs << " * " << rhs;
+    }
+    return lhs * rhs;
+}
+
+static inline uint64_t checkedAdd(uint64_t lhs, uint64_t rhs,
+                                  const char* label) {
+    if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
+        LOG(FATAL) << label << " overflows uint64_t: " << lhs << " + " << rhs;
+    }
+    return lhs + rhs;
+}
+
+static inline bool rangeContains(uint64_t offset, uint64_t bytes,
+                                 uint64_t limit) {
+    return offset <= limit && bytes <= limit - offset;
+}
+
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
 static inline bool isCudaMemory(void* ptr) {
     cudaPointerAttributes attr;
@@ -209,32 +237,36 @@ static inline bool isGpuMemory(void* ptr) {
     return false;
 }
 
-static inline uint8_t fillData(void* addr, size_t length) {
-    uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
+static inline void fillData(void* addr, size_t length, uint8_t seed) {
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
-        std::vector<uint8_t> ref_data(length, seed);
-        cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyDefault);
-        return seed;
+        auto err = cudaMemset(addr, seed, length);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemset failed: " << cudaGetErrorString(err);
+        return;
     }
 #elif defined(USE_SUNRISE)
     if (isCudaMemory(addr)) {
-        std::vector<uint8_t> ref_data(length, seed);
-        auto err =
-            cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyHostToDevice);
+        auto err = cudaMemset(addr, seed, length);
         LOG_ASSERT(err == cudaSuccess)
-            << "cudaMemcpy failed: " << cudaGetErrorString(err);
-        return seed;
+            << "cudaMemset failed: " << cudaGetErrorString(err);
+        return;
     }
 #endif
 #ifdef USE_HIP
     if (isHipMemory(addr)) {
-        std::vector<uint8_t> ref_data(length, seed);
-        hipMemcpy(addr, ref_data.data(), length, hipMemcpyDefault);
-        return seed;
+        auto err = hipMemset(addr, seed, length);
+        LOG_ASSERT(err == hipSuccess)
+            << "hipMemset failed: " << hipGetErrorString(err);
+        return;
     }
 #endif
     memset(addr, seed, length);
+}
+
+static inline uint8_t fillData(void* addr, size_t length) {
+    uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
+    fillData(addr, length, seed);
     return seed;
 }
 

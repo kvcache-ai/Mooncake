@@ -326,10 +326,37 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using MACA transport";
         }
 
-#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
+#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK) || defined(USE_MUSA)
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
+#ifdef USE_MUSA
+        const char* gpu_p2p_protocol = "musa";
+        const char* gpu_p2p_name = "MUSA";
+        const bool force_gpu_p2p = force_mnnvl || getenv("MC_FORCE_MUSA");
+#else
+        const char* gpu_p2p_protocol = "nvlink";
+        const char* gpu_p2p_name = "NVLink";
+        const bool force_gpu_p2p = force_mnnvl;
+#endif
+        // The cross-node GPU P2P transport is only constructible when its own
+        // build flag is set, so a build that enables USE_INTRA_NVLINK alone
+        // must keep the RDMA/TCP fallback instead of requesting a protocol
+        // MultiTransport cannot create.
+#if defined(USE_MNNVL) || defined(USE_MUSA)
+        constexpr bool kGpuP2PCompiled = true;
+#else
+        constexpr bool kGpuP2PCompiled = false;
+#endif
+        const bool no_hca = local_topology_->getHcaList().empty();
+        // MC_FORCE_HCA keeps the same meaning as on the non-NVLink path:
+        // install RDMA even when topology discovery found no HCA.
+        const bool force_hca = getenv("MC_FORCE_HCA") != nullptr;
+        if (force_gpu_p2p && !kGpuP2PCompiled) {
+            LOG(WARNING) << gpu_p2p_name
+                         << " transport was requested but is not compiled in, "
+                            "falling back to RDMA/TCP";
+        }
         // Explicit env var overrides take priority over HCA auto-detection
         if (intra_env) {
             Transport* t =
@@ -340,16 +367,17 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
-        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+        } else if (kGpuP2PCompiled && (force_gpu_p2p || no_hca)) {
             Transport* t =
-                multi_transports_->installTransport("nvlink", nullptr);
+                multi_transports_->installTransport(gpu_p2p_protocol, nullptr);
             if (!t) {
-                LOG(ERROR) << "Failed to install NVLink transport";
+                LOG(ERROR) << "Failed to install " << gpu_p2p_name
+                           << " transport";
                 return -1;
             }
-            LOG(INFO) << "Using cross-node NVLink transport "
-                      << "(MC_FORCE_MNNVL or no HCA detected)";
-        } else {
+            LOG(INFO) << "Using " << gpu_p2p_name << " transport "
+                      << "(forced or no HCA detected)";
+        } else if (!no_hca || force_hca) {
             Transport* t =
                 multi_transports_->installTransport("rdma", local_topology_);
             if (!t) {
@@ -357,6 +385,19 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 return -1;
             }
             LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
+        } else {
+#ifdef USE_TCP
+            Transport* t = multi_transports_->installTransport("tcp", nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install TCP transport";
+                return -1;
+            }
+            LOG(INFO) << "Using TCP transport (no HCA detected)";
+#else
+            LOG(ERROR) << "No HCA detected and neither " << gpu_p2p_name
+                       << " nor TCP transport is compiled in";
+            return -1;
+#endif
         }
 
 #elif !defined(USE_SUNRISE)

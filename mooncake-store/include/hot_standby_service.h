@@ -7,16 +7,16 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
-#include "metadata_store.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/capture.h"
 #include "ha/snapshot/snapshot_provider.h"
+#include "ha/standby_metadata_store.h"
 #include "standby_state_machine.h"
 #include "types.h"
 
@@ -27,6 +27,7 @@ class MasterService;
 class HaKvBackend;
 class OpLogBatchStandbyReader;
 enum class OpLogBatchStandbyPollDisposition;
+struct OpLogBatchStandbyPollResult;
 
 /**
  * @brief Configuration for HotStandbyService
@@ -169,6 +170,12 @@ class HotStandbyService {
      */
     bool ExportStandbySnapshot(StandbySnapshot& out) const;
 
+    std::optional<BatchOpLogSnapshotCapture> BeginBatchOpLogSnapshotCapture();
+    bool CopyNextBatchOpLogSnapshotChunk(size_t count,
+                                         BatchOpLogSnapshotCapture& capture,
+                                         std::vector<StandbyObjectEntry>& out);
+    void EndBatchOpLogSnapshotCapture(BatchOpLogSnapshotCapture& capture);
+
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
 
@@ -204,6 +211,9 @@ class HotStandbyService {
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend);
     void StopReplicationLoop();
+    void HandleSnapshotCaptureRequest(
+        const OpLogBatchStandbyPollResult& result);
+    void CancelSnapshotCapture();
 
     // Shared body for Promote() and PromoteAndExportSnapshot(): runs the
     // promotion sequence machine transitions + gap resolution + final
@@ -225,34 +235,6 @@ class HotStandbyService {
 
     HotStandbyConfig config_;
 
-    // Simple in-memory metadata store implementation
-    class StandbyMetadataStore : public MetadataStore {
-       public:
-        bool PutMetadata(const std::string& tenant_id, const std::string& key,
-                         const StandbyObjectMetadata& metadata) override;
-        bool Put(const std::string& key,
-                 const std::string& payload = std::string()) override;
-        std::optional<StandbyObjectMetadata> GetMetadata(
-            const std::string& tenant_id,
-            const std::string& key) const override;
-        bool Remove(const std::string& tenant_id,
-                    const std::string& key) override;
-        bool Exists(const std::string& tenant_id,
-                    const std::string& key) const override;
-        size_t GetKeyCountForTenant(
-            const std::string& tenant_id) const override;
-        size_t GetKeyCount() const override;
-        void Clear();
-
-        // Snapshot for promotion/restore.
-        void Snapshot(std::vector<StandbyObjectEntry>& out) const;
-
-       private:
-        mutable std::mutex mutex_;
-        std::unordered_map<
-            std::string, std::unordered_map<std::string, StandbyObjectMetadata>>
-            store_;
-    };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{
         std::make_unique<NoopSnapshotProvider>()};
@@ -286,6 +268,11 @@ class HotStandbyService {
     std::atomic<bool> replication_loop_running_{false};
     std::mutex replication_loop_mutex_;
     std::condition_variable replication_loop_cv_;
+
+    std::shared_ptr<BatchOpLogSnapshotCapture::LeaseState>
+        snapshot_capture_state_{
+            std::make_shared<BatchOpLogSnapshotCapture::LeaseState>()};
+    std::optional<BatchOpLogSnapshotCapture> ready_snapshot_capture_;
 
     // Synchronization
     mutable std::mutex mutex_;

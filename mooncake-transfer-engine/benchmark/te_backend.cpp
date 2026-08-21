@@ -242,17 +242,47 @@ int TEBenchRunner::runTarget() {
     return 0;
 }
 
+size_t TEBenchRunner::targetIndex(int thread_id) const {
+    LOG_ASSERT(!target_handles_.empty());
+    return static_cast<size_t>(thread_id) % target_handles_.size();
+}
+
+int TEBenchRunner::localTargetThreadId(int thread_id) const {
+    LOG_ASSERT(!target_handles_.empty());
+    return thread_id / static_cast<int>(target_handles_.size());
+}
+
+uint64_t TEBenchRunner::getTargetSegmentId(int thread_id) const {
+    return target_handles_[targetIndex(thread_id)];
+}
+
+size_t TEBenchRunner::getTargetCount() const {
+    return std::max<size_t>(target_handles_.size(), 1);
+}
+
 int TEBenchRunner::startInitiator(int num_threads) {
     if (!init_ok_) {
         LOG(ERROR) << "Initiator cannot start: initialization failed";
         return -1;
     }
-    handle_ = engine_->openSegment(XferBenchConfig::target_seg_name);
-    info_ = engine_->getMetadata()->getSegmentDescByID(handle_);
-    std::sort(
-        info_->buffers.begin(), info_->buffers.end(),
-        [](const TransferMetadata::BufferDesc& a,
-           const TransferMetadata::BufferDesc& b) { return a.name < b.name; });
+    auto names = splitCommaSeparated(XferBenchConfig::target_seg_name);
+    if (names.empty()) {
+        LOG(ERROR) << "No target segment name specified";
+        return -1;
+    }
+    target_handles_.clear();
+    target_infos_.clear();
+    for (const auto& name : names) {
+        SegmentID handle = engine_->openSegment(name);
+        auto info = engine_->getMetadata()->getSegmentDescByID(handle);
+        std::sort(info->buffers.begin(), info->buffers.end(),
+                  [](const TransferMetadata::BufferDesc& a,
+                     const TransferMetadata::BufferDesc& b) {
+                      return a.name < b.name;
+                  });
+        target_handles_.push_back(handle);
+        target_infos_.push_back(std::move(info));
+    }
     threads_.resize(num_threads);
     g_te_running = true;
     current_task_.resize(threads_.size());
@@ -346,7 +376,7 @@ int TEBenchRunner::runInitiatorTasks(
     return g_te_running ? 0 : -1;
 }
 
-double TEBenchRunner::runSingleTransfer(uint64_t local_addr,
+double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                                         uint64_t target_addr,
                                         uint64_t block_size,
                                         uint64_t batch_size, OpCode opcode,
@@ -362,7 +392,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr,
             opcode == READ ? TransferRequest::READ : TransferRequest::WRITE;
         entry.length = block_size;
         entry.source = (void*)(local_addr + block_size * i);
-        entry.target_id = handle_;
+        entry.target_id = target_id;
         entry.target_offset = target_addr + block_size * i;
         requests.emplace_back(entry);
     }

@@ -179,6 +179,10 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // MC_CUSTOM_TOPO_JSON works under MC_USE_TENT. Inline
     // topology/priority_matrix in MC_TENT_CONF still takes precedence.
     setConfig(config, "MC_CUSTOM_TOPO_JSON", "topology/custom_json_path");
+    // TENT RPC server io_context threads. The TCP data-path handlers do
+    // full-payload blocking copies inline, so deployments pushing bulk data
+    // over the TENT TCP transport raise this above the default of 1.
+    setConfig(config, "MC_TENT_RPC_THREADS", "rpc_server_threads");
     return status;
 }
 

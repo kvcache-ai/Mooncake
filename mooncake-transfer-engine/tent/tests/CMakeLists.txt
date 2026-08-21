@@ -8,14 +8,14 @@ add_executable(tent_metrics_example tent_metrics_example.cpp)
 # (tent_metrics, tent_interface) get it transitively; executables need it
 # explicit.
 target_link_libraries(tent_metrics_example PRIVATE tent_metrics tent_common
-                                                   asio_shared glog ibverbs)
+                                                   asio_shared glog::glog ibverbs)
 target_include_directories(tent_metrics_example
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
 # TENT Metrics Config Loader Unit Test
 add_executable(metrics_config_loader_test metrics_config_loader_test.cpp)
 target_link_libraries(metrics_config_loader_test
-                      PRIVATE tent_metrics tent_common gtest gtest_main glog)
+                      PRIVATE tent_metrics tent_common gtest gtest_main glog::glog)
 target_include_directories(metrics_config_loader_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
@@ -25,7 +25,7 @@ add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
 # listening endpoint.
 add_executable(tent_metrics_http_server_test metrics_http_server_test.cpp)
 target_link_libraries(tent_metrics_http_server_test
-                      PRIVATE tent_metrics tent_common gtest gtest_main glog)
+                      PRIVATE tent_metrics tent_common gtest gtest_main)
 if(TARGET asio_shared)
   target_link_libraries(tent_metrics_http_server_test PRIVATE asio_shared)
 endif()
@@ -41,7 +41,7 @@ add_test(NAME tent_metrics_http_server_test
 # compile time.
 add_executable(tent_metrics_recording_test metrics_recording_test.cpp)
 target_link_libraries(tent_metrics_recording_test PRIVATE gtest gtest_main
-                                                          tent_link_group glog)
+                                                          tent_link_group glog::glog)
 if(TARGET asio_shared)
   target_link_libraries(tent_metrics_recording_test PRIVATE asio_shared)
 endif()
@@ -158,6 +158,21 @@ target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
 target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
+
+add_executable(tent_tcp_datapath_roundtrip_test
+               tcp_datapath_roundtrip_test.cpp)
+target_link_libraries(tent_tcp_datapath_roundtrip_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+target_include_directories(tent_tcp_datapath_roundtrip_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+# Each case runs in its own process: the test forks a server child, which
+# must happen before the client process initializes any engine state.
+add_test(NAME tent_tcp_datapath_roundtrip_test_single_threaded
+         COMMAND tent_tcp_datapath_roundtrip_test
+                 --gtest_filter=TcpDataPathRoundtripTest.WriteThenReadAcrossProcesses)
+add_test(NAME tent_tcp_datapath_roundtrip_test_multi_threaded_rpc
+         COMMAND tent_tcp_datapath_roundtrip_test
+                 --gtest_filter=TcpDataPathRoundtripTest.WriteThenReadAcrossProcessesMultiThreadedRpc)
 
 add_executable(tent_shm_transport_test shm_transport_test.cpp)
 target_link_libraries(tent_shm_transport_test PRIVATE gtest gtest_main
