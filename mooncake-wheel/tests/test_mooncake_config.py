@@ -411,6 +411,7 @@ class TestMooncakeConfigValidation(unittest.TestCase):
             "ascend": "ascend",
             "musa": "musa",
             "nvlink_intra": "nvlink_intra",
+            "nccl": "nccl",
             "ub": "ub",
             "ubshmem": "ubshmem",
             "maca": "maca",
