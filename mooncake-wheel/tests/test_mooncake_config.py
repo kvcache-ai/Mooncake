@@ -29,6 +29,7 @@ class TestMooncakeConfig(unittest.TestCase):
             "device_name": "eth0",
             "enable_ssd_offload": True,
             "ssd_offload_path": "/nvme/mooncake_offload",
+            "local_rpc_port": 19445,
             "tenant_id": "tenant-a",
             "enable_client_http_server": True,
             "client_http_port": 19300,
@@ -56,6 +57,7 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.device_name, "eth0")
         self.assertEqual(config.enable_ssd_offload, True)
         self.assertEqual(config.ssd_offload_path, "/nvme/mooncake_offload")
+        self.assertEqual(config.local_rpc_port, 19445)
         self.assertEqual(config.tenant_id, "tenant-a")
         self.assertEqual(config.enable_client_http_server, True)
         self.assertEqual(config.client_http_port, 19300)
@@ -76,6 +78,7 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.device_name, "")
         self.assertEqual(config.enable_ssd_offload, False)
         self.assertEqual(config.ssd_offload_path, "")
+        self.assertEqual(config.local_rpc_port, 0)
         self.assertEqual(config.tenant_id, "default")
         self.assertEqual(config.enable_client_http_server, False)
         self.assertEqual(config.client_http_port, 9300)
@@ -112,6 +115,12 @@ class TestMooncakeConfig(unittest.TestCase):
         config = MooncakeConfig.from_file(self.config_file)
 
         self.assertEqual(config.ssd_offload_path, "")
+
+    def test_local_rpc_port_from_file_rejects_boolean(self):
+        self.write_config({**self.valid_config, "local_rpc_port": True})
+
+        with self.assertRaises(ValueError):
+            MooncakeConfig.from_file(self.config_file)
 
     def test_enable_ssd_offload_string_values(self):
         """from_file must parse string booleans like load_from_env, and reject typos.
@@ -211,6 +220,9 @@ class TestMooncakeConfig(unittest.TestCase):
         os.environ["MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"] = self.valid_config[
             "ssd_offload_path"
         ]
+        os.environ["MOONCAKE_LOCAL_RPC_PORT"] = str(
+            self.valid_config["local_rpc_port"]
+        )
         os.environ["MOONCAKE_TENANT_ID"] = self.valid_config["tenant_id"]
         os.environ["MOONCAKE_ENABLE_CLIENT_HTTP_SERVER"] = str(
             self.valid_config["enable_client_http_server"]
@@ -239,6 +251,7 @@ class TestMooncakeConfig(unittest.TestCase):
             self.assertEqual(
                 config.ssd_offload_path, self.valid_config["ssd_offload_path"]
             )
+            self.assertEqual(config.local_rpc_port, self.valid_config["local_rpc_port"])
             self.assertEqual(config.tenant_id, self.valid_config["tenant_id"])
             self.assertEqual(
                 config.enable_client_http_server,
@@ -258,6 +271,7 @@ class TestMooncakeConfig(unittest.TestCase):
             del os.environ["MOONCAKE_DEVICE"]
             del os.environ["MOONCAKE_OFFLOAD_ENABLED"]
             del os.environ["MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"]
+            del os.environ["MOONCAKE_LOCAL_RPC_PORT"]
             del os.environ["MOONCAKE_TENANT_ID"]
             del os.environ["MOONCAKE_ENABLE_CLIENT_HTTP_SERVER"]
             del os.environ["MOONCAKE_CLIENT_HTTP_PORT"]
@@ -461,6 +475,16 @@ class TestMooncakeConfigValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             self.make(local_buffer_size=-1024)
         self.assertIn("local_buffer_size", str(cm.exception))
+
+    def test_local_rpc_port_must_be_a_valid_tcp_port_or_zero(self):
+        for value in [-1, 65536, True, "50052"]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as cm:
+                    self.make(local_rpc_port=value)
+                self.assertIn("local_rpc_port", str(cm.exception))
+
+        self.assertEqual(self.make(local_rpc_port=0).local_rpc_port, 0)
+        self.assertEqual(self.make(local_rpc_port=65535).local_rpc_port, 65535)
 
     def test_empty_required_field_raises(self):
         for field in ["local_hostname", "metadata_server", "master_server_address"]:

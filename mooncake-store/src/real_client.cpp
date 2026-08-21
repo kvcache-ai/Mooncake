@@ -793,6 +793,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(ERROR) << "local_hostname is empty";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (enable_ssd_offload &&
+        (local_rpc_port < 0 || local_rpc_port > 65535 ||
+         (!start_offload_rpc_server && local_rpc_port == 0))) {
+        LOG(ERROR) << "local_rpc_port must be between 1 and 65535 when using "
+                      "an external SSD offload RPC server, or 0 to auto-bind "
+                      "the embedded server";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
 
     // Check if hostname already contains a port
     const std::string &hostname = local_hostname;
@@ -1105,9 +1113,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     if (enable_ssd_offload && start_offload_rpc_server) {
         // Start RPC server for offload operations (batch_get / release_buffer).
-        // Use port 0 to let the OS auto-allocate an available port.
-        offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+        // local_rpc_port=0 preserves the previous embedded-client behavior:
+        // let the OS pick a free port so multiple clients can share one host.
+        // A positive port opts into a stable restart identity.
+        offload_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+            1, local_rpc_port, "0.0.0.0");
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
@@ -1122,8 +1132,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         offload_rpc_port_ = offload_rpc_server_->port();
         LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
-
-        // Build local_rpc_addr from hostname + auto-allocated port
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
@@ -1171,12 +1179,13 @@ int RealClient::setup_real(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port) {
+    bool enable_client_http_server, int client_http_port, int local_rpc_port) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
-        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id, enable_client_http_server, client_http_port));
+        ipc_socket_path, local_rpc_port, enable_ssd_offload, true,
+        ssd_offload_path, tenant_id, enable_client_http_server,
+        client_http_port));
 }
 
 namespace {
@@ -1310,6 +1319,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
     bool enable_ssd_offload =
         get_config_bool(config, "enable_ssd_offload", false);
+    auto local_rpc_port_opt =
+        get_config_int(config, CONFIG_KEY_LOCAL_RPC_PORT, 0);
+    if (!local_rpc_port_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    int local_rpc_port = local_rpc_port_opt.value();
     bool enable_client_http_server =
         get_config_bool(config, CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, false);
     auto client_http_port_opt = get_config_int(
@@ -1319,11 +1334,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    return setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        local_rpc_port, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
