@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 namespace mooncake {
@@ -23,6 +24,9 @@ enum class ClientLivenessObservation {
     REFRESHED_ACTIVE,
     RECOVERED_ACTIVE,
     REJECTED_OFFLINE,
+    // The wrapped operation failed its success predicate, so state and the
+    // observation timestamp were left unchanged.
+    OBSERVATION_WITHHELD,
 };
 
 class ClientLivenessRecord {
@@ -32,6 +36,42 @@ class ClientLivenessRecord {
 
     explicit ClientLivenessRecord(TimePoint initial_observation)
         : last_liveness_at_(initial_observation) {}
+
+    class ServingGuard {
+       public:
+        ServingGuard(const ServingGuard&) = delete;
+        ServingGuard& operator=(const ServingGuard&) = delete;
+        ServingGuard(ServingGuard&&) noexcept = default;
+        ServingGuard& operator=(ServingGuard&&) noexcept = default;
+
+       private:
+        friend class ClientLivenessRecord;
+        explicit ServingGuard(std::unique_lock<std::mutex>&& lock)
+            : lock_(std::move(lock)) {}
+
+        std::unique_lock<std::mutex> lock_;
+    };
+
+    class RetainingGuard {
+       public:
+        RetainingGuard(const RetainingGuard&) = delete;
+        RetainingGuard& operator=(const RetainingGuard&) = delete;
+        RetainingGuard(RetainingGuard&&) noexcept = default;
+        RetainingGuard& operator=(RetainingGuard&&) noexcept = default;
+
+        [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
+            return record_->CommitObservationLocked(now);
+        }
+
+       private:
+        friend class ClientLivenessRecord;
+        RetainingGuard(ClientLivenessRecord* record,
+                       std::unique_lock<std::mutex>&& lock)
+            : record_(record), lock_(std::move(lock)) {}
+
+        ClientLivenessRecord* record_;
+        std::unique_lock<std::mutex> lock_;
+    };
 
     [[nodiscard]] ClientLivenessState state() const {
         return state_.load(std::memory_order_acquire);
@@ -45,8 +85,26 @@ class ClientLivenessRecord {
         return state() != ClientLivenessState::OFFLINE;
     }
 
+    [[nodiscard]] std::optional<ServingGuard> TryAcquireServingGuard() {
+        std::unique_lock<std::mutex> lock(transition_mutex_);
+        if (state_.load(std::memory_order_relaxed) !=
+            ClientLivenessState::ACTIVE) {
+            return std::nullopt;
+        }
+        return ServingGuard(std::move(lock));
+    }
+
+    [[nodiscard]] std::optional<RetainingGuard> TryAcquireRetainingGuard() {
+        std::unique_lock<std::mutex> lock(transition_mutex_);
+        if (state_.load(std::memory_order_relaxed) ==
+            ClientLivenessState::OFFLINE) {
+            return std::nullopt;
+        }
+        return RetainingGuard(this, std::move(lock));
+    }
+
     [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
-        return ObserveAndRun(now, [] {});
+        return ObserveAndRun(now, [] { return true; });
     }
 
     template <typename Operation>
@@ -58,15 +116,12 @@ class ClientLivenessRecord {
             return ClientLivenessObservation::REJECTED_OFFLINE;
         }
 
-        last_liveness_at_ = now;
-        if (current_state == ClientLivenessState::SUSPECTED) {
-            state_.store(ClientLivenessState::ACTIVE,
-                         std::memory_order_release);
-            std::forward<Operation>(operation)();
-            return ClientLivenessObservation::RECOVERED_ACTIVE;
+        const bool should_commit = std::forward<Operation>(operation)();
+        if (!should_commit) {
+            return ClientLivenessObservation::OBSERVATION_WITHHELD;
         }
-        std::forward<Operation>(operation)();
-        return ClientLivenessObservation::REFRESHED_ACTIVE;
+
+        return CommitObservationLocked(now, current_state);
     }
 
     template <typename Operation>
@@ -126,6 +181,23 @@ class ClientLivenessRecord {
     }
 
    private:
+    [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
+        TimePoint now) {
+        return CommitObservationLocked(
+            now, state_.load(std::memory_order_relaxed));
+    }
+
+    [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
+        TimePoint now, ClientLivenessState current_state) {
+        last_liveness_at_ = now;
+        if (current_state == ClientLivenessState::SUSPECTED) {
+            state_.store(ClientLivenessState::ACTIVE,
+                         std::memory_order_release);
+            return ClientLivenessObservation::RECOVERED_ACTIVE;
+        }
+        return ClientLivenessObservation::REFRESHED_ACTIVE;
+    }
+
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
     std::mutex transition_mutex_;
     TimePoint last_liveness_at_;
