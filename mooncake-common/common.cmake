@@ -77,8 +77,6 @@ if(BUILD_UNIT_TESTS)
 endif()
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
-option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
-       OFF)
 option(USE_NCCL_HOST "option for enabling the NCCL host RMA transport" OFF)
 option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
@@ -218,6 +216,9 @@ if(USE_VRAM_SEGMENT)
   add_compile_definitions(USE_VRAM_SEGMENT)
   message(STATUS "VRAM SEGMENT is ON")
 endif()
+
+option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
+       OFF)
 
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)

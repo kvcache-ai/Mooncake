@@ -6,6 +6,7 @@ set(GLOBAL_CONFIG "true")
 
 include(mooncake-common/FindJsonCpp.cmake)
 include(mooncake-common/FindGLOG.cmake)
+option(WITH_EP "build mooncake with expert parallelism support" OFF)
 include(mooncake-common/common.cmake)
 # unit test
 if (BUILD_UNIT_TESTS)
@@ -19,7 +20,6 @@ option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
 option(WITH_STORE_C_SHARED "build a self-contained libmooncake_store.so exposing only the store_c.h C ABI (for dlopen consumers)" OFF)
-option(WITH_EP "build mooncake with expert parallelism support" OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
 option(MOONCAKE_ENABLE_TEST_FAILPOINTS
        "Enable file-handshake failpoints for integration tests" OFF)
