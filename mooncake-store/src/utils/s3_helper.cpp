@@ -550,6 +550,8 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(
 
                 // Use original buffer pointer directly, avoid copying
                 const uint8_t *part_data = buffer.data() + offset;
+                const std::string part_crc32c =
+                    EncodeCrc32c(Crc32cValue(part_data, current_part_size));
 
                 // Add retry logic
                 const int max_retries = 2;
@@ -564,6 +566,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(
                     part_request.SetPartNumber(static_cast<int>(part_num));
                     part_request.SetContentLength(
                         static_cast<long long>(current_part_size));
+                    part_request.SetChecksumCRC32C(part_crc32c);
 
                     // Use temporary stream
                     auto stream =
