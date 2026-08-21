@@ -21,3 +21,8 @@ add_subdirectory(
   ${yalantinglibs_BINARY_DIR}
   EXCLUDE_FROM_ALL
 )
+
+# Suppress warnings for CMake before 3.25
+get_target_property(YLT_INCL_DIRS yalantinglibs INTERFACE_INCLUDE_DIRECTORIES)
+set_target_properties(yalantinglibs PROPERTIES
+  INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${YLT_INCL_DIRS}")
