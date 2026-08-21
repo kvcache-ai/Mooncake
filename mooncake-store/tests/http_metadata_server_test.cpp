@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
-#include <csignal>
 #include <string>
 #include <thread>
 
