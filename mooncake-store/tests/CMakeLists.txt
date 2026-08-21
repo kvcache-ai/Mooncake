@@ -40,6 +40,8 @@ add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
+add_store_test(client_liveness_test client_liveness_test.cpp)
+add_store_test(master_config_test master_config_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_test(
   NAME replica_selection_env_opt_in_test
