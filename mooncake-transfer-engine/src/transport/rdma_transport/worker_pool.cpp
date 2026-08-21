@@ -993,6 +993,7 @@ int WorkerPool::doProcessContextEvents() {
                      << context_.deviceName();
         if (event.event_type == IBV_EVENT_QP_FATAL) {
             auto endpoint_ptr = (RdmaEndPoint *)event.element.qp->qp_context;
+            auto endpoint = context_.getEndpointByPtr(endpoint_ptr);
 
             /**
              * There might be a deadlock if we call endpoint->set_active(false)
@@ -1010,13 +1011,16 @@ int WorkerPool::doProcessContextEvents() {
             event_acked = true;
 
             /**
-             * After ack the event, the endpoint might be destroyed if it
-             * happened to be destroying event.element.qp. Therefore, we cannot
-             * just dereference endpoint_ptr. Instead, we need to get the
-             * shared_ptr of the endpoint from context_ and use that shared_ptr
-             * to access the endpoint.
+             * After ack the event, the endpoint can otherwise be reclaimed
+             * before deleteEndpointByPtr() takes the store lock. Keep the
+             * shared_ptr acquired before ack alive through deletion so pointer
+             * identity cannot ABA-match a newly allocated endpoint.
              */
-            context_.deleteEndpointByPtr(endpoint_ptr);
+            if (endpoint) {
+                context_.deleteEndpointByPtr(endpoint.get());
+            } else {
+                LOG(WARNING) << "QP fatal event endpoint is no longer tracked";
+            }
         } else if (handleContextEvent(event.event_type, false, &event)) {
             event_acked = true;
         }

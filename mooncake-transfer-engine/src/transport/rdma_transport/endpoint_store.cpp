@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "config.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -53,6 +54,14 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
         LOG(INFO) << "Endpoint " << peer_nic_path
                   << " already exists in FIFOEndpointStore";
         return endpoint_map_[peer_nic_path];
+    }
+    if (max_size_ > 0 &&
+        waiting_list_len_.load(std::memory_order_relaxed) >= max_size_) {
+        LOG(WARNING) << "Endpoint waiting list reached limit on "
+                     << context->deviceName()
+                     << "; continuing endpoint creation"
+                     << ", waiting_endpoints="
+                     << waiting_list_len_.load(std::memory_order_relaxed);
     }
     if (!cq) {
         LOG(ERROR) << "Cannot insert endpoint " << peer_nic_path
@@ -188,6 +197,9 @@ size_t FIFOEndpointStore::getTotalQPNumber() {
     for (const auto &kv : endpoint_map_) {
         total_qps += kv.second->getQPNumber();
     }
+    for (const auto &endpoint : waiting_list_) {
+        total_qps += endpoint->getQPNumber();
+    }
     return total_qps;
 }
 
@@ -231,6 +243,14 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
         LOG(INFO) << "Endpoint " << peer_nic_path
                   << " already exists in SIEVEEndpointStore";
         return endpoint_map_[peer_nic_path].first;
+    }
+    if (max_size_ > 0 &&
+        waiting_list_len_.load(std::memory_order_relaxed) >= max_size_) {
+        LOG(WARNING) << "Endpoint waiting list reached limit on "
+                     << context->deviceName()
+                     << "; continuing endpoint creation"
+                     << ", waiting_endpoints="
+                     << waiting_list_len_.load(std::memory_order_relaxed);
     }
     if (!cq) {
         LOG(ERROR) << "Cannot insert endpoint " << peer_nic_path
