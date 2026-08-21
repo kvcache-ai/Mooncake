@@ -75,7 +75,6 @@ target_link_libraries(
          JsonCpp::JsonCpp
          numa
          asio_shared
-         yalantinglibs::yalantinglibs
   PRIVATE transport transfer_metadata_plugin)
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)

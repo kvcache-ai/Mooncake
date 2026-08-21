@@ -314,8 +314,7 @@ target_link_libraries(
           gflags::gflags
           mooncake_common
           numa
-          asio_shared
-          yalantinglibs::yalantinglibs)
+          asio_shared)
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_shared_objects build_etcd_wrapper)
 endif()
@@ -343,8 +342,7 @@ target_link_libraries(
           mooncake_common
           Mooncake::zstd
           Mooncake::xxhash
-          asio_shared
-          yalantinglibs::yalantinglibs)
+          asio_shared)
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store_master_objects
                              PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
@@ -383,8 +381,7 @@ target_link_libraries(
           Mooncake::xxhash
           mooncake_common
           numa
-          asio_shared
-          yalantinglibs::yalantinglibs)
+          asio_shared)
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
@@ -437,7 +434,6 @@ target_link_libraries(
           mooncake_common
           Mooncake::zstd
           asio_shared
-          yalantinglibs::yalantinglibs
           transfer_metadata_plugin
           gflags::gflags
           JsonCpp::JsonCpp
@@ -473,7 +469,6 @@ target_link_libraries(
          Mooncake::zstd
          asio_shared
          transfer_engine
-         yalantinglibs::yalantinglibs
   PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash numa)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
@@ -518,7 +513,6 @@ target_link_libraries(
           glog::glog
           gflags::gflags
           JsonCpp::JsonCpp
-          yalantinglibs::yalantinglibs
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
           asio_shared)
@@ -540,7 +534,7 @@ add_executable(mooncake_client real_client_main.cpp)
 set_target_properties(mooncake_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   mooncake_client PRIVATE mooncake_store transfer_engine asio_shared
-                          gflags::gflags yalantinglibs::yalantinglibs)
+                          gflags::gflags)
 if(CUDAToolkit_FOUND)
   target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
   target_include_directories(mooncake_client

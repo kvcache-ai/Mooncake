@@ -1,5 +1,7 @@
 find_package(yaml-cpp REQUIRED)
-find_path(ASIO_INCLUDE_DIR asio.hpp)
+find_path(ASIO_INCLUDE_DIR asio.hpp
+  HINTS ${yalantinglibs_SOURCE_DIR}/include/ylt/thirdparty
+)
 if(NOT ASIO_INCLUDE_DIR)
   message(FATAL_ERROR "standalone Asio headers not found")
 endif()
@@ -46,8 +48,7 @@ target_include_directories(
          $<INSTALL_INTERFACE:include>)
 
 target_link_libraries(
-  mooncake_common PUBLIC asio_shared yaml-cpp JsonCpp::JsonCpp
-                         yalantinglibs::yalantinglibs)
+  mooncake_common PUBLIC asio_shared yaml-cpp JsonCpp::JsonCpp)
 
 if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_common DESTINATION lib)
