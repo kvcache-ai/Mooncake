@@ -1,4 +1,4 @@
-#include "master_scenario.h"
+#include "master_service/dsl/scenario.h"
 
 #include <gtest/gtest-spi.h>
 #include <gtest/gtest.h>
@@ -32,6 +32,20 @@ concept SupportsHasReplicas = requires(T value) { value.HasReplicas(1); };
 template <typename T>
 concept SupportsHasCompleteReplicas =
     requires(T value) { value.HasCompleteReplicas(1); };
+
+template <typename T>
+concept SupportsHasChecksum = requires(T value) { value.HasChecksum(1); };
+
+template <typename T>
+concept SupportsHasNoChecksum = requires(T value) { value.HasNoChecksum(); };
+
+template <typename T>
+concept SupportsHasMemoryReplicaSize =
+    requires(T value) { value.HasMemoryReplicaSize(1); };
+
+template <typename T>
+concept SupportsIsOnMemoryNode =
+    requires(T value) { value.IsOnMemoryNode("memory"); };
 
 template <typename T>
 concept SupportsExpectedErrorMutation =
@@ -86,6 +100,10 @@ static_assert(!SupportsIsReadable<MissingObject>);
 static_assert(!SupportsIsNotReady<MissingObject>);
 static_assert(!SupportsHasReplicas<MissingObject>);
 static_assert(!SupportsHasCompleteReplicas<MissingObject>);
+static_assert(!SupportsHasChecksum<MissingObject>);
+static_assert(!SupportsHasNoChecksum<MissingObject>);
+static_assert(!SupportsHasMemoryReplicaSize<MissingObject>);
+static_assert(!SupportsIsOnMemoryNode<MissingObject>);
 static_assert(!SupportsExpectedReplicaCountMutation<MissingObject>);
 static_assert(!SupportsExpectedCompleteReplicaCountMutation<MissingObject>);
 static_assert(!SupportsThen<UnspecifiedObject>);
@@ -231,12 +249,13 @@ TEST(MasterScenarioContractTest, ReportsNotReadyObjectWhenAbsenceExpected) {
         "OBJECT_NOT_FOUND");
 }
 
-TEST(MasterScenarioContractTest, ReportsKeyCountMismatch) {
-    EXPECT_NONFATAL_FAILURE(MasterScenario("key count mismatch")
+TEST(MasterScenarioContractTest, ReportsReadableObjectCountMismatch) {
+    EXPECT_NONFATAL_FAILURE(MasterScenario("readable object count mismatch")
                                 .Given(MemoryNode("memory"))
                                 .When(PutStart("key", 1_KB))
-                                .Then(KeyCount(0)),
-                            "KeyCount is 1; expected 0");
+                                .When(PutEnd("key"))
+                                .Then(ReadableCount(Objects({"key"}), 0)),
+                            "ReadableCount is 1; expected 0");
 }
 
 TEST(MasterScenarioContractTest, ReportsObjectReplicaCountMismatch) {
@@ -257,6 +276,54 @@ TEST(MasterScenarioContractTest, ReportsCompleteReplicaCountMismatch) {
                             "Object(key) has 1 complete replicas; expected 0");
 }
 
+TEST(MasterScenarioContractTest, ReportsObjectChecksumMismatch) {
+    EXPECT_NONFATAL_FAILURE(MasterScenario("object checksum mismatch")
+                                .Given(MemoryNode("memory"))
+                                .When(PutStart("key", 1_KB))
+                                .When(PutEnd("key").WithChecksum(7))
+                                .Then(Object("key").HasChecksum(8)),
+                            "Object(key) has checksum 7; expected 8");
+}
+
+TEST(MasterScenarioContractTest, ReportsUnexpectedObjectChecksum) {
+    EXPECT_NONFATAL_FAILURE(MasterScenario("unexpected object checksum")
+                                .Given(MemoryNode("memory"))
+                                .When(PutStart("key", 1_KB))
+                                .When(PutEnd("key").WithChecksum(7))
+                                .Then(Object("key").HasNoChecksum()),
+                            "Object(key) has checksum 7; expected none");
+}
+
+TEST(MasterScenarioContractTest, ReportsMemoryReplicaSizeMismatch) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("memory replica size mismatch")
+            .Given(MemoryNode("memory"))
+            .When(PutStart("key", 1_KB))
+            .When(PutEnd("key"))
+            .Then(Object("key").HasMemoryReplicaSize(2_KB)),
+        "Object(key) has memory replica size 1024; expected 2048");
+}
+
+TEST(MasterScenarioContractTest, ReportsUnexpectedMemoryNode) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("unexpected memory node")
+            .Given(MemoryNode("memory"))
+            .When(PutStart("key", 1_KB))
+            .When(PutEnd("key"))
+            .Then(Object("key").IsOnMemoryNode("other")),
+        "Object(key) has a memory replica on memory; expected other");
+}
+
+TEST(MasterScenarioContractTest, ReportsRemoveAllCountMismatch) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("remove all count mismatch")
+            .Given(MemoryNode("memory"))
+            .Given(Objects({"key"}).Size(1_KB).CompleteOn("memory").ExpiredFrom(
+                std::chrono::system_clock::now() - std::chrono::hours(1)))
+            .When(RemoveAll().ExpectRemoved(2)),
+        "RemoveAll removed 1 objects; expected 2");
+}
+
 TEST(MasterScenarioContractTest, CreatesAndChecksObjectCollections) {
     MasterScenario("object collections")
         .Given(MemoryNode("memory"))
@@ -270,8 +337,7 @@ TEST(MasterScenarioContractTest, CreatesAndChecksObjectCollections) {
                   .NamedBy([](size_t index) {
                       return "collection-" + std::to_string(index);
                   })
-                  .AreReadable())
-        .Then(KeyCount(3));
+                  .AreReadable());
 }
 
 TEST(MasterScenarioContractTest, CollectionFailureIdentifiesObjectKey) {
