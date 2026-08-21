@@ -123,6 +123,7 @@ performance/vllm/index
 :caption: Design Documents
 :maxdepth: 1
 
+design/project-spec
 design/architecture
 design/transfer-engine/index
 design/reshard-manifest
