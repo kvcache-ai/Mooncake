@@ -73,11 +73,11 @@ class DeviceBuffer {
 
 TransferStatusEnum runOne(TransferEngine* engine,
                           const TransferRequest& request) {
-auto batch_id = engine->allocateBatchID(1);
-if (!engine->submitTransfer(batch_id, {request}).ok()) {
-    (void)engine->freeBatchID(batch_id);
-    return TransferStatusEnum::FAILED;
-}
+    auto batch_id = engine->allocateBatchID(1);
+    if (!engine->submitTransfer(batch_id, {request}).ok()) {
+        (void)engine->freeBatchID(batch_id);
+        return TransferStatusEnum::FAILED;
+    }
     TransferStatus status;
     status.s = TransferStatusEnum::WAITING;
     const auto deadline =
