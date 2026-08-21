@@ -1051,12 +1051,12 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                     0});
             }
             bool ambiguous_endpoint = false;
-            const bool any_standby_kept_alive = std::any_of(
-                segments.begin(), segments.end(),
-                [this](const Segment& segment) {
-                    return standby_accounted_memory_bytes_.contains(
-                        segment.name);
-                });
+            const bool any_standby_kept_alive =
+                std::any_of(segments.begin(), segments.end(),
+                            [this](const Segment& segment) {
+                                return standby_accounted_memory_bytes_.contains(
+                                    segment.name);
+                            });
             for (size_t shard_index = 0;
                  any_standby_kept_alive && shard_index < kNumShards;
                  ++shard_index) {
@@ -1945,8 +1945,7 @@ MasterService::BuildStaleHandleCleanupPlan(
                 invalid_memory = segment_pool_.IsResourceInactive(
                     replica.get_buffer_allocator());
             }
-            return (invalid_memory ||
-                    replica.has_invalid_nof_handle() ||
+            return (invalid_memory || replica.has_invalid_nof_handle() ||
                     replica.has_stale_local_disk_client(alive_clients)) &&
                    replica.is_completed();
         });
@@ -2442,8 +2441,7 @@ void MasterService::ClearInvalidHandles(
             invalid_memory = segment_pool_.IsResourceInactive(
                 replica.get_buffer_allocator());
         }
-        return (invalid_memory ||
-                replica.has_invalid_nof_handle() ||
+        return (invalid_memory || replica.has_invalid_nof_handle() ||
                 replica.has_stale_local_disk_client(alive_clients)) &&
                replica.is_completed();
     });
@@ -6869,8 +6867,7 @@ bool MasterService::CleanupStaleHandles(
                 invalid_memory = segment_pool_.IsResourceInactive(
                     replica.get_buffer_allocator());
             }
-            return (invalid_memory ||
-                    replica.has_invalid_nof_handle() ||
+            return (invalid_memory || replica.has_invalid_nof_handle() ||
                     replica.has_stale_local_disk_client(alive_clients)) &&
                    replica.is_completed();
         },
