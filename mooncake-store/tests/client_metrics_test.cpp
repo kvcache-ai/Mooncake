@@ -1132,8 +1132,8 @@ TEST_F(ClientMetricsTest, SerializeBucketHistogramFormat) {
     // Fractional boundaries keep their significant digits ("2.5", not
     // "2.500000" nor "2").
     out.clear();
-    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "h", {},
-                                                 {1, 2.5}, {1, 1, 1});
+    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "h", {}, {1, 2.5},
+                                                 {1, 1, 1});
     EXPECT_TRUE(out.find("m_bucket{le=\"1\"} 1") != std::string::npos);
     EXPECT_TRUE(out.find("m_bucket{le=\"2.5\"} 2") != std::string::npos);
     EXPECT_TRUE(out.find("m_bucket{le=\"+Inf\"} 3") != std::string::npos);
