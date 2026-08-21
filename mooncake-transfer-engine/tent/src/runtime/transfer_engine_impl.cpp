@@ -690,8 +690,9 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
          ++it) {
         if (it->addr == addr) {
             auto status = it->transport->freeLocalMemory(addr, it->size);
+            if (!status.ok()) return status;
             allocated_memory_.erase(it);
-            return status;
+            return Status::OK();
         }
     }
     return Status::InvalidArgument("Address region not registered" LOC_MARK);
