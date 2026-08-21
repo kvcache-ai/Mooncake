@@ -61,6 +61,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
+    buffer_allocator.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp
@@ -450,9 +451,6 @@ if(STORE_USE_REDIS)
 endif()
 if(USE_UB)
   target_link_libraries(mooncake_store_master PRIVATE ub_allocator)
-endif()
-if(USE_ASCEND_DIRECT OR USE_UBSHMEM)
-  target_link_libraries(mooncake_store_master PRIVATE ascend_transport)
 endif()
 
 # Complete public Store library.
