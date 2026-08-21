@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <iomanip>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -13,6 +14,24 @@
 namespace mooncake {
 
 namespace {
+
+// Renders a histogram bucket boundary for the `le` label without
+// redundant trailing zeros ("1" instead of "1.000000", "2.5" unchanged)
+// for cleaner Prometheus exposition.
+std::string FormatBucketBoundary(double boundary) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(6) << boundary;
+    std::string text = oss.str();
+    if (text.find('.') != std::string::npos) {
+        while (!text.empty() && text.back() == '0') {
+            text.pop_back();
+        }
+        if (!text.empty() && text.back() == '.') {
+            text.pop_back();
+        }
+    }
+    return text;
+}
 
 DataMetricSnapshot SnapshotDataMetric(DataMetric& m) {
     DataMetricSnapshot s;
@@ -605,8 +624,9 @@ void KeyRetentionMetric::SerializeBucketHistogram(
         sum += static_cast<double>(bucket_counts[i]) * (lower + upper) / 2.0;
 
         str.append(name).append("_bucket");
-        const std::string le =
-            (i == boundaries.size()) ? "+Inf" : std::to_string(boundaries[i]);
+        const std::string le = (i == boundaries.size())
+                                   ? "+Inf"
+                                   : FormatBucketBoundary(boundaries[i]);
         append_labels(le);
         str.append(std::to_string(cumulative)).append("\n");
     }
@@ -633,19 +653,24 @@ KeyRetentionMetric::KeyRetentionMetric(
       removed_age(prefix + "_removed_age_seconds",
                   "Lifetime distribution of removed keys on this "
                   "client (seconds; deleted, evicted or cleared)",
-                  LifetimeBuckets(), labels) {
-    // Geometric (~1.3x) birth-offset boundaries for the cohort counters.
-    int64_t bound = 1;
-    while (bound < kCohortCoverageSeconds) {
-        cohort_bounds_.push_back(bound);
-        const int64_t next = static_cast<int64_t>(bound * 1.3) + 1;
-        bound = next > bound ? next : bound + 1;
-    }
-    cohort_bounds_.push_back(bound);
-    cohorts_.resize(cohort_bounds_.size());
+                  LifetimeBuckets(), labels),
+      cohort_bounds_(BuildCohortBounds()),
+      cohorts_(cohort_bounds_.size()) {
     for (auto& cohort : cohorts_) {
         cohort.store(0, std::memory_order_relaxed);
     }
+}
+
+std::vector<int64_t> KeyRetentionMetric::BuildCohortBounds() {
+    std::vector<int64_t> bounds;
+    int64_t bound = 1;
+    while (bound < kCohortCoverageSeconds) {
+        bounds.push_back(bound);
+        const int64_t next = static_cast<int64_t>(bound * 1.3) + 1;
+        bound = next > bound ? next : bound + 1;
+    }
+    bounds.push_back(bound);
+    return bounds;
 }
 
 void KeyRetentionMetric::OnKeyCreated(

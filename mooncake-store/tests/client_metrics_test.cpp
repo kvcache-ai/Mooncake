@@ -1098,8 +1098,9 @@ TEST_F(ClientMetricsTest, KeyRetentionSerializeAndSummary) {
     const std::string summary = metric.summary_metrics();
     EXPECT_TRUE(summary.find("live=1, removed=1") != std::string::npos);
     EXPECT_TRUE(summary.find("live_age: p30=") != std::string::npos);
-    EXPECT_TRUE(summary.find("removed_age: p95=") != std::string::npos);
-    EXPECT_TRUE(summary.find("all_lifetime: p95=") != std::string::npos);
+    EXPECT_TRUE(summary.find("removed_age: p30=") != std::string::npos);
+    EXPECT_TRUE(summary.find("all_lifetime: p30=") != std::string::npos);
+    EXPECT_TRUE(summary.find(", p95=") != std::string::npos);
 }
 
 TEST_F(ClientMetricsTest, SerializeBucketHistogramFormat) {
@@ -1111,8 +1112,8 @@ TEST_F(ClientMetricsTest, SerializeBucketHistogramFormat) {
     EXPECT_TRUE(out.find("# HELP m help text") != std::string::npos);
     EXPECT_TRUE(out.find("# TYPE m histogram") != std::string::npos);
     // Exposition is cumulative: 2, 2, 5.
-    EXPECT_TRUE(out.find("m_bucket{le=\"1.000000\"} 2") != std::string::npos);
-    EXPECT_TRUE(out.find("m_bucket{le=\"10.000000\"} 2") != std::string::npos);
+    EXPECT_TRUE(out.find("m_bucket{le=\"1\"} 2") != std::string::npos);
+    EXPECT_TRUE(out.find("m_bucket{le=\"10\"} 2") != std::string::npos);
     EXPECT_TRUE(out.find("m_bucket{le=\"+Inf\"} 5") != std::string::npos);
     EXPECT_TRUE(out.find("m_count 5") != std::string::npos);
     // _sum estimate: 2 * 0.5 + 0 * 5.5 + 3 * 10 (midpoints; +Inf resolves
@@ -1123,10 +1124,19 @@ TEST_F(ClientMetricsTest, SerializeBucketHistogramFormat) {
     out.clear();
     KeyRetentionMetric::SerializeBucketHistogram(
         out, "m", "h", {{"client", "c1"}}, boundaries, {2, 0, 3});
-    EXPECT_TRUE(out.find("m_bucket{client=\"c1\",le=\"1.000000\"} 2") !=
+    EXPECT_TRUE(out.find("m_bucket{client=\"c1\",le=\"1\"} 2") !=
                 std::string::npos);
     EXPECT_TRUE(out.find("m_sum{client=\"c1\"} ") != std::string::npos);
     EXPECT_TRUE(out.find("m_count{client=\"c1\"} 5") != std::string::npos);
+
+    // Fractional boundaries keep their significant digits ("2.5", not
+    // "2.500000" nor "2").
+    out.clear();
+    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "h", {},
+                                                 {1, 2.5}, {1, 1, 1});
+    EXPECT_TRUE(out.find("m_bucket{le=\"1\"} 1") != std::string::npos);
+    EXPECT_TRUE(out.find("m_bucket{le=\"2.5\"} 2") != std::string::npos);
+    EXPECT_TRUE(out.find("m_bucket{le=\"+Inf\"} 3") != std::string::npos);
 
     // Empty distribution emits nothing (consistent with ylt histograms).
     out.clear();

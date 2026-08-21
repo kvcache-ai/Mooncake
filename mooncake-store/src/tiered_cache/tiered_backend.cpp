@@ -833,10 +833,11 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
             }
         }
 
+        if (removed_birth && retention_metric_) {
+            retention_metric_->OnKeyRemoved(*removed_birth);
+        }
+
         if (found_tier) {
-            if (removed_birth && retention_metric_) {
-                retention_metric_->OnKeyRemoved(*removed_birth);
-            }
             if (tier_metric_) {
                 tier_metric_->OnReplicaRemoved(*tier_id);
             }

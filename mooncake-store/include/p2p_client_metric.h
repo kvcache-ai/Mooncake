@@ -251,6 +251,8 @@ struct KeyRetentionMetric {
     std::vector<int64_t> BuildLiveAgeBuckets(int64_t t) const;
     int64_t ToOffsetSeconds(std::chrono::steady_clock::time_point tp) const;
     size_t CohortIndex(int64_t birth_offset_seconds) const;
+    // Geometric (~1.3x) birth-offset boundaries for the cohort counters.
+    static std::vector<int64_t> BuildCohortBounds();
 
    private:
     const std::chrono::steady_clock::time_point anchor_;

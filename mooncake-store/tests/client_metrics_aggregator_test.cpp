@@ -368,7 +368,7 @@ TEST_F(ClientMetricsAggregatorTest, RetentionCountsSumAcrossClients) {
 
     const std::string text = Serialize();
     ExpectMetricValue(text, "master_cluster_key_retention_live_count", 8);
-    ExpectMetricValue(text, "master_cluster_key_retention_removed_total", 9);
+    ExpectMetricValue(text, "master_cluster_key_retention_removed_count", 9);
 }
 
 // The merged histogram preserves the true distribution instead of
@@ -383,10 +383,10 @@ TEST_F(ClientMetricsAggregatorTest, RetentionHistogramsMergeDistributions) {
 
     const std::string text = Serialize();
     EXPECT_NE(text.find("master_cluster_key_retention_removed_age_"
-                        "seconds_bucket{le=\"5.000000\"} 10"),
+                        "seconds_bucket{le=\"5\"} 10"),
               std::string::npos);
     EXPECT_NE(text.find("master_cluster_key_retention_removed_age_"
-                        "seconds_bucket{le=\"3600.000000\"} 20"),
+                        "seconds_bucket{le=\"3600\"} 20"),
               std::string::npos);
     EXPECT_NE(text.find("master_cluster_key_retention_removed_age_"
                         "seconds_count 20"),
@@ -407,13 +407,13 @@ TEST_F(ClientMetricsAggregatorTest, RetentionLiveAgeHistogramFromBuckets) {
 
     const std::string text = Serialize();
     EXPECT_NE(text.find("master_cluster_key_retention_live_age_seconds_"
-                        "bucket{le=\"1.000000\"} 4"),
+                        "bucket{le=\"1\"} 4"),
               std::string::npos);
     EXPECT_NE(text.find("master_cluster_key_retention_live_age_seconds_"
                         "count 4"),
               std::string::npos);
     EXPECT_NE(text.find("master_cluster_key_retention_removed_age_"
-                        "seconds_bucket{le=\"1800.000000\"} 6"),
+                        "seconds_bucket{le=\"1800\"} 6"),
               std::string::npos);
     // Summary quantiles are interpolated from the merged buckets on the fly.
     const std::string summary =
@@ -427,12 +427,12 @@ TEST_F(ClientMetricsAggregatorTest, RetentionRecomputesOnUpdateAndRemove) {
                                          RetentionBucketWith(5, 1)));
     std::string text = Serialize();
     ExpectMetricValue(text, "master_cluster_key_retention_live_count", 2);
-    ExpectMetricValue(text, "master_cluster_key_retention_removed_total", 1);
+    ExpectMetricValue(text, "master_cluster_key_retention_removed_count", 1);
     EXPECT_NE(text.find("master_cluster_key_retention_live_age_seconds_"
-                        "bucket{le=\"60.000000\"} 2"),
+                        "bucket{le=\"60\"} 2"),
               std::string::npos);
     EXPECT_NE(text.find("master_cluster_key_retention_removed_age_"
-                        "seconds_bucket{le=\"60.000000\"} 1"),
+                        "seconds_bucket{le=\"60\"} 1"),
               std::string::npos);
 
     // Values can decrease on a fresh snapshot.
@@ -440,9 +440,9 @@ TEST_F(ClientMetricsAggregatorTest, RetentionRecomputesOnUpdateAndRemove) {
                                          ZeroRetentionBuckets()));
     text = Serialize();
     ExpectMetricValue(text, "master_cluster_key_retention_live_count", 1);
-    ExpectMetricValue(text, "master_cluster_key_retention_removed_total", 0);
+    ExpectMetricValue(text, "master_cluster_key_retention_removed_count", 0);
     EXPECT_NE(text.find("master_cluster_key_retention_live_age_seconds_"
-                        "bucket{le=\"60.000000\"} 1"),
+                        "bucket{le=\"60\"} 1"),
               std::string::npos);
     // No removed keys -> the empty histogram is omitted.
     EXPECT_EQ(text.find("master_cluster_key_retention_removed_age_"
@@ -452,7 +452,7 @@ TEST_F(ClientMetricsAggregatorTest, RetentionRecomputesOnUpdateAndRemove) {
     Remove(client);
     text = Serialize();
     ExpectMetricValue(text, "master_cluster_key_retention_live_count", 0);
-    ExpectMetricValue(text, "master_cluster_key_retention_removed_total", 0);
+    ExpectMetricValue(text, "master_cluster_key_retention_removed_count", 0);
     EXPECT_EQ(text.find("master_cluster_key_retention_live_age_seconds"),
               std::string::npos);
     EXPECT_EQ(text.find("master_cluster_key_retention_removed_age_"
@@ -473,7 +473,7 @@ TEST_F(ClientMetricsAggregatorTest, RetentionBucketSizeMismatchIsIgnored) {
     // Counts still aggregate; malformed buckets are skipped, so both
     // merged distributions stay empty and no histogram is emitted.
     ExpectMetricValue(text, "master_cluster_key_retention_live_count", 3);
-    ExpectMetricValue(text, "master_cluster_key_retention_removed_total", 1);
+    ExpectMetricValue(text, "master_cluster_key_retention_removed_count", 1);
     EXPECT_EQ(text.find("master_cluster_key_retention_live_age_seconds"),
               std::string::npos);
     EXPECT_EQ(text.find("master_cluster_key_retention_removed_age_"
@@ -492,7 +492,7 @@ TEST_F(ClientMetricsAggregatorTest, RetentionSerializeAndSummary) {
                         "gauge"),
               std::string::npos);
     EXPECT_NE(text.find("# TYPE master_cluster_key_retention_removed_"
-                        "lifetime_seconds histogram"),
+                        "age_seconds histogram"),
               std::string::npos);
     // The quantile gauges were replaced by scrape-time histograms.
     EXPECT_EQ(text.find("master_cluster_key_retention_live_age_p"),

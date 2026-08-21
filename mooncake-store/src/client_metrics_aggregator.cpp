@@ -73,10 +73,10 @@ ClientMetricsAggregator::ClientMetricsAggregator()
       key_live_count_(
           "master_cluster_key_retention_live_count",
           "Cluster-wide number of keys currently retained on clients"),
-      key_removed_count_(
-          "master_cluster_key_retention_removed_total",
-          "Cluster-wide cumulative number of keys removed from clients "
-          "(deleted, evicted or cleared)") {
+      key_removed_count_("master_cluster_key_retention_removed_count",
+                         "Cluster-wide number of keys removed from clients;"
+                         "gauge summed from client-reported cumulative counts, "
+                         "may decrease when clients restart or rejoin") {
     remote_read_retries_.inc(0);
     remote_write_retries_.inc(0);
     // Mark retention gauges changed once so zero values are serialized.

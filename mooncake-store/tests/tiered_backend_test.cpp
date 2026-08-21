@@ -75,6 +75,42 @@ class FixedStatsTier : public CacheTier {
     std::vector<std::string> tags_;
 };
 
+// A CacheTier whose Commit always fails; lets tests drive the failed-commit
+// path of TieredBackend::Commit, which leaves a "zombie" entry (indexed,
+// without replicas) behind.
+class FailingCommitTier : public CacheTier {
+   public:
+    FailingCommitTier(UUID id, size_t capacity)
+        : id_(id), capacity_(capacity) {}
+
+    tl::expected<void, ErrorCode> Init(TieredBackend*,
+                                       TransferEngine*) override {
+        return {};
+    }
+    tl::expected<void, ErrorCode> Allocate(size_t size,
+                                           DataSource& data_source) override {
+        data_source.buffer = std::make_unique<TempDRAMBuffer>(
+            std::make_unique<char[]>(size), size);
+        data_source.type = MemoryType::DRAM;
+        return {};
+    }
+    tl::expected<void, ErrorCode> Free(DataSource) override { return {}; }
+    tl::expected<void, ErrorCode> Commit(std::string_view,
+                                         const DataSource&) override {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    UUID GetTierId() const override { return id_; }
+    size_t GetCapacity() const override { return capacity_; }
+    size_t GetUsage() const override { return 0; }
+    MemoryType GetMemoryType() const override { return MemoryType::DRAM; }
+    const std::vector<std::string>& GetTags() const override { return tags_; }
+
+   private:
+    UUID id_;
+    size_t capacity_;
+    std::vector<std::string> tags_;
+};
+
 class TieredBackendTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -1842,6 +1878,63 @@ TEST_F(TieredBackendTest, KeyRetentionAllRemovalPathsRecord) {
     EXPECT_EQ(snap.live_count, 0);
     EXPECT_EQ(snap.removed_total, 3);
     EXPECT_EQ(SumRetentionBuckets(snap.removed_buckets), 3);
+    EXPECT_EQ(SumRetentionBuckets(snap.live_age_buckets), 0);
+}
+
+// A zombie entry (a Commit that failed after indexing the entry leaves it
+// without replicas) erased by a tier-specific Delete must still end its
+// retention lifetime, even though the call itself reports TIER_NOT_FOUND.
+TEST_F(TieredBackendTest, KeyRetentionZombieErasedByTierSpecificDelete) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto retention = std::make_shared<KeyRetentionMetric>("test_retention");
+    ASSERT_TRUE(backend
+                    .Init(config, /*engine=*/nullptr,
+                          /*add_replica_callback=*/nullptr,
+                          /*remove_replica_callback=*/nullptr,
+                          /*segment_sync_callback=*/nullptr,
+                          /*tier_metric=*/nullptr,
+                          /*retention_metric=*/retention)
+                    .has_value());
+
+    // Allocate from a tier whose Commit always fails: Commit indexes the
+    // entry first and fails afterwards, leaving a zombie behind.
+    const UUID failing_tier_id{9, 9};
+    InjectTier(backend,
+               std::make_shared<FailingCommitTier>(failing_tier_id,
+                                                   /*capacity=*/1073741824),
+               /*priority=*/1);
+    auto handle = backend.Allocate(SMALL_DATA_SIZE, failing_tier_id);
+    ASSERT_TRUE(handle.has_value());
+    EXPECT_FALSE(backend.Commit("zombie_key", handle.value()).has_value());
+
+    auto snap = retention->Snapshot();
+    EXPECT_EQ(snap.live_count, 1);
+    EXPECT_EQ(snap.removed_total, 0);
+    EXPECT_EQ(SumRetentionBuckets(snap.live_age_buckets), 1);
+
+    // The zombie has no replica on the tier, so the delete reports
+    // TIER_NOT_FOUND; the zombie cleanup must still record the lifetime.
+    auto result = backend.Delete("zombie_key", failing_tier_id);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::TIER_NOT_FOUND);
+
+    snap = retention->Snapshot();
+    EXPECT_EQ(snap.live_count, 0);
+    EXPECT_EQ(snap.removed_total, 1);
+    EXPECT_EQ(SumRetentionBuckets(snap.removed_buckets), 1);
     EXPECT_EQ(SumRetentionBuckets(snap.live_age_buckets), 0);
 }
 
