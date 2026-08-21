@@ -11,11 +11,13 @@ code or endpoint string changes are needed.
 |---|---|
 | `MC_ETCD_CONF_FILE` | Path to a file with `username=...` and `password=...` lines (one per line, `#` lines and empty lines ignored) |
 | `MC_ETCD_TLS_CA_CERT` | Path to the CA certificate used to verify the etcd server (one-way TLS) |
-| `MC_ETCD_TLS_SERVER_NAME` | Optional: override the server name used for TLS SNI / certificate hostname verification (e.g. connecting via IP) |
-| `MC_ETCD_TLS_INSECURE_SKIP_VERIFY` | Set to `"true"` to skip certificate verification (testing only, never in production) |
+| `MC_ETCD_TLS_SERVER_NAME` | Optional: override the server name used for TLS SNI / certificate hostname verification (e.g. connecting via IP). Requires TLS to be enabled (either `MC_ETCD_TLS_CA_CERT` or `MC_ETCD_TLS_INSECURE_SKIP_VERIFY="true"`). |
+| `MC_ETCD_TLS_INSECURE_SKIP_VERIFY` | Set to `"true"` to skip certificate verification (testing only, never in production). If set to `"true"` without `MC_ETCD_TLS_CA_CERT`, the client uses an insecure TLS connection. |
 
 All variables are optional. When none are set, the client behaves exactly as
-before (plaintext, no authentication).
+before (plaintext, no authentication). Invalid or incomplete TLS combinations
+are rejected during client initialization; the wrapper does not silently fall
+back to plaintext when TLS-related variables are partially configured.
 
 ## Example
 

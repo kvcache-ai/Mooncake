@@ -32,14 +32,10 @@ static inline void call_watch_cb(void* func,
 import "C"
 
 import (
-	"bufio"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -47,8 +43,6 @@ import (
 
 	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // prefixWatchInfo stores cancel function and callback context for a prefix watch
@@ -98,169 +92,6 @@ const (
 	storeDialKeepAliveTimeout = 3 * time.Second
 )
 
-// --- Security configuration (RBAC + TLS) loaded from environment variables ---
-//
-// Environment variables:
-//   MC_ETCD_CONF_FILE - Path to a file containing username=... and password=... lines.
-//   MC_ETCD_TLS_CA_CERT           - Path to the CA certificate file for server verification (one-way TLS).
-//   MC_ETCD_TLS_SERVER_NAME        - Optional: override the server name used for TLS SNI and certificate
-//                                     hostname verification. Useful when connecting via IP or a service
-//                                     name that differs from the certificate's SAN.
-//   MC_ETCD_TLS_INSECURE_SKIP_VERIFY - Set to "true" to skip server certificate verification. Only for
-//                                     testing environments; never use in production.
-//
-// All variables are optional. When none are set the behaviour is identical to before this feature.
-//
-// The configuration is loaded exactly once via sync.Once and cached, so even EtcdStoreResetClientWrapper
-// reuses the same parsed values without re-reading files.
-
-// securitySettings holds the cached RBAC and TLS configuration parsed from environment variables.
-// It is populated exactly once by loadSecurityConfig via sync.Once.
-type securitySettings struct {
-	username  string
-	password  string
-	tlsConfig *tls.Config
-	loadErr   error // non-nil when a configured resource failed to load
-}
-
-var (
-	securityOnce   sync.Once
-	cachedSecurity securitySettings
-)
-
-// parseRbacCredentialsFile reads a credentials file in key=value format and
-// returns the username and password. Expected format:
-//
-//	username=<user>
-//	password=<secret>
-//
-// Lines starting with '#' are treated as comments and ignored. Empty lines are skipped.
-func parseRbacCredentialsFile(path string) (string, string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", "", fmt.Errorf("cannot open credentials file %s: %w", path, err)
-	}
-	defer file.Close()
-
-	var username, password string
-	scanner := bufio.NewScanner(file)
-	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSpace(scanner.Text())
-		// Skip empty lines and comment lines.
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			return "", "", fmt.Errorf("credentials file %s line %d: invalid format, expected key=value", path, lineNo)
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		switch key {
-		case "username":
-			username = value
-		case "password":
-			password = value
-		default:
-			return "", "", fmt.Errorf("credentials file %s line %d: unknown key %q, expected username or password", path, lineNo, key)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return "", "", fmt.Errorf("error reading credentials file %s: %w", path, err)
-	}
-	if username == "" {
-		return "", "", fmt.Errorf("username not found in credentials file %s", path)
-	}
-	if password == "" {
-		return "", "", fmt.Errorf("password not found in credentials file %s", path)
-	}
-	return username, password, nil
-}
-
-// loadSecurityConfig reads environment variables and populates the cached
-// securitySettings. This function is called exactly once via sync.Once.
-// Diagnostic messages are written to stderr so they never pollute stdout,
-// which callers may rely on for data.
-func loadSecurityConfig() {
-	// --- RBAC credentials from file ---
-	credsFile := os.Getenv("MC_ETCD_CONF_FILE")
-	if credsFile != "" {
-		username, password, err := parseRbacCredentialsFile(credsFile)
-		if err != nil {
-			cachedSecurity.loadErr = fmt.Errorf("failed to load RBAC credentials: %w", err)
-			fmt.Fprintf(os.Stderr, "[etcd_wrapper] ERROR: %v\n", cachedSecurity.loadErr)
-			return
-		}
-		cachedSecurity.username = username
-		cachedSecurity.password = password
-		fmt.Fprintf(os.Stderr, "[etcd_wrapper] RBAC authentication enabled (user: %s)\n", username)
-	}
-
-	// --- TLS configuration (one-way: verify server) ---
-	caCertFile := os.Getenv("MC_ETCD_TLS_CA_CERT")
-	if caCertFile == "" {
-		// No TLS configured — this is fine, plaintext is the default.
-		return
-	}
-
-	caCert, err := os.ReadFile(caCertFile)
-	if err != nil {
-		cachedSecurity.loadErr = fmt.Errorf("failed to read CA certificate %s: %w", caCertFile, err)
-		fmt.Fprintf(os.Stderr, "[etcd_wrapper] ERROR: %v\n", cachedSecurity.loadErr)
-		return
-	}
-
-	caCertPool := x509.NewCertPool()
-	if !caCertPool.AppendCertsFromPEM(caCert) {
-		cachedSecurity.loadErr = fmt.Errorf("failed to parse CA certificate from %s (not valid PEM)", caCertFile)
-		fmt.Fprintf(os.Stderr, "[etcd_wrapper] ERROR: %v\n", cachedSecurity.loadErr)
-		return
-	}
-
-	tlsCfg := &tls.Config{
-		RootCAs:    caCertPool,
-		MinVersion: tls.VersionTLS12,
-	}
-
-	// Optional: override the server name used for SNI and hostname verification.
-	if serverName := os.Getenv("MC_ETCD_TLS_SERVER_NAME"); serverName != "" {
-		tlsCfg.ServerName = serverName
-		fmt.Fprintf(os.Stderr, "[etcd_wrapper] TLS ServerName override: %s\n", serverName)
-	}
-
-	// Optional: skip certificate verification (testing only).
-	if os.Getenv("MC_ETCD_TLS_INSECURE_SKIP_VERIFY") == "true" {
-		tlsCfg.InsecureSkipVerify = true
-		fmt.Fprintf(os.Stderr, "[etcd_wrapper] WARNING: TLS InsecureSkipVerify is enabled — not safe for production\n")
-	}
-
-	cachedSecurity.tlsConfig = tlsCfg
-	fmt.Fprintf(os.Stderr, "[etcd_wrapper] TLS enabled (CA: %s)\n", caCertFile)
-}
-
-// applySecurityConfig applies the cached security configuration (RBAC credentials
-// and TLS settings) to the given clientv3.Config. The configuration is loaded
-// lazily on first call via sync.Once.
-//
-// Returns nil on success or when no security environment variables are set.
-// Returns an error when a configured resource (RBAC file, CA certificate) fails
-// to load — the caller must abort client creation in this case to avoid falling
-// back to an unauthenticated connection.
-func applySecurityConfig(cfg *clientv3.Config) error {
-	securityOnce.Do(loadSecurityConfig)
-
-	if cachedSecurity.loadErr != nil {
-		return cachedSecurity.loadErr
-	}
-
-	cfg.Username = cachedSecurity.username
-	cfg.Password = cachedSecurity.password
-	cfg.TLS = cachedSecurity.tlsConfig
-	return nil
-}
-
 // newStoreClientConfig builds the base clientv3.Config for the store etcd client
 // and applies any security configuration (RBAC / TLS) from environment variables.
 // The caller must check the returned error and abort client creation on failure:
@@ -272,7 +103,6 @@ func newStoreClientConfig(validEndpoints []string) (clientv3.Config, error) {
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
-		PermitWithoutStream:  true,
 	}
 	if err := applySecurityConfig(&cfg); err != nil {
 		return cfg, err
@@ -455,11 +285,8 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 // are marked broken so their C++ owners receive a WATCH_BROKEN callback and
 // re-arm against the new client. The old client is closed only after the swap.
 //
-// This is used both by the exported reset wrapper and by the prefix-watch
-// goroutine when an etcd auth token expires: clientv3 never refreshes the
-// token for long-lived watch streams (etcd-io/etcd#12385, etcd-io/etcd#17623),
-// so the only reliable client-side fix is a brand-new client whose token
-// bundle is authenticated on first use.
+// This helper is used by the exported reset wrapper so the reset path and the
+// initial client creation path share the same security configuration handling.
 func rebuildStoreClient(endpoints []string) error {
 	cfg, cfgErr := newStoreClientConfig(endpoints)
 	if cfgErr != nil {
@@ -988,6 +815,66 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 	return 0
 }
 
+//export EtcdStoreTxnCompareAndPutWrapper
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+
+	cmpN := int(compareCount)
+	putN := int(putCount)
+
+	cmps := make([]clientv3.Cmp, 0, cmpN)
+	if cmpN > 0 {
+		compareKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(compareKeys))[:cmpN:cmpN]
+		compareKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(compareKeySizes))[:cmpN:cmpN]
+		compareKindList := (*[1 << 28]C.int)(unsafe.Pointer(compareKinds))[:cmpN:cmpN]
+		compareValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(compareValues))[:cmpN:cmpN]
+		compareValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(compareValueSizes))[:cmpN:cmpN]
+		for i := 0; i < cmpN; i++ {
+			k := C.GoStringN(compareKeyPtrs[i], compareKeySizeList[i])
+			switch int(compareKindList[i]) {
+			case 0:
+				v := C.GoStringN(compareValuePtrs[i], compareValueSizeList[i])
+				cmps = append(cmps, clientv3.Compare(clientv3.Value(k), "=", v))
+			case 1:
+				cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", 0))
+			default:
+				*errMsg = C.CString("unsupported compare kind")
+				return -1
+			}
+		}
+	}
+
+	ops := make([]clientv3.Op, 0, putN)
+	if putN > 0 {
+		putKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putKeys))[:putN:putN]
+		putKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(putKeySizes))[:putN:putN]
+		putValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putValues))[:putN:putN]
+		putValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(putValueSizes))[:putN:putN]
+		for i := 0; i < putN; i++ {
+			k := C.GoStringN(putKeyPtrs[i], putKeySizeList[i])
+			v := C.GoStringN(putValuePtrs[i], putValueSizeList[i])
+			ops = append(ops, clientv3.OpPut(k, v))
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := cli.Txn(ctx).If(cmps...).Then(ops...).Commit()
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !resp.Succeeded {
+		*errMsg = C.CString("transaction compare failed")
+		return -2
+	}
+	return 0
+}
+
 //export EtcdStoreGetWithPrefixWrapper
 func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.char, keySizes **C.int, values **C.char, valueSizes **C.int, count *C.int, errMsg **C.char) int {
 	cli := getStoreClient()
@@ -1223,38 +1110,13 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 			close(doneCh)
 		}()
 
-		// Auth tokens issued by etcd have a server-side TTL (default 300s for
-		// the `simple` token type). When one expires the server kills the
-		// long-lived watch stream with `Unauthenticated: invalid auth token`.
-		// Re-issuing cli.Watch() opens a NEW watch stream whose client
-		// interceptor calls getToken() and attaches a fresh token, so the
-		// watch recovers here without tearing down and re-arming from C++.
-		// authRetries caps *consecutive* reconnects triggered solely by token
-		// expiry: it is reset on every successful Created, so a credential
-		// problem still surfaces as WATCH_BROKEN instead of retrying forever.
-		const maxAuthRetries = 5
-		authRetries := maxAuthRetries
-
-		// resumeRev is the next revision to watch from on reconnect so no
-		// events are missed between the stream dying and the reconnect.
-		// 0 means "from the current revision" (or the caller's startRevision).
-		resumeRev := int64(startRevision)
-		if resumeRev < 0 {
-			resumeRev = 0
+		// WithCreatedNotify makes etcd send an initial response with
+		// Created == true as soon as the watch is registered server-side.
+		opts := []clientv3.OpOption{clientv3.WithPrefix(), clientv3.WithCreatedNotify()}
+		if startRevision > 0 {
+			opts = append(opts, clientv3.WithRev(int64(startRevision)))
 		}
-
-		// startWatch (re)creates the watch stream. Every call goes through the
-		// client interceptor, which re-authenticates when credentials are set.
-		startWatch := func() clientv3.WatchChan {
-			// WithCreatedNotify makes etcd send an initial response with
-			// Created == true as soon as the watch is registered server-side.
-			opts := []clientv3.OpOption{clientv3.WithPrefix(), clientv3.WithCreatedNotify()}
-			if resumeRev > 0 {
-				opts = append(opts, clientv3.WithRev(resumeRev))
-			}
-			return cli.Watch(ctx, p, opts...)
-		}
-		watchChan := startWatch()
+		watchChan := cli.Watch(ctx, p, opts...)
 
 		for {
 			select {
@@ -1275,9 +1137,6 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 				// server-side watch is established; release the waiter.
 				if watchResp.Created {
 					signalCreated(true)
-					// A successful (re)connect resets the auth-retry budget so
-					// only *consecutive* token failures can exhaust it.
-					authRetries = maxAuthRetries
 				}
 				if watchResp.Err() != nil {
 					// Watch error. Check if context was cancelled.
@@ -1286,79 +1145,15 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 						notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, false)
 						return
 					default:
+						notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, true)
+						return
 					}
-					// Detect auth-token expiry. Both rpctypes.Error() and
-					// status.FromError() can return codes.Unknown for the same
-					// Unauthenticated failure, so fall back to matching the
-					// stable server-side description text as well.
-					st, _ := status.FromError(watchResp.Err())
-					errText := watchResp.Err().Error()
-					isAuthTokenErr := st.Code() == codes.Unauthenticated ||
-						strings.Contains(errText, "etcdserver: invalid auth token")
-					if isAuthTokenErr && authRetries > 0 {
-						// Probe with a plain unary Authenticate RPC to tell
-						// "server rejects our credentials / auth is broken"
-						// (probe_err != nil) apart from "only this client's
-						// cached token is stale" (probe_err == nil).
-						authRetries--
-						probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
-						_, probeErr := cli.Auth.Authenticate(probeCtx, cli.Username, cli.Password)
-						probeCancel()
-						if probeErr == nil {
-							// Server is healthy and willing to issue a fresh
-							// token; the stale token lives only in this client's
-							// authTokenBundle, which clientv3 never refreshes
-							// for long-lived watch streams (etcd-io/etcd#12385,
-							// etcd-io/etcd#17623). Rebuilding the store client
-							// creates a fresh bundle that is authenticated on
-							// first use.
-							fmt.Fprintf(os.Stderr, "[etcd_wrapper] prefix=%s: auth token expired, rebuilding store client (retries left=%d): %v\n",
-								p, authRetries, watchResp.Err())
-							if rebuildErr := rebuildStoreClient(cli.Endpoints()); rebuildErr != nil {
-								fmt.Fprintf(os.Stderr, "[etcd_wrapper] prefix=%s: store client rebuild failed (%v), falling back to in-place reconnect\n",
-									p, rebuildErr)
-							} else {
-								// The rebuild cancelled every prefix watch
-								// (including this one) and swapped in a fresh
-								// client. Signal WATCH_BROKEN so the C++ side
-								// re-arms against the new client; any events
-								// missed between stream death and re-arm are
-								// replayed by the caller's resync logic.
-								notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, true)
-								return
-							}
-						} else {
-							fmt.Fprintf(os.Stderr, "[etcd_wrapper] prefix=%s: auth token expired, reconnecting (retries left=%d, reauth_probe_err=%v): %v\n",
-								p, authRetries, probeErr, watchResp.Err())
-						}
-						select {
-						case <-ctx.Done():
-							notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, false)
-							return
-						case <-time.After(200 * time.Millisecond):
-						}
-						watchChan = startWatch()
-						continue
-					}
-					// Log the concrete error before notifying C++ so the root
-					// cause (e.g. PermissionDenied, ErrCompacted, rpc error) is
-					// visible instead of being swallowed.
-					fmt.Fprintf(os.Stderr, "[etcd_wrapper] prefix=%s: watch response error (created=%v, rev=%d, auth_retries_left=%d): %v\n",
-						p, watchResp.Created, watchResp.Header.Revision, authRetries, watchResp.Err())
-					notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, true)
-					return
 				}
 
 				// Use response-level revision as a more stable resume point.
 				respRev := int64(0)
 				if watchResp.Header.Revision > 0 {
 					respRev = watchResp.Header.Revision
-				}
-				// The whole response is processed synchronously before the next
-				// channel read, so on a reconnect we can safely resume right
-				// after this response's revision without loss or duplication.
-				if respRev+1 > resumeRev {
-					resumeRev = respRev + 1
 				}
 
 				for _, event := range watchResp.Events {
