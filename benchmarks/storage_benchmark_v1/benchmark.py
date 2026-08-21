@@ -688,7 +688,10 @@ def main():
     parser.add_argument('--max-pages', type=int, default=2000,
                        help='Maximum number of pages')
     parser.add_argument('--fsync-mode', type=str, choices=['batch', 'always', 'end', 'none'],
-                       default='none', help='When to fsync')
+                       default='none',
+                       help='When to fsync. With --file-mode per-file, end does '
+                            'zero fsyncs and batch fsyncs only the last file in '
+                            'each batch; durability is weaker than single')
     parser.add_argument('--fsync-batch-size', type=int, default=100,
                        help='Number of writes between fsync')
     parser.add_argument('--threads', type=int, default=1,

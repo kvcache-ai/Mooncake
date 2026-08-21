@@ -27,7 +27,7 @@ python benchmark.py --scenario conversation \
 | `--file-mode` | `single` | Storage layout: `single` = one `data.bin` with slot offsets; `per-file` = one file per page. Per-file writes open with `O_TRUNC` and replace the whole page file |
 | `--max-requests` | `None` | Maximum number of requests to process |
 | `--max-pages` | `2000` | Maximum number of pages (creates modulo mapping if trace is larger) |
-| `--fsync-mode` | `none` | When to fsync: `none`, `batch`, `always`, or `end` |
+| `--fsync-mode` | `none` | When to fsync: `none`, `batch`, `always`, or `end`. With `--file-mode per-file`, `end`/`batch` are weaker than in `single` (see File Mode) |
 | `--fsync-batch-size` | `100` | Number of writes between fsync in batch mode |
 | `--threads` | `1` | Number of benchmark client worker threads |
 | `--replay-scales` | `0` | Comma-separated trace fast-forward speeds; `0` means unpaced |
@@ -78,6 +78,26 @@ strict single-client trace-order read/write and hit-rate accounting, use
 With `--threads > 1`, each thread still uses its own `thread_N/` directory.
 In `single` mode that directory contains `data.bin`; in `per-file` mode it
 contains `page_*.bin`.
+
+Per-file mode does not delete leftover `page_*.bin` files or `thread_N/`
+directories between runs. A re-run with a smaller `--max-pages` or fewer
+`--threads` can leave orphaned files. Within a run this is harmless
+(`_written_pages` starts empty and writes use `O_TRUNC`); remove them
+manually from `--storage-dir` if disk space matters.
+
+`--fsync-mode none` and `always` are comparable across file modes. Combined
+with `--file-mode per-file`, `end` and `batch` are weaker than in `single`
+and should not be compared as the same durability cost:
+
+- `end`: `write()` never fsyncs, and `close()` only fsyncs the persistent
+  `data.bin` fd, which per-file never opens. Expected result: zero fsyncs,
+  write latency and `Sync Count` look like `none`.
+- `batch`: `_pending_syncs` counts across files, but `os.fsync(fd)` runs
+  only on the current per-op fd. Expected result: one file per batch is
+  synced (the Nth write); the other N-1 files are already closed, and the
+  trailing partial batch is never flushed. `Sync Count` still increments,
+  but most writes are not durable, so write latency is much closer to
+  `none` than to `single` + `batch`.
 
 ## Output Format
 

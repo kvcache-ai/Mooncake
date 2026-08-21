@@ -62,7 +62,10 @@ class DiskHashTable(Storage):
             page_size: Size of each entry (page) in bytes
             max_pages: Maximum number of entries (creates circular mapping if trace is larger)
             file_mode: 'single' = one big data.bin with slot offsets (default);
-                       'per-file' = one file per page (open/read-write/close per op)
+                       'per-file' = one file per page (open/read-write/close per op).
+                       Per-file writes use O_TRUNC, so a partial-page
+                       (offset_in_page > 0 or length < page_size) write
+                       replaces the whole file and discards the rest of the page.
             fsync_mode: When to fsync ('batch', 'always', 'end', 'none')
             fsync_batch_size: Writes between fsync
         """
@@ -157,7 +160,9 @@ class DiskHashTable(Storage):
 
         single: reuse the persistent data.bin fd, base = physical * page_size.
         per-file: open page_<physical>.bin for this op, base = 0, owned = True
-                  (caller must close fd when done).
+                  (caller must close fd when done). Writes use O_TRUNC, so a
+                  partial-page(offset_in_page > 0 or length < page_size)
+                  write replaces the whole file.
         """
         physical_page_id = self._map_page_id(page_id)
         if self.file_mode == 'per-file':
