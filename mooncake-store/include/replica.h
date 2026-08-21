@@ -218,6 +218,9 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+    // Process-local affiliation with the exact Client incarnation. This is
+    // rebuilt after restore and deliberately excluded from descriptors.
+    std::shared_ptr<ClientLivenessRecord> client_liveness;
 };
 
 struct DistributedFSDescriptor {
@@ -293,10 +296,12 @@ class Replica {
 
     // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
-            std::string transport_endpoint, ReplicaStatus status)
+            std::string transport_endpoint, ReplicaStatus status,
+            std::shared_ptr<ClientLivenessRecord> client_liveness = nullptr)
         : id_(next_id_.fetch_add(1)),
           data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint)}),
+                                     std::move(transport_endpoint),
+                                     std::move(client_liveness)}),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -363,6 +368,43 @@ class Replica {
     }
 
     [[nodiscard]] Descriptor get_descriptor() const;
+
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
+        if (is_memory_replica()) {
+            const auto& data = std::get<MemoryReplicaData>(data_);
+            if (!data.buffer || !data.buffer->isAvailable()) {
+                return false;
+            }
+        } else if (is_nof_replica()) {
+            const auto& data = std::get<NoFReplicaData>(data_);
+            if (!data.buffer || !data.buffer->isAvailable()) {
+                return false;
+            }
+        } else if (is_local_disk_replica()) {
+            const auto& data = std::get<LocalDiskReplicaData>(data_);
+            const auto record = std::atomic_load_explicit(
+                &data.client_liveness, std::memory_order_acquire);
+            if (!record || !record->IsServing()) {
+                return false;
+            }
+        }
+        descriptor = get_descriptor();
+        if (is_memory_replica()) {
+            return std::get<MemoryReplicaData>(data_)
+                .buffer->isAvailable();
+        }
+        if (is_nof_replica()) {
+            return std::get<NoFReplicaData>(data_)
+                .buffer->isAvailable();
+        }
+        if (is_local_disk_replica()) {
+            const auto& data = std::get<LocalDiskReplicaData>(data_);
+            const auto record = std::atomic_load_explicit(
+                &data.client_liveness, std::memory_order_acquire);
+            return record && record->IsServing();
+        }
+        return true;
+    }
 
     [[nodiscard]] ReplicaID id() const { return id_; }
 
@@ -501,6 +543,21 @@ class Replica {
             return disk_data.client_id;
         }
         return std::nullopt;
+    }
+
+    void bindClientLiveness(
+        std::shared_ptr<ClientLivenessRecord> client_liveness) {
+        if (is_memory_replica()) {
+            auto& data = std::get<MemoryReplicaData>(data_);
+            if (data.buffer) {
+                data.buffer->bindClientLiveness(std::move(client_liveness));
+            }
+        } else if (is_local_disk_replica()) {
+            auto& record =
+                std::get<LocalDiskReplicaData>(data_).client_liveness;
+            std::atomic_store_explicit(&record, std::move(client_liveness),
+                                       std::memory_order_release);
+        }
     }
 
     [[nodiscard]] size_t get_memory_buffer_size() const {

@@ -58,6 +58,7 @@ struct MountedSegment {
     Segment segment;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    SegmentAllocatorRegistration allocator_registration;
 };
 
 struct MountedNoFSegment {
@@ -65,6 +66,7 @@ struct MountedNoFSegment {
     UUID client_id;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    SegmentAllocatorRegistration allocator_registration;
 };
 
 struct MountedNoFSegmentSnapshot {
@@ -109,7 +111,9 @@ class ScopedSegmentAccess {
     /**
      * @brief Mount a segment
      */
-    ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
+    ErrorCode MountSegment(
+        const Segment& segment, const UUID& client_id,
+        std::shared_ptr<ClientLivenessRecord> client_liveness);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -118,7 +122,9 @@ class ScopedSegmentAccess {
      * mounted while the return value will be OK.
      */
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
-                             const UUID& client_id);
+                             const UUID& client_id,
+                             std::shared_ptr<ClientLivenessRecord>
+                                 client_liveness);
 
     ErrorCode ValidateRemountSegment(const Segment& segment,
                                      const UUID& client_id) const;
@@ -160,6 +166,21 @@ class ScopedSegmentAccess {
      */
     ErrorCode GetClientSegments(const UUID& client_id,
                                 std::vector<Segment>& segments) const;
+
+    /**
+     * @brief Return every Store Client that owns a restored memory or local
+     *        disk segment.
+     */
+    std::vector<UUID> GetStoreClientIds() const;
+
+    /**
+     * @brief Rebind restored client-owned segment resources to a fresh
+     *        liveness record. Segment snapshots intentionally do not persist
+     *        record implementation state.
+     */
+    void BindClientLiveness(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& client_liveness);
 
     /**
      * @brief Get the names of all the segments

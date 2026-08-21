@@ -146,6 +146,16 @@ std::vector<LocalSsdManager::ClientAccess> LocalSsdManager::SnapshotClients()
     return clients;
 }
 
+std::vector<UUID> LocalSsdManager::GetClientIds() const {
+    std::vector<UUID> client_ids;
+    std::shared_lock lock(mutex_);
+    client_ids.reserve(clients_.size());
+    for (const auto& [client_id, record] : clients_) {
+        client_ids.push_back(client_id);
+    }
+    return client_ids;
+}
+
 void LocalSsdManager::WaitForOperations(const ClientMap& clients) {
     for (const auto& [_, record] : clients) {
         std::unique_lock lifecycle_lock(record->lifecycle_mutex);

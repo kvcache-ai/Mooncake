@@ -29,6 +29,7 @@
 
 #include "allocation_strategy.h"
 #include "background_worker.h"
+#include "client_liveness.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "lease.h"
@@ -999,6 +1000,8 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
 
+    std::shared_ptr<ClientLivenessRecord> FindClientRecord(
+        const UUID& client_id) const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
@@ -2547,6 +2550,9 @@ class MasterService {
 
     // Client related members
     mutable std::shared_mutex client_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        client_liveness_records_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
@@ -2950,6 +2956,10 @@ class MasterService {
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
+    bool TryGetReadableReplicaDescriptor(
+        const Replica& replica, Replica::Descriptor& descriptor) const;
+    std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
+        const ObjectMetadata& metadata) const;
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
