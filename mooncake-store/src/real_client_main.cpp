@@ -5,6 +5,7 @@
 #include "client_service.h"
 #include "common.h"
 #include "config.h"
+#include "byte_size.h"
 #include "real_client.h"
 
 using namespace mooncake;

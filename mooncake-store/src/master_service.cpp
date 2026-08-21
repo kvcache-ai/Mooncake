@@ -54,7 +54,6 @@
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
-#include "utils.h"
 #include "kv_event/kv_event_config.h"
 #include "master_snapshot_manager.h"
 #include "master_snapshot_repository.h"
@@ -4191,7 +4190,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
     if (use_disk_replica_) {
         std::string file_path =
-            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
+            FileUtil::ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
         replicas.emplace_back(file_path, value_length,
                               ReplicaStatus::PROCESSING);
     }

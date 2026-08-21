@@ -20,7 +20,7 @@
 #include "rpc_service.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
-#include "utils.h"
+#include "network.h"
 
 #include <ylt/reflection/user_reflect_macro.hpp>
 

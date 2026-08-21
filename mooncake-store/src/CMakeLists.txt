@@ -3,8 +3,7 @@ add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
     types.cpp
-    utils.cpp
-    mmap_arena.cpp
+    network.cpp
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
@@ -64,6 +63,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer_allocation.cpp
+    mmap_arena.cpp
+    mmap_buffer.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp
@@ -179,7 +180,10 @@ int main() {
     set(MOONCAKE_HAVE_NVME_URING_CMD ON)
     message(STATUS "io_uring: NVMe uring command support enabled")
   else()
-    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+    message(
+      STATUS
+        "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled"
+    )
   endif()
 endif()
 

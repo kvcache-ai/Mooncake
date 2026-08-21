@@ -7,6 +7,7 @@
 
 #include "bool_parser.h"
 #include "integer_parser.h"
+#include "byte_size.h"
 
 namespace mooncake {
 
