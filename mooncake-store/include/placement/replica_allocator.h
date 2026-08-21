@@ -41,13 +41,13 @@ struct ReplicaAllocationRequest final {
 class ReplicaAllocator final {
    public:
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        ScopedPlacementAccess& placement, PlacementPolicyType policy_type,
+        ScopedPlacementReadAccess& placement, PlacementPolicyType policy_type,
         const ReplicaAllocationRequest& request,
         std::optional<LocalSSDMetricsView> local_ssd_metrics =
             std::nullopt) const;
 
     tl::expected<Replica, ErrorCode> AllocateFrom(
-        ScopedPlacementAccess& placement, size_t size,
+        ScopedPlacementReadAccess& placement, size_t size,
         std::string_view group_name,
         ReplicaType replica_type = ReplicaType::MEMORY) const;
 };

@@ -761,7 +761,7 @@ class MasterServiceHATest : public ::testing::Test {
 
     static void PrepareUnmountSegmentForTesting(MasterService& service,
                                                 const UUID& segment_id) {
-        auto segment_access = service.segment_pool_.getSegmentPoolAccess();
+        auto segment_access = service.segment_pool_.AcquireWriteAccess();
         size_t metrics_dec_capacity = 0;
         ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
                                      segment_id, metrics_dec_capacity));

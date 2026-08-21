@@ -16,9 +16,9 @@
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "segment/pool.h"
-#include "segment/pool_view.h"
+#include "segment/pool_read_access.h"
 #include "serialize/serializer.h"
-#include "ha/snapshot/segment_pool_snapshot_codec.h"
+#include "ha/snapshot/store_resource_snapshot_codec.h"
 #include "utils/zstd_util.h"
 
 namespace mooncake {
@@ -101,7 +101,8 @@ ErrorCode ValidateManifest(std::string_view snapshot_id,
 
 tl::expected<std::optional<StandbyObjectMetadata>, ErrorCode>
 DeserializeStandbyObjectMetadata(
-    const msgpack::object& object, const SegmentPoolView& segment_view,
+    const msgpack::object& object,
+    const ScopedSegmentPoolReadAccess& segment_view,
     uint64_t snapshot_sequence_id,
     const std::chrono::system_clock::time_point& now) {
     if (object.type != msgpack::type::ARRAY) {
@@ -243,9 +244,10 @@ DeserializeStandbyObjectMetadata(
 }
 
 tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
-DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
-                                   const SegmentPoolView& segment_view,
-                                   uint64_t snapshot_sequence_id) {
+DeserializeStandbySnapshotMetadata(
+    const std::vector<uint8_t>& data,
+    const ScopedSegmentPoolReadAccess& segment_view,
+    uint64_t snapshot_sequence_id) {
     msgpack::object_handle root_handle;
     try {
         root_handle = msgpack::unpack(
@@ -477,7 +479,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         RegionDriverConfig driver_config;
         driver_config.memory_allocator = BufferAllocatorType::OFFSET;
         SegmentPool segment_pool(driver_config);
-        auto deserialize_segments = ha::SegmentPoolSnapshotCodec::Decode(
+        auto deserialize_segments = ha::StoreResourceSnapshotCodec::Decode(
             segment_pool, segments_content);
         if (!deserialize_segments) {
             LOG(ERROR) << "Failed to deserialize snapshot segments payload, "
@@ -487,7 +489,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         }
 
         auto deserialize_metadata = DeserializeStandbySnapshotMetadata(
-            metadata_content, segment_pool.getView(),
+            metadata_content, segment_pool.AcquireReadAccess(),
             descriptor.last_included_seq);
         if (!deserialize_metadata) {
             LOG(ERROR) << "Failed to deserialize snapshot metadata payload, "
@@ -502,7 +504,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         snapshot.metadata = std::move(deserialize_metadata.value());
 
         // Extract standby segment registry entries from the deserialized
-        // SegmentPool. SegmentPoolSnapshotCodec::Encode()
+        // SegmentPool. StoreResourceSnapshotCodec::Encode()
         // currently carries enough data to rebuild only memory segments
         // (the SegmentPool catalog, whose memory resources own allocators by
         // construction).
@@ -517,7 +519,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         // If a future change makes the serializer carry richer per-segment
         // data, the predicate below should be replaced with explicit branches
         // for each segment type.
-        SegmentPoolView view = segment_pool.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool.AcquireReadAccess();
         std::vector<std::pair<UUID, MountedRegion>> all_segments;
         view.GetMountedRegions(all_segments);
         for (const auto& [segment_id, mounted] : all_segments) {

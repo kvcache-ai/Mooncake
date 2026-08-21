@@ -117,7 +117,7 @@ struct SsdFreeRatioFirstPolicy {
     static constexpr bool kRanked = true;
     static constexpr bool kCxl = false;
 
-    const ScopedPlacementAccess& placement;
+    const ScopedPlacementReadAccess& placement;
     const std::optional<LocalSSDMetricsView>& metrics;
 
     double Score(PlacementGroup* group) const {
@@ -321,10 +321,10 @@ std::optional<double> LocalSSDMetricsView::GetFreeRatio(
 }
 
 tl::expected<std::vector<Replica>, ErrorCode> ReplicaAllocator::Allocate(
-    ScopedPlacementAccess& placement, PlacementPolicyType policy_type,
+    ScopedPlacementReadAccess& placement, PlacementPolicyType policy_type,
     const ReplicaAllocationRequest& request,
     std::optional<LocalSSDMetricsView> local_ssd_metrics) const {
-    auto view = placement.view();
+    auto view = placement.GetView();
 
     switch (policy_type) {
         case PlacementPolicyType::RANDOM:
@@ -343,12 +343,12 @@ tl::expected<std::vector<Replica>, ErrorCode> ReplicaAllocator::Allocate(
 }
 
 tl::expected<Replica, ErrorCode> ReplicaAllocator::AllocateFrom(
-    ScopedPlacementAccess& placement, size_t size, std::string_view group_name,
-    ReplicaType replica_type) const {
+    ScopedPlacementReadAccess& placement, size_t size,
+    std::string_view group_name, ReplicaType replica_type) const {
     if (size == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    PlacementGroup* group = placement.view().Find(group_name);
+    PlacementGroup* group = placement.GetView().Find(group_name);
     if (!group) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }

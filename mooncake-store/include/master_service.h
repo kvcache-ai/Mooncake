@@ -34,7 +34,7 @@
 #include "mutex.h"
 #include "nof_segment_manager.h"
 #include "segment/pool.h"
-#include "segment/pool_access.h"
+#include "segment/pool_write_access.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
 #include "tenant_quota_sharded.h"
@@ -2721,7 +2721,7 @@ class MasterService {
     tl::expected<void, ErrorCode> ValidateDrainRequest(
         const CreateDrainJobRequest& request);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
-        ScopedSegmentPoolAccess& segment_access,
+        ScopedSegmentPoolWriteAccess& segment_access,
         const CreateDrainJobRequest& request);
     void ProcessDrainJobs();
     void RefreshDrainJobTasks(DrainJob& job);

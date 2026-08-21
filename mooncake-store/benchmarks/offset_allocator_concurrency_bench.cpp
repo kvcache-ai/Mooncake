@@ -56,7 +56,7 @@ using mooncake::PlacementPolicyType;
 using mooncake::ReplicaAllocationRequest;
 using mooncake::ReplicaAllocator;
 using mooncake::ReplicaType;
-using mooncake::ScopedPlacementAccess;
+using mooncake::ScopedPlacementReadAccess;
 using mooncake::offset_allocator::OffsetAllocationHandle;
 using mooncake::offset_allocator::OffsetAllocator;
 using mooncake::offset_allocator::OffsetAllocStorageReport;
@@ -306,7 +306,7 @@ class PutAllocationFixture {
           buffer_allocator_(std::make_shared<OffsetBufferAllocator>(
               kSegmentName, kBenchmarkBaseAddress, capacity,
               "benchmark-endpoint", ReplicaType::MEMORY)),
-          target_(buffer_allocator_.get(), AllocationTargetKind::STANDARD) {
+          target_(buffer_allocator_.get(), AllocationTargetKind::NATIVE) {
         placement_.AddTarget(kSegmentName, &target_);
     }
 
@@ -325,7 +325,7 @@ class PutAllocationFixture {
     }
 
     bool expectAllocationFailure(uint64_t request_size) {
-        auto access = ScopedPlacementAccess(placement_, placement_mutex_);
+        auto access = ScopedPlacementReadAccess(placement_, placement_mutex_);
         ReplicaAllocationRequest request;
         request.size = request_size;
         auto result = replica_allocator_.Allocate(
@@ -334,7 +334,7 @@ class PutAllocationFixture {
     }
 
     bool allocateAndFree(uint64_t request_size) {
-        auto access = ScopedPlacementAccess(placement_, placement_mutex_);
+        auto access = ScopedPlacementReadAccess(placement_, placement_mutex_);
         ReplicaAllocationRequest request;
         request.size = request_size;
         auto result = replica_allocator_.Allocate(

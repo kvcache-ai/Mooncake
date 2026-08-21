@@ -83,26 +83,26 @@ class PlacementReadView final {
 
 using HostRegionIndex =
     std::map<std::string, std::map<std::string, std::set<UUID>>, std::less<>>;
-using ClientByRegionName =
+using OwnerClientByGroupName =
     std::unordered_map<std::string, UUID, TransparentStringHash,
                        std::equal_to<>>;
 
-class ScopedPlacementAccess final {
+class ScopedPlacementReadAccess final {
    public:
-    ScopedPlacementAccess(const PlacementIndex& placement,
-                          std::shared_mutex& mutex)
+    ScopedPlacementReadAccess(const PlacementIndex& placement,
+                              std::shared_mutex& mutex)
         : placement_(placement), lock_(mutex) {}
 
-    ScopedPlacementAccess(const PlacementIndex& placement,
-                          const HostRegionIndex& regions_by_host,
-                          const ClientByRegionName& client_by_name,
-                          std::shared_mutex& mutex)
+    ScopedPlacementReadAccess(
+        const PlacementIndex& placement, const HostRegionIndex& regions_by_host,
+        const OwnerClientByGroupName& owner_client_by_group_name,
+        std::shared_mutex& mutex)
         : placement_(placement),
           regions_by_host_(&regions_by_host),
-          client_by_name_(&client_by_name),
+          owner_client_by_group_name_(&owner_client_by_group_name),
           lock_(mutex) {}
 
-    PlacementReadView view() const { return placement_.GetView(); }
+    PlacementReadView GetView() const { return placement_.GetView(); }
 
     void GetHostOrderedGroups(std::string_view writer_host_id,
                               std::string_view key,
@@ -112,7 +112,7 @@ class ScopedPlacementAccess final {
    private:
     const PlacementIndex& placement_;
     const HostRegionIndex* regions_by_host_{nullptr};
-    const ClientByRegionName* client_by_name_{nullptr};
+    const OwnerClientByGroupName* owner_client_by_group_name_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 

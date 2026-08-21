@@ -16,20 +16,23 @@ namespace mooncake {
 class SegmentPool;
 
 struct RegionResourceView final {
-    // Raw pointers remain valid while the owning SegmentPoolView holds the
-    // pool's shared lock.
+    // Raw pointers remain valid while the owning ScopedSegmentPoolReadAccess
+    // holds the pool's shared lock.
     const BufferAllocatorBase* allocator;
     const AllocationTarget* target;
     bool active;
 };
 
-class SegmentPoolView final {
+class ScopedSegmentPoolReadAccess final {
    public:
-    explicit SegmentPoolView(const SegmentPool* segment_pool);
-    SegmentPoolView(SegmentPoolView&&) noexcept = default;
-    SegmentPoolView& operator=(SegmentPoolView&&) noexcept = default;
-    SegmentPoolView(const SegmentPoolView&) = delete;
-    SegmentPoolView& operator=(const SegmentPoolView&) = delete;
+    explicit ScopedSegmentPoolReadAccess(const SegmentPool* segment_pool);
+    ScopedSegmentPoolReadAccess(ScopedSegmentPoolReadAccess&&) noexcept =
+        default;
+    ScopedSegmentPoolReadAccess& operator=(
+        ScopedSegmentPoolReadAccess&&) noexcept = default;
+    ScopedSegmentPoolReadAccess(const ScopedSegmentPoolReadAccess&) = delete;
+    ScopedSegmentPoolReadAccess& operator=(const ScopedSegmentPoolReadAccess&) =
+        delete;
 
     ErrorCode GetSegment(const std::shared_ptr<BufferAllocatorBase>& allocator,
                          Segment& segment) const;

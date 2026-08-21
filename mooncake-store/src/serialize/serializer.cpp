@@ -5,7 +5,7 @@
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
 #include "master_service.h"
-#include "segment/pool_view.h"
+#include "segment/pool_read_access.h"
 #include "utils/zstd_util.h"
 
 namespace mooncake {
@@ -488,8 +488,8 @@ auto Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
 }
 
 tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
-    const AllocatedBuffer &buffer, const SegmentPoolView &segment_view,
-    MsgpackPacker &packer) {
+    const AllocatedBuffer &buffer,
+    const ScopedSegmentPoolReadAccess &segment_view, MsgpackPacker &packer) {
     packer.pack_array(5);
 
     // Serialize basic properties
@@ -547,7 +547,7 @@ tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
 }
 
 auto Serializer<AllocatedBuffer>::deserialize(
-    const msgpack::object &obj, const SegmentPoolView &segment_view)
+    const msgpack::object &obj, const ScopedSegmentPoolReadAccess &segment_view)
     -> tl::expected<PointerType, SerializationError> {
     // Check if object type is array (consistent with serialize_msgpack)
     if (obj.type != msgpack::type::ARRAY) {
@@ -649,7 +649,7 @@ auto Serializer<AllocatedBuffer>::deserialize(
 }
 
 tl::expected<void, SerializationError> Serializer<Replica>::serialize(
-    const Replica &replica, const SegmentPoolView &segment_view,
+    const Replica &replica, const ScopedSegmentPoolReadAccess &segment_view,
     MsgpackPacker &packer) {
     // Use unified array structure to pack Replica
     // Format: [id(uint64), status(int16), replica_type(int8), payload]
@@ -740,8 +740,8 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
     return {};
 }
 
-auto Serializer<Replica>::deserialize(const msgpack::object &obj,
-                                      const SegmentPoolView &segment_view)
+auto Serializer<Replica>::deserialize(
+    const msgpack::object &obj, const ScopedSegmentPoolReadAccess &segment_view)
     -> tl::expected<PointerType, SerializationError> {
     // Check if object type is array (consistent with serialize)
     if (obj.type != msgpack::type::ARRAY) {

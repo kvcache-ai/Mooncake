@@ -19,8 +19,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_repository.cpp
     master_metric_manager.cpp
     segment/pool.cpp
-    segment/pool_access.cpp
-    segment/pool_view.cpp
+    segment/pool_write_access.cpp
+    segment/pool_read_access.cpp
     placement/index.cpp
     placement/replica_allocator.cpp
     nof_segment_manager.cpp
@@ -46,7 +46,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/batch_oplog/codec.cpp
     ha/snapshot/allocator_snapshot_codec.cpp
-    ha/snapshot/segment_pool_snapshot_codec.cpp
+    ha/snapshot/store_resource_snapshot_codec.cpp
     ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/batch_oplog/writer.cpp
     ha/snapshot/master_snapshot_codec.cpp

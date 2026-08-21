@@ -121,7 +121,7 @@ PlacementGroup* PlacementReadView::Find(std::string_view name) const {
     return it == index_->by_name_.end() ? nullptr : it->second;
 }
 
-void ScopedPlacementAccess::GetHostOrderedGroups(
+void ScopedPlacementReadAccess::GetHostOrderedGroups(
     std::string_view writer_host_id, std::string_view key,
     std::vector<PlacementGroup*>& output) const {
     output.clear();
@@ -138,7 +138,7 @@ void ScopedPlacementAccess::GetHostOrderedGroups(
         }
     }
 
-    auto placement = view();
+    auto placement = GetView();
     for (size_t host_index = 0; host_index < regions_by_host_->size();
          ++host_index) {
         const auto& groups = host_it->second;
@@ -164,14 +164,15 @@ void ScopedPlacementAccess::GetHostOrderedGroups(
     }
 }
 
-std::optional<UUID> ScopedPlacementAccess::GetOwnerClientId(
+std::optional<UUID> ScopedPlacementReadAccess::GetOwnerClientId(
     std::string_view group_name) const {
-    if (!client_by_name_) {
+    if (!owner_client_by_group_name_) {
         return std::nullopt;
     }
-    auto it = client_by_name_->find(group_name);
-    return it == client_by_name_->end() ? std::nullopt
-                                        : std::optional<UUID>(it->second);
+    auto it = owner_client_by_group_name_->find(group_name);
+    return it == owner_client_by_group_name_->end()
+               ? std::nullopt
+               : std::optional<UUID>(it->second);
 }
 
 }  // namespace mooncake

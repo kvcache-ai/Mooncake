@@ -22,7 +22,7 @@ class PlacementState {
     TestBufferAllocator* Add(
         std::string logical_name, std::string endpoint,
         size_t capacity = kCapacity, size_t used = 0,
-        AllocationTargetKind kind = AllocationTargetKind::STANDARD,
+        AllocationTargetKind kind = AllocationTargetKind::NATIVE,
         std::string cxl_binding = {}) {
         auto allocator = std::make_shared<TestBufferAllocator>(
             logical_name, std::move(endpoint), capacity,
@@ -47,13 +47,13 @@ class PlacementState {
         owners[name] = client_id;
     }
 
-    ScopedPlacementAccess Access() {
-        return ScopedPlacementAccess(index, hosts, owners, mutex);
+    ScopedPlacementReadAccess Access() {
+        return ScopedPlacementReadAccess(index, hosts, owners, mutex);
     }
 
     PlacementIndex index;
     HostRegionIndex hosts;
-    ClientByRegionName owners;
+    OwnerClientByGroupName owners;
     LocalSsdManager local_ssd;
     std::vector<std::shared_ptr<TestBufferAllocator>> allocators;
     std::vector<std::unique_ptr<AllocationTarget>> targets;

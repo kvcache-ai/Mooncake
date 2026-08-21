@@ -8,8 +8,8 @@
 namespace mooncake {
 
 tl::expected<std::vector<Replica>, ErrorCode> NoFSegmentManager::Allocate(
-    PlacementPolicyType policy_type, const SegmentAllocationRequest& request) {
-    ScopedPlacementAccess placement(placement_index_, pool_mutex_);
+    PlacementPolicyType policy_type, const ReplicaPlacementRequest& request) {
+    ScopedPlacementReadAccess placement(placement_index_, manager_mutex_);
     const ReplicaAllocationRequest resolved{
         .size = request.size,
         .replica_count = request.replica_count,
@@ -22,8 +22,8 @@ tl::expected<std::vector<Replica>, ErrorCode> NoFSegmentManager::Allocate(
     return replica_allocator_.Allocate(placement, policy_type, resolved);
 }
 
-ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
-                                               const UUID& client_id) {
+ErrorCode ScopedNoFSegmentWriteAccess::MountSegment(const NoFSegment& segment,
+                                                    const UUID& client_id) {
     if (segment.size == 0) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -56,11 +56,12 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
     auto target = std::make_unique<AllocationTarget>(
-        allocator.get(), AllocationTargetKind::STANDARD);
+        allocator.get(), AllocationTargetKind::NATIVE);
     nof_segment_manager_->placement_index_.AddTarget(segment.name,
                                                      target.get());
-    nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
-    nof_segment_manager_->client_by_name_[segment.name] = client_id;
+    nof_segment_manager_->segment_ids_by_client_[client_id].push_back(
+        segment.id);
+    nof_segment_manager_->owner_client_by_group_name_[segment.name] = client_id;
     nof_segment_manager_->mounted_segments_.emplace(
         segment.id, MountedNoFSegment{segment, client_id, SegmentStatus::OK,
                                       std::move(allocator), std::move(target)});
@@ -69,7 +70,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedNoFSegmentAccess::ReMountSegment(
+ErrorCode ScopedNoFSegmentWriteAccess::ReMountSegment(
     const std::vector<NoFSegment>& segments, const UUID& client_id) {
     for (const auto& segment : segments) {
         auto result = MountSegment(segment, client_id);
@@ -81,7 +82,7 @@ ErrorCode ScopedNoFSegmentAccess::ReMountSegment(
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
+ErrorCode ScopedNoFSegmentWriteAccess::PrepareUnmountSegment(
     const UUID& segment_id, size_t& metrics_dec_capacity) {
     auto mounted = nof_segment_manager_->mounted_segments_.find(segment_id);
     if (mounted == nof_segment_manager_->mounted_segments_.end()) {
@@ -102,7 +103,7 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
+ErrorCode ScopedNoFSegmentWriteAccess::CommitUnmountSegment(
     const UUID& segment_id, const UUID& client_id,
     const size_t& metrics_dec_capacity) {
     auto mounted = nof_segment_manager_->mounted_segments_.find(segment_id);
@@ -110,28 +111,29 @@ ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     const std::string name = mounted->second.segment.name;
-    auto client = nof_segment_manager_->client_segments_.find(client_id);
-    if (client != nof_segment_manager_->client_segments_.end()) {
+    auto client = nof_segment_manager_->segment_ids_by_client_.find(client_id);
+    if (client != nof_segment_manager_->segment_ids_by_client_.end()) {
         auto id =
             std::find(client->second.begin(), client->second.end(), segment_id);
         if (id != client->second.end()) {
             client->second.erase(id);
         }
         if (client->second.empty()) {
-            nof_segment_manager_->client_segments_.erase(client);
+            nof_segment_manager_->segment_ids_by_client_.erase(client);
         }
     }
     nof_segment_manager_->mounted_segments_.erase(mounted);
     bool name_exists = false;
     for (const auto& [_, other] : nof_segment_manager_->mounted_segments_) {
         if (other.segment.name == name) {
-            nof_segment_manager_->client_by_name_[name] = other.client_id;
+            nof_segment_manager_->owner_client_by_group_name_[name] =
+                other.client_id;
             name_exists = true;
             break;
         }
     }
     if (!name_exists) {
-        nof_segment_manager_->client_by_name_.erase(name);
+        nof_segment_manager_->owner_client_by_group_name_.erase(name);
     }
     MasterMetricManager::instance().dec_total_nof_capacity(
         name, metrics_dec_capacity);
@@ -139,10 +141,10 @@ ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedNoFSegmentAccess::GetClientSegments(
+ErrorCode ScopedNoFSegmentWriteAccess::GetClientSegments(
     const UUID& client_id, std::vector<NoFSegment>& segments) const {
-    auto client = nof_segment_manager_->client_segments_.find(client_id);
-    if (client == nof_segment_manager_->client_segments_.end()) {
+    auto client = nof_segment_manager_->segment_ids_by_client_.find(client_id);
+    if (client == nof_segment_manager_->segment_ids_by_client_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     segments.clear();
@@ -155,7 +157,7 @@ ErrorCode ScopedNoFSegmentAccess::GetClientSegments(
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedNoFSegmentAccess::GetMountedSegments(
+ErrorCode ScopedNoFSegmentWriteAccess::GetMountedSegments(
     std::vector<MountedNoFSegmentSnapshot>& segments) const {
     segments.clear();
     for (const auto& [id, mounted] : nof_segment_manager_->mounted_segments_) {
@@ -165,7 +167,7 @@ ErrorCode ScopedNoFSegmentAccess::GetMountedSegments(
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedNoFSegmentAccess::GetAllSegments(
+ErrorCode ScopedNoFSegmentWriteAccess::GetAllSegments(
     std::vector<std::string>& all_segments) {
     all_segments.clear();
     for (const auto& [_, mounted] : nof_segment_manager_->mounted_segments_) {
@@ -176,9 +178,9 @@ ErrorCode ScopedNoFSegmentAccess::GetAllSegments(
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& name,
-                                                size_t& used,
-                                                size_t& capacity) {
+ErrorCode ScopedNoFSegmentWriteAccess::QuerySegments(const std::string& name,
+                                                     size_t& used,
+                                                     size_t& capacity) {
     auto* group = nof_segment_manager_->placement_index_.GetView().Find(name);
     if (!group) {
         return ErrorCode::SEGMENT_NOT_FOUND;
@@ -194,7 +196,7 @@ ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& name,
 
 void NoFSegmentManager::GetMountedSegmentsSnapshot(
     std::vector<MountedNoFSegmentSnapshot>& segments) const {
-    std::shared_lock lock(pool_mutex_);
+    std::shared_lock lock(manager_mutex_);
     segments.clear();
     segments.reserve(mounted_segments_.size());
     for (const auto& [id, mounted] : mounted_segments_) {

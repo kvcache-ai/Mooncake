@@ -28,8 +28,8 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "environ.h"
-#include "segment/pool_access.h"
-#include "segment/pool_view.h"
+#include "segment/pool_write_access.h"
+#include "segment/pool_read_access.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
 #endif
@@ -687,7 +687,7 @@ MasterService::~MasterService() {
     // release their capacity contribution so the process-lifetime
     // MasterMetricManager stays consistent when the next leadership term
     // constructs a fresh MasterService and the clients remount.
-    segment_pool_.releaseCapacityMetrics();
+    segment_pool_.ReleaseCapacityMetrics();
 }
 
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
@@ -860,8 +860,8 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     ErrorCode mount_result = ErrorCode::OK;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        ScopedSegmentPoolAccess segment_access =
-            segment_pool_.getSegmentPoolAccess();
+        ScopedSegmentPoolWriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
 
         // Tell the client monitor thread to start timing for this client. To
         // avoid the following undesired situations, this message must be sent
@@ -924,8 +924,8 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    ScopedNoFSegmentAccess nof_segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
+    ScopedNoFSegmentWriteAccess nof_segment_access =
+        nof_segment_manager_.AcquireWriteAccess();
 
     LOG(INFO) << "NoF segment mount: "
               << "client_id=" << client_id
@@ -978,7 +978,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             }
         }
         {
-            auto segment_access = segment_pool_.getSegmentPoolAccess();
+            auto segment_access = segment_pool_.AcquireWriteAccess();
             for (const auto& segment : segments) {
                 auto standby_validation =
                     ValidateStandbyRemountSegment(segment);
@@ -1001,8 +1001,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
         std::unordered_set<ObjectMetadata*> affected_objects;
         {
-            ScopedSegmentPoolAccess segment_access =
-                segment_pool_.getSegmentPoolAccess();
+            ScopedSegmentPoolWriteAccess segment_access =
+                segment_pool_.AcquireWriteAccess();
 
             // Tell the client monitor thread to start timing for this client.
             // To avoid the following undesired situations, this message must be
@@ -1117,7 +1117,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 if (restore.descriptors.empty()) {
                     restore.initial_state = {};
                 } else {
-                    auto initial_state = segment_pool_.BuildInitialState(
+                    auto initial_state = segment_pool_.BuildRegionInitialState(
                         restore.segment, restore.descriptors);
                     if (!initial_state) {
                         return tl::make_unexpected(initial_state.error());
@@ -1153,7 +1153,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 restore.prepared.emplace(std::move(*prepared));
             }
             for (auto& restore : restores) {
-                segment_access.CommitMount(*restore.prepared);
+                segment_access.CommitPreparedRegion(*restore.prepared);
             }
             for (auto& restore : restores) {
                 restore.buffers = restore.prepared->TakeImportedBuffers();
@@ -1215,8 +1215,8 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    ScopedNoFSegmentAccess nof_segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
+    ScopedNoFSegmentWriteAccess nof_segment_access =
+        nof_segment_manager_.AcquireWriteAccess();
     ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
@@ -1387,7 +1387,7 @@ uint64_t MasterService::GetTenantQuotaAllocatableCapacityBytes() {
     uint64_t capacity = 0;
     std::vector<std::pair<UUID, MountedRegion>> regions;
     {
-        SegmentPoolView view = segment_pool_.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
         view.GetMountedRegions(regions);
     }
     for (const auto& [_, mounted] : regions) {
@@ -2565,8 +2565,8 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     client_lock.unlock();
     // 1. Hide the segment from placement and deactivate its resource.
     {
-        ScopedSegmentPoolAccess segment_access =
-            segment_pool_.getSegmentPoolAccess();
+        ScopedSegmentPoolWriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
         ErrorCode err = segment_access.PrepareUnmountSegment(
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -2591,15 +2591,15 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     std::string te_endpoint;
     if (!segment_pool_.GetSegmentBasicInfo(segment_id, segment_name,
                                            te_endpoint)) {
-        auto segment_access = segment_pool_.getSegmentPoolAccess();
+        auto segment_access = segment_pool_.AcquireWriteAccess();
         (void)segment_access.RollbackUnmountSegment(segment_id);
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
 
     // 3. Commit the unmount operation
     {
-        ScopedSegmentPoolAccess segment_access =
-            segment_pool_.getSegmentPoolAccess();
+        ScopedSegmentPoolWriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
         auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
                                                        metrics_dec_capacity);
         if (err != ErrorCode::OK) {
@@ -2624,8 +2624,8 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
                                            uint64_t grace_period_ms)
     -> tl::expected<void, ErrorCode> {
     std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
-    ScopedSegmentPoolAccess segment_access =
-        segment_pool_.getSegmentPoolAccess();
+    ScopedSegmentPoolWriteAccess segment_access =
+        segment_pool_.AcquireWriteAccess();
 
     // Verify ownership: the segment must belong to the calling client
     std::vector<Segment> client_segments;
@@ -2675,8 +2675,8 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 
     // 1. Prepare to unmount the segment by deleting its allocator
     {
-        ScopedNoFSegmentAccess segment_access =
-            nof_segment_manager_.getNoFSegmentAccess();
+        ScopedNoFSegmentWriteAccess segment_access =
+            nof_segment_manager_.AcquireWriteAccess();
         ErrorCode err = segment_access.PrepareUnmountSegment(
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -2693,8 +2693,8 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     ClearInvalidHandles(alive_clients);
 
     // 3. Commit the unmount operation
-    ScopedNoFSegmentAccess segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
+    ScopedNoFSegmentWriteAccess segment_access =
+        nof_segment_manager_.AcquireWriteAccess();
     auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
                                                    metrics_dec_capacity);
     if (err != ErrorCode::OK) {
@@ -2826,7 +2826,7 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
 
 auto MasterService::GetAllSegments()
     -> tl::expected<std::vector<std::string>, ErrorCode> {
-    SegmentPoolView view = segment_pool_.getView();
+    ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
     std::vector<std::string> all_segments;
     view.GetActiveGroupNames(all_segments);
     return all_segments;
@@ -2852,7 +2852,7 @@ auto MasterService::GetNoFSegmentsByName(const std::string& segment_name)
 
 auto MasterService::GetSegmentsDetail()
     -> tl::expected<std::vector<SegmentDetailInfo>, ErrorCode> {
-    SegmentPoolView view = segment_pool_.getView();
+    ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
 
     // Get full info of all segments (including Segment and client_id)
     std::vector<std::pair<UUID, MountedRegion>> all_segments;
@@ -2889,7 +2889,7 @@ auto MasterService::GetSegmentsDetail()
 
 auto MasterService::QuerySegments(const std::string& segment)
     -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
-    SegmentPoolView view = segment_pool_.getView();
+    ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
     size_t used, capacity;
     auto err = view.QuerySegments(segment, used, capacity);
     if (err != ErrorCode::OK) {
@@ -2900,7 +2900,7 @@ auto MasterService::QuerySegments(const std::string& segment)
 
 auto MasterService::QuerySegmentStatus(const std::string& segment_name)
     -> tl::expected<SegmentStatus, ErrorCode> {
-    SegmentPoolView view = segment_pool_.getView();
+    ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
     SegmentStatus status = SegmentStatus::UNDEFINED;
     auto err = view.GetSegmentStatusByName(segment_name, status);
     if (err != ErrorCode::OK) {
@@ -2911,7 +2911,7 @@ auto MasterService::QuerySegmentStatus(const std::string& segment_name)
 
 auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
     -> tl::expected<SegmentStatus, ErrorCode> {
-    SegmentPoolView view = segment_pool_.getView();
+    ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
     SegmentStatus status = SegmentStatus::UNDEFINED;
     auto err = view.GetSegmentStatusById(segment_id, status);
     if (err != ErrorCode::OK) {
@@ -3200,7 +3200,7 @@ auto MasterService::QueryIp(const UUID& client_id)
     std::vector<Segment> segments;
     ErrorCode err;
     {
-        SegmentPoolView view = segment_pool_.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
         err = view.GetClientSegments(client_id, segments);
     }
     if (err != ErrorCode::OK) {
@@ -3993,9 +3993,9 @@ auto MasterService::AllocateAndInsertMetadata(
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
-    bool has_enough_memory_segments = false;
+    bool has_sufficient_memory_group_count = false;
     if (config.replica_num > 0) {
-        const SegmentAllocationRequest request{
+        const ReplicaPlacementRequest request{
             .size = value_length,
             .replica_count = config.replica_num,
             .preferred_group = config.preferred_segment,
@@ -4009,22 +4009,24 @@ auto MasterService::AllocateAndInsertMetadata(
         if (memory_policy_type_ == PlacementPolicyType::SSD_FREE_RATIO_FIRST) {
             local_ssd_metrics.emplace(local_ssd_manager_);
         }
-        AllocationDiagnostics diagnostics;
+        PlacementDiagnostics diagnostics;
         auto allocation_result = segment_pool_.Allocate(
             memory_policy_type_, request, local_ssd_metrics, &diagnostics);
-        has_enough_memory_segments = diagnostics.has_enough_groups;
+        has_sufficient_memory_group_count =
+            diagnostics.has_sufficient_active_group_count;
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
                     << ", error: " << allocation_result.error()
-                    << ", has_enough_groups=" << diagnostics.has_enough_groups;
+                    << ", has_sufficient_active_group_count="
+                    << diagnostics.has_sufficient_active_group_count;
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 refund_pending_quota();
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
-                if (has_enough_memory_segments) {
+                if (has_sufficient_memory_group_count) {
                     need_mem_eviction_ = true;
                 }
                 refund_pending_quota();
@@ -4038,7 +4040,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
 #ifdef USE_NOF
     if (config.nof_replica_num > 0) {
-        const SegmentAllocationRequest request{
+        const ReplicaPlacementRequest request{
             .size = value_length,
             .replica_count = config.nof_replica_num,
             .preferred_group = {},
@@ -4082,7 +4084,7 @@ auto MasterService::AllocateAndInsertMetadata(
             MasterMetricManager::instance().inc_put_start_alloc_failures();
             if (config.replica_num > 0 &&
                 allocated_memory_replicas != config.replica_num &&
-                has_enough_memory_segments) {
+                has_sufficient_memory_group_count) {
                 need_mem_eviction_ = true;
             }
             if (config.nof_replica_num > 0 &&
@@ -5539,7 +5541,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const bool dynamic_copy = dynamic_replication_lease_id != UUID{};
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (!dynamic_copy) {
-        SegmentPoolView view = segment_pool_.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
         for (const auto& tgt_segment : tgt_segments) {
             if (!view.ExistsSegmentName(tgt_segment)) {
                 LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
@@ -5591,7 +5593,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         return tl::make_unexpected(pending_validation.error());
     }
     if (dynamic_copy) {
-        SegmentPoolView view = segment_pool_.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
         for (const auto& tgt_segment : tgt_segments) {
             if (!view.ExistsSegmentName(tgt_segment)) {
                 ClearDynamicReplicationStateForKey(tenant_state, key);
@@ -5965,7 +5967,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     {
-        SegmentPoolView view = segment_pool_.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
         if (!view.ExistsSegmentName(tgt_segment)) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", error=target_segment_not_found";
@@ -8146,7 +8148,7 @@ MasterService::SelectDynamicReplicaPlan(
     std::vector<std::string> source_segments;
     size_t memory_replicas = 0;
 
-    SegmentPoolView view = segment_pool_.getView();
+    ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
     std::vector<std::pair<UUID, MountedRegion>> segments;
     view.GetMountedRegions(segments);
     std::unordered_map<std::string, Segment> segments_by_name;
@@ -8425,7 +8427,7 @@ tl::expected<UUID, ErrorCode> MasterService::SubmitDynamicReplicaCopyTask(
     const UUID& lease_id, uint64_t version_epoch) {
     UUID source_client;
     {
-        SegmentPoolView view = segment_pool_.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
         ErrorCode error =
             view.GetClientIdBySegmentName(plan.source_segment, source_client);
         if (error != ErrorCode::OK) {
@@ -8669,7 +8671,7 @@ auto MasterService::PromotionAllocStart(
     // to the holder's memory segment when possible.
     std::vector<Replica> staged_replicas;
     {
-        const SegmentAllocationRequest request{
+        const ReplicaPlacementRequest request{
             .size = size,
             .replica_count = 1,
             .preferred_group = {},
@@ -9418,7 +9420,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
 
     task_manager_serializer.Reset();
     metadata_serializer.Reset();
-    segment_pool_.getSegmentPoolAccess().Clear();
+    segment_pool_.AcquireWriteAccess().Clear();
     local_ssd_manager_.Clear();
 
     {
@@ -9442,7 +9444,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
     std::vector<std::string> segment_names;
     {
-        SegmentPoolView view = segment_pool_.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
         view.GetAllSegmentNames(segment_names);
     }
 
@@ -9529,7 +9531,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
         std::vector<std::pair<UUID, MountedRegion>> unready_regions;
         {
-            SegmentPoolView view = segment_pool_.getView();
+            ScopedSegmentPoolReadAccess view =
+                segment_pool_.AcquireReadAccess();
             view.GetUnreadyRegions(unready_regions);
         }
         for (const auto& [id, mounted] : unready_regions) {
@@ -9538,7 +9541,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
         std::vector<std::pair<UUID, MountedRegion>> all_segments;
         {
-            SegmentPoolView view = segment_pool_.getView();
+            ScopedSegmentPoolReadAccess view =
+                segment_pool_.AcquireReadAccess();
             view.GetMountedRegions(all_segments);
         }
         int64_t total_size = 0;
@@ -10899,8 +10903,8 @@ void MasterService::ClientMonitorFunc() {
                 }
                 alive_clients = ok_client_;
 
-                ScopedSegmentPoolAccess segment_access =
-                    segment_pool_.getSegmentPoolAccess();
+                ScopedSegmentPoolWriteAccess segment_access =
+                    segment_pool_.AcquireWriteAccess();
                 for (auto& client_id : expired_clients) {
                     // mounted mem segemtns of this expired client
                     std::vector<Segment> segments;
@@ -10935,8 +10939,8 @@ void MasterService::ClientMonitorFunc() {
             // segments for expired clients. Both require the exclusive
             // segment lock.
             {
-                ScopedSegmentPoolAccess segment_access =
-                    segment_pool_.getSegmentPoolAccess();
+                ScopedSegmentPoolWriteAccess segment_access =
+                    segment_pool_.AcquireWriteAccess();
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
                     segment_access.CommitUnmountSegment(
                         unmount_segments[i], client_ids[i], dec_capacities[i]);
@@ -10997,7 +11001,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     auto alive_clients = ok_client_;
     client_lock.unlock();
     {
-        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+        auto nof_segment_access = nof_segment_manager_.AcquireWriteAccess();
         ErrorCode err = nof_segment_access.PrepareUnmountSegment(
             snapshot.segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND ||
@@ -11022,7 +11026,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     ClearInvalidHandles(alive_clients);
 
     {
-        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+        auto nof_segment_access = nof_segment_manager_.AcquireWriteAccess();
         ErrorCode err = nof_segment_access.CommitUnmountSegment(
             snapshot.segment_id, snapshot.client_id, metrics_dec_capacity);
         if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_NOT_FOUND) {
@@ -11635,7 +11639,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Serialize replicas
     for (const auto& replica : metadata.GetAllReplicas()) {
         auto result = Serializer<Replica>::serialize(
-            replica, service_->segment_pool_.getView(), packer);
+            replica, service_->segment_pool_.AcquireReadAccess(), packer);
         if (!result) {
             return tl::unexpected(result.error());
         }
@@ -11751,7 +11755,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
                                    "deserialize ObjectMetadata truncated"));
         }
         auto result = Serializer<Replica>::deserialize(
-            array[index++], service_->segment_pool_.getView());
+            array[index++], service_->segment_pool_.AcquireReadAccess());
         if (!result) {
             return tl::unexpected(result.error());
         }
@@ -11836,7 +11840,7 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
         target_segments.front() != pending.target_segment) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
-    SegmentPoolView view = segment_pool_.getView();
+    ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
     UUID source_client;
     auto err =
         view.GetClientIdBySegmentName(pending.source_segment, source_client);
@@ -11904,7 +11908,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     std::string selected_source_segment;
     UUID select_client;
     {
-        SegmentPoolView view = segment_pool_.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
         for (const auto& target : targets) {
             if (!view.ExistsSegmentName(target)) {
                 LOG(ERROR) << "key=" << key << ", target_segment=" << target
@@ -11970,7 +11974,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
 
     UUID select_client;
     {
-        SegmentPoolView view = segment_pool_.getView();
+        ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
         if (!view.ExistsSegmentName(target)) {
             LOG(ERROR) << "key=" << key << ", target_segment=" << target
                        << ", error=target_segment_not_mounted";
@@ -12046,13 +12050,13 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
 
 tl::expected<void, ErrorCode> MasterService::ValidateDrainRequest(
     const CreateDrainJobRequest& request) {
-    ScopedSegmentPoolAccess segment_access =
-        segment_pool_.getSegmentPoolAccess();
+    ScopedSegmentPoolWriteAccess segment_access =
+        segment_pool_.AcquireWriteAccess();
     return ValidateDrainRequestLocked(segment_access, request);
 }
 
 tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
-    ScopedSegmentPoolAccess& segment_access,
+    ScopedSegmentPoolWriteAccess& segment_access,
     const CreateDrainJobRequest& request) {
     if (request.segments.empty() || request.max_concurrency == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -12098,8 +12102,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
     std::vector<std::string> draining_segments;
     {
-        ScopedSegmentPoolAccess segment_access =
-            segment_pool_.getSegmentPoolAccess();
+        ScopedSegmentPoolWriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
         auto valid = ValidateDrainRequestLocked(segment_access, request);
         if (!valid.has_value()) {
             return tl::make_unexpected(valid.error());
@@ -12199,8 +12203,8 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
         segments_to_restore = job->request.segments;
     }
 
-    ScopedSegmentPoolAccess segment_access =
-        segment_pool_.getSegmentPoolAccess();
+    ScopedSegmentPoolWriteAccess segment_access =
+        segment_pool_.AcquireWriteAccess();
     for (const auto& segment_name : segments_to_restore) {
         SegmentStatus status = SegmentStatus::UNDEFINED;
         if (segment_access.GetSegmentStatusByName(segment_name, status) ==
@@ -12223,7 +12227,7 @@ std::string MasterService::MakeDrainUnitKey(
 std::optional<std::string> MasterService::SelectDrainTargetForKey(
     const ObjectMetadata& metadata, const std::string& source_segment,
     const std::vector<std::string>& requested_targets) {
-    SegmentPoolView view = segment_pool_.getView();
+    ScopedSegmentPoolReadAccess view = segment_pool_.AcquireReadAccess();
     std::vector<std::string> candidate_segments = requested_targets;
     if (candidate_segments.empty()) {
         view.GetActiveGroupNames(candidate_segments);
@@ -12439,8 +12443,8 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     }
 
     {
-        ScopedSegmentPoolAccess segment_access =
-            segment_pool_.getSegmentPoolAccess();
+        ScopedSegmentPoolWriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
         for (const auto& segment_name : job.request.segments) {
             if (!remaining_segments.contains(segment_name)) {
                 (void)segment_access.SetSegmentStatusByName(
@@ -12468,8 +12472,8 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     }
 
     {
-        ScopedSegmentPoolAccess segment_access =
-            segment_pool_.getSegmentPoolAccess();
+        ScopedSegmentPoolWriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
         for (const auto& segment_name : job.request.segments) {
             SegmentStatus status = SegmentStatus::UNDEFINED;
             if (segment_access.GetSegmentStatusByName(segment_name, status) ==
@@ -12547,7 +12551,7 @@ MasterService::MetadataSerializer::SerializeDiscardedReplicas(
         // Serialize each replica
         for (const auto& replica : item.replicas_) {
             auto result = Serializer<Replica>::serialize(
-                replica, service_->segment_pool_.getView(), packer);
+                replica, service_->segment_pool_.AcquireReadAccess(), packer);
             if (!result) {
                 return tl::unexpected(result.error());
             }
@@ -12607,7 +12611,7 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
 
         for (uint32_t j = 0; j < replica_count; ++j) {
             auto replica_result = Serializer<Replica>::deserialize(
-                item_array[3 + j], service_->segment_pool_.getView());
+                item_array[3 + j], service_->segment_pool_.AcquireReadAccess());
             if (!replica_result) {
                 return tl::make_unexpected(SerializationError(
                     ErrorCode::DESERIALIZE_FAIL,

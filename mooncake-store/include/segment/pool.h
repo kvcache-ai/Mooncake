@@ -18,8 +18,8 @@
 namespace mooncake {
 
 class MasterServiceConfig;
-class ScopedSegmentPoolAccess;
-class SegmentPoolView;
+class ScopedSegmentPoolWriteAccess;
+class ScopedSegmentPoolReadAccess;
 
 class SegmentPool final {
    public:
@@ -28,21 +28,20 @@ class SegmentPool final {
     explicit SegmentPool(RegionDriverRegistry region_drivers)
         : region_drivers_(std::move(region_drivers)) {}
 
-    void releaseCapacityMetrics();
+    void ReleaseCapacityMetrics();
 
-    ScopedSegmentPoolAccess getSegmentPoolAccess();
-    SegmentPoolView getView() const;
+    ScopedSegmentPoolWriteAccess AcquireWriteAccess();
+    ScopedSegmentPoolReadAccess AcquireReadAccess() const;
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        PlacementPolicyType policy_type,
-        const SegmentAllocationRequest& request,
+        PlacementPolicyType policy_type, const ReplicaPlacementRequest& request,
         std::optional<LocalSSDMetricsView> local_ssd_metrics = std::nullopt,
-        AllocationDiagnostics* diagnostics = nullptr);
+        PlacementDiagnostics* diagnostics = nullptr);
     tl::expected<Replica, ErrorCode> AllocateFrom(
         size_t size, std::string_view group_name,
         ReplicaType replica_type = ReplicaType::MEMORY);
     std::optional<UUID> GetOwnerClientId(std::string_view group_name) const;
-    tl::expected<RegionInitialState, ErrorCode> BuildInitialState(
+    tl::expected<RegionInitialState, ErrorCode> BuildRegionInitialState(
         const Segment& segment,
         std::span<const AllocatedBuffer::Descriptor> descriptors) const;
 
@@ -64,16 +63,16 @@ class SegmentPool final {
     RegionDriverRegistry region_drivers_;
     std::unordered_map<UUID, MountedRegion, boost::hash<UUID>> mounted_regions_;
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
-        client_segments_;
-    ClientByRegionName client_by_name_;
+        region_ids_by_client_;
+    OwnerClientByGroupName owner_client_by_group_name_;
     std::unordered_map<std::string, std::vector<UUID>, TransparentStringHash,
                        std::equal_to<>>
-        region_ids_by_name_;
+        region_ids_by_group_name_;
     HostRegionIndex regions_by_host_;
     std::unordered_set<UUID, boost::hash<UUID>> capacity_accounted_regions_;
 
-    friend class ScopedSegmentPoolAccess;
-    friend class SegmentPoolView;
+    friend class ScopedSegmentPoolWriteAccess;
+    friend class ScopedSegmentPoolReadAccess;
     friend class SegmentTest;
 };
 

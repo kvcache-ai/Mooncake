@@ -48,12 +48,13 @@ class PreparedMountedRegion final {
     bool account_capacity_metrics_;
     PreparedRegionResource resource_;
 
-    friend class ScopedSegmentPoolAccess;
+    friend class ScopedSegmentPoolWriteAccess;
 };
 
-class ScopedSegmentPoolAccess final {
+class ScopedSegmentPoolWriteAccess final {
    public:
-    ScopedSegmentPoolAccess(SegmentPool* segment_pool, std::shared_mutex& mutex)
+    ScopedSegmentPoolWriteAccess(SegmentPool* segment_pool,
+                                 std::shared_mutex& mutex)
         : segment_pool_(segment_pool), lock_(mutex) {}
 
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
@@ -62,7 +63,7 @@ class ScopedSegmentPoolAccess final {
         const RegionInitialState& initial_state = {});
     tl::expected<PreparedMountedRegion, ErrorCode> PrepareAdopt(
         MountedRegion mounted, std::shared_ptr<BufferAllocatorBase> allocator);
-    void CommitMount(PreparedMountedRegion& prepared) noexcept;
+    void CommitPreparedRegion(PreparedMountedRegion& prepared) noexcept;
     void Clear() noexcept;
 
     ErrorCode ValidateRemountSegment(const Segment& segment,

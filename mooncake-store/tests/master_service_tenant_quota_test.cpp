@@ -172,10 +172,10 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             std::string(segment_name), std::string(segment_name), 4096,
             kSegmentBase);
         auto target = std::make_unique<AllocationTarget>(
-            allocator.get(), AllocationTargetKind::STANDARD);
+            allocator.get(), AllocationTargetKind::NATIVE);
 
         auto& manager = service.nof_segment_manager_;
-        std::unique_lock lock(manager.pool_mutex_);
+        std::unique_lock lock(manager.manager_mutex_);
         auto mounted = std::find_if(
             manager.mounted_segments_.begin(), manager.mounted_segments_.end(),
             [&](const auto& entry) {
@@ -311,7 +311,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         segment.te_endpoint = segment.name;
         next_segment_offset_ += size + 4096;
 
-        auto segment_access = service.segment_pool_.getSegmentPoolAccess();
+        auto segment_access = service.segment_pool_.AcquireWriteAccess();
         return segment_access.MountSegment(segment, generate_uuid());
     }
 

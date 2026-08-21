@@ -1,4 +1,4 @@
-#include "segment/pool_view.h"
+#include "segment/pool_read_access.h"
 
 #include <algorithm>
 
@@ -6,10 +6,11 @@
 
 namespace mooncake {
 
-SegmentPoolView::SegmentPoolView(const SegmentPool* segment_pool)
+ScopedSegmentPoolReadAccess::ScopedSegmentPoolReadAccess(
+    const SegmentPool* segment_pool)
     : segment_pool_(segment_pool), lock_(segment_pool->pool_mutex_) {}
 
-ErrorCode SegmentPoolView::GetSegment(
+ErrorCode ScopedSegmentPoolReadAccess::GetSegment(
     const std::shared_ptr<BufferAllocatorBase>& allocator,
     Segment& segment) const {
     if (!allocator) {
@@ -25,7 +26,7 @@ ErrorCode SegmentPoolView::GetSegment(
     return ErrorCode::SEGMENT_NOT_FOUND;
 }
 
-ErrorCode SegmentPoolView::GetMountedRegion(
+ErrorCode ScopedSegmentPoolReadAccess::GetMountedRegion(
     const UUID& segment_id, MountedRegion& mounted_region) const {
     auto mounted = segment_pool_->mounted_regions_.find(segment_id);
     if (mounted == segment_pool_->mounted_regions_.end()) {
@@ -35,7 +36,7 @@ ErrorCode SegmentPoolView::GetMountedRegion(
     return ErrorCode::OK;
 }
 
-std::optional<RegionResourceView> SegmentPoolView::GetResourceView(
+std::optional<RegionResourceView> ScopedSegmentPoolReadAccess::GetResourceView(
     const UUID& segment_id) const {
     auto mounted = segment_pool_->mounted_regions_.find(segment_id);
     if (mounted == segment_pool_->mounted_regions_.end()) {
@@ -49,7 +50,7 @@ std::optional<RegionResourceView> SegmentPoolView::GetResourceView(
                               resource->active};
 }
 
-std::shared_ptr<BufferAllocatorBase> SegmentPoolView::GetAllocator(
+std::shared_ptr<BufferAllocatorBase> ScopedSegmentPoolReadAccess::GetAllocator(
     const UUID& segment_id) const {
     auto mounted = segment_pool_->mounted_regions_.find(segment_id);
     if (mounted == segment_pool_->mounted_regions_.end()) {
@@ -59,23 +60,23 @@ std::shared_ptr<BufferAllocatorBase> SegmentPoolView::GetAllocator(
     return resource ? resource->allocator : nullptr;
 }
 
-std::optional<BufferAllocatorType> SegmentPoolView::GetMemoryAllocatorType()
-    const {
+std::optional<BufferAllocatorType>
+ScopedSegmentPoolReadAccess::GetMemoryAllocatorType() const {
     const auto* driver = segment_pool_->GetDriver(RegionKind::HOST_MEMORY);
     return driver ? driver->allocator_type() : std::nullopt;
 }
 
-bool SegmentPoolView::HasKind(RegionKind kind) const {
+bool ScopedSegmentPoolReadAccess::HasKind(RegionKind kind) const {
     return std::any_of(
         segment_pool_->mounted_regions_.begin(),
         segment_pool_->mounted_regions_.end(),
         [kind](const auto& entry) { return entry.second.kind == kind; });
 }
 
-ErrorCode SegmentPoolView::GetClientSegments(
+ErrorCode ScopedSegmentPoolReadAccess::GetClientSegments(
     const UUID& client_id, std::vector<Segment>& segments) const {
-    auto client = segment_pool_->client_segments_.find(client_id);
-    if (client == segment_pool_->client_segments_.end()) {
+    auto client = segment_pool_->region_ids_by_client_.find(client_id);
+    if (client == segment_pool_->region_ids_by_client_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     segments.clear();
@@ -88,7 +89,7 @@ ErrorCode SegmentPoolView::GetClientSegments(
     return ErrorCode::OK;
 }
 
-void SegmentPoolView::GetMountedRegions(
+void ScopedSegmentPoolReadAccess::GetMountedRegions(
     std::vector<std::pair<UUID, MountedRegion>>& regions) const {
     regions.clear();
     regions.reserve(segment_pool_->mounted_regions_.size());
@@ -97,7 +98,7 @@ void SegmentPoolView::GetMountedRegions(
     }
 }
 
-void SegmentPoolView::GetActiveGroupNames(
+void ScopedSegmentPoolReadAccess::GetActiveGroupNames(
     std::vector<std::string>& names) const {
     names.clear();
     const auto groups =
@@ -108,17 +109,18 @@ void SegmentPoolView::GetActiveGroupNames(
     }
 }
 
-void SegmentPoolView::GetAllSegmentNames(
+void ScopedSegmentPoolReadAccess::GetAllSegmentNames(
     std::vector<std::string>& names) const {
     names.clear();
-    names.reserve(segment_pool_->region_ids_by_name_.size());
-    for (const auto& [name, _] : segment_pool_->region_ids_by_name_) {
+    names.reserve(segment_pool_->region_ids_by_group_name_.size());
+    for (const auto& [name, _] : segment_pool_->region_ids_by_group_name_) {
         names.push_back(name);
     }
 }
 
-ErrorCode SegmentPoolView::QuerySegments(std::string_view name, size_t& used,
-                                         size_t& capacity) const {
+ErrorCode ScopedSegmentPoolReadAccess::QuerySegments(std::string_view name,
+                                                     size_t& used,
+                                                     size_t& capacity) const {
     auto* group = segment_pool_->placement_index_.GetView().Find(name);
     if (!group) {
         return ErrorCode::SEGMENT_NOT_FOUND;
@@ -132,7 +134,7 @@ ErrorCode SegmentPoolView::QuerySegments(std::string_view name, size_t& used,
     return capacity == 0 ? ErrorCode::SEGMENT_NOT_FOUND : ErrorCode::OK;
 }
 
-void SegmentPoolView::GetUnreadyRegions(
+void ScopedSegmentPoolReadAccess::GetUnreadyRegions(
     std::vector<std::pair<UUID, MountedRegion>>& regions) const {
     regions.clear();
     for (const auto& [id, mounted] : segment_pool_->mounted_regions_) {
@@ -142,28 +144,30 @@ void SegmentPoolView::GetUnreadyRegions(
     }
 }
 
-ErrorCode SegmentPoolView::GetClientIdBySegmentName(std::string_view name,
-                                                    UUID& client_id) const {
-    auto owner = segment_pool_->client_by_name_.find(name);
-    if (owner == segment_pool_->client_by_name_.end()) {
+ErrorCode ScopedSegmentPoolReadAccess::GetClientIdBySegmentName(
+    std::string_view name, UUID& client_id) const {
+    auto owner = segment_pool_->owner_client_by_group_name_.find(name);
+    if (owner == segment_pool_->owner_client_by_group_name_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     client_id = owner->second;
     return ErrorCode::OK;
 }
 
-bool SegmentPoolView::ExistsSegmentName(std::string_view name) const {
-    return segment_pool_->region_ids_by_name_.contains(name);
+bool ScopedSegmentPoolReadAccess::ExistsSegmentName(
+    std::string_view name) const {
+    return segment_pool_->region_ids_by_group_name_.contains(name);
 }
 
-bool SegmentPoolView::IsSegmentAllocatable(std::string_view name) const {
+bool ScopedSegmentPoolReadAccess::IsSegmentAllocatable(
+    std::string_view name) const {
     return segment_pool_->placement_index_.GetView().Find(name) != nullptr;
 }
 
-ErrorCode SegmentPoolView::GetSegmentStatusByName(std::string_view name,
-                                                  SegmentStatus& status) const {
-    auto group = segment_pool_->region_ids_by_name_.find(name);
-    if (group == segment_pool_->region_ids_by_name_.end() ||
+ErrorCode ScopedSegmentPoolReadAccess::GetSegmentStatusByName(
+    std::string_view name, SegmentStatus& status) const {
+    auto group = segment_pool_->region_ids_by_group_name_.find(name);
+    if (group == segment_pool_->region_ids_by_group_name_.end() ||
         group->second.empty()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
@@ -182,8 +186,8 @@ ErrorCode SegmentPoolView::GetSegmentStatusByName(std::string_view name,
     return ErrorCode::OK;
 }
 
-ErrorCode SegmentPoolView::GetSegmentStatusById(const UUID& id,
-                                                SegmentStatus& status) const {
+ErrorCode ScopedSegmentPoolReadAccess::GetSegmentStatusById(
+    const UUID& id, SegmentStatus& status) const {
     auto mounted = segment_pool_->mounted_regions_.find(id);
     if (mounted == segment_pool_->mounted_regions_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
@@ -192,11 +196,11 @@ ErrorCode SegmentPoolView::GetSegmentStatusById(const UUID& id,
     return ErrorCode::OK;
 }
 
-void SegmentPoolView::GetClientRegions(
+void ScopedSegmentPoolReadAccess::GetClientRegions(
     std::vector<std::pair<UUID, std::vector<UUID>>>& clients) const {
     clients.clear();
-    clients.reserve(segment_pool_->client_segments_.size());
-    for (const auto& entry : segment_pool_->client_segments_) {
+    clients.reserve(segment_pool_->region_ids_by_client_.size());
+    for (const auto& entry : segment_pool_->region_ids_by_client_) {
         clients.push_back(entry);
     }
 }

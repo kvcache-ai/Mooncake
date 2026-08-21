@@ -61,7 +61,7 @@ struct MountedRegion {
     RegionKind kind{RegionKind::HOST_MEMORY};
 };
 
-struct SegmentAllocationRequest final {
+struct ReplicaPlacementRequest final {
     size_t size{0};
     size_t replica_count{1};
     std::string_view preferred_group;
@@ -72,8 +72,8 @@ struct SegmentAllocationRequest final {
     std::string_view object_key;
 };
 
-struct AllocationDiagnostics final {
-    bool has_enough_groups{false};
+struct PlacementDiagnostics final {
+    bool has_sufficient_active_group_count{false};
 };
 
 }  // namespace mooncake

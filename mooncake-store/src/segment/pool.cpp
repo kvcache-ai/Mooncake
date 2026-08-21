@@ -1,7 +1,7 @@
 #include "segment/pool.h"
 
-#include "segment/pool_access.h"
-#include "segment/pool_view.h"
+#include "segment/pool_write_access.h"
+#include "segment/pool_read_access.h"
 
 #include <algorithm>
 #include <limits>
@@ -28,11 +28,13 @@ SegmentPool::SegmentPool(const MasterServiceConfig& config)
 SegmentPool::SegmentPool(const RegionDriverConfig& config)
     : SegmentPool(CreateRegionDrivers(config)) {}
 
-ScopedSegmentPoolAccess SegmentPool::getSegmentPoolAccess() {
-    return ScopedSegmentPoolAccess(this, pool_mutex_);
+ScopedSegmentPoolWriteAccess SegmentPool::AcquireWriteAccess() {
+    return ScopedSegmentPoolWriteAccess(this, pool_mutex_);
 }
 
-SegmentPoolView SegmentPool::getView() const { return SegmentPoolView(this); }
+ScopedSegmentPoolReadAccess SegmentPool::AcquireReadAccess() const {
+    return ScopedSegmentPoolReadAccess(this);
+}
 
 RegionDriver* SegmentPool::GetDriver(RegionKind kind) {
     auto it = region_drivers_.find(kind);
@@ -56,14 +58,15 @@ const RegionResource* SegmentPool::GetResource(
 }
 
 tl::expected<std::vector<Replica>, ErrorCode> SegmentPool::Allocate(
-    PlacementPolicyType policy_type, const SegmentAllocationRequest& request,
+    PlacementPolicyType policy_type, const ReplicaPlacementRequest& request,
     std::optional<LocalSSDMetricsView> local_ssd_metrics,
-    AllocationDiagnostics* diagnostics) {
-    ScopedPlacementAccess placement(placement_index_, regions_by_host_,
-                                    client_by_name_, pool_mutex_);
+    PlacementDiagnostics* diagnostics) {
+    ScopedPlacementReadAccess placement(placement_index_, regions_by_host_,
+                                        owner_client_by_group_name_,
+                                        pool_mutex_);
     if (diagnostics) {
-        diagnostics->has_enough_groups =
-            placement.view().size() >= request.replica_count;
+        diagnostics->has_sufficient_active_group_count =
+            placement.GetView().size() >= request.replica_count;
     }
 
     std::span<PlacementGroup* const> host_ordered_groups;
@@ -89,8 +92,9 @@ tl::expected<std::vector<Replica>, ErrorCode> SegmentPool::Allocate(
 
 tl::expected<Replica, ErrorCode> SegmentPool::AllocateFrom(
     size_t size, std::string_view group_name, ReplicaType replica_type) {
-    ScopedPlacementAccess placement(placement_index_, regions_by_host_,
-                                    client_by_name_, pool_mutex_);
+    ScopedPlacementReadAccess placement(placement_index_, regions_by_host_,
+                                        owner_client_by_group_name_,
+                                        pool_mutex_);
     return replica_allocator_.AllocateFrom(placement, size, group_name,
                                            replica_type);
 }
@@ -98,18 +102,21 @@ tl::expected<Replica, ErrorCode> SegmentPool::AllocateFrom(
 std::optional<UUID> SegmentPool::GetOwnerClientId(
     std::string_view group_name) const {
     std::shared_lock lock(pool_mutex_);
-    auto owner = client_by_name_.find(group_name);
-    return owner == client_by_name_.end() ? std::nullopt
-                                          : std::optional<UUID>(owner->second);
+    auto owner = owner_client_by_group_name_.find(group_name);
+    return owner == owner_client_by_group_name_.end()
+               ? std::nullopt
+               : std::optional<UUID>(owner->second);
 }
 
-tl::expected<RegionInitialState, ErrorCode> SegmentPool::BuildInitialState(
+tl::expected<RegionInitialState, ErrorCode>
+SegmentPool::BuildRegionInitialState(
     const Segment& segment,
     std::span<const AllocatedBuffer::Descriptor> descriptors) const {
-    return BuildRegionInitialState(MakeResourceSpec(segment), descriptors);
+    return mooncake::BuildRegionInitialState(MakeResourceSpec(segment),
+                                             descriptors);
 }
 
-void SegmentPool::releaseCapacityMetrics() {
+void SegmentPool::ReleaseCapacityMetrics() {
     std::unordered_set<std::string> segment_names;
     for (const auto& id : capacity_accounted_regions_) {
         auto mounted = mounted_regions_.find(id);

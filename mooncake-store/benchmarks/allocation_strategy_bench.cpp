@@ -329,7 +329,7 @@ class BenchmarkPlacement final {
     void Add(std::string_view name,
              std::shared_ptr<BufferAllocatorBase> allocator) {
         auto target = std::make_unique<AllocationTarget>(
-            allocator.get(), AllocationTargetKind::STANDARD);
+            allocator.get(), AllocationTargetKind::NATIVE);
         placement_.AddTarget(name, target.get());
         allocators_.push_back(std::move(allocator));
         targets_.push_back(std::move(target));
@@ -337,7 +337,7 @@ class BenchmarkPlacement final {
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         size_t size, size_t replica_count, PlacementPolicyType policy) {
-        ScopedPlacementAccess access(placement_, mutex_);
+        ScopedPlacementReadAccess access(placement_, mutex_);
         ReplicaAllocationRequest request;
         request.size = size;
         request.replica_count = replica_count;

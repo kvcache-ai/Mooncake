@@ -10,7 +10,7 @@
 namespace mooncake {
 
 enum class AllocationTargetKind {
-    STANDARD = 0,
+    NATIVE = 0,
     CXL,
 };
 

@@ -11,11 +11,11 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "utils.h"
-#include "ha/snapshot/segment_pool_snapshot_codec.h"
+#include "ha/snapshot/store_resource_snapshot_codec.h"
 #include "master_admin_service.h"
 #include "master_service.h"
 #include "segment/pool.h"
-#include "segment/pool_access.h"
+#include "segment/pool_write_access.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
@@ -333,13 +333,13 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     segment.size = 1024 * 1024 * 16;
     UUID client_id = generate_uuid();
     ASSERT_EQ(
-        source_manager.getSegmentPoolAccess().MountSegment(segment, client_id),
+        source_manager.AcquireWriteAccess().MountSegment(segment, client_id),
         ErrorCode::OK);
     const int64_t capacity_after_mount = metrics.get_total_mem_capacity();
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               static_cast<int64_t>(segment.size));
 
-    auto snapshot = ha::SegmentPoolSnapshotCodec::Encode(
+    auto snapshot = ha::StoreResourceSnapshotCodec::Encode(
         source_manager, LocalSsdPersistedState{});
     ASSERT_TRUE(snapshot.has_value());
 
@@ -350,7 +350,7 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
         // the gauges untouched.
         SegmentPool reader(driver_config);
         ASSERT_TRUE(
-            ha::SegmentPoolSnapshotCodec::Decode(reader, snapshot.value())
+            ha::StoreResourceSnapshotCodec::Decode(reader, snapshot.value())
                 .has_value());
     }
     ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_after_mount);
@@ -359,7 +359,7 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
 
     // Unmount to restore the gauges for the other tests.
     {
-        auto access = source_manager.getSegmentPoolAccess();
+        auto access = source_manager.AcquireWriteAccess();
         size_t dec_capacity = 0;
         ASSERT_EQ(access.PrepareUnmountSegment(segment.id, dec_capacity),
                   ErrorCode::OK);

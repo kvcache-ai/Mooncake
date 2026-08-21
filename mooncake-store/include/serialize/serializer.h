@@ -15,7 +15,7 @@ class AllocatedBuffer;
 class Replica;
 class MasterService;
 class BufferAllocatorBase;
-class SegmentPoolView;
+class ScopedSegmentPoolReadAccess;
 enum class ErrorCode;
 struct SerializationError;
 
@@ -75,11 +75,12 @@ class Serializer<AllocatedBuffer> {
     using PointerType = std::unique_ptr<AllocatedBuffer>;
 
     static tl::expected<void, SerializationError> serialize(
-        const AllocatedBuffer &buffer, const SegmentPoolView &segment_view,
-        MsgpackPacker &packer);
+        const AllocatedBuffer &buffer,
+        const ScopedSegmentPoolReadAccess &segment_view, MsgpackPacker &packer);
 
     static tl::expected<PointerType, SerializationError> deserialize(
-        const msgpack::object &obj, const SegmentPoolView &segment_view);
+        const msgpack::object &obj,
+        const ScopedSegmentPoolReadAccess &segment_view);
 };
 
 // Serializer specialization for Replica (interface declaration)
@@ -89,11 +90,12 @@ class Serializer<Replica> {
     using PointerType = std::shared_ptr<Replica>;
 
     static tl::expected<void, SerializationError> serialize(
-        const Replica &replica, const SegmentPoolView &segment_view,
+        const Replica &replica, const ScopedSegmentPoolReadAccess &segment_view,
         MsgpackPacker &packer);
 
     static tl::expected<PointerType, SerializationError> deserialize(
-        const msgpack::object &obj, const SegmentPoolView &segment_view);
+        const msgpack::object &obj,
+        const ScopedSegmentPoolReadAccess &segment_view);
 };
 
 // Generic serialization helper class

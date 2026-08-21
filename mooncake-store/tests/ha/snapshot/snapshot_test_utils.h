@@ -17,7 +17,7 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
-#include "ha/snapshot/segment_pool_snapshot_codec.h"
+#include "ha/snapshot/store_resource_snapshot_codec.h"
 #include "master_config.h"
 #include "replica.h"
 #include "segment/pool.h"
@@ -144,7 +144,7 @@ inline std::vector<uint8_t> BuildSegmentsPayload() {
     RegionDriverConfig driver_config;
     driver_config.memory_allocator = BufferAllocatorType::OFFSET;
     SegmentPool segment_pool(driver_config);
-    auto serialized = ha::SegmentPoolSnapshotCodec::Encode(
+    auto serialized = ha::StoreResourceSnapshotCodec::Encode(
         segment_pool, LocalSsdPersistedState{});
     if (!serialized) {
         throw std::runtime_error(serialized.error().message);

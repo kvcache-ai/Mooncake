@@ -151,7 +151,7 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         //    No ClearInvalidHandles sweep here (see file header).
         size_t metrics_dec_capacity = 0;
         {
-            auto segment_access = service.segment_pool_.getSegmentPoolAccess();
+            auto segment_access = service.segment_pool_.AcquireWriteAccess();
             if (segment_access.PrepareUnmountSegment(
                     segment.id, metrics_dec_capacity) != ErrorCode::OK) {
                 ::_exit(kExitUnmountFailed);

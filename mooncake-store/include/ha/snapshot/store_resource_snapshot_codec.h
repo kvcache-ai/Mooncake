@@ -18,7 +18,7 @@ namespace mooncake::ha {
 // Codec for the existing ma/an/ms/cs/ld store-resource snapshot payload.
 // It composes catalog, driver resource, placement and LocalSSD views without
 // making any of those runtime components depend on serialization.
-class SegmentPoolSnapshotCodec final {
+class StoreResourceSnapshotCodec final {
    public:
     static tl::expected<std::vector<uint8_t>, SerializationError> Encode(
         const SegmentPool& segment_pool,

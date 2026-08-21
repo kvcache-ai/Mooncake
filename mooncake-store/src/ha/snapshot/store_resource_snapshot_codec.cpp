@@ -1,4 +1,4 @@
-#include "ha/snapshot/segment_pool_snapshot_codec.h"
+#include "ha/snapshot/store_resource_snapshot_codec.h"
 
 #include <algorithm>
 #include <limits>
@@ -15,8 +15,8 @@
 #include "ha/snapshot/allocator_snapshot_codec.h"
 #include "ha/snapshot/local_ssd_codec.h"
 #include "segment/pool.h"
-#include "segment/pool_access.h"
-#include "segment/pool_view.h"
+#include "segment/pool_write_access.h"
+#include "segment/pool_read_access.h"
 #include "serialize/serializer.h"
 #include "utils/zstd_util.h"
 
@@ -123,10 +123,10 @@ IndexFields(const msgpack::object& object) {
 }  // namespace
 
 tl::expected<std::vector<uint8_t>, SerializationError>
-SegmentPoolSnapshotCodec::Encode(
+StoreResourceSnapshotCodec::Encode(
     const SegmentPool& segment_pool,
     const LocalSsdPersistedState& local_ssd_state) {
-    auto view = segment_pool.getView();
+    auto view = segment_pool.AcquireReadAccess();
     const auto allocator_type = view.GetMemoryAllocatorType();
     if (!allocator_type || *allocator_type != BufferAllocatorType::OFFSET) {
         return tl::make_unexpected(SerializationError(
@@ -200,8 +200,8 @@ SegmentPoolSnapshotCodec::Encode(
 }
 
 tl::expected<LocalSsdPersistedState, SerializationError>
-SegmentPoolSnapshotCodec::Decode(SegmentPool& segment_pool,
-                                 const std::vector<uint8_t>& data) {
+StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
+                                   const std::vector<uint8_t>& data) {
     std::vector<uint8_t> decompressed;
     try {
         decompressed = zstd_decompress(data);
@@ -236,7 +236,7 @@ SegmentPoolSnapshotCodec::Decode(SegmentPool& segment_pool,
     }
 
     const auto memory_allocator_type =
-        segment_pool.getView().GetMemoryAllocatorType();
+        segment_pool.AcquireReadAccess().GetMemoryAllocatorType();
     const auto allocator_field = fields->find("ma");
     if (!memory_allocator_type || allocator_field == fields->end() ||
         allocator_field->second->type != msgpack::type::POSITIVE_INTEGER ||
@@ -395,7 +395,7 @@ SegmentPoolSnapshotCodec::Decode(SegmentPool& segment_pool,
         }
     }
 
-    auto access = segment_pool.getSegmentPoolAccess();
+    auto access = segment_pool.AcquireWriteAccess();
     std::vector<PreparedMountedRegion> prepared;
     prepared.reserve(order.size());
     for (const auto& id : order) {
@@ -412,7 +412,7 @@ SegmentPoolSnapshotCodec::Decode(SegmentPool& segment_pool,
     // untouched. Once every resource is ready, replacement is no-fail.
     access.Clear();
     for (auto& region : prepared) {
-        access.CommitMount(region);
+        access.CommitPreparedRegion(region);
     }
     return std::move(*local_ssd);
 }

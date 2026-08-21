@@ -49,9 +49,10 @@ inline std::ostream& operator<<(
 
 class NoFSegmentManager;
 
-class ScopedNoFSegmentAccess final {
+class ScopedNoFSegmentWriteAccess final {
    public:
-    ScopedNoFSegmentAccess(NoFSegmentManager* manager, std::shared_mutex& mutex)
+    ScopedNoFSegmentWriteAccess(NoFSegmentManager* manager,
+                                std::shared_mutex& mutex)
         : nof_segment_manager_(manager), lock_(mutex) {}
 
     ErrorCode MountSegment(const NoFSegment& segment, const UUID& client_id);
@@ -81,17 +82,17 @@ class NoFSegmentManager final {
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
         : memory_allocator_(memory_allocator) {}
 
-    ScopedNoFSegmentAccess getNoFSegmentAccess() {
-        return ScopedNoFSegmentAccess(this, pool_mutex_);
+    ScopedNoFSegmentWriteAccess AcquireWriteAccess() {
+        return ScopedNoFSegmentWriteAccess(this, manager_mutex_);
     }
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         PlacementPolicyType policy_type,
-        const SegmentAllocationRequest& request);
+        const ReplicaPlacementRequest& request);
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
     tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> GetSegmentsByName(
         const std::string& segment_name) const {
-        std::shared_lock lock(pool_mutex_);
+        std::shared_lock lock(manager_mutex_);
         std::vector<NoFSegmentOwnerInfo> result;
         for (const auto& [segment_id, mounted] : mounted_segments_) {
             if (mounted.segment.name == segment_name) {
@@ -105,17 +106,17 @@ class NoFSegmentManager final {
     }
 
    private:
-    mutable std::shared_mutex pool_mutex_;
+    mutable std::shared_mutex manager_mutex_;
     const BufferAllocatorType memory_allocator_;
     PlacementIndex placement_index_;
     ReplicaAllocator replica_allocator_;
     std::unordered_map<UUID, MountedNoFSegment, boost::hash<UUID>>
         mounted_segments_;
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
-        client_segments_;
-    ClientByRegionName client_by_name_;
+        segment_ids_by_client_;
+    OwnerClientByGroupName owner_client_by_group_name_;
 
-    friend class ScopedNoFSegmentAccess;
+    friend class ScopedNoFSegmentWriteAccess;
     friend class SegmentTest;
     friend class test::MasterServiceTenantQuotaTest;
 };

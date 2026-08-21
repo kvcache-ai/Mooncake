@@ -169,7 +169,7 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             return Stage(MakeResource(spec, std::move(allocator),
-                                      AllocationTargetKind::STANDARD));
+                                      AllocationTargetKind::NATIVE));
         }
 
         if (*allocator_type() == BufferAllocatorType::CACHELIB) {
@@ -180,7 +180,7 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             auto resource = MakeResource(spec, std::move(restored->allocator),
-                                         AllocationTargetKind::STANDARD);
+                                         AllocationTargetKind::NATIVE);
             return Stage(std::move(resource), std::move(restored->buffers));
         }
         if (*allocator_type() == BufferAllocatorType::OFFSET) {
@@ -191,7 +191,7 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             auto resource = MakeResource(spec, std::move(restored->allocator),
-                                         AllocationTargetKind::STANDARD);
+                                         AllocationTargetKind::NATIVE);
             return Stage(std::move(resource), std::move(restored->buffers));
         }
     } catch (const std::exception& e) {
@@ -214,8 +214,8 @@ MemoryRegionDriver::PrepareAdopt(
         allocator->base() != spec.base || allocator->capacity() != spec.size) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return Stage(MakeResource(spec, std::move(allocator),
-                              AllocationTargetKind::STANDARD));
+    return Stage(
+        MakeResource(spec, std::move(allocator), AllocationTargetKind::NATIVE));
 }
 
 CxlRegionDriver::CxlRegionDriver(std::string path, size_t size)

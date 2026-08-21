@@ -8,7 +8,7 @@
 #include "master_service.h"
 #include "segment/pool.h"
 #include "serialize/serializer.h"
-#include "ha/snapshot/segment_pool_snapshot_codec.h"
+#include "ha/snapshot/store_resource_snapshot_codec.h"
 #include "task_manager.h"
 
 namespace mooncake::ha {
@@ -122,14 +122,14 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeMetadata(
 tl::expected<std::vector<uint8_t>, SerializationError>
 MasterSnapshotCodec::EncodeSegments(const SegmentPool& segment_pool,
                                     LocalSsdManager& local_ssd_manager) const {
-    return SegmentPoolSnapshotCodec::Encode(
+    return StoreResourceSnapshotCodec::Encode(
         segment_pool, local_ssd_manager.ExportPersistedState());
 }
 
 tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeSegments(
     MasterService* master_service, const std::vector<uint8_t>& data) const {
     auto local_ssd_state =
-        SegmentPoolSnapshotCodec::Decode(master_service->segment_pool_, data);
+        StoreResourceSnapshotCodec::Decode(master_service->segment_pool_, data);
     if (!local_ssd_state) {
         return tl::unexpected(local_ssd_state.error());
     }
