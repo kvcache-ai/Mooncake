@@ -63,6 +63,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
+    client_buffer_allocation.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp
