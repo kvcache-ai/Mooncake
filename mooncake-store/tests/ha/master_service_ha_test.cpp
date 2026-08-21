@@ -508,6 +508,32 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
+    static std::string FindGroupIdOnDifferentShard(MasterService& service,
+                                                   size_t source_shard,
+                                                   const std::string& prefix) {
+        for (size_t index = 0; index < MasterService::kNumShards * 2; ++index) {
+            std::string group_id = prefix + std::to_string(index);
+            if (service.getShardIndex(group_id) != source_shard) {
+                return group_id;
+            }
+        }
+        return {};
+    }
+
+    static std::string FindGroupIdOnDifferentShardFromObject(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key, const std::string& prefix) {
+        return FindGroupIdOnDifferentShard(
+            service, service.getShardIndex(tenant_id, key), prefix);
+    }
+
+    static std::string FindGroupIdOnDifferentShardFromGroup(
+        MasterService& service, const std::string& group_id,
+        const std::string& prefix) {
+        return FindGroupIdOnDifferentShard(
+            service, service.getShardIndex(group_id), prefix);
+    }
+
     // Friend access to MasterService::metadata_shards_ and
     // getMetadataShardIndex, which are otherwise private.
     // MasterServiceHATest is friended; TEST_F-generated subclasses are not,
@@ -967,6 +993,57 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
               metric_after_restore);
     ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
                     .has_value());
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreRejectsUngroupedObjectDuplicatedIntoAnotherShard) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_cross_shard_duplicate";
+    const std::string endpoint = "standby_cross_shard_segment";
+    auto existing = MakeStandbyObject(key, endpoint);
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    auto duplicate = MakeStandbyObject(key, endpoint);
+    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromObject(
+        service, kDefaultTenant, key, "group-");
+    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreRejectsGroupedObjectDuplicatedIntoAnotherGroupShard) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_cross_group_duplicate";
+    const std::string endpoint = "standby_cross_group_segment";
+    auto existing = MakeStandbyObject(key, endpoint);
+    existing.metadata.group_id = "existing-group";
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    auto duplicate = MakeStandbyObject(key, endpoint);
+    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromGroup(
+        service, existing.metadata.group_id, "replacement-group-");
+    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 }
 
 TEST_F(MasterServiceHATest, RestoreRejectsDescriptorSizeMismatch) {
