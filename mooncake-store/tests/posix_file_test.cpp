@@ -1,6 +1,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <array>
+#include <cstdlib>
+#include <memory>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -295,6 +297,28 @@ TEST_F(PosixFileTest, UringBatchReadReportsShortReadPerRequest) {
     EXPECT_TRUE(descs[1].completed);
     EXPECT_EQ(descs[1].error, ErrorCode::OK);
     EXPECT_EQ(descs[1].bytes_read, 2U);
+}
+
+TEST_F(PosixFileTest, UringBatchReadRejectsMisalignedDirectIoDescriptors) {
+    int uring_fd = dup(test_fd);
+    ASSERT_GE(uring_fd, 0);
+    UringFile uring_file(test_filename, uring_fd, 32, true);
+
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, 4096, 8192), 0);
+    std::unique_ptr<void, decltype(&std::free)> buffer(allocation, &std::free);
+    auto* aligned = static_cast<char*>(buffer.get());
+
+    auto expect_invalid = [&](UringFile::ReadDesc desc) {
+        auto result = uring_file.batch_read(&desc, 1);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::FILE_INVALID_BUFFER);
+        EXPECT_FALSE(desc.completed);
+    };
+
+    expect_invalid(UringFile::ReadDesc{aligned + 1, 4096, 0});
+    expect_invalid(UringFile::ReadDesc{aligned, 4095, 0});
+    expect_invalid(UringFile::ReadDesc{aligned, 4096, 1});
 }
 
 TEST_F(PosixFileTest, UringBatchReadDrainsErrorsBeforeNextOperation) {

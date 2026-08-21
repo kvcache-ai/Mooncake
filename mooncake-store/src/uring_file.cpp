@@ -142,14 +142,7 @@ class SharedUringRing {
     }
 
     // Descriptor for one independently-addressed read in a batch.
-    struct ReadDesc {
-        void* buf;
-        size_t len;
-        off_t off;
-        size_t bytes_read;
-        ErrorCode error;
-        bool completed;
-    };
+    using ReadDesc = UringFile::ReadDesc;
 
     /// Submit up to QUEUE_DEPTH reads at once (each at its own offset), then
     /// collect completions. Repeat until all @p cnt descs are done.
@@ -778,12 +771,17 @@ tl::expected<void, ErrorCode> UringFile::batch_read(ReadDesc* descs, int cnt) {
     if (!descs || cnt <= 0)
         return make_error<void>(ErrorCode::FILE_INVALID_BUFFER);
 
-    // Map UringFile::ReadDesc → SharedUringRing::ReadDesc (same layout, but
-    // ensure they stay in sync if either changes).
-    static_assert(sizeof(ReadDesc) == sizeof(SharedUringRing::ReadDesc),
-                  "ReadDesc layout mismatch");
-    auto* ring_descs = reinterpret_cast<SharedUringRing::ReadDesc*>(descs);
-    return SharedUringRing::instance().batch_read(fd_, ring_descs, cnt);
+    for (int i = 0; i < cnt; ++i) {
+        if (!descs[i].buf || descs[i].len == 0)
+            return make_error<void>(ErrorCode::FILE_INVALID_BUFFER);
+        if (use_direct_io_ &&
+            (reinterpret_cast<uintptr_t>(descs[i].buf) % ALIGNMENT_ ||
+             descs[i].len % ALIGNMENT_ || descs[i].off % ALIGNMENT_)) {
+            return make_error<void>(ErrorCode::FILE_INVALID_BUFFER);
+        }
+    }
+
+    return SharedUringRing::instance().batch_read(fd_, descs, cnt);
 }
 
 // ---------------------------------------------------------------------------
