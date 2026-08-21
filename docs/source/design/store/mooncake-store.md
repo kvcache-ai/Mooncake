@@ -45,7 +45,7 @@ The `Client` can be used in three ways:
 Mooncake store supports two deployment methods to accommodate different availability requirements:
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
 2. **High availability mode**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
-If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election, ensuring continuous availability.
+If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election. Election alone does not make a node ready to serve: the elected node must complete standby catch-up, export and validate the complete promotion context, restore that context (including a valid empty context), and revalidate leadership. If any step fails, the node remains unavailable rather than serving from unverified or partial metadata.
 
 In both modes, the leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
 

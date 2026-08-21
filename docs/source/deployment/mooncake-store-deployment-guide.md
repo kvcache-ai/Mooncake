@@ -304,8 +304,11 @@ When the Primary fails, the Standby is promoted through the following steps:
    - `applied_seq_id`: The latest applied OpLog sequence ID.
    - `objects`: All object metadata from the in-memory store.
    - `segments`: All segment registry entries.
-4. **State Restoration**: The new Primary restores its state from the `PromotionContext`, populating metadata shards and the segment manager.
-5. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
+4. **State Restoration**: The new Primary restores and validates the complete `PromotionContext`, populating metadata shards and the segment manager. A context with zero objects and segments still passes through restoration so that unsupported recovery modes cannot bypass validation.
+5. **Serving Gate**: The supervisor revalidates leadership and exposes the RPC service only after restoration succeeds. Promotion, restoration, or leadership validation failure leaves `service_ready=false`, keeps data endpoints unavailable, and releases leadership. Failure to release leadership does not make the candidate serviceable.
+6. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
+
+This fail-closed behavior is intentional. Older versions could log a restoration error and continue serving from empty or partially restored metadata. That behavior was a correctness bug, not a supported availability fallback: the serving state could disagree with the durable OpLog and poison later recovery attempts. Mooncake does not automatically discard snapshots, OpLog records, or metadata after a recovery error.
 
 ### Example: HA Deployment with etcd
 
@@ -356,6 +359,18 @@ mooncake_master --config_path=primary.yaml
 # Start Standby
 mooncake_master --config_path=standby.yaml
 ```
+
+### Recovery from Unusable HA State
+
+First repair temporary backend, configuration, or snapshot-access failures and restart the affected Standby. If the recovery history is confirmed unusable and losing all cached metadata is acceptable, start a new empty cluster explicitly:
+
+1. Stop every Primary and Standby process that uses the old `cluster_id`.
+2. Confirm that losing the old cache metadata and snapshots is acceptable.
+3. Change every node to a new, previously unused `cluster_id`.
+4. Start the new cluster and allow applications to repopulate the cache.
+5. Keep the old namespace for diagnosis, then remove it separately after confirming that no old process can reconnect.
+
+Using a new `cluster_id` isolates the new cluster from the old OpLog, durable prefix, producer view, and snapshot namespace. Do not delete individual recovery keys or reuse the old `cluster_id` while any old process may still run. There is no automatic reset-on-restore-failure option.
 
 ### Resetting a Legacy OpLog Namespace
 
