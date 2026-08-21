@@ -697,8 +697,13 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             return -1;
         }
 
-        // Count aliases so the registration outlives every sub-range but one
-        auto it = registered_base_refs_.find((uint64_t)base_ptr);
+        // Re-registering the same address is idempotent; a new sub-range of
+        // an already exported allocation just takes another reference.
+        uint64_t base = (uint64_t)base_ptr;
+        if (!registered_addr_to_base_.emplace((uint64_t)addr, base).second) {
+            return 0;
+        }
+        auto it = registered_base_refs_.find(base);
         if (it != registered_base_refs_.end()) {
             it->second++;
             return 0;
@@ -708,6 +713,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         hipIpcMemHandle_t handle;
         if (!checkHip(hipIpcGetMemHandle(&handle, base_ptr),
                       "HipTransport: hipIpcGetMemHandle failed")) {
+            registered_addr_to_base_.erase((uint64_t)addr);
             return -1;
         }
 
@@ -723,7 +729,9 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 #endif
         int rc = metadata_->addLocalMemoryBuffer(desc, true);
         if (rc == 0) {
-            registered_base_refs_[(uint64_t)base_ptr] = 1;
+            registered_base_refs_[base] = 1;
+        } else {
+            registered_addr_to_base_.erase((uint64_t)addr);
         }
         return rc;
     }
@@ -775,28 +783,33 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    void* key_ptr = addr;
     if (!use_fabric_mem_) {
-        void* base_ptr = nullptr;
-        size_t alloc_size = 0;
-        hipError_t result = hipMemGetAddressRange(
-            (hipDeviceptr_t*)&base_ptr, &alloc_size, (hipDeviceptr_t)addr);
-        if (result == hipSuccess) {
-            key_ptr = base_ptr;
-        } else {
-            (void)hipGetLastError();
-            LOG(WARNING) << "HipTransport: hipMemGetAddressRange failed for "
-                         << addr << " during unregister (error " << result
-                         << "); memory may already be freed, using the "
-                         << "provided address";
-        }
-        // Keep the registration alive until the last sub-range releases it
+        // Hold register_mutex_ through the metadata removal, mirroring the
+        // register path, so a concurrent register of another sub-range cannot
+        // republish the buffer in between.
         std::lock_guard<std::mutex> lock(register_mutex_);
-        auto it = registered_base_refs_.find((uint64_t)key_ptr);
-        if (it != registered_base_refs_.end() && --it->second > 0) return 0;
-        registered_base_refs_.erase((uint64_t)key_ptr);
+        auto alias_it = registered_addr_to_base_.find((uint64_t)addr);
+        if (alias_it != registered_addr_to_base_.end()) {
+            uint64_t base = alias_it->second;
+            registered_addr_to_base_.erase(alias_it);
+            // Both maps are updated in pairs under this mutex, so the base
+            // always has a refcount entry here. Only the last alias removes
+            // the shared registration.
+            if (--registered_base_refs_[base] > 0) return 0;
+            registered_base_refs_.erase(base);
+            return metadata_->removeLocalMemoryBuffer((void*)base,
+                                                      update_metadata);
+        }
+        // Not registered here (host memory owned by another transport, or
+        // already unregistered). The caller's address may still equal the
+        // base of a registration whose aliases are live (slab-level cleanup
+        // passing the allocation base); that registration is only removable
+        // through its aliases above.
+        if (registered_base_refs_.count((uint64_t)addr)) {
+            return ERR_ADDRESS_NOT_REGISTERED;
+        }
     }
-    return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 }
 
 int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
