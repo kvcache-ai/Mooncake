@@ -165,6 +165,15 @@ target_link_libraries(connect_pause_tracker_test PUBLIC gtest gtest_main
                                                         pthread)
 add_test(NAME connect_pause_tracker_test COMMAND connect_pause_tracker_test)
 
+# Hardware-free unit test for the context-level circuit-breaker state
+# (ContextHealthTracker is header-only and clock-injectable), runs on every CI
+# runner.
+add_executable(context_health_tracker_test
+               ${WORKSPACE}/context_health_tracker_test.cpp)
+target_link_libraries(context_health_tracker_test PUBLIC gtest gtest_main
+                                                         pthread)
+add_test(NAME context_health_tracker_test COMMAND context_health_tracker_test)
+
 # Hardware-free unit tests for DmabufExport struct and
 # RdmaContext::{exportDmabuf, closeDmabufExport}. Runs on every CI runner — no
 # RDMA device or GPU required (host-memory paths only).

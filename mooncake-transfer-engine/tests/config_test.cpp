@@ -501,5 +501,171 @@ TEST_F(MaxWrEnvTest, OutOfRangeDoesNotSetFlag) {
     EXPECT_EQ(config.max_wr, 256u);
 }
 
+// MC_CONTEXT_PAUSE_TTL_MS bounds how long the context-level circuit breaker
+// holds a tripped local RNIC context inactive before half-open reactivation.
+// 0 is a valid value (never auto-reactivate -- the legacy latch); the range is
+// capped at 600000ms like MC_CONN_PAUSE_TTL_MS. Garbage / negative /
+// out-of-range values must preserve the default: a typo silently resolving to
+// 0 would re-introduce the permanent-latch behavior this knob exists to fix.
+class ContextPauseTtlEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_CONTEXT_PAUSE_TTL_MS"); }
+};
+
+TEST_F(ContextPauseTtlEnvTest, DefaultIsFiveThousandWhenUnset) {
+    ::unsetenv("MC_CONTEXT_PAUSE_TTL_MS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 5000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "10000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 10000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, ZeroIsAcceptedAndDisablesReactivation) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "0", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 99;  // sentinel must be overwritten by 0
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 0);
+}
+
+TEST_F(ContextPauseTtlEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "600000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 600000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "600001", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 7);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "-1", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 11);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "abc", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 13;  // a typo must NOT re-enable the latch
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 13);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "5000s", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 15);
+}
+
+TEST_F(ContextPauseTtlEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 17);
+}
+
+// MC_CONTEXT_FAILURE_MIN_PEERS is the number of distinct peer servers an
+// all-rails-failed streak must span before the context breaker may trip.
+// 1 restores the legacy single-peer tripping; 0 is rejected (below range)
+// because a streak could then trip with no peer evidence at all.
+class ContextFailureMinPeersEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_CONTEXT_FAILURE_MIN_PEERS"); }
+};
+
+TEST_F(ContextFailureMinPeersEnvTest, DefaultIsTwoWhenUnset) {
+    ::unsetenv("MC_CONTEXT_FAILURE_MIN_PEERS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 2);
+}
+
+TEST_F(ContextFailureMinPeersEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_FAILURE_MIN_PEERS", "4", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 4);
+}
+
+TEST_F(ContextFailureMinPeersEnvTest, OneIsAcceptedLegacyBehavior) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_FAILURE_MIN_PEERS", "1", 1), 0);
+    GlobalConfig config;
+    config.context_failure_min_peers = 99;  // sentinel overwritten by 1
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 1);
+}
+
+TEST_F(ContextFailureMinPeersEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_FAILURE_MIN_PEERS", "64", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 64);
+}
+
+TEST_F(ContextFailureMinPeersEnvTest, ZeroIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_FAILURE_MIN_PEERS", "0", 1), 0);
+    GlobalConfig config;
+    config.context_failure_min_peers = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 7);
+}
+
+TEST_F(ContextFailureMinPeersEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_FAILURE_MIN_PEERS", "65", 1), 0);
+    GlobalConfig config;
+    config.context_failure_min_peers = 9;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 9);
+}
+
+TEST_F(ContextFailureMinPeersEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_FAILURE_MIN_PEERS", "-1", 1), 0);
+    GlobalConfig config;
+    config.context_failure_min_peers = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 11);
+}
+
+TEST_F(ContextFailureMinPeersEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_FAILURE_MIN_PEERS", "abc", 1), 0);
+    GlobalConfig config;
+    config.context_failure_min_peers = 13;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 13);
+}
+
+TEST_F(ContextFailureMinPeersEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_FAILURE_MIN_PEERS", "2x", 1), 0);
+    GlobalConfig config;
+    config.context_failure_min_peers = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 15);
+}
+
+TEST_F(ContextFailureMinPeersEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_FAILURE_MIN_PEERS", "", 1), 0);
+    GlobalConfig config;
+    config.context_failure_min_peers = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_failure_min_peers, 17);
+}
+
 }  // namespace
 }  // namespace mooncake
