@@ -471,8 +471,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         if (exportOffset + length > allocSize) {
             const size_t page = (size_t)sysconf(_SC_PAGESIZE);
             uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
-            if (aligned < (uintptr_t)allocBase)
-                aligned = (uintptr_t)allocBase;
+            if (aligned < (uintptr_t)allocBase) aligned = (uintptr_t)allocBase;
             exportBase = (CUdeviceptr)aligned;
             exportOffset = (uintptr_t)addr - aligned;
             exportSize =
