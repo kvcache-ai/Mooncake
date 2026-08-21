@@ -6,7 +6,6 @@
 
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -67,30 +66,6 @@ class TransferTaskTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 };
-
-// Test basic MemcpyOperation functionality
-TEST_F(TransferTaskTest, MemcpyOperationBasic) {
-    const size_t data_size = 1024;
-    std::vector<char> src_data(data_size, 'A');
-    std::vector<char> dest_data(data_size, 'B');
-
-    // Create memcpy operation
-    MemcpyOperation op(dest_data.data(), src_data.data(), data_size);
-
-    // Verify operation parameters
-    EXPECT_EQ(op.dest, dest_data.data());
-    EXPECT_EQ(op.src, src_data.data());
-    EXPECT_EQ(op.size, data_size);
-
-    // Perform memcpy manually to test
-    std::memcpy(op.dest, op.src, op.size);
-
-    // Verify data was copied correctly
-    EXPECT_EQ(dest_data, src_data);
-    for (size_t i = 0; i < data_size; ++i) {
-        EXPECT_EQ(dest_data[i], 'A');
-    }
-}
 
 // Test MemcpyOperationState functionality
 TEST_F(TransferTaskTest, MemcpyOperationState) {
@@ -186,6 +161,7 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
     constexpr size_t kFragmentCount = 128;
     std::vector<char> source(kBufferSize), destination(kBufferSize, 0);
     std::iota(source.begin(), source.end(), 0);
+    std::vector<size_t> completions(kFragmentCount, 0);
     std::vector<size_t> destination_offsets, source_offsets,
         lengths(kFragmentCount, 1);
     for (size_t i = 0; i < kFragmentCount; ++i) {
@@ -216,12 +192,17 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
                         .local_offsets = destination_offsets,
                         .remote_offsets = source_offsets,
                         .lengths = lengths,
-                        .on_fragment_complete = {},
+                        .on_fragment_complete =
+                            [&](size_t i, const Status& status) {
+                                EXPECT_TRUE(status.ok());
+                                ++completions[i];
+                            },
                     }})
                     .ok());
     for (size_t i = 0; i < kFragmentCount; ++i) {
         EXPECT_EQ(destination[destination_offsets[i]],
                   source[source_offsets[i]]);
+        EXPECT_EQ(completions[i], 1u);
     }
 }
 

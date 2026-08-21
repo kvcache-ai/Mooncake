@@ -34,6 +34,9 @@ class PutOperation;
 class DistributedStorageBackend;
 class RealClient;
 
+std::optional<size_t> GetTransportRegistrationLimit(
+    const std::string& protocol);
+
 /**
  * @brief Result of a query operation containing replica information and lease
  * timeout
@@ -468,6 +471,15 @@ class Client {
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
     tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+
+    /**
+     * @brief Deregisters this client's local disk segment from the master.
+     * Idempotent. The master drops the LOCAL_DISK replicas this client owns, so
+     * readers stop being handed a disk whose owner is about to stop serving.
+     * Callers must stop offloading first, otherwise the storage heartbeat
+     * re-mounts the segment on its next tick.
+     */
+    tl::expected<void, ErrorCode> UnmountLocalDiskSegment();
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
@@ -1000,6 +1012,11 @@ class Client {
                                        const std::string& tenant_id,
                                        const std::string& source,
                                        const std::vector<std::string>& targets);
+    tl::expected<void, ErrorCode> Copy(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& source, const std::vector<std::string>& targets,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Move an object's replica from source segment to target segment

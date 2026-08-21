@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -8,6 +9,7 @@
 #include "config.h"
 #include "acl/acl.h"
 #include "transport/ascend_transport/ascend_direct_transport/adxl_compat.h"
+#include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 
 namespace mooncake {
 namespace {
@@ -15,6 +17,39 @@ constexpr size_t kFabricMemPageSize = 1024ULL * 1024 * 1024;  // 1G
 constexpr int kBestEffortStartPercent = 100;
 constexpr int kBestEffortMinPercent = 50;
 constexpr int kBestEffortPercentStep = 10;
+
+std::atomic<uint32_t> g_agent_alloc_next{0};
+
+bool BindNextAgentDevice() {
+    if (!globalConfig().ascend_agent_mode) {
+        return true;
+    }
+    auto &mgr = ContextManager::getInstance();
+    if (!mgr.isInitialized()) {
+        return true;
+    }
+    const uint32_t n = mgr.getDeviceCount();
+    if (n == 0) {
+        return true;
+    }
+    const uint32_t idx = g_agent_alloc_next.load(std::memory_order_relaxed) % n;
+    if (!mgr.setCurrentContext(static_cast<int32_t>(idx))) {
+        LOG(ERROR) << "Failed to set agent-mode alloc context for device "
+                   << idx;
+        return false;
+    }
+    return true;
+}
+
+void CommitAgentDeviceSlot() {
+    if (!globalConfig().ascend_agent_mode) {
+        return;
+    }
+    if (!ContextManager::getInstance().isInitialized()) {
+        return;
+    }
+    g_agent_alloc_next.fetch_add(1, std::memory_order_relaxed);
+}
 
 size_t align_down_1g(size_t n) {
     return (n / kFabricMemPageSize) * kFabricMemPageSize;
@@ -160,32 +195,8 @@ void *allocate_fabric_exact(size_t total_size, bool quiet = false) {
     return va;
 }
 #endif
-}  // namespace
 
-void *ascend_allocate_vmm_memory_direct(size_t total_size) {
-#ifdef ASCEND_SUPPORT_FABRIC_MEM
-    return allocate_vmm_memory_direct_impl(total_size);
-#else
-    (void)total_size;
-    return nullptr;
-#endif
-}
-
-aclrtDrvMemHandle ascend_get_physical_handle_from_va(void *va) {
-#ifdef ASCEND_SUPPORT_FABRIC_MEM
-    std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
-    auto it = g_vmm_alloc_records.find(va);
-    if (it == g_vmm_alloc_records.end() || !it->second.is_direct_alloc) {
-        return nullptr;
-    }
-    return it->second.handle;
-#else
-    (void)va;
-    return nullptr;
-#endif
-}
-
-void *ascend_allocate_memory(size_t total_size, const std::string &protocol) {
+void *AllocateStoreMemoryImpl(size_t total_size, const std::string &protocol) {
     if (globalConfig().ascend_use_fabric_mem) {
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
         return allocate_fabric_exact(total_size);
@@ -215,6 +226,41 @@ void *ascend_allocate_memory(size_t total_size, const std::string &protocol) {
     }
     return buffer;
 }
+}  // namespace
+
+void *ascend_allocate_vmm_memory_direct(size_t total_size) {
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+    return allocate_vmm_memory_direct_impl(total_size);
+#else
+    (void)total_size;
+    return nullptr;
+#endif
+}
+
+aclrtDrvMemHandle ascend_get_physical_handle_from_va(void *va) {
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+    std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
+    auto it = g_vmm_alloc_records.find(va);
+    if (it == g_vmm_alloc_records.end() || !it->second.is_direct_alloc) {
+        return nullptr;
+    }
+    return it->second.handle;
+#else
+    (void)va;
+    return nullptr;
+#endif
+}
+
+void *ascend_allocate_memory(size_t total_size, const std::string &protocol) {
+    if (!BindNextAgentDevice()) {
+        return nullptr;
+    }
+    void *ptr = AllocateStoreMemoryImpl(total_size, protocol);
+    if (ptr) {
+        CommitAgentDeviceSlot();
+    }
+    return ptr;
+}
 
 void *ascend_allocate_memory_best_effort(size_t target_size,
                                          const std::string &protocol,
@@ -225,10 +271,15 @@ void *ascend_allocate_memory_best_effort(size_t target_size,
     }
     *actual_size = 0;
 
+    if (!BindNextAgentDevice()) {
+        return nullptr;
+    }
+
     if (!globalConfig().ascend_use_fabric_mem) {
-        void *ptr = ascend_allocate_memory(target_size, protocol);
+        void *ptr = AllocateStoreMemoryImpl(target_size, protocol);
         if (ptr) {
             *actual_size = target_size;
+            CommitAgentDeviceSlot();
         }
         return ptr;
     }
@@ -255,6 +306,7 @@ void *ascend_allocate_memory_best_effort(size_t target_size,
         void *ptr = allocate_fabric_exact(sz, /*quiet=*/true);
         if (ptr != nullptr) {
             *actual_size = sz;
+            CommitAgentDeviceSlot();
             if (sz < target_size) {
                 LOG(WARNING) << "Fabric mem best-effort: target=" << target_size
                              << ", actual=" << sz << " (" << pct << "%)";

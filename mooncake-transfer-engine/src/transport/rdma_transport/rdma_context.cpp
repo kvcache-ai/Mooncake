@@ -209,7 +209,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     }
     if (openRdmaDevice(device_name_, port, gid_index)) {
         LOG(ERROR) << "Failed to open device " << device_name_ << " on port "
-                   << port << " with GID " << gid_index;
+                   << static_cast<int>(port) << " with GID " << gid_index;
         return ERR_CONTEXT;
     }
 
@@ -1213,8 +1213,8 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_port_attr attr;
         int ret = ibv_query_port(context, port, &attr);
         if (ret) {
-            LOG(ERROR) << "Failed to query port " << port << " on "
-                       << device_name << ": " << strerror(ret);
+            LOG(ERROR) << "Failed to query port " << static_cast<int>(port)
+                       << " on " << device_name << ": " << strerror(ret);
             int close_ret = ibv_close_device(context);
             if (close_ret) {
                 LOG(ERROR) << "ibv_close_device(" << device_name
@@ -1341,7 +1341,8 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ret = ibv_query_port(context, port, &port_attr);
         if (ret) {
             LOG(WARNING) << "Failed to query port attributes on " << device_name
-                         << "/" << port << ": " << strerror(ret);
+                         << "/" << static_cast<int>(port) << ": "
+                         << strerror(ret);
             int close_ret = ibv_close_device(context);
             if (close_ret) {
                 LOG(ERROR) << "ibv_close_device(" << device_name
@@ -1360,34 +1361,37 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                                          found_gid_index);
             if (gid_state != GidNetworkState::GID_NOT_FOUND) {
                 LOG(INFO) << "Find best gid index: " << found_gid_index
-                          << " on " << device_name << "/" << port
-                          << " (network state: "
+                          << " on " << device_name << "/"
+                          << static_cast<int>(port) << " (network state: "
                           << GidNetworkStateToString(gid_state) << ")";
                 gid_index = found_gid_index;
             } else {
                 LOG(WARNING) << "No suitable GID found on " << device_name
-                             << "/" << port;
+                             << "/" << static_cast<int>(port);
                 goto cleanup_context_and_devices;
             }
         } else {
             // Also check network state for user-specified GID
             bool has_ndev = !readGidNdev(device_name, port, gid_index).empty();
             if (!has_ndev) {
-                LOG(WARNING) << "User-specified GID index " << gid_index
-                             << " on " << device_name << "/" << port
-                             << " has no associated network device, "
-                             << "may not be optimal for RDMA operations";
+                LOG(WARNING)
+                    << "User-specified GID index " << gid_index << " on "
+                    << device_name << "/" << static_cast<int>(port)
+                    << " has no associated network device, "
+                    << "may not be optimal for RDMA operations";
             }
             LOG(INFO) << "Using user-specified GID index: " << gid_index
-                      << " on " << device_name << "/" << port << " ("
-                      << (has_ndev ? "with" : "without") << " network device)";
+                      << " on " << device_name << "/" << static_cast<int>(port)
+                      << " (" << (has_ndev ? "with" : "without")
+                      << " network device)";
         }
 
         // Continue with GID validation
         ret = ibv_query_gid(context, port, gid_index, &gid_);
         if (ret) {
             LOG(ERROR) << "Failed to query GID " << gid_index << " on "
-                       << device_name << "/" << port << ": " << strerror(ret);
+                       << device_name << "/" << static_cast<int>(port) << ": "
+                       << strerror(ret);
             goto cleanup_context_and_devices;
         }
 

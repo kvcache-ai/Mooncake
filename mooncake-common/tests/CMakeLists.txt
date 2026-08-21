@@ -21,7 +21,8 @@ target_link_libraries(rpc_client_io_context_test PUBLIC mooncake_common gtest
                                                         ibverbs pthread)
 add_test(NAME rpc_client_io_context_test COMMAND rpc_client_io_context_test)
 
-foreach(parser_test ascii_string bool_parser integer_parser)
+foreach(parser_test ascii_string bool_parser environment_value_parser
+                    integer_parser)
   add_executable(${parser_test}_test ${parser_test}_test.cpp)
   target_link_libraries(${parser_test}_test PUBLIC mooncake_common gtest
                                                    gtest_main pthread)

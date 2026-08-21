@@ -39,7 +39,7 @@ echo "Running import structure test..."
 cp -r mooncake-wheel/tests test_env/
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cd test_env
-pip install torch==2.11.0 numpy
+pip install torch numpy
 python -c "import mooncake._fast_copy"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
@@ -48,7 +48,7 @@ echo "Running mooncake config test..."
 python tests/test_mooncake_config.py
 
 echo "Running reshard contract tests..."
-python -m pip install pytest
+python -m pip install pytest hypothesis==6.141.0
 python -m pytest reshard_tests -q
 
 echo "Verifying mooncake_master entry point..."

@@ -24,10 +24,10 @@
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
+#include "nvme_kv_backend.h"
 #include "utils.h"
 #include "crc32c.h"
 #include "ascii_string.h"
-#include "bool_parser.h"
 #include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
@@ -57,6 +57,31 @@ struct FdGuard {
 #endif
 
 namespace mooncake {
+
+namespace {
+
+struct OffsetAllocatorBackendEnvironmentVariables {
+    inline static constexpr EnvironmentVariable<std::string>
+        kMooncakeOffsetEvictionPolicy{"MOONCAKE_OFFSET_EVICTION_POLICY"};
+    inline static constexpr EnvironmentVariable<std::string>
+        kMooncakeOffsetHighRatio{"MOONCAKE_OFFSET_HIGH_RATIO"};
+    inline static constexpr EnvironmentVariable<std::string>
+        kMooncakeOffsetLowRatio{"MOONCAKE_OFFSET_LOW_RATIO"};
+    inline static constexpr EnvironmentVariable<int64_t>
+        kMooncakeOffsetMaxCapacityNodes{"MOONCAKE_OFFSET_MAX_CAPACITY_NODES"};
+    inline static constexpr EnvironmentVariable<int64_t>
+        kMooncakeOffsetMaxEvictPerOffload{
+            "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD"};
+    inline static constexpr EnvironmentVariable<std::string>
+        kMooncakeOffsetPersistMode{"MOONCAKE_OFFSET_PERSIST_MODE"};
+    inline static constexpr EnvironmentVariable<int64_t>
+        kMooncakeOffsetPersistIntervalSeconds{
+            "MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS"};
+    inline static constexpr EnvironmentVariable<bool> kMooncakeOffsetRecordCrc{
+        "MOONCAKE_OFFSET_RECORD_CRC"};
+};
+
+}  // namespace
 
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
@@ -103,6 +128,14 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
         Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
                           Environ::GetInt64("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
                                             config.max_total_size));
+
+    config.max_physical_bytes =
+        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES",
+                          config.max_physical_bytes);
+
+    config.disk_scan_cache_ms =
+        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS",
+                          config.disk_scan_cache_ms);
 
     const auto policy_str = Environ::GetString(
         "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
@@ -165,42 +198,42 @@ bool OffsetAllocatorBackendConfig::Validate() const {
     return true;
 }
 
-static std::optional<double> GetEnvDouble(const char* name) {
-    const char* env = std::getenv(name);
-    if (!env || env[0] == '\0') return std::nullopt;
-    try {
-        return std::stod(env);
-    } catch (...) {
-        return std::nullopt;
-    }
-}
-
 OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     OffsetAllocatorBackendConfig cfg;
+    using Variables = OffsetAllocatorBackendEnvironmentVariables;
 
-    const char* pol = std::getenv("MOONCAKE_OFFSET_EVICTION_POLICY");
-    if (pol) {
-        if (AsciiCaseInsensitiveEquals(pol, "fifo")) {
+    const auto policy = Environ::Read(Variables::kMooncakeOffsetEvictionPolicy);
+    if (policy.has_value()) {
+        if (AsciiCaseInsensitiveEquals(*policy, "fifo")) {
             cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
         }
         // NONE is default; LRU reserved for phase 2
     }
 
-    if (auto v = GetEnvDouble("MOONCAKE_OFFSET_HIGH_RATIO"))
-        cfg.high_ratio = *v;
-    if (auto v = GetEnvDouble("MOONCAKE_OFFSET_LOW_RATIO")) cfg.low_ratio = *v;
+    constexpr EnvironmentDoubleParseOptions kLegacyRatioParsing{
+        .allow_trailing_characters = true,
+        .allow_non_finite = true,
+    };
+    if (const auto value = Environ::Read(Variables::kMooncakeOffsetHighRatio)) {
+        cfg.high_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
+                             .value_or(cfg.high_ratio);
+    }
+    if (const auto value = Environ::Read(Variables::kMooncakeOffsetLowRatio)) {
+        cfg.low_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
+                            .value_or(cfg.low_ratio);
+    }
     // Both byte and key watermarks derive from the same ratio pair.
     cfg.keys_high_ratio = cfg.high_ratio;
     cfg.keys_low_ratio = cfg.low_ratio;
 
-    cfg.max_capacity_nodes = Environ::GetInt64(
-        "MOONCAKE_OFFSET_MAX_CAPACITY_NODES", cfg.max_capacity_nodes);
+    cfg.max_capacity_nodes = Environ::ReadOr(
+        Variables::kMooncakeOffsetMaxCapacityNodes, cfg.max_capacity_nodes);
 
     // Read eviction cap as int64_t to guard against negative env values
     // which would wrap to SIZE_MAX with an unsigned parser.
     auto max_evict_raw =
-        Environ::GetInt64("MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD",
-                          static_cast<int64_t>(cfg.max_evict_per_offload));
+        Environ::ReadOr(Variables::kMooncakeOffsetMaxEvictPerOffload,
+                        static_cast<int64_t>(cfg.max_evict_per_offload));
     if (max_evict_raw > 0) {
         cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
     } else if (max_evict_raw <= 0) {
@@ -210,9 +243,9 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     }
 
     // Persistence mode
-    const char* persist = std::getenv("MOONCAKE_OFFSET_PERSIST_MODE");
-    if (persist) {
-        std::string s(persist);
+    const auto persist = Environ::Read(Variables::kMooncakeOffsetPersistMode);
+    if (persist.has_value()) {
+        const std::string& s = *persist;
         if (AsciiCaseInsensitiveEquals(s, "disabled")) {
             cfg.persist_mode = OffsetPersistMode::kDisabled;
         } else if (AsciiCaseInsensitiveEquals(s, "relaxed")) {
@@ -226,24 +259,18 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     }
 
     cfg.persist_interval_seconds =
-        Environ::GetInt64("MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS",
-                          cfg.persist_interval_seconds);
+        Environ::ReadOr(Variables::kMooncakeOffsetPersistIntervalSeconds,
+                        cfg.persist_interval_seconds);
 
     // Record CRC-32C: "0"/"false"/"off" disables per-record checksums.
-    const char* crc_env = std::getenv("MOONCAKE_OFFSET_RECORD_CRC");
-    if (crc_env) {
-        const auto parsed = TryParseBool(crc_env);
-        if (parsed.has_value() && !*parsed) {
-            cfg.enable_record_crc = false;
-        }
+    if (const auto record_crc =
+            Environ::Read(Variables::kMooncakeOffsetRecordCrc);
+        record_crc.has_value() && !*record_crc) {
+        cfg.enable_record_crc = false;
     }
 
     return cfg;
 }
-
-StorageBackendInterface::StorageBackendInterface(
-    const FileStorageConfig& config)
-    : file_storage_config_(config) {}
 
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
@@ -2408,10 +2435,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
+    if (offloading_objects.empty()) {
+        return {};
+    }
     auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
+    auto carryover_objects = std::move(ungrouped_offloading_objects);
+    bool carryover_loaded = false;
     auto it = offloading_objects.cbegin();
-    int64_t residue_count = static_cast<int64_t>(
-        offloading_objects.size() + ungrouped_offloading_objects.size());
+    int64_t residue_count = static_cast<int64_t>(offloading_objects.size() +
+                                                 carryover_objects.size());
     int64_t total_count = residue_count;
 
     auto is_exist_func =
@@ -2424,20 +2456,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         std::unordered_map<std::string, int64_t> bucket_objects;
         int64_t bucket_data_size = 0;
 
-        if (!ungrouped_offloading_objects.empty()) {
-            for (const auto& ungrouped_it : ungrouped_offloading_objects) {
+        if (!carryover_loaded) {
+            for (const auto& ungrouped_it : carryover_objects) {
                 bucket_data_size += ungrouped_it.second;
                 bucket_keys.push_back(ungrouped_it.first);
                 bucket_objects.emplace(ungrouped_it.first, ungrouped_it.second);
             }
             VLOG(1) << "Ungrouped offloading objects have been processed and "
                        "cleared; count="
-                    << ungrouped_offloading_objects.size();
-            ungrouped_offloading_objects.clear();
+                    << carryover_objects.size();
+            carryover_loaded = true;
         }
 
-        for (int64_t i = static_cast<int64_t>(bucket_keys.size());
-             i < bucket_backend_config_.bucket_keys_limit; ++i) {
+        while (static_cast<int64_t>(bucket_keys.size()) <
+               bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
@@ -2447,6 +2479,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                         << "Total ungrouped count: "
                         << ungrouped_offloading_objects.size();
                 return {};
+            }
+
+            if (carryover_objects.find(it->first) != carryover_objects.end()) {
+                ++it;
+                continue;
             }
 
             if (it->second > bucket_backend_config_.bucket_size_limit) {
@@ -2850,6 +2887,56 @@ BucketStorageBackend::SelectEvictionCandidate() {
     }
 }
 
+int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
+    namespace fs = std::filesystem;
+    auto now = std::chrono::steady_clock::now();
+    if (cached_disk_bytes_ >= 0 &&
+        now - cached_disk_bytes_at_ <
+            std::chrono::milliseconds(
+                bucket_backend_config_.disk_scan_cache_ms)) {
+        return cached_disk_bytes_;
+    }
+    int64_t total = 0;
+    std::error_code ec;
+    // Recursive scan: matches Init()'s recursive_directory_iterator and the
+    // du/kubelet accounting basis (the whole subtree, not just top-level
+    // entries), so nested content can never be silently missed.
+    fs::recursive_directory_iterator it(storage_path_, ec), end;
+    if (ec) {
+        // Cannot even open storage_path_. This is a hard safety cap, so fail
+        // CLOSED: report the cap as reached so eviction/rejection engages
+        // instead of letting the disk overflow, and do NOT cache the result
+        // (next call re-scans once the directory is readable again).
+        LOG(WARNING) << "[Bucket] physcap disk scan could not open "
+                     << storage_path_ << ": " << ec.message()
+                     << ", failing closed";
+        return bucket_backend_config_.max_physical_bytes;
+    }
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            // Iteration errored partway. Returning the partial total would
+            // under-count and silently open the cap; fail closed and skip
+            // caching so the next call re-scans.
+            LOG(WARNING) << "[Bucket] physcap disk scan error under "
+                         << storage_path_ << ": " << ec.message()
+                         << ", failing closed";
+            return bucket_backend_config_.max_physical_bytes;
+        }
+        struct stat st;
+        // st_blocks counts 512-byte blocks actually allocated on disk — the
+        // same basis as du / kubelet's emptyDir accounting (handles block
+        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
+        // file concurrently deleted during eviction) is skipped best-effort:
+        // that only under-counts by ~one file and avoids spurious fail-closed.
+        if (::stat(it->path().c_str(), &st) == 0) {
+            total += static_cast<int64_t>(st.st_blocks) * 512;
+        }
+    }
+    cached_disk_bytes_ = total;
+    cached_disk_bytes_at_ = now;
+    return total;
+}
+
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
     int64_t required_size, const std::vector<std::string>& write_keys) {
@@ -2918,6 +3005,32 @@ BucketStorageBackend::PrepareEviction(
     uint64_t accumulated_freed_space = 0;
     const int64_t synthetic_required_size =
         write_keys.empty() ? required_size : 0;
+    // On-disk footprint of the incoming write (~required_size); 0 for
+    // watermark-driven eviction, which has no incoming write. Added to the
+    // physical check below so we free enough room for THIS write, not merely
+    // enough to bring current usage back under the cap.
+    const int64_t incoming_physical_size =
+        write_keys.empty() ? 0 : required_size;
+
+    // Ground-truth physical usage of the offload directory (cached),
+    // snapshotted once. As buckets are selected for eviction their files get
+    // deleted in the later FinalizeEviction, so (physical_used_start -
+    // accumulated_freed_space) projects the physical bytes that will remain
+    // after this round.
+    const int64_t physical_used_start =
+        bucket_backend_config_.max_physical_bytes > 0
+            ? ActualDiskBytesUsedLocked()
+            : 0;
+    // True when the projected physical usage after this round — real disk usage
+    // minus what we free here, plus the incoming write — would still exceed the
+    // physical cap. Shared by the in-loop "keep evicting" test and the
+    // post-loop "reject the write" test.
+    const auto phys_over_cap = [&](uint64_t freed) {
+        return bucket_backend_config_.max_physical_bytes > 0 &&
+               physical_used_start + incoming_physical_size -
+                       static_cast<int64_t>(freed) >
+                   bucket_backend_config_.max_physical_bytes;
+    };
 
     while (!buckets_.empty() && evict_count < kMaxEvictionBuckets) {
         bool quota_exceeded = total_size_ + pending_eviction_size_ +
@@ -2928,11 +3041,18 @@ BucketStorageBackend::PrepareEviction(
         bool disk_still_full =
             initial_disk_full && (accumulated_freed_space < deficit);
 
-        if (!quota_exceeded && !disk_still_full) break;
+        // Physical hard cap on real on-disk usage (not total_size_, which
+        // under-counts lingering bucket files, and not fs::space(), which is
+        // blind to cgroup/emptyDir quotas).
+        bool phys_exceeded = phys_over_cap(accumulated_freed_space);
+
+        if (!quota_exceeded && !disk_still_full && !phys_exceeded) break;
 
         if (evict_count == 0) {
             LOG(INFO) << "[Evict] triggered: total=" << total_size_ << "/"
                       << bucket_backend_config_.max_total_size
+                      << " physical=" << physical_used_start << "/"
+                      << bucket_backend_config_.max_physical_bytes
                       << " required=" << required_size
                       << " disk_full=" << initial_disk_full;
         }
@@ -2977,8 +3097,12 @@ BucketStorageBackend::PrepareEviction(
                                     pending_write_size_ +
                                     synthetic_required_size >
                                 bucket_backend_config_.max_total_size;
+    // Physical cap still exceeded after evicting up to kMaxEvictionBuckets:
+    // reject the write (FILE_WRITE_FAIL, handled as an offload miss upstream)
+    // rather than overrun the disk quota and get OOM-evicted.
+    const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     pending_eviction_size_ += result.evicted_size;
-    if (!write_keys.empty() && quota_exceeded) {
+    if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -3148,6 +3272,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     if (!pending.buckets.empty()) {
         LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()
                   << " cleanup_failed=" << cleanup_failed_count;
+        // Files were just deleted; force the next physical-usage query to
+        // rescan rather than return the now-stale (higher) cached value.
+        {
+            SharedMutexLocker lock(&mutex_);
+            cached_disk_bytes_ = -1;
+        }
     }
     if (cleanup_failed_count != 0) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -5547,6 +5677,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
             return std::make_shared<OffsetAllocatorStorageBackend>(
                 config, offset_backend_config);
         }
+        case StorageBackendType::kNvmeKv:
+            return std::make_shared<NvmeKvStorageBackend>(config);
+
         case StorageBackendType::kDistributed: {
             auto distributed_config =
                 DistributedStorageConfig::FromEnvironment();

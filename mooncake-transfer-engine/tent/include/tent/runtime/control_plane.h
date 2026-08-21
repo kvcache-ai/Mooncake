@@ -97,6 +97,11 @@ class ControlClient {
     static Status delegate(const std::string& server_addr,
                            const Request& request);
 
+    using DelegateCallback = std::function<void(Status)>;
+    static void delegateAsync(const std::string& server_addr,
+                              const Request& request,
+                              DelegateCallback callback);
+
     static Status pinStageBuffer(const std::string& server_addr,
                                  const std::string& location, uint64_t& addr);
 
@@ -128,7 +133,7 @@ class ControlService {
 
     void setNotifyCallback(const OnNotify& callback);
 
-    Status start(uint16_t& port, bool ipv6_ = false);
+    Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
 
    private:
     void onGetSegmentDesc(const std::string_view& request,

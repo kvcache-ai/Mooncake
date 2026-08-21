@@ -20,7 +20,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  # Build the artifact tested below through the exact release wheel path. The
+  # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
+  build-wheel:
     needs: [spell-check, clang-format, check-paths]
     if: &run-ci-for-source-changes >-
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
@@ -29,158 +31,6 @@ jobs:
        github.event_name == 'workflow_dispatch' ||
        github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
-    env:
-      CI: "true"
-      SCCACHE_GHA_ENABLED: "true"
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Install and start etcd
-      run: |
-        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-        sleep 3 # Give etcd time to start
-        etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
-      shell: bash
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
-      with:
-        cuda: '12.8.1'
-        linux-local-args: '["--toolkit"]'
-        method: 'network'
-        sub-packages: '["nvcc"]'
-
-    - name: Install build utilities
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ninja-build
-
-    - name: Test HugeTLB sizing helper
-      run: |
-        python3 scripts/test_hicache_hugepage_requirements.py
-      shell: bash
-
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-    - name: Configure project
-      run: |
-        sudo apt update -y
-        sudo bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Build nvlink_allocator.so
-      run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-        cd mooncake-transfer-engine/nvlink-allocator
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
-    - name: Start Metadata Server
-      run: |
-        cd mooncake-transfer-engine/example/http-metadata-server-python
-        pip install aiohttp
-        python ./bootstrap_server.py &
-      shell: bash
-
-    - name: Run Mooncake Store Rust smoke test and benchmark
-      env:
-        MOONCAKE_STORE_CLUSTER_ID: ci_rust_test_cluster
-        MOONCAKE_STORE_RUST_LINK_ASAN: "1"
-      run: ./scripts/ci/run_store_rust_smoke.sh
-      shell: bash
-
-    - name: Run Go store binding integration tests
-      env:
-        MOONCAKE_STORE_CLUSTER_ID: ci_go_test_cluster
-        MOONCAKE_STORE_GO_LINK_COMMON: "1"
-        MOONCAKE_STORE_GO_SANITIZED: "1"
-      run: ./scripts/ci/run_store_go_integration.sh
-      shell: bash
-
-    - name: Test (in build env)
-      id: ctest
-      run: |
-        cd build
-        mkdir -p test-results
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-          DEFAULT_KV_LEASE_TTL=500 \
-          ctest -j --output-on-failure \
-            --output-junit "$GITHUB_WORKSPACE/build/test-results/ctest.xml"
-      shell: bash
-
-    - name: Preserve CTest diagnostics
-      if: ${{ always() && steps.ctest.outcome == 'failure' }}
-      uses: ./.github/actions/ctest-diagnostics
-      with:
-        summary-title: CTest failure (Python ${{ matrix.python-version }})
-        artifact-name: ctest-diagnostics-py${{ matrix.python-version }}
-        junit-report: build/test-results/ctest.xml
-        failed-tests-log: build/Testing/Temporary/LastTestsFailed.log
-        last-test-log: build/Testing/Temporary/LastTest.log
-
-    - name: Drain HTTP E2E test
-      if: matrix.python-version == '3.12'
-      run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        # Keep the sanitizer gate on the C++ integration test. The Python
-        # drain script is manual/nightly only because pybind + ASan teardown in
-        # a Python host process is not stable.
-        DEFAULT_KV_LEASE_TTL=500 ./mooncake-store/tests/task_integration_test --gtest_filter='TaskExecutorIntegrationTest.DrainJobCompleteFlow'
-      shell: bash
-
-  # Build the artifact tested below through the exact release wheel path. The
-  # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
-  build-wheel:
-    needs: [spell-check, clang-format, check-paths]
-    if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       python-versions: '["3.10", "3.12"]'
@@ -338,15 +188,11 @@ jobs:
         python mooncake-pg/tests/test_pg_collectives.py
       shell: bash
 
-    - name: Test PyTorch 2.13 Single-Buffer Collectives (CPU Only)
-      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.10'
+    - name: Test PyTorch >= 2.13 Single-Buffer Collectives (CPU Only)
       env:
         MC_FORCE_TCP: "true"
       run: |
         source test_env/bin/activate
-        python -m pip install --force-reinstall "torch==2.13.0" \
-          --index-url https://download.pytorch.org/whl/cu126 \
-          --extra-index-url https://pypi.org/simple
         python mooncake-pg/tests/test_pg_collectives.py \
           TestMooncakePGCollectivesCPU.test_all_gather_into_tensor \
           TestMooncakePGCollectivesCPU.test_reduce_scatter_sum
@@ -368,11 +214,8 @@ jobs:
         python-version: ['3.10', '3.12']
     env:
       CI: "true"
-      TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
       PIP_NO_CACHE_DIR: "1"
-      MAX_JOBS: "2"
-      EP_TORCH_VERSIONS: "2.11.0;2.12.0;2.12.1;2.13.0"
       CMAKE_RELWITHDEBINFO_FLAGS: "-O2 -DNDEBUG"
 
     steps:
@@ -415,9 +258,6 @@ jobs:
         df -h
       shell: bash
 
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
     - name: Build transfer engine only
       run: |
         cd mooncake-transfer-engine
@@ -448,130 +288,6 @@ jobs:
         rm -rf build
         df -h
       shell: bash
-
-    - name: Configure project with all settings are ON
-      run: |
-        mkdir build
-        cd build
-        # ENABLE_DEBUG_SYMBOLS=OFF alone still leaves CMake's RelWithDebInfo -g.
-        cmake -G Ninja .. \
-          -DUSE_ETCD=ON \
-          -DUSE_CXL=ON \
-          -DUSE_REDIS=ON \
-          -DUSE_HTTP=ON \
-          -DWITH_STORE=ON \
-          -DWITH_P2P_STORE=ON \
-          -DWITH_METRICS=ON \
-          -DBUILD_UNIT_TESTS=ON \
-          -DBUILD_EXAMPLES=ON \
-          -DENABLE_SCCACHE=ON \
-          -DUSE_CUDA=ON \
-          -DUSE_MNNVL=OFF \
-          -DUSE_UB=OFF \
-          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
-          "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
-          "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
-          -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-      # TODO: lack USE_NVMEOF,USE_MNNVL
-
-    - name: Build project with all settings are ON
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-        df -h
-      shell: bash
-
-    - name: Configure project with unit tests and examples
-      run: |
-        cd build
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DWITH_STORE_RUST=ON -DENABLE_SCCACHE=ON -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project with unit tests and examples
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Check Mooncake Store Rust bindings, examples, and tests
-      run: |
-        # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
-        # The toolkit stubs dir only ships libcuda.so; create the versioned symlink.
-        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
-           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
-          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-        fi
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cd mooncake-store/rust
-        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
-        cargo test --lib
-        MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
-        MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
-          cargo test --examples --tests --no-run
-        cargo clean
-      shell: bash
-
-    - name: Verify Mooncake Store Rust dlopen bindings and packaging
-      run: |
-        cd mooncake-store/rust
-        # 1. Committed dlopen bindings must stay in sync with store_c.h.
-        cargo run --locked --example generate_dlopen_bindings
-        git diff --exit-code -- src/generated/ffi_dlopen_bindings.rs
-        # 2. The published dlopen crate must build with no header/bindgen: package
-        #    it, extract, and check the dlopen feature against the packaged files.
-        cargo package --no-verify --allow-dirty
-        crate=$(ls target/package/mooncake_store-*.crate | head -1)
-        dest=$(mktemp -d)
-        tar xzf "$crate" -C "$dest"
-        (cd "$dest"/mooncake_store-* && cargo check --no-default-features --features dlopen)
-      shell: bash
-
-    - name: Configure project
-      run: |
-        cd build
-        rm -r */tests
-        cmake -G Ninja .. \
-          -DBUILD_UNIT_TESTS=OFF \
-          -DBUILD_EXAMPLES=OFF \
-          -DUSE_HTTP=ON \
-          -DENABLE_SCCACHE=ON \
-          -DUSE_CXL=ON \
-          -DWITH_EP=ON \
-          "-DEP_TORCH_VERSIONS=${EP_TORCH_VERSIONS}" \
-          -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Build nvlink_allocator.so
-      run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-        cd mooncake-transfer-engine/nvlink-allocator
-        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
 
   spell-check:
     name: Spell Check with Typos
@@ -761,7 +477,7 @@ jobs:
     secrets: inherit
 
   integration-test:
-    needs: [build, build-wheel-cu13, check-paths]
+    needs: [build-wheel-cu13, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
@@ -895,7 +611,6 @@ jobs:
       - spell-check
       - clang-format
       - docs-check
-      - build
       - build-wheel
       - build-flags
       - test-wheel-ubuntu

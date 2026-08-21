@@ -15,6 +15,21 @@
 
 #include "utils.h"
 
+#if defined(__has_feature)
+#define MC_HAS_FEATURE(x) __has_feature(x)
+#else
+#define MC_HAS_FEATURE(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || MC_HAS_FEATURE(address_sanitizer) || \
+    MC_HAS_FEATURE(leak_sanitizer)
+// Suppress false positives from libnuma.so process-wide caches that are
+// intentionally retained until process exit.
+extern "C" __attribute__((weak, visibility("default"))) const char*
+__lsan_default_suppressions() {
+    return "leak:libnuma.so\n";
+}
+#endif
+
 namespace mooncake {
 
 namespace {
@@ -77,7 +92,6 @@ TEST_F(MmapArenaFallbackTest, PopulateNumaHugetlbMappingTouchesEveryRegion) {
     if (numa_available() < 0) {
         GTEST_SKIP() << "NUMA is unavailable";
     }
-
     setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
     setenv("MC_STORE_HUGEPAGE_SIZE", "2MB", 1);
 
