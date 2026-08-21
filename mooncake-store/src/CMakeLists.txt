@@ -451,6 +451,9 @@ endif()
 if(USE_UB)
   target_link_libraries(mooncake_store_master PRIVATE ub_allocator)
 endif()
+if(USE_ASCEND_DIRECT OR USE_UBSHMEM)
+  target_link_libraries(mooncake_store_master PRIVATE ascend_transport)
+endif()
 
 # Complete public Store library.
 add_library(
