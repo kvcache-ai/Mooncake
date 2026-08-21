@@ -105,6 +105,15 @@ TEST_F(LocalFileSnapshotObjectStoreTest, GetConnectionInfo) {
     EXPECT_NE(info.find(tmp_dir()), std::string::npos);
 }
 
+TEST_F(LocalFileSnapshotObjectStoreTest, InspectObjectReturnsSize) {
+    ASSERT_TRUE(backend_->UploadString("test/inspect", "data"));
+
+    auto inspection = backend_->InspectObject("test/inspect");
+    ASSERT_TRUE(inspection) << inspection.error();
+    EXPECT_EQ(4u, inspection->stored_size);
+    EXPECT_FALSE(inspection->crc32c.has_value());
+}
+
 TEST_F(LocalFileSnapshotObjectStoreTest, UploadBuffer_CreatesSubdirectories) {
     std::vector<uint8_t> data = {42};
     auto result = backend_->UploadBuffer("a/b/c/deep_file", data);
