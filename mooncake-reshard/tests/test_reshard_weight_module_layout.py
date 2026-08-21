@@ -4,9 +4,6 @@ import importlib.util
 
 import mooncake.reshard.weight as model_weight
 import mooncake.reshard.weight._planner.contracts as planner_contracts
-from mooncake.reshard.contracts import (
-    RuntimeBindingFragment as RuntimeBindingFragmentContract,
-)
 from mooncake.reshard.weight.binding import (
     validate_runtime_binding,
     validate_runtime_bindings,
@@ -29,19 +26,22 @@ from mooncake.reshard.weight.placement import (
 from mooncake.reshard.weight.runtime import (
     WeightRuntimeBindingManifest as RuntimeBindingContract,
 )
-from mooncake.reshard.weight.topology import (
-    ParallelTopology as ParallelTopologyContract,
-)
-from mooncake.reshard.weight.topology import (
-    TopologyParticipant as TopologyParticipantContract,
-)
 from mooncake.reshard.weight.types import (
     ParallelRank as ParallelRankContract,
 )
 from mooncake.reshard.weight.types import (
     PlacementFragment as PlacementFragmentContract,
 )
+from mooncake.reshard.weight.types import (
+    RuntimeBindingFragment as RuntimeBindingFragmentContract,
+)
 from mooncake.reshard.weight.types import TensorDescriptor as TensorContract
+from mooncake.reshard.weight.topology import (
+    ParallelTopology as ParallelTopologyContract,
+)
+from mooncake.reshard.weight.topology import (
+    TopologyParticipant as TopologyParticipantContract,
+)
 
 
 def test_responsibility_modules_preserve_public_contract_identity() -> None:
@@ -82,5 +82,8 @@ def test_logical_planner_does_not_ship_runtime_execution_contracts() -> None:
     assert not hasattr(planner_contracts, "BoundWeightFragment")
     assert not hasattr(planner_contracts, "TransferPlan")
     assert (
-        importlib.util.find_spec("mooncake.reshard.weight._planner.attestation") is None
+        importlib.util.find_spec(
+            "mooncake.reshard.weight._planner.attestation"
+        )
+        is None
     )
