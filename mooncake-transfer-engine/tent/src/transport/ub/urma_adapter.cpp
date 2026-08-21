@@ -30,8 +30,11 @@
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+
 #if defined(TENT_HAS_REAL_URMA) && TENT_HAS_REAL_URMA
 #include <urma_api.h>
+#include <urma_ubagg.h>
 #endif
 
 namespace mooncake {
@@ -352,10 +355,11 @@ class RuntimeLease {
 class RealContext final : public Context {
    public:
     RealContext(std::shared_ptr<RuntimeLease> runtime, DeviceInfo info,
-                urma_context_t* native)
+                urma_context_t* native, uint32_t ctp_priority)
         : runtime_(std::move(runtime)),
           info_(std::move(info)),
-          native_(native) {}
+          native_(native),
+          ctp_priority_(ctp_priority) {}
 
     ~RealContext() override { (void)close(); }
 
@@ -366,6 +370,12 @@ class RealContext final : public Context {
     }
 
     urma_context_t* native() const noexcept { return native_; }
+
+    bool isBondingDevice() const noexcept {
+        return info_.native_device_name.rfind("bonding", 0) == 0;
+    }
+
+    uint32_t ctpPriority() const noexcept { return ctp_priority_; }
 
     Status close() {
         if (native_ == nullptr) return Status::OK();
@@ -379,6 +389,7 @@ class RealContext final : public Context {
     std::shared_ptr<RuntimeLease> runtime_;
     DeviceInfo info_;
     urma_context_t* native_ = nullptr;
+    uint32_t ctp_priority_ = 15;
 };
 
 class RealJfc final : public Jfc {
@@ -554,12 +565,14 @@ class RealLocalSegment final : public LocalSegment {
    public:
     RealLocalSegment(std::shared_ptr<RealContext> context,
                      urma_target_seg_t* native, uint64_t address,
-                     uint64_t length, SegmentDescriptor descriptor)
+                     uint64_t length, SegmentDescriptor descriptor,
+                     urma_token_id_t* token_id)
         : context_(std::move(context)),
           native_(native),
           address_(address),
           length_(length),
-          descriptor_(std::move(descriptor)) {}
+          descriptor_(std::move(descriptor)),
+          token_id_(token_id) {}
 
     ~RealLocalSegment() override { (void)close(); }
 
@@ -576,10 +589,19 @@ class RealLocalSegment final : public LocalSegment {
     }
 
     Status close() {
-        if (native_ == nullptr) return Status::OK();
-        const int rc = urma_unregister_seg(native_);
-        if (rc != URMA_SUCCESS) return nativeError("urma_unregister_seg", rc);
-        native_ = nullptr;
+        if (native_ != nullptr) {
+            const int rc = urma_unregister_seg(native_);
+            if (rc != URMA_SUCCESS) {
+                return nativeError("urma_unregister_seg", rc);
+            }
+            native_ = nullptr;
+        }
+
+        if (token_id_ != nullptr) {
+            (void)urma_free_token_id(token_id_);
+            token_id_ = nullptr;
+        }
+
         return Status::OK();
     }
 
@@ -589,6 +611,7 @@ class RealLocalSegment final : public LocalSegment {
     uint64_t address_ = 0;
     uint64_t length_ = 0;
     SegmentDescriptor descriptor_;
+    urma_token_id_t* token_id_ = nullptr;
 };
 
 class RealRemoteSegment final : public RemoteSegment {
@@ -645,7 +668,12 @@ class RealJetty final : public Jetty {
         config.flag.bs.share_jfr = 1;
         config.jfs_cfg.depth = options.depth;
         config.jfs_cfg.trans_mode = URMA_TM_RC;
-        config.jfs_cfg.priority = options.priority;
+        config.jfs_cfg.priority =
+            context_->isBondingDevice() ? context_->ctpPriority()
+                                        : options.priority;
+        if (context_->isBondingDevice()) {
+            config.jfs_cfg.flag.bs.multi_path = 1;
+        }
         config.jfs_cfg.max_sge = options.max_sge;
         config.jfs_cfg.max_rsge = options.max_sge;
         config.jfs_cfg.rnr_retry = options.rnr_retry;
@@ -1109,6 +1137,48 @@ class RealUrmaAdapter final : public UrmaAdapter {
                 return nativePointerError("urma_create_context");
             }
 
+            if (requested.native_device_name.rfind("bonding", 0) == 0) {
+                bondp_set_bonding_mode_in_t bonding_mode{};
+                bonding_mode.bonding_mode = BONDP_BONDING_MODE_STANDALONE;
+                bonding_mode.bonding_level = BONDP_BONDING_LEVEL_IODIE;
+
+                urma_user_ctl_in_t ctl_in{};
+                ctl_in.addr = reinterpret_cast<uint64_t>(&bonding_mode);
+                ctl_in.len = sizeof(bonding_mode);
+                ctl_in.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
+
+                urma_user_ctl_out_t ctl_out{};
+                const int ctl_rc =
+                    urma_user_ctl(native_context, &ctl_in, &ctl_out);
+                if (ctl_rc != URMA_SUCCESS) {
+                    (void)urma_delete_context(native_context);
+                    return nativeError(
+                        "urma_user_ctl(SET_BONDING_MODE)", ctl_rc);
+                }
+            }
+
+            uint32_t ctp_priority = 15;
+            bool ctp_priority_found = false;
+            for (uint32_t priority_index = 0;
+                 priority_index < URMA_MAX_PRIORITY_CNT; ++priority_index) {
+                const auto& priority_info =
+                    attributes.dev_cap.priority_info[priority_index];
+                if (priority_info.tp_type.bs.ctp != 0) {
+                    ctp_priority = priority_index;
+                    LOG(INFO) << "UB_PRIO_SELECTED priority=" << ctp_priority
+                              << " SL=" << static_cast<int>(priority_info.SL);
+                    ctp_priority_found = true;
+                    break;
+                }
+            }
+
+            if (requested.native_device_name.rfind("bonding", 0) == 0 &&
+                !ctp_priority_found) {
+                (void)urma_delete_context(native_context);
+                return Status::InvalidArgument(
+                    "bonding URMA device has no CTP priority");
+            }
+
             DeviceInfo current = requested;
             current.native_device_path =
                 boundedString(native_device->path, URMA_MAX_PATH);
@@ -1119,8 +1189,9 @@ class RealUrmaAdapter final : public UrmaAdapter {
                                         ":eid" +
                                         std::to_string(current.eid_index);
             }
-            output = std::make_shared<RealContext>(
-                std::move(runtime), std::move(current), native_context);
+            output = std::make_shared<RealContext>(std::move(runtime),
+                                                   std::move(current),
+                                                   native_context, ctp_priority);
             return Status::OK();
         }
         return Status::DeviceNotFound("URMA device not found: " +
@@ -1191,20 +1262,29 @@ class RealUrmaAdapter final : public UrmaAdapter {
             return Status::InvalidArgument("invalid local segment range");
         }
 
+        urma_token_id_t* token_id =
+            urma_alloc_token_id(real_context->native());
+        if (token_id == nullptr) {
+            return nativePointerError("urma_alloc_token_id");
+        }
+
         urma_reg_seg_flag_t flags{};
         flags.bs.token_policy = URMA_TOKEN_NONE;
         flags.bs.cacheable =
             options.cacheable ? URMA_CACHEABLE : URMA_NON_CACHEABLE;
         flags.bs.access = nativeAccess(options.access);
+        flags.bs.token_id_valid = 1;
 
         urma_seg_cfg_t config{};
         config.va = address;
         config.len = length;
+        config.token_id = token_id;
         config.token_value.token = options.token;
         config.flag = flags;
         urma_target_seg_t* native_segment =
             urma_register_seg(real_context->native(), &config);
         if (native_segment == nullptr) {
+            (void)urma_free_token_id(token_id);
             return nativePointerError("urma_register_seg");
         }
 
@@ -1214,13 +1294,17 @@ class RealUrmaAdapter final : public UrmaAdapter {
         wire_descriptor.attr = native_segment->seg.attr;
         wire_descriptor.token_id = native_segment->seg.token_id;
 
+        LOG(INFO) << "UB_SEG_TOKEN_ID token_id_valid=1"
+                  << " va=0x" << std::hex << address << " len=0x" << length
+                  << std::dec;
+
         SegmentDescriptor descriptor;
         descriptor.urma_api_version = URMA_API_VERSION;
         descriptor.urma_abi_size = sizeof(urma_seg_t);
         descriptor.hex = encodeHex(&wire_descriptor, sizeof(wire_descriptor));
         output = std::make_shared<RealLocalSegment>(
             std::move(real_context), native_segment, address, length,
-            std::move(descriptor));
+            std::move(descriptor), token_id);
         return Status::OK();
     }
 
