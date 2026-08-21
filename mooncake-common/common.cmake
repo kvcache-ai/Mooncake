@@ -667,5 +667,13 @@ if(NOT TARGET gflags::gflags)
   endforeach()
 endif()
 
+set(GH_MIRROR "")
+if(DEFINED ENV{ASCEND_GITHUB_MIRROR_URLS})
+  set(GH_MIRROR $ENV{ASCEND_GITHUB_MIRROR_URLS})
+endif()
+if(GH_MIRROR)
+  message(STATUS "Using Github mirror: ${GH_MIRROR}")
+endif()
+
 include(${CMAKE_CURRENT_LIST_DIR}/FindYLT.cmake)
 add_compile_definitions(YLT_ENABLE_IBV)
