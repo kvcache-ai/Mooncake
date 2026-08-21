@@ -16,6 +16,7 @@
 #include "tent/common/status.h"
 
 #include <bits/stdint-uintn.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <numa.h>
 #include <glog/logging.h>
@@ -56,15 +57,28 @@ Status CudaPlatform::free(void* ptr, size_t size) {
 }
 
 Status CudaPlatform::copy(void* dst, void* src, size_t length) {
-    // Use cudaMemcpyAsync with a non-blocking stream instead of cudaMemcpy(),
-    // as the latter relies on the legacy default stream and can introduce
-    // unintended synchronization or even deadlocks in downstream
-    // components (e.g. mooncake-pg).
+    // Use a non-blocking stream to avoid unintended synchronization
+    // or even deadlocks in downstream components (e.g. mooncake-pg).
     CUDAStreamHandle stream;
     CHECK_STATUS(getStreamFromPool(stream));
+
+#ifdef USE_CU_MEMCPY
+    // Ensure CUDA Driver API is initialized (idempotent)
+    static CUresult init_result = cuInit(0);
+    if (init_result != CUDA_SUCCESS) {
+        const char* error_str = nullptr;
+        cuGetErrorString(init_result, &error_str);
+        return Status::InternalError(
+            std::string("CUDA Driver API init failed: ") + error_str);
+    }
+    CHECK_CU(cuMemcpyAsync((CUdeviceptr)dst, (CUdeviceptr)src, length,
+                           (CUstream)stream.get()));
+    CHECK_CU(cuStreamSynchronize((CUstream)stream.get()));
+#else  // Original implementation using cudaMemcpyAsync
     CHECK_CUDA(
         cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
     CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+#endif
     return Status::OK();
 }
 }  // namespace tent

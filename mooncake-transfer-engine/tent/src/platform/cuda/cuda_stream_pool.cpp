@@ -14,6 +14,10 @@
 
 #include "tent/platform/cuda.h"
 
+#ifdef USE_CU_MEMCPY
+#include <cuda.h>
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -67,6 +71,29 @@ Status CUDAStreamPool::DevicePool::acquire(cudaStream_t& outStream) {
 
     // Lazy creation: avoid holding the lock so we don't block other threads
     // checking out streams.
+#ifdef USE_CU_MEMCPY
+    // Use CUDA Driver API to avoid runtime lock contention with PyTorch
+    CUcontext currentCtx = nullptr;
+    CUdevice currentDevice = 0;
+    CHECK_CU(cuCtxGetCurrent(&currentCtx));
+    if (currentCtx) {
+        CHECK_CU(cuCtxGetDevice(&currentDevice));
+    }
+
+    // Set the device for stream creation
+    CUdevice targetDevice;
+    CHECK_CU(cuDeviceGet(&targetDevice, deviceId_));
+    CUcontext targetCtx = nullptr;
+    CHECK_CU(cuDevicePrimaryCtxRetain(&targetCtx, targetDevice));
+    CHECK_CU(cuCtxSetCurrent(targetCtx));
+
+    CHECK_CU(cuStreamCreate(&outStream, CU_STREAM_NON_BLOCKING));
+
+    // Restore previous context
+    if (currentCtx) {
+        CHECK_CU(cuCtxSetCurrent(currentCtx));
+    }
+#else
     int currentDevice;
     CHECK_CUDA(cudaGetDevice(&currentDevice));
 
@@ -80,6 +107,7 @@ Status CUDAStreamPool::DevicePool::acquire(cudaStream_t& outStream) {
     if (currentDevice != deviceId_) {
         CHECK_CUDA(cudaSetDevice(currentDevice));
     }
+#endif
 
     return Status::OK();
 }
@@ -91,9 +119,23 @@ void CUDAStreamPool::DevicePool::release(cudaStream_t stream) {
 
 Status CUDAStreamPool::acquire(CUDAStreamHandle& outHandle, int deviceId) {
     if (deviceId == kCurrentDevice) {
+#ifdef USE_CU_MEMCPY
+        CUcontext currentCtx = nullptr;
+        CUresult result = cuCtxGetCurrent(&currentCtx);
+        if (result != CUDA_SUCCESS || !currentCtx) {
+            return Status::InternalError("No CUDA context current");
+        }
+        CUdevice device;
+        result = cuCtxGetDevice(&device);
+        if (result != CUDA_SUCCESS) {
+            return Status::InternalError("Failed to get current device ID");
+        }
+        deviceId = static_cast<int>(device);
+#else
         if (cudaGetDevice(&deviceId) != cudaSuccess) {
             return Status::InternalError("Failed to get current device ID");
         }
+#endif
     } else if (deviceId < 0) {
         return Status::InternalError("Invalid device ID");
     }
@@ -138,8 +180,13 @@ CUDAStreamPool::DevicePool* CUDAStreamPool::getDevicePool(int deviceId) {
 
     // consistency check on deviceId
     int actualDeviceCount = 0;
+#ifdef USE_CU_MEMCPY
+    CUresult result = cuDeviceGetCount(&actualDeviceCount);
+    if (result != CUDA_SUCCESS || deviceId >= actualDeviceCount) {
+#else
     if (cudaGetDeviceCount(&actualDeviceCount) != cudaSuccess ||
         deviceId >= actualDeviceCount) {
+#endif
         LOG(ERROR) << "Invalid cuda device id " << deviceId;
         return nullptr;
     }
