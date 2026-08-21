@@ -295,7 +295,7 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         return true;
     };
 
-    const size_t routed = service_->getMetadataShardIndex(tenant, action.key);
+    const size_t routed = service_->getShardIndex(tenant, action.key);
     if (update(routed)) {
         return *this;
     }
