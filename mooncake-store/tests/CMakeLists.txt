@@ -196,6 +196,12 @@ add_store_test(health_check_test health_check_test.cpp)
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)
 add_store_test(mmap_arena_test mmap_arena_test.cpp)
 add_store_test(mmap_arena_fallback_test mmap_arena_fallback_test.cpp)
+# mmap_arena_fallback_test exercises a large slice of utils.cpp/mmap_arena.cpp,
+# so under --coverage builds it produces heavy .gcda merge traffic at exit.
+# Running it in parallel with the rest of the suite intermittently trips
+# libgcov's file locking on CI: every gtest case passes yet the process exits
+# non-zero. Serialize it as mitigation; see the PR for the full analysis.
+set_tests_properties(mmap_arena_fallback_test PROPERTIES RUN_SERIAL TRUE)
 add_store_test(object_data_type_test object_data_type_test.cpp)
 add_subdirectory(e2e)
 
