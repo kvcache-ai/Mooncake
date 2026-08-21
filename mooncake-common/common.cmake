@@ -666,5 +666,13 @@ if(NOT TARGET gflags::gflags)
     endif()
   endforeach()
 endif()
-find_package(yalantinglibs CONFIG REQUIRED)
+if(SKBUILD AND EXISTS "${CMAKE_SOURCE_DIR}/extern/yalantinglibs/CMakeLists.txt")
+  set(YLT_ENABLE_IBV
+      ON
+      CACHE BOOL "Enable yalantinglibs ibverbs support" FORCE)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/extern/yalantinglibs"
+                   "${CMAKE_BINARY_DIR}/_deps/yalantinglibs" EXCLUDE_FROM_ALL)
+else()
+  find_package(yalantinglibs CONFIG REQUIRED)
+endif()
 add_compile_definitions(YLT_ENABLE_IBV)
