@@ -96,9 +96,7 @@ class KVCacheTopology:
     def world_size(self) -> int:
         return len(self.participants)
 
-    def participant(
-        self, participant_id: ParticipantId
-    ) -> KVCacheTopologyParticipant:
+    def participant(self, participant_id: ParticipantId) -> KVCacheTopologyParticipant:
         for participant in self.participants:
             if participant.participant_id == participant_id:
                 return participant

@@ -207,13 +207,9 @@ def _plan(
 
 def test_placement_part_and_binding_round_trip_are_canonical() -> None:
     placement = _placement("source", ((0, 1), (2, 3)), 2)
-    binding = _binding(
-        placement, "source-p0-t0", base_address=1_000_000_000
-    )
+    binding = _binding(placement, "source-p0-t0", base_address=1_000_000_000)
     restored = kv_cache_placement_from_json(kv_cache_placement_to_json(placement))
-    restored_part = kv_cache_part_from_json(
-        kv_cache_part_to_json(placement.parts[0])
-    )
+    restored_part = kv_cache_part_from_json(kv_cache_part_to_json(placement.parts[0]))
     restored_binding = kv_cache_runtime_binding_from_json(
         kv_cache_runtime_binding_to_json(binding)
     )
@@ -270,12 +266,8 @@ def test_prepare_attests_both_complete_global_placements() -> None:
     full_plan = _plan(source, target, "target-p0-t0")
     source_id = full_plan.source_participant_ids[0]
     plan = full_plan.for_source(source_id)
-    source_binding = _binding(
-        source, source_id, base_address=1_000_000_000
-    )
-    target_binding = _binding(
-        target, "target-p0-t0", base_address=2_000_000_000
-    )
+    source_binding = _binding(source, source_id, base_address=1_000_000_000)
+    target_binding = _binding(target, "target-p0-t0", base_address=2_000_000_000)
 
     prepared = prepare_kv_cache_transfer(plan, source_binding, target_binding)
 
@@ -386,7 +378,9 @@ def test_complete_placement_rejects_missing_participant_and_coverage() -> None:
 def test_binding_requires_exact_participant_membership_and_global_digest() -> None:
     placement = _placement("source", ((0,),), 2)
     bindings = tuple(
-        _binding(placement, part.participant_id, base_address=1_000_000_000 + i * 10_000_000)
+        _binding(
+            placement, part.participant_id, base_address=1_000_000_000 + i * 10_000_000
+        )
         for i, part in enumerate(placement.parts)
     )
     validate_runtime_bindings(placement, bindings)
@@ -403,9 +397,7 @@ def test_binding_requires_exact_participant_membership_and_global_digest() -> No
 
 def test_singleton_stride_is_normalized_before_binding_validation() -> None:
     placement = _placement("source", ((0,),), 4)
-    binding = _binding(
-        placement, "source-p0-t0", base_address=1_000_000_000
-    )
+    binding = _binding(placement, "source-p0-t0", base_address=1_000_000_000)
     first = binding.buffers[0]
     fragment = first.fragment
     assert fragment.local_shape[1] == 1
@@ -430,9 +422,7 @@ def test_logical_plan_round_trip_preserves_both_global_placements() -> None:
         ParticipantId("source-p0-t0")
     )
 
-    restored = kv_cache_logical_plan_from_json(
-        kv_cache_logical_plan_to_json(plan)
-    )
+    restored = kv_cache_logical_plan_from_json(kv_cache_logical_plan_to_json(plan))
 
     assert restored == plan
     assert restored.source_placement.placement_id == source.placement_id

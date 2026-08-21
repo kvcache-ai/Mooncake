@@ -4,6 +4,9 @@ import importlib.util
 
 import mooncake.reshard.weight as model_weight
 import mooncake.reshard.weight._planner.contracts as planner_contracts
+from mooncake.reshard.contracts import (
+    RuntimeBindingFragment as RuntimeBindingFragmentContract,
+)
 from mooncake.reshard.weight.binding import (
     validate_runtime_binding,
     validate_runtime_bindings,
@@ -79,8 +82,5 @@ def test_logical_planner_does_not_ship_runtime_execution_contracts() -> None:
     assert not hasattr(planner_contracts, "BoundWeightFragment")
     assert not hasattr(planner_contracts, "TransferPlan")
     assert (
-        importlib.util.find_spec(
-            "mooncake.reshard.weight._planner.attestation"
-        )
-        is None
+        importlib.util.find_spec("mooncake.reshard.weight._planner.attestation") is None
     )

@@ -37,12 +37,11 @@ __all__ = [
     "RevisionId",
     "RuntimeBindingFragment",
     "RuntimeBindingManifest",
-    "RuntimeBindingFragment",
     "RuntimeFragmentId",
     "RuntimeInstanceId",
     "StoredFragmentId",
+    "StoredResourceManifest",
     "TensorId",
     "TopologyId",
-    "StoredResourceManifest",
     "validate_resource_binding_identity",
 ]

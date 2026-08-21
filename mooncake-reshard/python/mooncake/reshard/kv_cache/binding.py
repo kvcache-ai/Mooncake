@@ -32,9 +32,7 @@ def validate_runtime_binding(
         for layer_id in part.layer_ids
         for component in KVCacheComponent
     }
-    actual_keys = {
-        (item.global_layer_id, item.component) for item in binding.buffers
-    }
+    actual_keys = {(item.global_layer_id, item.component) for item in binding.buffers}
     if expected_keys != actual_keys:
         missing = sorted(
             (layer, component.value) for layer, component in expected_keys - actual_keys

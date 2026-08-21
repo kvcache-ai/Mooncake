@@ -5,7 +5,6 @@ from typing import Protocol
 
 import mooncake.reshard.weight.placement as weight_placement
 import pytest
-from mooncake import reshard
 from mooncake.reshard import weight
 from mooncake.reshard.contracts import (
     PlacementManifest,
@@ -23,6 +22,8 @@ from weight_manifest.helpers import (
     binding_manifest,
     placement_manifest,
 )
+
+from mooncake import reshard
 
 
 def test_reshard_public_api_is_resource_neutral():

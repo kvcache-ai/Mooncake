@@ -108,9 +108,7 @@ def placement_fragment_id(
     return PlacementFragmentId(f"sha256:{hashlib.sha256(encoded).hexdigest()}")
 
 
-def canonical_strides_bytes(
-    shape: tuple[int, ...], itemsize: int
-) -> tuple[int, ...]:
+def canonical_strides_bytes(shape: tuple[int, ...], itemsize: int) -> tuple[int, ...]:
     strides: list[int] = []
     running = itemsize
     for extent in reversed(shape):
@@ -125,9 +123,7 @@ def require_nonempty_string(value: object, name: str) -> str:
     return value
 
 
-def require_integer(
-    value: object, name: str, *, minimum: int = 0
-) -> int:
+def require_integer(value: object, name: str, *, minimum: int = 0) -> int:
     if type(value) is not int:
         raise ValueError(f"{name} must be an integer")
     if value < minimum:
@@ -143,9 +139,7 @@ def require_integer_tuple(
     *,
     minimum: int = 0,
 ) -> tuple[int, ...]:
-    if isinstance(values, (str, bytes, bytearray)) or not isinstance(
-        values, Sequence
-    ):
+    if isinstance(values, (str, bytes, bytearray)) or not isinstance(values, Sequence):
         raise ValueError(f"{name} must contain integers")  # noqa: TRY004
     items = cast(Sequence[object], values)
     return tuple(

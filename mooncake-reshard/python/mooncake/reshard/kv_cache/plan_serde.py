@@ -17,12 +17,8 @@ def kv_cache_logical_plan_to_json(plan: KVCacheLogicalTransferPlan) -> str:
         raise ValueError("plan must be a KVCacheLogicalTransferPlan")  # noqa: TRY004
     return json.dumps(
         {
-            "source_placement_json": kv_cache_placement_to_json(
-                plan.source_placement
-            ),
-            "target_placement_json": kv_cache_placement_to_json(
-                plan.target_placement
-            ),
+            "source_placement_json": kv_cache_placement_to_json(plan.source_placement),
+            "target_placement_json": kv_cache_placement_to_json(plan.target_placement),
             "target_participant_id": plan.target_participant_id,
             "edges": [_edge_to_wire(edge) for edge in plan.edges],
             "expected_writer_ids": list(plan.expected_writer_ids),
@@ -59,9 +55,7 @@ def kv_cache_logical_plan_from_json(value: str) -> KVCacheLogicalTransferPlan:
         ),
         expected_writer_ids=tuple(
             ParticipantId(_string(item, "expected_writer_id"))
-            for item in _sequence(
-                payload["expected_writer_ids"], "expected_writer_ids"
-            )
+            for item in _sequence(payload["expected_writer_ids"], "expected_writer_ids")
         ),
     )
 
@@ -131,16 +125,10 @@ def _edge_from_wire(value: object) -> KVCacheTransferEdge:
         ),
         global_layer_id=_integer(edge["global_layer_id"], "global_layer_id"),
         component=KVCacheComponent(_string(edge["component"], "component")),
-        global_head_start=_integer(
-            edge["global_head_start"], "global_head_start"
-        ),
+        global_head_start=_integer(edge["global_head_start"], "global_head_start"),
         head_count=_integer(edge["head_count"], "head_count"),
-        source_head_offset=_integer(
-            edge["source_head_offset"], "source_head_offset"
-        ),
-        target_head_offset=_integer(
-            edge["target_head_offset"], "target_head_offset"
-        ),
+        source_head_offset=_integer(edge["source_head_offset"], "source_head_offset"),
+        target_head_offset=_integer(edge["target_head_offset"], "target_head_offset"),
         head_dim=_integer(edge["head_dim"], "head_dim"),
         itemsize=_integer(edge["itemsize"], "itemsize"),
     )

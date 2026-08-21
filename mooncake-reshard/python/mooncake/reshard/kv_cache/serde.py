@@ -140,9 +140,7 @@ def kv_cache_runtime_binding_from_json(
         resource_id=ResourceId(_string(payload["resource_id"], "resource_id")),
         placement_id=PlacementId(_string(payload["placement_id"], "placement_id")),
         placement_digest=_string(payload["placement_digest"], "placement_digest"),
-        instance_id=RuntimeInstanceId(
-            _string(payload["instance_id"], "instance_id")
-        ),
+        instance_id=RuntimeInstanceId(_string(payload["instance_id"], "instance_id")),
         generation=_integer(payload["generation"], "generation"),
         lease_id=LeaseId(_string(payload["lease_id"], "lease_id")),
         revision=RevisionId(_string(payload["revision"], "revision")),
@@ -213,9 +211,7 @@ def _part_from_wire(value: object) -> KVCachePlacementPart:
             _string(part["placement_set_id"], "placement_set_id")
         ),
         topology_id=TopologyId(_string(part["topology_id"], "topology_id")),
-        participant_id=ParticipantId(
-            _string(part["participant_id"], "participant_id")
-        ),
+        participant_id=ParticipantId(_string(part["participant_id"], "participant_id")),
         rank=_rank_from_wire(part["rank"]),
         descriptor=_descriptor_from_wire(part["descriptor"]),
         layer_ids=_integer_tuple(part["layer_ids"], "layer_ids"),
@@ -308,9 +304,7 @@ def _descriptor_from_wire(value: object) -> KVCacheDescriptor:
         total_kv_heads=_integer(
             descriptor["total_kv_heads"], "total_kv_heads", minimum=1
         ),
-        key_head_dim=_integer(
-            descriptor["key_head_dim"], "key_head_dim", minimum=1
-        ),
+        key_head_dim=_integer(descriptor["key_head_dim"], "key_head_dim", minimum=1),
         value_head_dim=_integer(
             descriptor["value_head_dim"], "value_head_dim", minimum=1
         ),
@@ -367,15 +361,11 @@ def _buffer_from_wire(value: object) -> KVCacheBufferBinding:
         "KV-cache runtime buffer",
     )
     return KVCacheBufferBinding(
-        global_layer_id=_integer(
-            binding["global_layer_id"], "global_layer_id"
-        ),
+        global_layer_id=_integer(binding["global_layer_id"], "global_layer_id"),
         component=KVCacheComponent(_string(binding["component"], "component")),
         fragment=KVCacheRuntimeBuffer(
             placement_fragment_id=PlacementFragmentId(
-                _string(
-                    fragment["placement_fragment_id"], "placement_fragment_id"
-                )
+                _string(fragment["placement_fragment_id"], "placement_fragment_id")
             ),
             fragment_id=RuntimeFragmentId(
                 _string(fragment["fragment_id"], "fragment_id")
@@ -389,9 +379,7 @@ def _buffer_from_wire(value: object) -> KVCacheBufferBinding:
             local_shape=_integer_tuple(
                 fragment["local_shape"], "local_shape", minimum=1
             ),
-            strides_bytes=_integer_tuple(
-                fragment["strides_bytes"], "strides_bytes"
-            ),
+            strides_bytes=_integer_tuple(fragment["strides_bytes"], "strides_bytes"),
             storage_address=_integer(
                 fragment["storage_address"], "storage_address", minimum=1
             ),
@@ -490,12 +478,9 @@ def _integer(value: object, label: str, *, minimum: int = 0) -> int:
     return value
 
 
-def _integer_tuple(
-    value: object, label: str, *, minimum: int = 0
-) -> tuple[int, ...]:
+def _integer_tuple(value: object, label: str, *, minimum: int = 0) -> tuple[int, ...]:
     return tuple(
-        _integer(item, label, minimum=minimum)
-        for item in _sequence(value, label)
+        _integer(item, label, minimum=minimum) for item in _sequence(value, label)
     )
 
 
