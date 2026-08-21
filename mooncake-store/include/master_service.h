@@ -95,6 +95,11 @@ class MasterServiceHATest;
 // invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
 // ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
 class MasterServiceProcessingKeyDoubleEraseTest;
+// Friended so the LOCAL_DISK deregistration interleaving tests can run the
+// two halves of UnmountLocalDiskSegment (deregistration, replica sweep)
+// with a competing mount + register serialized between them, pinning the
+// interleaving instead of hoping a thread scheduler produces it.
+class LocalDiskUnmountInterleavingTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -132,6 +137,7 @@ class MasterService {
     friend class test::MasterScenario;
     // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
     friend class test::MasterServiceProcessingKeyDoubleEraseTest;
+    friend class test::LocalDiskUnmountInterleavingTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
@@ -713,6 +719,30 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Deregisters a client's file storage segment from the master. This
+     * function is idempotent.
+     *
+     * Drops the client's LOCAL_DISK registration and then its LOCAL_DISK
+     * replicas -- the outcome the client-expiry branch of ClientMonitorFunc
+     * reaches after one client_ttl. Exposing it as an operation lets a store
+     * that is shutting down deregister while it can still serve, instead of
+     * leaving the master advertising it as an owner until the TTL elapses.
+     * Object metadata whose last replica was on that disk is erased, exactly
+     * as on expiry; a store that comes back re-adopts its files through the
+     * MountLocalDiskSegment/NotifyOffloadSuccess path, which recreates them.
+     *
+     * The replica sweep targets exactly this owner (see
+     * ClearLocalDiskHandlesOwnedBy), and the deregistration runs under the
+     * exclusive snapshot_mutex_ so no registration admitted against the old
+     * one can land after the sweep: NotifyOffloadSuccess checks the
+     * registration and writes the replica inside one shared-lock section,
+     * which therefore falls entirely before the deregistration (registered,
+     * then swept) or entirely after (refused with SEGMENT_NOT_FOUND).
+     */
+    auto UnmountLocalDiskSegment(const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
@@ -948,6 +978,16 @@ class MasterService {
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+    // Clear completed LOCAL_DISK replicas owned by exactly this client, in
+    // all shards. Owner-targeted on purpose: a liveness-complement sweep
+    // classifies by absence from a point-in-time set, so an owner that
+    // mounts and registers between taking that set and the sweep reaching
+    // its shard would be swept as stale. A predicate on the owner id cannot
+    // misclassify a concurrent mount, whatever the interleaving.
+    void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
+    // Shard walk shared by the two sweeps above; removes completed replicas
+    // matching is_stale, erasing a key when no valid replica remains.
+    void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -1861,6 +1901,9 @@ class MasterService {
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const;
+    StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& is_stale) const;
     tl::expected<void, ErrorCode> PersistStaleHandleCleanupForHA(
         const std::string& why, const TenantId& tenant_id,
         const std::string& key, ObjectMetadata& metadata,
@@ -1888,6 +1931,22 @@ class MasterService {
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
         MetadataShardAccessorRW* shard = nullptr);
+    // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
+    // accounting (quota release, promotion-task cancellation, disk-replica
+    // shard bookkeeping) instead of duplicating it.
+    bool CleanupStaleHandles(
+        TenantState& tenant_state, ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& is_stale,
+        MetadataShardAccessorRW* shard = nullptr);
+
+    // True when client_id currently has a LOCAL_DISK registration.
+    // Momentarily takes the LocalSsdManager registry lock, so callers must not
+    // hold it; call before taking a metadata shard lock. Callers that need the
+    // answer to stay true across a later metadata write must hold
+    // snapshot_mutex_ (shared) across both -- UnmountLocalDiskSegment
+    // deregisters the client under the exclusive lock, so the check and the
+    // write cannot straddle a deregistration.
+    bool HasMountedLocalDiskSegment(const UUID& client_id);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
