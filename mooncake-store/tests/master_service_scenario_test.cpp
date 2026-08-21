@@ -1,4 +1,4 @@
-#include "master_scenario.h"
+#include "master_service/dsl/scenario.h"
 
 #include <array>
 
