@@ -72,6 +72,22 @@ bool SegmentPoolView::HasKind(RegionKind kind) const {
         [kind](const auto& entry) { return entry.second.kind == kind; });
 }
 
+ErrorCode SegmentPoolView::GetClientSegments(
+    const UUID& client_id, std::vector<Segment>& segments) const {
+    auto client = segment_pool_->client_segments_.find(client_id);
+    if (client == segment_pool_->client_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    segments.clear();
+    for (const auto& id : client->second) {
+        auto mounted = segment_pool_->mounted_regions_.find(id);
+        if (mounted != segment_pool_->mounted_regions_.end()) {
+            segments.push_back(mounted->second.segment);
+        }
+    }
+    return ErrorCode::OK;
+}
+
 void SegmentPoolView::GetMountedRegions(
     std::vector<std::pair<UUID, MountedRegion>>& regions) const {
     regions.clear();
@@ -90,6 +106,90 @@ void SegmentPoolView::GetActiveGroupNames(
     for (const auto* group : groups) {
         names.push_back(group->name);
     }
+}
+
+void SegmentPoolView::GetAllSegmentNames(
+    std::vector<std::string>& names) const {
+    names.clear();
+    names.reserve(segment_pool_->region_ids_by_name_.size());
+    for (const auto& [name, _] : segment_pool_->region_ids_by_name_) {
+        names.push_back(name);
+    }
+}
+
+ErrorCode SegmentPoolView::QuerySegments(std::string_view name, size_t& used,
+                                         size_t& capacity) const {
+    auto* group = segment_pool_->placement_index_.GetView().Find(name);
+    if (!group) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    used = 0;
+    capacity = 0;
+    for (const auto* target : group->targets) {
+        used += target->Used();
+        capacity += target->Capacity();
+    }
+    return capacity == 0 ? ErrorCode::SEGMENT_NOT_FOUND : ErrorCode::OK;
+}
+
+void SegmentPoolView::GetUnreadyRegions(
+    std::vector<std::pair<UUID, MountedRegion>>& regions) const {
+    regions.clear();
+    for (const auto& [id, mounted] : segment_pool_->mounted_regions_) {
+        if (mounted.status != SegmentStatus::OK) {
+            regions.emplace_back(id, mounted);
+        }
+    }
+}
+
+ErrorCode SegmentPoolView::GetClientIdBySegmentName(std::string_view name,
+                                                    UUID& client_id) const {
+    auto owner = segment_pool_->client_by_name_.find(name);
+    if (owner == segment_pool_->client_by_name_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    client_id = owner->second;
+    return ErrorCode::OK;
+}
+
+bool SegmentPoolView::ExistsSegmentName(std::string_view name) const {
+    return segment_pool_->region_ids_by_name_.contains(name);
+}
+
+bool SegmentPoolView::IsSegmentAllocatable(std::string_view name) const {
+    return segment_pool_->placement_index_.GetView().Find(name) != nullptr;
+}
+
+ErrorCode SegmentPoolView::GetSegmentStatusByName(std::string_view name,
+                                                  SegmentStatus& status) const {
+    auto group = segment_pool_->region_ids_by_name_.find(name);
+    if (group == segment_pool_->region_ids_by_name_.end() ||
+        group->second.empty()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+
+    status = SegmentStatus::UNDEFINED;
+    for (const auto& id : group->second) {
+        auto mounted = segment_pool_->mounted_regions_.find(id);
+        if (mounted == segment_pool_->mounted_regions_.end()) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        if (SegmentStatusAvailabilityRank(mounted->second.status) <
+            SegmentStatusAvailabilityRank(status)) {
+            status = mounted->second.status;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode SegmentPoolView::GetSegmentStatusById(const UUID& id,
+                                                SegmentStatus& status) const {
+    auto mounted = segment_pool_->mounted_regions_.find(id);
+    if (mounted == segment_pool_->mounted_regions_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    status = mounted->second.status;
+    return ErrorCode::OK;
 }
 
 void SegmentPoolView::GetClientRegions(

@@ -16,7 +16,6 @@
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "segment/pool.h"
-#include "segment/pool_access.h"
 #include "segment/pool_view.h"
 #include "serialize/serializer.h"
 #include "ha/snapshot/segment_pool_snapshot_codec.h"
@@ -518,31 +517,25 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         // If a future change makes the serializer carry richer per-segment
         // data, the predicate below should be replaced with explicit branches
         // for each segment type.
-        std::vector<std::pair<Segment, UUID>> all_segments;
-        {
-            auto segment_access = segment_pool.getSegmentPoolAccess();
-            segment_access.GetAllSegments(all_segments);
-        }
         SegmentPoolView view = segment_pool.getView();
-        for (const auto& [seg, client_id] : all_segments) {
-            MountedRegion mounted;
-            if (view.GetMountedRegion(seg.id, mounted) != ErrorCode::OK) {
-                continue;
-            }
-            if (!view.GetResourceView(seg.id)) {
+        std::vector<std::pair<UUID, MountedRegion>> all_segments;
+        view.GetMountedRegions(all_segments);
+        for (const auto& [segment_id, mounted] : all_segments) {
+            const auto& segment = mounted.segment;
+            if (!view.GetResourceView(segment_id)) {
                 // Defensive: a catalog entry without a driver resource should
                 // not exist. Log and skip rather than emitting a half-populated
                 // StandbySegmentInfo.
                 LOG(WARNING)
                     << "snapshot contains MountedRegion without allocator; "
-                    << "skipping segment_name=" << seg.name
-                    << " segment_id=" << seg.id;
+                    << "skipping segment_name=" << segment.name
+                    << " segment_id=" << segment.id;
                 continue;
             }
             StandbySegmentInfo info;
-            info.segment_name = seg.name;
-            info.transport_endpoint = seg.te_endpoint;
-            info.capacity = seg.size;
+            info.segment_name = segment.name;
+            info.transport_endpoint = segment.te_endpoint;
+            info.capacity = segment.size;
             info.is_memory_segment = true;
             // file_path stays empty for memory segments by contract.
             snapshot.segments.push_back(std::move(info));

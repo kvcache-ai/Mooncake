@@ -78,22 +78,10 @@ class ScopedSegmentPoolAccess final {
 
     ErrorCode GetClientSegments(const UUID& client_id,
                                 std::vector<Segment>& segments) const;
-    ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
-    ErrorCode GetAllSegments(
-        std::vector<std::pair<Segment, UUID>>& all_segments);
-    ErrorCode GetAllSegmentNames(std::vector<std::string>& all_segment_names);
-    ErrorCode QuerySegments(const std::string& segment, size_t& used,
-                            size_t& capacity);
-    ErrorCode GetUnreadySegments(
-        std::vector<std::pair<Segment, UUID>>& unready_segments) const;
-    ErrorCode GetClientIdBySegmentName(const std::string& segment_name,
-                                       UUID& client_id) const;
     bool ExistsSegmentName(const std::string& segment_name) const;
     bool IsSegmentAllocatable(const std::string& segment_name) const;
     ErrorCode GetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus& status) const;
-    ErrorCode GetSegmentStatusById(const UUID& segment_id,
-                                   SegmentStatus& status) const;
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
 

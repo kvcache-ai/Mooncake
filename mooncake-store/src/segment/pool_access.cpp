@@ -52,24 +52,6 @@ bool SameSegment(const Segment& lhs, const Segment& rhs) {
            lhs.protocol == rhs.protocol && lhs.host_id == rhs.host_id;
 }
 
-int AvailabilityRank(SegmentStatus status) {
-    switch (status) {
-        case SegmentStatus::OK:
-            return 0;
-        case SegmentStatus::DRAINING:
-            return 1;
-        case SegmentStatus::DRAINED:
-            return 2;
-        case SegmentStatus::GRACEFULLY_UNMOUNTING:
-            return 3;
-        case SegmentStatus::UNMOUNTING:
-            return 4;
-        case SegmentStatus::UNDEFINED:
-            return 5;
-    }
-    return 5;
-}
-
 }  // namespace
 
 tl::expected<PreparedMountedRegion, ErrorCode>
@@ -378,74 +360,6 @@ ErrorCode ScopedSegmentPoolAccess::GetClientSegments(
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentPoolAccess::GetAllSegments(
-    std::vector<std::string>& all_segments) {
-    all_segments.clear();
-    const auto groups =
-        segment_pool_->placement_index_.GetView().active_groups();
-    all_segments.reserve(groups.size());
-    for (const auto* group : groups) {
-        all_segments.push_back(group->name);
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentPoolAccess::GetAllSegments(
-    std::vector<std::pair<Segment, UUID>>& all_segments) {
-    all_segments.clear();
-    for (const auto& [_, mounted] : segment_pool_->mounted_regions_) {
-        all_segments.emplace_back(mounted.segment, mounted.client_id);
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentPoolAccess::GetAllSegmentNames(
-    std::vector<std::string>& all_segment_names) {
-    all_segment_names.clear();
-    all_segment_names.reserve(segment_pool_->region_ids_by_name_.size());
-    for (const auto& [name, _] : segment_pool_->region_ids_by_name_) {
-        all_segment_names.push_back(name);
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentPoolAccess::QuerySegments(const std::string& name,
-                                                 size_t& used,
-                                                 size_t& capacity) {
-    auto* group = segment_pool_->placement_index_.GetView().Find(name);
-    if (!group) {
-        return ErrorCode::SEGMENT_NOT_FOUND;
-    }
-    used = 0;
-    capacity = 0;
-    for (const auto* target : group->targets) {
-        used += target->Used();
-        capacity += target->Capacity();
-    }
-    return capacity == 0 ? ErrorCode::SEGMENT_NOT_FOUND : ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentPoolAccess::GetUnreadySegments(
-    std::vector<std::pair<Segment, UUID>>& unready_segments) const {
-    unready_segments.clear();
-    for (const auto& [_, mounted] : segment_pool_->mounted_regions_) {
-        if (mounted.status != SegmentStatus::OK) {
-            unready_segments.emplace_back(mounted.segment, mounted.client_id);
-        }
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentPoolAccess::GetClientIdBySegmentName(
-    const std::string& segment_name, UUID& client_id) const {
-    auto owner = segment_pool_->client_by_name_.find(segment_name);
-    if (owner == segment_pool_->client_by_name_.end()) {
-        return ErrorCode::SEGMENT_NOT_FOUND;
-    }
-    client_id = owner->second;
-    return ErrorCode::OK;
-}
-
 bool ScopedSegmentPoolAccess::ExistsSegmentName(
     const std::string& segment_name) const {
     return segment_pool_->region_ids_by_name_.contains(segment_name);
@@ -471,21 +385,11 @@ ErrorCode ScopedSegmentPoolAccess::GetSegmentStatusByName(
         if (mounted == segment_pool_->mounted_regions_.end()) {
             return ErrorCode::INTERNAL_ERROR;
         }
-        if (AvailabilityRank(mounted->second.status) <
-            AvailabilityRank(status)) {
+        if (SegmentStatusAvailabilityRank(mounted->second.status) <
+            SegmentStatusAvailabilityRank(status)) {
             status = mounted->second.status;
         }
     }
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentPoolAccess::GetSegmentStatusById(
-    const UUID& segment_id, SegmentStatus& status) const {
-    auto mounted = segment_pool_->mounted_regions_.find(segment_id);
-    if (mounted == segment_pool_->mounted_regions_.end()) {
-        return ErrorCode::SEGMENT_NOT_FOUND;
-    }
-    status = mounted->second.status;
     return ErrorCode::OK;
 }
 

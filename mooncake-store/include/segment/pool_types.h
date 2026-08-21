@@ -21,6 +21,24 @@ enum class SegmentStatus {
     UNMOUNTING,
 };
 
+constexpr int SegmentStatusAvailabilityRank(SegmentStatus status) noexcept {
+    switch (status) {
+        case SegmentStatus::OK:
+            return 0;
+        case SegmentStatus::DRAINING:
+            return 1;
+        case SegmentStatus::DRAINED:
+            return 2;
+        case SegmentStatus::GRACEFULLY_UNMOUNTING:
+            return 3;
+        case SegmentStatus::UNMOUNTING:
+            return 4;
+        case SegmentStatus::UNDEFINED:
+            return 5;
+    }
+    return 5;
+}
+
 inline std::ostream& operator<<(std::ostream& os,
                                 const SegmentStatus& status) noexcept {
     static const std::unordered_map<SegmentStatus, std::string_view>

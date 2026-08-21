@@ -4,6 +4,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -40,9 +41,23 @@ class SegmentPoolView final {
         const UUID& segment_id) const;
     std::optional<BufferAllocatorType> GetMemoryAllocatorType() const;
     bool HasKind(RegionKind kind) const;
+    ErrorCode GetClientSegments(const UUID& client_id,
+                                std::vector<Segment>& segments) const;
     void GetMountedRegions(
         std::vector<std::pair<UUID, MountedRegion>>& regions) const;
     void GetActiveGroupNames(std::vector<std::string>& names) const;
+    void GetAllSegmentNames(std::vector<std::string>& names) const;
+    ErrorCode QuerySegments(std::string_view name, size_t& used,
+                            size_t& capacity) const;
+    void GetUnreadyRegions(
+        std::vector<std::pair<UUID, MountedRegion>>& regions) const;
+    ErrorCode GetClientIdBySegmentName(std::string_view name,
+                                       UUID& client_id) const;
+    bool ExistsSegmentName(std::string_view name) const;
+    bool IsSegmentAllocatable(std::string_view name) const;
+    ErrorCode GetSegmentStatusByName(std::string_view name,
+                                     SegmentStatus& status) const;
+    ErrorCode GetSegmentStatusById(const UUID& id, SegmentStatus& status) const;
     void GetClientRegions(
         std::vector<std::pair<UUID, std::vector<UUID>>>& clients) const;
 

@@ -363,18 +363,18 @@ TEST_F(SegmentTest, HostOrderingUsesGroupPointersAndTracksSameNameTargets) {
     EXPECT_TRUE(endpoint == local0.te_endpoint ||
                 endpoint == local1.te_endpoint);
     {
-        auto access = pool.getSegmentPoolAccess();
+        auto view = pool.getView();
         size_t used = 0;
         size_t capacity = 0;
-        ASSERT_EQ(access.QuerySegments("local", used, capacity), ErrorCode::OK);
+        ASSERT_EQ(view.QuerySegments("local", used, capacity), ErrorCode::OK);
         EXPECT_EQ(capacity, 2 * kRegionSize);
     }
     CommitUnmount(pool, local0, client);
     {
-        auto access = pool.getSegmentPoolAccess();
+        auto view = pool.getView();
         size_t used = 0;
         size_t capacity = 0;
-        ASSERT_EQ(access.QuerySegments("local", used, capacity), ErrorCode::OK);
+        ASSERT_EQ(view.QuerySegments("local", used, capacity), ErrorCode::OK);
         EXPECT_EQ(capacity, kRegionSize);
     }
     CommitUnmount(pool, local1, client);
@@ -390,22 +390,34 @@ TEST_F(SegmentTest, SameNameRegionsShareLifecycleAndMetrics) {
         auto access = pool.getSegmentPoolAccess();
         ASSERT_EQ(access.MountSegment(first, client), ErrorCode::OK);
         ASSERT_EQ(access.MountSegment(second, client), ErrorCode::OK);
+    }
 
+    {
+        auto view = pool.getView();
         std::vector<std::string> names;
-        ASSERT_EQ(access.GetAllSegmentNames(names), ErrorCode::OK);
+        view.GetAllSegmentNames(names);
         EXPECT_EQ(names, std::vector<std::string>{first.name});
+    }
 
+    {
+        auto access = pool.getSegmentPoolAccess();
         ASSERT_EQ(
             access.SetSegmentStatusByName(first.name, SegmentStatus::DRAINING),
             ErrorCode::OK);
         EXPECT_FALSE(access.IsSegmentAllocatable(first.name));
+    }
+    {
+        auto view = pool.getView();
         SegmentStatus status = SegmentStatus::UNDEFINED;
-        ASSERT_EQ(access.GetSegmentStatusById(first.id, status), ErrorCode::OK);
+        ASSERT_EQ(view.GetSegmentStatusById(first.id, status), ErrorCode::OK);
         EXPECT_EQ(status, SegmentStatus::DRAINING);
-        ASSERT_EQ(access.GetSegmentStatusById(second.id, status),
-                  ErrorCode::OK);
+        ASSERT_EQ(view.GetSegmentStatusById(second.id, status), ErrorCode::OK);
         EXPECT_EQ(status, SegmentStatus::DRAINING);
+    }
 
+    {
+        auto access = pool.getSegmentPoolAccess();
+        SegmentStatus status = SegmentStatus::UNDEFINED;
         ASSERT_EQ(access.SetSegmentStatusByName(first.name, SegmentStatus::OK),
                   ErrorCode::OK);
         EXPECT_TRUE(access.IsSegmentAllocatable(first.name));
@@ -524,6 +536,34 @@ TEST_F(SegmentTest, AllocationHoldsPoolReadLockAcrossAllocatorCall) {
     EXPECT_EQ(access.RollbackUnmountSegment(segment.id), ErrorCode::OK);
 }
 
+TEST_F(SegmentTest, CatalogReadViewAllowsConcurrentAllocation) {
+    SegmentPool pool(OffsetDrivers());
+    auto segment = MakeSegment(0, "read-view");
+    const UUID client = generate_uuid();
+    {
+        auto access = pool.getSegmentPoolAccess();
+        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    }
+
+    auto view = pool.getView();
+    auto allocation = std::async(std::launch::async, [&] {
+        const SegmentAllocationRequest request{
+            .size = 4096,
+            .replica_count = 1,
+            .preferred_group = {},
+            .preferred_groups = {},
+            .excluded_groups = {},
+            .replica_type = ReplicaType::MEMORY,
+            .writer_host_id = {},
+            .object_key = {},
+        };
+        return pool.Allocate(PlacementPolicyType::RANDOM, request);
+    });
+    ASSERT_EQ(allocation.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_TRUE(allocation.get().has_value());
+}
+
 TEST_F(SegmentTest, QueryAndClientIndexesFollowLifecycle) {
     SegmentPool pool(OffsetDrivers());
     auto a = MakeSegment(0, "a");
@@ -533,12 +573,15 @@ TEST_F(SegmentTest, QueryAndClientIndexesFollowLifecycle) {
         auto access = pool.getSegmentPoolAccess();
         ASSERT_EQ(access.MountSegment(a, client), ErrorCode::OK);
         ASSERT_EQ(access.MountSegment(b, client), ErrorCode::OK);
+    }
+    {
+        auto view = pool.getView();
         std::vector<Segment> segments;
-        ASSERT_EQ(access.GetClientSegments(client, segments), ErrorCode::OK);
+        ASSERT_EQ(view.GetClientSegments(client, segments), ErrorCode::OK);
         EXPECT_EQ(segments.size(), 2U);
         size_t used = 1;
         size_t capacity = 0;
-        ASSERT_EQ(access.QuerySegments(a.name, used, capacity), ErrorCode::OK);
+        ASSERT_EQ(view.QuerySegments(a.name, used, capacity), ErrorCode::OK);
         EXPECT_EQ(used, 0U);
         EXPECT_EQ(capacity, a.size);
     }
