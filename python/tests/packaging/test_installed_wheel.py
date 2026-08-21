@@ -45,6 +45,7 @@ from importlib import metadata
 from pathlib import Path
 import mooncake
 import mooncake.engine
+import mooncake.mooncake_config
 import mooncake.reshard
 import mooncake.store
 
@@ -60,6 +61,7 @@ for ep_module in (
     "mooncake_elastic_buffer.py",
 ):
     assert (package_path.parent / ep_module).is_file(), ep_module
+assert mooncake.mooncake_config.MooncakeConfig is not None
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],
