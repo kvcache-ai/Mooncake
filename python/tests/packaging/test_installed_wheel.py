@@ -45,6 +45,7 @@ from importlib import metadata
 from pathlib import Path
 import mooncake
 import mooncake.engine
+import mooncake.mooncake_config
 import mooncake.reshard
 import mooncake.store
 
@@ -54,6 +55,7 @@ assert not package_path.is_relative_to(repository_path), (package_path, reposito
 assert metadata.version("mooncake-transfer-engine") == {_project_version()!r}
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+assert mooncake.mooncake_config.MooncakeConfig is not None
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],
