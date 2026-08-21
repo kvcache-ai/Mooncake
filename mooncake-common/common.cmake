@@ -165,7 +165,7 @@ option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE
-       "build the Rust interface and sample code for the transfer engine" OFF)
+       "build the Transfer Engine Rust library and sample code" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
 option(USE_EVENT_DRIVEN_COMPLETION
