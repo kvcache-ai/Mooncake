@@ -176,9 +176,7 @@ def test_weight_manifest_round_trip_preserves_single_and_multi_axis_shards() -> 
                     tensor_id=multi_axis_tensor.tensor_id,
                     global_offset=(expert, out_shard * 4, 0),
                     local_shape=(1, 4, 4),
-                    object_key=(
-                        f"{group_id}/payload/multi-e{expert}-o{out_shard}"
-                    ),
+                    object_key=(f"{group_id}/payload/multi-e{expert}-o{out_shard}"),
                     object_offset=0,
                     nbytes=32,
                 )

@@ -104,8 +104,8 @@ framework-specific input.
 Run the logical planner tests from the repository root:
 
 ```bash
-PYTHONPATH=mooncake-reshard/python \
-python3 -m pytest -q mooncake-reshard/tests
+python3 -m pip install -e '.[dev]'
+python3 -m pytest -q python/tests/reshard
 
-npx --yes pyright --project mooncake-reshard/pyrightconfig.json
+pyright --project python/pyrightconfig.json
 ```

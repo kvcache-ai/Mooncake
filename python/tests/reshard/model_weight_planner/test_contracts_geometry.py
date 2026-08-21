@@ -124,6 +124,7 @@ def test_transfer_region_describes_cross_dim_logical_overlap(
     with pytest.raises(ValueError, match="exceeds max_segments"):
         tuple(region.iter_segments(max_segments=region.segment_count - 1))
 
+
 def test_transfer_region_mixed_radix_iteration_and_n_dim_bounds() -> None:
     source = n_dim_fragment(
         fragment_id="source",

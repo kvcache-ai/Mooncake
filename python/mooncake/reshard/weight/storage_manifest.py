@@ -71,8 +71,7 @@ class StoredManifestIdentity:
             _require_nonempty_string(getattr(self, name), name)
         _require_u64(self.weight_generation, "weight_generation")
         if len(self.content_sha256) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in self.content_sha256
+            character not in "0123456789abcdef" for character in self.content_sha256
         ):
             raise ValueError("content_sha256 must be a SHA-256 hex digest")
 

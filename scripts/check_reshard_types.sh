@@ -2,9 +2,9 @@
 # Validate the canonical reshard contracts and their required negative examples.
 set -euo pipefail
 
-pyright --project mooncake-reshard/pyrightconfig.json
+pyright --project python/pyrightconfig.json
 
-if negative_output=$(pyright --project mooncake-reshard/typecheck/negative/pyrightconfig.json 2>&1); then
+if negative_output=$(pyright --project python/tests/typecheck/reshard/negative/pyrightconfig.json 2>&1); then
     echo "Expected invalid reshard contract examples to fail static checking."
     exit 1
 fi

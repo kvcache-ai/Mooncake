@@ -69,6 +69,7 @@ dev = [
     "build",
     "cmake-format==0.6.13",
     "codespell==2.2.6",
+    "hypothesis==6.141.0",
     "pre-commit==3.7.1",
     "pyright==1.1.411",
     "pytest",

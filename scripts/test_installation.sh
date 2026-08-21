@@ -37,7 +37,7 @@ python -c "import mooncake.reshard.weight" && echo "Success: Reshard import succ
 echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
-cp -r mooncake-reshard/tests test_env/reshard_tests
+cp -r python/tests/reshard test_env/reshard_tests
 cd test_env
 pip install torch numpy
 python -c "import mooncake._fast_copy"
