@@ -106,7 +106,10 @@ class FakeLeaderCoordinator : public ha::LeaderCoordinator {
    public:
     struct State {
         int release_calls{0};
+        int monitor_start_calls{0};
         ErrorCode release_result{ErrorCode::OK};
+        ErrorCode monitor_start_result{
+            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS};
     };
 
     explicit FakeLeaderCoordinator(ViewVersionId view_version,
@@ -146,6 +149,10 @@ class FakeLeaderCoordinator : public ha::LeaderCoordinator {
     StartLeadershipMonitor(
         const ha::LeadershipSession& /*session*/,
         ha::LeadershipLostCallback /*on_leadership_lost*/) override {
+        if (state_) {
+            ++state_->monitor_start_calls;
+            return tl::make_unexpected(state_->monitor_start_result);
+        }
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
@@ -343,6 +350,30 @@ TEST_F(HighAvailabilityTest,
     EXPECT_EQ(health.status, 200);
     EXPECT_NE(health.body.find("\"service_ready\":false"), std::string::npos);
     EXPECT_EQ(HttpGet(admin_port, "/get_all_keys").status, 503);
+    admin.Stop();
+}
+
+TEST_F(HighAvailabilityTest, EmptyPromotionContextPassesRestoreGate) {
+    auto state = std::make_shared<FakeLeaderCoordinator::State>();
+    state->monitor_start_result = ErrorCode::INVALID_PARAMS;
+    auto config = MakeSupervisorConfig();
+    const int admin_port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(admin_port), false,
+                            "127.0.0.1");
+    ASSERT_TRUE(admin.Start());
+
+    EXPECT_EQ(
+        -1,
+        ha::RunSupervisorLoopForTesting(
+            MakeEtcdBackendSpec("unused"), config, admin,
+            std::make_unique<FakeLeaderCoordinator>(1, state),
+            std::make_unique<FakeStandbyController>(ha::PromotionContext{})));
+    EXPECT_EQ(state->monitor_start_calls, 1);
+    EXPECT_EQ(state->release_calls, 1);
+
+    const auto health = HttpGet(admin_port, "/health");
+    EXPECT_EQ(health.status, 200);
+    EXPECT_NE(health.body.find("\"service_ready\":false"), std::string::npos);
     admin.Stop();
 }
 
