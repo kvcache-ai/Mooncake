@@ -1535,7 +1535,7 @@ class MasterService {
         uint64_t pending_quota_charge_bytes{0};
         UUID dynamic_replication_lease_id{};
         uint64_t dynamic_replication_version_epoch{0};
-        bool durable_cleanup_pending{false};
+        uint64_t durable_cleanup_generation{0};
         bool source_removed{false};
     };
 
@@ -1882,7 +1882,8 @@ class MasterService {
         MetadataShardAccessorRW* shard);
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
+        uint64_t replication_cleanup_generation = 0);
     void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
                                            QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
@@ -1893,7 +1894,8 @@ class MasterService {
         const std::vector<ReplicaID>& target_ids,
         const UUID& dynamic_replication_lease_id,
         uint64_t dynamic_replication_version_epoch,
-        const std::chrono::system_clock::time_point& ttl);
+        const std::chrono::system_clock::time_point& ttl,
+        uint64_t cleanup_generation);
     struct StaleHandleCleanupPlan {
         std::vector<ReplicaID> removed_ids;
         std::vector<Replica::Descriptor> remaining;
@@ -2074,8 +2076,8 @@ class MasterService {
         NO_THREAD_SAFETY_ANALYSIS;
     void CancelReplicationTaskForRemovedSource(
         TenantState& tenant_state, ObjectMetadata& metadata,
-        const std::vector<ReplicaID>& removed_replica_ids)
-        NO_THREAD_SAFETY_ANALYSIS;
+        const std::vector<ReplicaID>& removed_replica_ids,
+        uint64_t cleanup_generation = 0) NO_THREAD_SAFETY_ANALYSIS;
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -2432,6 +2434,7 @@ class MasterService {
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
+    std::atomic<uint64_t> next_replication_cleanup_generation_{1};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
     // boost lockfree queue requires trivial assignment operator

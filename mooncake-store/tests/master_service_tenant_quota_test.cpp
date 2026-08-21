@@ -20,10 +20,35 @@
 
 #include "allocation_strategy.h"
 #include "ha/kv/ha_kv_backend.h"
+#include "ha/oplog/ordered_oplog_writer.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
+
+class RejectableCommitOpLogWriter final : public OrderedOpLogWriter {
+   public:
+    RejectableCommitOpLogWriter(
+        OrderedOpLogWriterConfig config, WriteBatchFn write_batch,
+        std::shared_ptr<std::atomic<bool>> reject_commit)
+        : OrderedOpLogWriter(std::move(config), std::move(write_batch)),
+          reject_commit_(std::move(reject_commit)) {}
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        if (reject_commit_->load(std::memory_order_relaxed)) {
+            Abort(std::move(reservation));
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry), std::move(callback));
+    }
+
+   private:
+    std::shared_ptr<std::atomic<bool>> reject_commit_;
+};
 
 class BlockingQuotaOpLogBackend final : public HaKvBackend {
    public:
@@ -294,6 +319,85 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         return false;
+    }
+
+    uint64_t ReplicationCleanupGeneration(MasterService& service,
+                                          const TenantId& tenant_id,
+                                          const std::string& key) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.HasReplicationTask()) {
+            return 0;
+        }
+        return accessor.GetReplicationTask().durable_cleanup_generation;
+    }
+
+    bool HasReplicaWithStatus(MasterService& service, const TenantId& tenant_id,
+                              const std::string& key, ReplicaStatus status) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return false;
+        }
+        return accessor.Get().HasReplica([status](const Replica& replica) {
+            return replica.status() == status;
+        });
+    }
+
+    tl::expected<void, ErrorCode> PersistStaleCleanupForTest(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        const std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
+        auto plan =
+            service.BuildStaleHandleCleanupPlan(accessor.Get(), alive_clients);
+        return service.PersistStaleHandleCleanupForHA("test", tenant_id, key,
+                                                      accessor.GetTenantState(),
+                                                      accessor.Get(), plan);
+    }
+
+    void FinalizeExpiredReplicationWithGenerationForTest(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key, uint64_t cleanup_generation) {
+        MasterService::ReplicationTask task;
+        {
+            MasterService::MetadataAccessorRW accessor(
+                &service, MasterService::ObjectIdentity{tenant_id, key});
+            ASSERT_TRUE(accessor.HasReplicationTask());
+            task = accessor.GetReplicationTask();
+        }
+        OpLogEntry entry;
+        entry.tenant_id = tenant_id.value();
+        entry.object_key = key;
+        service.FinalizeExpiredReplicationTaskAfterDurable(
+            entry, task.source_id, task.replica_ids,
+            task.dynamic_replication_lease_id,
+            task.dynamic_replication_version_epoch,
+            task.start_time + service.put_start_release_timeout_sec_,
+            cleanup_generation);
+    }
+
+    size_t DiscardedReplicaBatchCount(MasterService& service) {
+        std::lock_guard lock(service.discarded_replicas_mutex_);
+        return service.discarded_replicas_.size();
+    }
+
+    uint64_t DiscardedReplicaMemoryBytes(MasterService& service) {
+        std::lock_guard lock(service.discarded_replicas_mutex_);
+        uint64_t bytes = 0;
+        for (const auto& replicas : service.discarded_replicas_) {
+            bytes += replicas.memSize();
+        }
+        return bytes;
+    }
+
+    uint64_t ReleaseAllDiscardedReplicasForTest(MasterService& service) {
+        return service.ReleaseExpiredDiscardedReplicas(
+            std::chrono::system_clock::time_point::max());
     }
 
     void ReloadTenantQuotaPolicyFromStore(MasterService& service) {
@@ -1353,13 +1457,125 @@ TEST_F(MasterServiceTenantQuotaTest,
     TriggerMetadataAccessorCleanupForRemovedSource(service,
                                                    TenantId("tenant-a"), "key");
     EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 0);
+    EXPECT_EQ(DiscardedReplicaBatchCount(service), 1);
+    EXPECT_EQ(DiscardedReplicaMemoryBytes(service), 100);
 
     auto copy_end = service.CopyEnd(source_client, "key", TenantId("tenant-a"));
     ASSERT_FALSE(copy_end.has_value());
     EXPECT_EQ(copy_end.error(), ErrorCode::REPLICA_IS_GONE);
     EXPECT_FALSE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    EXPECT_EQ(ReleaseAllDiscardedReplicasForTest(service), 1);
+    EXPECT_EQ(DiscardedReplicaBatchCount(service), 0);
     PutComplete(service, source_client, "replacement", TenantId("tenant-a"),
                 200);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       ReplicationCleanupGenerationSerializesStaleAndTimeoutCleanup) {
+    auto config = MakeConfig({{TenantId("tenant-a"), 200}});
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.cluster_id = "quota_cleanup_generation";
+    config.oplog_batch_max_entries = 16;
+    MasterService service(config);
+    auto backend = std::make_shared<BlockingQuotaOpLogBackend>();
+    ASSERT_EQ(service.SetBatchOpLogBackendForTesting(backend), ErrorCode::OK);
+
+    UUID source_segment_id;
+    UUID source_client =
+        MountSegment(service, 4096, "segment-a", &source_segment_id);
+    MountSegment(service, 4096, "segment-b");
+    ReplicateConfig replicate_config = MemoryConfig();
+    replicate_config.preferred_segment = "segment-a";
+    ASSERT_TRUE(service
+                    .PutStart(source_client, "key", TenantId("tenant-a"), 100,
+                              replicate_config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(source_client, "key", TenantId("tenant-a"),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .CopyStart(source_client, "key", TenantId("tenant-a"),
+                               "segment-a", {"segment-b"})
+                    .has_value());
+
+    InvalidateSegmentAllocatorWithoutCleanup(service, source_segment_id);
+    backend->BlockTransactions();
+    ASSERT_TRUE(PersistStaleCleanupForTest(service, TenantId("tenant-a"), "key")
+                    .has_value());
+    const uint64_t stale_generation =
+        ReplicationCleanupGeneration(service, TenantId("tenant-a"), "key");
+    ASSERT_NE(stale_generation, 0);
+
+    DiscardExpiredProcessingForTest(service, TenantId("tenant-a"), "key");
+    EXPECT_EQ(
+        ReplicationCleanupGeneration(service, TenantId("tenant-a"), "key"),
+        stale_generation);
+    FinalizeExpiredReplicationWithGenerationForTest(
+        service, TenantId("tenant-a"), "key", stale_generation + 1);
+    EXPECT_EQ(
+        ReplicationCleanupGeneration(service, TenantId("tenant-a"), "key"),
+        stale_generation);
+    EXPECT_TRUE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+
+    backend->AllowTransactions();
+    ASSERT_TRUE(WaitForChargedBytes(service, TenantId("tenant-a"), 0));
+    EXPECT_EQ(
+        ReplicationCleanupGeneration(service, TenantId("tenant-a"), "key"), 0);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       StaleCleanupCommitFailureLeavesReplicaAndTaskUnchanged) {
+    auto config = MakeConfig({{TenantId("tenant-a"), 200}});
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.cluster_id = "quota_cleanup_commit_failure";
+    config.oplog_batch_max_entries = 16;
+    MasterService service(config);
+    auto reject_commit = std::make_shared<std::atomic<bool>>(false);
+    service.SetBatchOpLogWriterFactoryForTesting(
+        [reject_commit](OrderedOpLogWriterConfig writer_config,
+                        OrderedOpLogWriter::WriteBatchFn write_batch) {
+            return std::make_unique<RejectableCommitOpLogWriter>(
+                std::move(writer_config), std::move(write_batch),
+                reject_commit);
+        });
+    auto backend = std::make_shared<BlockingQuotaOpLogBackend>();
+    ASSERT_EQ(service.SetBatchOpLogBackendForTesting(backend), ErrorCode::OK);
+
+    UUID source_segment_id;
+    UUID source_client =
+        MountSegment(service, 4096, "segment-a", &source_segment_id);
+    MountSegment(service, 4096, "segment-b");
+    ReplicateConfig replicate_config = MemoryConfig();
+    replicate_config.preferred_segment = "segment-a";
+    ASSERT_TRUE(service
+                    .PutStart(source_client, "key", TenantId("tenant-a"), 100,
+                              replicate_config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(source_client, "key", TenantId("tenant-a"),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .CopyStart(source_client, "key", TenantId("tenant-a"),
+                               "segment-a", {"segment-b"})
+                    .has_value());
+
+    InvalidateSegmentAllocatorWithoutCleanup(service, source_segment_id);
+    reject_commit->store(true, std::memory_order_relaxed);
+    auto persist_result =
+        PersistStaleCleanupForTest(service, TenantId("tenant-a"), "key");
+    ASSERT_FALSE(persist_result.has_value());
+    EXPECT_EQ(persist_result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(
+        ReplicationCleanupGeneration(service, TenantId("tenant-a"), "key"), 0);
+    EXPECT_TRUE(HasReplicaWithStatus(service, TenantId("tenant-a"), "key",
+                                     ReplicaStatus::COMPLETE));
+    EXPECT_FALSE(HasReplicaWithStatus(service, TenantId("tenant-a"), "key",
+                                      ReplicaStatus::REMOVED));
+    EXPECT_TRUE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
 }
 
 TEST_F(MasterServiceTenantQuotaTest, DeletePolicyRequiresTenantWithoutObjects) {
