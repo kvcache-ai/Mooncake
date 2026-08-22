@@ -5602,6 +5602,85 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
     service_->RemoveAll();
 }
 
+// ===================== Client Offboarding Tests =====================
+
+TEST_F(MasterServiceTest,
+       ClientOffboardingProcessesRealSegmentAndMetadataResiduals) {
+    MasterService service;
+    auto segment = MakeSegment("offboarding_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    const std::string key =
+        PutObjectOnSegment(service, client_id, segment.name);
+    const auto liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(liveness);
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = liveness;
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_TRUE(job.pending_prepare_segments.empty());
+    EXPECT_TRUE(job.prepared_segments.empty());
+    EXPECT_TRUE(job.metadata_cleanup_accepted);
+    EXPECT_TRUE(job.local_ssd_unregistered);
+    EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+    EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
+
+    auto exists = service.ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(*exists);
+}
+
+TEST_F(MasterServiceTest,
+       ClientOffboardingKeepsPreparedResidualWithoutRepreparingIt) {
+    MasterService service;
+    const UUID client_id = generate_uuid();
+    auto prepared_segment = MakeSegment("offboarding_prepared_segment");
+    auto blocked_segment =
+        MakeSegment("offboarding_blocked_segment", /*base=*/0x400000000);
+    ASSERT_TRUE(
+        service.MountSegment(prepared_segment, client_id).has_value());
+    ASSERT_TRUE(service.MountSegment(blocked_segment, client_id).has_value());
+    ASSERT_TRUE(service
+                    .GracefulUnmountSegment(blocked_segment.id, client_id,
+                                             /*grace_period_ms=*/60'000)
+                    .has_value());
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+    job.pending_prepare_segments = {
+        {.segment_id = prepared_segment.id,
+         .segment_name = prepared_segment.name,
+         .transport_endpoint = prepared_segment.te_endpoint},
+        {.segment_id = blocked_segment.id,
+         .segment_name = blocked_segment.name,
+         .transport_endpoint = blocked_segment.te_endpoint}};
+
+    ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
+    ASSERT_EQ(job.prepared_segments.size(), 1u);
+    ASSERT_EQ(job.pending_prepare_segments.size(), 1u);
+    EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
+    EXPECT_EQ(job.pending_prepare_segments.front().segment_id,
+              blocked_segment.id);
+    const auto retained_capacity =
+        job.prepared_segments.front().metrics_dec_capacity;
+
+    ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
+    ASSERT_EQ(job.prepared_segments.size(), 1u);
+    ASSERT_EQ(job.pending_prepare_segments.size(), 1u);
+    EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
+    EXPECT_EQ(job.prepared_segments.front().metrics_dec_capacity,
+              retained_capacity);
+}
+
 // ===================== Graceful Unmount Tests =====================
 
 TEST_F(MasterServiceTest, GracefulUnmountSegment_SetsCorrectStatus) {

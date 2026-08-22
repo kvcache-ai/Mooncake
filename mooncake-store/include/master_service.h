@@ -4,7 +4,6 @@
 #include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
-#include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -30,6 +29,7 @@
 #include "allocation_strategy.h"
 #include "background_worker.h"
 #include "client_liveness.h"
+#include "client_offboarding.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "lease.h"
@@ -168,6 +168,7 @@ class MasterService {
     friend class test::MasterServiceSSDTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
+    friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
@@ -1018,7 +1019,12 @@ class MasterService {
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
     // Shard walk shared by the two sweeps above; removes completed replicas
     // matching is_stale, erasing a key when no valid replica remains.
-    void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale);
+    tl::expected<void, ErrorCode> ClearStaleHandles(
+        const std::function<bool(const Replica&)>& is_stale);
+    bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
+    bool ShouldSkipSnapshotForClientOffboarding() const {
+        return client_offboarding_worker_.HasPending();
+    }
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -2556,19 +2562,12 @@ class MasterService {
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
+    ClientOffboardingWorker client_offboarding_worker_{this};
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    // boost lockfree queue requires trivial assignment operator
-    struct PodUUID {
-        uint64_t first;
-        uint64_t second;
-    };
-    static constexpr size_t kClientPingQueueSize =
-        128 * 1024;  // Size of the client ping queue
-    boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
     const int64_t client_active_ttl_sec_;
     const int64_t client_suspicion_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;

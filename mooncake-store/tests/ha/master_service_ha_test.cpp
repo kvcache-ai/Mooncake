@@ -801,7 +801,7 @@ class MasterServiceHATest : public ::testing::Test {
         EXPECT_EQ(allocators == nullptr ? 0 : allocators->size(), 1);
         return allocators == nullptr || allocators->empty()
                    ? 0
-                   : allocators->front()->size();
+                   : allocators->front()->allocator->size();
     }
 
     static void EraseObjectForTesting(MasterService& service,
