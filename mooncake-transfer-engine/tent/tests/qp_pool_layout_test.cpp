@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include "tent/transport/rdma/params.h"
+#include "tent/transport/rdma/qp_pool_routing.h"
 
 namespace mooncake {
 namespace tent {
@@ -109,6 +110,54 @@ TEST(QpPoolLayoutTest, SegmentsPartitionAllQpIndices) {
     EXPECT_EQ(pool_of(4), nullptr);
 }
 
+TEST(QpPoolLayoutTest, PerPoolLinkLayerQosOverridesDefaults) {
+    auto layout = computeQpPoolSegments(
+        {{"latency", 2, 0, 3, 96}, {"bulk", 2, 0, 7, 128}}, 4);
+    ASSERT_TRUE(layout.valid);
+
+    auto latency0 = resolveQpLinkLayerQos(
+        layout.segments, /*qp_index=*/0, /*default_service_level=*/1,
+        /*default_traffic_class=*/2);
+    EXPECT_EQ(latency0.service_level, 3);
+    EXPECT_EQ(latency0.traffic_class, 96);
+
+    auto latency1 = resolveQpLinkLayerQos(
+        layout.segments, /*qp_index=*/1, /*default_service_level=*/1,
+        /*default_traffic_class=*/2);
+    EXPECT_EQ(latency1.service_level, 3);
+    EXPECT_EQ(latency1.traffic_class, 96);
+
+    auto bulk0 = resolveQpLinkLayerQos(
+        layout.segments, /*qp_index=*/2, /*default_service_level=*/1,
+        /*default_traffic_class=*/2);
+    EXPECT_EQ(bulk0.service_level, 7);
+    EXPECT_EQ(bulk0.traffic_class, 128);
+
+    auto bulk1 = resolveQpLinkLayerQos(
+        layout.segments, /*qp_index=*/3, /*default_service_level=*/1,
+        /*default_traffic_class=*/2);
+    EXPECT_EQ(bulk1.service_level, 7);
+    EXPECT_EQ(bulk1.traffic_class, 128);
+}
+
+TEST(QpPoolLayoutTest, MissingPoolQosFieldsFallBackIndependently) {
+    auto layout = computeQpPoolSegments(
+        {{"sl-only", 1, 0, 5, -1}, {"tc-only", 1, 0, -1, 144}}, 2);
+    ASSERT_TRUE(layout.valid);
+
+    auto sl_only = resolveQpLinkLayerQos(
+        layout.segments, /*qp_index=*/0, /*default_service_level=*/1,
+        /*default_traffic_class=*/2);
+    EXPECT_EQ(sl_only.service_level, 5);
+    EXPECT_EQ(sl_only.traffic_class, 2);
+
+    auto tc_only = resolveQpLinkLayerQos(
+        layout.segments, /*qp_index=*/1, /*default_service_level=*/1,
+        /*default_traffic_class=*/2);
+    EXPECT_EQ(tc_only.service_level, 1);
+    EXPECT_EQ(tc_only.traffic_class, 144);
+}
+
 // --- selectQpInPool: the step-3 router (slice pool -> QP index)
 // ---------------
 
@@ -173,6 +222,64 @@ TEST(SelectQpInPoolTest, ResultAlwaysInRange) {
             EXPECT_LT(idx, 6);
         }
     }
+}
+
+TEST(QpPoolWorkerRoutingTest, NamedPoolSelectsOwningWorker) {
+    auto segs = twoPools();  // kv=[0,4), ctrl=[4,6)
+
+    auto ctrl_from_worker0 = selectQpPoolRoute(
+        segs, "ctrl", /*candidate=*/0, /*total_qp=*/6,
+        /*num_workers=*/6, /*fallback_worker=*/0);
+    EXPECT_EQ(ctrl_from_worker0.qp_index, 4);
+    EXPECT_EQ(ctrl_from_worker0.worker_id, 4);
+
+    auto ctrl_from_worker1 = selectQpPoolRoute(
+        segs, "ctrl", /*candidate=*/1, /*total_qp=*/6,
+        /*num_workers=*/6, /*fallback_worker=*/1);
+    EXPECT_EQ(ctrl_from_worker1.qp_index, 5);
+    EXPECT_EQ(ctrl_from_worker1.worker_id, 5);
+
+    auto kv_wrap = selectQpPoolRoute(segs, "kv", /*candidate=*/5,
+                                     /*total_qp=*/6, /*num_workers=*/6,
+                                     /*fallback_worker=*/5);
+    EXPECT_EQ(kv_wrap.qp_index, 1);
+    EXPECT_EQ(kv_wrap.worker_id, 1);
+
+    auto no_workers = selectQpPoolRoute(segs, "ctrl", /*candidate=*/0,
+                                        /*total_qp=*/6, /*num_workers=*/0,
+                                        /*fallback_worker=*/0);
+    EXPECT_EQ(no_workers.qp_index, 4);
+    EXPECT_EQ(no_workers.worker_id, 0);
+}
+
+TEST(QpPoolWorkerRoutingTest, MixedBatchGroupsSlicesByPool) {
+    RdmaTask kv_task{};
+    kv_task.qp_pool = "kv";
+    RdmaTask ctrl_task{};
+    ctrl_task.qp_pool = "ctrl";
+    RdmaTask default_task{};
+
+    RdmaSlice kv0{};
+    kv0.task = &kv_task;
+    RdmaSlice ctrl0{};
+    ctrl0.task = &ctrl_task;
+    RdmaSlice kv1{};
+    kv1.task = &kv_task;
+    RdmaSlice default0{};
+    default0.task = &default_task;
+    RdmaSlice ctrl1{};
+    ctrl1.task = &ctrl_task;
+
+    auto groups =
+        groupSlicesByQpPool({&kv0, &ctrl0, &kv1, &default0, &ctrl1});
+
+    ASSERT_EQ(groups.size(), static_cast<size_t>(3));
+    EXPECT_EQ(groups[0].pool, "kv");
+    EXPECT_EQ(groups[0].slices, (std::vector<RdmaSlice*>{&kv0, &kv1}));
+    EXPECT_EQ(groups[1].pool, "ctrl");
+    EXPECT_EQ(groups[1].slices, (std::vector<RdmaSlice*>{&ctrl0, &ctrl1}));
+    EXPECT_EQ(groups[2].pool, "");
+    EXPECT_EQ(groups[2].slices, (std::vector<RdmaSlice*>{&default0}));
 }
 
 // A pool with a non-positive num_qp would create an empty/negative QP span and

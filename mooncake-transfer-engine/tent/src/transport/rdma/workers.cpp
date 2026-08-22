@@ -26,6 +26,7 @@
 #include "tent/transport/rdma/bw_arbitration.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/promotion_policy.h"
+#include "tent/transport/rdma/qp_pool_routing.h"
 #include "tent/transport/rdma/shared_quota.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/string_builder.h"
@@ -267,10 +268,15 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
 }
 
 Status Workers::submit(RdmaSlice* slice) {
+    return submit(slice, -1);
+}
+
+Status Workers::submit(RdmaSlice* slice, int worker_id) {
     RdmaSliceList slice_list;
     slice_list.first = slice;
     slice_list.num_slices = 1;
-    return submit(slice_list);
+    if (slice) slice->next = nullptr;
+    return submit(slice_list, worker_id);
 }
 
 Status Workers::cancel(RdmaTask* task) {
@@ -510,36 +516,93 @@ void Workers::asyncPostSend() {
             }
         }
 
-        int num_submitted = endpoint->submitSlices(slices, tl_wid);
-        for (int id = 0; id < num_submitted; ++id) {
-            auto slice = slices[id];
+        auto finish_submitted_slice = [&](RdmaSlice* slice) {
             if (slice->failed) {
                 releaseSliceQuota(slice);
                 if (slice->task->cancel_requested.load(
                         std::memory_order_acquire)) {
                     updateSliceStatus(slice, CANCELED);
                     worker.inflight_slices.fetch_sub(1);
-                    continue;
+                    return;
                 }
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
-                        << "Slice " << slice << " failed: retry count exceeded";
+                    LOG(WARNING) << "Slice " << slice
+                                 << " failed: retry count exceeded";
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
                 } else {
                     submit(slice);
                 }
                 worker.inflight_slices.fetch_sub(1);
+                return;
+            }
+
+            slice->submit_ts = getCurrentTimeInNano();
+            worker.inflight_slice_set.insert(slice);
+        };
+
+        const bool qp_pool_routing = endpoint->qpPoolRoutingEnabled();
+
+        // Legacy/default path: no QP pools are configured, so keep the
+        // historical single submit and prefix erase. The only added work is the
+        // qpPoolRoutingEnabled() check above.
+        if (!qp_pool_routing) {
+            int num_submitted = endpoint->submitSlices(slices, tl_wid);
+            for (int id = 0; id < num_submitted; ++id) {
+                finish_submitted_slice(slices[id]);
+            }
+
+            if (num_submitted) {
+                slices.erase(slices.begin(), slices.begin() + num_submitted);
+            }
+            continue;
+        }
+
+        // QP-pool path: redirect slices to the worker that owns their selected
+        // pool QP, then submit each pool separately so mixed batches do not
+        // inherit the first slice's pool.
+        std::vector<RdmaSlice*> kept;
+        kept.reserve(slices.size());
+        for (auto* slice : slices) {
+            const int owner = endpoint->selectQpOwnerWorker(
+                rdmaSliceQpPoolName(slice), tl_wid, num_workers_);
+            if (owner == tl_wid) {
+                kept.push_back(slice);
+                continue;
+            }
+            auto st = submit(slice, owner);
+            if (st.ok()) {
+                worker.inflight_slices.fetch_sub(1);
             } else {
-                slice->submit_ts = getCurrentTimeInNano();
-                worker.inflight_slice_set.insert(slice);
+                LOG(ERROR) << "Failed to redirect slice " << slice
+                           << " to worker " << owner << ": " << st.ToString();
+                releaseSliceQuota(slice);
+                updateSliceStatus(slice, FAILED);
+                worker.inflight_slices.fetch_sub(1);
+            }
+        }
+        slices.swap(kept);
+        if (slices.empty()) continue;
+
+        std::unordered_set<RdmaSlice*> submitted;
+        auto groups = groupSlicesByQpPool(slices);
+        for (auto& group : groups) {
+            int num_submitted = endpoint->submitSlices(group.slices, tl_wid);
+            for (int id = 0; id < num_submitted; ++id) {
+                auto slice = group.slices[id];
+                submitted.insert(slice);
+                finish_submitted_slice(slice);
             }
         }
 
-        if (num_submitted) {
-            slices.erase(slices.begin(), slices.begin() + num_submitted);
+        if (!submitted.empty()) {
+            slices.erase(std::remove_if(slices.begin(), slices.end(),
+                                        [&](RdmaSlice* slice) {
+                                            return submitted.count(slice) != 0;
+                                        }),
+                         slices.end());
         }
     }
 }

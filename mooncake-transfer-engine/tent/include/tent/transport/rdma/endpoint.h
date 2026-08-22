@@ -157,6 +157,13 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index);
 
+    int selectQpIndex(const std::string& qp_pool, int candidate);
+
+    int selectQpOwnerWorker(const std::string& qp_pool, int candidate,
+                            size_t num_workers);
+
+    bool qpPoolRoutingEnabled();
+
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
     size_t acknowledge(RdmaSlice* slice, TransferStatusEnum status);
