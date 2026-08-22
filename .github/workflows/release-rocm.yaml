@@ -131,6 +131,7 @@ jobs:
           rm -rf build && mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+            -DENABLE_MULTI_PROTOCOL=ON \
             -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
             -DBUILD_UNIT_TESTS=OFF -DENABLE_DEBUG_SYMBOLS=OFF \
             -DCMAKE_BUILD_TYPE=Release \

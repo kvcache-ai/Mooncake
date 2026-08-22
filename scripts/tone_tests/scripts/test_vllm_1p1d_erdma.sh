@@ -2,7 +2,11 @@
 
 test_case_name="test_vllm_1p1d_erdma"
 TEST_TYPE="double"
-SUPPORT_MODELS=("Qwen/Qwen3-8B" "deepseek-ai/DeepSeek-V2-Lite")
+if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+    SUPPORT_MODELS=("Qwen/Qwen3-8B")
+else
+    SUPPORT_MODELS=("Qwen/Qwen3-8B" "deepseek-ai/DeepSeek-V2-Lite")
+fi
 
 PID_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}/run/pids/${test_case_name}
 BASE_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}
@@ -32,7 +36,7 @@ start_server()
         kv_role="kv_producer"
     fi
 
-    local kv_config_json="{\\\"kv_connector\\\":\\\"MooncakeConnector\\\",\\\"kv_role\\\":\\\"$kv_role\\\"}"
+    local kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\"}"
 
     local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
     
