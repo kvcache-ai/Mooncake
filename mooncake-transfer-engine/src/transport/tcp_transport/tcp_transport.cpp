@@ -56,6 +56,7 @@ using LaneRetryHandlerHook = void (*)() noexcept;
 using LaneAdmissionHandlerHook = void (*)() noexcept;
 using LaneObserverHook = void (*)(int, size_t, uint64_t, size_t, bool) noexcept;
 using LaneFailureReasonHook = void (*)(int) noexcept;
+using StartTransferMetadataHook = void (*)() noexcept;
 
 std::mutex lane_test_hook_mutex;
 LaneConnectHandlerHook lane_connect_handler_hook = nullptr;
@@ -64,6 +65,7 @@ LaneRetryHandlerHook lane_retry_handler_hook = nullptr;
 LaneAdmissionHandlerHook lane_admission_handler_hook = nullptr;
 LaneObserverHook lane_observer_hook = nullptr;
 LaneFailureReasonHook lane_failure_reason_hook = nullptr;
+StartTransferMetadataHook start_transfer_metadata_hook = nullptr;
 
 enum LaneTestEvent {
     kLaneQueueAdmitted = 1,
@@ -142,6 +144,15 @@ void invokeLaneFailureReasonHook(int reason) noexcept {
     }
     if (hook) hook(reason);
 }
+
+void invokeStartTransferMetadataHook() noexcept {
+    StartTransferMetadataHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = start_transfer_metadata_hook;
+    }
+    if (hook) hook();
+}
 }  // namespace
 
 void tcpTransportSetLaneConnectHandlerHookForTest(
@@ -177,6 +188,12 @@ void tcpTransportSetLaneFailureReasonHookForTest(
     LaneFailureReasonHook hook) noexcept {
     std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
     lane_failure_reason_hook = hook;
+}
+
+void tcpTransportSetStartTransferMetadataHookForTest(
+    StartTransferMetadataHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    start_transfer_metadata_hook = hook;
 }
 
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {
@@ -364,6 +381,7 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
 #else
     desc->protocol = "tcp";
 #endif
+    desc->tcp_data_host = metadata_->localRpcMeta().ip_or_host_name;
     desc->tcp_data_port = tcp_data_port;
     // Advertise acknowledged framing (#2086); initiators fall back to v1
     // against descriptors that do not carry the field.
@@ -646,10 +664,13 @@ void TcpTransport::startTransfer(Slice* slice,
         return;
     }
 
-    TransferMetadata::RpcMetaDesc meta_entry;
-    if (metadata_->getRpcMetaEntry(desc->name, meta_entry)) {
-        LOG(ERROR) << "TcpTransport::startTransfer failed to get RPC meta "
-                      "entry for segment name: "
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    invokeStartTransferMetadataHook();
+#endif
+
+    if (desc->tcp_data_host.empty()) {
+        LOG(ERROR) << "TcpTransport::startTransfer found no TCP data host for "
+                      "segment name: "
                    << desc->name;
         finish(TransferStatusEnum::FAILED);
         return;
@@ -663,7 +684,7 @@ void TcpTransport::startTransfer(Slice* slice,
         return;
     }
 
-    const ConnectionKey key{meta_entry.ip_or_host_name,
+    const ConnectionKey key{desc->tcp_data_host,
                             static_cast<uint16_t>(desc->tcp_data_port)};
     const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
     TcpWorkItem work(slice, use_v2, std::move(continuation));
@@ -672,7 +693,7 @@ void TcpTransport::startTransfer(Slice* slice,
     // disabled. Fixed lanes provide the same serial socket reuse without
     // reviving the old unbounded dynamic pool.
     if (enable_connection_pool_ || reuse_connection) {
-        enqueuePooledTransfer(key, std::move(work));
+        enqueuePooledTransfer(desc->name, key, std::move(work));
         return;
     }
 

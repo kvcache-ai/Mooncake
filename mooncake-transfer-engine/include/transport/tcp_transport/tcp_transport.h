@@ -217,6 +217,7 @@ class TcpTransport : public Transport {
         asio::io_context::executor_type executor;
     };
 
+    struct ConnectionLaneState;
     struct PeerConnectionGroup;
 
     struct ConnectionLane {
@@ -273,6 +274,9 @@ class TcpTransport : public Transport {
         std::shared_ptr<asio::steady_timer> retry_timer;
         uint64_t retry_epoch = 0;
         uint64_t connect_failure_log_count = 0;
+        bool retiring = false;
+        bool retirement_scheduled = false;
+        std::weak_ptr<ConnectionLaneState> owner_state;
         std::shared_ptr<FailureCounters> failure_counters;
     };
 
@@ -286,6 +290,8 @@ class TcpTransport : public Transport {
         std::unordered_map<ConnectionKey, std::shared_ptr<PeerConnectionGroup>,
                            ConnectionKeyHash>
             groups;
+        std::unordered_map<std::string, ConnectionKey> current_key_by_peer;
+        std::vector<std::shared_ptr<PeerConnectionGroup>> retiring_groups;
         std::weak_ptr<ConnectionLaneRuntime> runtime;
         std::shared_ptr<FailureCounters> failure_counters =
             std::make_shared<FailureCounters>();
@@ -300,10 +306,18 @@ class TcpTransport : public Transport {
 
     std::shared_ptr<asio::ip::tcp::socket> getConnection(
         const std::string &host, uint16_t port);
-    void enqueuePooledTransfer(const ConnectionKey &key, TcpWorkItem work);
+    void enqueuePooledTransfer(const std::string &logical_peer,
+                               const ConnectionKey &key, TcpWorkItem work);
     static uint64_t requestGroupPumpLocked(PeerConnectionGroup &group);
     static void postGroupPump(const std::shared_ptr<PeerConnectionGroup> &group,
                               uint64_t pump_epoch);
+    static bool requestGroupRetirementLocked(PeerConnectionGroup &group);
+    static void postGroupRetirement(
+        const std::shared_ptr<PeerConnectionGroup> &group);
+    static void scheduleGroupRetirement(
+        const std::shared_ptr<PeerConnectionGroup> &group);
+    static void runGroupRetirement(
+        const std::shared_ptr<PeerConnectionGroup> &group);
     static void runGroupPump(const std::shared_ptr<PeerConnectionGroup> &group,
                              uint64_t pump_epoch);
     static void startLaneConnect(
