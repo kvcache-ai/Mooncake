@@ -389,9 +389,10 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
+int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
+    (void)length;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_SUPA)
     // Decide host vs GPU without assuming the presence of nvidia-peermem. Host
@@ -446,17 +447,56 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         }
 
         int dmabuf_fd;
+        // cuMemGetAddressRange() only reports the mapping that contains addr.
+        // For memory allocated through the CUDA virtual memory management API
+        // (cuMemCreate + cuMemMap), as used by PyTorch's
+        // PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, that mapping is a
+        // single growth chunk — 20 MiB by default, see c10's
+        // large_segment_size / large_segment_size_mb — even though the
+        // surrounding VA reservation is contiguous and orders of magnitude
+        // larger. Exporting only that chunk makes offset + length exceed the
+        // resulting dma_buf, and ibv_reg_dmabuf_mr() below then fails with
+        // EINVAL for every buffer larger than one chunk (Mooncake#2511).
+        //
+        // When the reported allocation does not cover the range the caller is
+        // about to register, export exactly [addr, addr + length) instead.
+        // cuMemGetHandleForAddressRange() accepts a range spanning several
+        // mappings as long as they are contiguously mapped, which is precisely
+        // the expandable-segment layout. The export base is page-aligned so
+        // that offset % page_size == iova % page_size, which
+        // ibv_reg_dmabuf_mr() requires.
+        CUdeviceptr exportBase = allocBase;
+        size_t exportSize = allocSize;
+        uint64_t exportOffset = (uintptr_t)addr - (uintptr_t)allocBase;
+        if (exportOffset + length > allocSize) {
+            const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
+            if (aligned < (uintptr_t)allocBase) aligned = (uintptr_t)allocBase;
+            exportBase = (CUdeviceptr)aligned;
+            exportOffset = (uintptr_t)addr - aligned;
+            exportSize =
+                (exportOffset + length + page - 1) & ~(size_t)(page - 1);
+            VLOG(1) << "dma_buf: reported allocation for " << (uintptr_t)addr
+                    << " (base=" << (uintptr_t)allocBase
+                    << " size=" << allocSize << ") does not cover length "
+                    << length << "; exporting the requested range instead"
+                    << " (base=" << (uintptr_t)exportBase
+                    << " size=" << exportSize
+                    << "). Expected for CUDA VMM allocations such as PyTorch"
+                       " expandable_segments.";
+        }
+
         // flags must be 0: the PCIE-BAR1 mapping flag is rejected (error 801)
         // on some GPU/driver combinations (e.g. B200).
         result = cuMemGetHandleForAddressRange(
-            &dmabuf_fd, allocBase, allocSize,
+            &dmabuf_fd, exportBase, exportSize,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
-                       << " base=" << (uintptr_t)allocBase
-                       << " size=" << allocSize << " cuda error=" << errStr;
+                       << " base=" << (uintptr_t)exportBase
+                       << " size=" << exportSize << " cuda error=" << errStr;
 #if defined(USE_CUDA) || defined(USE_SUPA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif
@@ -464,7 +504,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         }
         out.method = DmabufExport::Method::kDmabufReg;
         out.fd = dmabuf_fd;
-        out.offset = (uintptr_t)addr - (uintptr_t)allocBase;
+        out.offset = exportOffset;
 #if defined(USE_CUDA) || defined(USE_SUPA)
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
@@ -599,7 +639,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
-        PLOG(ERROR) << "Failed to register memory " << addr;
+        PLOG(ERROR) << "Failed to register memory " << addr << " length "
+                    << length << " dmabuf_offset " << exp.offset;
         return ERR_CONTEXT;
     }
     return 0;
@@ -625,7 +666,7 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
     // The shared-fd benefit only matters when a buffer is registered against
     // multiple NICs (see RdmaTransport::registerLocalMemoryInternal).
     DmabufExport exp;
-    int ret = exportDmabuf(addr, exp);
+    int ret = exportDmabuf(addr, length, exp);
     if (ret != 0) {
         return ret;
     }
@@ -651,7 +692,7 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
     if (!pd_) return 0;  // placeholder context
     DmabufExport exp;
-    int ret = exportDmabuf(addr, exp);
+    int ret = exportDmabuf(addr, length, exp);
     if (ret != 0) {
         return ret;
     }
