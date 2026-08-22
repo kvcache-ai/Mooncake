@@ -2699,6 +2699,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             MutexLocker cache_locker(&file_cache_mutex_);
             file_cache_.erase(bucket_data_path);
         }
+
+        // Flush bucket data to stable storage before committing metadata.
+        // This prevents a crash from leaving valid metadata pointing at
+        // incomplete data (write-ordering durability guarantee).
+        // OpenFile returns PosixFile for writes (UringFile is read-only),
+        // so this datasync is the effective flush for the fallback path.
+        auto sync_result = file->datasync();
+        if (!sync_result) {
+            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
     }
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
