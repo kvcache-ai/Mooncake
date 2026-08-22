@@ -22,6 +22,7 @@ jobs:
     # so it also loads on the ROCm 7.0 image variants.
     container: rocm/dev-ubuntu-22.04:7.2.3-complete
     strategy:
+      fail-fast: false
       matrix:
         # 3.10 covers the SGLang ROCm image; 3.12 covers vLLM ROCm.
         python-version: ['3.10', '3.12']
@@ -42,7 +43,30 @@ jobs:
         apt-get update -y
         apt-get install -y --no-install-recommends git ca-certificates
 
-    - uses: actions/checkout@v4
+    - name: Check out source (attempt 1)
+      id: checkout-1
+      continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.checkout_ref || github.sha }}
+        persist-credentials: false
+        submodules: recursive
+
+    - name: Check out source (attempt 2)
+      id: checkout-2
+      if: steps.checkout-1.outcome == 'failure'
+      continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.checkout_ref || github.sha }}
+        persist-credentials: false
+        submodules: recursive
+
+    - name: Check out source (attempt 3)
+      if: >-
+        steps.checkout-1.outcome == 'failure' &&
+        steps.checkout-2.outcome == 'failure'
+      uses: actions/checkout@v4
       with:
         ref: ${{ inputs.checkout_ref || github.sha }}
         persist-credentials: false
