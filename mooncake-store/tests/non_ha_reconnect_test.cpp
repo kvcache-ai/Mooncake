@@ -20,7 +20,7 @@
 #include "centralized_client_service.h"
 #include "p2p/client/p2p_client_service.h"
 #include "test_server_helpers.h"
-#include "test_p2p_server_helpers.h"
+#include "p2p/test_p2p_server_helpers.h"
 #undef protected
 
 #include "utils.h"

@@ -12,7 +12,7 @@
 
 #include "p2p/tiered_cache/tiers/storage_tier.h"
 #include "p2p/tiered_cache/tiered_backend.h"
-#include "utils/common.h"
+#include "../utils/common.h"
 #include "storage_backend.h"
 #include "allocator.h"
 #include "utils.h"

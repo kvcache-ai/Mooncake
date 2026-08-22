@@ -38,7 +38,7 @@
 #include "p2p/tiered_cache/tiered_backend.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"
-#include "utils/common.h"
+#include "../utils/common.h"
 
 namespace mooncake {
 namespace test {

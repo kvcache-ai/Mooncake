@@ -12,7 +12,7 @@
 #include "p2p/tiered_cache/scheduler/scheduler_factory.h"  // detail::ReadMultiLRUConfig
 #include "p2p/tiered_cache/tiered_backend.h"
 #include "p2p/tiered_cache/tiers/cache_tier.h"  // TempDRAMBuffer
-#include "utils/common.h"                   // InitTieredBackendForTest
+#include "../utils/common.h"                   // InitTieredBackendForTest
 
 namespace mooncake {
 namespace {

@@ -27,7 +27,7 @@
 #include "p2p/ha/oplog/redis_oplog_store.h"
 #include "process_handler.h"
 #include "p2p/ha/redis_master_view_helper.h"
-#include "../redis_test_utils.h"
+#include "../p2p/redis_test_utils.h"
 #include "types.h"
 
 #include <hiredis/hiredis.h>

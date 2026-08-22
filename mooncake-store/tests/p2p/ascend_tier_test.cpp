@@ -10,7 +10,7 @@
 
 #include "p2p/tiered_cache/tiers/cache_tier.h"
 #include "p2p/tiered_cache/tiered_backend.h"
-#include "utils/common.h"
+#include "../utils/common.h"
 #include "types.h"
 
 #ifdef USE_ASCEND_CACHE_TIER

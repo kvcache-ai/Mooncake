@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 #include "p2p/tiered_cache/tiered_backend.h"
-#include "utils/common.h"
+#include "../utils/common.h"
 #include <fstream>
 #include <chrono>
 #include <thread>
