@@ -181,8 +181,8 @@ fi
 
 echo "Building wheel package..."
 # Stage the reshard Python package for the combined Mooncake wheel. The tracked
-# source of truth remains in the top-level module.
-RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
+# source of truth remains in the root Python package.
+RESHARD_SOURCE_DIR="python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
 cleanup_reshard_staging() {
     rm -rf "${RESHARD_STAGING_DIR}"

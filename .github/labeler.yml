@@ -36,6 +36,10 @@ Common:
     - any-glob-to-any-file:
       - 'mooncake-common/**/*'
       - 'mooncake-reshard/**/*'
+      - 'python/mooncake/reshard/**/*'
+      - 'python/tests/reshard/**/*'
+      - 'python/tests/typecheck/reshard/**/*'
+      - 'python/pyrightconfig.json'
 
 CI/Build:
   - changed-files:
@@ -56,7 +60,8 @@ Tests:
     - any-glob-to-any-file:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
-      - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/reshard/**/*'
+      - 'python/tests/typecheck/reshard/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:

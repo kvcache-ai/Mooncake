@@ -23,10 +23,3 @@ install(
   FILES_MATCHING
   PATTERN "*.py"
   PATTERN "__init__.py" EXCLUDE)
-install(
-  DIRECTORY
-    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-reshard/python/mooncake/reshard/"
-  DESTINATION mooncake/reshard
-  COMPONENT python
-  FILES_MATCHING
-  PATTERN "*.py")

@@ -124,7 +124,6 @@ def test_ep_ownership_is_derived_from_parallel_axis_semantics() -> None:
 
 
 def test_dp_ownership_routes_each_tensor_through_its_declared_owner() -> None:
-
     tensor_a = replace(
         descriptor(),
         tensor_id="layers.0.weight",

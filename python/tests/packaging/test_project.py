@@ -57,6 +57,11 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
 
 
+def test_reshard_has_one_authoritative_source() -> None:
+    assert (REPOSITORY_ROOT / "python" / "mooncake" / "reshard").is_dir()
+    assert not list((REPOSITORY_ROOT / "mooncake-reshard").rglob("*.py"))
+
+
 def test_pg_extension_build_stages_outside_the_source_tree(
     tmp_path: Path,
 ) -> None:

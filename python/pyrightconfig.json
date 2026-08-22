@@ -1,0 +1,19 @@
+{
+  "include": [
+    "mooncake/reshard/contracts",
+    "mooncake/reshard/weight/types.py",
+    "mooncake/reshard/weight/topology.py",
+    "mooncake/reshard/weight/part.py",
+    "mooncake/reshard/weight/placement.py",
+    "mooncake/reshard/weight/runtime.py",
+    "mooncake/reshard/weight/validation.py",
+    "mooncake/reshard/weight/binding.py",
+    "mooncake/reshard/weight/serde.py"
+  ],
+  "extraPaths": ["."],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "strict",
+  "reportPrivateUsage": "none",
+  "reportUnnecessaryIsInstance": "none",
+  "reportUnusedFunction": "none"
+}

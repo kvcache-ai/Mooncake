@@ -186,9 +186,7 @@ def _plan_transfer(
         else {}
     )
     source_dp_owners = (
-        complete_dp_owned_source_owners(
-            source_tensors, placement_source_fragments
-        )
+        complete_dp_owned_source_owners(source_tensors, placement_source_fragments)
         if parallel_sources
         else {}
     )
