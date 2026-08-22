@@ -129,17 +129,28 @@ Status ProxyManager::deconstruct() {
         has_pending_cleanups_.store(false, std::memory_order_relaxed);
     }
     for (auto& pending : remaining) {
-        if (!pending.remote_operations.empty()) {
+        size_t deferred_remote_buffers = 0;
+        for (auto& operation : pending.remote_operations) {
+            if (!operation) continue;
+            operation->abandonForCleanup();
+            ++deferred_remote_buffers;
+        }
+        if (deferred_remote_buffers != 0) {
             LOG(WARNING)
-                << "Leaving " << pending.remote_addrs.size()
-                << " remote stage buffers pinned because "
-                << pending.remote_operations.size()
-                << " remote staging requests have not reached a confirmed "
-                   "terminal state";
-            continue;
+                << "Deferring cleanup of " << deferred_remote_buffers
+                << " remote stage buffers until their staging requests "
+                   "reach a terminal state";
         }
         for (auto& [server, addr] : pending.remote_addrs) {
-            ControlClient::unpinStageBuffer(server, addr);
+            const bool owned_by_pending_operation = std::any_of(
+                pending.remote_operations.begin(),
+                pending.remote_operations.end(), [&](const auto& operation) {
+                    return operation &&
+                           operation->ownsRemoteBuffer(server, addr);
+                });
+            if (!owned_by_pending_operation) {
+                ControlClient::unpinStageBuffer(server, addr);
+            }
         }
     }
     std::unique_lock<std::shared_mutex> guard(stage_buffers_mutex_);
@@ -225,10 +236,23 @@ void ProxyManager::submitRemoteStage(
     remote_stage.length = chunk_length;
     remote_stage.target_id = LOCAL_SEGMENT_ID;
     remote_stage.target_offset = request.target_offset + offset;
-    operation = std::make_shared<internal::RemoteStageOperation>();
+    operation = std::make_shared<internal::RemoteStageOperation>(
+        server_addr, remote_stage_buffer, [server_addr, remote_stage_buffer] {
+            ControlClient::unpinStageBufferAsync(
+                server_addr, remote_stage_buffer,
+                [server_addr, remote_stage_buffer](Status status) {
+                    if (!status.ok()) {
+                        LOG(WARNING)
+                            << "Failed to unpin deferred remote stage buffer "
+                            << remote_stage_buffer << " on " << server_addr
+                            << ": " << status;
+                    }
+                });
+        });
     ControlClient::delegateAsync(
-        server_addr, remote_stage,
-        [operation](Status status) { operation->complete(std::move(status)); });
+        server_addr, remote_stage, [operation](Status status, bool confirmed) {
+            operation->complete(std::move(status), confirmed);
+        });
 }
 
 Status ProxyManager::waitCrossStage(const Request& request,
@@ -684,8 +708,13 @@ Status ProxyManager::transferEventLoop(
                 }
                 auto result = operation->tryTakeResult();
                 if (result) {
+                    if (!result->confirmed) {
+                        chunk.state = StageState::FAILED;
+                        event_queue.push(id);
+                        break;
+                    }
                     operation.reset();
-                    if (!result->ok()) {
+                    if (!result->status.ok()) {
                         chunk.state = StageState::FAILED;
                         event_queue.push(id);
                         break;
