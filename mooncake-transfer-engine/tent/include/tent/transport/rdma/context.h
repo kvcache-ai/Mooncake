@@ -95,7 +95,7 @@ class RdmaContext {
     const std::string name() const { return device_name_; }
 
    public:
-    uint16_t lid() const { return lid_; }
+    uint32_t lid() const { return lid_; }
 
     std::string gid() const;
 
@@ -145,7 +145,7 @@ class RdmaContext {
     size_t num_comp_channel_ = 0;
     std::vector<ibv_comp_channel *> comp_channel_;
 
-    uint16_t lid_ = 0;
+    uint32_t lid_ = 0;
     int gid_index_ = -1;
     ibv_gid gid_;
 
