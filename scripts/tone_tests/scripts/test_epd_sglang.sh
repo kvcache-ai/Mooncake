@@ -17,7 +17,7 @@ start_epd_component()
     local component_type=$1  # encoder，prefill, decode
     local model_name=$2
     local model_name_clean=$3
-    
+
     local host
     local port
     local log_path
@@ -25,14 +25,18 @@ start_epd_component()
     local extra_args
     local ready_pattern
     local rdma_device=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}
-    
+
     case $component_type in
         "encoder")
             host=$LOCAL_IP
             port=30000
             log_path="/test_run/run/logs/$test_case_name/$model_name_clean/encoder.log"
             pid_suffix="encoder"
-            extra_args="--encoder-only --encoder-transfer-backend mooncake --mooncake-ib-device=${rdma_device} --tp-size 2 --base-gpu-id=${MOONCAKE_EPD_ENCODER_GPU_ID:-0}"
+            # The source test image is 2326x3495. Qwen2.5-VL expands it to
+            # roughly 41k vision tokens, which makes this smoke request exceed
+            # its client timeout on ROCm. Cap preprocessing at 672x672 pixels;
+            # this still exercises multimodal encoder-to-prefill transfer.
+            extra_args="--encoder-only --encoder-transfer-backend mooncake --mooncake-ib-device=${rdma_device} --tp-size 2 --base-gpu-id=${MOONCAKE_EPD_ENCODER_GPU_ID:-0} --mm-process-config '{\"image\":{\"max_pixels\":451584}}'"
             ready_pattern="Application startup complete."
             echo "Starting Encoder..."
             ;;
@@ -59,12 +63,12 @@ start_epd_component()
             return 1
             ;;
     esac
-    
+
     if ! launch_sglang_server "$model_name" "$host" "$port" "$log_path" "$pid_suffix" "$extra_args" "$ready_pattern"; then
         echo "ERROR: Failed to start $component_type"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -77,7 +81,7 @@ run_proxy()
         echo "ERROR: Failed to start SGLang Router"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -86,7 +90,7 @@ run_request()
     local model_name=$1
     local image_file_path=${2:-"${BASE_DIR}/assets/test_cat.jpg"}
     echo "===== Sending Test Request ====="
-    
+
     if [ ! -f "$image_file_path" ]; then
         echo "ERROR: Image file not found: $image_file_path"
         return 1
@@ -126,20 +130,20 @@ with open('$temp_json_file', 'w') as f:
 
 print("✓ JSON file generated successfully")
 EOF
-    
+
     if [ $? -ne 0 ]; then
         echo "ERROR: Failed to generate JSON request file"
         rm -f "$temp_json_file"
         return 1
     fi
-    
+
     curl_response=$(curl -s -w "\n%{http_code}" -X POST http://127.0.0.1:8000/v1/chat/completions \
       -H "Content-Type: application/json" \
       -d @$temp_json_file \
       --max-time 60)
-    
+
     rm -f "$temp_json_file"
-    
+
     response_body=$(echo "$curl_response" | head -n -1)
     status_code=$(echo "$curl_response" | tail -n 1)
     echo "Curl Response:"
@@ -167,7 +171,7 @@ start_local_components()
     local model_name=$1
     local model_name_clean=$2
     local components=("encoder" "prefill")
-    
+
     for component in "${components[@]}"; do
         start_epd_component "$component" "$model_name" "$model_name_clean" || return 1
     done
@@ -178,12 +182,12 @@ start_remote_decode()
 {
     local model_name=$1
     local model_name_clean=$2
-    
+
     if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_component decode $model_name $model_name_clean"; then
         echo "ERROR: Failed to start remote decode component"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -193,9 +197,9 @@ run_single_model()
     local model_name_clean=$(sanitize_model_name "$model_name")
 
     setup_log_directory_dual "$test_case_name" "$model_name_clean"
-    
+
     echo "===== Run MODEL NAME: $model_name ====="
-    
+
     # Encoders → Local Prefill → Remote Decode → Router → Test
     if start_local_components "$model_name" "$model_name_clean" && \
        start_remote_decode "$model_name" "$model_name_clean" && \
@@ -222,7 +226,7 @@ run_test()
         echo "ERROR: Please specify LOCAL_IP and REMOTE_IP"
         return 1
     fi
-    
+
     echo "===== Running EPD test case: $test_case_name for all supported models ====="
 
     local test_failed=false
@@ -236,14 +240,14 @@ run_test()
     if [ "$test_failed" = true ]; then
         return 1
     fi
-    
+
     return 0
 }
 
 parse()
 {
     echo "===== Parsing test results ====="
-    
+
     if collect_and_validate_model_results "SUPPORT_MODELS" "sglang_server_decode.log" "$test_case_name" "cat|kitten|feline"; then
         save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
         echo "✓ Test PASSED"
