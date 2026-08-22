@@ -22,7 +22,7 @@
 #include "ha_recovery_manager.h"
 #include "peer_client.h"
 #include "p2p_client_metric.h"
-#include "p2p_master_client.h"
+#include "p2p/master/p2p_master_client.h"
 #include "route_cache.h"
 #include "task_handle.h"
 

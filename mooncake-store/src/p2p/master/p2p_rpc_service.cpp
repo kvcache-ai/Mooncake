@@ -1,5 +1,5 @@
-#include "p2p_rpc_service.h"
-#include "p2p_master_metric_manager.h"
+#include "p2p/master/p2p_rpc_service.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 #include "rpc_helper.h"
 #include <csignal>
 

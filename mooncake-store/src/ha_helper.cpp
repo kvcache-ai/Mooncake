@@ -2,7 +2,7 @@
 #include "etcd_helper.h"
 #include "centralized_rpc_service.h"
 #include "ha/oplog/p2p_hot_standby_service.h"
-#include "p2p_rpc_service.h"
+#include "p2p/master/p2p_rpc_service.h"
 #include "rpc_service.h"
 #include "utils.h"
 #ifdef STORE_USE_REDIS

@@ -24,6 +24,11 @@ include_directories(
     ${ETCD_WRAPPER_INCLUDE}
 )
 
+# Until base-class inheritance is severed (Phase 2) and centralized code is
+# restored (Phase 3), the two static archives have circular symbol references;
+# RESCAN lets the linker iterate the group until everything resolves.
+set(MOONCAKE_STORE_LIBS $<LINK_GROUP:RESCAN,mooncake_store,mooncake_store_p2p>)
+
 # Add subdirectories
 add_subdirectory(src)
 

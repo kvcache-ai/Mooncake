@@ -15,11 +15,9 @@ set(MOONCAKE_STORE_SOURCES
     types.cpp
     master_client.cpp
     centralized_master_client.cpp
-    p2p_master_client.cpp
     utils.cpp
     master_metric_manager.cpp
     centralized_master_metric_manager.cpp
-    p2p_master_metric_manager.cpp
     client_metrics_aggregator.cpp
     storage_backend.cpp
     thread_pool.cpp
@@ -32,15 +30,12 @@ set(MOONCAKE_STORE_SOURCES
     centralized_client_manager.cpp
     centralized_client_meta.cpp
     p2p_client_manager.cpp
-    p2p_master_service.cpp
     p2p_client_meta.cpp
-    p2p_segment_manager.cpp
     transfer_task.cpp
     etcd_helper.cpp
     ha_helper.cpp
     rpc_service.cpp
     centralized_rpc_service.cpp
-    p2p_rpc_service.cpp
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
@@ -166,6 +161,20 @@ target_link_libraries(mooncake_store
         transfer_engine
 )
 
+# P2P architecture library (P2P split, Phase 1). Transitional state: it still
+# links the whole mooncake_store because base-class inheritance is severed only
+# in Phase 2; the leaf-only layering constraint (§3.2) is enforced in Phase 3.
+set(MOONCAKE_STORE_P2P_SOURCES
+    p2p/master/p2p_master_service.cpp
+    p2p/master/p2p_master_client.cpp
+    p2p/master/p2p_master_metric_manager.cpp
+    p2p/master/p2p_segment_manager.cpp
+    p2p/master/p2p_rpc_service.cpp
+)
+
+add_library(mooncake_store_p2p ${MOONCAKE_STORE_P2P_SOURCES})
+target_link_libraries(mooncake_store_p2p PUBLIC mooncake_store)
+
 # Link Ascend ACL library if USE_ASCEND_CACHE_TIER is enabled
 if(USE_ASCEND_CACHE_TIER)
   # Try to find Ascend ACL library
@@ -244,7 +253,7 @@ if (USE_ASCEND_DIRECT)
 endif()
 
 if (BUILD_SHARED_LIBS)
-  install(TARGETS mooncake_store DESTINATION lib)
+  install(TARGETS mooncake_store mooncake_store_p2p DESTINATION lib)
 endif()
 
 # Master binary
@@ -262,7 +271,7 @@ endif()
 
 target_include_directories(mooncake_master PRIVATE ${MASTER_EXTRA_INCS})
 target_link_libraries(mooncake_master PRIVATE
-    mooncake_store
+    ${MOONCAKE_STORE_LIBS}
     cachelib_memory_allocator
     pthread
     ibverbs
@@ -282,7 +291,7 @@ target_link_options(mooncake_master PRIVATE -Os -s)
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
-target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine asio_shared)
+target_link_libraries(mooncake_client PRIVATE ${MOONCAKE_STORE_LIBS} transfer_engine asio_shared)
 target_compile_options(mooncake_client PRIVATE -Os)
 target_link_options(mooncake_client PRIVATE -Os -s)
 

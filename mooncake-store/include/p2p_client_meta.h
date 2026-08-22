@@ -5,8 +5,8 @@
 #include <optional>
 
 #include "client_meta.h"
-#include "p2p_segment_manager.h"
-#include "p2p_rpc_types.h"
+#include "p2p/master/p2p_segment_manager.h"
+#include "p2p/master/p2p_rpc_types.h"
 #include "heartbeat_type.h"
 
 namespace mooncake {

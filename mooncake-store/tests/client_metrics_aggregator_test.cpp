@@ -14,7 +14,7 @@
 
 #include "heartbeat_type.h"
 #include "p2p_client_metric.h"
-#include "p2p_master_metric_manager.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake {
 namespace test {

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "master_client.h"
-#include "p2p_rpc_types.h"
+#include "p2p/master/p2p_rpc_types.h"
 
 namespace mooncake {
 

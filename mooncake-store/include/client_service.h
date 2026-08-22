@@ -19,7 +19,7 @@
 #include "inflight_tracker.h"
 #include "transfer_engine.h"
 #include "types.h"
-#include "p2p_rpc_types.h"
+#include "p2p/master/p2p_rpc_types.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "master_client.h"

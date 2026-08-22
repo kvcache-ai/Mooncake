@@ -8,7 +8,7 @@
 #include <string>
 
 #include "master_metric_manager.h"
-#include "p2p_master_metric_manager.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 #include "heartbeat_type.h"
 
 namespace mooncake::test {

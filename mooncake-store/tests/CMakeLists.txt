@@ -1,7 +1,7 @@
 function(add_store_test name)
     add_executable(${name} ${ARGN})
     target_link_libraries(${name} PUBLIC
-        mooncake_store
+        ${MOONCAKE_STORE_LIBS}
         transfer_engine
         cachelib_memory_allocator
         ${ETCD_WRAPPER_LIB}
@@ -97,13 +97,13 @@ add_store_test(p2p_oplog_test
 add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)
-target_link_libraries(high_availability_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
+target_link_libraries(high_availability_test PUBLIC ${MOONCAKE_STORE_LIBS} transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
 if (STORE_USE_ETCD)
     add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
 
 add_executable(redis_election_helper_test redis_election_helper_test.cpp)
-target_link_libraries(redis_election_helper_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
+target_link_libraries(redis_election_helper_test PUBLIC ${MOONCAKE_STORE_LIBS} transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
 if(STORE_USE_REDIS)
     add_test(NAME redis_election_helper_test COMMAND redis_election_helper_test)
 endif()
@@ -114,7 +114,7 @@ endif()
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(stress_workload_test PUBLIC
-    mooncake_store
+    ${MOONCAKE_STORE_LIBS}
     transfer_engine
     cachelib_memory_allocator
     ${ETCD_WRAPPER_LIB}

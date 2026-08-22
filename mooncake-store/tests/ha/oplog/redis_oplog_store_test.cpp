@@ -16,7 +16,7 @@
 #include "ha/oplog/oplog_store_factory.h"
 #include "ha/oplog/redis_oplog_store.h"
 #include "ha/oplog/p2p_standby_snapshot_service.h"
-#include "p2p_master_service.h"
+#include "p2p/master/p2p_master_service.h"
 #include "redis_util.h"
 #include "../../redis_test_utils.h"
 

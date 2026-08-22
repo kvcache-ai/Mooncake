@@ -22,7 +22,7 @@
 #define private public
 #define protected public
 #include "p2p_client_service.h"
-#include "p2p_master_service.h"
+#include "p2p/master/p2p_master_service.h"
 #include "master_service.h"
 #undef protected
 #undef private

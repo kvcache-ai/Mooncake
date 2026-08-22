@@ -4,7 +4,7 @@
 #include <glog/logging.h>
 #include <limits>
 
-#include "p2p_master_metric_manager.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake {
 P2PClientMeta::P2PClientMeta(const UUID& client_id,

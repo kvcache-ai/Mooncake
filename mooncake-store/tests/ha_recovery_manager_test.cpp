@@ -34,7 +34,7 @@
 #undef private
 
 #include "async_metadata_notifier.h"
-#include "p2p_master_client.h"
+#include "p2p/master/p2p_master_client.h"
 #include "tiered_cache/tiered_backend.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"

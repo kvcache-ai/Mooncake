@@ -45,7 +45,7 @@
 #include "centralized_master_client.h"
 #include "master_client.h"
 #include "master_config.h"
-#include "p2p_master_client.h"
+#include "p2p/master/p2p_master_client.h"
 #include "rpc_types.h"
 #include "test_p2p_server_helpers.h"
 #include "test_server_helpers.h"

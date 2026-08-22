@@ -11,7 +11,7 @@
 
 #include "async_metadata_notifier.h"
 #include "data_manager.h"
-#include "p2p_master_client.h"
+#include "p2p/master/p2p_master_client.h"
 #include "types.h"
 
 namespace mooncake {

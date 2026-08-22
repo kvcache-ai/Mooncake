@@ -1,4 +1,4 @@
-#include "p2p_master_service.h"
+#include "p2p/master/p2p_master_service.h"
 
 #include <glog/logging.h>
 #include <algorithm>
@@ -10,7 +10,7 @@
 #include "ha/oplog/oplog_store_factory.h"
 #include "p2p_client_meta.h"
 #include "ha_metric_manager.h"
-#include "p2p_master_metric_manager.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake {
 

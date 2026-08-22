@@ -7,10 +7,10 @@
 
 #define private public
 #define protected public
-#include "p2p_segment_manager.h"
+#include "p2p/master/p2p_segment_manager.h"
 #undef private
 #undef protected
-#include "p2p_master_metric_manager.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake {
 
