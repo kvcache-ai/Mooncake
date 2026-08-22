@@ -237,16 +237,6 @@ Status Topology::parse(const std::string& json_content) {
 
 namespace {
 
-Topology::MemType memTypeFromLocation(const std::string& location) {
-    LocationParser parser(location);
-    const auto type = parser.type();
-    if (type == "cpu") return Topology::MEM_HOST;
-    if (type == "cuda" || type == "gpu") return Topology::MEM_CUDA;
-    if (type == "rocm") return Topology::MEM_ROCM;
-    if (type == "ascend") return Topology::MEM_ASCEND;
-    return Topology::MEM_UNKNOWN;
-}
-
 Topology::NicID ensureNic(
     Topology& topo, const std::string& name,
     std::unordered_map<std::string, Topology::NicID>* ids) {

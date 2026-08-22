@@ -121,6 +121,10 @@ TENT accepts the same classic Transfer Engine priority-matrix JSON format:
 }
 ```
 
+Keys must match discovered location names (`cpu:N`, `cuda:N`, `hip:N` on AMD).
+TENT accepts the legacy AMD prefix `rocm:N` when parsing matrices so existing
+configs keep working; discovery and dumps emit `hip:N`, matching classic TE.
+
 Preferred HCAs map to topology rank 0; available/fallback HCAs map to rank 1.
 
 Configuration priority (highest first):
@@ -593,7 +597,7 @@ using Location = std::string;
 const static std::string kWildcardLocation = "*";
 ```
 
-Location strings identify device affinity: `"cpu:0"`, `"cuda:0"`, `"cuda:1"`, etc. Use `"*"` for automatic detection.
+Location strings identify device affinity: `"cpu:0"`, `"cuda:0"`, `"hip:0"`, etc. Use `"*"` for automatic detection. On AMD GPUs the canonical prefix is `hip:` (same as classic TE). The legacy TENT prefix `rocm:` is still accepted when parsing locations and custom NIC matrices.
 
 ### TransportType
 
