@@ -8,13 +8,13 @@
 #include <thread>
 #include <vector>
 
-#include "tiered_cache/tiers/cache_tier.h"
-#include "tiered_cache/tiered_backend.h"
+#include "p2p/tiered_cache/tiers/cache_tier.h"
+#include "p2p/tiered_cache/tiered_backend.h"
 #include "utils/common.h"
 #include "types.h"
 
 #ifdef USE_ASCEND_CACHE_TIER
-#include "tiered_cache/tiers/ascend_tier.h"
+#include "p2p/tiered_cache/tiers/ascend_tier.h"
 #endif
 
 // Helper function to parse JSON string using thread-safe CharReaderBuilder

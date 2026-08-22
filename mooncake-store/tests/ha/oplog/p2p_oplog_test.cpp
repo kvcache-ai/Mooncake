@@ -1,4 +1,4 @@
-#include "ha/oplog/p2p_oplog_types.h"
+#include "p2p/ha/oplog/p2p_oplog_types.h"
 
 #include <gtest/gtest.h>
 

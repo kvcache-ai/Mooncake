@@ -1,7 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "tiered_cache/event_driven_scheduler/frequency_sketch.h"
+#include "p2p/tiered_cache/event_driven_scheduler/frequency_sketch.h"
 
 namespace mooncake {
 namespace {

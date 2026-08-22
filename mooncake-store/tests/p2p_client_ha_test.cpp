@@ -5,7 +5,7 @@
 #undef protected
 
 #ifdef STORE_USE_REDIS
-#include "redis_election_helper.h"
+#include "p2p/ha/redis_election_helper.h"
 #endif
 
 namespace mooncake {

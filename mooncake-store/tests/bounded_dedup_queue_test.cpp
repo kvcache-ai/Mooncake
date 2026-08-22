@@ -6,8 +6,8 @@
 #include <thread>
 #include <vector>
 
-#include "tiered_cache/event_driven_scheduler/bounded_dedup_queue.h"
-#include "tiered_cache/event_driven_scheduler/event_driven_policy.h"
+#include "p2p/tiered_cache/event_driven_scheduler/bounded_dedup_queue.h"
+#include "p2p/tiered_cache/event_driven_scheduler/event_driven_policy.h"
 
 namespace mooncake {
 namespace {

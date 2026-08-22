@@ -1,4 +1,4 @@
-#include "ha/oplog/p2p_oplog_applier.h"
+#include "p2p/ha/oplog/p2p_oplog_applier.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -10,9 +10,9 @@
 #include <thread>
 #include <vector>
 
-#include "ha/oplog/oplog_manager.h"
-#include "ha/oplog/p2p_oplog_types.h"
-#include "ha/oplog/p2p_standby_metadata_store.h"
+#include "p2p/ha/oplog/oplog_manager.h"
+#include "p2p/ha/oplog/p2p_oplog_types.h"
+#include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 #include "mock_oplog_store.h"
 #include "types.h"
 

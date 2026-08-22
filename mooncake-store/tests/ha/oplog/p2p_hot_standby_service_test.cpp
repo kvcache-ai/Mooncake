@@ -1,4 +1,4 @@
-#include "ha/oplog/p2p_hot_standby_service.h"
+#include "p2p/ha/oplog/p2p_hot_standby_service.h"
 
 #include <unistd.h>
 
@@ -14,7 +14,7 @@
 
 #include <xxhash.h>
 
-#include "ha/oplog/localfs_oplog_store.h"
+#include "p2p/ha/oplog/localfs_oplog_store.h"
 #include "mock_oplog_store.h"
 #include "p2p/master/p2p_master_service.h"
 #include "p2p/master/p2p_rpc_service.h"

@@ -1,4 +1,4 @@
-#include "ha/oplog/p2p_standby_metadata_store.h"
+#include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 
 #include <gtest/gtest.h>
 

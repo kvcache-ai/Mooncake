@@ -37,36 +37,7 @@ set(MOONCAKE_STORE_SOURCES
     dummy_client.cpp
     http_metadata_server.cpp
     file_storage.cpp
-    tiered_cache/copier_registry.cpp
-    tiered_cache/data_copier.cpp
-    tiered_cache/tiered_backend.cpp
-    ha_recovery_manager.cpp
-    tiered_cache/tiers/dram_tier.cpp
-    tiered_cache/tiers/storage_tier.cpp
-    tiered_cache/scheduler/simple_policy.cpp
-    tiered_cache/scheduler/lru_policy.cpp
-    tiered_cache/scheduler/client_scheduler.cpp
-    tiered_cache/scheduler/scheduler_factory.cpp
-    tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
-    tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
-    tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
     task_manager.cpp
-    # HA OpLog components (ported from main branch)
-    ha/oplog/oplog_manager.cpp
-    ha/oplog/oplog_serializer.cpp
-    ha/oplog/localfs_oplog_store.cpp
-    ha/oplog/polling_oplog_change_notifier.cpp
-    ha/oplog/oplog_store_factory.cpp
-    ha/oplog/oplog_applier.cpp
-    ha/oplog/oplog_replicator.cpp
-    # P2P HA OpLog components
-    ha/oplog/p2p_oplog_types.cpp
-    ha/oplog/p2p_oplog_applier.cpp
-    ha/oplog/p2p_standby_metadata_store.cpp
-    ha/oplog/p2p_hot_standby_service.cpp
-    ha/oplog/p2p_standby_snapshot_service.cpp
-    standby_state_machine.cpp
-    ha_metric_manager.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -76,10 +47,10 @@ if(STORE_USE_REDIS)
     find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h REQUIRED)
     find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
     message(STATUS "Found hiredis: include=${HIREDIS_INCLUDE_DIR} lib=${HIREDIS_LIB}")
-    list(APPEND MOONCAKE_STORE_SOURCES redis_util.cpp)
-    list(APPEND MOONCAKE_STORE_SOURCES redis_election_helper.cpp)
-    list(APPEND MOONCAKE_STORE_SOURCES redis_master_view_helper.cpp)
-    list(APPEND MOONCAKE_STORE_SOURCES ha/oplog/redis_oplog_store.cpp)
+    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/redis_util.cpp)
+    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/redis_election_helper.cpp)
+    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/redis_master_view_helper.cpp)
+    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/oplog/redis_oplog_store.cpp)
     list(APPEND EXTRA_LIBS ${HIREDIS_LIB})
 endif()
 
@@ -115,7 +86,7 @@ endif()
 
 # Ascend Cache Tier support
 if(USE_ASCEND_CACHE_TIER)
-  list(APPEND MOONCAKE_STORE_SOURCES tiered_cache/tiers/ascend_tier.cpp)
+  list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/tiered_cache/tiers/ascend_tier.cpp)
   message(STATUS "Ascend Cache Tier enabled")
 endif()
 
@@ -152,7 +123,7 @@ target_link_libraries(mooncake_store
 # P2P architecture library (P2P split, Phase 1). Transitional state: it still
 # links the whole mooncake_store because base-class inheritance is severed only
 # in Phase 2; the leaf-only layering constraint (§3.2) is enforced in Phase 3.
-set(MOONCAKE_STORE_P2P_SOURCES
+list(APPEND MOONCAKE_STORE_P2P_SOURCES
     p2p/master/p2p_master_service.cpp
     p2p/master/p2p_master_client.cpp
     p2p/master/p2p_master_metric_manager.cpp
@@ -170,6 +141,33 @@ set(MOONCAKE_STORE_P2P_SOURCES
     p2p/client/async_metadata_notifier.cpp
     p2p/client/client_metrics_aggregator.cpp
     p2p/client/runtime_config_store.cpp
+    p2p/tiered_cache/copier_registry.cpp
+    p2p/tiered_cache/data_copier.cpp
+    p2p/tiered_cache/tiered_backend.cpp
+    p2p/tiered_cache/tiers/dram_tier.cpp
+    p2p/tiered_cache/tiers/storage_tier.cpp
+    p2p/tiered_cache/scheduler/simple_policy.cpp
+    p2p/tiered_cache/scheduler/lru_policy.cpp
+    p2p/tiered_cache/scheduler/client_scheduler.cpp
+    p2p/tiered_cache/scheduler/scheduler_factory.cpp
+    p2p/tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
+    p2p/tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
+    p2p/tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
+    p2p/ha/oplog/oplog_manager.cpp
+    p2p/ha/oplog/oplog_serializer.cpp
+    p2p/ha/oplog/localfs_oplog_store.cpp
+    p2p/ha/oplog/polling_oplog_change_notifier.cpp
+    p2p/ha/oplog/oplog_store_factory.cpp
+    p2p/ha/oplog/oplog_applier.cpp
+    p2p/ha/oplog/oplog_replicator.cpp
+    p2p/ha/oplog/p2p_oplog_types.cpp
+    p2p/ha/oplog/p2p_oplog_applier.cpp
+    p2p/ha/oplog/p2p_standby_metadata_store.cpp
+    p2p/ha/oplog/p2p_hot_standby_service.cpp
+    p2p/ha/oplog/p2p_standby_snapshot_service.cpp
+    p2p/ha/standby_state_machine.cpp
+    p2p/ha/ha_metric_manager.cpp
+    p2p/ha/ha_recovery_manager.cpp
 )
 
 add_library(mooncake_store_p2p ${MOONCAKE_STORE_P2P_SOURCES})

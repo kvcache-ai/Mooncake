@@ -17,7 +17,7 @@
 #include "p2p/client/p2p_client_service.h"
 #include "centralized_client_service.h"
 #ifdef STORE_USE_REDIS
-#include "redis_master_view_helper.h"
+#include "p2p/ha/redis_master_view_helper.h"
 #endif
 #include <ylt/coro_http/coro_http_client.hpp>
 

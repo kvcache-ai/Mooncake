@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "tiered_cache/tiers/cache_tier.h"
+#include "p2p/tiered_cache/tiers/cache_tier.h"
 
 namespace mooncake {
 
