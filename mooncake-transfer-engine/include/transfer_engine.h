@@ -210,8 +210,8 @@ class TransferEngine {
 
     BatchID allocateBatchID(size_t batch_size);
 
-    // An OK or BatchBusy return invalidates batch_id. BatchBusy means physical
-    // cleanup is deferred and in-flight transport work may still own buffers.
+    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
+    // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);

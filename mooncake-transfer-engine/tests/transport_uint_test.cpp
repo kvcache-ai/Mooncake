@@ -88,9 +88,9 @@ class TransferEngineImplTestPeer {
         task.transport_ = task_transport;
     }
 
-    static Transport::Slice* prepareAgedSliceBatch(
-        MultiTransport& transport, Transport::BatchID batch_id,
-        int64_t slice_age_ns) {
+    static Transport::Slice* prepareAgedSliceBatch(MultiTransport& transport,
+                                                   Transport::BatchID batch_id,
+                                                   int64_t slice_age_ns) {
         auto& batch = Transport::toBatchDesc(batch_id);
         auto& task = batch.task_list.emplace_back();
         task.batch_id = batch_id;
@@ -418,7 +418,10 @@ TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
     EXPECT_EQ(status.s, Transport::TransferStatusEnum::TIMEOUT);
 
     Status free_status = multi_transport.freeBatchID(batch_id);
-    EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
+    EXPECT_EQ(free_status.ToString(),
+              "BatchCleanupDeferred: BatchID is invalid because cleanup has "
+              "been deferred");
     EXPECT_EQ(free_status.message(),
               "BatchID is invalid because cleanup has been deferred");
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
@@ -445,7 +448,7 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
                                                  &task_transport);
 
     Status free_status = multi_transport.freeBatchID(batch_id);
-    EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
     EXPECT_EQ(free_status.message(),
               "BatchID is invalid because cleanup has been deferred");
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
@@ -472,7 +475,7 @@ TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
         multi_transport, batch_id);
 
     Status free_status = multi_transport.freeBatchID(batch_id);
-    EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
     EXPECT_EQ(free_status.message(),
               "BatchID is invalid because cleanup has been deferred");
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,

@@ -1330,7 +1330,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
 
         if (remaining_ != 0) return;
         auto free_status = freeBatch(batch_id_);
-        if (!free_status.ok() && !free_status.IsBatchBusy())
+        if (!free_status.ok() && !free_status.IsBatchCleanupDeferred())
             remember(free_status);
         batch_id_ = INVALID_BATCH_ID;
         finish();
