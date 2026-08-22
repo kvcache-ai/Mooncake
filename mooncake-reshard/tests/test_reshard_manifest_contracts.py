@@ -83,9 +83,9 @@ def test_legacy_model_weight_namespace_is_not_installed():
     assert find_spec("mooncake.model_weight") is None
 
 
-def test_kv_cache_is_reserved_without_a_manifest_implementation():
+def test_kv_cache_specialization_is_installed_under_reshard():
     assert ResourceKind.KV_CACHE.value == "kv_cache"
-    assert find_spec("mooncake.reshard.kv_cache") is None
+    assert find_spec("mooncake.reshard.kv_cache") is not None
 
 
 def test_weight_placement_json_has_a_strict_resource_kind():
