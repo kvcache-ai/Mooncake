@@ -1535,7 +1535,8 @@ class MasterService {
         uint64_t pending_quota_charge_bytes{0};
         UUID dynamic_replication_lease_id{};
         uint64_t dynamic_replication_version_epoch{0};
-        bool durable_cleanup_pending{false};
+        uint64_t durable_cleanup_generation{0};
+        bool source_removed{false};
     };
 
     struct OffloadingTask {
@@ -1881,7 +1882,8 @@ class MasterService {
         MetadataShardAccessorRW* shard);
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
+        uint64_t replication_cleanup_generation = 0);
     void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
                                            QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
@@ -1892,7 +1894,8 @@ class MasterService {
         const std::vector<ReplicaID>& target_ids,
         const UUID& dynamic_replication_lease_id,
         uint64_t dynamic_replication_version_epoch,
-        const std::chrono::system_clock::time_point& ttl);
+        const std::chrono::system_clock::time_point& ttl,
+        uint64_t cleanup_generation);
     struct StaleHandleCleanupPlan {
         std::vector<ReplicaID> removed_ids;
         std::vector<Replica::Descriptor> remaining;
@@ -1906,8 +1909,8 @@ class MasterService {
         const std::function<bool(const Replica&)>& is_stale) const;
     tl::expected<void, ErrorCode> PersistStaleHandleCleanupForHA(
         const std::string& why, const TenantId& tenant_id,
-        const std::string& key, ObjectMetadata& metadata,
-        const StaleHandleCleanupPlan& plan);
+        const std::string& key, TenantState& tenant_state,
+        ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
@@ -2071,6 +2074,10 @@ class MasterService {
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
+    void CancelReplicationTaskForRemovedSource(
+        TenantState& tenant_state, ObjectMetadata& metadata,
+        const std::vector<ReplicaID>& removed_replica_ids,
+        uint64_t cleanup_generation = 0) NO_THREAD_SAFETY_ANALYSIS;
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -2156,6 +2163,8 @@ class MasterService {
                     &removed_replica_ids);
                 service_->CancelPromotionTaskForRemovedReplicas(
                     *tenant_state_, it_->second, removed_replica_ids);
+                service_->CancelReplicationTaskForRemovedSource(
+                    *tenant_state_, it_->second, removed_replica_ids);
                 const uint64_t after_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
                 if (service_->enable_multi_tenants_ &&
@@ -2172,8 +2181,14 @@ class MasterService {
                             << ", bytes=" << before_charge - after_charge;
                     }
                 }
-                // If no valid replicas remain, delete the whole object.
-                if (!it_->second.IsValid()) {
+                // If no valid replicas remain, delete the whole object unless
+                // a cancelled replication task still preserves End/Revoke
+                // protocol semantics.
+                const bool preserve_cancelled_replication =
+                    replication_task_it_ !=
+                        tenant_state_->replication_tasks.end() &&
+                    replication_task_it_->second.source_removed;
+                if (!it_->second.IsValid() && !preserve_cancelled_replication) {
                     // NOTE: Erase() -> EraseMetadata() already removes the key
                     // from processing_keys (by key), so calling
                     // EraseFromProcessing() here would re-erase the same node
@@ -2419,6 +2434,7 @@ class MasterService {
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
+    std::atomic<uint64_t> next_replication_cleanup_generation_{1};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
     // boost lockfree queue requires trivial assignment operator

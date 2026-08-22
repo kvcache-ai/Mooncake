@@ -1802,7 +1802,7 @@ tl::expected<void, ErrorCode> MasterService::SettlePrimaryWriteQuotaIfReady(
 
 void MasterService::FinalizeRemovedReplicasAfterDurable(
     const OpLogEntry& durable_entry, const std::vector<ReplicaID>& replica_ids,
-    QuotaEraseMode quota_mode) {
+    QuotaEraseMode quota_mode, uint64_t replication_cleanup_generation) {
     if (replica_ids.empty()) {
         return;
     }
@@ -1820,6 +1820,15 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     auto metadata_it = tenant_state.metadata.find(durable_entry.object_key);
     if (metadata_it == tenant_state.metadata.end()) {
         return;
+    }
+    if (replication_cleanup_generation != 0) {
+        auto task_it =
+            tenant_state.replication_tasks.find(durable_entry.object_key);
+        if (task_it == tenant_state.replication_tasks.end() ||
+            task_it->second.durable_cleanup_generation !=
+                replication_cleanup_generation) {
+            return;
+        }
     }
 
     std::unordered_set<ReplicaID> ids(replica_ids.begin(), replica_ids.end());
@@ -1876,7 +1885,15 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     }
     CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
                                           erased_replica_ids);
+    CancelReplicationTaskForRemovedSource(tenant_state, metadata,
+                                          erased_replica_ids,
+                                          replication_cleanup_generation);
     if (!metadata.IsValid()) {
+        auto task_it = tenant_state.replication_tasks.find(metadata.user_key);
+        if (task_it != tenant_state.replication_tasks.end() &&
+            task_it->second.source_removed) {
+            return;
+        }
         EraseMetadata(tenant_state, metadata_it, tenant_id, quota_mode, &shard);
         if (tenant_state.Empty()) {
             shard->tenants.erase(tenant_it);
@@ -1947,7 +1964,8 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
     const std::vector<ReplicaID>& target_ids,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch,
-    const std::chrono::system_clock::time_point& ttl) {
+    const std::chrono::system_clock::time_point& ttl,
+    uint64_t cleanup_generation) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
     MetadataAccessorRW accessor(this, MakeObjectIdentityForRequest(
@@ -1960,8 +1978,8 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
         return;
     }
     auto& task = accessor.GetReplicationTask();
-    if (!task.durable_cleanup_pending || task.source_id != source_id ||
-        task.replica_ids != target_ids ||
+    if (task.durable_cleanup_generation != cleanup_generation ||
+        task.source_id != source_id || task.replica_ids != target_ids ||
         task.dynamic_replication_lease_id != dynamic_replication_lease_id ||
         task.dynamic_replication_version_epoch !=
             dynamic_replication_version_epoch) {
@@ -2041,7 +2059,8 @@ MasterService::BuildStaleHandleCleanupPlan(
 
 tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     const std::string& why, const TenantId& tenant_id, const std::string& key,
-    ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan) {
+    TenantState& tenant_state, ObjectMetadata& metadata,
+    const StaleHandleCleanupPlan& plan) {
     if (plan.removed_ids.empty() || !enable_oplog_) {
         return {};
     }
@@ -2053,29 +2072,49 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
                               : SerializeMetadataForOpLogFromReplicaDescriptors(
                                     metadata, plan.remaining);
 
+    const std::unordered_set<ReplicaID> ids(plan.removed_ids.begin(),
+                                            plan.removed_ids.end());
+    auto task_it = tenant_state.replication_tasks.find(key);
+    const bool removes_replication_source =
+        task_it != tenant_state.replication_tasks.end() &&
+        ids.contains(task_it->second.source_id);
+    if (removes_replication_source &&
+        task_it->second.durable_cleanup_generation != 0) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     auto reservation = ReserveBatchOpLogSlot();
     if (!reservation) {
         return tl::make_unexpected(reservation.error());
     }
-    const std::unordered_set<ReplicaID> ids(plan.removed_ids.begin(),
-                                            plan.removed_ids.end());
-    metadata.VisitReplicas(
-        [&ids](const Replica& replica) { return ids.contains(replica.id()); },
-        [](Replica& replica) { replica.mark_removed(); });
+    uint64_t cleanup_generation = 0;
+    if (removes_replication_source) {
+        cleanup_generation = next_replication_cleanup_generation_.fetch_add(
+            1, std::memory_order_relaxed);
+        task_it->second.durable_cleanup_generation = cleanup_generation;
+    }
     auto result = AppendReservedOpLogWithDurableFinalize(
         std::move(reservation.value()), op_type, tenant_id.value(), key,
         payload,
-        [this,
-         removed_ids = plan.removed_ids](const OpLogEntry& durable_entry) {
+        [this, removed_ids = plan.removed_ids,
+         cleanup_generation](const OpLogEntry& durable_entry) {
             FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
-                                                QuotaEraseMode::kFull);
+                                                QuotaEraseMode::kFull,
+                                                cleanup_generation);
         });
     if (!result) {
+        if (removes_replication_source &&
+            task_it->second.durable_cleanup_generation == cleanup_generation) {
+            task_it->second.durable_cleanup_generation = 0;
+        }
         LOG(WARNING) << why
                      << ": stale cleanup OpLog queue failed for key=" << key
                      << ", err=" << static_cast<int>(result.error());
         return tl::make_unexpected(result.error());
     }
+    metadata.VisitReplicas(
+        [&ids](const Replica& replica) { return ids.contains(replica.id()); },
+        [](Replica& replica) { replica.mark_removed(); });
     return {};
 }
 
@@ -2528,7 +2567,8 @@ void MasterService::ClearStaleHandles(
                             auto persist_result =
                                 PersistStaleHandleCleanupForHA(
                                     "ClearStaleHandles", tenant_it->first,
-                                    it->first, it->second, cleanup_plan);
+                                    it->first, tenant_state, it->second,
+                                    cleanup_plan);
                             if (!persist_result) {
                                 ++it;
                                 continue;
@@ -2545,6 +2585,13 @@ void MasterService::ClearStaleHandles(
                         ++it;
                     }
                 } else if (!it->second.IsValid()) {
+                    auto task_it = tenant_state.replication_tasks.find(
+                        it->second.user_key);
+                    if (task_it != tenant_state.replication_tasks.end() &&
+                        task_it->second.source_removed) {
+                        ++it;
+                        continue;
+                    }
                     if (enable_ha_) {
                         if (enable_oplog_) {
                             auto persist_result =
@@ -4397,7 +4444,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "PutStart(stale cleanup)", object_id.tenant_id, key,
-                        it->second, cleanup_plan);
+                        tenant_state, it->second, cleanup_plan);
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
                     }
@@ -5065,7 +5112,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "UpsertStart(stale cleanup)", object_id.tenant_id, key,
-                        it->second, cleanup_plan);
+                        tenant_state, it->second, cleanup_plan);
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
                     }
@@ -5797,7 +5844,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
-    if (!accessor.Exists()) {
+    const bool object_exists = accessor.Exists();
+    if (!object_exists && !accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -5819,7 +5867,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         LOG(ERROR) << "Ongoing replication task type is MOVE instead of COPY";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (task.durable_cleanup_pending) {
+    if (task.durable_cleanup_generation) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (task.dynamic_replication_lease_id != dynamic_replication_lease_id ||
@@ -5828,6 +5876,10 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         LOG(ERROR) << "key=" << key
                    << ", error=dynamic_replication_token_mismatch";
         return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    if (!object_exists && task.source_removed) {
+        accessor.Erase();
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
 
     auto& metadata = accessor.Get();
@@ -5969,7 +6021,8 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
-    if (!accessor.Exists()) {
+    const bool object_exists = accessor.Exists();
+    if (!object_exists && !accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -5991,7 +6044,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
         LOG(ERROR) << "Ongoing replication task type is MOVE instead of COPY";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (task.durable_cleanup_pending) {
+    if (task.durable_cleanup_generation) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (task.dynamic_replication_lease_id != dynamic_replication_lease_id ||
@@ -6000,6 +6053,10 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
         LOG(ERROR) << "key=" << key
                    << ", error=dynamic_replication_token_mismatch";
         return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    if (!object_exists && task.source_removed) {
+        accessor.Erase();
+        return {};
     }
 
     auto& metadata = accessor.Get();
@@ -6166,7 +6223,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
-    if (!accessor.Exists()) {
+    const bool object_exists = accessor.Exists();
+    if (!object_exists && !accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -6187,6 +6245,13 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     if (task.type != ReplicationTask::Type::MOVE) {
         LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (task.durable_cleanup_generation) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (!object_exists && task.source_removed) {
+        accessor.Erase();
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
 
     auto& metadata = accessor.Get();
@@ -6351,7 +6416,8 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
-    if (!accessor.Exists()) {
+    const bool object_exists = accessor.Exists();
+    if (!object_exists && !accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -6372,6 +6438,13 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     if (task.type != ReplicationTask::Type::MOVE) {
         LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (task.durable_cleanup_generation) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (!object_exists && task.source_removed) {
+        accessor.Erase();
+        return {};
     }
 
     auto& metadata = accessor.Get();
@@ -6809,7 +6882,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             if (!cleanup_plan.removed_ids.empty()) {
                 auto persist_result = PersistStaleHandleCleanupForHA(
                     "BatchRemove(stale cleanup)", normalized_tenant, key,
-                    it->second, cleanup_plan);
+                    tenant_state, it->second, cleanup_plan);
                 if (!persist_result) {
                     results[original_idx] =
                         tl::make_unexpected(persist_result.error());
@@ -6937,6 +7010,53 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
                                        metadata.user_key);
 }
 
+void MasterService::CancelReplicationTaskForRemovedSource(
+    TenantState& tenant_state, ObjectMetadata& metadata,
+    const std::vector<ReplicaID>& removed_replica_ids,
+    uint64_t cleanup_generation) {
+    if (removed_replica_ids.empty()) return;
+
+    auto task_it = tenant_state.replication_tasks.find(metadata.user_key);
+    if (task_it == tenant_state.replication_tasks.end() ||
+        std::find(removed_replica_ids.begin(), removed_replica_ids.end(),
+                  task_it->second.source_id) == removed_replica_ids.end()) {
+        return;
+    }
+    if ((cleanup_generation == 0 &&
+         task_it->second.durable_cleanup_generation != 0) ||
+        (cleanup_generation != 0 &&
+         task_it->second.durable_cleanup_generation != cleanup_generation)) {
+        return;
+    }
+
+    const auto target_ids = task_it->second.replica_ids;
+    auto target_replicas = PopReplicasWithCacheTotalAccounting(
+        metadata, [&target_ids](const Replica& replica) {
+            return std::find(target_ids.begin(), target_ids.end(),
+                             replica.id()) != target_ids.end();
+        });
+    std::vector<ReplicaID> erased_target_ids;
+    erased_target_ids.reserve(target_replicas.size());
+    for (const auto& replica : target_replicas) {
+        erased_target_ids.push_back(replica.id());
+    }
+    RecordDynamicReplicaRemoval(metadata, erased_target_ids);
+    ReleaseLocalDiskUsage(target_replicas);
+    FreeDfsReplicas(metadata.user_key, target_replicas);
+    if (!target_replicas.empty()) {
+        const auto ttl =
+            task_it->second.start_time + put_start_release_timeout_sec_;
+        std::lock_guard lock(discarded_replicas_mutex_);
+        discarded_replicas_.emplace_back(std::move(target_replicas), ttl);
+    }
+    ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                       task_it->second.pending_quota_charge_bytes);
+    task_it->second.pending_quota_charge_bytes = 0;
+    task_it->second.durable_cleanup_generation = 0;
+    task_it->second.source_removed = true;
+    ClearDynamicReplicationStateForKey(tenant_state, metadata.user_key);
+}
+
 bool MasterService::CleanupStaleHandles(
     TenantState& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
@@ -6970,6 +7090,8 @@ bool MasterService::CleanupStaleHandles(
                                           &removed_replica_ids);
     CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
                                           removed_replica_ids);
+    CancelReplicationTaskForRemovedSource(tenant_state, metadata,
+                                          removed_replica_ids);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (enable_multi_tenants_ && before_charge > after_charge) {
         auto release_result = metadata.quota_ledger.ReleaseCommitted(
@@ -6985,8 +7107,11 @@ bool MasterService::CleanupStaleHandles(
         shard->OnDiskReplicaRemoved(had_completed_disk, metadata);
     }
 
-    // Return true if no valid replicas remain after cleanup
-    return !metadata.IsValid();
+    auto task_it = tenant_state.replication_tasks.find(metadata.user_key);
+    const bool preserve_cancelled_task =
+        task_it != tenant_state.replication_tasks.end() &&
+        task_it->second.source_removed;
+    return !metadata.IsValid() && !preserve_cancelled_task;
 }
 
 void MasterService::FreeDfsReplicas(const std::string& key,
@@ -9192,7 +9317,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
             const auto ttl =
                 task_it->second.start_time + put_start_release_timeout_sec_;
-            if (ttl > now || task_it->second.durable_cleanup_pending) {
+            if (ttl > now || task_it->second.durable_cleanup_generation) {
                 task_it++;
                 continue;
             }
@@ -9215,7 +9340,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
             if (had_complete_replica && enable_oplog_ &&
                 ordered_oplog_writer_) {
-                task_it->second.durable_cleanup_pending = true;
+                const uint64_t cleanup_generation =
+                    next_replication_cleanup_generation_.fetch_add(
+                        1, std::memory_order_relaxed);
+                task_it->second.durable_cleanup_generation = cleanup_generation;
                 tl::expected<OpLogEntry, ErrorCode> persist_result;
                 auto source_id = task_it->second.source_id;
                 auto target_ids = replica_ids;
@@ -9230,12 +9358,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         enable_oplog_
                             ? [this, source_id,
                                target_ids = std::move(target_ids),
-                               dynamic_lease_id, dynamic_version_epoch,
-                               ttl](const OpLogEntry& durable_entry) {
+                               dynamic_lease_id, dynamic_version_epoch, ttl,
+                               cleanup_generation](
+                                  const OpLogEntry& durable_entry) {
                                   FinalizeExpiredReplicationTaskAfterDurable(
                                       durable_entry, source_id, target_ids,
                                       dynamic_lease_id, dynamic_version_epoch,
-                                      ttl);
+                                      ttl, cleanup_generation);
                               }
                             : DurableFinalizeCallback{});
                 } else {
@@ -9247,12 +9376,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         enable_oplog_
                             ? [this, source_id,
                                target_ids = std::move(target_ids),
-                               dynamic_lease_id, dynamic_version_epoch,
-                               ttl](const OpLogEntry& durable_entry) {
+                               dynamic_lease_id, dynamic_version_epoch, ttl,
+                               cleanup_generation](
+                                  const OpLogEntry& durable_entry) {
                                   FinalizeExpiredReplicationTaskAfterDurable(
                                       durable_entry, source_id, target_ids,
                                       dynamic_lease_id, dynamic_version_epoch,
-                                      ttl);
+                                      ttl, cleanup_generation);
                               }
                             : DurableFinalizeCallback{});
                 }
@@ -9263,7 +9393,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         << task_it->first
                         << ", err=" << static_cast<int>(persist_result.error())
                         << ", deferring discard";
-                    task_it->second.durable_cleanup_pending = false;
+                    if (task_it->second.durable_cleanup_generation ==
+                        cleanup_generation) {
+                        task_it->second.durable_cleanup_generation = 0;
+                    }
                     ++task_it;
                     continue;
                 }
