@@ -65,11 +65,16 @@ class ShmTransportTestPeer {
 
 namespace {
 
+std::string uniqueShmName() {
+    static std::atomic<uint64_t> sequence{0};
+    return "/mooncake_tent_shm_test_" + std::to_string(getpid()) + "_" +
+           std::to_string(sequence.fetch_add(1));
+}
+
 class ScopedShmFile {
    public:
     explicit ScopedShmFile(size_t length)
-        : name_("/mooncake_tent_shm_test_" + std::to_string(getpid())),
-          length_(length) {
+        : name_(uniqueShmName()), length_(length) {
         shm_unlink(name_.c_str());
         fd_ = shm_open(name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
         EXPECT_GE(fd_, 0);
@@ -84,6 +89,13 @@ class ScopedShmFile {
     }
 
     const std::string& name() const { return name_; }
+
+    void fill(char value) {
+        ASSERT_GE(fd_, 0);
+        std::vector<char> contents(length_, value);
+        ASSERT_EQ(pwrite(fd_, contents.data(), contents.size(), 0),
+                  static_cast<ssize_t>(contents.size()));
+    }
 
    private:
     std::string name_;
@@ -362,6 +374,51 @@ TEST(ShmTransportTest, NeedsRefreshCacheKeepsExistingMappings) {
     unsigned char residency = 0;
     errno = 0;
     EXPECT_EQ(mincore(mapped, page_size, &residency), 0);
+
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(ShmTransportTest, RemapsReallocatedBufferAtSameRemoteAddress) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    constexpr uint64_t kRemoteAddress = 0x40000000;
+    ScopedShmFile first_generation(page_size);
+    ScopedShmFile second_generation(page_size);
+    first_generation.fill('A');
+    second_generation.fill('B');
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithShm(*metadata, first_generation.name(),
+                                           kRemoteAddress, page_size)
+                    .ok());
+
+    ShmTransport transport;
+    std::string local_segment_name = "shm_test_segment";
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, metadata, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+
+    uint64_t first_address = kRemoteAddress;
+    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, first_address, 1,
+                                               LOCAL_SEGMENT_ID)
+                    .ok());
+    ASSERT_EQ(*reinterpret_cast<char*>(first_address), 'A');
+
+    ASSERT_TRUE(installLocalSegmentWithShm(*metadata, second_generation.name(),
+                                           kRemoteAddress, page_size)
+                    .ok());
+
+    uint64_t second_address = kRemoteAddress;
+    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, second_address, 1,
+                                               LOCAL_SEGMENT_ID)
+                    .ok());
+    EXPECT_EQ(*reinterpret_cast<char*>(second_address), 'B');
+    EXPECT_NE(first_address, second_address);
+
+    unsigned char residency = 0;
+    EXPECT_EQ(
+        mincore(reinterpret_cast<void*>(first_address), page_size, &residency),
+        0);
 
     ASSERT_TRUE(transport.uninstall().ok());
 }
