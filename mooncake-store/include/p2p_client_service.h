@@ -9,6 +9,7 @@
 #include <thread>
 #include <utility>
 #include <coroutine>
+#include <async_simple/Executor.h>
 #include <async_simple/Future.h>
 #include <async_simple/Promise.h>
 #include <async_simple/Try.h>
@@ -352,17 +353,20 @@ class P2PClientService final : public ClientService {
         std::string endpoint;
         std::vector<Slice>* slices;
         TeTransferFn te_transfer;
+        async_simple::Executor* coro_executor = nullptr;
 
         RemoteForwardWriteOp(PeerClient* p, std::shared_ptr<P2PClientMetric> m,
                              std::shared_ptr<RemoteWriteRequest> wr,
                              std::string ep, std::vector<Slice>* s,
-                             TeTransferFn transfer)
+                             TeTransferFn transfer,
+                             async_simple::Executor* executor)
             : peer_ptr(p),
               metrics(m),
               write_req(std::move(wr)),
               endpoint(std::move(ep)),
               slices(s),
-              te_transfer(std::move(transfer)) {}
+              te_transfer(std::move(transfer)),
+              coro_executor(executor) {}
 
         std::string_view route() const override { return endpoint; }
         std::unique_ptr<TaskHandle<void>> Dispatch() override;
@@ -524,6 +528,8 @@ class P2PClientService final : public ClientService {
      * Thread-safe via peer_clients_mutex_.
      */
     PeerClient& GetOrCreatePeerClient(const std::string& endpoint);
+
+    async_simple::Executor* GetCoroExecutor() const;
 
    private:
     void OnHAEvent(HAEvent event) override;

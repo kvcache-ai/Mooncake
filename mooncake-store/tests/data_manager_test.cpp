@@ -2313,11 +2313,13 @@ TEST_F(DataManagerTest, TeAsyncPollWorkerCreatesPollExecutor) {
         MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/4);
     ASSERT_NE(with_pool, nullptr);
     EXPECT_NE(with_pool->te_poll_executor_, nullptr);
+    EXPECT_NE(with_pool->GetCoroExecutor(), nullptr);
 
     auto without_pool =
         MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/0);
     ASSERT_NE(without_pool, nullptr);
     EXPECT_EQ(without_pool->te_poll_executor_, nullptr);
+    EXPECT_NE(without_pool->GetCoroExecutor(), nullptr);
 }
 
 TEST_F(DataManagerTest, WaitAllTransferBatchesAsyncEmptySucceedsWithPollPool) {

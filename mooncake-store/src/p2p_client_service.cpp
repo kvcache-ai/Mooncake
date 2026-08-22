@@ -18,7 +18,6 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_io/coro_io.hpp>
 
-#include "te_wait_future.h"
 #include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
@@ -1030,7 +1029,7 @@ P2PClientService::CreatePutHandlesFromRoute(
         RunWriteWithRetry(std::move(promise), std::move(task.first_task),
                           std::move(task.first_op),
                           std::move(task.retry_op_list), keys[i], sizes[i])
-            .via(coro_io::get_global_executor())
+            .via(GetCoroExecutor())
             .start([](auto&&) {});
         handles.push_back(FutureHandle<void>::Create(std::shared_ptr<void>{},
                                                      std::move(future)));
@@ -1093,7 +1092,7 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                     };
                 write_ops.push_back(std::make_unique<RemoteForwardWriteOp>(
                     peer, metrics_, write_req, endpoint, &slices,
-                    std::move(te_transfer)));
+                    std::move(te_transfer), dm->GetCoroExecutor()));
             } else {
                 // segment_id is intentionally left unset: the write route is
                 // client-granular; the remote peer picks the concrete segment.
@@ -1159,7 +1158,8 @@ P2PClientService::RemoteForwardWriteOp::Dispatch() {
     auto future = promise->getFuture();
     RemoteForwardWriteOp::RunForwardRemotePut(
         std::move(promise), peer_ptr, metrics, te_transfer, write_req, slices)
-        .via(coro_io::get_global_executor())
+        .via(coro_executor != nullptr ? coro_executor
+                                      : coro_io::get_global_executor())
         .start([](auto&&) {});
     return FutureHandle<void>::Create(write_req, std::move(future));
 }
@@ -1775,7 +1775,7 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
 
     const uint64_t object_size = iter.object_size();
     RunReadWithRetry(std::move(iter), req, promise)
-        .via(coro_io::get_global_executor())
+        .via(GetCoroExecutor())
         .start([](auto&&) {});
 
     ReadTaskHandle res;
@@ -1827,7 +1827,8 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
             Transport::TransferRequest::READ);
     }
 
-    auto tr = co_await AwaitTeExpectedFuture(std::move(*transfer_fut));
+    auto tr = co_await AwaitExpectedFuture(std::move(*transfer_fut),
+                                           GetCoroExecutor());
     if (!tr) {
         LOG(ERROR) << "Forward TE read failed, key=" << req->key
                    << ", error=" << tr.error();
@@ -2454,6 +2455,15 @@ tl::expected<void, ErrorCode> P2PClientService::UnmountSegment(
 // PeerClient management
 // ============================================================================
 
+async_simple::Executor* P2PClientService::GetCoroExecutor() const {
+    if (data_manager_.has_value()) {
+        if (async_simple::Executor* ex = data_manager_->GetCoroExecutor()) {
+            return ex;
+        }
+    }
+    return coro_io::get_global_executor();
+}
+
 PeerClient& P2PClientService::GetOrCreatePeerClient(
     const std::string& endpoint) {
     std::lock_guard<std::mutex> lock(peer_clients_mutex_);
@@ -2514,7 +2524,7 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
 
         std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
         void* base = slices->front().ptr;
-        auto te = co_await AwaitTeExpectedFuture(
+        auto te = co_await AwaitExpectedFuture(
             te_transfer(base, slices->front().size, dest));
         if (!te) {
             LOG(ERROR) << "Forward TE write failed, key=" << write_req->key

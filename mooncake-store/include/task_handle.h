@@ -3,16 +3,45 @@
 #include <memory>
 
 #include <glog/logging.h>
+#include <async_simple/Executor.h>
 #include <async_simple/Future.h>
 #include <async_simple/Promise.h>
+#include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
+#include <ylt/coro_io/coro_io.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "te_wait_future.h"
 #include "types.h"
 
 namespace mooncake {
+
+// Await a Future and resume off the completing thread.
+// Prefer CurrentExecutor; if unbound (e.g. syncAwait without via), use
+// caller-provided fallback, then coro_io's global executor.
+template <typename V>
+inline async_simple::coro::Lazy<tl::expected<V, ErrorCode>>
+AwaitExpectedFuture(async_simple::Future<tl::expected<V, ErrorCode>> fut,
+                    async_simple::Executor* fallback_ex = nullptr) {
+    async_simple::Executor* ex = co_await async_simple::CurrentExecutor{};
+    if (ex == nullptr) {
+        ex = fallback_ex != nullptr ? fallback_ex
+                                    : coro_io::get_global_executor();
+        LOG(WARNING) << "AwaitExpectedFuture: no CurrentExecutor; resuming via "
+                     << (fallback_ex != nullptr
+                             ? "caller fallback executor"
+                             : "coro_io::get_global_executor()");
+    }
+    try {
+        co_return co_await std::move(fut).via(ex);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "AwaitExpectedFuture exception: " << e.what();
+        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    } catch (...) {
+        LOG(ERROR) << "AwaitExpectedFuture unknown exception";
+        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+}
 
 // ============================================================================
 // TaskHandle<V> — abstract base for pending operations.
@@ -85,10 +114,8 @@ class FutureHandle : public TaskHandle<V> {
         : request_storage_(std::move(request_storage)),
           future_(std::move(future)) {}
 
-    // Block the caller on the Future itself. Do not syncAwait(WaitAsync()):
-    // that would resume TE-poll completions on the poll worker and run any
-    // caller-visible continuation there. Future::get() waits via CV without
-    // executing business logic on the completer thread.
+    // Block on the Future via CV. Do not syncAwait(WaitAsync()): that can
+    // resume on the completing thread and run caller continuation there.
     tl::expected<V, ErrorCode> Wait() override {
         try {
             return std::move(future_).get();
@@ -101,9 +128,8 @@ class FutureHandle : public TaskHandle<V> {
         }
     }
 
-    // Resume off te_poll: via CurrentExecutor, or coro_io global if unbound.
     async_simple::coro::Lazy<tl::expected<V, ErrorCode>> WaitAsync() override {
-        co_return co_await AwaitTeExpectedFuture(std::move(future_));
+        co_return co_await AwaitExpectedFuture(std::move(future_));
     }
 
     template <typename T>
@@ -118,5 +144,46 @@ class FutureHandle : public TaskHandle<V> {
     std::shared_ptr<void> request_storage_;
     async_simple::Future<tl::expected<V, ErrorCode>> future_;
 };
+
+// Future plus a continuation after it completes. Wait() uses Future::get();
+// WaitAsync() resumes off the completing thread via AwaitExpectedFuture.
+template <typename V, typename Then>
+class FutureThenHandle final : public TaskHandle<V> {
+   public:
+    FutureThenHandle(async_simple::Future<tl::expected<V, ErrorCode>> future,
+                     Then then)
+        : future_(std::move(future)), then_(std::move(then)) {}
+
+    tl::expected<V, ErrorCode> Wait() override {
+        return then_(GetFuture());
+    }
+
+    async_simple::coro::Lazy<tl::expected<V, ErrorCode>> WaitAsync() override {
+        co_return then_(co_await AwaitExpectedFuture(std::move(future_)));
+    }
+
+   private:
+    tl::expected<V, ErrorCode> GetFuture() {
+        try {
+            return std::move(future_).get();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "FutureThenHandle::Wait exception: " << e.what();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        } catch (...) {
+            LOG(ERROR) << "FutureThenHandle::Wait unknown exception";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
+    async_simple::Future<tl::expected<V, ErrorCode>> future_;
+    Then then_;
+};
+
+template <typename V, typename Then>
+std::unique_ptr<FutureThenHandle<V, std::decay_t<Then>>> MakeFutureThenHandle(
+    async_simple::Future<tl::expected<V, ErrorCode>> future, Then&& then) {
+    return std::make_unique<FutureThenHandle<V, std::decay_t<Then>>>(
+        std::move(future), std::forward<Then>(then));
+}
 
 }  // namespace mooncake

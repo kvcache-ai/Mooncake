@@ -14,8 +14,10 @@
 #include <unordered_map>
 #include <vector>
 #include <functional>
+#include <async_simple/Executor.h>
 #include <async_simple/Future.h>
 #include <async_simple/coro/Lazy.h>
+#include <ylt/coro_io/io_context_pool.hpp>
 #include <ylt/util/tl/expected.hpp>
 #include "async_memcpy_executor.h"
 #include "client_buffer.hpp"
@@ -303,6 +305,13 @@ class DataManager {
         const std::vector<RemoteBufferDesc>& peer_buffers,
         Transport::TransferRequest::OpCode opcode);
 
+    /**
+     * @brief Dedicated coro_io executor for P2P business Lazys (`via`/`start`)
+     *        and TE-wait hop-back. Independent of RPC's pool and of
+     *        `te_poll_executor_` (poll wait only; not an asio executor).
+     */
+    async_simple::Executor* GetCoroExecutor() const;
+
     // ================================================================
     // Utilities
     // ================================================================
@@ -329,8 +338,6 @@ class DataManager {
                std::optional<UUID> tier_id = std::nullopt) const;
 
    private:
-    friend class PutViaTeTaskHandle;
-
     void ClearLeaseRecords();
 
     struct KeyCtx {
@@ -486,6 +493,15 @@ class DataManager {
                             const std::vector<RemoteBufferDesc>& remote_buffers,
                             Transport::TransferRequest::OpCode opcode);
 
+    // Validate peer buffers and submit TE batches. Shared by TransferData and
+    // TransferDataAsync; callers only differ in how they wait.
+    tl::expected<
+        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
+        ErrorCode>
+    SubmitTransferData(void* local_transfer_base, size_t total_size,
+                       const std::vector<RemoteBufferDesc>& peer_buffers,
+                       Transport::TransferRequest::OpCode opcode);
+
     /**
      * @brief Helper to wait for a transfer batch to complete
      * @param batch_id Batch ID to poll
@@ -601,6 +617,7 @@ class DataManager {
     LocalTransferConfig local_transfer_config_;
     std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
     std::unique_ptr<AsyncMemcpyExecutor> te_poll_executor_;
+    std::shared_ptr<coro_io::io_context_pool> coro_executor_pool_;
     std::chrono::milliseconds lease_duration_;
     std::chrono::milliseconds lease_scan_interval_;
     std::atomic<bool> lease_scanner_stop_requested_{false};

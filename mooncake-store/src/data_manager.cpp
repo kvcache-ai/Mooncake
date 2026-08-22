@@ -22,8 +22,6 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
-#include "te_wait_future.h"
-
 namespace mooncake {
 
 namespace {
@@ -162,6 +160,17 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
         te_poll_executor_ = std::make_unique<AsyncMemcpyExecutor>(
             local_transfer_config_.te_async_poll_worker_num);
     }
+    unsigned coro_threads =
+        static_cast<unsigned>(local_transfer_config_.te_async_poll_worker_num);
+    if (coro_threads == 0) {
+        coro_threads = std::thread::hardware_concurrency();
+    }
+    if (coro_threads == 0) {
+        coro_threads = 1;
+    }
+    coro_executor_pool_ =
+        std::make_shared<coro_io::io_context_pool>(coro_threads);
+    std::thread([pool = coro_executor_pool_]() { pool->run(); }).detach();
 
     lease_duration_ = std::chrono::milliseconds(
         key_lease_config.duration_ms > 0 ? key_lease_config.duration_ms
@@ -182,6 +191,7 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
               << local_transfer_config_.local_memcpy_async_worker_num
               << ", te_async_poll_workers="
               << local_transfer_config_.te_async_poll_worker_num
+              << ", coro_executor_threads=" << coro_threads
               << ", p2p_key_lease_duration_ms=" << lease_duration_.count()
               << ", p2p_key_lease_scan_interval_ms="
               << lease_scan_interval_.count();
@@ -200,6 +210,9 @@ void DataManager::Stop() {
     }
     if (te_poll_executor_) {
         te_poll_executor_->Shutdown();
+    }
+    if (coro_executor_pool_) {
+        coro_executor_pool_->stop();
     }
     if (tiered_backend_) {
         tiered_backend_->Stop();
@@ -498,57 +511,6 @@ tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManager::Put(
 
 // TE wait may offload to te_poll_executor_; copy/commit always run after wait
 // on the Wait() caller or WaitAsync resume executor (not on poll workers).
-namespace {
-
-tl::expected<void, ErrorCode> GetExpectedFuture(
-    async_simple::Future<tl::expected<void, ErrorCode>> fut) {
-    try {
-        return std::move(fut).get();
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "TE wait future exception: " << e.what();
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    } catch (...) {
-        LOG(ERROR) << "TE wait future unknown exception";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-}
-
-}  // namespace
-
-// Keeps TeSubmitResult alive across async TE wait, then runs copy/commit.
-class PutViaTeTaskHandle final : public TaskHandle<void> {
-   public:
-    PutViaTeTaskHandle(
-        DataManager* dm, DataManager::KeyCtx kctx, UUID write_operation_id,
-        DataManager::TeSubmitResult ctx,
-        async_simple::Future<tl::expected<void, ErrorCode>> wait_future)
-        : dm_(dm),
-          kctx_(std::move(kctx)),
-          write_operation_id_(write_operation_id),
-          ctx_(std::move(ctx)),
-          wait_future_(std::move(wait_future)) {}
-
-    tl::expected<void, ErrorCode> Wait() override {
-        return dm_->FinishPutViaTeAfterWait(
-            kctx_, write_operation_id_, ctx_,
-            GetExpectedFuture(std::move(wait_future_)));
-    }
-
-    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> WaitAsync()
-        override {
-        co_return dm_->FinishPutViaTeAfterWait(
-            kctx_, write_operation_id_, ctx_,
-            co_await AwaitTeExpectedFuture(std::move(wait_future_)));
-    }
-
-   private:
-    DataManager* dm_;
-    DataManager::KeyCtx kctx_;
-    UUID write_operation_id_;
-    DataManager::TeSubmitResult ctx_;
-    async_simple::Future<tl::expected<void, ErrorCode>> wait_future_;
-};
-
 tl::expected<void, ErrorCode> DataManager::FinishPutViaTeAfterWait(
     const KeyCtx& ctx, const UUID& write_operation_id, TeSubmitResult& te_ctx,
     tl::expected<void, ErrorCode> wait_result) {
@@ -630,9 +592,14 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
     if (te_poll_executor_) {
         auto wait_future = WaitAllTransferBatchesAsync(
             std::move(submit_result->transfer_batches));
-        return std::make_unique<PutViaTeTaskHandle>(
-            this, kctx, write_operation_id, std::move(*submit_result),
-            std::move(wait_future));
+        return MakeFutureThenHandle<void>(
+            std::move(wait_future),
+            [this, kctx, write_operation_id,
+             ctx = std::move(*submit_result)](
+                tl::expected<void, ErrorCode> wait_result) mutable {
+                return FinishPutViaTeAfterWait(kctx, write_operation_id, ctx,
+                                               std::move(wait_result));
+            });
     }
 
     return CallableTaskHandle<void>::Create(
@@ -937,8 +904,9 @@ DataManager::ReadRemoteDataAsync(
     // Keep TeSubmitResult (AllocationHandle / temp_buffer) alive across await.
     TeSubmitResult ctx = std::move(*submit_result);
 
-    auto wait_result = co_await AwaitTeExpectedFuture(
-        WaitAllTransferBatchesAsync(std::move(ctx.transfer_batches)));
+    auto wait_result = co_await AwaitExpectedFuture(
+        WaitAllTransferBatchesAsync(std::move(ctx.transfer_batches)),
+        GetCoroExecutor());
     if (!wait_result) {
         LOG(ERROR) << "ReadRemoteData: WaitAllTransferBatches failed"
                    << ", key=" << key
@@ -1014,8 +982,9 @@ DataManager::WriteRemoteDataAsync(
     }
     TeSubmitResult ctx = std::move(*submit_result);
 
-    auto wait_result = co_await AwaitTeExpectedFuture(
-        WaitAllTransferBatchesAsync(std::move(ctx.transfer_batches)));
+    auto wait_result = co_await AwaitExpectedFuture(
+        WaitAllTransferBatchesAsync(std::move(ctx.transfer_batches)),
+        GetCoroExecutor());
     if (!wait_result) {
         (void)WriteRevokeInternal(kctx, write_operation_id);
         timer.LogResponse("error_code=", wait_result.error());
@@ -1612,32 +1581,46 @@ DataManager::SubmitTeTransferBatches(
     return submitted_batches;
 }
 
-tl::expected<void, ErrorCode> DataManager::TransferData(
+tl::expected<std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
+             ErrorCode>
+DataManager::SubmitTransferData(
     void* local_transfer_base, size_t total_size,
     const std::vector<RemoteBufferDesc>& peer_buffers,
     Transport::TransferRequest::OpCode opcode) {
     auto validate_result = ValidateRemoteBuffers(peer_buffers);
     if (!validate_result) {
-        LOG(ERROR) << "TransferData: ValidateRemoteBuffers failed: "
+        LOG(ERROR) << "SubmitTransferData: ValidateRemoteBuffers failed: "
                    << toString(validate_result.error());
-        return tl::make_unexpected(validate_result.error());
+        return tl::unexpected(validate_result.error());
     }
     size_t total_remote_size = 0;
     for (const auto& buf : peer_buffers) total_remote_size += buf.size;
     if (total_remote_size != total_size) {
-        LOG(ERROR) << "TransferData: peer buffer size mismatch ("
+        LOG(ERROR) << "SubmitTransferData: peer buffer size mismatch ("
                    << total_remote_size << " vs " << total_size << ")";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!transfer_engine_->getMetadata()) {
-        LOG(ERROR) << "TransferEngine not initialized";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        LOG(ERROR) << "SubmitTransferData: TransferEngine not initialized";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto batches = SubmitTeTransferBatches(local_transfer_base, total_size,
                                            peer_buffers, opcode);
     if (!batches) {
-        LOG(ERROR) << "TransferData: SubmitTeTransferBatches failed: "
+        LOG(ERROR) << "SubmitTransferData: SubmitTeTransferBatches failed: "
                    << toString(batches.error());
+        return tl::unexpected(batches.error());
+    }
+    return batches;
+}
+
+tl::expected<void, ErrorCode> DataManager::TransferData(
+    void* local_transfer_base, size_t total_size,
+    const std::vector<RemoteBufferDesc>& peer_buffers,
+    Transport::TransferRequest::OpCode opcode) {
+    auto batches = SubmitTransferData(local_transfer_base, total_size,
+                                      peer_buffers, opcode);
+    if (!batches) {
         return tl::unexpected(batches.error());
     }
     auto wait_result = WaitAllTransferBatches(batches.value());
@@ -1659,34 +1642,19 @@ DataManager::TransferDataAsync(
         return MakeReadyExpectedFuture(TransferData(
             local_transfer_base, total_size, peer_buffers, opcode));
     }
-    auto validate_result = ValidateRemoteBuffers(peer_buffers);
-    if (!validate_result) {
-        LOG(ERROR) << "TransferDataAsync: ValidateRemoteBuffers failed: "
-                   << toString(validate_result.error());
-        return MakeReadyExpectedFuture(
-            tl::make_unexpected(validate_result.error()));
-    }
-    size_t total_remote_size = 0;
-    for (const auto& buf : peer_buffers) total_remote_size += buf.size;
-    if (total_remote_size != total_size) {
-        LOG(ERROR) << "TransferDataAsync: peer buffer size mismatch ("
-                   << total_remote_size << " vs " << total_size << ")";
-        return MakeReadyExpectedFuture(
-            tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    if (!transfer_engine_->getMetadata()) {
-        LOG(ERROR) << "TransferDataAsync: TransferEngine not initialized";
-        return MakeReadyExpectedFuture(
-            tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-    }
-    auto batches = SubmitTeTransferBatches(local_transfer_base, total_size,
-                                           peer_buffers, opcode);
+    auto batches = SubmitTransferData(local_transfer_base, total_size,
+                                      peer_buffers, opcode);
     if (!batches) {
-        LOG(ERROR) << "TransferDataAsync: SubmitTeTransferBatches failed: "
-                   << toString(batches.error());
         return MakeReadyExpectedFuture(tl::unexpected(batches.error()));
     }
     return WaitAllTransferBatchesAsync(std::move(batches.value()));
+}
+
+async_simple::Executor* DataManager::GetCoroExecutor() const {
+    if (coro_executor_pool_) {
+        return coro_executor_pool_->get_executor();
+    }
+    return coro_io::get_global_executor();
 }
 
 tl::expected<void, ErrorCode> DataManager::ValidateRemoteBuffers(
