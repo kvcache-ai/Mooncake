@@ -106,6 +106,44 @@ endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
 
+# RISC-V toolchains may implement 16-byte atomic operations in libatomic rather
+# than emitting native instructions. Boost.Lockfree uses these operations in the
+# Store master, so detect and propagate the runtime library in RISC-V mode.
+if(USE_RISCV)
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles(
+    "
+alignas(16) volatile unsigned __int128 value = 0;
+int main(int argc, char**) {
+  __atomic_store_n(&value, static_cast<unsigned __int128>(argc),
+                   __ATOMIC_SEQ_CST);
+  return static_cast<int>(__atomic_load_n(&value, __ATOMIC_SEQ_CST));
+}
+"
+    MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
+  if(NOT MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
+    set(CMAKE_REQUIRED_LIBRARIES_SAVE ${CMAKE_REQUIRED_LIBRARIES})
+    set(CMAKE_REQUIRED_LIBRARIES atomic)
+    check_cxx_source_compiles(
+      "
+alignas(16) volatile unsigned __int128 value = 0;
+int main(int argc, char**) {
+  __atomic_store_n(&value, static_cast<unsigned __int128>(argc),
+                   __ATOMIC_SEQ_CST);
+  return static_cast<int>(__atomic_load_n(&value, __ATOMIC_SEQ_CST));
+}
+"
+      MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
+    set(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES_SAVE})
+    if(MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
+      list(APPEND EXTRA_LIBS atomic)
+      message(STATUS "16-byte atomics: using libatomic")
+    else()
+      message(FATAL_ERROR "16-byte atomic operations are not supported")
+    endif()
+  endif()
+endif()
+
 # Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)
 if(AWSSDK_FOUND)
@@ -179,7 +217,10 @@ int main() {
     set(MOONCAKE_HAVE_NVME_URING_CMD ON)
     message(STATUS "io_uring: NVMe uring command support enabled")
   else()
-    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+    message(
+      STATUS
+        "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled"
+    )
   endif()
 endif()
 
