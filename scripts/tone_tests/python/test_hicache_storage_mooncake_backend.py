@@ -395,9 +395,45 @@ class TestMooncakeBackendAccuracy(
 
     def test_eval_accuracy(self):
         """Test eval accuracy with cache persistence across cache flushes"""
-        from test_hicache_storage_file_backend import run_eval_accuracy_test
+        if os.getenv("CI_ACCELERATOR") != "rocm":
+            from test_hicache_storage_file_backend import run_eval_accuracy_test
 
-        run_eval_accuracy_test(self)
+            run_eval_accuracy_test(self)
+            return
+
+        # Qwen3 can spend the upstream 512-token budget entirely in its
+        # thinking trace, leaving no final GSM8K answer. Give ROCm CI enough
+        # room to finish the answer so this remains a cache-accuracy test rather
+        # than a reasoning-length lottery.
+        from types import SimpleNamespace
+
+        from sglang.test.run_eval import run_eval
+
+        args = SimpleNamespace(
+            base_url=f"http://{self.base_host}:{self.base_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=2048,
+            num_examples=200,
+            num_threads=64,
+        )
+        metrics_initial = run_eval(args)
+        self.flush_cache()
+        metrics_cached = run_eval(args)
+
+        accuracy_diff = abs(metrics_initial["score"] - metrics_cached["score"])
+        print(f"Accuracy difference: {accuracy_diff:.4f}")
+        self.assertGreater(
+            metrics_initial["score"], 0.6, "Initial accuracy should be reasonable"
+        )
+        self.assertGreater(
+            metrics_cached["score"], 0.6, "Cached accuracy should be reasonable"
+        )
+        self.assertLess(
+            accuracy_diff,
+            0.03,
+            "Accuracy should be consistent between cache states",
+        )
 
 
 if __name__ == "__main__":
