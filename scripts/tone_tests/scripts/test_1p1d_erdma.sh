@@ -2,7 +2,14 @@
 
 test_case_name="test_1p1d_erdma"
 TEST_TYPE="double"
-SUPPORT_MODELS=("Qwen/Qwen3-8B" "deepseek-ai/DeepSeek-V2-Lite")
+if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+    # SGLang v0.5.13's ROCm fused MLA path treats ForwardMetadata as a tuple
+    # and crashes during server initialization. Keep ROCm external-PD coverage
+    # on Qwen until the pinned upstream image contains the MLA fix.
+    SUPPORT_MODELS=("Qwen/Qwen3-8B")
+else
+    SUPPORT_MODELS=("Qwen/Qwen3-8B" "deepseek-ai/DeepSeek-V2-Lite")
+fi
 
 PID_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}/run/pids/${test_case_name}
 BASE_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}
@@ -29,6 +36,9 @@ start_server()
     fi
 
     local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}"
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        extra_args="${extra_args} --disaggregation-ib-device=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
+    fi
     if ! launch_sglang_server "$model_name" "$host" "30001" "$sglang_server_log_path" "$mode_name" "$extra_args"; then
         return 1
     fi

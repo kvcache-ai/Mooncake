@@ -344,6 +344,10 @@ class TestMooncakeBackendPageFirstLayout(
         return server_args, env_vars
 
 
+@unittest.skipIf(
+    os.getenv("CI_ACCELERATOR") == "rocm",
+    "The pinned SGLang ROCm image has an incompatible fused MLA metadata API.",
+)
 class TestMooncakeBackendMLAModel(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
