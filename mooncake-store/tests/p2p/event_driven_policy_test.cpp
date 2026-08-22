@@ -8,10 +8,10 @@
 #include <optional>
 #include <string>
 
-#include "p2p/tiered_cache/event_driven_scheduler/multi_lru_policy.h"
-#include "p2p/tiered_cache/scheduler/scheduler_factory.h"  // detail::ReadMultiLRUConfig
-#include "p2p/tiered_cache/tiered_backend.h"
-#include "p2p/tiered_cache/tiers/cache_tier.h"  // TempDRAMBuffer
+#include "p2p/client/tiered_cache/event_driven_scheduler/multi_lru_policy.h"
+#include "p2p/client/tiered_cache/scheduler/scheduler_factory.h"  // detail::ReadMultiLRUConfig
+#include "p2p/client/tiered_cache/tiered_backend.h"
+#include "p2p/client/tiered_cache/tiers/cache_tier.h"  // TempDRAMBuffer
 #include "../utils/common.h"                   // InitTieredBackendForTest
 
 namespace mooncake {

@@ -8,7 +8,7 @@
 
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/ha/oplog/oplog_store_factory.h"
-#include "p2p/client/p2p_client_meta.h"
+#include "p2p/master/p2p_client_meta.h"
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 

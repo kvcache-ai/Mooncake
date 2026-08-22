@@ -86,7 +86,7 @@ endif()
 
 # Ascend Cache Tier support
 if(USE_ASCEND_CACHE_TIER)
-  list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/tiered_cache/tiers/ascend_tier.cpp)
+  list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/client/tiered_cache/tiers/ascend_tier.cpp)
   message(STATUS "Ascend Cache Tier enabled")
 endif()
 
@@ -129,9 +129,9 @@ list(APPEND MOONCAKE_STORE_P2P_SOURCES
     p2p/master/p2p_master_metric_manager.cpp
     p2p/master/p2p_segment_manager.cpp
     p2p/master/p2p_rpc_service.cpp
+    p2p/master/p2p_client_meta.cpp
+    p2p/master/p2p_client_manager.cpp
     p2p/client/p2p_client_service.cpp
-    p2p/client/p2p_client_manager.cpp
-    p2p/client/p2p_client_meta.cpp
     p2p/client/p2p_client_metric.cpp
     p2p/client/peer_client.cpp
     p2p/client/client_rpc_service.cpp
@@ -141,18 +141,18 @@ list(APPEND MOONCAKE_STORE_P2P_SOURCES
     p2p/client/async_metadata_notifier.cpp
     p2p/client/client_metrics_aggregator.cpp
     p2p/client/runtime_config_store.cpp
-    p2p/tiered_cache/copier_registry.cpp
-    p2p/tiered_cache/data_copier.cpp
-    p2p/tiered_cache/tiered_backend.cpp
-    p2p/tiered_cache/tiers/dram_tier.cpp
-    p2p/tiered_cache/tiers/storage_tier.cpp
-    p2p/tiered_cache/scheduler/simple_policy.cpp
-    p2p/tiered_cache/scheduler/lru_policy.cpp
-    p2p/tiered_cache/scheduler/client_scheduler.cpp
-    p2p/tiered_cache/scheduler/scheduler_factory.cpp
-    p2p/tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
-    p2p/tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
-    p2p/tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
+    p2p/client/tiered_cache/copier_registry.cpp
+    p2p/client/tiered_cache/data_copier.cpp
+    p2p/client/tiered_cache/tiered_backend.cpp
+    p2p/client/tiered_cache/tiers/dram_tier.cpp
+    p2p/client/tiered_cache/tiers/storage_tier.cpp
+    p2p/client/tiered_cache/scheduler/simple_policy.cpp
+    p2p/client/tiered_cache/scheduler/lru_policy.cpp
+    p2p/client/tiered_cache/scheduler/client_scheduler.cpp
+    p2p/client/tiered_cache/scheduler/scheduler_factory.cpp
+    p2p/client/tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
+    p2p/client/tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
+    p2p/client/tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
     p2p/ha/oplog/oplog_manager.cpp
     p2p/ha/oplog/oplog_serializer.cpp
     p2p/ha/oplog/localfs_oplog_store.cpp

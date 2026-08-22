@@ -4,7 +4,7 @@
 
 #include "file_storage.h"
 #include "storage_backend.h"
-#include "p2p/tiered_cache/tiered_backend.h"
+#include "p2p/client/tiered_cache/tiered_backend.h"
 
 namespace mooncake {
 namespace fs = std::filesystem;

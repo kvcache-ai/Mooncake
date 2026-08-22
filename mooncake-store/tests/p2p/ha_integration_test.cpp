@@ -27,7 +27,7 @@
 #undef protected
 #undef private
 
-#include "p2p/client/p2p_client_meta.h"
+#include "p2p/master/p2p_client_meta.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"
 

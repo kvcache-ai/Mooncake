@@ -14,9 +14,9 @@
 #include <vector>
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#include "p2p/tiered_cache/tiered_backend.h"
-#include "p2p/tiered_cache/tiers/cache_tier.h"
-#include "p2p/tiered_cache/data_copier.h"
+#include "p2p/client/tiered_cache/tiered_backend.h"
+#include "p2p/client/tiered_cache/tiers/cache_tier.h"
+#include "p2p/client/tiered_cache/data_copier.h"
 #include "utils/scoped_vlog_timer.h"
 #include "utils.h"
 

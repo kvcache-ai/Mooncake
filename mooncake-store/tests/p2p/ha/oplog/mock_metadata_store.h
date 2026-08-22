@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-#include "p2p/common/metadata_store.h"
+#include "p2p/ha/metadata_store.h"
 
 namespace mooncake::test {
 

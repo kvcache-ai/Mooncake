@@ -1,7 +1,7 @@
 #include <algorithm>
 #include <gtest/gtest.h>
 #include <glog/logging.h>
-#include "p2p/tiered_cache/tiered_backend.h"
+#include "p2p/client/tiered_cache/tiered_backend.h"
 #include "../utils/common.h"
 #include <fstream>
 #include <chrono>
@@ -10,11 +10,11 @@
 #include <atomic>
 #include <mutex>
 #include <vector>
-#include "p2p/tiered_cache/scheduler/lru_policy.h"
-#include "p2p/tiered_cache/tiers/cache_tier.h"  // Ensure TempDRAMBuffer is available
-#include "p2p/tiered_cache/scheduler/lru_stats_collector.h"
-#include "p2p/tiered_cache/scheduler/simple_policy.h"
-#include "p2p/tiered_cache/scheduler/stats_collector.h"
+#include "p2p/client/tiered_cache/scheduler/lru_policy.h"
+#include "p2p/client/tiered_cache/tiers/cache_tier.h"  // Ensure TempDRAMBuffer is available
+#include "p2p/client/tiered_cache/scheduler/lru_stats_collector.h"
+#include "p2p/client/tiered_cache/scheduler/simple_policy.h"
+#include "p2p/client/tiered_cache/scheduler/stats_collector.h"
 
 namespace mooncake {
 

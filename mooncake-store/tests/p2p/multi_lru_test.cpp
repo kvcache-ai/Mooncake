@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-#include "p2p/tiered_cache/event_driven_scheduler/multi_lru_stats_collector.h"
+#include "p2p/client/tiered_cache/event_driven_scheduler/multi_lru_stats_collector.h"
 
 namespace mooncake {
 namespace {

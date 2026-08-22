@@ -13,7 +13,7 @@
 
 #include "client_metric.h"
 #include "p2p/client/p2p_client_metric.h"
-#include "p2p/tiered_cache/tiers/cache_tier.h"
+#include "p2p/client/tiered_cache/tiers/cache_tier.h"
 
 namespace mooncake::test {
 

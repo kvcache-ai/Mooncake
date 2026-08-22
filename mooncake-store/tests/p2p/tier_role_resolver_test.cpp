@@ -3,8 +3,8 @@
 
 #include <vector>
 
-#include "p2p/tiered_cache/event_driven_scheduler/tier_roles.h"
-#include "p2p/tiered_cache/tiered_backend.h"  // TierView
+#include "p2p/client/tiered_cache/event_driven_scheduler/tier_roles.h"
+#include "p2p/client/tiered_cache/tiered_backend.h"  // TierView
 
 namespace mooncake {
 namespace {

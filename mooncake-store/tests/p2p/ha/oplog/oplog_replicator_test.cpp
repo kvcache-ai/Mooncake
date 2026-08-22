@@ -12,7 +12,7 @@
 
 #include <xxhash.h>
 
-#include "p2p/common/metadata_store.h"
+#include "p2p/ha/metadata_store.h"
 #include "p2p/ha/oplog/oplog_applier.h"
 #include "p2p/ha/oplog/oplog_change_notifier.h"
 #include "p2p/ha/oplog/oplog_manager.h"

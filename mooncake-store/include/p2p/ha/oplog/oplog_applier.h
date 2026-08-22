@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "p2p/ha/oplog/oplog_manager.h"
-#include "p2p/common/metadata_store.h"
+#include "p2p/ha/metadata_store.h"
 
 namespace mooncake {
 
