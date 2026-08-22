@@ -212,6 +212,8 @@ docker_launch(){
         # Python modules/native libraries and breaks the Store RPC ABI.
         pip_cmd=$(append_str "${pip_cmd}" \
             "python3 -m pip uninstall -y mooncake-transfer-engine mooncake-transfer-engine-rocm")
+        pip_cmd=$(append_str "${pip_cmd}" \
+            "python3 -c 'import shutil, site, sysconfig; from pathlib import Path; roots={Path(path).resolve() for path in (*site.getsitepackages(), site.getusersitepackages(), sysconfig.get_path(\"purelib\"), sysconfig.get_path(\"platlib\")) if path}; packages=sorted({root / \"mooncake\" for root in roots}); [(print(\"Removing orphaned Mooncake package:\", package), shutil.rmtree(package)) for package in packages if package.is_dir()]'")
     fi
     pip_cmd=$(append_str "${pip_cmd}" "python3 -m pip install --force-reinstall /test_run/$cleaned_path/whls/$mooncake_whl_file")
 
@@ -255,21 +257,29 @@ fi
 
 if [ \"\$rdma_ready\" != true ] && [ -r /opt/mooncake-host-rdma/libionic.so.1 ]; then
     echo 'Overlaying host-matched Ionic provider library'
+    # Let the package installation update the loader cache before replacing
+    # its ABI-incompatible provider. Running ldconfig afterwards would restore
+    # libionic.so.1 to the newer container library.
+    ldconfig
     install -m 0644 /opt/mooncake-host-rdma/libionic.so.1 \
         /usr/lib/x86_64-linux-gnu/libionic-host.so.1
     ln -sfn libionic-host.so.1 /usr/lib/x86_64-linux-gnu/libionic.so.1
     ln -sfn libionic-host.so.1 /usr/lib/x86_64-linux-gnu/libionic.so
 
     verbs_abi=\$(find /usr/lib/x86_64-linux-gnu/libibverbs -maxdepth 1 \
-        -type f -o -type l 2>/dev/null \
+        \( -type f -o -type l \) 2>/dev/null \
         | sed -n 's/.*-rdmav\([0-9][0-9]*\)[.]so$/\1/p' | head -n 1)
     if [ -n \"\$verbs_abi\" ]; then
-        ln -sfn ../libionic.so.1 \
+        ln -sfn ../libionic-host.so.1 \
             /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav\${verbs_abi}.so
+        echo 'Ionic provider path:' \
+            \"\$(readlink -f /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav\${verbs_abi}.so)\"
     else
         echo 'WARNING: Unable to determine the container libibverbs provider ABI' >&2
     fi
-    ldconfig
+    echo 'Ionic provider checksums:'
+    sha256sum /opt/mooncake-host-rdma/libionic.so.1 \
+        /usr/lib/x86_64-linux-gnu/libionic-host.so.1
 fi"
         echo "Checking ROCm RoCE userspace"
         if ! ${docker_exec} "${rocm_rdma_cmd}"; then
@@ -323,9 +333,9 @@ case \"\$gid\" in ''|'::'|'0:0:0:0:0:0:0:0') echo 'RDMA GID is empty' >&2; exit 
     fi
 
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
-        local mooncake_install_check="python3 -c 'import importlib.metadata as md, mooncake; assert md.version(\"mooncake-transfer-engine-rocm\"); print(\"Mooncake package:\", mooncake.__file__); print(\"Mooncake ROCm distribution:\", md.version(\"mooncake-transfer-engine-rocm\"))' && ! python3 -m pip show mooncake-transfer-engine >/dev/null 2>&1"
+        local mooncake_install_check="python3 /test_run/python/verify_rocm_wheel.py && ! python3 -m pip show mooncake-transfer-engine >/dev/null 2>&1"
         if ! ${docker_exec} "${mooncake_install_check}"; then
-            echo "ERROR: Conflicting Mooncake distributions remain after ROCm wheel installation" >&2
+            echo "ERROR: The ROCm wheel did not replace all image-provided Mooncake files" >&2
             return 1
         fi
     fi
@@ -566,7 +576,7 @@ check_proxy_ready() {
 
 stop_container(){
     local container_name=${1:-$CONTAINER_NAME}
-    local remote_host=$2
+    local remote_host=${2:-}
     local location="local"
     
     if [ -z "$container_name" ]; then
