@@ -774,8 +774,8 @@ void Client::EnsureStorageControlPlaneStarted() {
 
 ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
-    const std::string& protocol,
-    const std::optional<std::string>& device_names) {
+    const std::string& protocol, const std::optional<std::string>& device_names,
+    bool force_manual_nvlink) {
     // TEs created through the Store entry (Client::Create ->
     // InitTransferEngine) are tagged so ascend_direct can resolve a per-role
     // link config (e.g. Store=RoCE/D2H, P2P=HCCS/D2D). The flag only needs to
@@ -809,6 +809,11 @@ ErrorCode Client::InitTransferEngine(
                           << " protocol, since no device names provided";
                 auto_discover = true;
             }
+        }
+        // The EGM Store pool needs this exact transport even on machines where
+        // generic topology discovery would select an available RDMA device.
+        if (protocol == "nvlink" && force_manual_nvlink) {
+            auto_discover = false;
         }
         transfer_engine_->setAutoDiscover(
             {.enabled = auto_discover, .protocol = protocol});
@@ -920,6 +925,25 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "nvlink" && force_manual_nvlink) {
+            if (device_names.has_value()) {
+                LOG(WARNING)
+                    << "NVLink protocol does not use device names, ignoring";
+            }
+            try {
+                transport =
+                    transfer_engine_->installTransport("nvlink", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "nvlink_transport_install_failed "
+                              "error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            if (!transport) {
+                LOG(ERROR) << "Failed to install NVLink transport; ensure "
+                              "Mooncake is built with USE_MNNVL";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else if (protocol == "ascend" || protocol == "ubshmem" ||
                    protocol == "sunrise_link") {
             if (device_names.has_value()) {
@@ -1028,6 +1052,18 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    return CreateInternal(local_hostname, metadata_connstring, protocol,
+                          device_names, master_server_entry, transfer_engine,
+                          std::move(labels), tenant_id, false);
+}
+
+std::optional<std::shared_ptr<Client>> Client::CreateInternal(
+    const std::string& local_hostname, const std::string& metadata_connstring,
+    const std::string& protocol, const std::optional<std::string>& device_names,
+    const std::string& master_server_entry,
+    const std::shared_ptr<TransferEngine>& transfer_engine,
+    std::map<std::string, std::string> labels, const std::string& tenant_id,
+    bool force_manual_nvlink) {
     auto client = std::shared_ptr<Client>(new Client(
         local_hostname, metadata_connstring, protocol, labels, tenant_id));
 
@@ -1115,7 +1151,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                         protocol, device_names);
+                                         protocol, device_names,
+                                         force_manual_nvlink);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return std::nullopt;
@@ -3552,6 +3589,59 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
 
     EnsureStorageControlPlaneStarted();
     return segment_id;
+}
+
+tl::expected<void, ErrorCode> Client::MountEgmStorePoolSegment(
+    const UUID& segment_id, const void* buffer, size_t size) {
+    if (protocol_ != "nvlink" || !transfer_engine_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto check_result = CheckRegisterMemoryParams(buffer, size, protocol_);
+    if (!check_result) return tl::unexpected(check_result.error());
+
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    if (mounted_segments_.count(segment_id) != 0) {
+        return tl::unexpected(ErrorCode::SEGMENT_ALREADY_EXISTS);
+    }
+    for (const auto& entry : mounted_segments_) {
+        const auto& mounted = entry.second;
+        const uintptr_t mounted_begin = mounted.base;
+        const uintptr_t mounted_end = mounted_begin + mounted.size;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(buffer);
+        const uintptr_t end = begin + size;
+        if (std::max(mounted_begin, begin) < std::min(mounted_end, end)) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    Segment segment;
+    segment.id = segment_id;
+    segment.name = local_hostname_;
+    segment.base = reinterpret_cast<uintptr_t>(buffer);
+    segment.size = size;
+    segment.protocol = "nvlink";
+    segment.host_id = host_id_;
+    segment.te_endpoint = metadata_connstring_ == P2PHANDSHAKE
+                              ? transfer_engine_->getLocalIpAndPort()
+                              : local_hostname_;
+
+    // Retain a record before either publication step. The ordinary idempotent
+    // unmount path can then compensate a failed registration or an ambiguous
+    // Master reply without releasing the allocation too early.
+    mounted_segments_[segment_id] = segment;
+
+    int rc = transfer_engine_->registerLocalMemory(
+        const_cast<void*>(buffer), size, kWildcardLocation, true, true);
+    if (rc != 0) {
+        LOG(ERROR) << "EGM register_local_memory_failed base=" << buffer
+                   << " size=" << size << ", error=" << rc;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto mount_result = master_client_.MountSegment(segment);
+    if (!mount_result) return tl::unexpected(mount_result.error());
+
+    EnsureStorageControlPlaneStarted();
+    return {};
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentById(
