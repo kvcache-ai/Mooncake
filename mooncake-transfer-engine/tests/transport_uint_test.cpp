@@ -419,6 +419,8 @@ TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
 
     Status free_status = multi_transport.freeBatchID(batch_id);
     EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                               batch_id));
 
@@ -444,6 +446,8 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
 
     Status free_status = multi_transport.freeBatchID(batch_id);
     EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                               batch_id));
 
@@ -469,6 +473,8 @@ TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
 
     Status free_status = multi_transport.freeBatchID(batch_id);
     EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                               batch_id));
 

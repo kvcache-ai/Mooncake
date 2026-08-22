@@ -115,7 +115,7 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
     std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
     if (deferred_cleanup_batches_.count(batch_id) != 0) {
         return Status::BatchBusy(
-            "BatchID cleanup is already deferred because the batch is busy");
+            "BatchID is invalid because cleanup has already been deferred");
     }
 
     Status status = tryFreeBatchID(batch_id);
@@ -125,17 +125,18 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
 
     deferred_cleanup_batches_.insert(batch_id);
     if (!deferred_cleanup_thread_.joinable()) {
-        // Start the cleanup worker lazily after a caller observes BatchBusy.
-        // Deferred cleanup is only a safety net for timed-out or failed batches;
-        // freeBatchID still preserves the public contract that BatchBusy means
-        // transfer buffers may remain owned by in-flight transport work.
+        // Start the cleanup worker lazily after taking ownership of a busy
+        // batch. BatchBusy preserves the signal that in-flight transport work
+        // may still own buffers, while the message tells callers that the batch
+        // handle itself is invalid and must not be reused.
         deferred_cleanup_thread_ =
             std::thread(&MultiTransport::deferredCleanupLoop, this);
     }
     deferred_cleanup_cv_.notify_one();
     LOG(WARNING) << "Batch " << batch_id
                  << " is still busy; cleanup has been deferred";
-    return status;
+    return Status::BatchBusy(
+        "BatchID is invalid because cleanup has been deferred");
 }
 
 Status MultiTransport::tryFreeBatchID(BatchID batch_id) {
