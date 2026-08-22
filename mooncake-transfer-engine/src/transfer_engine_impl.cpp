@@ -29,6 +29,7 @@
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#include "transport/rdma_twosided/rdma_twosided_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -561,16 +562,30 @@ int TransferEngineImpl::sendNotifyByID(
         LOG(ERROR) << "sendNotifyByID: invalid segment ID " << target_id;
         return ERR_METADATA;
     }
-    Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
-    return ret;
+    return sendNotifyByName(desc->name, std::move(notify_msg));
 }
 
 int TransferEngineImpl::sendNotifyByName(
     std::string remote_agent, TransferMetadata::NotifyDesc notify_msg) {
+    if (globalConfig().rdma_notify_enabled) {
+        Transport* transport = getTransport("rdma_twosided");
+        if (!transport) transport = getTransport("rdma");
+        auto* rdma_twosided = dynamic_cast<RdmaTwoSidedTransport*>(transport);
+        if (rdma_twosided) {
+            int ret = rdma_twosided->sendRdmaNotify(remote_agent, notify_msg);
+            if (ret == 0) return 0;
+            if (!globalConfig().rdma_notify_oob_fallback) {
+                LOG(ERROR) << "sendNotifyByName: RDMA notify failed for "
+                           << remote_agent << " ret=" << ret
+                           << " (OOB fallback disabled)";
+                return ret;
+            }
+            VLOG(1) << "sendNotifyByName: RDMA notify unavailable for "
+                    << remote_agent << ", falling back to OOB";
+        }
+    }
     Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
-    return ret;
+    return metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
 }
 
 int TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
