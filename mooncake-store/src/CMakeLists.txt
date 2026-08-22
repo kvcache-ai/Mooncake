@@ -16,6 +16,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
     config/local_file_snapshot_config.cpp
+    client_offboarding.cpp
     master_service.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp

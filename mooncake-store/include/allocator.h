@@ -122,6 +122,12 @@ class AllocatedBuffer {
                                    std::memory_order_release);
     }
 
+    [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
+        const {
+        return std::atomic_load_explicit(&client_liveness_,
+                                         std::memory_order_acquire);
+    }
+
     [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const;
 
     // Serialize the buffer into a descriptor for transfer

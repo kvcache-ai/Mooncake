@@ -58,6 +58,16 @@ class MasterServiceTest : public ::testing::Test {
         service.replica_cleanup_worker_.Schedule();
     }
 
+    std::shared_ptr<ClientLivenessRecord> FindClientLivenessForTest(
+        MasterService& service, const UUID& client_id) {
+        return service.FindClientRecord(client_id);
+    }
+
+    bool ProcessClientOffboardingForTest(MasterService& service,
+                                         ClientOffboardingJob& job) {
+        return service.ProcessClientOffboardingJob(job);
+    }
+
     void ExpectKeyHiddenFromReadApis(MasterService& service,
                                      const std::string& key) {
         auto get = service.GetReplicaList(key, TenantId::Default());

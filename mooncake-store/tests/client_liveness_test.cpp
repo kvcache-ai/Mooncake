@@ -57,5 +57,31 @@ TEST(ClientLivenessRecordTest, AdmissionHelpersFollowState) {
     EXPECT_EQ(mutations, 2);
 }
 
+TEST(ClientLivenessRecordTest, FailedOperationDoesNotRecoverOrRefresh) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+
+    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_EQ(record.ObserveAndRun(initial + 11s, [] { return false; }),
+              ClientLivenessObservation::OBSERVATION_WITHHELD);
+    EXPECT_EQ(record.state(), ClientLivenessState::SUSPECTED);
+    EXPECT_EQ(record.Evaluate(initial + 30s, 10s, 20s),
+              ClientLivenessTransition::BECAME_OFFLINE);
+}
+
+TEST(ClientLivenessRecordTest, RetainingGuardCommitsSuccessfulObservation) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+
+    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    auto guard = record.TryAcquireRetainingGuard();
+    ASSERT_TRUE(guard.has_value());
+    EXPECT_EQ(guard->Observe(initial + 11s),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    EXPECT_TRUE(record.IsServing());
+}
+
 }  // namespace
 }  // namespace mooncake::test
