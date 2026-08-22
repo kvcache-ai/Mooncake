@@ -788,7 +788,7 @@ TEST(ValidatePortRangeTest, AboveMaxRejected) {
     EXPECT_EQ(max_p, 17000);
 }
 
-// --- MC_MTU (valid values only; invalid causes exit()) ---
+// --- MC_MTU (valid values only; invalid is logged and ignored) ---
 
 class MtuEnvTest : public ::testing::Test {
    protected:
@@ -825,6 +825,13 @@ TEST_F(MtuEnvTest, Mtu2048) {
 
 TEST_F(MtuEnvTest, Mtu4096) {
     ASSERT_EQ(::setenv("MC_MTU", "4096", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.mtu_length, IBV_MTU_4096);
+}
+
+TEST_F(MtuEnvTest, InvalidIsIgnored) {
+    ASSERT_EQ(::setenv("MC_MTU", "1500", 1), 0);
     GlobalConfig config;
     loadGlobalConfig(config);
     EXPECT_EQ(config.mtu_length, IBV_MTU_4096);
