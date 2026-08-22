@@ -17,7 +17,7 @@ def main() -> None:
     )
     source = source_path.read_text()
     old = "self.origin_input_ids_unpadded[self.surr_offset :] + output_ids"
-    new = "self.origin_input_ids_unpadded[self.surr_offset :] + list(output_ids)"
+    new = "list(self.origin_input_ids_unpadded[self.surr_offset :]) + list(output_ids)"
 
     if new in source:
         print(f"SGLang detokenizer patch already applied: {source_path}")
