@@ -42,7 +42,11 @@ start_server()
     
     local env_vars
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
-        env_vars="ROCR_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} HIP_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1}"
+        # ROCm's HSA dma-buf export path can crash when vLLM registers every
+        # layer's multi-GiB KV buffer concurrently. Keep the RDMA batch
+        # registration sequential while retaining parallel registration as
+        # the default elsewhere.
+        env_vars="ROCR_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} HIP_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} MC_MAX_CONCURRENT_REG_MR=1"
     else
         env_vars="CUDA_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-6,7}"
     fi
