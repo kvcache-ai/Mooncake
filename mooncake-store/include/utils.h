@@ -340,6 +340,16 @@ inline size_t align_up(size_t size, size_t alignment) {
 }
 
 /**
+ * @brief Fault in a fresh mmap mapping with parallel CPU writes.
+ *
+ * Touches one byte per page. A thread_count of zero selects the existing
+ * hardware-based default. Call this only for a newly allocated mapping whose
+ * contents may be zeroed.
+ */
+void populate_mmap_mapping(void* ptr, size_t total_size, size_t page_size,
+                           size_t thread_count = 0);
+
+/**
  * @brief Fault in a fresh HugeTLB mapping with parallel CPU writes.
  *
  * Touches one byte per configured hugepage. Call this only for a newly
