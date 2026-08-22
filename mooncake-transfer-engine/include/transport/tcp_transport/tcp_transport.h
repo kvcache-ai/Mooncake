@@ -109,6 +109,9 @@ class TcpTransport : public Transport {
     const char *getName() const override { return "tcp"; }
 
    private:
+    // Opaque identity generated once per transport lifetime and published in
+    // the local TCP segment descriptor.
+    std::string tcp_instance_id_;
     TcpContext *context_;
     std::atomic_bool running_;
     std::thread thread_;
@@ -118,16 +121,21 @@ class TcpTransport : public Transport {
     struct ConnectionKey {
         std::string host;
         uint16_t port;
+        std::string tcp_instance_id;
 
         bool operator==(const ConnectionKey &other) const {
-            return host == other.host && port == other.port;
+            return host == other.host && port == other.port &&
+                   tcp_instance_id == other.tcp_instance_id;
         }
     };
 
     struct ConnectionKeyHash {
         std::size_t operator()(const ConnectionKey &key) const {
-            return std::hash<std::string>()(key.host) ^
-                   (std::hash<uint16_t>()(key.port) << 1);
+            const auto host_hash = std::hash<std::string>()(key.host);
+            const auto port_hash = std::hash<uint16_t>()(key.port);
+            const auto instance_hash =
+                std::hash<std::string>()(key.tcp_instance_id);
+            return host_hash ^ (port_hash << 1) ^ (instance_hash << 2);
         }
     };
 
@@ -217,6 +225,7 @@ class TcpTransport : public Transport {
         asio::io_context::executor_type executor;
     };
 
+    struct ConnectionLaneState;
     struct PeerConnectionGroup;
 
     struct ConnectionLane {
@@ -273,6 +282,9 @@ class TcpTransport : public Transport {
         std::shared_ptr<asio::steady_timer> retry_timer;
         uint64_t retry_epoch = 0;
         uint64_t connect_failure_log_count = 0;
+        bool retiring = false;
+        bool retirement_scheduled = false;
+        std::weak_ptr<ConnectionLaneState> owner_state;
         std::shared_ptr<FailureCounters> failure_counters;
     };
 
@@ -286,6 +298,8 @@ class TcpTransport : public Transport {
         std::unordered_map<ConnectionKey, std::shared_ptr<PeerConnectionGroup>,
                            ConnectionKeyHash>
             groups;
+        std::unordered_map<std::string, ConnectionKey> current_key_by_peer;
+        std::vector<std::shared_ptr<PeerConnectionGroup>> retiring_groups;
         std::weak_ptr<ConnectionLaneRuntime> runtime;
         std::shared_ptr<FailureCounters> failure_counters =
             std::make_shared<FailureCounters>();
@@ -300,10 +314,18 @@ class TcpTransport : public Transport {
 
     std::shared_ptr<asio::ip::tcp::socket> getConnection(
         const std::string &host, uint16_t port);
-    void enqueuePooledTransfer(const ConnectionKey &key, TcpWorkItem work);
+    void enqueuePooledTransfer(const std::string &logical_peer,
+                               const ConnectionKey &key, TcpWorkItem work);
     static uint64_t requestGroupPumpLocked(PeerConnectionGroup &group);
     static void postGroupPump(const std::shared_ptr<PeerConnectionGroup> &group,
                               uint64_t pump_epoch);
+    static bool requestGroupRetirementLocked(PeerConnectionGroup &group);
+    static void postGroupRetirement(
+        const std::shared_ptr<PeerConnectionGroup> &group);
+    static void scheduleGroupRetirement(
+        const std::shared_ptr<PeerConnectionGroup> &group);
+    static void runGroupRetirement(
+        const std::shared_ptr<PeerConnectionGroup> &group);
     static void runGroupPump(const std::shared_ptr<PeerConnectionGroup> &group,
                              uint64_t pump_epoch);
     static void startLaneConnect(
