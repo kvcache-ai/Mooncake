@@ -106,23 +106,11 @@ endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
 
-# Some architectures implement 16-byte atomic operations in libatomic rather
+# RISC-V toolchains may implement 16-byte atomic operations in libatomic rather
 # than emitting native instructions. Boost.Lockfree uses these operations in the
-# Store master, so detect and propagate the runtime library when needed.
-include(CheckCXXSourceCompiles)
-check_cxx_source_compiles(
-  "
-alignas(16) volatile unsigned __int128 value = 0;
-int main(int argc, char**) {
-  __atomic_store_n(&value, static_cast<unsigned __int128>(argc),
-                   __ATOMIC_SEQ_CST);
-  return static_cast<int>(__atomic_load_n(&value, __ATOMIC_SEQ_CST));
-}
-"
-  MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
-if(NOT MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
-  set(CMAKE_REQUIRED_LIBRARIES_SAVE ${CMAKE_REQUIRED_LIBRARIES})
-  set(CMAKE_REQUIRED_LIBRARIES atomic)
+# Store master, so detect and propagate the runtime library in RISC-V mode.
+if(USE_RISCV)
+  include(CheckCXXSourceCompiles)
   check_cxx_source_compiles(
     "
 alignas(16) volatile unsigned __int128 value = 0;
@@ -132,13 +120,27 @@ int main(int argc, char**) {
   return static_cast<int>(__atomic_load_n(&value, __ATOMIC_SEQ_CST));
 }
 "
-    MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
-  set(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES_SAVE})
-  if(MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
-    list(APPEND EXTRA_LIBS atomic)
-    message(STATUS "16-byte atomics: using libatomic")
-  else()
-    message(FATAL_ERROR "16-byte atomic operations are not supported")
+    MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
+  if(NOT MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
+    set(CMAKE_REQUIRED_LIBRARIES_SAVE ${CMAKE_REQUIRED_LIBRARIES})
+    set(CMAKE_REQUIRED_LIBRARIES atomic)
+    check_cxx_source_compiles(
+      "
+alignas(16) volatile unsigned __int128 value = 0;
+int main(int argc, char**) {
+  __atomic_store_n(&value, static_cast<unsigned __int128>(argc),
+                   __ATOMIC_SEQ_CST);
+  return static_cast<int>(__atomic_load_n(&value, __ATOMIC_SEQ_CST));
+}
+"
+      MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
+    set(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES_SAVE})
+    if(MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
+      list(APPEND EXTRA_LIBS atomic)
+      message(STATUS "16-byte atomics: using libatomic")
+    else()
+      message(FATAL_ERROR "16-byte atomic operations are not supported")
+    endif()
   endif()
 endif()
 
