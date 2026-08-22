@@ -65,6 +65,9 @@ DEFINE_string(p2p_transfer_direction_mode, "reverse",
 DEFINE_uint64(local_memcpy_async_worker_num, 32,
               "If set p2p_local_transfer_mode=memcpy, Worker number for async "
               "local memcpy executor (P2P), 0 means forbid async memcpy");
+DEFINE_uint64(te_async_poll_worker_num, 32,
+              "Worker number for async TE batch polling in DataManager (P2P), "
+              "0 means synchronous TE wait");
 DEFINE_uint32(http_port, 9003, "Port for client HTTP server");
 DEFINE_bool(enable_http_server, true, "Enable client HTTP server");
 DEFINE_uint32(
@@ -166,7 +169,8 @@ int main(int argc, char* argv[]) {
                 FLAGS_redis_password, FLAGS_redis_db_index,
                 FLAGS_redis_master_view_ttl_sec,
                 FLAGS_redis_heartbeat_interval_sec, FLAGS_redis_username,
-                static_cast<uint16_t>(FLAGS_heartbeat_rpc_port));
+                static_cast<uint16_t>(FLAGS_heartbeat_rpc_port),
+                static_cast<size_t>(FLAGS_te_async_poll_worker_num));
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)

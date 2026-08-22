@@ -1,15 +1,14 @@
 /**
  * @file inflight_tracker_test.cpp
- * @brief Unit tests for the shared InflightTracker: admission, the
- *        enter/leave transition hook, Close() rejecting new operations, and
- *        Wait() blocking until in-flight operations finish. Header-only, no
- *        external dependencies. The in-flight count lives in the hook (the
- *        caller's gauge), so the tests count via the hook.
+ * @brief Unit tests for InflightTracker: admission, enter/leave hooks,
+ *        Close() rejecting new operations, Wait() until drain, and
+ *        cross-thread Guard destruction (safe after counter-based drain).
  */
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <thread>
 
 #include "inflight_tracker.h"
@@ -23,8 +22,10 @@ TEST(InflightTrackerTest, AdmitsAndFiresHook) {
         auto g = tracker.Enter();
         EXPECT_TRUE(g.is_valid());
         EXPECT_EQ(inflight.load(), 1);
+        EXPECT_EQ(tracker.inflight(), 1);
     }
     EXPECT_EQ(inflight.load(), 0);
+    EXPECT_EQ(tracker.inflight(), 0);
 }
 
 TEST(InflightTrackerTest, CloseRejectsNewGuards) {
@@ -65,6 +66,7 @@ TEST(InflightTrackerTest, WaitBlocksUntilInflightReleased) {
     EXPECT_EQ(inflight.load(), 1);
 
     std::thread drainer([&] {
+        tracker.Close();
         tracker.Wait();  // blocks until the worker releases its guard
         wait_returned.store(true, std::memory_order_release);
     });
@@ -78,6 +80,27 @@ TEST(InflightTrackerTest, WaitBlocksUntilInflightReleased) {
     worker.join();
     EXPECT_TRUE(wait_returned.load(std::memory_order_acquire));
     EXPECT_EQ(inflight.load(), 0);
+}
+
+TEST(InflightTrackerTest, GuardCanBeDestroyedOnAnotherThread) {
+    std::atomic<int> hook_inflight{0};
+    InflightTracker tracker(
+        "cross-thread", [&] { ++hook_inflight; }, [&] { --hook_inflight; });
+
+    std::optional<InflightTracker::Guard> guard;
+    guard.emplace(tracker.Enter());
+    ASSERT_TRUE(guard->is_valid());
+    EXPECT_EQ(tracker.inflight(), 1);
+
+    std::thread other([&] {
+        guard.reset();  // Retire on a different OS thread than Enter
+    });
+    other.join();
+    EXPECT_EQ(tracker.inflight(), 0);
+    EXPECT_EQ(hook_inflight.load(), 0);
+
+    tracker.Close();
+    tracker.Wait();
 }
 
 }  // namespace mooncake

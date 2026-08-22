@@ -14,6 +14,10 @@
 #include <unordered_map>
 #include <vector>
 #include <functional>
+#include <async_simple/Executor.h>
+#include <async_simple/Future.h>
+#include <async_simple/coro/Lazy.h>
+#include <ylt/coro_io/io_context_pool.hpp>
 #include <ylt/util/tl/expected.hpp>
 #include "async_memcpy_executor.h"
 #include "client_buffer.hpp"
@@ -56,6 +60,11 @@ struct LocalTransferConfig {
     // When mode == MEMCPY, the following parameters are used:
     // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
+
+    // Dedicated coro_io pool for TE wait coroutines (poll getTransferStatus,
+    // then co_await sleep_for). Independent of `mode`. 0 keeps synchronous TE
+    // wait on the caller thread.
+    size_t te_async_poll_worker_num = 32;
 };
 
 /**
@@ -227,6 +236,11 @@ class DataManager {
         std::string_view key,
         const std::vector<RemoteBufferDesc>& dest_buffers);
 
+    /** Reverse read with TE wait offloaded when te_poll is enabled. */
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> ReadRemoteDataAsync(
+        std::string_view key,
+        const std::vector<RemoteBufferDesc>& dest_buffers);
+
     /**
      * @brief Write data from remote source buffers
      * @param key Object key to write
@@ -237,6 +251,12 @@ class DataManager {
     tl::expected<UUID, ErrorCode> WriteRemoteData(
         std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
+
+    /** Reverse write with TE wait offloaded when te_poll is enabled. */
+    async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
+    WriteRemoteDataAsync(std::string_view key,
+                         const std::vector<RemoteBufferDesc>& src_buffers,
+                         std::optional<UUID> tier_id = std::nullopt);
 
     tl::expected<PreWriteResponse, ErrorCode> PreWrite(
         std::string_view key, size_t size_bytes,
@@ -271,6 +291,25 @@ class DataManager {
         void* local_transfer_base, size_t total_size,
         const std::vector<RemoteBufferDesc>& peer_buffers,
         Transport::TransferRequest::OpCode opcode);
+
+    /**
+     * @brief Same as TransferData, but TE completion polling is offloaded when
+     * `te_async_poll_worker_num > 0`.
+     *
+     * Returns a Future (not Lazy) so callers co_await a single Future layer;
+     * avoids nested-coroutine issues with async_simple on some compilers.
+     */
+    async_simple::Future<tl::expected<void, ErrorCode>> TransferDataAsync(
+        void* local_transfer_base, size_t total_size,
+        const std::vector<RemoteBufferDesc>& peer_buffers,
+        Transport::TransferRequest::OpCode opcode);
+
+    /**
+     * @brief Dedicated coro_io executor for P2P business Lazys (`via`/`start`)
+     *        and TE-wait hop-back. Independent of RPC's pool and of the TE
+     *        wait pool (`te_wait_pool_`).
+     */
+    async_simple::Executor* GetCoroExecutor() const;
 
     // ================================================================
     // Utilities
@@ -436,6 +475,11 @@ class DataManager {
         AllocationHandle handle;  // Ensure local memory is not released
     };
 
+    // After TE wait for local PutViaTe: optional DRAM staging copy + commit.
+    tl::expected<void, ErrorCode> FinishPutViaTeAfterWait(
+        const KeyCtx& ctx, const UUID& write_operation_id,
+        TeSubmitResult& te_ctx, tl::expected<void, ErrorCode> wait_result);
+
     tl::expected<TeSubmitResult, ErrorCode> SubmitTeTransferInternal(
         const AllocationHandle& handle,
         const std::vector<RemoteBufferDesc>& remote_buffers,
@@ -448,6 +492,15 @@ class DataManager {
                             const std::vector<RemoteBufferDesc>& remote_buffers,
                             Transport::TransferRequest::OpCode opcode);
 
+    // Validate peer buffers and submit TE batches. Shared by TransferData and
+    // TransferDataAsync; callers only differ in how they wait.
+    tl::expected<
+        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
+        ErrorCode>
+    SubmitTransferData(void* local_transfer_base, size_t total_size,
+                       const std::vector<RemoteBufferDesc>& peer_buffers,
+                       Transport::TransferRequest::OpCode opcode);
+
     /**
      * @brief Helper to wait for a transfer batch to complete
      * @param batch_id Batch ID to poll
@@ -458,6 +511,31 @@ class DataManager {
     tl::expected<void, ErrorCode> WaitTransferBatch(
         Transport::BatchID batch_id, size_t num_tasks,
         const std::string& segment_endpoint);
+
+    enum class TeBatchPollResult { kPending, kCompleted, kFailed };
+
+    TeBatchPollResult PollTransferBatchOnce(
+        Transport::BatchID batch_id, size_t num_tasks,
+        const std::string& segment_endpoint,
+        std::chrono::steady_clock::time_point start_time);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    WaitTransferBatchCoro(Transport::BatchID batch_id, size_t num_tasks,
+                          std::string segment_endpoint);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    WaitAllTransferBatchesCoro(
+        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
+            batches);
+
+    void ReleaseTeWaitInflight();
+    bool IsTeBatchFullyDrained(Transport::BatchID batch_id, size_t num_tasks);
+    async_simple::coro::Lazy<void> CancelBatchTETaskCoro(
+        Transport::BatchID batch_id, size_t num_tasks);
+    async_simple::coro::Lazy<void> CancelTeWaitBatchesCoro(
+        const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
+            batches,
+        size_t from_index);
 
     /**
      * @brief Validate remote buffer descriptors
@@ -528,6 +606,12 @@ class DataManager {
         const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
             batches);
 
+    /** TE wait coroutines on te_wait_pool_ when configured. */
+    async_simple::Future<tl::expected<void, ErrorCode>>
+    WaitAllTransferBatchesAsync(
+        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
+            batches);
+
     // Wait for all tasks to reach a terminal state, then free the batch.
     void CancelBatchTETask(Transport::BatchID batch_id, size_t num_tasks);
 
@@ -556,6 +640,12 @@ class DataManager {
 
     LocalTransferConfig local_transfer_config_;
     std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
+    std::shared_ptr<coro_io::io_context_pool> te_wait_pool_;
+    std::mutex te_wait_mutex_;
+    std::condition_variable te_wait_cv_;
+    std::atomic<bool> te_wait_stopped_{false};
+    size_t te_wait_inflight_{0};  // guarded by te_wait_mutex_
+    std::shared_ptr<coro_io::io_context_pool> coro_executor_pool_;
     std::chrono::milliseconds lease_duration_;
     std::chrono::milliseconds lease_scan_interval_;
     std::atomic<bool> lease_scanner_stop_requested_{false};

@@ -1187,7 +1187,8 @@ PYBIND11_MODULE(store, m) {
                uint64_t route_cache_ttl_ms = 60 * 1000,
                const std::string& local_transfer_mode = "te",
                size_t local_memcpy_async_worker_num = 32,
-               uint16_t http_port = 9003, bool enable_http_server = true,
+               size_t te_async_poll_worker_num = 32, uint16_t http_port = 9003,
+               bool enable_http_server = true,
                size_t async_sender_thread_count = 4,
                size_t async_max_batch_size = 2000,
                size_t async_route_queue_size = 0,
@@ -1222,8 +1223,8 @@ PYBIND11_MODULE(store, m) {
                     async_route_queue_size, p2p_key_lease_duration_ms,
                     p2p_key_lease_scan_interval_ms, p2p_transfer_direction_mode,
                     runtime_config, enable_metric_collection,
-                    metric_report_interval_seconds);
-                config.heartbeat_rpc_port = heartbeat_rpc_port;
+                    metric_report_interval_seconds, DEFAULT_CLUSTER_ID, "", 0,
+                    5, 2, "", heartbeat_rpc_port, te_async_poll_worker_num);
 
                 auto ret = real_client->setup(config);
                 return ret;
@@ -1238,6 +1239,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("route_cache_ttl_ms") = 60 * 1000,
             py::arg("local_transfer_mode") = "te",
             py::arg("local_memcpy_async_worker_num") = 32,
+            py::arg("te_async_poll_worker_num") = 32,
             py::arg("http_port") = 9003, py::arg("enable_http_server") = true,
             py::arg("async_sender_thread_count") = 4,
             py::arg("async_max_batch_size") = 2000,
@@ -1368,6 +1370,8 @@ PYBIND11_MODULE(store, m) {
             "(default 'te').\n"
             "  local_memcpy_async_worker_num: Async memcpy worker count "
             "(default 32).\n"
+            "  te_async_poll_worker_num: TE batch poll worker count "
+            "(default 32; 0 = sync TE wait).\n"
             "  async_sender_thread_count: Async route sender thread count "
             "(default 0).\n"
             "  async_max_batch_size: Async route max batch size (default "

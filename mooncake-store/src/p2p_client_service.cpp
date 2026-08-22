@@ -16,6 +16,7 @@
 #include <async_simple/Try.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
+#include <ylt/coro_io/coro_io.hpp>
 
 #include "utils/scoped_vlog_timer.h"
 
@@ -332,6 +333,8 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 
     LocalTransferConfig local_transfer_config;
     local_transfer_config.mode = config.local_transfer_mode;
+    local_transfer_config.te_async_poll_worker_num =
+        config.te_async_poll_worker_num;
     if (config.local_transfer_mode == LocalTransferMode::TE) {
         local_transfer_config.te_endpoint = get_te_endpoint();
     } else {
@@ -1026,6 +1029,7 @@ P2PClientService::CreatePutHandlesFromRoute(
         RunWriteWithRetry(std::move(promise), std::move(task.first_task),
                           std::move(task.first_op),
                           std::move(task.retry_op_list), keys[i], sizes[i])
+            .via(GetCoroExecutor())
             .start([](auto&&) {});
         handles.push_back(FutureHandle<void>::Create(std::shared_ptr<void>{},
                                                      std::move(future)));
@@ -1081,14 +1085,14 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                 DataManager* dm = &*data_manager_;
                 RemoteForwardWriteOp::TeTransferFn te_transfer =
                     [dm](void* local_base, size_t size,
-                         const std::vector<RemoteBufferDesc>& dest_buffers)
-                    -> tl::expected<void, ErrorCode> {
-                    return dm->TransferData(local_base, size, dest_buffers,
-                                            Transport::TransferRequest::WRITE);
-                };
+                         const std::vector<RemoteBufferDesc>& dest_buffers) {
+                        return dm->TransferDataAsync(
+                            local_base, size, dest_buffers,
+                            Transport::TransferRequest::WRITE);
+                    };
                 write_ops.push_back(std::make_unique<RemoteForwardWriteOp>(
                     peer, metrics_, write_req, endpoint, &slices,
-                    std::move(te_transfer)));
+                    std::move(te_transfer), dm->GetCoroExecutor()));
             } else {
                 // segment_id is intentionally left unset: the write route is
                 // client-granular; the remote peer picks the concrete segment.
@@ -1112,15 +1116,10 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
     return write_ops;
 }
 
-// TODO (TE mode blocking):
-// When local_transfer_mode == TE, data_manager->Put() returns a
-// CallableTaskHandle whose WaitAsync() falls back to the base class synchronous
-// Wait() — there is no true coroutine suspension point.
-// As a result, co_await current_task->WaitAsync() inside RunWriteWithRetry will
-// block the coroutine worker thread for the full duration of the TE transfer
-// instead of yielding it.
-// The retry chain can only advance after that blocking wait returns.
-// See the TODO in DataManager::PutViaTe for planned async improvements.
+// DataManager bridges local TE Put so WaitAsync only awaits TE wait (via
+// te_wait_pool_ when configured); copy/commit run after resume on the business
+// executor. Wait coroutines poll getTransferStatus and yield with
+// coro_io::sleep_for.
 std::unique_ptr<TaskHandle<void>> P2PClientService::LocalWriteOp::Dispatch() {
     if (!data_manager) {
         LOG(ERROR) << "Data manager not initialized";
@@ -1159,6 +1158,8 @@ P2PClientService::RemoteForwardWriteOp::Dispatch() {
     auto future = promise->getFuture();
     RemoteForwardWriteOp::RunForwardRemotePut(
         std::move(promise), peer_ptr, metrics, te_transfer, write_req, slices)
+        .via(coro_executor != nullptr ? coro_executor
+                                      : coro_io::get_global_executor())
         .start([](auto&&) {});
     return FutureHandle<void>::Create(write_req, std::move(future));
 }
@@ -1773,7 +1774,9 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
     auto future = promise->getFuture();
 
     const uint64_t object_size = iter.object_size();
-    RunReadWithRetry(std::move(iter), req, promise).start([](auto&&) {});
+    RunReadWithRetry(std::move(iter), req, promise)
+        .via(GetCoroExecutor())
+        .start([](auto&&) {});
 
     ReadTaskHandle res;
     res.data_size = object_size;
@@ -1796,50 +1799,68 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
             << req->key << ", buffer_count=" << req->dest_buffers.size();
         co_return ErrorCode::NOT_IMPLEMENTED;
     }
-    PinKeyRequest pin_req;
-    pin_req.key = req->key;
-    auto pin = co_await route.peer->AsyncPinKey(pin_req);
-    if (!pin) {
-        if (pin.error() != ErrorCode::OBJECT_NOT_FOUND) {
-            LOG(ERROR) << "AsyncPinKey failed, key=" << req->key
-                       << ", error=" << pin.error();
-        }
-        co_return pin.error();
-    }
     void* base = reinterpret_cast<void*>(req->dest_buffers[0].addr);
     const size_t total = req->dest_buffers[0].size;
-    auto tr =
-        data_manager_->TransferData(base, total, {pin.value().remote_buffer},
-                                    Transport::TransferRequest::READ);
+
+    // Scope `pin` so the tl::expected does not live across the TE-wait
+    // suspend point. Hold the produced Future in an optional (async_simple::
+    // Future has no default ctor) so only a Future/trivial locals cross the
+    // suspend. Works around gcc-11/12 coroutine-lowering ICE in
+    // build_special_member_call.
+    std::optional<async_simple::Future<tl::expected<void, ErrorCode>>>
+        transfer_fut;
+    UUID read_operation_id{};
+    {
+        PinKeyRequest pin_req;
+        pin_req.key = req->key;
+        auto pin = co_await route.peer->AsyncPinKey(pin_req);
+        if (!pin) {
+            if (pin.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(ERROR) << "AsyncPinKey failed, key=" << req->key
+                           << ", error=" << pin.error();
+            }
+            co_return pin.error();
+        }
+        read_operation_id = pin.value().read_operation_id;
+        transfer_fut = data_manager_->TransferDataAsync(
+            base, total, {pin.value().remote_buffer},
+            Transport::TransferRequest::READ);
+    }
+
+    auto tr = co_await AwaitExpectedFuture(std::move(*transfer_fut),
+                                           GetCoroExecutor());
     if (!tr) {
         LOG(ERROR) << "Forward TE read failed, key=" << req->key
                    << ", error=" << tr.error();
         UnPinKeyRequest cleanup;
         cleanup.key = req->key;
-        cleanup.read_operation_id = pin.value().read_operation_id;
+        cleanup.read_operation_id = read_operation_id;
         Stopwatch rollback_sw;
-        tl::expected<void, ErrorCode> cleanup_unpin;
+        bool cleanup_ok = false;
+        ErrorCode cleanup_error = ErrorCode::OK;
         for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
             if (metrics_) {
                 metrics_->rollback.unpin_key_requests.inc();
             }
-            cleanup_unpin = co_await route.peer->AsyncUnPinKey(cleanup);
-            if (cleanup_unpin) {
+            auto r = co_await route.peer->AsyncUnPinKey(cleanup);
+            if (r) {
+                cleanup_ok = true;
                 break;
             }
-            if (cleanup_unpin.error() == ErrorCode::LEASE_EXPIRED) {
-                cleanup_unpin = tl::expected<void, ErrorCode>{};
+            cleanup_error = r.error();
+            if (cleanup_error == ErrorCode::LEASE_EXPIRED) {
+                cleanup_ok = true;
                 break;
             }
             if (attempt + 1 < kRevokeRetryMaxCnt) {
                 LOG(WARNING)
                     << "AsyncUnPinKey retry after TE failure, key=" << req->key
                     << ", attempt=" << (attempt + 1)
-                    << ", error=" << cleanup_unpin.error();
+                    << ", error=" << cleanup_error;
             }
         }
         if (metrics_) {
-            if (cleanup_unpin) {
+            if (cleanup_ok) {
                 metrics_->rollback.unpin_key_latency_success.observe(
                     rollback_sw.elapsed_us());
             } else {
@@ -1848,16 +1869,15 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
                     rollback_sw.elapsed_us());
             }
         }
-        if (!cleanup_unpin) {
+        if (!cleanup_ok) {
             LOG(ERROR) << "AsyncUnPinKey failed after TE read failure, key="
-                       << req->key << ", error=" << cleanup_unpin.error();
+                       << req->key << ", error=" << cleanup_error;
         }
         co_return tr.error();
     }
     // Success: skip UnPinKey to save RPC latency; owner lease / scanner
     // releases pin.
-    tl::expected<void, ErrorCode> ok;
-    promise->setValue(std::move(ok));
+    promise->setValue(tl::expected<void, ErrorCode>{});
     co_return ErrorCode::OK;
 }
 
@@ -2435,6 +2455,15 @@ tl::expected<void, ErrorCode> P2PClientService::UnmountSegment(
 // PeerClient management
 // ============================================================================
 
+async_simple::Executor* P2PClientService::GetCoroExecutor() const {
+    if (data_manager_.has_value()) {
+        if (async_simple::Executor* ex = data_manager_->GetCoroExecutor()) {
+            return ex;
+        }
+    }
+    return coro_io::get_global_executor();
+}
+
 PeerClient& P2PClientService::GetOrCreatePeerClient(
     const std::string& endpoint) {
     std::lock_guard<std::mutex> lock(peer_clients_mutex_);
@@ -2460,93 +2489,112 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
     std::shared_ptr<WritePromise> promise, PeerClient* peer,
     std::shared_ptr<P2PClientMetric> metrics, TeTransferFn te_transfer,
     std::shared_ptr<RemoteWriteRequest> write_req, std::vector<Slice>* slices) {
-    if (!peer || !te_transfer || !write_req || !slices) {
+    // Ensure the Dispatch()-side WritePromise always completes. TE poll cancel
+    // / shutdown completes the transfer Future with setException; without this
+    // catch the outer promise would hang forever (.start ignores Lazy errors).
+    try {
+        if (!peer || !te_transfer || !write_req || !slices) {
+            promise->setValue(tl::expected<void, ErrorCode>(
+                tl::unexpected(ErrorCode::INTERNAL_ERROR)));
+            co_return;
+        }
+        if (slices->size() != 1) {
+            LOG(ERROR)
+                << "Forward transfer write supports a single slice only, key="
+                << write_req->key << ", slice_count=" << slices->size();
+            promise->setValue(tl::expected<void, ErrorCode>(
+                tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
+            co_return;
+        }
+        PreWriteRequest pre_req;
+        pre_req.key = write_req->key;
+        pre_req.size_bytes = slices->front().size;
+        pre_req.target_tier_id = write_req->target_tier_id;
+
+        auto pre = co_await peer->AsyncPreWrite(pre_req);
+        if (!pre) {
+            if (!IsAlreadyExistsError(pre.error())) {
+                LOG(ERROR) << "AsyncPreWrite failed, key=" << write_req->key
+                           << ", error=" << pre.error();
+            }
+            promise->setValue(
+                tl::expected<void, ErrorCode>(tl::unexpected(pre.error())));
+            co_return;
+        }
+
+        std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
+        void* base = slices->front().ptr;
+        auto te = co_await AwaitExpectedFuture(
+            te_transfer(base, slices->front().size, dest));
+        if (!te) {
+            LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
+                       << ", error=" << te.error();
+            WriteRevokeRequest revoke_req;
+            revoke_req.key = write_req->key;
+            revoke_req.write_operation_id = pre.value().write_operation_id;
+            Stopwatch rollback_sw;
+            tl::expected<void, ErrorCode> revoke_res;
+            for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
+                if (metrics) {
+                    metrics->rollback.write_revoke_requests.inc();
+                }
+                revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
+                if (revoke_res) {
+                    break;
+                }
+                if (revoke_res.error() == ErrorCode::LEASE_EXPIRED) {
+                    revoke_res = tl::expected<void, ErrorCode>{};
+                    break;
+                }
+                if (attempt + 1 < kRevokeRetryMaxCnt) {
+                    LOG(WARNING)
+                        << "AsyncWriteRevoke retry after TE failure, key="
+                        << write_req->key << ", attempt=" << (attempt + 1)
+                        << ", error=" << revoke_res.error();
+                }
+            }
+            if (metrics) {
+                if (revoke_res) {
+                    metrics->rollback.write_revoke_latency_success.observe(
+                        rollback_sw.elapsed_us());
+                } else {
+                    metrics->rollback.write_revoke_failures.inc();
+                    metrics->rollback.write_revoke_latency_failure.observe(
+                        rollback_sw.elapsed_us());
+                }
+            }
+            if (!revoke_res) {
+                LOG(ERROR) << "AsyncWriteRevoke failed after TE failure, key="
+                           << write_req->key
+                           << ", error=" << revoke_res.error();
+            }
+            promise->setValue(
+                tl::expected<void, ErrorCode>(tl::unexpected(te.error())));
+            co_return;
+        }
+
+        WriteCommitRequest commit;
+        commit.key = write_req->key;
+        commit.write_operation_id = pre.value().write_operation_id;
+        auto cm = co_await peer->AsyncWriteCommit(commit);
+        if (!cm) {
+            promise->setValue(
+                tl::expected<void, ErrorCode>(tl::unexpected(cm.error())));
+            co_return;
+        }
+        promise->setValue(tl::expected<void, ErrorCode>{});
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "RunForwardRemotePut exception"
+                   << ", key=" << (write_req ? write_req->key : "<null>")
+                   << ", what=" << e.what();
         promise->setValue(tl::expected<void, ErrorCode>(
             tl::unexpected(ErrorCode::INTERNAL_ERROR)));
-        co_return;
-    }
-    if (slices->size() != 1) {
-        LOG(ERROR)
-            << "Forward transfer write supports a single slice only, key="
-            << write_req->key << ", slice_count=" << slices->size();
+    } catch (...) {
+        LOG(ERROR) << "RunForwardRemotePut unknown exception"
+                   << ", key=" << (write_req ? write_req->key : "<null>");
         promise->setValue(tl::expected<void, ErrorCode>(
-            tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
-        co_return;
+            tl::unexpected(ErrorCode::INTERNAL_ERROR)));
     }
-    PreWriteRequest pre_req;
-    pre_req.key = write_req->key;
-    pre_req.size_bytes = slices->front().size;
-    pre_req.target_tier_id = write_req->target_tier_id;
-
-    auto pre = co_await peer->AsyncPreWrite(pre_req);
-    if (!pre) {
-        if (!IsAlreadyExistsError(pre.error())) {
-            LOG(ERROR) << "AsyncPreWrite failed, key=" << write_req->key
-                       << ", error=" << pre.error();
-        }
-        promise->setValue(
-            tl::expected<void, ErrorCode>(tl::unexpected(pre.error())));
-        co_return;
-    }
-
-    std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
-    void* base = slices->front().ptr;
-    auto te = te_transfer(base, slices->front().size, dest);
-    if (!te) {
-        LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
-                   << ", error=" << te.error();
-        WriteRevokeRequest revoke_req;
-        revoke_req.key = write_req->key;
-        revoke_req.write_operation_id = pre.value().write_operation_id;
-        Stopwatch rollback_sw;
-        tl::expected<void, ErrorCode> revoke_res;
-        for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
-            if (metrics) {
-                metrics->rollback.write_revoke_requests.inc();
-            }
-            revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
-            if (revoke_res) {
-                break;
-            }
-            if (revoke_res.error() == ErrorCode::LEASE_EXPIRED) {
-                revoke_res = tl::expected<void, ErrorCode>{};
-                break;
-            }
-            if (attempt + 1 < kRevokeRetryMaxCnt) {
-                LOG(WARNING) << "AsyncWriteRevoke retry after TE failure, key="
-                             << write_req->key << ", attempt=" << (attempt + 1)
-                             << ", error=" << revoke_res.error();
-            }
-        }
-        if (metrics) {
-            if (revoke_res) {
-                metrics->rollback.write_revoke_latency_success.observe(
-                    rollback_sw.elapsed_us());
-            } else {
-                metrics->rollback.write_revoke_failures.inc();
-                metrics->rollback.write_revoke_latency_failure.observe(
-                    rollback_sw.elapsed_us());
-            }
-        }
-        if (!revoke_res) {
-            LOG(ERROR) << "AsyncWriteRevoke failed after TE failure, key="
-                       << write_req->key << ", error=" << revoke_res.error();
-        }
-        promise->setValue(
-            tl::expected<void, ErrorCode>(tl::unexpected(te.error())));
-        co_return;
-    }
-
-    WriteCommitRequest commit;
-    commit.key = write_req->key;
-    commit.write_operation_id = pre.value().write_operation_id;
-    auto cm = co_await peer->AsyncWriteCommit(commit);
-    if (!cm) {
-        promise->setValue(
-            tl::expected<void, ErrorCode>(tl::unexpected(cm.error())));
-        co_return;
-    }
-    promise->setValue(tl::expected<void, ErrorCode>{});
 }
 
 // ============================================================================
