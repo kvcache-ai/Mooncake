@@ -973,6 +973,8 @@ class MasterService {
     // Restore master state
     void RestoreState();
     void ResetStateAfterFailedRestoreAttempt();
+    tl::expected<void, SerializationError>
+    RebuildClientLivenessAfterSnapshotRestore();
 
     /**
      * @brief Apply decoded snapshot state to running master service
@@ -2661,6 +2663,7 @@ class MasterService {
         std::string source_segment;
         std::string target_segment;
         std::string target_domain;
+        std::shared_ptr<ClientLivenessRecord> source_liveness;
     };
 
     DynamicReplicationMode dynamic_replication_mode_{
@@ -2943,13 +2946,14 @@ class MasterService {
         const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
 
-    // Invalid endpoints from standby that don't exist locally
-    std::unordered_set<std::string> invalid_replica_endpoints_;
-
     // Keep DummyBufferAllocator alive after standby restore.
     // Key: transport_endpoint, Value: allocator.
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         standby_allocator_keepalive_;
+    // Promotion snapshots do not carry the memory Segment owner. Restored
+    // buffers remain immediately readable through this process-local gate
+    // until ReMount binds them to the reporting Client's canonical record.
+    std::shared_ptr<ClientLivenessRecord> standby_restore_gate_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
 

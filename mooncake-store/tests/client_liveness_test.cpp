@@ -1,6 +1,9 @@
 #include "client_liveness.h"
 
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -81,6 +84,40 @@ TEST(ClientLivenessRecordTest, RetainingGuardCommitsSuccessfulObservation) {
     EXPECT_EQ(guard->Observe(initial + 11s),
               ClientLivenessObservation::RECOVERED_ACTIVE);
     EXPECT_TRUE(record.IsServing());
+}
+
+TEST(ClientLivenessRecordTest, RetireCallbackRunsAfterTransitionGuardRelease) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+
+    std::mutex completion_mutex;
+    std::condition_variable completion_cv;
+    bool completed = false;
+    bool rejected_offline = false;
+    std::thread probe;
+
+    EXPECT_EQ(
+        record.EvaluateAndRetire(initial + 30s, 10s, 20s, [&] {
+            probe = std::thread([&] {
+                rejected_offline =
+                    !record.TryAcquireRetainingGuard().has_value();
+                {
+                    std::lock_guard<std::mutex> lock(completion_mutex);
+                    completed = true;
+                }
+                completion_cv.notify_one();
+            });
+
+            std::unique_lock<std::mutex> lock(completion_mutex);
+            EXPECT_TRUE(completion_cv.wait_for(lock, 1s,
+                                               [&] { return completed; }));
+        }),
+        ClientLivenessTransition::BECAME_OFFLINE);
+
+    probe.join();
+    EXPECT_TRUE(rejected_offline);
 }
 
 }  // namespace

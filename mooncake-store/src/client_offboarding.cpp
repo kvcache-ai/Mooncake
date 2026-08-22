@@ -11,10 +11,6 @@
 
 namespace mooncake {
 
-namespace {
-constexpr uint64_t kAlertRetryThreshold = 10;
-}
-
 ClientOffboardingWorker::~ClientOffboardingWorker() { Stop(); }
 
 void ClientOffboardingWorker::Start() {
@@ -133,7 +129,7 @@ void ClientOffboardingWorker::ThreadFunc() {
         ++job.retry_count;
         MasterMetricManager::instance().inc_client_offboarding_failure();
         MasterMetricManager::instance().inc_client_offboarding_retry();
-        const bool alert = job.retry_count >= kAlertRetryThreshold;
+        const bool alert = ShouldAlert(job.retry_count);
         if (alert) {
             MasterMetricManager::instance().inc_client_offboarding_alert();
         }

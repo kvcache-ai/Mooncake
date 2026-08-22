@@ -482,8 +482,8 @@ TEST_F(PromotionOnHitTest,
     service->RemoveAll();
 }
 
-// PromotionObjectHeartbeat returns an empty task list when called against a
-// client that has no LocalDiskSegment registered.
+// An unknown Client is rejected by the liveness work gate before the
+// LocalDisk mailbox is consulted.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -493,10 +493,10 @@ TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     UUID unknown_client = generate_uuid();
     auto pending = service->PromotionObjectHeartbeat(unknown_client);
     ASSERT_FALSE(pending.has_value());
-    EXPECT_EQ(pending.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_EQ(pending.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
-// PromotionAllocStart on a non-existent key returns OBJECT_NOT_FOUND.
+// An unknown Client is rejected before object metadata is consulted.
 TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -506,7 +506,7 @@ TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
     auto resp = service->PromotionAllocStart(generate_uuid(), "nonexistent",
                                              TenantId::Default(), 1024, {});
     ASSERT_FALSE(resp.has_value());
-    EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(resp.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 TEST_F(PromotionOnHitTest, InvalidPrimaryEndCannotCompletePromotionReplica) {
@@ -682,7 +682,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReplicaCleanupErasesTask) {
     service->RemoveAll();
 }
 
-// NotifyPromotionSuccess on a non-existent key returns OBJECT_NOT_FOUND.
+// An unknown Client is rejected before promotion metadata is consulted.
 TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -693,7 +693,7 @@ TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
     auto resp = service->NotifyPromotionSuccess(client_id, "nonexistent",
                                                 TenantId::Default());
     ASSERT_FALSE(resp.has_value());
-    EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(resp.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 // Concurrent readers racing into TryPushPromotionQueue must dedupe to a
@@ -1642,10 +1642,12 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
                                               TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value());
 
-    // An unrelated client tries to Notify. Must be rejected as
-    // INVALID_PARAMS so the staged replica stays PROCESSING.
+    // A live but unrelated client reaches the holder check and is rejected,
+    // so the staged replica stays PROCESSING.
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
+    ASSERT_TRUE(
+        service->MountLocalDiskSegment(intruder_id, true).has_value());
     auto bad_notify = service->NotifyPromotionSuccess(intruder_id, "k_cold",
                                                       TenantId::Default());
     ASSERT_FALSE(bad_notify.has_value())
@@ -1990,6 +1992,8 @@ TEST_F(PromotionOnHitTest, NotifyFailureRejectsNonHolder) {
     // Intruder calls Failure with the wrong client_id.
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
+    ASSERT_TRUE(
+        service->MountLocalDiskSegment(intruder_id, true).has_value());
     auto bad_failure = service->NotifyPromotionFailure(intruder_id, "k_cold",
                                                        TenantId::Default());
     ASSERT_FALSE(bad_failure.has_value())
@@ -2040,6 +2044,8 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsNonHolder) {
 
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
+    ASSERT_TRUE(
+        service->MountLocalDiskSegment(intruder_id, true).has_value());
     auto bad_alloc = service->PromotionAllocStart(
         intruder_id, "k_cold", TenantId::Default(), 1024, {});
     ASSERT_FALSE(bad_alloc.has_value())

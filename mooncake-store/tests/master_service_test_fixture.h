@@ -68,6 +68,31 @@ class MasterServiceTest : public ::testing::Test {
         return service.ProcessClientOffboardingJob(job);
     }
 
+    ErrorCode PrepareUnmountSegmentForTest(MasterService& service,
+                                           const UUID& segment_id,
+                                           size_t& metrics_dec_capacity) {
+        auto access = service.segment_manager_.getSegmentAccess();
+        return access.PrepareUnmountSegment(segment_id, metrics_dec_capacity);
+    }
+
+    ErrorCode CommitUnmountSegmentForTest(MasterService& service,
+                                          const UUID& segment_id,
+                                          const UUID& client_id,
+                                          size_t metrics_dec_capacity) {
+        auto access = service.segment_manager_.getSegmentAccess();
+        return access.CommitUnmountSegment(segment_id, client_id,
+                                           metrics_dec_capacity);
+    }
+
+    std::chrono::seconds ClientOffboardingRetryDelayForTest(
+        uint64_t retry_count) {
+        return ClientOffboardingWorker::RetryDelay(retry_count);
+    }
+
+    bool ClientOffboardingShouldAlertForTest(uint64_t retry_count) {
+        return ClientOffboardingWorker::ShouldAlert(retry_count);
+    }
+
     void ExpectKeyHiddenFromReadApis(MasterService& service,
                                      const std::string& key) {
         auto get = service.GetReplicaList(key, TenantId::Default());

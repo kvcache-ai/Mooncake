@@ -893,6 +893,30 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
     EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_, "2-segment");
 }
 
+TEST_F(AllocationStrategyTest,
+       SsdFreeRatioFirstSnapshotPreservesOwnerRanking) {
+    const size_t kSegmentSize = 64 * MiB;
+    SsdPlacementTestState state;
+    state.AddSegment("busy", 0, kSegmentSize, 1000 * MiB, 900 * MiB);
+    state.AddSegment("free", 1, kSegmentSize, 1000 * MiB, 100 * MiB);
+
+    AllocatorManager snapshot;
+    {
+        auto placement = state.GetPlacement();
+        snapshot = placement.SnapshotAllocatorManager();
+    }
+
+    SsdFreeRatioFirstAllocationStrategy strategy(state.local_ssd);
+    auto result = strategy.Allocate(snapshot, 64 * 1024);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "free");
+}
+
 TEST_F(AllocationStrategyTest, SsdFreeRatioFirstWithoutUsageAllocates) {
     SsdPlacementTestState state;
     state.AddSegmentWithoutSsd("segment1", 64 * MiB);

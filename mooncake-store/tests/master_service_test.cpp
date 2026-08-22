@@ -5604,6 +5604,42 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
 
 // ===================== Client Offboarding Tests =====================
 
+TEST_F(MasterServiceTest, ClientOffboardingRetryPolicy) {
+    EXPECT_EQ(ClientOffboardingRetryDelayForTest(1), std::chrono::seconds(1));
+    EXPECT_EQ(ClientOffboardingRetryDelayForTest(2), std::chrono::seconds(2));
+    EXPECT_EQ(ClientOffboardingRetryDelayForTest(3), std::chrono::seconds(4));
+    EXPECT_EQ(ClientOffboardingRetryDelayForTest(4), std::chrono::seconds(8));
+    EXPECT_EQ(ClientOffboardingRetryDelayForTest(5),
+              std::chrono::seconds(16));
+    EXPECT_EQ(ClientOffboardingRetryDelayForTest(6),
+              std::chrono::seconds(30));
+    EXPECT_EQ(ClientOffboardingRetryDelayForTest(100),
+              std::chrono::seconds(30));
+    EXPECT_FALSE(ClientOffboardingShouldAlertForTest(9));
+    EXPECT_TRUE(ClientOffboardingShouldAlertForTest(10));
+    EXPECT_TRUE(ClientOffboardingShouldAlertForTest(11));
+}
+
+TEST_F(MasterServiceTest, ReMountDoesNotRecoverSuspectedClient) {
+    MasterService service;
+    auto segment = MakeSegment("suspected_remount_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    const auto liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(liveness);
+    ASSERT_EQ(liveness->Evaluate(ClientLivenessRecord::Clock::now(),
+                                 std::chrono::seconds::zero(),
+                                 std::chrono::hours(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+
+    ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
+    EXPECT_EQ(liveness->state(), ClientLivenessState::SUSPECTED);
+    EXPECT_EQ(service.Ping(client_id)->client_status, ClientStatus::OK);
+    EXPECT_EQ(liveness->state(), ClientLivenessState::ACTIVE);
+}
+
 TEST_F(MasterServiceTest,
        ClientOffboardingProcessesRealSegmentAndMetadataResiduals) {
     MasterService service;

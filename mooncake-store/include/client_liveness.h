@@ -156,28 +156,38 @@ class ClientLivenessRecord {
     [[nodiscard]] ClientLivenessTransition EvaluateAndRetire(
         TimePoint now, Clock::duration active_ttl,
         Clock::duration suspicion_ttl, RetireOperation&& retire_operation) {
-        std::lock_guard<std::mutex> lock(transition_mutex_);
-        switch (state_.load(std::memory_order_relaxed)) {
-            case ClientLivenessState::ACTIVE:
-                if (now - last_liveness_at_ >= active_ttl) {
-                    suspected_since_ = now;
-                    state_.store(ClientLivenessState::SUSPECTED,
-                                 std::memory_order_release);
-                    return ClientLivenessTransition::BECAME_SUSPECTED;
-                }
-                break;
-            case ClientLivenessState::SUSPECTED:
-                if (now - suspected_since_ >= suspicion_ttl) {
-                    state_.store(ClientLivenessState::OFFLINE,
-                                 std::memory_order_release);
-                    std::forward<RetireOperation>(retire_operation)();
-                    return ClientLivenessTransition::BECAME_OFFLINE;
-                }
-                break;
-            case ClientLivenessState::OFFLINE:
-                break;
+        ClientLivenessTransition transition =
+            ClientLivenessTransition::NONE;
+        {
+            std::lock_guard<std::mutex> lock(transition_mutex_);
+            switch (state_.load(std::memory_order_relaxed)) {
+                case ClientLivenessState::ACTIVE:
+                    if (now - last_liveness_at_ >= active_ttl) {
+                        suspected_since_ = now;
+                        state_.store(ClientLivenessState::SUSPECTED,
+                                     std::memory_order_release);
+                        transition =
+                            ClientLivenessTransition::BECAME_SUSPECTED;
+                    }
+                    break;
+                case ClientLivenessState::SUSPECTED:
+                    if (now - suspected_since_ >= suspicion_ttl) {
+                        state_.store(ClientLivenessState::OFFLINE,
+                                     std::memory_order_release);
+                        transition = ClientLivenessTransition::BECAME_OFFLINE;
+                    }
+                    break;
+                case ClientLivenessState::OFFLINE:
+                    break;
+            }
         }
-        return ClientLivenessTransition::NONE;
+        // OFFLINE is already visible and no new guard can enter. Run the
+        // one-shot retirement work without nesting this mutex under Segment,
+        // metadata, or snapshot locks acquired by the callback.
+        if (transition == ClientLivenessTransition::BECAME_OFFLINE) {
+            std::forward<RetireOperation>(retire_operation)();
+        }
+        return transition;
     }
 
    private:

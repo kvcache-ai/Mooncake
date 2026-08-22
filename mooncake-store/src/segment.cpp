@@ -384,7 +384,7 @@ bool ScopedSegmentAccess::ReplaceAllocators(
             segment_manager_->mounted_segments_.find(replacement.segment_id);
         if (mounted == segment_manager_->mounted_segments_.end() ||
             !mounted->second.allocator_registration ||
-            mounted->second.allocator_registration->allocator !=
+            mounted->second.allocator_registration->GetAllocator() !=
                 replacement.expected ||
             !replacement.replacement) {
             return false;
@@ -503,7 +503,12 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
 
 ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     const UUID& segment_id, const UUID& client_id,
-    const size_t& metrics_dec_capacity) {
+    const size_t& metrics_dec_capacity, bool retain_name_registration) {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+
     // Remove from client_segments_
     bool found_in_client_segments = false;
     auto client_it = segment_manager_->client_segments_.find(client_id);
@@ -525,13 +530,11 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     }
 
     // segment_id -> segment_name
-    std::string segment_name;
-    bool is_cxl = false;
-    auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
-    if (segment != segment_manager_->mounted_segments_.end()) {
-        segment_name = segment->second.segment.name;
-        RemoveHostSegment(segment_manager_->segments_by_host_,
-                          segment->second.segment);
+    const std::string segment_name = mounted->second.segment.name;
+    const bool is_cxl = mounted->second.segment.protocol == "cxl";
+    RemoveHostSegment(segment_manager_->segments_by_host_,
+                      mounted->second.segment);
+    if (!retain_name_registration) {
         auto segment_id_by_name_it =
             segment_manager_->segment_id_by_name_.find(segment_name);
         if (segment_id_by_name_it !=
@@ -540,10 +543,9 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
             segment_manager_->segment_id_by_name_.erase(segment_id_by_name_it);
             segment_manager_->client_by_name_.erase(segment_name);
         }
-        is_cxl = (segment->second.segment.protocol == "cxl");
     }
     // Remove from mounted_segments_
-    segment_manager_->mounted_segments_.erase(segment_id);
+    segment_manager_->mounted_segments_.erase(mounted);
 
     // Decrease the total capacity
     if (!is_cxl) {
@@ -556,6 +558,17 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     }
 
     return ErrorCode::OK;
+}
+
+void ScopedSegmentAccess::ReleaseUnmountedSegmentName(
+    const UUID& segment_id, const std::string& segment_name) {
+    const auto segment_id_by_name =
+        segment_manager_->segment_id_by_name_.find(segment_name);
+    if (segment_id_by_name != segment_manager_->segment_id_by_name_.end() &&
+        segment_id_by_name->second == segment_id) {
+        segment_manager_->segment_id_by_name_.erase(segment_id_by_name);
+        segment_manager_->client_by_name_.erase(segment_name);
+    }
 }
 
 ErrorCode ScopedSegmentAccess::GetClientSegments(
@@ -595,6 +608,19 @@ ErrorCode ScopedSegmentAccess::GetAllSegments(
             segment_pair.second.segment.name);
         if (client_it != segment_manager_->client_by_name_.end()) {
             client_id = client_it->second;
+        } else {
+            // PrepareUnmount removes the name index before Commit removes the
+            // ownership edge. Snapshot restore still needs the exact owner of
+            // such an unready Segment, so fall back to the canonical
+            // client_segments_ relation.
+            for (const auto& [owner, segment_ids] :
+                 segment_manager_->client_segments_) {
+                if (std::find(segment_ids.begin(), segment_ids.end(),
+                              segment_pair.first) != segment_ids.end()) {
+                    client_id = owner;
+                    break;
+                }
+            }
         }
 
         all_segments.emplace_back(segment_pair.second.segment, client_id);
@@ -624,9 +650,11 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
     const auto& allocators = allocator_manager.getAllocators(segment);
     if (allocators != nullptr) {
         for (const auto& allocator : *allocators) {
-            if (allocator && allocator->allocator) {
-                total_used += allocator->allocator->size();
-                total_capacity += allocator->allocator->capacity();
+            const auto buffer_allocator =
+                allocator ? allocator->GetAllocator() : nullptr;
+            if (buffer_allocator) {
+                total_used += buffer_allocator->size();
+                total_capacity += buffer_allocator->capacity();
             }
         }
     }
@@ -1427,9 +1455,11 @@ ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& segment,
     const auto& allocators = allocator_manager.getAllocators(segment);
     if (allocators != nullptr) {
         for (const auto& allocator : *allocators) {
-            if (allocator && allocator->allocator) {
-                total_used += allocator->allocator->size();
-                total_capacity += allocator->allocator->capacity();
+            const auto buffer_allocator =
+                allocator ? allocator->GetAllocator() : nullptr;
+            if (buffer_allocator) {
+                total_used += buffer_allocator->size();
+                total_capacity += buffer_allocator->capacity();
             }
         }
     }

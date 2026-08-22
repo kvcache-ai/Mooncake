@@ -503,9 +503,7 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
 // MountSegmentDuplicate Tests:
 // 1. MountSegment with the same segment id. The second mount operation return
 // SEGMENT_ALREADY_EXISTS.
-// 2. MountSegment with different segment id and the same segment name should be
-// considered as different segments. Validate the status of SegmentManager use
-// ValidateMountedSegments function.
+// 2. A different segment id cannot reuse an existing segment name.
 TEST_F(SegmentTest, MountSegmentDuplicate) {
     SegmentManager segment_manager;
     // Create a valid segment and client ID
@@ -538,13 +536,12 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
     segment2.size = segment.size * 2;
     segment2.base = segment.base + segment.size;
 
-    // Mount the second segment
-    ASSERT_EQ(segment_access.MountSegment(segment2, client_id, client_liveness_), ErrorCode::OK);
+    // A name identifies one mounted segment incarnation.
+    ASSERT_EQ(segment_access.MountSegment(segment2, client_id, client_liveness_),
+              ErrorCode::INVALID_PARAMS);
 
-    // Verify both segments are mounted correctly
-    std::vector<Segment> segments = {segment, segment2};
-    std::vector<UUID> client_ids = {client_id, client_id};
-    ValidateMountedSegments(segment_manager, segments, client_ids);
+    // Verify the rejected request did not alter the original mount.
+    ValidateMountedSegment(segment_manager, segment, client_id);
 }
 
 // UnmountSegmentSuccess:
@@ -761,7 +758,7 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
     }
 }
 
-TEST_F(SegmentTest, HostOrderedSegmentsKeepsNameUntilLastSameNameSegmentGone) {
+TEST_F(SegmentTest, HostOrderedSegmentsRejectsDifferentIdWithSameName) {
     SegmentManager segment_manager;
 
     Segment segment0;
@@ -783,8 +780,9 @@ TEST_F(SegmentTest, HostOrderedSegmentsKeepsNameUntilLastSameNameSegmentGone) {
         auto segment_access = segment_manager.getSegmentAccess();
         ASSERT_EQ(segment_access.MountSegment(segment0, client_id, client_liveness_),
                   ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountSegment(segment1, client_id, client_liveness_),
-                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment1, client_id,
+                                              client_liveness_),
+                  ErrorCode::INVALID_PARAMS);
     }
 
     {
@@ -810,8 +808,7 @@ TEST_F(SegmentTest, HostOrderedSegmentsKeepsNameUntilLastSameNameSegmentGone) {
         auto allocator_access = segment_manager.getAllocatorAccess();
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
-        ASSERT_EQ(ordered.size(), 1u);
-        EXPECT_EQ(ordered[0], segment1.name);
+        EXPECT_TRUE(ordered.empty());
     }
 }
 

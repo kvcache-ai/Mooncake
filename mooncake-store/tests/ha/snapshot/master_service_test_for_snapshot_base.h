@@ -749,6 +749,59 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== Core Test Method ====================
 
+    static void AssertRestoredClientAffiliations(MasterService* service) {
+        std::unordered_map<std::string, UUID> owner_by_alias;
+        {
+            auto segment_access = service->segment_manager_.getSegmentAccess();
+            std::vector<std::pair<Segment, UUID>> segments;
+            ASSERT_EQ(segment_access.GetAllSegments(segments), ErrorCode::OK);
+            for (const auto& [segment, owner] : segments) {
+                owner_by_alias[segment.name] = owner;
+                owner_by_alias[segment.te_endpoint] = owner;
+                ASSERT_TRUE(service->client_liveness_records_.contains(owner));
+            }
+        }
+        for (const auto& owner : service->local_ssd_manager_.GetClientIds()) {
+            ASSERT_TRUE(service->client_liveness_records_.contains(owner));
+        }
+
+        for (const auto& shard : service->metadata_shards_) {
+            for (const auto& [tenant_id, tenant_state] : shard.tenants) {
+                (void)tenant_id;
+                for (const auto& [key, metadata] : tenant_state.metadata) {
+                    (void)key;
+                    for (const auto& replica : metadata.GetAllReplicas()) {
+                        if (replica.is_memory_replica()) {
+                            const auto endpoint =
+                                replica.get_descriptor()
+                                    .get_memory_descriptor()
+                                    .buffer_descriptor.transport_endpoint_;
+                            const auto owner = owner_by_alias.find(endpoint);
+                            ASSERT_NE(owner, owner_by_alias.end());
+                            const auto record =
+                                service->client_liveness_records_.find(
+                                    owner->second);
+                            ASSERT_NE(record,
+                                      service->client_liveness_records_.end());
+                            EXPECT_TRUE(
+                                replica.isAffiliatedWith(record->second));
+                        } else if (replica.is_local_disk_replica()) {
+                            const auto owner =
+                                replica.get_local_disk_client_id();
+                            ASSERT_TRUE(owner.has_value());
+                            const auto record =
+                                service->client_liveness_records_.find(*owner);
+                            ASSERT_NE(record,
+                                      service->client_liveness_records_.end());
+                            EXPECT_TRUE(
+                                replica.isAffiliatedWith(record->second));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Test snapshot and restore functionality
     void TestSnapshotAndRestore(std::unique_ptr<MasterService>& service) {
         // ========== Phase 1: Manually persist metadata ==========
@@ -775,6 +828,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
         ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+        AssertRestoredClientAffiliations(restored_service.get());
 
         // ========== Phase 4: Persist restored metadata again ==========
         std::string snapshot_id2 = GenerateSnapshotId();

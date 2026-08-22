@@ -44,8 +44,18 @@ struct SegmentAllocator {
 
     [[nodiscard]] bool IsServing() const {
         const auto record = GetClientLiveness();
-        return allocator && record && record->IsServing() &&
+        return GetAllocator() && record && record->IsServing() &&
                lifetime.isAvailable();
+    }
+
+    [[nodiscard]] std::shared_ptr<BufferAllocatorBase> GetAllocator() const {
+        return std::atomic_load_explicit(&allocator,
+                                         std::memory_order_acquire);
+    }
+
+    void BindAllocator(std::shared_ptr<BufferAllocatorBase> replacement) {
+        std::atomic_store_explicit(&allocator, std::move(replacement),
+                                   std::memory_order_release);
     }
 
     void BindClientLiveness(std::shared_ptr<ClientLivenessRecord> record) {
@@ -58,7 +68,7 @@ struct SegmentAllocator {
     }
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) const {
-        if (!allocator || !lifetime.isAvailable()) {
+        if (!lifetime.isAvailable()) {
             return nullptr;
         }
         const auto record = GetClientLiveness();
@@ -69,7 +79,11 @@ struct SegmentAllocator {
         if (!serving_guard) {
             return nullptr;
         }
-        auto buffer = allocator->allocate(size);
+        const auto current_allocator = GetAllocator();
+        if (!current_allocator) {
+            return nullptr;
+        }
+        auto buffer = current_allocator->allocate(size);
         if (!buffer) {
             return nullptr;
         }
@@ -220,7 +234,8 @@ class AllocatorManager {
             auto target = std::find_if(
                 it->second.begin(), it->second.end(),
                 [&replacement](const SegmentAllocatorRegistration& reg) {
-                    return reg && reg->allocator == replacement.expected;
+                    return reg &&
+                           reg->GetAllocator() == replacement.expected;
                 });
             if (target == it->second.end()) {
                 return false;
@@ -228,9 +243,27 @@ class AllocatorManager {
             targets.push_back(target);
         }
         for (size_t i = 0; i < replacements.size(); ++i) {
-            (*targets[i])->allocator = replacements[i].replacement;
+            (*targets[i])->BindAllocator(replacements[i].replacement);
         }
         return true;
+    }
+
+    AllocatorManager Snapshot(
+        const std::unordered_map<std::string, UUID>* owners = nullptr) const {
+        AllocatorManager snapshot;
+        snapshot.names_ = names_;
+        snapshot.allocators_ = allocators_;
+        if (owners != nullptr) {
+            snapshot.owner_by_name_ = *owners;
+        }
+        return snapshot;
+    }
+
+    std::optional<UUID> GetOwnerClientId(const std::string& name) const {
+        const auto owner = owner_by_name_.find(name);
+        return owner == owner_by_name_.end()
+                   ? std::nullopt
+                   : std::optional<UUID>(owner->second);
     }
 
     /**
@@ -278,6 +311,7 @@ class AllocatorManager {
     std::unordered_map<std::string,
                        std::vector<SegmentAllocatorRegistration>>
         allocators_;
+    std::unordered_map<std::string, UUID> owner_by_name_;
     friend class SegmentSerializer;  // for fork serialize
 };
 
@@ -679,11 +713,15 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
             if (!allocator || !allocator->IsServing()) {
                 continue;
             }
+            const auto buffer_allocator = allocator->GetAllocator();
+            if (!buffer_allocator) {
+                continue;
+            }
             const auto capacity =
-                static_cast<uint64_t>(allocator->allocator->capacity());
+                static_cast<uint64_t>(buffer_allocator->capacity());
             total_capacity += capacity;
             total_free += capacity -
-                          static_cast<uint64_t>(allocator->allocator->size());
+                          static_cast<uint64_t>(buffer_allocator->size());
         }
         if (total_capacity == 0) {
             return 0.0;
@@ -709,7 +747,14 @@ class SsdFreeRatioFirstAllocationStrategy final
             std::set<std::string>(),
         const ReplicaType replica_type = ReplicaType::MEMORY) override;
 
-    using RandomAllocationStrategy::Allocate;
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override;
 
    private:
     const LocalSsdManager& local_ssd_;

@@ -560,6 +560,20 @@ class Replica {
         }
     }
 
+    [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
+        const {
+        if (is_memory_replica()) {
+            const auto& data = std::get<MemoryReplicaData>(data_);
+            return data.buffer ? data.buffer->getClientLiveness() : nullptr;
+        }
+        if (is_local_disk_replica()) {
+            const auto& data = std::get<LocalDiskReplicaData>(data_);
+            return std::atomic_load_explicit(&data.client_liveness,
+                                             std::memory_order_acquire);
+        }
+        return nullptr;
+    }
+
     [[nodiscard]] bool isAffiliatedWith(
         const std::shared_ptr<ClientLivenessRecord>& client_liveness) const {
         if (is_memory_replica()) {
