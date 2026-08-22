@@ -449,6 +449,19 @@ class Replica {
         return false;  // DiskReplicaData does not have handles
     }
 
+    [[nodiscard]] std::shared_ptr<BufferAllocatorBase> get_buffer_allocator()
+        const {
+        if (is_memory_replica()) {
+            const auto& mem_data = std::get<MemoryReplicaData>(data_);
+            return mem_data.buffer ? mem_data.buffer->lockAllocator() : nullptr;
+        }
+        if (is_nof_replica()) {
+            const auto& nof_data = std::get<NoFReplicaData>(data_);
+            return nof_data.buffer ? nof_data.buffer->lockAllocator() : nullptr;
+        }
+        return nullptr;
+    }
+
     bool replace_memory_buffer(std::unique_ptr<AllocatedBuffer> buffer) {
         if (!buffer || !is_memory_replica()) {
             return false;

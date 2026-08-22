@@ -12,9 +12,8 @@ namespace mooncake {
 
 // Forward declarations
 class MasterService;
-class SegmentManager;
+class SegmentPool;
 class LocalSsdManager;
-class NoFSegmentManager;
 class ClientTaskManager;
 
 namespace ha {
@@ -28,18 +27,15 @@ namespace ha {
  */
 struct MasterSnapshotStateView {
     MasterService& master_service;
-    SegmentManager& segment_manager;
+    SegmentPool& segment_pool;
     LocalSsdManager& local_ssd_manager;
-    NoFSegmentManager& nof_segment_manager;
     ClientTaskManager& task_manager;
 
-    MasterSnapshotStateView(MasterService& ms, SegmentManager& sm,
-                            LocalSsdManager& lsm, NoFSegmentManager& nsm,
-                            ClientTaskManager& tm)
+    MasterSnapshotStateView(MasterService& ms, SegmentPool& sm,
+                            LocalSsdManager& lsm, ClientTaskManager& tm)
         : master_service(ms),
-          segment_manager(sm),
+          segment_pool(sm),
           local_ssd_manager(lsm),
-          nof_segment_manager(nsm),
           task_manager(tm) {}
 };
 
@@ -61,7 +57,7 @@ struct MasterSnapshotPayloads {
  *
  * This codec handles serialization of the complete master state bundle:
  * - Metadata shards (objects, replicas, tenant state)
- * - Segment manager state
+ * - SegmentPool state
  * - Task manager state
  * - Discarded replicas
  *
@@ -70,7 +66,7 @@ struct MasterSnapshotPayloads {
  *
  * Format details:
  * - metadata: msgpack-encoded metadata shards (compressed per-shard with zstd)
- * - segments: msgpack-encoded segment manager state
+ * - segments: msgpack-encoded SegmentPool state
  * - task_manager: msgpack-encoded task manager state
  * - manifest.txt: format descriptor "<type>|<version>|<snapshot_id>"
  *   (e.g., "messagepack|1.0.0|snapshot-000123")
@@ -95,7 +91,7 @@ class MasterSnapshotCodec {
      *
      * The returned struct contains:
      * - metadata: serialized metadata shards
-     * - segments: serialized segment manager state
+     * - segments: serialized SegmentPool state
      * - task_manager: serialized task manager state
      */
     tl::expected<MasterSnapshotPayloads, SerializationError> Encode(
@@ -141,8 +137,8 @@ class MasterSnapshotCodec {
 
     // Segment encoding/decoding
     tl::expected<std::vector<uint8_t>, SerializationError> EncodeSegments(
-        SegmentManager& segment_manager, LocalSsdManager& local_ssd_manager,
-        NoFSegmentManager& nof_segment_manager) const;
+        const SegmentPool& segment_pool,
+        LocalSsdManager& local_ssd_manager) const;
     tl::expected<void, SerializationError> DecodeSegments(
         MasterService* master_service, const std::vector<uint8_t>& data) const;
 

@@ -19,7 +19,6 @@
 #include "ha/snapshot/snapshot_logger.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "serialize/serializer.h"
-#include "segment.h"
 #include "task_manager.h"
 #include "utils/file_util.h"
 #include "utils/zstd_util.h"
@@ -443,9 +442,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         // Use the new MasterSnapshotCodec to encode all state
         ha::MasterSnapshotCodec codec;
         ha::MasterSnapshotStateView state_view(
-            *master_service_, master_service_->segment_manager_,
+            *master_service_, master_service_->segment_pool_,
             master_service_->local_ssd_manager_,
-            master_service_->nof_segment_manager_,
             master_service_->task_manager_);
 
         auto encode_result = codec.Encode(state_view);

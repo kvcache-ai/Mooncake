@@ -209,8 +209,7 @@ class MasterServiceSupervisorConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
-    AllocationStrategyType allocation_strategy_type =
-        AllocationStrategyType::RANDOM;
+    PlacementPolicyType allocation_strategy_type = PlacementPolicyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -356,18 +355,18 @@ class MasterServiceSupervisorConfig {
             memory_allocator = BufferAllocatorType::OFFSET;
         }
 
-        // Convert string allocation_strategy to AllocationStrategyType enum
+        // Convert string allocation_strategy to PlacementPolicyType enum
         if (config.allocation_strategy == "free_ratio_first") {
-            allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+            allocation_strategy_type = PlacementPolicyType::FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "cxl") {
-            allocation_strategy_type = AllocationStrategyType::CXL;
+            allocation_strategy_type = PlacementPolicyType::CXL;
         } else if (config.allocation_strategy == "random") {
-            allocation_strategy_type = AllocationStrategyType::RANDOM;
+            allocation_strategy_type = PlacementPolicyType::RANDOM;
         } else if (config.allocation_strategy == "ssd_free_ratio_first") {
             allocation_strategy_type =
-                AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+                PlacementPolicyType::SSD_FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "local_first") {
-            allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+            allocation_strategy_type = PlacementPolicyType::LOCAL_FIRST;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
@@ -375,7 +374,7 @@ class MasterServiceSupervisorConfig {
                          << "Valid options are: random, free_ratio_first, cxl, "
                             "ssd_free_ratio_first, local_first "
                             "(case-sensitive)";
-            allocation_strategy_type = AllocationStrategyType::RANDOM;
+            allocation_strategy_type = PlacementPolicyType::RANDOM;
         }
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -531,8 +530,7 @@ class WrappedMasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
-    AllocationStrategyType allocation_strategy_type =
-        AllocationStrategyType::RANDOM;
+    PlacementPolicyType allocation_strategy_type = PlacementPolicyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -641,18 +639,18 @@ class WrappedMasterServiceConfig {
             memory_allocator = mooncake::BufferAllocatorType::OFFSET;
         }
 
-        // Convert string allocation_strategy to AllocationStrategyType enum
+        // Convert string allocation_strategy to PlacementPolicyType enum
         if (config.allocation_strategy == "free_ratio_first") {
-            allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+            allocation_strategy_type = PlacementPolicyType::FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "cxl") {
-            allocation_strategy_type = AllocationStrategyType::CXL;
+            allocation_strategy_type = PlacementPolicyType::CXL;
         } else if (config.allocation_strategy == "random") {
-            allocation_strategy_type = AllocationStrategyType::RANDOM;
+            allocation_strategy_type = PlacementPolicyType::RANDOM;
         } else if (config.allocation_strategy == "ssd_free_ratio_first") {
             allocation_strategy_type =
-                AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+                PlacementPolicyType::SSD_FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "local_first") {
-            allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+            allocation_strategy_type = PlacementPolicyType::LOCAL_FIRST;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
@@ -660,7 +658,7 @@ class WrappedMasterServiceConfig {
                          << "Valid options are: random, free_ratio_first, cxl, "
                             "ssd_free_ratio_first, local_first "
                             "(case-sensitive)";
-            allocation_strategy_type = AllocationStrategyType::RANDOM;
+            allocation_strategy_type = PlacementPolicyType::RANDOM;
         }
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -821,8 +819,7 @@ class MasterServiceConfigBuilder {
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
-    AllocationStrategyType allocation_strategy_type_ =
-        AllocationStrategyType::RANDOM;
+    PlacementPolicyType memory_policy_type_ = PlacementPolicyType::RANDOM;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     bool enable_multi_tenants_ = false;
@@ -984,8 +981,8 @@ class MasterServiceConfigBuilder {
     }
 
     MasterServiceConfigBuilder& set_allocation_strategy_type(
-        AllocationStrategyType type) {
-        allocation_strategy_type_ = type;
+        PlacementPolicyType type) {
+        memory_policy_type_ = type;
         return *this;
     }
 
@@ -1208,8 +1205,7 @@ class MasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
-    AllocationStrategyType allocation_strategy_type =
-        AllocationStrategyType::RANDOM;
+    PlacementPolicyType allocation_strategy_type = PlacementPolicyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -1369,7 +1365,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
-    config.allocation_strategy_type = allocation_strategy_type_;
+    config.allocation_strategy_type = memory_policy_type_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;

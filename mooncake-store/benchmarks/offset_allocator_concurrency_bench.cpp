@@ -11,13 +11,14 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <gflags/gflags.h>
 
-#include "allocation_strategy.h"
+#include "placement/replica_allocator.h"
 #include "allocator.h"
 #include "offset_allocator/offset_allocator.h"
 
@@ -47,10 +48,15 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using mooncake::AllocatedBuffer;
-using mooncake::AllocatorManager;
+using mooncake::AllocationTarget;
+using mooncake::AllocationTargetKind;
 using mooncake::OffsetBufferAllocator;
-using mooncake::RandomAllocationStrategy;
+using mooncake::PlacementIndex;
+using mooncake::PlacementPolicyType;
+using mooncake::ReplicaAllocationRequest;
+using mooncake::ReplicaAllocator;
 using mooncake::ReplicaType;
+using mooncake::ScopedPlacementAccess;
 using mooncake::offset_allocator::OffsetAllocationHandle;
 using mooncake::offset_allocator::OffsetAllocator;
 using mooncake::offset_allocator::OffsetAllocStorageReport;
@@ -297,43 +303,56 @@ class PutAllocationFixture {
    public:
     PutAllocationFixture(uint64_t capacity, uint64_t /* unused */)
         : capacity_(capacity),
-          allocator_(std::make_shared<OffsetBufferAllocator>(
+          buffer_allocator_(std::make_shared<OffsetBufferAllocator>(
               kSegmentName, kBenchmarkBaseAddress, capacity,
-              "benchmark-endpoint", ReplicaType::MEMORY)) {
-        allocator_manager_.addAllocator(kSegmentName, allocator_);
+              "benchmark-endpoint", ReplicaType::MEMORY)),
+          target_(buffer_allocator_.get(), AllocationTargetKind::STANDARD) {
+        placement_.AddTarget(kSegmentName, &target_);
     }
 
     bool prepareCapacityPressure(double used_ratio) {
         return fillCapacityPressure(
             capacity_, used_ratio,
-            [&](uint64_t size) { return allocator_->allocate(size); }, held_);
+            [&](uint64_t size) { return buffer_allocator_->allocate(size); },
+            held_);
     }
 
     bool prepareFragmentation(uint64_t block_size, uint32_t stride) {
         return createFragmentation(
             block_size, stride,
-            [&](uint64_t size) { return allocator_->allocate(size); }, held_);
+            [&](uint64_t size) { return buffer_allocator_->allocate(size); },
+            held_);
     }
 
     bool expectAllocationFailure(uint64_t request_size) {
-        auto result = strategy_.Allocate(allocator_manager_, request_size, 1);
+        auto access = ScopedPlacementAccess(placement_, placement_mutex_);
+        ReplicaAllocationRequest request;
+        request.size = request_size;
+        auto result = replica_allocator_.Allocate(
+            access, PlacementPolicyType::RANDOM, request);
         return !result.has_value();
     }
 
     bool allocateAndFree(uint64_t request_size) {
-        auto result = strategy_.Allocate(allocator_manager_, request_size, 1);
+        auto access = ScopedPlacementAccess(placement_, placement_mutex_);
+        ReplicaAllocationRequest request;
+        request.size = request_size;
+        auto result = replica_allocator_.Allocate(
+            access, PlacementPolicyType::RANDOM, request);
         return result.has_value();
     }
 
     OffsetAllocStorageReport report() const {
-        return allocator_->getOffsetAllocator()->storageReport();
+        return buffer_allocator_->getOffsetAllocator()->storageReport();
     }
 
    private:
     uint64_t capacity_;
-    std::shared_ptr<OffsetBufferAllocator> allocator_;
-    AllocatorManager allocator_manager_;
-    RandomAllocationStrategy strategy_;
+    std::shared_ptr<OffsetBufferAllocator> buffer_allocator_;
+    AllocationTarget target_;
+    PlacementIndex placement_;
+    std::shared_mutex placement_mutex_;
+    ReplicaAllocator replica_allocator_;
     std::vector<std::unique_ptr<AllocatedBuffer>> held_;
 };
 

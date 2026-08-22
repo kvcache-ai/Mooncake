@@ -9,7 +9,6 @@
 #include "ha/snapshot/master_snapshot_codec.h"
 #include "master_config.h"
 #include "master_service.h"
-#include "segment.h"
 #include "task_manager.h"
 #include "tenant_id.h"
 #include "utils/zstd_util.h"
@@ -33,9 +32,9 @@ class MasterSnapshotCodecTest : public ::testing::Test {
     // funneled through this helper (friendship is not inherited by the
     // TEST_F-generated subclasses).
     static MasterSnapshotStateView MakeStateView(MasterService& service) {
-        return MasterSnapshotStateView(
-            service, service.segment_manager_, service.local_ssd_manager_,
-            service.nof_segment_manager_, service.task_manager_);
+        return MasterSnapshotStateView(service, service.segment_pool_,
+                                       service.local_ssd_manager_,
+                                       service.task_manager_);
     }
 
     std::unique_ptr<MasterService> master_service_;

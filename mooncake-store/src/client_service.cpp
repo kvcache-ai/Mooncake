@@ -5,7 +5,6 @@
 
 #include "ascii_string.h"
 #include "allocator.h"
-#include "segment.h"
 
 #include <csignal>
 #include <algorithm>

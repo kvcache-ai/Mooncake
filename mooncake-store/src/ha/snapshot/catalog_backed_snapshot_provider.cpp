@@ -15,8 +15,10 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
-#include "segment.h"
+#include "segment/pool.h"
+#include "segment/pool_view.h"
 #include "serialize/serializer.h"
+#include "ha/snapshot/segment_pool_snapshot_codec.h"
 #include "utils/zstd_util.h"
 
 namespace mooncake {
@@ -99,7 +101,8 @@ ErrorCode ValidateManifest(std::string_view snapshot_id,
 
 tl::expected<std::optional<StandbyObjectMetadata>, ErrorCode>
 DeserializeStandbyObjectMetadata(
-    const msgpack::object& object, const SegmentView& segment_view,
+    const msgpack::object& object, const SegmentPoolView& segment_view,
+    uint64_t snapshot_sequence_id,
     const std::chrono::system_clock::time_point& now) {
     if (object.type != msgpack::type::ARRAY) {
         LOG(ERROR) << "Snapshot metadata entry is not an array";
@@ -241,7 +244,8 @@ DeserializeStandbyObjectMetadata(
 
 tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
 DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
-                                   const SegmentView& segment_view) {
+                                   const SegmentPoolView& segment_view,
+                                   uint64_t snapshot_sequence_id) {
     msgpack::object_handle root_handle;
     try {
         root_handle = msgpack::unpack(
@@ -329,7 +333,8 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                 const auto normalized_tenant = NormalizeTenantId(tenant_id);
 
                 auto metadata_result = DeserializeStandbyObjectMetadata(
-                    item.via.array.ptr[metadata_index], segment_view, now);
+                    item.via.array.ptr[metadata_index], segment_view,
+                    snapshot_sequence_id, now);
                 if (!metadata_result) {
                     return tl::make_unexpected(metadata_result.error());
                 }
@@ -469,10 +474,11 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
             return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
         }
 
-        SegmentManager segment_manager(BufferAllocatorType::OFFSET);
-        SegmentSerializer segment_serializer(&segment_manager);
-        auto deserialize_segments =
-            segment_serializer.Deserialize(segments_content);
+        RegionDriverConfig driver_config;
+        driver_config.memory_allocator = BufferAllocatorType::OFFSET;
+        SegmentPool segment_pool(driver_config);
+        auto deserialize_segments = ha::SegmentPoolSnapshotCodec::Decode(
+            segment_pool, segments_content);
         if (!deserialize_segments) {
             LOG(ERROR) << "Failed to deserialize snapshot segments payload, "
                        << "snapshot_id=" << descriptor.snapshot_id
@@ -481,7 +487,8 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         }
 
         auto deserialize_metadata = DeserializeStandbySnapshotMetadata(
-            metadata_content, segment_manager.getView());
+            metadata_content, segment_pool.getView(),
+            descriptor.last_included_seq);
         if (!deserialize_metadata) {
             LOG(ERROR) << "Failed to deserialize snapshot metadata payload, "
                        << "snapshot_id=" << descriptor.snapshot_id
@@ -495,10 +502,10 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         snapshot.metadata = std::move(deserialize_metadata.value());
 
         // Extract standby segment registry entries from the deserialized
-        // SegmentManager. The snapshot's SegmentSerializer::Serialize()
+        // SegmentPool. SegmentPoolSnapshotCodec::Encode()
         // currently carries enough data to rebuild only memory segments
-        // (segment_manager.mounted_segments_, where buf_allocator is non-null
-        // by construction — MountSegment is the only path that populates it).
+        // (the SegmentPool catalog, whose memory resources own allocators by
+        // construction).
         //
         // LocalSSD state is serialized as per-client offloading bookkeeping
         // without the transport_endpoint / file_path / capacity fields that
@@ -510,29 +517,25 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         // If a future change makes the serializer carry richer per-segment
         // data, the predicate below should be replaced with explicit branches
         // for each segment type.
-        ScopedSegmentAccess segment_access = segment_manager.getSegmentAccess();
-        std::vector<std::pair<Segment, UUID>> all_segments;
-        segment_access.GetAllSegments(all_segments);
-        SegmentView view = segment_manager.getView();
-        for (const auto& [seg, client_id] : all_segments) {
-            MountedSegment mounted;
-            if (view.GetMountedSegment(seg.id, mounted) != ErrorCode::OK) {
-                continue;
-            }
-            if (mounted.buf_allocator == nullptr) {
-                // Defensive: a MountedSegment without an allocator should
-                // not exist in the snapshot today. Log and skip rather
-                // than emitting a half-populated StandbySegmentInfo.
+        SegmentPoolView view = segment_pool.getView();
+        std::vector<std::pair<UUID, MountedRegion>> all_segments;
+        view.GetMountedRegions(all_segments);
+        for (const auto& [segment_id, mounted] : all_segments) {
+            const auto& segment = mounted.segment;
+            if (!view.GetResourceView(segment_id)) {
+                // Defensive: a catalog entry without a driver resource should
+                // not exist. Log and skip rather than emitting a half-populated
+                // StandbySegmentInfo.
                 LOG(WARNING)
-                    << "snapshot contains MountedSegment without allocator; "
-                    << "skipping segment_name=" << seg.name
-                    << " segment_id=" << seg.id;
+                    << "snapshot contains MountedRegion without allocator; "
+                    << "skipping segment_name=" << segment.name
+                    << " segment_id=" << segment.id;
                 continue;
             }
             StandbySegmentInfo info;
-            info.segment_name = seg.name;
-            info.transport_endpoint = seg.te_endpoint;
-            info.capacity = seg.size;
+            info.segment_name = segment.name;
+            info.transport_endpoint = segment.te_endpoint;
+            info.capacity = segment.size;
             info.is_memory_segment = true;
             // file_path stays empty for memory segments by contract.
             snapshot.segments.push_back(std::move(info));

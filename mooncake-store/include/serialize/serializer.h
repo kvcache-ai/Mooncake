@@ -15,11 +15,9 @@ class AllocatedBuffer;
 class Replica;
 class MasterService;
 class BufferAllocatorBase;
-class SegmentView;
+class SegmentPoolView;
 enum class ErrorCode;
 struct SerializationError;
-class MountedSegment;
-class OffsetBufferAllocator;
 
 using MsgpackPacker = msgpack::packer<msgpack::sbuffer>;
 
@@ -77,11 +75,11 @@ class Serializer<AllocatedBuffer> {
     using PointerType = std::unique_ptr<AllocatedBuffer>;
 
     static tl::expected<void, SerializationError> serialize(
-        const AllocatedBuffer &buffer, const SegmentView &segment_view,
+        const AllocatedBuffer &buffer, const SegmentPoolView &segment_view,
         MsgpackPacker &packer);
 
     static tl::expected<PointerType, SerializationError> deserialize(
-        const msgpack::object &obj, const SegmentView &segment_view);
+        const msgpack::object &obj, const SegmentPoolView &segment_view);
 };
 
 // Serializer specialization for Replica (interface declaration)
@@ -91,34 +89,11 @@ class Serializer<Replica> {
     using PointerType = std::shared_ptr<Replica>;
 
     static tl::expected<void, SerializationError> serialize(
-        const Replica &replica, const SegmentView &segment_view,
+        const Replica &replica, const SegmentPoolView &segment_view,
         MsgpackPacker &packer);
 
     static tl::expected<PointerType, SerializationError> deserialize(
-        const msgpack::object &obj, const SegmentView &segment_view);
-};
-
-template <>
-class Serializer<MountedSegment> {
-   public:
-    static tl::expected<void, SerializationError> serialize(
-        const MountedSegment &mounted_segment, MsgpackPacker &packer);
-
-    static tl::expected<MountedSegment, SerializationError> deserialize(
-        const msgpack::object &obj);
-};
-
-// Serializer specialization for OffsetBufferAllocator (interface declaration)
-template <>
-class Serializer<OffsetBufferAllocator> {
-   public:
-    using PointerType = std::shared_ptr<OffsetBufferAllocator>;
-
-    static tl::expected<void, SerializationError> serialize(
-        const OffsetBufferAllocator &allocator, MsgpackPacker &packer);
-
-    static tl::expected<PointerType, SerializationError> deserialize(
-        const msgpack::object &obj);
+        const msgpack::object &obj, const SegmentPoolView &segment_view);
 };
 
 // Generic serialization helper class
