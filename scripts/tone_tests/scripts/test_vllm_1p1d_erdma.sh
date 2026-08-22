@@ -77,7 +77,10 @@ run_proxy()
     local use_health_check=0
     if python3 -c "from packaging import version; import sys; sys.exit(0 if version.parse('$vllm_version') >= version.parse('0.16.0') else 1)" 2>/dev/null; then
         echo "Using Mooncake Connector Proxy (vLLM >= 0.16.0)"
-        proxy_script="python3 -u /vllm-workspace/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
+        # Official vLLM runtime images do not guarantee that examples are
+        # installed under /vllm-workspace. Use the versioned upstream proxy
+        # shipped with this test suite instead.
+        proxy_script="python3 -u /test_run/python/mooncake_connector_proxy.py --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
         ready_pattern="All prefiller instances are ready."
     else
         echo "Using NIXL Proxy (vLLM < 0.16.0)"
@@ -102,7 +105,7 @@ run_proxy()
 
     # Additional health check for toy_proxy_server
     if [ "$use_health_check" -eq 1 ]; then
-        if ! wait_for_server_ready "$LOCAL_IP" "8000" "/health"; then
+        if ! wait_for_server_ready "$LOCAL_IP" "8000" "/healthcheck"; then
             return 1
         fi
     fi
