@@ -24,7 +24,7 @@ start_server()
     local port
     local kv_role
 
-    if [ "$ISREMOTE" == "0" ]; then 
+    if [ "$ISREMOTE" == "0" ]; then
         host=$LOCAL_IP
         vllm_server_log_path=/test_run/run/logs/$test_case_name/$model_name_clean/vllm_server_local.log
         port=8020
@@ -38,19 +38,21 @@ start_server()
 
     local kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\"}"
 
-    local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
-    
     local env_vars
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
-        # ROCm's HSA dma-buf export path can crash when vLLM registers every
-        # layer's multi-GiB KV buffer concurrently. Keep the RDMA batch
-        # registration sequential while retaining parallel registration as
-        # the default elsewhere.
-        env_vars="ROCR_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} HIP_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} MC_MAX_CONCURRENT_REG_MR=1"
+        # The MI350X default allocates roughly 233 GiB of KV cache per rank,
+        # producing 72 multi-GiB dma-buf registrations against every visible
+        # RNIC. The connector smoke test needs only a small cache and the RoCE
+        # rail selected by the runner profile.
+        local gpu_memory_utilization=0.3
+        env_vars="ROCR_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} HIP_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} MC_MAX_CONCURRENT_REG_MR=1 MC_TE_FILTERS=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
     else
+        local gpu_memory_utilization=0.85
         env_vars="CUDA_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-6,7}"
     fi
-    
+
+    local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization ${gpu_memory_utilization} --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
+
     if ! launch_vllm_server "$model_name" "$host" "$port" "$vllm_server_log_path" "$kv_role" "$extra_args" "$env_vars"; then
         return 1
     fi
@@ -64,11 +66,11 @@ run_proxy()
     local proxy_log_path="/test_run/run/logs/$test_case_name/$model_name/proxy.log"
 
     echo "===== Proxy Run ====="
-    
+
     # Get vLLM version and decide which proxy to use
     local vllm_version=$(${docker_exec} "python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null" || echo "0.15.0")
     echo "Detected vLLM version: $vllm_version"
-    
+
     # Determine proxy script and ready check strategy
     local proxy_script
     local ready_pattern
@@ -86,7 +88,7 @@ run_proxy()
 
     # Launch proxy
     local pid_file="${PID_DIR}/proxy.pid"
-    
+
     echo "Starting proxy server..."
     if ! launch_and_track_process "exec $proxy_script" "$proxy_log_path" "$pid_file"; then
         return 1
@@ -151,7 +153,7 @@ run_single_model()
 
     setup_log_directory_dual "$test_case_name" "$model_name_clean"
 
-    echo "===== Run MODEL NAME: $model_name ====="    
+    echo "===== Run MODEL NAME: $model_name ====="
     # Local start server
     if ! start_server $model_name $model_name_clean; then
         echo "ERROR: Failed to start local server for model $model_name"
@@ -212,7 +214,7 @@ run_test()
     if [ "$test_failed" = true ]; then
         return 1
     fi
-    
+
     return 0
 }
 
