@@ -16,8 +16,11 @@
 
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <functional>
+#include <thread>
 
 #include "config.h"
 #include "memory_location.h"
@@ -32,6 +35,40 @@
 namespace mooncake {
 
 const static int kTransferWorkerCount = globalConfig().workers_per_ctx;
+
+static uint64_t delayedRedispatchMaxWaitNs() {
+    const uint64_t pause_ns =
+        globalConfig().rdma_rail_pause_seconds * 1000000000ull;
+    return std::max<uint64_t>(120000000000ull, pause_ns * 4);
+}
+
+static uint64_t delayedRedispatchJitterNs(Transport::Slice *slice,
+                                          uint64_t window_ns) {
+    if (!slice || window_ns == 0) return 0;
+    auto value = reinterpret_cast<uintptr_t>(slice) >> 4;
+    value ^= static_cast<uintptr_t>(slice->target_id) * 0x9e3779b97f4a7c15ull;
+    return static_cast<uint64_t>(value % window_ns);
+}
+
+static uint64_t delayedRedispatchBackoffNs(Transport::Slice *slice,
+                                           uint64_t now) {
+    const static uint64_t kMinBackoffNs = 100000000ull;   // 100 ms
+    const static uint64_t kMaxBackoffNs = 2000000000ull;  // 2 seconds
+
+    uint64_t delay_ns = kMinBackoffNs;
+    if (slice && slice->ts > 0 && now > static_cast<uint64_t>(slice->ts)) {
+        const uint64_t elapsed_ns = now - static_cast<uint64_t>(slice->ts);
+        uint64_t scale = std::max<uint64_t>(1, elapsed_ns / kMinBackoffNs);
+        while (scale > 1 && delay_ns < kMaxBackoffNs) {
+            delay_ns <<= 1;
+            scale >>= 1;
+        }
+        delay_ns = std::min(delay_ns, kMaxBackoffNs);
+    }
+
+    const uint64_t jitter_window = std::max<uint64_t>(1, delay_ns / 4);
+    return delay_ns + delayedRedispatchJitterNs(slice, jitter_window);
+}
 
 static std::string resolveBufferLocation(
     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
@@ -251,8 +288,10 @@ int WorkerPool::submitPostSend(
                 }
             }
             if (!found) {
-                slice->markFailed();  // All rails unavailable
+                slice->peer_nic_path = peer_nic_path;
+                delayRedispatch(slice, false, "all peer rails unavailable");
                 all_rails_failed_count++;
+                submitted_slice_count++;
                 continue;
             }
         }
@@ -308,6 +347,94 @@ void WorkerPool::enqueuePreparedSlices(SliceList (&slice_list_map)[kShardCount],
         std::lock_guard<std::mutex> lock(cond_mutex_);
         cond_var_.notify_all();
     }
+}
+
+void WorkerPool::delayRedispatch(Transport::Slice *slice,
+                                 bool handoff_to_local_worker,
+                                 const char *reason) {
+    if (!slice) return;
+    const uint64_t now = static_cast<uint64_t>(getCurrentTimeInNano());
+    if (slice->ts <= 0) slice->ts = static_cast<int64_t>(now);
+    const uint64_t first_wait_ns = static_cast<uint64_t>(slice->ts);
+    if (now > first_wait_ns &&
+        now - first_wait_ns > delayedRedispatchMaxWaitNs()) {
+        LOG(ERROR) << "Worker: Giving up delayed redispatch after "
+                   << (now - first_wait_ns) / 1000000ull
+                   << " ms, reason=" << reason
+                   << ", target=" << slice->target_id
+                   << ", peer_nic=" << slice->peer_nic_path
+                   << ", local_nic=" << context_.deviceName();
+        slice->markFailed();
+        processed_slice_count_++;
+        return;
+    }
+
+    uint64_t delay_ns = delayedRedispatchBackoffNs(slice, now);
+    const uint64_t rail_pause_remaining_ns =
+        peerRailPauseRemainingNs(slice->peer_nic_path, now);
+    if (rail_pause_remaining_ns > 0) {
+        const uint64_t pause_jitter_ns =
+            delayedRedispatchJitterNs(slice, kDelayedRedispatchMinBackoffNs);
+        delay_ns =
+            std::max(delay_ns, rail_pause_remaining_ns + pause_jitter_ns);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(delayed_slices_lock_);
+        delayed_slices_.push_back(
+            {slice, now + delay_ns, handoff_to_local_worker});
+    }
+    VLOG(1) << "Worker: delayed redispatch for target " << slice->target_id
+            << ", reason=" << reason << ", local_nic=" << context_.deviceName()
+            << ", peer_nic=" << slice->peer_nic_path
+            << ", delay_ms=" << delay_ns / 1000000ull;
+}
+
+bool WorkerPool::hasDelayedSlices() const {
+    std::lock_guard<std::mutex> lock(delayed_slices_lock_);
+    return !delayed_slices_.empty();
+}
+
+uint64_t WorkerPool::nextDelayedSliceDueNs() const {
+    std::lock_guard<std::mutex> lock(delayed_slices_lock_);
+    uint64_t next_due_ns = 0;
+    for (const auto &entry : delayed_slices_) {
+        if (entry.due_ns == 0) continue;
+        if (next_due_ns == 0 || entry.due_ns < next_due_ns)
+            next_due_ns = entry.due_ns;
+    }
+    return next_due_ns;
+}
+
+void WorkerPool::releaseReadyDelayedSlices(int thread_id) {
+    const uint64_t now = static_cast<uint64_t>(getCurrentTimeInNano());
+    std::vector<DelayedSlice> ready;
+    {
+        std::lock_guard<std::mutex> lock(delayed_slices_lock_);
+        if (delayed_slices_.empty()) return;
+        std::vector<DelayedSlice> pending;
+        pending.reserve(delayed_slices_.size());
+        for (auto &entry : delayed_slices_) {
+            if (entry.due_ns <= now)
+                ready.push_back(entry);
+            else
+                pending.push_back(entry);
+        }
+        delayed_slices_.swap(pending);
+    }
+    if (ready.empty()) return;
+
+    SliceList remote_retry;
+    SliceList local_retry;
+    for (auto &entry : ready) {
+        if (!entry.slice) continue;
+        if (!context_.active() || entry.handoff_to_local_worker)
+            local_retry.push_back(entry.slice);
+        else
+            remote_retry.push_back(entry.slice);
+    }
+    if (!remote_retry.empty()) redispatch(remote_retry, thread_id, false);
+    if (!local_retry.empty()) redispatch(local_retry, thread_id, true);
 }
 
 int WorkerPool::submitPreparedPostSend(
@@ -442,7 +569,10 @@ void WorkerPool::performPostSend(int thread_id) {
         // deadline; only a genuine connection/QP failure can arm or extend it.
         if (!isRailAvailable(entry.first) ||
             context_.isConnectPaused(entry.first)) {
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            for (auto &slice : entry.second) {
+                slice->peer_nic_path = entry.first;
+                delayRedispatch(slice, false, "peer rail is paused");
+            }
             entry.second.clear();
             continue;
         }
@@ -454,7 +584,10 @@ void WorkerPool::performPostSend(int thread_id) {
         auto endpoint = context_.endpoint(entry.first);
 #endif
         if (!endpoint) {
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            for (auto &slice : entry.second) {
+                slice->peer_nic_path = entry.first;
+                delayRedispatch(slice, false, "endpoint unavailable");
+            }
             entry.second.clear();
             continue;
         }
@@ -497,6 +630,10 @@ void WorkerPool::performPostSend(int thread_id) {
                     if (!has_peer_alternative && local_context_inactive &&
                         tryHandoffToAnotherLocalWorker(slice)) {
                         processed_slice_count_++;
+                    } else if (!has_peer_alternative &&
+                               !local_context_inactive) {
+                        delayRedispatch(slice, false,
+                                        "endpoint setup failed transiently");
                     } else {
                         failed_slice_list.push_back(slice);
                     }
@@ -513,8 +650,10 @@ void WorkerPool::performPostSend(int thread_id) {
                 markRailFailed(entry.first, true);
                 redispatch_counter_++;
                 context_.deleteEndpointByPtr(endpoint.get());
-                for (auto &slice : entry.second)
-                    failed_slice_list.push_back(slice);
+                for (auto &slice : entry.second) {
+                    delayRedispatch(slice, false,
+                                    "timed out waiting for ready ACK");
+                }
                 entry.second.clear();
             }
             continue;
@@ -768,9 +907,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 }
                 // A local RNIC failure cannot be repaired by keeping this
                 // worker/context and changing the remote rail. If no other
-                // local worker can take the slice, fail it immediately.
-                slice->markFailed();
-                processed_slice_count_++;
+                // local worker can take the slice yet, wait for rail recovery
+                // before deciding every local path is gone.
+                delayRedispatch(slice, true, "no alternate local RNIC");
                 continue;
             }
 
@@ -788,8 +927,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                            << "dest_addr=" << (void *)slice->rdma.dest_addr
                            << ", length=" << slice->length
                            << ", retry_cnt=" << slice->rdma.retry_cnt;
-                slice->markFailed();
-                processed_slice_count_++;
+                delayRedispatch(slice, false,
+                                "peer segment unavailable or no target RNIC");
                 continue;
             }
             slice->rdma.dest_rkey =
@@ -822,13 +961,13 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 }
                 if (!found) {
                     LOG(ERROR)
-                        << "Worker: Cannot redispatch slice because all peer "
+                        << "Worker: Delaying redispatch because all peer "
                            "rails are paused for target "
                         << slice->target_id
                         << ", selected peer=" << peer_nic_path
                         << ", retry_cnt=" << slice->rdma.retry_cnt;
-                    slice->markFailed();
-                    processed_slice_count_++;
+                    slice->peer_nic_path = peer_nic_path;
+                    delayRedispatch(slice, false, "all peer rails paused");
                     continue;
                 }
             }
@@ -850,7 +989,6 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                         << ", length=" << slice->length
                         << ", retry_cnt=" << slice->rdma.retry_cnt;
             }
-            slice->ts = 0;
             if (use_local_queue) {
                 collective_slice_queue_[thread_id][peer_nic_path].push_back(
                     slice);
@@ -929,7 +1067,6 @@ bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
         slice->rdma.source_lkey =
             local_segment_desc->buffers[buffer_id].lkey[device_id];
         slice->rdma.endpoint = nullptr;
-        slice->ts = 0;
 
         std::vector<Transport::Slice *> handoff{slice};
         alt_ctx->worker_pool_->submitPreparedPostSend(handoff);
@@ -961,6 +1098,7 @@ void WorkerPool::transferWorker(int thread_id) {
     const bool can_post = workerCanPost(thread_id);
     const bool can_poll = workerCanPoll(thread_id);
     while (workers_running_.load(std::memory_order_relaxed)) {
+        releaseReadyDelayedSlices(thread_id);
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =
@@ -992,6 +1130,15 @@ void WorkerPool::transferWorker(int thread_id) {
             performPollCq(thread_id);
         }
 #endif
+        const uint64_t next_delayed_due_ns = nextDelayedSliceDueNs();
+        if (next_delayed_due_ns > 0) {
+            const uint64_t now = static_cast<uint64_t>(getCurrentTimeInNano());
+            if (next_delayed_due_ns > now) {
+                const uint64_t sleep_ns = std::min(next_delayed_due_ns - now,
+                                                   kDelayedRedispatchWakeCapNs);
+                std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
+            }
+        }
         last_wait_ts = getCurrentTimeInNano();
     }
 }
@@ -1412,6 +1559,23 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
         return true;
     }
     return false;
+}
+
+uint64_t WorkerPool::peerRailPauseRemainingNs(const std::string &peer_nic_path,
+                                              uint64_t now) {
+    if (peer_nic_path.empty()) return 0;
+
+    std::lock_guard<std::mutex> lock(rail_state_lock_);
+    auto it = rail_states_.find(peer_nic_path);
+    if (it == rail_states_.end()) return 0;
+    auto &state = it->second;
+    if (state.pause_until_ns == 0) return 0;
+    if (now >= state.pause_until_ns) {
+        state.error_count = 0;
+        state.pause_until_ns = 0;
+        return 0;
+    }
+    return state.pause_until_ns - now;
 }
 
 // Unified retry logic: increment retry count and return whether retry is
