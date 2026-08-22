@@ -492,6 +492,7 @@ Status RdmaTransport::submitTransferTasks(
             (request.length + num_slices - 1) / num_slices, default_block_size);
 
         std::vector<int> slice_dev_ids;
+        std::vector<uint64_t> slice_charged_bytes;
         // Only if a single request is enough, we perform aggregated allocation
         if (num_slices >= max_slice_count / 2) {
             std::string source_location = kWildcardLocation;
@@ -505,7 +506,7 @@ Status RdmaTransport::submitTransferTasks(
                 auto status = device_selector->allocate(
                     request.length, static_cast<uint32_t>(num_slices),
                     block_size, source_location, slice_dev_ids,
-                    request.priority, batch->device_mask);
+                    request.priority, batch->device_mask, &slice_charged_bytes);
                 if (!status.ok() || slice_dev_ids.empty()) {
                     LOG(WARNING) << "Device quota allocation failed: "
                                  << status.message();
@@ -535,6 +536,13 @@ Status RdmaTransport::submitTransferTasks(
             if (slice_idx < slice_dev_ids.size()) {
                 slice->source_dev_id = slice_dev_ids[slice_idx];
                 slice->quota_charged = true;
+                slice->charged_dev_id = slice->source_dev_id;
+                // Remember the exact bytes charged so release is symmetric even
+                // when this slice's real length differs from the allocator's
+                // per-slice estimate.
+                slice->charged_bytes = slice_idx < slice_charged_bytes.size()
+                                           ? slice_charged_bytes[slice_idx]
+                                           : slice->length;
             }
             offset += length;
             int part_id = next_worker_idx % num_workers;
