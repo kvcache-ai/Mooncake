@@ -2,8 +2,11 @@
 
 #include <memory>
 
+#include <glog/logging.h>
 #include <async_simple/Future.h>
 #include <async_simple/Promise.h>
+#include <async_simple/Executor.h>
+#include <async_simple/coro/CurrentExecutor.h>
 #include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
@@ -84,12 +87,39 @@ class FutureHandle : public TaskHandle<V> {
         : request_storage_(std::move(request_storage)),
           future_(std::move(future)) {}
 
+    // Block the caller on the Future itself. Do not syncAwait(WaitAsync()):
+    // that would resume TE-poll completions on the poll worker and run any
+    // caller-visible continuation there. Future::get() waits via CV without
+    // executing business logic on the completer thread.
     tl::expected<V, ErrorCode> Wait() override {
-        return async_simple::coro::syncAwait(WaitAsync());
+        try {
+            return std::move(future_).get();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "FutureHandle::Wait exception: " << e.what();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        } catch (...) {
+            LOG(ERROR) << "FutureHandle::Wait unknown exception";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
     }
 
+    // When the Lazy has an executor (via CurrentExecutor), bind the Future so
+    // TE-poll setValue resumes the coroutine on that executor, not on the poll
+    // worker.
     async_simple::coro::Lazy<tl::expected<V, ErrorCode>> WaitAsync() override {
-        co_return co_await std::move(future_);
+        async_simple::Executor* ex = co_await async_simple::coro::CurrentExecutor{};
+        try {
+            if (ex != nullptr) {
+                co_return co_await std::move(future_).via(ex);
+            }
+            co_return co_await std::move(future_);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "FutureHandle::WaitAsync exception: " << e.what();
+            co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        } catch (...) {
+            LOG(ERROR) << "FutureHandle::WaitAsync unknown exception";
+            co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
     }
 
     template <typename T>

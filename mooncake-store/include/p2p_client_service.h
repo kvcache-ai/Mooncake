@@ -341,9 +341,10 @@ class P2PClientService final : public ClientService {
     struct RemoteForwardWriteOp : WriteOp {
         using WritePromise =
             async_simple::Promise<tl::expected<void, ErrorCode>>;
-        using TeTransferFn = std::function<tl::expected<void, ErrorCode>(
-            void* local_base, size_t size,
-            const std::vector<RemoteBufferDesc>& dest_buffers)>;
+        using TeTransferFn = std::function<
+            async_simple::Future<tl::expected<void, ErrorCode>>(
+                void* local_base, size_t size,
+                const std::vector<RemoteBufferDesc>& dest_buffers)>;
 
         PeerClient* peer_ptr;
         std::shared_ptr<P2PClientMetric> metrics;

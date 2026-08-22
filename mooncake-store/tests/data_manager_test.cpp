@@ -18,6 +18,10 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "utils.h"
+#include "task_handle.h"
+#include <async_simple/coro/FutureAwaiter.h>
+#include <async_simple/coro/Lazy.h>
+#include <async_simple/coro/SyncAwait.h>
 #undef protected
 #undef private
 
@@ -2260,6 +2264,138 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteDataPartialFailure) {
     LOG(INFO)
         << "=== Real RDMA Multi-Batch WriteRemoteData Partial Failure Test "
            "Completed ===";
+}
+
+namespace {
+
+tl::expected<void, ErrorCode> AwaitVoidExpectedFuture(
+    async_simple::Future<tl::expected<void, ErrorCode>> fut) {
+    return async_simple::coro::syncAwait(
+        [](async_simple::Future<tl::expected<void, ErrorCode>> f)
+            -> async_simple::coro::Lazy<tl::expected<void, ErrorCode>> {
+            co_return co_await std::move(f);
+        }(std::move(fut)));
+}
+
+std::unique_ptr<DataManager> MakeDataManagerForTePollTest(
+    std::shared_ptr<TransferEngine> te, size_t te_async_poll_worker_num) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "tags": ["fast", "local"],
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    if (!parseJsonString(json_config_str, config)) {
+        return nullptr;
+    }
+    auto backend = std::make_unique<TieredBackend>(1024);
+    auto init_result = InitTieredBackendForTest(*backend, config);
+    if (!init_result.has_value()) {
+        return nullptr;
+    }
+    LocalTransferConfig transfer_config;
+    transfer_config.mode = LocalTransferMode::TE;
+    transfer_config.te_async_poll_worker_num = te_async_poll_worker_num;
+    return std::make_unique<DataManager>(std::move(backend), std::move(te),
+                                         1024, transfer_config);
+}
+
+}  // namespace
+
+TEST_F(DataManagerTest, TeAsyncPollWorkerCreatesPollExecutor) {
+    auto with_pool =
+        MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/4);
+    ASSERT_NE(with_pool, nullptr);
+    EXPECT_NE(with_pool->te_poll_executor_, nullptr);
+
+    auto without_pool =
+        MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/0);
+    ASSERT_NE(without_pool, nullptr);
+    EXPECT_EQ(without_pool->te_poll_executor_, nullptr);
+}
+
+TEST_F(DataManagerTest, WaitAllTransferBatchesAsyncEmptySucceedsWithPollPool) {
+    auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/2);
+    ASSERT_NE(dm, nullptr);
+    ASSERT_NE(dm->te_poll_executor_, nullptr);
+
+    auto result = AwaitVoidExpectedFuture(dm->WaitAllTransferBatchesAsync({}));
+    ASSERT_TRUE(result.has_value());
+}
+
+TEST_F(DataManagerTest,
+       WaitAllTransferBatchesAsyncEmptySucceedsWithoutPollPool) {
+    auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/0);
+    ASSERT_NE(dm, nullptr);
+    ASSERT_EQ(dm->te_poll_executor_, nullptr);
+
+    auto result = AwaitVoidExpectedFuture(dm->WaitAllTransferBatchesAsync({}));
+    ASSERT_TRUE(result.has_value());
+}
+
+TEST_F(DataManagerTest, TransferDataAsyncRejectsInvalidBuffersWithPollPool) {
+    auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/2);
+    ASSERT_NE(dm, nullptr);
+
+    char local_buf[16]{};
+    auto result = AwaitVoidExpectedFuture(dm->TransferDataAsync(
+        local_buf, sizeof(local_buf), /*peer_buffers=*/{},
+        Transport::TransferRequest::WRITE));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(DataManagerTest, TransferDataAsyncRejectsInvalidBuffersWithoutPollPool) {
+    auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/0);
+    ASSERT_NE(dm, nullptr);
+
+    char local_buf[16]{};
+    auto result = AwaitVoidExpectedFuture(dm->TransferDataAsync(
+        local_buf, sizeof(local_buf), /*peer_buffers=*/{},
+        Transport::TransferRequest::WRITE));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(DataManagerTest, TePollExecutorOffloadReturnsFutureHandle) {
+    // BuildDataCopierViaTe / TransferDataAsync expose TE wait as FutureHandle.
+    auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/2);
+    ASSERT_NE(dm, nullptr);
+    ASSERT_NE(dm->te_poll_executor_, nullptr);
+
+    auto future =
+        dm->te_poll_executor_->SubmitSingleTask<tl::expected<void, ErrorCode>>(
+            []() -> tl::expected<void, ErrorCode> { return {}; });
+    auto handle = FutureHandle<void>::Create(std::shared_ptr<void>{},
+                                             std::move(future));
+    ASSERT_NE(dynamic_cast<FutureHandle<void>*>(handle.get()), nullptr);
+    ASSERT_EQ(dynamic_cast<CallableTaskHandle<void>*>(handle.get()), nullptr);
+    auto wait_res = handle->Wait();
+    ASSERT_TRUE(wait_res.has_value());
+}
+
+TEST_F(DataManagerTest, TePollExecutorShutdownCancelSurfacesAsException) {
+    auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/2);
+    ASSERT_NE(dm, nullptr);
+    ASSERT_NE(dm->te_poll_executor_, nullptr);
+
+    dm->te_poll_executor_->Shutdown();
+    auto fut = dm->WaitAllTransferBatchesAsync({});
+    bool saw_exception = false;
+    try {
+        (void)AwaitVoidExpectedFuture(std::move(fut));
+    } catch (const std::exception&) {
+        saw_exception = true;
+    } catch (...) {
+        saw_exception = true;
+    }
+    EXPECT_TRUE(saw_exception);
 }
 
 }  // namespace mooncake

@@ -40,7 +40,8 @@ class P2PClientIntegrationTest : public ::testing::Test {
         const std::string& host_name, uint32_t rpc_port = 0,
         const std::string& local_transfer_mode = "te",
         TransferDirectionMode transfer_direction_mode =
-            TransferDirectionMode::REVERSE) {
+            TransferDirectionMode::REVERSE,
+        size_t te_async_poll_worker_num = 32) {
         if (rpc_port == 0) rpc_port = getFreeTcpPort();
 
         auto config = ClientConfigBuilder::build_p2p_real_client(
@@ -53,6 +54,7 @@ class P2PClientIntegrationTest : public ::testing::Test {
             config.local_transfer_mode = LocalTransferMode::MEMCPY;
         }
         config.transfer_direction_mode = transfer_direction_mode;
+        config.te_async_poll_worker_num = te_async_poll_worker_num;
 
         config.async_sender_thread_count = 0;
 
@@ -1028,6 +1030,86 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
             EXPECT_EQ(std::string(static_cast<char*>(buffer_handle->ptr()),
                                   buffer_handle->size()),
                       payloads[i]);
+        }
+    }
+}
+
+// ============================================================================
+// TE async poll offload: functional correctness (0 = sync wait, >0 = poll pool)
+// Multi-key batch covers concurrent per-key chains; single-key would be redundant.
+// ============================================================================
+
+TEST_F(P2PClientIntegrationTest, TeAsyncPollForwardRemoteBatchPutAndGet) {
+    const std::vector<size_t> te_async_poll_workers = {0, 4};
+    constexpr int batch_size = 6;
+    for (size_t te_async : te_async_poll_workers) {
+        SCOPED_TRACE("te_async_poll_worker_num=" + std::to_string(te_async));
+
+        std::string host = "localhost:" + std::to_string(getFreeTcpPort());
+        auto remote_writer = CreateP2PClient(
+            host, /*rpc_port=*/0, "te", TransferDirectionMode::FORWARD,
+            te_async);
+        ASSERT_NE(remote_writer, nullptr);
+
+        std::vector<std::string> keys;
+        std::vector<std::string> payloads;
+        std::vector<std::vector<Slice>> batched_slices;
+        keys.reserve(batch_size);
+        payloads.reserve(batch_size);
+        batched_slices.reserve(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+            keys.push_back("p2p_te_async_fwd_batch_" + std::to_string(te_async) +
+                           "_key_" + std::to_string(i));
+            payloads.push_back("payload_" + std::to_string(te_async) + "_" +
+                               std::to_string(i));
+        }
+        for (int i = 0; i < batch_size; ++i) {
+            std::vector<Slice> slices;
+            slices.emplace_back(Slice{const_cast<char*>(payloads[i].data()),
+                                      payloads[i].size()});
+            batched_slices.push_back(std::move(slices));
+        }
+
+        WriteRouteRequestConfig remote_put_config;
+        remote_put_config.remote_weight = 1.0;
+        remote_put_config.local_write_waterline = 0.0;
+        remote_put_config.max_candidates =
+            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+        auto put_results =
+            remote_writer->BatchPut(keys, batched_slices, remote_put_config);
+        ASSERT_EQ(put_results.size(), static_cast<size_t>(batch_size));
+        for (size_t i = 0; i < put_results.size(); ++i) {
+            ASSERT_TRUE(put_results[i].has_value())
+                << "Forward BatchPut failed te_async=" << te_async
+                << " key=" << keys[i]
+                << " err=" << static_cast<int>(put_results[i].error());
+        }
+
+        ReadRouteConfig read_config;
+        read_config.max_candidates =
+            GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+        std::vector<std::vector<char>> read_payloads(batch_size);
+        std::vector<std::vector<void*>> all_buffers(batch_size);
+        std::vector<std::vector<size_t>> all_sizes(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+            read_payloads[i].resize(payloads[i].size(), 0);
+            all_buffers[i].push_back(read_payloads[i].data());
+            all_sizes[i].push_back(read_payloads[i].size());
+        }
+
+        auto batch_get_results =
+            remote_writer->BatchGet(keys, all_buffers, all_sizes, read_config);
+        ASSERT_EQ(batch_get_results.size(), static_cast<size_t>(batch_size));
+        for (int i = 0; i < batch_size; ++i) {
+            ASSERT_TRUE(batch_get_results[i].has_value())
+                << "Forward BatchGet failed te_async=" << te_async
+                << " key=" << keys[i]
+                << " err=" << static_cast<int>(batch_get_results[i].error());
+            EXPECT_EQ(static_cast<size_t>(batch_get_results[i].value()),
+                      payloads[i].size());
+            EXPECT_EQ(
+                std::string(read_payloads[i].data(), read_payloads[i].size()),
+                payloads[i]);
         }
     }
 }

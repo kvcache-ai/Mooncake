@@ -204,6 +204,12 @@ struct P2PClientConfig : RealClientConfigBase {
     // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
 
+    // Worker threads for offloading TransferEngine batch polling
+    // (WaitAllTransferBatches) in DataManager: local TE Put/Get and remote
+    // forward TE (co_await) paths. Independent of local_transfer_mode. 0 means
+    // synchronous TE wait on the caller/coroutine thread.
+    size_t te_async_poll_worker_num = 32;
+
     // PreWrite / PinKey key lease: maximum time (ms) a key may stay in
     // intermediate (lease-protected) state before expiring.
     static constexpr uint32_t kP2pDefaultKeyLeaseDurationMs = 5000;
@@ -359,7 +365,8 @@ class ClientConfigBuilder {
         const std::string& redis_password = "", int redis_db_index = 0,
         int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
         const std::string& redis_username = "",
-        uint16_t heartbeat_rpc_port = 0) {
+        uint16_t heartbeat_rpc_port = 0,
+        size_t te_async_poll_worker_num = 32) {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -382,6 +389,7 @@ class ClientConfigBuilder {
             config.local_memcpy_async_worker_num =
                 local_memcpy_async_worker_num;
         }
+        config.te_async_poll_worker_num = te_async_poll_worker_num;
         config.async_sender_thread_count = async_sender_thread_count;
         config.async_max_batch_size = async_max_batch_size;
         config.async_route_queue_size = async_route_queue_size;
@@ -452,6 +460,9 @@ class ClientConfigBuilder {
         size_t memcpy_async_worker_num =
             get_config_size(config, DictP2P::kLocalMemcpyAsyncWorkerNum,
                             DictP2P::kDefaultLocalMemcpyAsyncWorkerNum);
+        size_t te_async_poll_worker_num =
+            get_config_size(config, DictP2P::kTeAsyncPollWorkerNum,
+                            DictP2P::kDefaultTeAsyncPollWorkerNum);
         size_t async_sender_thread_count =
             get_config_size(config, DictP2P::kAsyncSenderThreadCount,
                             DictP2P::kDefaultAsyncSenderThreadCount);
@@ -486,7 +497,7 @@ class ClientConfigBuilder {
             redis_config.password, redis_config.db_index,
             redis_config.master_view_ttl_sec,
             redis_config.heartbeat_interval_sec, redis_config.username,
-            heartbeat_rpc_port);
+            heartbeat_rpc_port, te_async_poll_worker_num);
     }
 
    private:
@@ -557,6 +568,8 @@ class ClientConfigBuilder {
         static constexpr const char* kLocalTransferMode = "local_transfer_mode";
         static constexpr const char* kLocalMemcpyAsyncWorkerNum =
             "local_memcpy_async_worker_num";
+        static constexpr const char* kTeAsyncPollWorkerNum =
+            "te_async_poll_worker_num";
         static constexpr const char* kAsyncSenderThreadCount =
             "async_sender_thread_count";
         static constexpr const char* kAsyncMaxBatchSize =
@@ -572,6 +585,7 @@ class ClientConfigBuilder {
         static constexpr uint64_t kDefaultRouteCacheTtlMs = 1ULL * 60 * 1000;
         static constexpr const char* kDefaultLocalTransferMode = "te";
         static constexpr size_t kDefaultLocalMemcpyAsyncWorkerNum = 32;
+        static constexpr size_t kDefaultTeAsyncPollWorkerNum = 32;
         static constexpr size_t kDefaultAsyncSenderThreadCount = 4;
         static constexpr size_t kDefaultAsyncMaxBatchSize = 2000;
         static constexpr size_t kDefaultAsyncRouteQueueSize = 0;

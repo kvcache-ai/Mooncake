@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <vector>
 #include <functional>
+#include <async_simple/Future.h>
 #include <ylt/util/tl/expected.hpp>
 #include "async_memcpy_executor.h"
 #include "client_buffer.hpp"
@@ -56,6 +57,12 @@ struct LocalTransferConfig {
     // When mode == MEMCPY, the following parameters are used:
     // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
+
+    // Dedicated worker threads to offload TransferEngine batch polling
+    // (WaitAllTransferBatches) for local TE Put/Get and remote forward TE
+    // paths. Independent of `mode`. 0 keeps synchronous TE wait on the caller
+    // thread.
+    size_t te_async_poll_worker_num = 32;
 };
 
 /**
@@ -272,6 +279,18 @@ class DataManager {
         const std::vector<RemoteBufferDesc>& peer_buffers,
         Transport::TransferRequest::OpCode opcode);
 
+    /**
+     * @brief Same as TransferData, but TE completion polling is offloaded when
+     * `te_async_poll_worker_num > 0`.
+     *
+     * Returns a Future (not Lazy) so callers co_await a single Future layer;
+     * avoids nested-coroutine issues with async_simple on some compilers.
+     */
+    async_simple::Future<tl::expected<void, ErrorCode>> TransferDataAsync(
+        void* local_transfer_base, size_t total_size,
+        const std::vector<RemoteBufferDesc>& peer_buffers,
+        Transport::TransferRequest::OpCode opcode);
+
     // ================================================================
     // Utilities
     // ================================================================
@@ -298,6 +317,8 @@ class DataManager {
                std::optional<UUID> tier_id = std::nullopt) const;
 
    private:
+    friend class PutViaTeTaskHandle;
+
     void ClearLeaseRecords();
 
     struct KeyCtx {
@@ -436,6 +457,11 @@ class DataManager {
         AllocationHandle handle;  // Ensure local memory is not released
     };
 
+    // After TE wait for local PutViaTe: optional DRAM staging copy + commit.
+    tl::expected<void, ErrorCode> FinishPutViaTeAfterWait(
+        const KeyCtx& ctx, const UUID& write_operation_id, TeSubmitResult& te_ctx,
+        tl::expected<void, ErrorCode> wait_result);
+
     tl::expected<TeSubmitResult, ErrorCode> SubmitTeTransferInternal(
         const AllocationHandle& handle,
         const std::vector<RemoteBufferDesc>& remote_buffers,
@@ -528,6 +554,12 @@ class DataManager {
         const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
             batches);
 
+    /** Offload WaitAllTransferBatches to te_poll_executor_ when configured. */
+    async_simple::Future<tl::expected<void, ErrorCode>>
+    WaitAllTransferBatchesAsync(
+        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
+            batches);
+
     // Wait for all tasks to reach a terminal state, then free the batch.
     void CancelBatchTETask(Transport::BatchID batch_id, size_t num_tasks);
 
@@ -556,6 +588,7 @@ class DataManager {
 
     LocalTransferConfig local_transfer_config_;
     std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
+    std::unique_ptr<AsyncMemcpyExecutor> te_poll_executor_;
     std::chrono::milliseconds lease_duration_;
     std::chrono::milliseconds lease_scan_interval_;
     std::atomic<bool> lease_scanner_stop_requested_{false};
