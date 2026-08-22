@@ -4,6 +4,7 @@ import copy
 import ctypes
 import io
 import json
+import sys
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -12,6 +13,8 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
+
+from mooncake._partial_read import MatrixReadPlan, plan_matrix_read
 
 try:
     import mooncake.store as _mooncake_store
@@ -29,6 +32,7 @@ except Exception:  # pragma: no cover
 DEFAULT_BUNDLE_CHUNK_BYTES = 64 * 1024**2
 AUTO_PARALLEL_MIN_BYTES = DEFAULT_BUNDLE_CHUNK_BYTES
 AUTO_PARALLEL_MIN_CHUNKS = 8
+MAX_MATRIX_RANGES = 4096
 MISSING_OBJECT_ERROR = (
     -704
 )  # Mooncake remove returns -704 for an already-missing object.
@@ -305,6 +309,50 @@ class _DataProtoRowSelection:
     count: int
     member_slice: StructuredMemberSlice | None = None
     indices: tuple[int, ...] | None = None
+
+
+@dataclass
+class _MatrixRead:
+    name: str
+    payload_spec: Mapping[str, Any]
+    field_spec: Mapping[str, Any]
+    dtype: np.dtype[Any] | None
+    rows: range | tuple[int, ...]
+    columns: slice
+    plan: MatrixReadPlan
+    ranges: tuple[tuple[int, int, int], ...]
+    metadata_bytes: int
+    destination: Any
+
+    def decode(self, staging: bytes) -> Any:
+        if self.dtype is not None:
+            value = np.frombuffer(
+                staging,
+                dtype=self.dtype,
+                count=self.plan.nbytes // self.dtype.itemsize,
+            ).reshape(self.plan.shape)
+            return value if self.destination is not None else value.copy()
+        payload = (
+            _slice_tensor_metadata(
+                staging[: self.metadata_bytes], self.plan.shape, self.plan.nbytes
+            )
+            + staging[self.metadata_bytes :]
+        )
+        return (
+            payload
+            if self.destination is not None
+            else _deserialize_tensor_payload(payload)
+        )
+
+    def finish(self, value: Any) -> Any:
+        if self.destination is None:
+            return value
+        if self.dtype is not None:
+            np.copyto(self.destination, value)
+            return self.destination
+        ctypes.memmove(self.destination.ptr, value, len(value))
+        _ = self.destination.owner
+        return self.destination
 
 
 DATAPROTO_REF_HANDLE_TYPE = "mooncake_dataproto_ref"
@@ -718,6 +766,7 @@ class MooncakeBundleTransfer:
         data_cls: Optional[Any] = None,
         destinations: Optional[Mapping[str, Any]] = None,
         rows: slice | StructuredMemberSlice | Sequence[int] | None = None,
+        batch_slices: Optional[Mapping[str, slice]] = None,
     ) -> Any:
         """Materialize a DataProto-like object or flat dict."""
         if type not in {"dataproto", "dict"}:
@@ -731,6 +780,7 @@ class MooncakeBundleTransfer:
             data_cls=dict if type == "dict" else data_cls,
             destinations=destinations,
             rows=rows,
+            batch_slices=batch_slices,
             _flat_dict_output=(type == "dict"),
         )
         return _envelope_to_flat_dict(result) if type == "dict" else result
@@ -803,6 +853,7 @@ class MooncakeBundleTransfer:
         data_cls: Optional[Any] = None,
         destinations: Optional[Mapping[str, Any]] = None,
         rows: slice | StructuredMemberSlice | Sequence[int] | None = None,
+        batch_slices: Optional[Mapping[str, slice]] = None,
     ) -> Any:
         """Materialize selected DataProto fields from structured object refs."""
         return self._get_dataproto(
@@ -814,6 +865,7 @@ class MooncakeBundleTransfer:
             data_cls=data_cls,
             destinations=destinations,
             rows=rows,
+            batch_slices=batch_slices,
         )
 
     def _get_dataproto(
@@ -827,6 +879,7 @@ class MooncakeBundleTransfer:
         data_cls: Optional[Any] = None,
         destinations: Optional[Mapping[str, Any]] = None,
         rows: slice | StructuredMemberSlice | Sequence[int] | None = None,
+        batch_slices: Optional[Mapping[str, slice]] = None,
         _flat_dict_output: bool = False,
     ) -> Any:
         """Materialize selected DataProto fields from structured object refs."""
@@ -838,11 +891,20 @@ class MooncakeBundleTransfer:
         batch_names, non_tensor_names = _resolve_dataproto_field_selection(
             ref, fields, batch_fields, non_tensor_fields
         )
-        batch: dict[str, Any] = {}
+        if batch_slices is not None and not isinstance(batch_slices, Mapping):
+            raise TypeError("DataProto batch_slices must be a mapping")
+        matrix_slices = dict(batch_slices or {})
         non_tensor_batch: dict[str, Any] = {}
         destination_map = destinations or {}
+        batch, matrix_reads = (
+            self._read_dataproto_matrices(
+                ref, batch_names, row_slice, row_indices, matrix_slices, destination_map
+            )
+            if matrix_slices or row_selection is not None
+            else ({}, [])
+        )
         requested = [
-            *[("batch", name) for name in batch_names],
+            *[("batch", name) for name in batch_names if name not in batch],
             *[("non_tensor_batch", name) for name in non_tensor_names],
         ]
         by_stage: dict[str, list[tuple[str, StructuredFieldLocation]]] = {}
@@ -950,9 +1012,60 @@ class MooncakeBundleTransfer:
                     else _object_array_from_decoded_values(values)
                 )
         meta_info = _select_mapping(ref.meta_info, meta_info_keys)
-        return _build_dataproto_like_result(
+        staged_matrices = {read.name: batch[read.name] for read in matrix_reads}
+        for read in matrix_reads:
+            if read.destination is not None:
+                batch[read.name] = read.destination
+        result = _build_dataproto_like_result(
             batch, non_tensor_batch, meta_info, data_cls
         )
+        for read in matrix_reads:
+            batch[read.name] = read.finish(staged_matrices[read.name])
+        return result
+
+    def _read_dataproto_matrices(
+        self,
+        ref: MooncakeDataProtoRef,
+        batch_names: Sequence[str],
+        row_slice: StructuredMemberSlice | None,
+        row_indices: tuple[int, ...] | None,
+        slices: Mapping[str, slice],
+        destinations: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], list[_MatrixRead]]:
+        rows = row_indices
+        if rows is None:
+            rows = (
+                range(ref.batch_size)
+                if row_slice is None
+                else range(*_normalized_member_slice(row_slice, ref.batch_size))
+            )
+        requests = []
+        include_rows = row_slice is not None or row_indices is not None
+        for name in slices:
+            if name not in ref.field_index:
+                raise KeyError(f"unknown DataProto field: {name!r}")
+            if name not in batch_names or ref.field_index[name].section != "batch":
+                raise ValueError(f"DataProto matrix field {name!r} is not selected")
+        names = [
+            name for name in batch_names if include_rows or name in slices
+        ]
+        for name in names:
+            columns = slices.get(name, slice(None))
+            if not isinstance(columns, slice):
+                raise TypeError(f"DataProto batch_slices for {name!r} must be a slice")
+            location = ref.field_index[name]
+            requests.append(
+                (
+                    name,
+                    ref.stage_refs[location.stage],
+                    location.member,
+                    rows,
+                    columns,
+                    destinations.get(name),
+                    name in slices,
+                )
+            )
+        return self._structured_store.materialize_matrices(requests, ref.batch_size)
 
     def _read_dataproto_member_indices(
         self,
@@ -3289,6 +3402,78 @@ class _StructuredObjectLayer:
         }
         return StructuredObjectResult(metadata=dict(metadata), objects=objects)
 
+    def materialize_matrices(
+        self, requests: Sequence[tuple[Any, ...]], batch_size: int
+    ) -> tuple[dict[str, Any], list[_MatrixRead]]:
+        reads: list[_MatrixRead] = []
+        stage_cache: dict[str, tuple[Mapping[str, Any], Mapping[str, Any]]] = {}
+        for name, stage_ref, member, rows, columns, destination, required in requests:
+            manifest_key = stage_ref.manifest_key
+            if manifest_key not in stage_cache:
+                manifest = self._bundle_store.resolve_manifest(stage_ref)
+                metadata = _decode_structured_metadata(
+                    self._bundle_store.read_payload(manifest["meta"])
+                )
+                stage_cache[manifest_key] = (
+                    manifest["buffers"],
+                    _structured_field_specs(metadata),
+                )
+            buffers, fields = stage_cache[manifest_key]
+            payload_spec = buffers[member]
+            field_spec = fields.get(member, {"encoding": "bytes"})
+            is_matrix = (
+                field_spec.get("encoding") in {"ndarray", "torch_tensor"}
+                and not field_spec.get("nested")
+                and payload_spec.get("format") != "torch_save"
+                and len(field_spec.get("shape", ())) == 2
+            )
+            if not is_matrix:
+                if required:
+                    raise TypeError(f"DataProto field {name!r} is not a dense matrix")
+                continue
+            reads.append(
+                _prepare_matrix_read(
+                    name, payload_spec, field_spec, rows, columns, destination
+                )
+            )
+        if any(int(read.field_spec["shape"][0]) != batch_size for read in reads):
+            raise ValueError("DataProto matrix field shape does not match batch size")
+        staged = (
+            None
+            if any(read.plan.ranges is None for read in reads)
+            else (
+                self._bundle_store._transport.read_payload_ranges_batch(
+                    [(read.payload_spec, read.ranges) for read in reads],
+                    MAX_MATRIX_RANGES,
+                )
+            )
+        )
+        values = (
+            [read.decode(data) for read, data in zip(reads, staged)]
+            if staged is not None
+            else [self._materialize_matrix_fallback(read) for read in reads]
+        )
+        return dict(zip((read.name for read in reads), values)), reads
+
+    def _materialize_matrix_fallback(self, read: _MatrixRead) -> Any:
+        value = self._read_structured_member(
+            read.name, read.payload_spec, read.field_spec, None, None
+        )
+        rows = (
+            slice(read.rows.start, read.rows.stop, read.rows.step)
+            if isinstance(read.rows, range)
+            else list(read.rows)
+        )
+        value = value[rows, read.columns]
+        value = (
+            np.ascontiguousarray(value)
+            if read.dtype is not None
+            else value.contiguous()
+        )
+        if read.dtype is None and read.destination is not None:
+            value = _tensor_payload_bytes(_TensorPayload(value))[0]
+        return value
+
     def _resolve_structured_read(
         self,
         spec: StructuredObjectReadSpec,
@@ -4430,6 +4615,64 @@ class _MooncakePayloadTransport:
             payload_spec["chunks"], destination_ptr, ranges
         )
 
+    def read_payload_ranges_batch(
+        self,
+        requests: Sequence[tuple[Mapping[str, Any], Sequence[tuple[int, int, int]]]],
+        max_fragments: int,
+    ) -> list[bytes] | None:
+        pool = self._ensure_buffer_pool()
+        if not callable(self._get_into_ranges) or pool is None:
+            return None
+        fragments = []
+        offsets = []
+        lengths = []
+        total_bytes = 0
+        for payload_spec, ranges in requests:
+            offsets.append(total_bytes)
+            output_bytes = ranges[-1][1] + ranges[-1][2] if ranges else 0
+            lengths.append(output_bytes)
+            for source, destination, size in ranges:
+                physical = _payload_range_fragments(
+                    payload_spec["chunks"],
+                    source,
+                    size,
+                    total_bytes + destination,
+                    max_fragments - len(fragments) + 1,
+                )
+                if sum(part[4] for part in physical) != size:
+                    return None
+                fragments.extend(physical)
+                if len(fragments) > max_fragments:
+                    return None
+            total_bytes += output_bytes
+            if total_bytes > sys.maxsize:
+                return None
+        if not fragments:
+            return [b"" for _request in requests]
+        try:
+            lease = pool.acquire(total_bytes, block=False)
+        except RuntimeError:
+            return None
+        if lease is None:
+            return None
+        sizes = [[part[4]] for part in fragments]
+        try:
+            results = self._get_into_ranges(
+                [lease.ptr],
+                [[part[0] for part in fragments]],
+                [[[part[2]] for part in fragments]],
+                [[[part[3]] for part in fragments]],
+                [sizes],
+            )
+            if results != [sizes]:
+                raise RuntimeError("get_into_ranges failed for ranged payload")
+            return [
+                ctypes.string_at(lease.ptr + offset, length)
+                for offset, length in zip(offsets, lengths)
+            ]
+        finally:
+            lease.release()
+
     def put_tensor_object_buffer(
         self,
         key: str,
@@ -5014,6 +5257,68 @@ class _MooncakePayloadTransport:
         return callable(self._register_buffer) and callable(self._unregister_buffer)
 
 
+def _prepare_matrix_read(
+    name: str,
+    payload_spec: Mapping[str, Any],
+    field_spec: Mapping[str, Any],
+    rows: range | tuple[int, ...],
+    columns: slice,
+    destination: Any,
+) -> _MatrixRead:
+    encoding = field_spec.get("encoding")
+    shape = tuple(int(value) for value in field_spec["shape"])
+    dtype = np.dtype(field_spec["dtype"]) if encoding == "ndarray" else None
+    itemsize = dtype.itemsize if dtype is not None else int(field_spec["element_size"])
+    metadata_bytes = (
+        0 if dtype is not None else int(payload_spec.get("metadata_bytes", -1))
+    )
+    if (
+        itemsize <= 0
+        or metadata_bytes < 0
+        or (dtype is None and metadata_bytes < _tensor_metadata_size())
+    ):
+        raise ValueError(f"DataProto matrix field {name!r} is missing range metadata")
+    plan = plan_matrix_read(shape, itemsize, rows, columns, MAX_MATRIX_RANGES)
+    start, stop, _step = columns.indices(shape[1])
+    expected_bytes = metadata_bytes + shape[0] * shape[1] * itemsize
+    if (
+        expected_bytes > sys.maxsize
+        or int(payload_spec.get("bytes", -1)) != expected_bytes
+    ):
+        raise ValueError(f"DataProto matrix field {name!r} payload size is invalid")
+    ranges = ((0, 0, metadata_bytes),) if metadata_bytes else ()
+    ranges += tuple(
+        (metadata_bytes + source, metadata_bytes + output, size)
+        for source, output, size in (plan.ranges or ())
+    )
+    if dtype is not None and destination is not None:
+        if isinstance(destination, _RawDestinationBuffer) and destination.ptr <= 0:
+            raise ValueError(f"DataProto matrix field {name!r} destination is invalid")
+        destination = _resolve_ndarray_destination(name, destination, dtype, plan.shape)
+    elif destination is not None:
+        if not isinstance(
+            destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)
+        ):
+            raise ValueError(
+                f"structured tensor member {name} only supports "
+                "tensor_object_buffer or raw_destination destinations"
+            )
+        if destination.ptr <= 0 or destination.size < metadata_bytes + plan.nbytes:
+            raise ValueError(f"DataProto matrix field {name!r} destination is invalid")
+    return _MatrixRead(
+        name,
+        payload_spec,
+        field_spec,
+        dtype,
+        rows,
+        slice(start, stop),
+        plan,
+        ranges,
+        metadata_bytes,
+        destination,
+    )
+
+
 def _resolve_ndarray_destination(
     name: str,
     destination: Any,
@@ -5237,6 +5542,7 @@ def _payload_range_fragments(
     byte_offset: int,
     byte_length: int,
     destination_offset: int = 0,
+    max_fragments: int | None = None,
 ) -> list[tuple[str, int, int, int, int]]:
     fragments: list[tuple[str, int, int, int, int]] = []
     read_end = byte_offset + byte_length
@@ -5256,6 +5562,8 @@ def _payload_range_fragments(
                     overlap_end - overlap_start,
                 )
             )
+            if max_fragments is not None and len(fragments) >= max_fragments:
+                break
         chunk_offset = chunk_end
     return fragments
 
