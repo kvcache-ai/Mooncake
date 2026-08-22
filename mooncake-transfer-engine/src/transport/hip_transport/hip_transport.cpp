@@ -683,24 +683,57 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             return 0;
         }
 
+        // Resolve the true hipMalloc base address. Framework caching
+        // allocators (PyTorch, etc.) sub-allocate tensors within larger
+        // hipMalloc segments. hipIpcGetMemHandle always returns a handle for
+        // the entire segment, so we must register at segment granularity or
+        // relocateSharedMemoryAddress() maps every sub-range back onto the
+        // segment base and the peer silently reads the wrong bytes.
+        void* base_ptr = nullptr;
+        size_t alloc_size = 0;
+        if (!checkHip(hipMemGetAddressRange((hipDeviceptr_t*)&base_ptr,
+                                            &alloc_size, (hipDeviceptr_t)addr),
+                      "HipTransport: hipMemGetAddressRange failed")) {
+            return -1;
+        }
+
+        // Re-registering the same address is idempotent; a new sub-range of
+        // an already exported allocation just takes another reference.
+        uint64_t base = (uint64_t)base_ptr;
+        if (!registered_addr_to_base_.emplace((uint64_t)addr, base).second) {
+            return 0;
+        }
+        auto it = registered_base_refs_.find(base);
+        if (it != registered_base_refs_.end()) {
+            it->second++;
+            return 0;
+        }
+
         // Get IPC handle
         hipIpcMemHandle_t handle;
-        if (!checkHip(hipIpcGetMemHandle(&handle, addr),
+        if (!checkHip(hipIpcGetMemHandle(&handle, base_ptr),
                       "HipTransport: hipIpcGetMemHandle failed")) {
+            registered_addr_to_base_.erase((uint64_t)addr);
             return -1;
         }
 
         // Register buffer with metadata
         (void)remote_accessible;
         BufferDesc desc;
-        desc.addr = (uint64_t)addr;
-        desc.length = length;
+        desc.addr = (uint64_t)base_ptr;
+        desc.length = alloc_size;
         desc.name = location;
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
 #ifdef ENABLE_MULTI_PROTOCOL
         desc.protocol = "hip";
 #endif
-        return metadata_->addLocalMemoryBuffer(desc, true);
+        int rc = metadata_->addLocalMemoryBuffer(desc, true);
+        if (rc == 0) {
+            registered_base_refs_[base] = 1;
+        } else {
+            registered_addr_to_base_.erase((uint64_t)addr);
+        }
+        return rc;
     }
 
     // Fabric memory registration
@@ -750,6 +783,32 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
+    if (!use_fabric_mem_) {
+        // Hold register_mutex_ through the metadata removal, mirroring the
+        // register path, so a concurrent register of another sub-range cannot
+        // republish the buffer in between.
+        std::lock_guard<std::mutex> lock(register_mutex_);
+        auto alias_it = registered_addr_to_base_.find((uint64_t)addr);
+        if (alias_it != registered_addr_to_base_.end()) {
+            uint64_t base = alias_it->second;
+            registered_addr_to_base_.erase(alias_it);
+            // Both maps are updated in pairs under this mutex, so the base
+            // always has a refcount entry here. Only the last alias removes
+            // the shared registration.
+            if (--registered_base_refs_[base] > 0) return 0;
+            registered_base_refs_.erase(base);
+            return metadata_->removeLocalMemoryBuffer((void*)base,
+                                                      update_metadata);
+        }
+        // Not registered here (host memory owned by another transport, or
+        // already unregistered). The caller's address may still equal the
+        // base of a registration whose aliases are live (slab-level cleanup
+        // passing the allocation base); that registration is only removable
+        // through its aliases above.
+        if (registered_base_refs_.count((uint64_t)addr)) {
+            return ERR_ADDRESS_NOT_REGISTERED;
+        }
+    }
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 }
 
