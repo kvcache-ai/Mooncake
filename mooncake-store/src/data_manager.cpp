@@ -41,7 +41,8 @@ async_simple::Future<tl::expected<void, ErrorCode>> MakeReadyExpectedFuture(
     return future;
 }
 
-async_simple::Future<tl::expected<void, ErrorCode>> MakeCancelledTeWaitFuture() {
+async_simple::Future<tl::expected<void, ErrorCode>>
+MakeCancelledTeWaitFuture() {
     async_simple::Promise<tl::expected<void, ErrorCode>> promise;
     auto future = promise.getFuture();
     promise.setException(
@@ -653,8 +654,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
             std::move(submit_result->transfer_batches));
         return MakeFutureThenHandle<void>(
             std::move(wait_future),
-            [this, kctx, write_operation_id,
-             ctx = std::move(*submit_result)](
+            [this, kctx, write_operation_id, ctx = std::move(*submit_result)](
                 tl::expected<void, ErrorCode> wait_result) mutable {
                 return FinishPutViaTeAfterWait(kctx, write_operation_id, ctx,
                                                std::move(wait_result));
@@ -1899,9 +1899,8 @@ DataManager::WaitAllTransferBatchesAsync(
     if (wait_ex == nullptr) {
         return MakeReadyExpectedFuture(WaitAllTransferBatches(batches));
     }
-    return LaunchExpectedLazy(
-        WaitAllTransferBatchesCoro(std::move(batches)), wait_ex,
-        [this]() { ReleaseTeWaitInflight(); });
+    return LaunchExpectedLazy(WaitAllTransferBatchesCoro(std::move(batches)),
+                              wait_ex, [this]() { ReleaseTeWaitInflight(); });
 }
 
 void DataManager::ReleaseTeWaitInflight() {
@@ -1946,9 +1945,8 @@ DataManager::TeBatchPollResult DataManager::PollTransferBatchOnce(
         Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
         if (!s.ok()) {
             LOG(ERROR) << "Failed to get transfer status for task " << i
-                       << " for batch " << batch_id
-                       << " for segment endpoint '" << segment_endpoint
-                       << "', error: " << s.message();
+                       << " for batch " << batch_id << " for segment endpoint '"
+                       << segment_endpoint << "', error: " << s.message();
             return TeBatchPollResult::kFailed;
         }
 
@@ -1961,8 +1959,7 @@ DataManager::TeBatchPollResult DataManager::PollTransferBatchOnce(
             status.s == TransferStatusEnum::TIMEOUT) {
             LOG(ERROR) << "Transfer task " << i << " for batch " << batch_id
                        << " for segment endpoint '" << segment_endpoint
-                       << "' failed with status "
-                       << static_cast<int>(status.s);
+                       << "' failed with status " << static_cast<int>(status.s);
             return TeBatchPollResult::kFailed;
         }
         all_completed = false;
@@ -1981,8 +1978,8 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
     const std::string& segment_endpoint) {
     auto start_time = std::chrono::steady_clock::now();
     while (true) {
-        auto poll = PollTransferBatchOnce(batch_id, num_tasks,
-                                          segment_endpoint, start_time);
+        auto poll = PollTransferBatchOnce(batch_id, num_tasks, segment_endpoint,
+                                          start_time);
         if (poll == TeBatchPollResult::kFailed) {
             LOG(ERROR) << "Transfer failed in batch_id " << batch_id;
             CancelBatchTETask(batch_id, num_tasks);
@@ -2008,8 +2005,8 @@ DataManager::WaitTransferBatchCoro(Transport::BatchID batch_id,
             co_await CancelBatchTETaskCoro(batch_id, num_tasks);
             co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        auto poll = PollTransferBatchOnce(batch_id, num_tasks,
-                                          segment_endpoint, start_time);
+        auto poll = PollTransferBatchOnce(batch_id, num_tasks, segment_endpoint,
+                                          start_time);
         if (poll == TeBatchPollResult::kFailed) {
             LOG(ERROR) << "Transfer failed in batch_id " << batch_id;
             co_await CancelBatchTETaskCoro(batch_id, num_tasks);

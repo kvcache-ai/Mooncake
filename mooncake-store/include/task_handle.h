@@ -20,9 +20,9 @@ namespace mooncake {
 // Prefer CurrentExecutor; if unbound (e.g. syncAwait without via), use
 // caller-provided fallback, then coro_io's global executor.
 template <typename V>
-inline async_simple::coro::Lazy<tl::expected<V, ErrorCode>>
-AwaitExpectedFuture(async_simple::Future<tl::expected<V, ErrorCode>> fut,
-                    async_simple::Executor* fallback_ex = nullptr) {
+inline async_simple::coro::Lazy<tl::expected<V, ErrorCode>> AwaitExpectedFuture(
+    async_simple::Future<tl::expected<V, ErrorCode>> fut,
+    async_simple::Executor* fallback_ex = nullptr) {
     async_simple::Executor* ex = co_await async_simple::CurrentExecutor{};
     if (ex == nullptr) {
         ex = fallback_ex != nullptr ? fallback_ex
@@ -154,9 +154,7 @@ class FutureThenHandle final : public TaskHandle<V> {
                      Then then)
         : future_(std::move(future)), then_(std::move(then)) {}
 
-    tl::expected<V, ErrorCode> Wait() override {
-        return then_(GetFuture());
-    }
+    tl::expected<V, ErrorCode> Wait() override { return then_(GetFuture()); }
 
     async_simple::coro::Lazy<tl::expected<V, ErrorCode>> WaitAsync() override {
         co_return then_(co_await AwaitExpectedFuture(std::move(future_)));

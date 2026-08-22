@@ -364,8 +364,7 @@ class ClientConfigBuilder {
         const std::string& redis_cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& redis_password = "", int redis_db_index = 0,
         int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
-        const std::string& redis_username = "",
-        uint16_t heartbeat_rpc_port = 0,
+        const std::string& redis_username = "", uint16_t heartbeat_rpc_port = 0,
         size_t te_async_poll_worker_num = 32) {
         P2PClientConfig config;
         fill_real_client_config_base(

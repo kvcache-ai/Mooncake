@@ -1187,8 +1187,8 @@ PYBIND11_MODULE(store, m) {
                uint64_t route_cache_ttl_ms = 60 * 1000,
                const std::string& local_transfer_mode = "te",
                size_t local_memcpy_async_worker_num = 32,
-               size_t te_async_poll_worker_num = 32,
-               uint16_t http_port = 9003, bool enable_http_server = true,
+               size_t te_async_poll_worker_num = 32, uint16_t http_port = 9003,
+               bool enable_http_server = true,
                size_t async_sender_thread_count = 4,
                size_t async_max_batch_size = 2000,
                size_t async_route_queue_size = 0,
@@ -1223,8 +1223,8 @@ PYBIND11_MODULE(store, m) {
                     async_route_queue_size, p2p_key_lease_duration_ms,
                     p2p_key_lease_scan_interval_ms, p2p_transfer_direction_mode,
                     runtime_config, enable_metric_collection,
-                    metric_report_interval_seconds, DEFAULT_CLUSTER_ID, "", 0, 5,
-                    2, "", heartbeat_rpc_port, te_async_poll_worker_num);
+                    metric_report_interval_seconds, DEFAULT_CLUSTER_ID, "", 0,
+                    5, 2, "", heartbeat_rpc_port, te_async_poll_worker_num);
 
                 auto ret = real_client->setup(config);
                 return ret;
