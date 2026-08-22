@@ -43,38 +43,34 @@ jobs:
         apt-get update -y
         apt-get install -y --no-install-recommends git ca-certificates
 
-    - name: Check out source (attempt 1)
-      id: checkout-1
-      continue-on-error: true
+    - name: Check out source
       uses: actions/checkout@v4
       with:
         ref: ${{ inputs.checkout_ref || github.sha }}
         persist-credentials: false
-        submodules: recursive
-
-    - name: Check out source (attempt 2)
-      id: checkout-2
-      if: steps.checkout-1.outcome == 'failure'
-      continue-on-error: true
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ inputs.checkout_ref || github.sha }}
-        persist-credentials: false
-        submodules: recursive
-
-    - name: Check out source (attempt 3)
-      if: >-
-        steps.checkout-1.outcome == 'failure' &&
-        steps.checkout-2.outcome == 'failure'
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ inputs.checkout_ref || github.sha }}
-        persist-credentials: false
-        submodules: recursive
+        submodules: false
 
     - name: Mark repository as safe
       run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
       shell: bash
+
+    - name: Check out submodules
+      shell: bash
+      run: |
+        set -eo pipefail
+        git submodule sync --recursive
+        for attempt in 1 2 3; do
+          if git -c http.version=HTTP/1.1 submodule update \
+            --init --recursive --depth=1 --jobs=2; then
+            exit 0
+          fi
+          if [ "$attempt" -eq 3 ]; then
+            echo "Submodule checkout failed after $attempt attempts" >&2
+            exit 1
+          fi
+          echo "Submodule checkout attempt $attempt failed; retrying..." >&2
+          sleep $((attempt * 10))
+        done
 
     - name: Install toolchain and Python ${{ matrix.python-version }}
       shell: bash
