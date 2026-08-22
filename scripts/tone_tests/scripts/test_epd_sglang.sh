@@ -42,11 +42,6 @@ start_epd_component()
             log_path="/test_run/run/logs/$test_case_name/$model_name_clean/sglang_server_prefill.log"
             pid_suffix="prefill"
             extra_args="--disaggregation-mode prefill --disaggregation-ib-device=${rdma_device} --language-only --encoder-urls http://${LOCAL_IP}:30000 --tp-size 2 --encoder-transfer-backend mooncake --mooncake-ib-device=${rdma_device} --base-gpu-id=${MOONCAKE_EPD_PREFILL_GPU_ID:-4}"
-            if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
-                # SGLang v0.5.13.post1's overlap-disaggregation path mixes
-                # list and array.array token buffers after encoder transfer.
-                extra_args+=" --disable-overlap-schedule"
-            fi
             ready_pattern="The server is fired up and ready to roll!"
             echo "Starting Prefill Server..."
             ;;
