@@ -32,11 +32,7 @@ start_epd_component()
             port=30000
             log_path="/test_run/run/logs/$test_case_name/$model_name_clean/encoder.log"
             pid_suffix="encoder"
-            # The source test image is 2326x3495. Qwen2.5-VL expands it to
-            # roughly 41k vision tokens, which makes this smoke request exceed
-            # its client timeout on ROCm. Cap preprocessing at 672x672 pixels;
-            # this still exercises multimodal encoder-to-prefill transfer.
-            extra_args="--encoder-only --encoder-transfer-backend mooncake --mooncake-ib-device=${rdma_device} --tp-size 2 --base-gpu-id=${MOONCAKE_EPD_ENCODER_GPU_ID:-0} --mm-process-config '{\"image\":{\"max_pixels\":451584}}'"
+            extra_args="--encoder-only --encoder-transfer-backend mooncake --mooncake-ib-device=${rdma_device} --tp-size 2 --base-gpu-id=${MOONCAKE_EPD_ENCODER_GPU_ID:-0}"
             ready_pattern="Application startup complete."
             echo "Starting Encoder..."
             ;;
@@ -46,6 +42,11 @@ start_epd_component()
             log_path="/test_run/run/logs/$test_case_name/$model_name_clean/sglang_server_prefill.log"
             pid_suffix="prefill"
             extra_args="--disaggregation-mode prefill --disaggregation-ib-device=${rdma_device} --language-only --encoder-urls http://${LOCAL_IP}:30000 --tp-size 2 --encoder-transfer-backend mooncake --mooncake-ib-device=${rdma_device} --base-gpu-id=${MOONCAKE_EPD_PREFILL_GPU_ID:-4}"
+            if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+                # SGLang v0.5.13.post1's overlap-disaggregation path mixes
+                # list and array.array token buffers after encoder transfer.
+                extra_args+=" --disable-overlap-schedule"
+            fi
             ready_pattern="The server is fired up and ready to roll!"
             echo "Starting Prefill Server..."
             ;;
@@ -89,6 +90,10 @@ run_request()
 {
     local model_name=$1
     local image_file_path=${2:-"${BASE_DIR}/assets/test_cat.jpg"}
+    local request_timeout=60
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        request_timeout=180
+    fi
     echo "===== Sending Test Request ====="
 
     if [ ! -f "$image_file_path" ]; then
@@ -140,7 +145,7 @@ EOF
     curl_response=$(curl -s -w "\n%{http_code}" -X POST http://127.0.0.1:8000/v1/chat/completions \
       -H "Content-Type: application/json" \
       -d @$temp_json_file \
-      --max-time 60)
+      --max-time "$request_timeout")
 
     rm -f "$temp_json_file"
 
