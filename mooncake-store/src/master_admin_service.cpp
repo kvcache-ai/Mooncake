@@ -276,6 +276,7 @@ bool MasterAdminServer::Start() {
         metric_report_running_.store(true);
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_.load()) {
+                RefreshStorageMetrics();
                 const auto snapshot = SnapshotState();
                 std::ostringstream log_stream;
                 log_stream << "Master Admin Metrics: role="
@@ -334,16 +335,32 @@ void MasterAdminServer::SetObservedLeader(
 
 void MasterAdminServer::SetServiceDelegate(
     std::shared_ptr<WrappedMasterService> service) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    service_ = std::move(service);
-    if (!service_) {
-        service_available_ = false;
+    std::lock_guard<std::mutex> refresh_lock(storage_metrics_refresh_mutex_);
+    bool clear_storage_metrics = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        service_ = std::move(service);
+        if (!service_) {
+            service_available_ = false;
+        }
+        clear_storage_metrics = !service_available_;
+    }
+    if (clear_storage_metrics) {
+        MasterMetricManager::instance().project_storage_usage({});
     }
 }
 
 void MasterAdminServer::SetServiceAvailable(bool available) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    service_available_ = available && service_ != nullptr;
+    std::lock_guard<std::mutex> refresh_lock(storage_metrics_refresh_mutex_);
+    bool service_available = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        service_available_ = available && service_ != nullptr;
+        service_available = service_available_;
+    }
+    if (!service_available) {
+        MasterMetricManager::instance().project_storage_usage({});
+    }
 }
 
 MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
@@ -357,6 +374,7 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
 }
 
 std::string MasterAdminServer::BuildMetricsText() const {
+    RefreshStorageMetrics();
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
@@ -442,6 +460,7 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
 }
 
 std::string MasterAdminServer::BuildMetricsSummaryText() const {
+    RefreshStorageMetrics();
     const auto snapshot = SnapshotState();
     std::ostringstream oss;
     oss << "role=" << ha::MasterRuntimeRoleToString(snapshot.state)
@@ -508,6 +527,15 @@ std::shared_ptr<WrappedMasterService> MasterAdminServer::GetActiveService()
         return nullptr;
     }
     return snapshot.service;
+}
+
+void MasterAdminServer::RefreshStorageMetrics() const {
+    std::lock_guard<std::mutex> refresh_lock(storage_metrics_refresh_mutex_);
+    const auto runtime = SnapshotState();
+    const auto storage = runtime.service_available && runtime.service
+                             ? runtime.service->GetStorageUsageSnapshot()
+                             : TieredStorageUsageSnapshot{};
+    MasterMetricManager::instance().project_storage_usage(storage);
 }
 
 template <typename Handler>

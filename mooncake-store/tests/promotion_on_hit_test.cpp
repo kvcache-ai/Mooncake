@@ -119,6 +119,19 @@ class PromotionOnHitTest : public ::testing::Test {
         replica->mark_complete();
     }
 
+    static std::unique_ptr<AllocatedBuffer> AllocateOnSegmentForTesting(
+        MasterService* service, const UUID& segment_id, size_t size) {
+        std::shared_ptr<BufferAllocatorBase> allocator;
+        {
+            auto segment_access = service->segment_manager_.getSegmentAccess();
+            allocator = segment_access.GetAllocator(segment_id);
+        }
+        if (!allocator) {
+            return nullptr;
+        }
+        return allocator->allocate(size);
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     std::string WriteTenantQuotaPolicyFile(
@@ -2488,6 +2501,50 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
     EXPECT_EQ(mm.get_promotion_rejected_watermark() - wm_pre, 1);
 
     wm_service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, WatermarkUsesAllocatorStateAfterMetricsReset) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.eviction_high_watermark_ratio = 0.5;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 12 * 1024 * 1024;
+    const std::string segment_name = "allocator_watermark_segment";
+    auto segment = PrepareSegment(*service, segment_name, kDefaultSegmentBase,
+                                  kSegmentSize);
+    auto allocated = AllocateOnSegmentForTesting(
+        service.get(), segment.segment_id, kAllocationSize);
+    ASSERT_NE(allocated, nullptr);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, segment.client_id,
+                                       "allocator_watermark_key", 1024,
+                                       segment.segment_name));
+
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_mem_size();
+    metrics.reset_total_mem_capacity();
+    metrics.reset_segment_allocated_mem_size(segment_name);
+    metrics.reset_segment_total_mem_capacity(segment_name);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+
+    const int64_t rejected_before = metrics.get_promotion_rejected_watermark();
+    auto get_result =
+        service->GetReplicaList("allocator_watermark_key", TenantId::Default());
+    EXPECT_TRUE(get_result.has_value());
+    EXPECT_EQ(metrics.get_promotion_rejected_watermark() - rejected_before, 1);
+
+    // Restore the observable gauges before normal teardown. The business
+    // assertion above intentionally reset them, but allocator and service
+    // destructors still emit their matching decrements.
+    metrics.inc_allocated_mem_size(segment_name, kAllocationSize);
+    metrics.inc_total_mem_capacity(segment_name, kSegmentSize);
+    allocated.reset();
+    service->RemoveAll();
 }
 
 TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
