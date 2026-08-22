@@ -1,24 +1,37 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping, Sequence
+import logging
+import threading
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 class DataProtoCatalog:
     """Map logical rows and fields to immutable DataProto refs.
 
-    The catalog only tracks metadata. Data transfer and object lifetime remain
-    owned by MooncakeBundleTransfer and Mooncake Store, respectively. Calls to
-    one catalog instance must be serialized by its host. Each update publishes
-    one immutable, single-stage fragment; multi-stage append handles are not
-    catalog fragments.
+    Calls to one catalog instance must be serialized by its host. Direct
+    handles remain metadata-only. DataProtoCatalogTransfer marks only fresh,
+    independent fragments as managed so their physical lifetime can follow
+    logical references and active readers; append-derived handles are not
+    managed catalog fragments.
     """
 
     def __init__(self) -> None:
         self._partitions: dict[str, dict[str, dict[str, Any]]] = {}
         self._fragments: dict[str, dict[str, Any]] = {}
+        self._retired: dict[str, dict[str, Any]] = {}
+        self._publications: dict[str, dict[str, Any]] = {}
         self._fragment_refcounts: dict[str, int] = {}
+        self._managed_fragments: set[str] = set()
+        self._fragment_readers: dict[str, int] = {}
+        self._read_pins: dict[int, tuple[str, ...]] = {}
+        self._next_read_token = 0
+        self._drained = False
 
     def update(
         self,
@@ -28,7 +41,47 @@ class DataProtoCatalog:
         tags: Sequence[Mapping[str, Any]] | None = None,
         handle: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Merge tags and publish every field in a single-stage ``handle``."""
+        return self._update(partition, keys, tags=tags, handle=handle, managed=False)
+
+    def publish(
+        self,
+        operation_id: str,
+        partition: str,
+        keys: Sequence[str],
+        *,
+        tags: Sequence[Mapping[str, Any]] | None = None,
+        handle: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently publish one transfer-managed fresh fragment."""
+        operation_id = _nonempty_string(operation_id, "operation_id")
+        previous = self._publications.get(operation_id)
+        if previous is not None:
+            return copy.deepcopy(previous)
+
+        result = self._update(
+            partition,
+            keys,
+            tags=tags,
+            handle=handle,
+            managed=handle is not None,
+        )
+        self._publications[operation_id] = copy.deepcopy(result)
+        return result
+
+    def ack_publication(self, operation_id: str) -> None:
+        self._publications.pop(_nonempty_string(operation_id, "operation_id"), None)
+
+    def _update(
+        self,
+        partition: str,
+        keys: Sequence[str],
+        *,
+        tags: Sequence[Mapping[str, Any]] | None,
+        handle: Mapping[str, Any] | None,
+        managed: bool,
+    ) -> dict[str, Any]:
+        if self._drained:
+            raise RuntimeError("DataProto catalog is drained")
         partition = _nonempty_string(partition, "partition")
         keys = _names(keys, "keys")
         normalized_tags = _tags(tags, len(keys))
@@ -41,6 +94,17 @@ class DataProtoCatalog:
             previous = self._fragments.get(fragment_id)
             if previous is not None and previous != stored_handle:
                 raise ValueError(f"DataProto fragment id collision: {fragment_id!r}")
+            if (
+                previous is not None
+                and (fragment_id in self._managed_fragments) != managed
+            ):
+                raise ValueError(
+                    f"DataProto fragment management mismatch: {fragment_id!r}"
+                )
+            if fragment_id in self._retired:
+                raise ValueError(
+                    f"DataProto fragment id is pending retirement: {fragment_id!r}"
+                )
 
         current_entries = self._partitions.get(partition, {})
         merged_tags = {}
@@ -56,6 +120,8 @@ class DataProtoCatalog:
         if fragment is not None:
             self._fragments.setdefault(fragment_id, stored_handle)
             self._fragment_refcounts.setdefault(fragment_id, 0)
+            if managed:
+                self._managed_fragments.add(fragment_id)
 
         for row, key in enumerate(keys):
             entry = entries.setdefault(key, {"tag": {}, "fields": {}})
@@ -79,6 +145,7 @@ class DataProtoCatalog:
             "keys": list(keys),
             "tags": response_tags,
             "fields": _field_union(entries, keys),
+            **self._retired_result(),
         }
 
     def resolve(
@@ -86,6 +153,8 @@ class DataProtoCatalog:
         partition: str,
         keys: Sequence[str],
         fields: Sequence[str] | None = None,
+        *,
+        pin: bool = False,
     ) -> dict[str, Any]:
         """Resolve an ordered logical read into immutable fragment locations."""
         partition = _nonempty_string(partition, "partition")
@@ -118,7 +187,20 @@ class DataProtoCatalog:
             grouped_fields.setdefault(locations, []).append(field)
             fragment_ids.update(location[0] for location in locations)
 
-        return {
+        handles = {
+            fragment_id: copy.deepcopy(self._fragments[fragment_id])
+            for fragment_id in fragment_ids
+        }
+        meta_info: dict[str, Any] = {}
+        for handle in handles.values():
+            for name, value in handle.get("meta_info", {}).items():
+                if name in meta_info and meta_info[name] != value:
+                    raise ValueError(
+                        f"conflicting DataProto meta_info value for {name!r}"
+                    )
+                meta_info[name] = copy.deepcopy(value)
+
+        result = {
             "keys": list(keys),
             "tags": [copy.deepcopy(entries[key]["tag"]) for key in keys],
             "fields": selected,
@@ -126,11 +208,36 @@ class DataProtoCatalog:
                 {"fields": fields, "locations": list(locations)}
                 for locations, fields in grouped_fields.items()
             ],
-            "handles": {
-                fragment_id: copy.deepcopy(self._fragments[fragment_id])
-                for fragment_id in fragment_ids
-            },
+            "handles": handles,
+            "meta_info": meta_info,
         }
+        if pin:
+            self._next_read_token += 1
+            token = self._next_read_token
+            pinned = tuple(fragment_ids)
+            self._read_pins[token] = pinned
+            for fragment_id in pinned:
+                self._fragment_readers[fragment_id] = (
+                    self._fragment_readers.get(fragment_id, 0) + 1
+                )
+            result["read_token"] = token
+        return result
+
+    def release_read(self, token: int) -> dict[str, Any]:
+        """Idempotently release a pinned resolve and return pending handles."""
+        fragment_ids = self._read_pins.pop(token, None)
+        if fragment_ids is None:
+            return self._retired_result()
+
+        for fragment_id in fragment_ids:
+            readers = self._fragment_readers[fragment_id] - 1
+            if readers:
+                self._fragment_readers[fragment_id] = readers
+                continue
+            del self._fragment_readers[fragment_id]
+            if fragment_id not in self._fragment_refcounts:
+                self._retire_fragment(fragment_id)
+        return self._retired_result()
 
     def list(self, partition: str | None = None) -> dict[str, dict[str, Any]]:
         """Return tags using the same partition/key shape as rollout KV APIs."""
@@ -147,16 +254,16 @@ class DataProtoCatalog:
             for partition_id in partitions
         }
 
-    def remove(self, partition: str, keys: Sequence[str]) -> None:
+    def remove(self, partition: str, keys: Sequence[str]) -> dict[str, Any]:
         """Remove logical keys after their writers have finished.
 
-        This only removes catalog metadata; physical lifetime stays with Store.
+        Returned managed handles can be passed to ``cleanup_dataproto``.
         """
         partition = _nonempty_string(partition, "partition")
         keys = _names(keys, "keys")
         entries = self._partitions.get(partition)
         if entries is None:
-            return
+            return self._retired_result()
 
         for key in keys:
             entry = entries.pop(key, None)
@@ -166,6 +273,38 @@ class DataProtoCatalog:
                 self._drop_fragment_reference(fragment_id)
         if not entries:
             del self._partitions[partition]
+        return self._retired_result()
+
+    def drain(self) -> dict[str, Any]:
+        """Retire all metadata after clients quiesce and return pending handles."""
+        if self._read_pins:
+            raise RuntimeError(
+                f"cannot drain DataProto catalog with {len(self._read_pins)} active read(s)"
+            )
+        for fragment_id in self._managed_fragments:
+            self._retired[fragment_id] = self._fragments[fragment_id]
+        self._partitions.clear()
+        self._fragments.clear()
+        self._fragment_refcounts.clear()
+        self._managed_fragments.clear()
+        self._fragment_readers.clear()
+        self._publications.clear()
+        self._drained = True
+        return self._retired_result()
+
+    def ack_retired(self, handles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Forget retired handles whose Store objects were removed successfully."""
+        for handle in handles:
+            _ref, fragment_id, normalized = _normalize_handle(handle)
+            pending = self._retired.get(fragment_id)
+            if pending is None:
+                continue
+            if pending != normalized:
+                raise ValueError(
+                    f"retired DataProto fragment mismatch: {fragment_id!r}"
+                )
+            del self._retired[fragment_id]
+        return self._retired_result()
 
     def _drop_fragment_reference(self, fragment_id: str) -> None:
         remaining = self._fragment_refcounts[fragment_id] - 1
@@ -173,32 +312,261 @@ class DataProtoCatalog:
             self._fragment_refcounts[fragment_id] = remaining
             return
         del self._fragment_refcounts[fragment_id]
-        del self._fragments[fragment_id]
+        if self._fragment_readers.get(fragment_id, 0):
+            return
+        self._retire_fragment(fragment_id)
+
+    def _retire_fragment(self, fragment_id: str) -> None:
+        handle = self._fragments.pop(fragment_id)
+        if fragment_id in self._managed_fragments:
+            self._managed_fragments.remove(fragment_id)
+            self._retired[fragment_id] = handle
+
+    def _retired_result(self) -> dict[str, Any]:
+        return {
+            "retired_handles": [
+                copy.deepcopy(handle) for handle in self._retired.values()
+            ]
+        }
 
 
-def _fragment(
-    handle: Mapping[str, Any], batch_size: int
-) -> tuple[str, dict[str, Any], tuple[str, ...]]:
+class DataProtoCatalogTransfer:
+    _RESULTS_ATTR = "_mooncake_catalog_results"
+
+    def __init__(self, transfer: Any, catalog_call: Callable[..., Any]) -> None:
+        self.transfer = transfer
+        self._catalog_call = catalog_call
+        self._pending_publications: list[dict[str, Any]] = []
+        self._pending_publication_acks: list[str] = []
+        self._pending_results: list[Any] = []
+        self._cleanup_lock = threading.RLock()
+
+    def put(
+        self,
+        data: Any,
+        *,
+        partition: str,
+        keys: Sequence[str],
+        tags: Sequence[Mapping[str, Any]] | None = None,
+        **put_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Put one immutable fragment and atomically publish it in Catalog."""
+        self._retry_publication_acks()
+        self._retry_publications(strict=True)
+        partition = _nonempty_string(partition, "partition")
+        normalized_keys = _names(keys, "keys")
+        normalized_tags = _tags(tags, len(normalized_keys))
+        if data is None and normalized_tags is None:
+            raise ValueError("catalog update requires tags or DataProto data")
+
+        handle = None
+        if data is not None:
+            if len(data) != len(normalized_keys):
+                raise ValueError(
+                    f"DataProto batch size {len(data)} does not match {len(normalized_keys)} logical keys"
+                )
+            from mooncake.structured_object_store import export_dataproto_ref
+
+            handle = export_dataproto_ref(
+                self.transfer.put(
+                    data, type="dataproto", partition=partition, **put_kwargs
+                )
+            )
+        publication = {
+            "operation_id": uuid.uuid4().hex,
+            "partition": partition,
+            "keys": normalized_keys,
+            "tags": normalized_tags,
+            "handle": handle,
+        }
+        for attempt in range(2):
+            try:
+                return self._publish(publication)
+            except Exception:
+                if attempt:
+                    with self._cleanup_lock:
+                        self._pending_publications.append(publication)
+                    raise
+                logger.exception("Retrying DataProto Catalog publication")
+        raise AssertionError("unreachable")
+
+    def resolve(
+        self,
+        partition: str,
+        keys: Sequence[str],
+        fields: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._catalog_call("resolve", partition, keys, fields, pin=True)
+
+    def release_read(self, token: int) -> None:
+        self._cleanup_retired(self._catalog_call("release_read", token))
+
+    def attach_results(self, output: Any, results: Sequence[Any]) -> None:
+        setattr(output, self._RESULTS_ATTR, list(results))
+
+    def release_result(self, output: Any) -> None:
+        results = getattr(output, self._RESULTS_ATTR, ()) or ()
+        setattr(output, self._RESULTS_ATTR, [])
+        self.discard_results(results)
+
+    def discard_results(self, results: Sequence[Any], *, strict: bool = False) -> None:
+        self._retry_pending(
+            "_pending_results",
+            results,
+            self.transfer.release_result,
+            "release DataProto read buffer",
+            attempts=2,
+            strict=strict,
+        )
+
+    def list(self, partition: str | None = None) -> dict[str, dict[str, Any]]:
+        return self._catalog_call("list", partition)
+
+    def remove(self, partition: str, keys: Sequence[str]) -> None:
+        self._cleanup_retired(self._catalog_call("remove", partition, keys))
+
+    def drain(self) -> None:
+        for attempt in range(2):
+            try:
+                self._retry_publications(strict=True)
+                self._cleanup_retired(self._catalog_call("drain"), strict=True)
+                return
+            except Exception:
+                if attempt:
+                    raise
+                logger.exception("Retrying DataProto Catalog drain")
+
+    def close(self) -> None:
+        self.discard_results((), strict=True)
+        self._retry_publications(strict=True)
+        self._retry_publication_acks(strict=True)
+
+    def _cleanup_retired(
+        self, result: Mapping[str, Any], *, strict: bool = False
+    ) -> None:
+        removed = []
+        failures = 0
+        for handle in result.get("retired_handles", ()):
+            try:
+                self.transfer.cleanup_dataproto(handle)
+            except Exception:
+                failures += 1
+                logger.exception("Failed to clean up retired DataProto fragment")
+            else:
+                removed.append(handle)
+        if removed:
+            try:
+                self._catalog_call("ack_retired", removed)
+            except Exception:
+                logger.exception("Failed to acknowledge retired DataProto fragments")
+                if strict:
+                    raise
+        if strict and failures:
+            raise RuntimeError(
+                f"failed to clean up {failures} retired DataProto fragment(s)"
+            )
+
+    def _publish(self, publication: Mapping[str, Any]) -> dict[str, Any]:
+        operation_id = publication["operation_id"]
+        result = self._catalog_call(
+            "publish",
+            operation_id,
+            publication["partition"],
+            publication["keys"],
+            tags=publication["tags"],
+            handle=publication["handle"],
+        )
+        self._cleanup_retired(result)
+        self._ack_publication(operation_id)
+        return result
+
+    def _ack_publication(self, operation_id: str) -> None:
+        try:
+            self._catalog_call("ack_publication", operation_id)
+        except Exception:
+            logger.exception("Failed to acknowledge DataProto Catalog publication")
+            with self._cleanup_lock:
+                if operation_id not in self._pending_publication_acks:
+                    self._pending_publication_acks.append(operation_id)
+
+    def _retry_publication_acks(self, *, strict: bool = False) -> None:
+        self._retry_pending(
+            "_pending_publication_acks",
+            (),
+            lambda operation_id: self._catalog_call("ack_publication", operation_id),
+            "acknowledge DataProto Catalog publication",
+            strict=strict,
+        )
+
+    def _retry_publications(self, *, strict: bool = False) -> None:
+        self._retry_pending(
+            "_pending_publications",
+            (),
+            self._publish,
+            "publish pending DataProto fragment",
+            strict=strict,
+        )
+
+    def _retry_pending(
+        self,
+        pending_attr: str,
+        items: Sequence[Any],
+        action: Callable[[Any], None],
+        label: str,
+        *,
+        attempts: int = 1,
+        strict: bool = False,
+    ) -> None:
+        with self._cleanup_lock:
+            pending = [*getattr(self, pending_attr), *items]
+            setattr(self, pending_attr, [])
+        for _attempt in range(attempts):
+            failed = []
+            for item in pending:
+                try:
+                    action(item)
+                except Exception:
+                    logger.exception("Failed to %s", label)
+                    failed.append(item)
+            pending = failed
+        with self._cleanup_lock:
+            getattr(self, pending_attr).extend(pending)
+            pending_count = len(getattr(self, pending_attr))
+        if strict and pending_count:
+            raise RuntimeError(f"failed to {label} for {pending_count} item(s)")
+
+
+def _normalize_handle(
+    handle: Mapping[str, Any],
+) -> tuple[Any, str, dict[str, Any]]:
     from mooncake.structured_object_store import (
         export_dataproto_ref,
         import_dataproto_ref,
     )
 
     ref = import_dataproto_ref(handle)
+    if len(ref.stage_refs) != 1:
+        raise ValueError("catalog fragments must contain exactly one DataProto stage")
+    fragment_id = _nonempty_string(
+        next(iter(ref.stage_refs.values())).manifest_key,
+        "manifest_key",
+    )
+    return ref, fragment_id, export_dataproto_ref(ref)
+
+
+def _fragment(
+    handle: Mapping[str, Any], batch_size: int
+) -> tuple[str, dict[str, Any], tuple[str, ...]]:
+    ref, fragment_id, stored_handle = _normalize_handle(handle)
     if ref.batch_size != batch_size:
         raise ValueError(
             f"DataProto batch size {ref.batch_size!r} does not match "
             f"{batch_size} logical keys"
         )
-    if len(ref.stage_refs) != 1:
-        raise ValueError("catalog fragments must contain exactly one DataProto stage")
-    fragment_id = _nonempty_string(
-        next(iter(ref.stage_refs.values())).manifest_key, "manifest_key"
-    )
     fields = _names(ref.field_index, "field names")
     if not fields:
         raise ValueError("DataProto catalog fragments cannot be empty")
-    return fragment_id, export_dataproto_ref(ref), fields
+    return fragment_id, stored_handle, fields
 
 
 def _field_union(

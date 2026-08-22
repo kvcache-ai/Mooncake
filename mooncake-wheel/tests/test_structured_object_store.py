@@ -120,6 +120,10 @@ class InMemoryStore:
         finally:
             self._exit_get()
 
+    def is_exist(self, key: str) -> int:
+        with self.lock:
+            return int(key in self.objects or key in self.tensor_objects)
+
     def remove(self, key: str, force: bool = False) -> int:
         with self.lock:
             self.objects.pop(key, None)
@@ -1636,7 +1640,7 @@ def test_bundle_remove_deletes_payload_and_manifest() -> None:
     transfer.remove_bundle(ref)
 
     assert store.objects == {}
-    assert store.batch_remove_calls == 1
+    assert store.batch_remove_calls == 2
 
 
 def test_bundle_partial_put_failure_cleans_payloads() -> None:
@@ -1665,7 +1669,7 @@ def test_bundle_remove_uses_force_batch_remove_when_available() -> None:
     transfer.materialize(transfer.read_spec(ref))
     transfer.remove_bundle(ref)
 
-    assert store.batch_remove_forces == [True]
+    assert store.batch_remove_forces == [True, True]
     assert store.objects == {}
 
 
@@ -1676,7 +1680,36 @@ def test_bundle_remove_recovers_after_transient_batch_failure() -> None:
     transfer.remove_bundle(ref)
 
     assert store.objects == {}
-    assert store.batch_remove_calls == 1
+    assert store.batch_remove_calls == 2
+
+
+def test_bundle_remove_keeps_manifest_until_payload_cleanup_succeeds(
+    monkeypatch,
+) -> None:
+    store, transfer = make_transfer()
+    ref = transfer.put_bundle(b"meta", {"payload": b"abcdef"}, chunk_bytes=2)
+    failed_key = ref.manifest["buffers"]["payload"]["chunks"][0]["key"]
+    remove = store.remove
+    monkeypatch.setattr(
+        store,
+        "remove",
+        lambda key, force=False: -1 if key == failed_key else remove(key, force),
+    )
+    monkeypatch.setattr(
+        store,
+        "batch_remove",
+        lambda keys, force=False: [store.remove(key, force) for key in keys],
+    )
+
+    with pytest.raises(RuntimeError, match="failed to remove"):
+        transfer.remove_bundle(ref)
+
+    assert failed_key in store.objects
+    assert ref.manifest_key in store.objects
+    monkeypatch.setattr(store, "remove", remove)
+    transfer.remove_bundle(ref)
+    transfer.remove_bundle({"manifest_key": ref.manifest_key})
+    assert store.objects == {}
 
 
 def test_bundle_batch_get_failure_unregisters_buffer() -> None:
@@ -4069,6 +4102,26 @@ def test_dataproto_helper_jagged_nested_batch_tensor_roundtrip() -> None:
     assert matrix_result._ragged_idx == 2
     for actual, expected in zip(matrix_result.unbind(), matrix_rows):
         assert torch.equal(actual, expected)
+
+
+def test_dataproto_helper_refreshes_stale_jagged_sequence_cache(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(sos, "_has_tensor_codec_helpers", lambda: False)
+    _store, transfer = make_transfer()
+    offsets = torch.arange(0, 513, 64)
+    nested = torch.nested.nested_tensor_from_jagged(
+        torch.arange(512, dtype=torch.float32),
+        offsets=offsets,
+        min_seqlen=512,
+        max_seqlen=512,
+    )
+
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"log_probs": nested}))
+    result = transfer.get_dataproto(ref)["batch"]["log_probs"]
+
+    assert result.offsets().tolist() == offsets.tolist()
+    assert result._min_seqlen == result._max_seqlen == 64
+    assert torch.nested.to_padded_tensor(result, 0).shape == (8, 64)
 
 
 def _assert_tensor_object_equal(actual, expected) -> None:
