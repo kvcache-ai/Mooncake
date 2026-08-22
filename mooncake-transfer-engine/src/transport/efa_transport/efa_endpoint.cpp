@@ -74,7 +74,12 @@ int EfaEndPoint::setupConnectionsByActive() {
     if (rc) return rc;
 
     if (peer_desc.efa_addr.empty()) {
-        LOG(ERROR) << "Peer did not provide EFA address in handshake";
+        LOG(ERROR) << "Peer did not provide EFA address in handshake: "
+                   << "local=" << context_.nicPath()
+                   << ", peer_nic_path=" << peer_nic_path_ << ", reply_msg=\""
+                   << peer_desc.reply_msg << "\""
+                   << " (peer may be in the middle of restart / not yet "
+                      "fully initialized; consider retry with backoff)";
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -105,7 +110,11 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
 
     if (peer_desc.efa_addr.empty()) {
         local_desc.reply_msg = "No EFA address provided";
-        LOG(ERROR) << "Peer did not provide EFA address";
+        LOG(ERROR) << "Peer did not provide EFA address (passive path): "
+                   << "local=" << context_.nicPath()
+                   << ", peer_nic_path=" << peer_nic_path_
+                   << " (peer's shared endpoint may not be fully "
+                      "initialized yet)";
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -119,7 +128,7 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
     //
     // Log semantics:
     //   * Same cached peer address → benign symmetric handshake under
-    //     bilateral traffic.  Demote to INFO to keep decode logs readable
+    //     bilateral traffic.  Demote to VLOG(1) to keep decode logs readable
     //     without hiding real reconnects.
     //   * Different cached peer address → genuine reconnect (peer
     //     restart, port reshuffle that reached disconnect first, etc.).
@@ -154,6 +163,35 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
 void EfaEndPoint::disconnect() {
     RWSpinlock::WriteGuard guard(lock_);
     disconnectUnlocked();
+}
+
+bool EfaEndPoint::hasOutstandingSlice() const {
+    RWSpinlock::ReadGuard guard(lock_);
+    return context_.slotHasInflight(peer_fi_addr_);
+}
+
+bool EfaEndPoint::disconnectIfIdle() {
+    // tryLock, never a blocking WriteGuard: this runs on the CQ-polling
+    // thread, and submitPostSend() holds the read lock while it spins waiting
+    // for CQ credit that only this poller can release.  Blocking for the
+    // write lock here deadlocks that pair outright (observed: submitter
+    // spinning in submitSlicesOnPeer under the read lock, poller queued for
+    // the write lock, neither able to advance).  Failing to acquire is
+    // reported as "still busy" so the caller retries on a later drain.
+    if (!lock_.tryLock()) return false;
+    // Idle means BOTH: the write lock was free (no submitter inside
+    // submitPostSend for this handle) and the shared AV slot has no inflight
+    // operations, possibly a sibling endpoint's (see EfaContext::av_slots_).
+    // Tearing down a busy peer here stays memory-safe, but it drops the handle
+    // to UNCONNECTED and forces the next batch through a fresh handshake --
+    // both callers only want to touch a peer that is quiet.
+    if (context_.slotHasInflight(peer_fi_addr_)) {
+        lock_.unlock();
+        return false;
+    }
+    disconnectUnlocked();
+    lock_.unlock();
+    return true;
 }
 
 void EfaEndPoint::disconnectUnlocked() {
