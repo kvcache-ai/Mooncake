@@ -980,6 +980,8 @@ TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
 
     Status free_status = multi_transport.freeBatchID(batch_id);
     EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                               batch_id));
 
@@ -1008,6 +1010,8 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
         multi_transport, batch_id,
         [&] { callback_called.store(true, std::memory_order_release); });
     EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                               batch_id));
     EXPECT_FALSE(callback_called.load(std::memory_order_acquire));
@@ -1035,6 +1039,8 @@ TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
 
     Status free_status = multi_transport.freeBatchID(batch_id);
     EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                               batch_id));
 
