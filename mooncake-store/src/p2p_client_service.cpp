@@ -1117,9 +1117,9 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
 }
 
 // DataManager bridges local TE Put so WaitAsync only awaits TE wait (via
-// te_poll when configured); copy/commit run after resume on the business
-// executor. TransferEngine still completes via blocking getTransferStatus +
-// sleep on poll workers; follow-up is async completion inside TE.
+// te_wait_pool_ when configured); copy/commit run after resume on the business
+// executor. Wait coroutines poll getTransferStatus and yield with
+// coro_io::sleep_for.
 std::unique_ptr<TaskHandle<void>> P2PClientService::LocalWriteOp::Dispatch() {
     if (!data_manager) {
         LOG(ERROR) << "Data manager not initialized";

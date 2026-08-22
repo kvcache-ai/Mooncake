@@ -2312,20 +2312,20 @@ TEST_F(DataManagerTest, TeAsyncPollWorkerCreatesPollExecutor) {
     auto with_pool =
         MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/4);
     ASSERT_NE(with_pool, nullptr);
-    EXPECT_NE(with_pool->te_poll_executor_, nullptr);
+    EXPECT_NE(with_pool->te_wait_pool_, nullptr);
     EXPECT_NE(with_pool->GetCoroExecutor(), nullptr);
 
     auto without_pool =
         MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/0);
     ASSERT_NE(without_pool, nullptr);
-    EXPECT_EQ(without_pool->te_poll_executor_, nullptr);
+    EXPECT_EQ(without_pool->te_wait_pool_, nullptr);
     EXPECT_NE(without_pool->GetCoroExecutor(), nullptr);
 }
 
 TEST_F(DataManagerTest, WaitAllTransferBatchesAsyncEmptySucceedsWithPollPool) {
     auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/2);
     ASSERT_NE(dm, nullptr);
-    ASSERT_NE(dm->te_poll_executor_, nullptr);
+    ASSERT_NE(dm->te_wait_pool_, nullptr);
 
     auto result = AwaitVoidExpectedFuture(dm->WaitAllTransferBatchesAsync({}));
     ASSERT_TRUE(result.has_value());
@@ -2335,7 +2335,7 @@ TEST_F(DataManagerTest,
        WaitAllTransferBatchesAsyncEmptySucceedsWithoutPollPool) {
     auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/0);
     ASSERT_NE(dm, nullptr);
-    ASSERT_EQ(dm->te_poll_executor_, nullptr);
+    ASSERT_EQ(dm->te_wait_pool_, nullptr);
 
     auto result = AwaitVoidExpectedFuture(dm->WaitAllTransferBatchesAsync({}));
     ASSERT_TRUE(result.has_value());
@@ -2365,15 +2365,13 @@ TEST_F(DataManagerTest, TransferDataAsyncRejectsInvalidBuffersWithoutPollPool) {
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
-TEST_F(DataManagerTest, TePollExecutorOffloadReturnsFutureHandle) {
+TEST_F(DataManagerTest, TeWaitPoolOffloadReturnsFutureHandle) {
     // BuildDataCopierViaTe / TransferDataAsync expose TE wait as FutureHandle.
     auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/2);
     ASSERT_NE(dm, nullptr);
-    ASSERT_NE(dm->te_poll_executor_, nullptr);
+    ASSERT_NE(dm->te_wait_pool_, nullptr);
 
-    auto future =
-        dm->te_poll_executor_->SubmitSingleTask<tl::expected<void, ErrorCode>>(
-            []() -> tl::expected<void, ErrorCode> { return {}; });
+    auto future = dm->WaitAllTransferBatchesAsync({});
     auto handle =
         FutureHandle<void>::Create(std::shared_ptr<void>{}, std::move(future));
     ASSERT_NE(dynamic_cast<FutureHandle<void>*>(handle.get()), nullptr);
@@ -2382,12 +2380,12 @@ TEST_F(DataManagerTest, TePollExecutorOffloadReturnsFutureHandle) {
     ASSERT_TRUE(wait_res.has_value());
 }
 
-TEST_F(DataManagerTest, TePollExecutorShutdownCancelSurfacesAsException) {
+TEST_F(DataManagerTest, TeWaitPoolShutdownCancelSurfacesAsException) {
     auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/2);
     ASSERT_NE(dm, nullptr);
-    ASSERT_NE(dm->te_poll_executor_, nullptr);
+    ASSERT_NE(dm->te_wait_pool_, nullptr);
 
-    dm->te_poll_executor_->Shutdown();
+    dm->Stop();
     auto fut = dm->WaitAllTransferBatchesAsync({});
     bool saw_exception = false;
     try {
@@ -2398,6 +2396,15 @@ TEST_F(DataManagerTest, TePollExecutorShutdownCancelSurfacesAsException) {
         saw_exception = true;
     }
     EXPECT_TRUE(saw_exception);
+}
+
+TEST_F(DataManagerTest, TeWaitPoolStopDrainsInflightEmptyWait) {
+    auto dm = MakeDataManagerForTePollTest(transfer_engine_, /*te_async=*/2);
+    ASSERT_NE(dm, nullptr);
+    auto fut = dm->WaitAllTransferBatchesAsync({});
+    dm->Stop();
+    auto result = AwaitVoidExpectedFuture(std::move(fut));
+    ASSERT_TRUE(result.has_value());
 }
 
 }  // namespace mooncake

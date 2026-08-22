@@ -61,10 +61,9 @@ struct LocalTransferConfig {
     // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
 
-    // Dedicated worker threads to offload TransferEngine batch polling
-    // (WaitAllTransferBatches) for local TE Put/Get and remote forward TE
-    // paths. Independent of `mode`. 0 keeps synchronous TE wait on the caller
-    // thread.
+    // Dedicated coro_io pool for TE wait coroutines (poll getTransferStatus,
+    // then co_await sleep_for). Independent of `mode`. 0 keeps synchronous TE
+    // wait on the caller thread.
     size_t te_async_poll_worker_num = 32;
 };
 
@@ -307,8 +306,8 @@ class DataManager {
 
     /**
      * @brief Dedicated coro_io executor for P2P business Lazys (`via`/`start`)
-     *        and TE-wait hop-back. Independent of RPC's pool and of
-     *        `te_poll_executor_` (poll wait only; not an asio executor).
+     *        and TE-wait hop-back. Independent of RPC's pool and of the TE
+     *        wait pool (`te_wait_pool_`).
      */
     async_simple::Executor* GetCoroExecutor() const;
 
@@ -513,6 +512,31 @@ class DataManager {
         Transport::BatchID batch_id, size_t num_tasks,
         const std::string& segment_endpoint);
 
+    enum class TeBatchPollResult { kPending, kCompleted, kFailed };
+
+    TeBatchPollResult PollTransferBatchOnce(
+        Transport::BatchID batch_id, size_t num_tasks,
+        const std::string& segment_endpoint,
+        std::chrono::steady_clock::time_point start_time);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    WaitTransferBatchCoro(Transport::BatchID batch_id, size_t num_tasks,
+                          std::string segment_endpoint);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    WaitAllTransferBatchesCoro(
+        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
+            batches);
+
+    void ReleaseTeWaitInflight();
+    bool IsTeBatchFullyDrained(Transport::BatchID batch_id, size_t num_tasks);
+    async_simple::coro::Lazy<void> CancelBatchTETaskCoro(
+        Transport::BatchID batch_id, size_t num_tasks);
+    async_simple::coro::Lazy<void> CancelTeWaitBatchesCoro(
+        const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
+            batches,
+        size_t from_index);
+
     /**
      * @brief Validate remote buffer descriptors
      * @param buffers Buffer descriptors to validate
@@ -582,7 +606,7 @@ class DataManager {
         const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
             batches);
 
-    /** Offload WaitAllTransferBatches to te_poll_executor_ when configured. */
+    /** TE wait coroutines on te_wait_pool_ when configured. */
     async_simple::Future<tl::expected<void, ErrorCode>>
     WaitAllTransferBatchesAsync(
         std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
@@ -616,7 +640,11 @@ class DataManager {
 
     LocalTransferConfig local_transfer_config_;
     std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
-    std::unique_ptr<AsyncMemcpyExecutor> te_poll_executor_;
+    std::shared_ptr<coro_io::io_context_pool> te_wait_pool_;
+    std::mutex te_wait_mutex_;
+    std::condition_variable te_wait_cv_;
+    std::atomic<bool> te_wait_stopped_{false};
+    size_t te_wait_inflight_{0};  // guarded by te_wait_mutex_
     std::shared_ptr<coro_io::io_context_pool> coro_executor_pool_;
     std::chrono::milliseconds lease_duration_;
     std::chrono::milliseconds lease_scan_interval_;

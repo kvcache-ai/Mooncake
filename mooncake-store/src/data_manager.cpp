@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <glog/logging.h>
 #include <thread>
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -19,8 +21,10 @@
 #include "utils.h"
 
 #include <async_simple/Promise.h>
+#include <async_simple/Try.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
+#include <ylt/coro_io/coro_io.hpp>
 
 namespace mooncake {
 
@@ -36,6 +40,50 @@ async_simple::Future<tl::expected<void, ErrorCode>> MakeReadyExpectedFuture(
     promise.setValue(std::move(value));
     return future;
 }
+
+async_simple::Future<tl::expected<void, ErrorCode>> MakeCancelledTeWaitFuture() {
+    async_simple::Promise<tl::expected<void, ErrorCode>> promise;
+    auto future = promise.getFuture();
+    promise.setException(
+        std::make_exception_ptr(std::runtime_error("task cancelled")));
+    return future;
+}
+
+template <typename OnComplete>
+async_simple::Future<tl::expected<void, ErrorCode>> LaunchExpectedLazy(
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> lazy,
+    async_simple::Executor* ex, OnComplete on_complete) {
+    auto promise = std::make_shared<
+        async_simple::Promise<tl::expected<void, ErrorCode>>>();
+    auto future = promise->getFuture();
+    auto complete = std::make_shared<OnComplete>(std::move(on_complete));
+    auto finish = [promise, complete](
+                      async_simple::Try<tl::expected<void, ErrorCode>>&& t) {
+        try {
+            promise->setValue(t.value());
+        } catch (...) {
+            try {
+                promise->setException(std::current_exception());
+            } catch (...) {
+            }
+        }
+        (*complete)();
+    };
+    try {
+        std::move(lazy).via(ex).start(std::move(finish));
+    } catch (...) {
+        try {
+            promise->setException(std::current_exception());
+        } catch (...) {
+        }
+        (*complete)();
+    }
+    return future;
+}
+
+constexpr int64_t kTeWaitTimeoutSeconds = 10;
+constexpr int64_t kTeDrainTimeoutSeconds = 10;
+constexpr auto kTeWaitPollInterval = std::chrono::microseconds(100);
 
 struct LocalCopyPlan {
     AllocationHandle source_handle;
@@ -157,8 +205,11 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
             local_transfer_config_.local_memcpy_async_worker_num);
     }
     if (local_transfer_config_.te_async_poll_worker_num > 0) {
-        te_poll_executor_ = std::make_unique<AsyncMemcpyExecutor>(
+        unsigned wait_threads = static_cast<unsigned>(
             local_transfer_config_.te_async_poll_worker_num);
+        te_wait_pool_ =
+            std::make_shared<coro_io::io_context_pool>(wait_threads);
+        std::thread([pool = te_wait_pool_]() { pool->run(); }).detach();
     }
     unsigned coro_threads =
         static_cast<unsigned>(local_transfer_config_.te_async_poll_worker_num);
@@ -208,8 +259,16 @@ void DataManager::Stop() {
     if (async_memcpy_executor_) {
         async_memcpy_executor_->Shutdown();
     }
-    if (te_poll_executor_) {
-        te_poll_executor_->Shutdown();
+    {
+        std::unique_lock lock(te_wait_mutex_);
+        te_wait_stopped_.store(true, std::memory_order_release);
+        // Finish in-flight wait Promises before stopping either coro_io pool.
+        // Otherwise a wait posted after stop(), or a hop-back on
+        // coro_executor_pool_, can hang forever.
+        te_wait_cv_.wait(lock, [this] { return te_wait_inflight_ == 0; });
+    }
+    if (te_wait_pool_) {
+        te_wait_pool_->stop();
     }
     if (coro_executor_pool_) {
         coro_executor_pool_->stop();
@@ -509,8 +568,8 @@ tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManager::Put(
     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 }
 
-// TE wait may offload to te_poll_executor_; copy/commit always run after wait
-// on the Wait() caller or WaitAsync resume executor (not on poll workers).
+// TE wait may offload to te_wait_pool_; copy/commit always run after wait
+// on the Wait() caller or WaitAsync resume executor (not on wait workers).
 tl::expected<void, ErrorCode> DataManager::FinishPutViaTeAfterWait(
     const KeyCtx& ctx, const UUID& write_operation_id, TeSubmitResult& te_ctx,
     tl::expected<void, ErrorCode> wait_result) {
@@ -589,7 +648,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         return tl::unexpected(submit_result.error());
     }
 
-    if (te_poll_executor_) {
+    if (te_wait_pool_) {
         auto wait_future = WaitAllTransferBatchesAsync(
             std::move(submit_result->transfer_batches));
         return MakeFutureThenHandle<void>(
@@ -785,7 +844,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaTe(
 
     ReadTaskHandle res;
     res.data_size = static_cast<int64_t>(source_size);
-    if (te_poll_executor_) {
+    if (te_wait_pool_) {
         // Keep AllocationHandle / temp_buffer alive until Wait/WaitAsync
         // finishes; only transfer_batches are consumed by the poll Future.
         auto storage =
@@ -1638,7 +1697,7 @@ DataManager::TransferDataAsync(
     void* local_transfer_base, size_t total_size,
     const std::vector<RemoteBufferDesc>& peer_buffers,
     Transport::TransferRequest::OpCode opcode) {
-    if (!te_poll_executor_) {
+    if (!te_wait_pool_) {
         return MakeReadyExpectedFuture(TransferData(
             local_transfer_base, total_size, peer_buffers, opcode));
     }
@@ -1826,83 +1885,164 @@ tl::expected<void, ErrorCode> DataManager::WaitAllTransferBatches(
 async_simple::Future<tl::expected<void, ErrorCode>>
 DataManager::WaitAllTransferBatchesAsync(
     std::vector<std::tuple<Transport::BatchID, size_t, std::string>> batches) {
-    if (!te_poll_executor_) {
+    async_simple::Executor* wait_ex = nullptr;
+    {
+        std::lock_guard lock(te_wait_mutex_);
+        if (te_wait_stopped_.load(std::memory_order_acquire)) {
+            return MakeCancelledTeWaitFuture();
+        }
+        if (te_wait_pool_) {
+            ++te_wait_inflight_;
+            wait_ex = te_wait_pool_->get_executor();
+        }
+    }
+    if (wait_ex == nullptr) {
         return MakeReadyExpectedFuture(WaitAllTransferBatches(batches));
     }
-    return te_poll_executor_->SubmitSingleTask<tl::expected<void, ErrorCode>>(
-        [this, batches = std::move(batches)]() mutable {
-            return WaitAllTransferBatches(batches);
-        });
+    return LaunchExpectedLazy(
+        WaitAllTransferBatchesCoro(std::move(batches)), wait_ex,
+        [this]() { ReleaseTeWaitInflight(); });
+}
+
+void DataManager::ReleaseTeWaitInflight() {
+    std::lock_guard lock(te_wait_mutex_);
+    --te_wait_inflight_;
+    if (te_wait_inflight_ == 0) {
+        te_wait_cv_.notify_all();
+    }
+}
+
+bool DataManager::IsTeBatchFullyDrained(Transport::BatchID batch_id,
+                                        size_t num_tasks) {
+    for (size_t i = 0; i < num_tasks; ++i) {
+        TransferStatus status;
+        Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
+        if (!s.ok() || (status.s != TransferStatusEnum::COMPLETED &&
+                        status.s != TransferStatusEnum::FAILED)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+DataManager::TeBatchPollResult DataManager::PollTransferBatchOnce(
+    Transport::BatchID batch_id, size_t num_tasks,
+    const std::string& segment_endpoint,
+    std::chrono::steady_clock::time_point start_time) {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed =
+        std::chrono::duration_cast<std::chrono::seconds>(now - start_time)
+            .count();
+    if (elapsed >= kTeWaitTimeoutSeconds) {
+        LOG(ERROR) << "WaitTransferBatch: Timeout after " << elapsed
+                   << " seconds for batch " << batch_id
+                   << " for segment endpoint '" << segment_endpoint << "'";
+        return TeBatchPollResult::kFailed;
+    }
+
+    bool all_completed = true;
+    for (size_t i = 0; i < num_tasks; ++i) {
+        TransferStatus status;
+        Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
+        if (!s.ok()) {
+            LOG(ERROR) << "Failed to get transfer status for task " << i
+                       << " for batch " << batch_id
+                       << " for segment endpoint '" << segment_endpoint
+                       << "', error: " << s.message();
+            return TeBatchPollResult::kFailed;
+        }
+
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            continue;
+        }
+        if (status.s == TransferStatusEnum::FAILED ||
+            status.s == TransferStatusEnum::CANCELED ||
+            status.s == TransferStatusEnum::INVALID ||
+            status.s == TransferStatusEnum::TIMEOUT) {
+            LOG(ERROR) << "Transfer task " << i << " for batch " << batch_id
+                       << " for segment endpoint '" << segment_endpoint
+                       << "' failed with status "
+                       << static_cast<int>(status.s);
+            return TeBatchPollResult::kFailed;
+        }
+        all_completed = false;
+    }
+
+    if (all_completed) {
+        VLOG(1) << "All transfers completed for batch " << batch_id
+                << " for segment endpoint '" << segment_endpoint << "'";
+        return TeBatchPollResult::kCompleted;
+    }
+    return TeBatchPollResult::kPending;
 }
 
 tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
     Transport::BatchID batch_id, size_t num_tasks,
     const std::string& segment_endpoint) {
-    constexpr int64_t timeout_seconds = 10;
     auto start_time = std::chrono::steady_clock::now();
-
     while (true) {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed =
-            std::chrono::duration_cast<std::chrono::seconds>(now - start_time)
-                .count();
-        if (elapsed >= timeout_seconds) {
-            LOG(ERROR) << "WaitTransferBatch: Timeout after " << elapsed
-                       << " seconds for batch " << batch_id
-                       << " for segment endpoint '" << segment_endpoint << "'";
-            CancelBatchTETask(batch_id, num_tasks);
-            return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
-        }
-
-        bool all_completed = true;
-        bool has_failure = false;
-
-        for (size_t i = 0; i < num_tasks; ++i) {
-            TransferStatus status;
-            Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
-            if (!s.ok()) {
-                LOG(ERROR) << "Failed to get transfer status for task " << i
-                           << " for batch " << batch_id
-                           << " for segment endpoint '" << segment_endpoint
-                           << "', error: " << s.message();
-                has_failure = true;
-                break;
-            }
-
-            if (status.s == TransferStatusEnum::COMPLETED) {
-                continue;
-            } else if (status.s == TransferStatusEnum::FAILED ||
-                       status.s == TransferStatusEnum::CANCELED ||
-                       status.s == TransferStatusEnum::INVALID ||
-                       status.s == TransferStatusEnum::TIMEOUT) {
-                LOG(ERROR) << "Transfer task " << i << " for batch " << batch_id
-                           << " for segment endpoint '" << segment_endpoint
-                           << "' failed with status "
-                           << static_cast<int>(status.s);
-                has_failure = true;
-                break;
-            } else {
-                all_completed = false;
-            }
-        }  // end for
-
-        if (has_failure) {
+        auto poll = PollTransferBatchOnce(batch_id, num_tasks,
+                                          segment_endpoint, start_time);
+        if (poll == TeBatchPollResult::kFailed) {
             LOG(ERROR) << "Transfer failed in batch_id " << batch_id;
             CancelBatchTETask(batch_id, num_tasks);
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
-
-        if (all_completed) {
-            VLOG(1) << "All transfers completed for batch " << batch_id
-                    << " for segment endpoint '" << segment_endpoint << "'";
-            break;
+        if (poll == TeBatchPollResult::kCompleted) {
+            transfer_engine_->freeBatchID(batch_id);
+            return {};
         }
+        std::this_thread::sleep_for(kTeWaitPollInterval);
+    }
+}
 
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }  // end while
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+DataManager::WaitTransferBatchCoro(Transport::BatchID batch_id,
+                                   size_t num_tasks,
+                                   std::string segment_endpoint) {
+    auto start_time = std::chrono::steady_clock::now();
+    while (true) {
+        if (te_wait_stopped_.load(std::memory_order_acquire)) {
+            LOG(WARNING) << "WaitTransferBatchCoro cancelled by shutdown"
+                         << ", batch_id=" << batch_id;
+            co_await CancelBatchTETaskCoro(batch_id, num_tasks);
+            co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        auto poll = PollTransferBatchOnce(batch_id, num_tasks,
+                                          segment_endpoint, start_time);
+        if (poll == TeBatchPollResult::kFailed) {
+            LOG(ERROR) << "Transfer failed in batch_id " << batch_id;
+            co_await CancelBatchTETaskCoro(batch_id, num_tasks);
+            co_return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+        if (poll == TeBatchPollResult::kCompleted) {
+            transfer_engine_->freeBatchID(batch_id);
+            co_return tl::expected<void, ErrorCode>{};
+        }
+        (void)co_await coro_io::sleep_for(kTeWaitPollInterval);
+    }
+}
 
-    transfer_engine_->freeBatchID(batch_id);
-    return {};
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+DataManager::WaitAllTransferBatchesCoro(
+    std::vector<std::tuple<Transport::BatchID, size_t, std::string>> batches) {
+    for (size_t i = 0; i < batches.size(); ++i) {
+        Transport::BatchID batch_id = std::get<0>(batches[i]);
+        size_t num_tasks = std::get<1>(batches[i]);
+        auto wait_result = co_await WaitTransferBatchCoro(
+            batch_id, num_tasks, std::get<2>(batches[i]));
+        if (!wait_result) {
+            LOG(ERROR) << "Transfer failed for segment endpoint '"
+                       << std::get<2>(batches[i]) << "'"
+                       << ", error: " << toString(wait_result.error())
+                       << ", batch_id: " << batch_id << ", index: " << i
+                       << ", total_batches: " << batches.size()
+                       << ", num_tasks: " << num_tasks;
+            co_await CancelTeWaitBatchesCoro(batches, i + 1);
+            co_return tl::unexpected(wait_result.error());
+        }
+    }
+    co_return tl::expected<void, ErrorCode>{};
 }
 
 // freeBatchID() only releases BatchDesc when is_finished=true on every task.
@@ -1911,34 +2051,54 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
 // poll until all tasks reach a terminal state before calling freeBatchID.
 void DataManager::CancelBatchTETask(Transport::BatchID batch_id,
                                     size_t num_tasks) {
-    constexpr int64_t kDrainTimeoutSeconds = 10;
     auto start = std::chrono::steady_clock::now();
     while (true) {
-        bool all_finished = true;
-        for (size_t i = 0; i < num_tasks; ++i) {
-            TransferStatus status;
-            Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
-            if (!s.ok() || (status.s != TransferStatusEnum::COMPLETED &&
-                            status.s != TransferStatusEnum::FAILED)) {
-                all_finished = false;
-                break;
-            }
-        }
-        if (all_finished) {
+        if (IsTeBatchFullyDrained(batch_id, num_tasks)) {
             break;
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::steady_clock::now() - start)
                            .count();
-        if (elapsed >= kDrainTimeoutSeconds) {
+        if (elapsed >= kTeDrainTimeoutSeconds) {
             LOG(WARNING) << "CancelBatchTETask: timed out after " << elapsed
                          << "s for batch " << batch_id
                          << " — BatchDesc may leak";
-            return;  // freeBatchID would fail; accept the leak
+            return;
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        std::this_thread::sleep_for(kTeWaitPollInterval);
     }
     transfer_engine_->freeBatchID(batch_id);
+}
+
+async_simple::coro::Lazy<void> DataManager::CancelBatchTETaskCoro(
+    Transport::BatchID batch_id, size_t num_tasks) {
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        if (IsTeBatchFullyDrained(batch_id, num_tasks)) {
+            break;
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        if (elapsed >= kTeDrainTimeoutSeconds) {
+            LOG(WARNING) << "CancelBatchTETask: timed out after " << elapsed
+                         << "s for batch " << batch_id
+                         << " — BatchDesc may leak";
+            co_return;
+        }
+        (void)co_await coro_io::sleep_for(kTeWaitPollInterval);
+    }
+    transfer_engine_->freeBatchID(batch_id);
+}
+
+async_simple::coro::Lazy<void> DataManager::CancelTeWaitBatchesCoro(
+    const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
+        batches,
+    size_t from_index) {
+    for (size_t j = from_index; j < batches.size(); ++j) {
+        co_await CancelBatchTETaskCoro(std::get<0>(batches[j]),
+                                       std::get<1>(batches[j]));
+    }
 }
 
 tl::expected<void, ErrorCode> DataManager::CopyFromDRAMBuffer(

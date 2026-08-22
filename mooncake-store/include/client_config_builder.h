@@ -204,10 +204,10 @@ struct P2PClientConfig : RealClientConfigBase {
     // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
 
-    // Worker threads for offloading TransferEngine batch polling
-    // (WaitAllTransferBatches) in DataManager: local TE Put/Get and remote
-    // forward TE (co_await) paths. Independent of local_transfer_mode. 0 means
-    // synchronous TE wait on the caller/coroutine thread.
+    // Size of the dedicated coro_io pool for TE wait coroutines
+    // (poll getTransferStatus, yield via sleep_for) in DataManager: local TE
+    // Put/Get and remote forward TE (co_await) paths. Independent of
+    // local_transfer_mode. 0 means synchronous TE wait on the caller thread.
     size_t te_async_poll_worker_num = 32;
 
     // PreWrite / PinKey key lease: maximum time (ms) a key may stay in
