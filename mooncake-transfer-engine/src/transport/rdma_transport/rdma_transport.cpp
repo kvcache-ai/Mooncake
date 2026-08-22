@@ -1114,10 +1114,16 @@ int RdmaTransport::initializeRdmaResources() {
     for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>(*this, device_name);
         auto &config = globalConfig();
-        int ret = context->construct(config.num_cq_per_ctx,
-                                     config.num_comp_channels_per_ctx,
-                                     config.port, config.gid_index,
-                                     config.max_cqe, config.max_ep_per_ctx);
+        size_t cq_per_ctx = config.num_cq_per_ctx;
+        if (cq_per_ctx < static_cast<size_t>(config.workers_per_ctx)) {
+            cq_per_ctx = static_cast<size_t>(config.workers_per_ctx);
+            LOG(INFO) << "Increasing RDMA CQ count for " << device_name
+                      << " to match workers_per_ctx=" << config.workers_per_ctx
+                      << " for worker-owned endpoint polling";
+        }
+        int ret = context->construct(
+            cq_per_ctx, config.num_comp_channels_per_ctx, config.port,
+            config.gid_index, config.max_cqe, config.max_ep_per_ctx);
         if (ret) {
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
