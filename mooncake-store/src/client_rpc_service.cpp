@@ -116,7 +116,8 @@ ClientRpcService::ReadRemoteData(const RemoteReadRequest& request) {
             }
             if (metrics_) {
                 if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                    metrics_->peer_request_metrics.read_remote_data.misses.inc();
+                    metrics_->peer_request_metrics.read_remote_data.misses
+                        .inc();
                 } else {
                     metrics_->peer_request_metrics.read_remote_data.failures
                         .inc();

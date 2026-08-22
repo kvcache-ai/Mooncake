@@ -821,16 +821,15 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaTe(
     if (te_poll_executor_) {
         // Keep AllocationHandle / temp_buffer alive until Wait/WaitAsync
         // finishes; only transfer_batches are consumed by the poll Future.
-        auto storage = std::make_shared<TeSubmitResult>(
-            std::move(submit_result.value()));
+        auto storage =
+            std::make_shared<TeSubmitResult>(std::move(submit_result.value()));
         auto future =
             WaitAllTransferBatchesAsync(std::move(storage->transfer_batches));
         res.task_handle =
             FutureHandle<void>::Create(std::move(storage), std::move(future));
     } else {
-        auto te_wait =
-            [this, ctx = std::move(submit_result.value()),
-             h = handle]() mutable -> tl::expected<void, ErrorCode> {
+        auto te_wait = [this, ctx = std::move(submit_result.value()),
+                        h = handle]() mutable -> tl::expected<void, ErrorCode> {
             ScopedVLogTimer timer(1, "DataManager::BuildDataCopierViaTe");
             auto wait_result = WaitAllTransferBatches(ctx.transfer_batches);
             if (!wait_result) {
@@ -1657,8 +1656,8 @@ DataManager::TransferDataAsync(
     const std::vector<RemoteBufferDesc>& peer_buffers,
     Transport::TransferRequest::OpCode opcode) {
     if (!te_poll_executor_) {
-        return MakeReadyExpectedFuture(
-            TransferData(local_transfer_base, total_size, peer_buffers, opcode));
+        return MakeReadyExpectedFuture(TransferData(
+            local_transfer_base, total_size, peer_buffers, opcode));
     }
     auto validate_result = ValidateRemoteBuffers(peer_buffers);
     if (!validate_result) {

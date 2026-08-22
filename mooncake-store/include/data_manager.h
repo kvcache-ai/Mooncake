@@ -471,8 +471,8 @@ class DataManager {
 
     // After TE wait for local PutViaTe: optional DRAM staging copy + commit.
     tl::expected<void, ErrorCode> FinishPutViaTeAfterWait(
-        const KeyCtx& ctx, const UUID& write_operation_id, TeSubmitResult& te_ctx,
-        tl::expected<void, ErrorCode> wait_result);
+        const KeyCtx& ctx, const UUID& write_operation_id,
+        TeSubmitResult& te_ctx, tl::expected<void, ErrorCode> wait_result);
 
     tl::expected<TeSubmitResult, ErrorCode> SubmitTeTransferInternal(
         const AllocationHandle& handle,

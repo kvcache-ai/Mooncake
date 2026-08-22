@@ -2463,8 +2463,8 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
     std::shared_ptr<WritePromise> promise, PeerClient* peer,
     std::shared_ptr<P2PClientMetric> metrics, TeTransferFn te_transfer,
     std::shared_ptr<RemoteWriteRequest> write_req, std::vector<Slice>* slices) {
-    // Ensure the Dispatch()-side WritePromise always completes. TE poll cancel /
-    // shutdown completes the transfer Future with setException; without this
+    // Ensure the Dispatch()-side WritePromise always completes. TE poll cancel
+    // / shutdown completes the transfer Future with setException; without this
     // catch the outer promise would hang forever (.start ignores Lazy errors).
     try {
         if (!peer || !te_transfer || !write_req || !slices) {

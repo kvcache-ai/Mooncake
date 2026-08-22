@@ -3,9 +3,9 @@
 #include <glog/logging.h>
 #include <async_simple/Executor.h>
 #include <async_simple/Future.h>
-#include <async_simple/coro/CurrentExecutor.h>
 #include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
+#include <csignal>
 #include <ylt/coro_io/coro_io.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -15,13 +15,12 @@ namespace mooncake {
 
 // Await a TE-poll Future and always resume off the poll worker.
 // Prefer the Lazy's CurrentExecutor; if none is bound (e.g. syncAwait without
-// via), fall back to coro_io's global executor so copy/commit/RPC never continue
-// on te_poll threads.
+// via), fall back to coro_io's global executor so copy/commit/RPC never
+// continue on te_poll threads.
 template <typename V>
 inline async_simple::coro::Lazy<tl::expected<V, ErrorCode>>
-AwaitTeExpectedFuture(
-    async_simple::Future<tl::expected<V, ErrorCode>> fut) {
-    async_simple::Executor* ex = co_await async_simple::coro::CurrentExecutor{};
+AwaitTeExpectedFuture(async_simple::Future<tl::expected<V, ErrorCode>> fut) {
+    async_simple::Executor* ex = co_await async_simple::CurrentExecutor{};
     if (ex == nullptr) {
         ex = coro_io::get_global_executor();
         LOG(WARNING) << "AwaitTeExpectedFuture: no CurrentExecutor; "

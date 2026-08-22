@@ -2344,9 +2344,9 @@ TEST_F(DataManagerTest, TransferDataAsyncRejectsInvalidBuffersWithPollPool) {
     ASSERT_NE(dm, nullptr);
 
     char local_buf[16]{};
-    auto result = AwaitVoidExpectedFuture(dm->TransferDataAsync(
-        local_buf, sizeof(local_buf), /*peer_buffers=*/{},
-        Transport::TransferRequest::WRITE));
+    auto result = AwaitVoidExpectedFuture(
+        dm->TransferDataAsync(local_buf, sizeof(local_buf), /*peer_buffers=*/{},
+                              Transport::TransferRequest::WRITE));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -2356,9 +2356,9 @@ TEST_F(DataManagerTest, TransferDataAsyncRejectsInvalidBuffersWithoutPollPool) {
     ASSERT_NE(dm, nullptr);
 
     char local_buf[16]{};
-    auto result = AwaitVoidExpectedFuture(dm->TransferDataAsync(
-        local_buf, sizeof(local_buf), /*peer_buffers=*/{},
-        Transport::TransferRequest::WRITE));
+    auto result = AwaitVoidExpectedFuture(
+        dm->TransferDataAsync(local_buf, sizeof(local_buf), /*peer_buffers=*/{},
+                              Transport::TransferRequest::WRITE));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -2372,8 +2372,8 @@ TEST_F(DataManagerTest, TePollExecutorOffloadReturnsFutureHandle) {
     auto future =
         dm->te_poll_executor_->SubmitSingleTask<tl::expected<void, ErrorCode>>(
             []() -> tl::expected<void, ErrorCode> { return {}; });
-    auto handle = FutureHandle<void>::Create(std::shared_ptr<void>{},
-                                             std::move(future));
+    auto handle =
+        FutureHandle<void>::Create(std::shared_ptr<void>{}, std::move(future));
     ASSERT_NE(dynamic_cast<FutureHandle<void>*>(handle.get()), nullptr);
     ASSERT_EQ(dynamic_cast<CallableTaskHandle<void>*>(handle.get()), nullptr);
     auto wait_res = handle->Wait();

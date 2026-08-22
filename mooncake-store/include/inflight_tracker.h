@@ -13,7 +13,8 @@ namespace mooncake {
 
 // Tracks in-flight work for graceful drain. Guard is thread-agnostic (safe to
 // destroy after co_await on another executor).
-// Drain protocol: Close() then Wait(). Wait() alone does not reject new Enter().
+// Drain protocol: Close() then Wait(). Wait() alone does not reject new
+// Enter().
 class InflightTracker {
    public:
     explicit InflightTracker(std::string name,
@@ -85,8 +86,8 @@ class InflightTracker {
         inflight_.fetch_add(1, std::memory_order_acq_rel);
         // Close() may have raced after the first check; undo and reject.
         if (!running_.load(std::memory_order_acquire)) {
-            NotifyIfDrained(
-                inflight_.fetch_sub(1, std::memory_order_acq_rel) == 1);
+            NotifyIfDrained(inflight_.fetch_sub(1, std::memory_order_acq_rel) ==
+                            1);
             return false;
         }
         if (on_entering_) on_entering_();

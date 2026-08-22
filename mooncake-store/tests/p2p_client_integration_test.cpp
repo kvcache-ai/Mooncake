@@ -1036,7 +1036,8 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
 
 // ============================================================================
 // TE async poll offload: functional correctness (0 = sync wait, >0 = poll pool)
-// Multi-key batch covers concurrent per-key chains; single-key would be redundant.
+// Multi-key batch covers concurrent per-key chains; single-key would be
+// redundant.
 // ============================================================================
 
 TEST_F(P2PClientIntegrationTest, TeAsyncPollForwardRemoteBatchPutAndGet) {
@@ -1046,9 +1047,9 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollForwardRemoteBatchPutAndGet) {
         SCOPED_TRACE("te_async_poll_worker_num=" + std::to_string(te_async));
 
         std::string host = "localhost:" + std::to_string(getFreeTcpPort());
-        auto remote_writer = CreateP2PClient(
-            host, /*rpc_port=*/0, "te", TransferDirectionMode::FORWARD,
-            te_async);
+        auto remote_writer =
+            CreateP2PClient(host, /*rpc_port=*/0, "te",
+                            TransferDirectionMode::FORWARD, te_async);
         ASSERT_NE(remote_writer, nullptr);
 
         std::vector<std::string> keys;
@@ -1058,8 +1059,9 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollForwardRemoteBatchPutAndGet) {
         payloads.reserve(batch_size);
         batched_slices.reserve(batch_size);
         for (int i = 0; i < batch_size; ++i) {
-            keys.push_back("p2p_te_async_fwd_batch_" + std::to_string(te_async) +
-                           "_key_" + std::to_string(i));
+            keys.push_back("p2p_te_async_fwd_batch_" +
+                           std::to_string(te_async) + "_key_" +
+                           std::to_string(i));
             payloads.push_back("payload_" + std::to_string(te_async) + "_" +
                                std::to_string(i));
         }
@@ -1121,9 +1123,9 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollReverseRemoteBatchPutAndGet) {
         SCOPED_TRACE("te_async_poll_worker_num=" + std::to_string(te_async));
 
         std::string host = "localhost:" + std::to_string(getFreeTcpPort());
-        auto remote_writer = CreateP2PClient(
-            host, /*rpc_port=*/0, "te", TransferDirectionMode::REVERSE,
-            te_async);
+        auto remote_writer =
+            CreateP2PClient(host, /*rpc_port=*/0, "te",
+                            TransferDirectionMode::REVERSE, te_async);
         ASSERT_NE(remote_writer, nullptr);
 
         std::vector<std::string> keys;
@@ -1133,8 +1135,9 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollReverseRemoteBatchPutAndGet) {
         payloads.reserve(batch_size);
         batched_slices.reserve(batch_size);
         for (int i = 0; i < batch_size; ++i) {
-            keys.push_back("p2p_te_async_rev_batch_" + std::to_string(te_async) +
-                           "_key_" + std::to_string(i));
+            keys.push_back("p2p_te_async_rev_batch_" +
+                           std::to_string(te_async) + "_key_" +
+                           std::to_string(i));
             payloads.push_back("rev_payload_" + std::to_string(te_async) + "_" +
                                std::to_string(i));
         }
