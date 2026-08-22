@@ -13,7 +13,7 @@
 #include "client_metric.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
-#include "utils.h"
+#include "network.h"
 
 namespace mooncake::test {
 namespace {

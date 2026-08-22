@@ -1,4 +1,4 @@
-#include "utils.h"
+#include "client_buffer_allocation.h"
 
 #include "config.h"
 #include "ub_allocator.h"
@@ -23,6 +23,7 @@
 #endif
 
 namespace mooncake {
+namespace {
 
 #ifdef USE_VRAM_SEGMENT
 tl::expected<void *, std::string> allocate_vram_memory(
@@ -53,6 +54,8 @@ tl::expected<void *, std::string> allocate_vram_memory(
     return ptr;
 }
 #endif
+
+}  // namespace
 
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,

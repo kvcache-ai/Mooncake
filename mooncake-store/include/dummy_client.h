@@ -1,5 +1,7 @@
 #pragma once
 
+#include "result.h"
+
 #include <atomic>
 #include <csignal>
 #include <mutex>

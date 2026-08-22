@@ -243,3 +243,4 @@ TEST_F(HealthCheckTest, MetricsEndpointsReturnCorrectData) {
 
 }  // namespace testing
 }  // namespace mooncake
+#include "network.h"

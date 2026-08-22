@@ -2,10 +2,24 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
+#include <string_view>
 
 namespace mooncake {
 namespace {
+
+std::string SanitizeKey(const std::string &key) {
+    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
+    std::string sanitized_key;
+    sanitized_key.reserve(key.size());
+    for (char c : key) {
+        const bool invalid =
+            c == '\0' || kInvalidChars.find(c) != std::string_view::npos;
+        sanitized_key.push_back(invalid ? '_' : c);
+    }
+    return sanitized_key;
+}
 
 constexpr std::size_t kDefaultChunkSize = 64ull * 1024 * 1024;  // 64 MB
 
@@ -50,6 +64,20 @@ tl::expected<void, std::string> WriteChunks(std::ofstream &file,
 }
 
 }  // namespace
+
+std::string FileUtil::ResolvePathFromKey(const std::string &key,
+                                         const std::string &root_dir,
+                                         const std::string &fsdir) {
+    const size_t hash = std::hash<std::string>{}(key);
+    const char dir1 = static_cast<char>('a' + (hash & 0x0F));
+    const char dir2 = static_cast<char>('a' + ((hash >> 4) & 0x0F));
+    const std::filesystem::path dir_path =
+        std::filesystem::path(std::string(1, dir1)) / std::string(1, dir2);
+    return (std::filesystem::path(root_dir) / fsdir / dir_path /
+            SanitizeKey(key))
+        .lexically_normal()
+        .string();
+}
 
 tl::expected<void, std::string> FileUtil::SaveStringToFile(
     const std::string &content, const std::string &file_path) {

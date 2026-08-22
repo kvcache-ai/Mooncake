@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "allocator.h"
+#include "client_buffer_allocation.h"
 #include "client_service.h"
 #include "test_server_helpers.h"
 #include "default_config.h"

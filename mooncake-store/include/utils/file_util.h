@@ -12,6 +12,10 @@ namespace fs = std::filesystem;
 
 class FileUtil {
    public:
+    static std::string ResolvePathFromKey(const std::string& key,
+                                          const std::string& root_dir,
+                                          const std::string& fsdir);
+
     /**
      * @brief Save string content to file
      * @param content Content to save

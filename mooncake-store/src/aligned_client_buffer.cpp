@@ -6,7 +6,8 @@
 #include <cstring>
 #include <string_view>
 
-#include "utils.h"
+#include "client_buffer_allocation.h"
+#include "client_buffer_allocation.h"
 
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
