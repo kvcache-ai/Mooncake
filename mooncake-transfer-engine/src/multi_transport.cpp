@@ -14,6 +14,7 @@
 
 #include "multi_transport.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -84,7 +85,16 @@ MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string& local_server_name)
     : metadata_(metadata), local_server_name_(local_server_name) {}
 
-MultiTransport::~MultiTransport() {}
+MultiTransport::~MultiTransport() {
+    {
+        std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
+        stop_deferred_cleanup_ = true;
+    }
+    deferred_cleanup_cv_.notify_one();
+    if (deferred_cleanup_thread_.joinable()) {
+        deferred_cleanup_thread_.join();
+    }
+}
 
 MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     auto batch_desc = new BatchDesc();
@@ -102,20 +112,115 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
+    std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
+    if (deferred_cleanup_batches_.count(batch_id) != 0) {
+        return Status::BatchCleanupDeferred(
+            "BatchID is invalid because cleanup has already been deferred");
+    }
+
+    Status status = tryFreeBatchID(batch_id);
+    if (!status.IsBatchBusy()) {
+        return status;
+    }
+
+    deferred_cleanup_batches_.insert(batch_id);
+    if (!deferred_cleanup_thread_.joinable()) {
+        // Start the cleanup worker lazily after taking ownership of a busy
+        // batch. BatchCleanupDeferred tells callers that in-flight transport
+        // work may still own buffers but the batch handle is already invalid.
+        deferred_cleanup_thread_ =
+            std::thread(&MultiTransport::deferredCleanupLoop, this);
+    }
+    deferred_cleanup_cv_.notify_one();
+    LOG(WARNING) << "Batch " << batch_id
+                 << " is still busy; cleanup has been deferred";
+    return Status::BatchCleanupDeferred(
+        "BatchID is invalid because cleanup has been deferred");
+}
+
+Status MultiTransport::tryFreeBatchID(BatchID batch_id) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
-        if (!batch_desc.task_list[task_id].is_finished) {
+        auto& task = batch_desc.task_list[task_id];
+        if (task.is_finished) {
+            continue;
+        }
+        if (task.slice_count == 0) {
+            task.is_finished = true;
+            continue;
+        }
+
+        TransferStatus status;
+        Status query_status = getTransferStatus(batch_id, task_id, status);
+        if (!query_status.ok()) {
+            return query_status;
+        }
+        // A terminal transfer status only means the task published completion;
+        // event-driven completion callbacks may still be unwinding while
+        // holding raw BatchDesc access. Keep the batch alive until the explicit
+        // quiescence counter reaches zero below.
+        if (status.s != Transport::TransferStatusEnum::COMPLETED &&
+            status.s != Transport::TransferStatusEnum::FAILED) {
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
     }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    if (batch_desc.active_completion_callbacks.load(
+            std::memory_order_acquire) != 0) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed until completion callbacks are quiescent");
+    }
+#endif
+
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
     batch_desc_set_.erase(batch_id);
 #endif
     return Status::OK();
+}
+
+void MultiTransport::deferredCleanupLoop() {
+    constexpr auto kCleanupInterval = std::chrono::milliseconds(100);
+    std::unique_lock<std::mutex> lock(deferred_cleanup_mutex_);
+    while (true) {
+        if (deferred_cleanup_batches_.empty()) {
+            if (stop_deferred_cleanup_) {
+                return;
+            }
+            deferred_cleanup_cv_.wait(lock, [this] {
+                return stop_deferred_cleanup_ ||
+                       !deferred_cleanup_batches_.empty();
+            });
+            continue;
+        }
+
+        for (auto it = deferred_cleanup_batches_.begin();
+             it != deferred_cleanup_batches_.end();) {
+            Status status = tryFreeBatchID(*it);
+            if (status.ok()) {
+                it = deferred_cleanup_batches_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (stop_deferred_cleanup_) {
+            if (!deferred_cleanup_batches_.empty()) {
+                LOG(WARNING)
+                    << "Deferred cleanup stopped with "
+                    << deferred_cleanup_batches_.size()
+                    << " busy batch(es); leaving them allocated to avoid "
+                       "blocking shutdown while transport callbacks are "
+                       "still pending";
+            }
+            return;
+        }
+        deferred_cleanup_cv_.wait_for(lock, kCleanupInterval);
+    }
 }
 
 Status MultiTransport::submitTransfer(

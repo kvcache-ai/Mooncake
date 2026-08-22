@@ -41,38 +41,61 @@ class EmptyCallback : public XChannelCallback {
 
 BarexTransport::BarexTransport() {}
 
-BarexTransport::~BarexTransport() {
+BarexTransport::~BarexTransport() { shutdownResources(); }
+
+void BarexTransport::shutdownResources() {
 #ifdef CONFIG_USE_BATCH_DESC_SET
     for (auto &entry : batch_desc_set_) delete entry.second;
     batch_desc_set_.clear();
 #endif
-    for (auto ctx : client_context_list_) {
-        std::vector<XChannel *> chs = ctx->getAllChannel();
-        for (auto ch : chs) {
-            BarexResult ret =
-                connector_->CloseChannel(ch, [&, ch](accl::barex::Status s) {
-                    LOG(INFO) << "CloseChannel() finished, s.IsOk=" << s.IsOk();
-                    ch->Destroy();
-                });
-            if (ret != accl::barex::BAREX_SUCCESS) {
-                LOG(ERROR) << "CloseChannel() failed, ret " << ret;
+
+    if (connector_) {
+        for (const auto &ctx : client_context_list_) {
+            for (auto *channel : ctx->getAllChannel()) {
+                BarexResult ret = connector_->CloseChannel(
+                    channel, [channel](accl::barex::Status status) {
+                        LOG(INFO) << "CloseChannel() finished, s.IsOk="
+                                  << status.IsOk();
+                        channel->Destroy();
+                    });
+                if (ret != accl::barex::BAREX_SUCCESS) {
+                    LOG(ERROR) << "CloseChannel() failed, ret " << ret;
+                }
             }
         }
+        connector_->Shutdown();
+        connector_->WaitStop();
+        connector_.reset();
     }
+
+    if (listener_) {
+        listener_->Shutdown();
+        listener_->WaitStop();
+        listener_.reset();
+    }
+
     client_context_list_.clear();
     server_context_list_.clear();
-    metadata_->removeSegmentDesc(local_server_name_);
-    batch_desc_set_.clear();
-    connector_->Shutdown();
-    connector_->WaitStop();
-    listener_->Shutdown();
-    listener_->WaitStop();
-    server_threadpool_->Shutdown();
-    server_threadpool_->WaitStop();
-    client_threadpool_->Shutdown();
-    client_threadpool_->WaitStop();
-    mempool_->Shutdown();
-    mempool_->WaitStop();
+
+    if (server_threadpool_) {
+        server_threadpool_->Shutdown();
+        server_threadpool_->WaitStop();
+        server_threadpool_.reset();
+    }
+    if (client_threadpool_) {
+        client_threadpool_->Shutdown();
+        client_threadpool_->WaitStop();
+        client_threadpool_.reset();
+    }
+    if (mempool_) {
+        mempool_->Shutdown();
+        mempool_->WaitStop();
+        mempool_.reset();
+    }
+
+    if (metadata_) {
+        metadata_->removeSegmentDesc(local_server_name_);
+    }
 }
 
 int BarexTransport::install(std::string &local_server_name,
@@ -163,6 +186,7 @@ int BarexTransport::registerLocalMemory(void *addr, size_t length,
 
     bool is_gpu = dtype == GPU ? true : false;
 
+    std::vector<void *> registered_chunks;
     while (remaining > 0) {
         size_t buffer_len = std::min(buffer_size, remaining);
         int ret =
@@ -170,8 +194,18 @@ int BarexTransport::registerLocalMemory(void *addr, size_t length,
                                     remote_accessible, update_metadata, is_gpu);
         if (ret) {
             LOG(ERROR) << "registerLocalMemoryBase failed, ret " << ret;
-            return -1;
+            for (auto it = registered_chunks.rbegin();
+                 it != registered_chunks.rend(); ++it) {
+                metadata_->removeLocalMemoryBuffer(*it, update_metadata);
+                BarexResult rollback_result = mempool_->DeregUserMr(*it, dtype);
+                if (rollback_result != BAREX_SUCCESS) {
+                    LOG(ERROR) << "Failed to roll back registered memory at "
+                               << *it << ", ret " << rollback_result;
+                }
+            }
+            return ret;
         }
+        registered_chunks.push_back(current_ptr);
         current_ptr = static_cast<char *>(current_ptr) + buffer_len;
         remaining -= buffer_len;
     }
@@ -208,26 +242,46 @@ int BarexTransport::registerLocalMemoryBase(void *addr, size_t length,
         }
     }
 
+    auto rollback_registration = [&]() {
+        BarexResult rollback_result = mempool_->DeregUserMr(addr, dtype);
+        if (rollback_result != BAREX_SUCCESS) {
+            LOG(ERROR) << "Failed to roll back registered memory at " << addr
+                       << ", ret " << rollback_result;
+        }
+    };
+
     // Get the memory location automatically after registered MR(pinned),
     // when the name is kWildcardLocation("*").
     if (name == kWildcardLocation) {
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length, only_first_page);
+        std::vector<void *> added_buffers;
         for (auto &entry : entries) {
             buffer_desc.name = entry.location;
             buffer_desc.addr = entry.start;
             buffer_desc.length = entry.len;
             int rc =
                 metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-            if (rc) return rc;
+            if (rc) {
+                for (auto *added_addr : added_buffers) {
+                    metadata_->removeLocalMemoryBuffer(added_addr,
+                                                       update_metadata);
+                }
+                rollback_registration();
+                return rc;
+            }
+            added_buffers.push_back(reinterpret_cast<void *>(entry.start));
         }
     } else {
         buffer_desc.name = name;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-        if (rc) return rc;
+        if (rc) {
+            rollback_registration();
+            return rc;
+        }
     }
 
     return 0;
@@ -300,17 +354,30 @@ int BarexTransport::allocateLocalSegmentID() {
 int BarexTransport::registerLocalMemoryBatch(
     const std::vector<BarexTransport::BufferEntry> &buffer_list,
     const std::string &location) {
+    std::vector<void *> registered_buffers;
     for (auto &buffer : buffer_list) {
         int ret = registerLocalMemory(buffer.addr, buffer.length, location,
                                       true, false);
         if (ret) {
             LOG(ERROR) << "BarexTransport: Failed to register memory: addr "
                        << buffer.addr << " length " << buffer.length;
+            for (auto it = registered_buffers.rbegin();
+                 it != registered_buffers.rend(); ++it) {
+                unregisterLocalMemory(*it, false);
+            }
             return ret;
         }
+        registered_buffers.push_back(buffer.addr);
     }
 
-    return metadata_->updateLocalSegmentDesc();
+    int ret = metadata_->updateLocalSegmentDesc();
+    if (ret) {
+        for (auto it = registered_buffers.rbegin();
+             it != registered_buffers.rend(); ++it) {
+            unregisterLocalMemory(*it, false);
+        }
+    }
+    return ret;
 }
 
 int BarexTransport::unregisterLocalMemoryBatch(
@@ -772,6 +839,13 @@ Status BarexTransport::submitTransferTask(
     // const size_t kBlockSize = globalConfig().slice_size;
     const size_t kBlockMaxSize = globalConfig().eic_max_block_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
+    auto mark_prepared_failed = [&]() {
+        for (auto &entry : slices_to_post) {
+            for (auto *slice : entry.second) {
+                slice->markFailed();
+            }
+        }
+    };
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
     for (size_t index = 0; index < task_list.size(); ++index) {
@@ -792,6 +866,7 @@ Status BarexTransport::submitTransferTask(
         if (!peer_segment_desc) {
             LOG(ERROR) << "peer_segment_desc not found for target_id "
                        << target_id;
+            mark_prepared_failed();
             return Status::InvalidArgument(
                 "BarexTransport: peer_segment_desc not found");
         }
@@ -1183,15 +1258,22 @@ Status BarexTransport::submitTransferTask(
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
+                mark_prepared_failed();
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active device(s): " +
                     std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
             }
         }
     }
-    for (auto &entry : slices_to_post) {
+    for (auto it = slices_to_post.begin(); it != slices_to_post.end(); ++it) {
+        auto &entry = *it;
         int ret = entry.first->submitPostSend(entry.second);
         if (ret) {
+            for (++it; it != slices_to_post.end(); ++it) {
+                for (auto *slice : it->second) {
+                    slice->markFailed();
+                }
+            }
             return Status::InvalidArgument("submitPostSend failed");
         }
     }
@@ -1455,14 +1537,14 @@ int BarexTransport::startHandshakeDaemon(std::string &local_server_name) {
                    << result;
         return ERR_INVALID_ARGUMENT;
     }
-    result = listener->Listen();
+    listener_ = std::shared_ptr<XListener>(listener);
+    result = listener_->Listen();
     if (result != BAREX_SUCCESS) {
         LOG(ERROR)
             << "BarexTransport: startHandshakeDaemon, Listen failed, result "
             << result;
         return ERR_INVALID_ARGUMENT;
     }
-    listener_ = std::shared_ptr<XListener>(listener);
     XConnector *connector = nullptr;
     result =
         XConnector::NewInstance(connector, 2, TIMER_3S, raw_client_contexts);
