@@ -215,13 +215,17 @@ void EnterStandbyMode(MasterAdminServer& admin_server,
     SetRuntimeState(admin_server, standby_controller.GetStandbyRuntimeState());
 }
 
-int RunSupervisorLoop(const HABackendSpec& spec,
-                      const MasterServiceSupervisorConfig& config,
-                      MasterAdminServer& admin_server) {
+int RunSupervisorLoop(
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
+    MasterAdminServer& admin_server,
+    std::unique_ptr<LeaderCoordinator> coordinator_override = nullptr,
+    std::unique_ptr<StandbyController> standby_controller = nullptr) {
     auto label_reconciler = MakeLeaderLabelReconciler(config);
     label_reconciler.SetLeader(false);
     SetRuntimeState(admin_server, MasterRuntimeState::kStarting);
-    auto standby_controller = CreateStandbyController(spec, config);
+    if (!standby_controller) {
+        standby_controller = CreateStandbyController(spec, config);
+    }
     std::atomic<bool> accept_standby_runtime_updates{false};
     standby_controller->SetStandbyRuntimeStateCallback(
         [&](MasterRuntimeState state) {
@@ -236,7 +240,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                      accept_standby_runtime_updates, std::nullopt);
 
     while (true) {
-        auto coordinator = CreateLeaderCoordinator(spec);
+        auto coordinator = coordinator_override
+                               ? decltype(CreateLeaderCoordinator(spec))(
+                                     std::move(coordinator_override))
+                               : CreateLeaderCoordinator(spec);
         if (!coordinator) {
             if (HandleSupervisorError("create leader coordinator",
                                       coordinator.error(), spec.type)) {
@@ -336,8 +343,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             EnterStandbyMode(admin_server, *standby_controller,
                              accept_standby_runtime_updates,
                              leadership_session->view);
-            if (HandleSupervisorError("promote standby for serve",
-                                      promotion_ctx.error(), spec.type)) {
+            if (HandleLeadershipPhaseError(
+                    "standby promotion failure", "promote standby for serve",
+                    leader_coordinator, *leadership_session,
+                    promotion_ctx.error(), spec.type)) {
                 return -1;
             }
             continue;
@@ -390,18 +399,30 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);
 
-        // Restore from standby if we have context
-        if (promotion_ctx->applied_seq_id > 0 ||
-            !promotion_ctx->objects.empty() ||
-            !promotion_ctx->segments.empty()) {
-            auto restore_result = wrapped_master_service->RestoreFromStandby(
-                promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                promotion_ctx->segments);
-            if (!restore_result) {
-                LOG(ERROR) << "Standby restore failed: "
-                           << toString(restore_result.error());
+        // Restore is the serving gate: do not register or expose a candidate
+        // service until the complete promotion context has been applied.
+        SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
+        auto restore_result = wrapped_master_service->RestoreFromStandby(
+            promotion_ctx->objects, promotion_ctx->applied_seq_id,
+            promotion_ctx->segments);
+        if (!restore_result) {
+            LOG(ERROR) << "Standby restore failed: "
+                       << toString(restore_result.error());
+            wrapped_master_service.reset();
+            DeactivateServingState(admin_server, label_reconciler);
+            EnterStandbyMode(admin_server, *standby_controller,
+                             accept_standby_runtime_updates,
+                             leadership_session->view);
+            SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
+            if (HandleLeadershipPhaseError(
+                    "standby restore failure", "restore standby state",
+                    leader_coordinator, *leadership_session,
+                    restore_result.error(), spec.type)) {
+                return -1;
             }
+            continue;
         }
+        SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 
@@ -504,6 +525,15 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 }
 
 }  // namespace
+
+int RunSupervisorLoopForTesting(
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
+    MasterAdminServer& admin_server,
+    std::unique_ptr<LeaderCoordinator> coordinator,
+    std::unique_ptr<StandbyController> standby_controller) {
+    return RunSupervisorLoop(spec, config, admin_server, std::move(coordinator),
+                             std::move(standby_controller));
+}
 
 MasterServiceSupervisor::MasterServiceSupervisor(
     const MasterServiceSupervisorConfig& config)
