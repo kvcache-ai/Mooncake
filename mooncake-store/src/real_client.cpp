@@ -589,12 +589,27 @@ ResourceTracker &ResourceTracker::getInstance() {
 
 ResourceTracker::ResourceTracker() {
     // In embedded environments (e.g. Python), the host runtime owns signal
-    // handling.  Blocking SIGINT with pthread_sigmask (done inside
-    // startSignalThread) would prevent Python from raising KeyboardInterrupt,
-    // causing the process to hang on Ctrl-C.  Detect Python at runtime via
-    // dlsym so we don't need to include <Python.h> or change any public API.
+    // handling.  Blocking SIGINT with pthread_sigmask would prevent Python
+    // from raising KeyboardInterrupt, causing the process to hang on Ctrl-C.
+    // Detect Python at runtime via dlsym so we don't need to include
+    // <Python.h> or change any public API.
     if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
         // Standalone C/C++ process – install our own signal handling.
+
+        // Block SIGTERM/SIGINT/SIGHUP in the main thread BEFORE any
+        // application threads are spawned.  All subsequently created threads
+        // (ylt coroutine threads, RPC threads, etc.) inherit this mask, so
+        // process-directed signals are only delivered to the sigwait thread.
+        // Previously this masking was done inside the signal thread lambda,
+        // which only masked the signal thread itself — leaving other threads
+        // able to receive SIGTERM directly and terminate before cleanup runs.
+        sigset_t block_set;
+        sigemptyset(&block_set);
+        sigaddset(&block_set, SIGINT);
+        sigaddset(&block_set, SIGTERM);
+        sigaddset(&block_set, SIGHUP);
+        pthread_sigmask(SIG_BLOCK, &block_set, nullptr);
+
         startSignalThread();
     }
 
@@ -619,6 +634,18 @@ void ResourceTracker::cleanupAllResources() {
     if (!cleaned_.compare_exchange_strong(expected, true,
                                           std::memory_order_acq_rel)) {
         return;
+    }
+
+    // Optional grace period before tearing down segments.
+    // Set MC_STORE_TERM_GRACE_SECONDS to give in-flight operations time to
+    // complete before segments are unmounted.  Default is 0 (immediate).
+    if (const char *val = std::getenv("MC_STORE_TERM_GRACE_SECONDS")) {
+        int grace_seconds = std::atoi(val);
+        if (grace_seconds > 0) {
+            LOG(INFO) << "SIGTERM grace period: waiting " << grace_seconds
+                      << "s before unmounting segments";
+            sleep(grace_seconds);
+        }
     }
 
     MutexLocker locker(&mutex_);
@@ -651,7 +678,10 @@ void ResourceTracker::startSignalThread() {
         std::promise<void> ready;
         auto ready_future = ready.get_future();
 
-        // Block signals in this thread; new threads inherit this mask
+        // SIGINT/SIGTERM/SIGHUP are already blocked in the main thread (done
+        // in the ResourceTracker constructor before any threads were spawned),
+        // so this thread inherits that mask.  We only need to additionally
+        // block SIGUSR1 (used to interrupt sigwait on stop).
         sigset_t set;
         sigemptyset(&set);
         sigaddset(&set, SIGINT);
