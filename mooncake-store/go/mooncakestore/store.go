@@ -26,6 +26,13 @@ import (
 	"unsafe"
 )
 
+type ClientType int
+
+const (
+	MOONCAKE_CLIENT_REAL  ClientType = C.MOONCAKE_CLIENT_REAL
+	MOONCAKE_CLIENT_DUMMY ClientType = C.MOONCAKE_CLIENT_DUMMY
+)
+
 // Store wraps a Mooncake Store client handle.
 type Store struct {
 	handle C.mooncake_store_t
@@ -41,16 +48,17 @@ func New() (*Store, error) {
 	return &Store{handle: h}, nil
 }
 
-// Setup initialises the store client and connects to the cluster.
-//
-// Parameters:
-//   - localHostname: hostname/IP of this node
-//   - metadataServer: metadata server URL (e.g. "http://host:8080/metadata")
-//   - globalSegmentSize: size of the global memory segment in bytes
-//   - localBufferSize: size of the local transfer buffer in bytes
-//   - protocol: transport protocol ("tcp" or "rdma")
-//   - deviceName: RDMA device name (empty for TCP or auto-discovery)
-//   - masterServerAddr: master service address (e.g. "host:50051")
+// NewWithType creates a new Store instance with the specified client type.
+// Use MOONCAKE_CLIENT_REAL or MOONCAKE_CLIENT_DUMMY.
+func NewWithType(clientType ClientType) (*Store, error) {
+	h := C.mooncake_store_create_with_type(C.mooncake_client_type_t(clientType))
+	if h == nil {
+		return nil, ErrStoreNil
+	}
+	return &Store{handle: h}, nil
+}
+
+// Setup initialises a real store client and connects to the cluster.
 func (s *Store) Setup(localHostname, metadataServer string,
 	globalSegmentSize, localBufferSize uint64,
 	protocol, deviceName, masterServerAddr string) error {
@@ -73,6 +81,27 @@ func (s *Store) Setup(localHostname, metadataServer string,
 		cLocalHostname, cMetadataServer,
 		C.uint64_t(globalSegmentSize), C.uint64_t(localBufferSize),
 		cProtocol, cDeviceName, cMasterAddr)
+	if ret != 0 {
+		return ErrSetupFailed
+	}
+	return nil
+}
+
+// DummySetup initialises a dummy store client.
+func (s *Store) DummySetup(memPoolSize, localBufferSize uint64,
+	serverAddress, ipcSocketPath string) error {
+	if s.handle == nil {
+		return ErrStoreNil
+	}
+
+	cServerAddress := C.CString(serverAddress)
+	cIpcSocketPath := C.CString(ipcSocketPath)
+	defer C.free(unsafe.Pointer(cServerAddress))
+	defer C.free(unsafe.Pointer(cIpcSocketPath))
+
+	ret := C.mooncake_store_setup_dummy(s.handle,
+		C.uint64_t(memPoolSize), C.uint64_t(localBufferSize),
+		cServerAddress, cIpcSocketPath)
 	if ret != 0 {
 		return ErrSetupFailed
 	}
@@ -537,4 +566,78 @@ func (s *Store) UnregisterBuffer(ptr uintptr) error {
 		return ErrUnregisterBuffer
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// DummyClient-specific: Query registered buffers
+// ---------------------------------------------------------------------------
+
+type RegisteredBufferInfo struct {
+	Ptr     uintptr
+	Size    uint64
+	IsLocal bool
+}
+
+func (s *Store) RegisteredBufferCount() (int, error) {
+	if s.handle == nil {
+		return 0, ErrStoreNil
+	}
+	count := C.mooncake_store_get_registered_buffer_count(s.handle)
+	return int(count), nil
+}
+
+func (s *Store) RegisteredBufferAt(index int) (*RegisteredBufferInfo, error) {
+	if s.handle == nil {
+		return nil, ErrStoreNil
+	}
+	if index < 0 {
+		return nil, ErrInvalidArgument
+	}
+	var size C.size_t
+	ptr := C.mooncake_store_get_registered_buffer_at(s.handle,
+		C.size_t(index), &size)
+	if ptr == nil {
+		return nil, ErrBufferNotFound
+	}
+	return &RegisteredBufferInfo{
+		Ptr:  uintptr(ptr),
+		Size: uint64(size),
+	}, nil
+}
+
+// UnregisterAllBuffers 注销所有已注册的 buffer
+// 用于程序结束前清理资源，避免内存泄漏
+// 注意：此函数会遍历所有已注册 buffer 并逐个调用 UnregisterBuffer
+func (s *Store) UnregisterAllBuffers() (int, error) {
+	if s.handle == nil {
+		return 0, ErrStoreNil
+	}
+	count, err := s.RegisteredBufferCount()
+	if err != nil {
+		return 0, err
+	}
+
+	ptrs := make([]uintptr, 0, count)
+	for i := 0; i < count; i++ {
+		bufInfo, err := s.RegisteredBufferAt(i)
+		if err == nil {
+			ptrs = append(ptrs, bufInfo.Ptr)
+		}
+	}
+
+	unregistered := 0
+	for _, ptr := range ptrs {
+		if err := s.UnregisterBuffer(ptr); err == nil {
+			unregistered++
+		}
+	}
+
+	return unregistered, nil
+}
+
+func (s *Store) IsHotCachePtr(ptr uintptr) bool {
+	if s.handle == nil || ptr == 0 {
+		return false
+	}
+	return C.mooncake_store_is_hot_cache_ptr(s.handle, unsafe.Pointer(ptr)) == 1
 }
