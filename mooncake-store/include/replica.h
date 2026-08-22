@@ -119,9 +119,10 @@ struct ReplicateConfig {
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
-    // Optional per-key routing group IDs. Empty string keeps that key
-    // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
-    // and memory eviction behavior.
+    // Optional per-key group IDs. Empty string keeps that key
+    // ungrouped. Group IDs tie keys into a lifecycle group: the background
+    // eviction treats the group as a unit (all-or-none). Object routing is
+    // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
 
     ReplicateConfig ForSingleKey(size_t key_index) const {

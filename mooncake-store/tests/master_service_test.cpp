@@ -123,8 +123,7 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        const size_t shard_idx =
-            service.getMetadataShardIndex(normalized_tenant, key);
+        const size_t shard_idx = service.getShardIndex(normalized_tenant, key);
         MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
         const auto tenant_it = shard->tenants.find(normalized_tenant);
         if (tenant_it == shard->tenants.end()) {
@@ -149,8 +148,7 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        const size_t shard_idx =
-            service.getMetadataShardIndex(normalized_tenant, key);
+        const size_t shard_idx = service.getShardIndex(normalized_tenant, key);
         MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
         auto& metadata = shard->tenants.at(normalized_tenant).metadata.at(key);
         {
@@ -167,6 +165,37 @@ class MasterServiceTest : public ::testing::Test {
 
     size_t SoftPinRegistrationCount(MasterService& service) {
         return service.soft_pin_deadline_index_.RegistrationCountForTest();
+    }
+
+    std::vector<std::string> GetGroupMemberKeysForTest(
+        MasterService& service, const std::string& group_id,
+        const std::string& tenant_id = "default") {
+        const TenantId normalized_tenant =
+            service.ResolveRequestTenantId(TenantId(tenant_id));
+        const size_t gs_idx =
+            service.GetGroupShardIndex(normalized_tenant, group_id);
+        MasterService::GroupShardAccessorRO gs(&service, gs_idx);
+        auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
+        if (it == gs->groups.end()) {
+            return {};
+        }
+        return {it->second.member_keys.begin(), it->second.member_keys.end()};
+    }
+
+    void ClearGroupStateForTest(MasterService& service) {
+        for (size_t i = 0; i < service.group_shards_.size(); ++i) {
+            MasterService::GroupShardAccessorRW gs(&service, i);
+            gs->groups.clear();
+        }
+    }
+
+    void RebuildGroupStateForTest(MasterService& service) {
+        service.RebuildGroupState();
+    }
+
+    size_t GetGroupShardIndexForTest(MasterService& service,
+                                     const std::string& group_id) {
+        return service.GetGroupShardIndex(TenantId::Default(), group_id);
     }
 
     std::optional<uint32_t> GetReplicaRefcntBySegmentName(
@@ -1282,6 +1311,64 @@ TEST_F(MasterServiceTest, GroupedObjectRoutesKeyLevelLookupAndRemove) {
     EXPECT_FALSE(exists_after_remove.value());
 }
 
+TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
+    // Route-decoupling invariant: object routing is a pure function of
+    // (tenant, key); the group_id is only a lifecycle annotation and never
+    // affects which metadata shard an object lands in. The group domain is
+    // sharded by hash(tenant, group_id) and stores only the member key list.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Two member keys that hash to different metadata shards, sharing one
+    // group whose id hashes to yet another shard. The default-tenant route is
+    // hash(key) % kNumShards (mirrors MasterService::getShardIndex).
+    constexpr size_t kMetadataShardCountForTest = 1024;
+    const std::string key_a = "route_decouple_key_a";
+    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    std::string key_b = "route_decouple_key_b";
+    const size_t shard_a =
+        std::hash<std::string>{}(key_a) % kMetadataShardCountForTest;
+    size_t shard_b =
+        std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
+    for (int i = 0; i < 10000 && shard_b == shard_a; ++i) {
+        key_b = "route_decouple_key_b_" + std::to_string(i);
+        shard_b = std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
+    }
+    const size_t shard_g = GetGroupShardIndexForTest(*service_, group_id);
+    ASSERT_NE(shard_a, shard_b);  // members span metadata shards
+    ASSERT_NE(shard_a, shard_g);  // two independent routing domains
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    PutCompletedObject(*service_, client_id, key_a, config);
+    PutCompletedObject(*service_, client_id, key_b, config);
+
+    // Both members are reachable purely through hash(tenant, key) routing,
+    // even though their group lives on a different shard.
+    EXPECT_TRUE(service_->ExistKey(key_a, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(key_b, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(
+        service_->GetReplicaList(key_a, TenantId::Default()).has_value());
+    EXPECT_TRUE(
+        service_->GetReplicaList(key_b, TenantId::Default()).has_value());
+
+    // The group table still sees both members: group state is a separate,
+    // key-list-only domain.
+    auto members = GetGroupMemberKeysForTest(*service_, group_id);
+    EXPECT_EQ(2u, members.size());
+
+    // Route stability: the object route is hash(tenant, key) alone — grouping
+    // does not change it (identical to the ungrouped route computed before the
+    // objects existed), so a later ungrouped put of the same key would land on
+    // the same shard.
+    EXPECT_EQ(shard_a,
+              std::hash<std::string>{}(key_a) % kMetadataShardCountForTest);
+    EXPECT_EQ(shard_b,
+              std::hash<std::string>{}(key_b) % kMetadataShardCountForTest);
+}
+
 TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
     const std::string key = "tenant_grouped_shared_user_key";
     const TenantId tenant_a("tenant_group_route_a");
@@ -1717,7 +1804,7 @@ TEST_F(MasterServiceTest, RemoveByRegexUnregistersGroupedRoute) {
     EXPECT_TRUE(service_->GetReplicaList(key, TenantId::Default()).has_value());
 }
 
-TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
+TEST_F(MasterServiceTest, GroupedReadRefreshesOnlyReadMemberLease) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(200).build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
@@ -1736,6 +1823,8 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
     PutCompletedObject(*service_, client_id, key_a, config_a);
     PutCompletedObject(*service_, client_id, key_b, config_b);
 
+    // Read key_a (twice, near expiry). The read path is group-agnostic and
+    // refreshes ONLY key_a's own lease — not the whole group.
     auto exists = service_->ExistKey(key_a, TenantId::Default());
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
@@ -1744,20 +1833,23 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
     exists = service_->ExistKey(key_a, TenantId::Default());
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    auto remove_group_peer = service_->Remove(key_b, TenantId::Default());
-    ASSERT_FALSE(remove_group_peer.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_group_peer.error());
+    // key_a's own lease is still valid, so a non-force remove is rejected.
+    auto remove_read_member = service_->Remove(key_a, TenantId::Default());
+    ASSERT_FALSE(remove_read_member.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_read_member.error());
 
+    // key_b's lease was never refreshed by reading key_a, so it is expired and
+    // can be removed without force.
+    EXPECT_TRUE(service_->Remove(key_b, TenantId::Default()).has_value());
+
+    // Force cleanup of the still-leased member.
     EXPECT_TRUE(service_->Remove(key_a, TenantId::Default(), /*force=*/true)
-                    .has_value());
-    EXPECT_TRUE(service_->Remove(key_b, TenantId::Default(), /*force=*/true)
                     .has_value());
 }
 
 TEST_F(MasterServiceTest,
-       GroupedLeaseRefreshAfterMembershipChangeDoesNotWaitForTriggerExpiry) {
+       GroupedMembershipChangeDoesNotRefreshPeerLeaseOnRead) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(500).build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
@@ -1775,21 +1867,25 @@ TEST_F(MasterServiceTest,
     PutCompletedObject(*service_, client_id, key_a, config);
     ASSERT_TRUE(service_->ExistKey(key_a, TenantId::Default()).value_or(false));
 
+    // Add a new member to the group after key_a's lease was already granted.
     PutCompletedObject(*service_, client_id, key_b, config);
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
+    // Reading key_a refreshes only key_a's own lease; the newly added key_b is
+    // NOT swept in (there is no whole-group lease refresh on the read path).
     auto exists = service_->ExistKey(key_a, TenantId::Default());
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(390));
 
-    auto remove_group_peer = service_->Remove(key_b, TenantId::Default());
-    ASSERT_FALSE(remove_group_peer.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_group_peer.error());
+    // key_a is protected by its own lease...
+    auto remove_read_member = service_->Remove(key_a, TenantId::Default());
+    ASSERT_FALSE(remove_read_member.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_read_member.error());
+
+    // ...but key_b's lease is expired, so it can be removed without force.
+    EXPECT_TRUE(service_->Remove(key_b, TenantId::Default()).has_value());
 
     EXPECT_TRUE(service_->Remove(key_a, TenantId::Default(), /*force=*/true)
-                    .has_value());
-    EXPECT_TRUE(service_->Remove(key_b, TenantId::Default(), /*force=*/true)
                     .has_value());
 }
 
@@ -1822,6 +1918,63 @@ TEST_F(MasterServiceTest, RemoveGroupedMemberPreservesOtherMembers) {
     auto group_empty = service_->ExistKey(key_b, TenantId::Default());
     ASSERT_TRUE(group_empty.has_value());
     EXPECT_FALSE(group_empty.value());
+}
+
+TEST_F(MasterServiceTest, GroupStateRegistersAndCleansUpMembers) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key_a = "group_state_key_a";
+    const std::string key_b = "group_state_key_b";
+    const std::string group_id = "group_state_group";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    PutCompletedObject(*service_, client_id, key_a, config);
+    PutCompletedObject(*service_, client_id, key_b, config);
+
+    auto members = GetGroupMemberKeysForTest(*service_, group_id);
+    EXPECT_EQ(2u, members.size());
+
+    // Removing one member shrinks, but does not erase, the group.
+    ASSERT_TRUE(service_->Remove(key_a, TenantId::Default(), /*force=*/true)
+                    .has_value());
+    members = GetGroupMemberKeysForTest(*service_, group_id);
+    ASSERT_EQ(1u, members.size());
+    EXPECT_EQ(key_b, members[0]);
+
+    // Removing the last member erases the group.
+    ASSERT_TRUE(service_->Remove(key_b, TenantId::Default(), /*force=*/true)
+                    .has_value());
+    EXPECT_TRUE(GetGroupMemberKeysForTest(*service_, group_id).empty());
+}
+
+TEST_F(MasterServiceTest, RebuildGroupStateRestoresMembershipFromMetadata) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key_a = "rebuild_group_key_a";
+    const std::string key_b = "rebuild_group_key_b";
+    const std::string group_id = "rebuild_group_id";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    PutCompletedObject(*service_, client_id, key_a, config);
+    PutCompletedObject(*service_, client_id, key_b, config);
+
+    // Simulate a snapshot reset: drop all group state.
+    ClearGroupStateForTest(*service_);
+    EXPECT_TRUE(GetGroupMemberKeysForTest(*service_, group_id).empty());
+
+    // Rebuild from object metadata (as snapshot deserialization does).
+    RebuildGroupStateForTest(*service_);
+
+    auto members = GetGroupMemberKeysForTest(*service_, group_id);
+    EXPECT_EQ(2u, members.size());
 }
 
 TEST_F(MasterServiceTest, UpsertPreservesGroupMembership) {

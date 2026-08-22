@@ -1628,17 +1628,13 @@ class MasterService {
         std::unordered_map<std::string, std::chrono::steady_clock::time_point>
             dynamic_replication_cooldowns;
 
-        std::unordered_map<std::string, std::unordered_set<std::string>>
-            group_members;  // group_id → set of keys
-
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
                    promotion_tasks.empty() && promotion_candidates.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
-                   dynamic_replication_cooldowns.empty() &&
-                   group_members.empty();
+                   dynamic_replication_cooldowns.empty();
         }
     };
 
@@ -1653,6 +1649,27 @@ class MasterService {
         long disk_object_count GUARDED_BY(mutex) = 0;
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
+
+    // Group domain: sharded by hash(tenant, group_id), storing only the
+    // member key list (no group-level lease). Object routing is decoupled from
+    // groups — objects are always routed by hash(tenant, key); group membership
+    // is a lifecycle constraint consulted at eviction time. Group protection is
+    // derived from member object leases at eviction, keeping the read path free
+    // of any group-table lookup.
+    struct GroupState {
+        TenantId tenant_id;
+        std::string group_id;
+        std::unordered_set<std::string> member_keys;
+
+        bool Empty() const { return member_keys.empty(); }
+    };
+
+    struct GroupShard {
+        mutable SharedMutex mutex;
+        // key: tenant_id.MakeScopedKey(group_id)
+        std::unordered_map<std::string, GroupState> groups GUARDED_BY(mutex);
+    };
+    std::array<GroupShard, kNumShards> group_shards_;
 
     class SoftPinDeadlineIndex {
        public:
@@ -1717,12 +1734,6 @@ class MasterService {
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr);
-
-    std::unordered_map<std::string, std::string> object_group_ids_
-        GUARDED_BY(group_routing_mutex_);
-    mutable std::unordered_set<std::string> groups_needing_lease_refresh_
-        GUARDED_BY(group_routing_mutex_);
-    mutable std::shared_mutex group_routing_mutex_;
 
     static constexpr size_t kObjectOperationLockStripes = 4096;
 
@@ -1801,6 +1812,43 @@ class MasterService {
         SharedMutexLocker lock_;
     };
 
+    // For accessing a group shard with read-write permission
+    class GroupShardAccessorRW {
+       public:
+        GroupShardAccessorRW(MasterService* master_service, size_t shard_index)
+            : shard_(master_service->group_shards_[shard_index]),
+              lock_(&shard_.mutex) {}
+
+        GroupShard* operator->() { return &shard_; }
+
+        const GroupShard* operator->() const { return &shard_; }
+
+        GroupShard& get() { return shard_; }
+
+        const GroupShard& get() const { return shard_; }
+
+       private:
+        GroupShard& shard_;
+        SharedMutexLocker lock_;
+    };
+
+    // For accessing a group shard with read-only permission
+    class GroupShardAccessorRO {
+       public:
+        GroupShardAccessorRO(const MasterService* master_service,
+                             size_t shard_index)
+            : shard_(master_service->group_shards_[shard_index]),
+              lock_(&shard_.mutex, shared_lock) {}
+
+        const GroupShard* operator->() const { return &shard_; }
+
+        const GroupShard& get() const { return shard_; }
+
+       private:
+        const GroupShard& shard_;
+        SharedMutexLocker lock_;
+    };
+
     static ObjectIdentity MakeObjectIdentity(const std::string& user_key,
                                              TenantId tenant_id) {
         return {std::move(tenant_id), user_key};
@@ -1831,17 +1879,30 @@ class MasterService {
         return std::hash<std::string>{}(key) % kNumShards;
     }
 
-    size_t getMetadataShardIndex(const TenantId& tenant_id,
-                                 const std::string& key) const;
-    std::optional<std::string> GetGroupRoute(const TenantId& tenant_id,
-                                             const std::string& key) const;
-    void RegisterGroupMember(TenantState& tenant_state,
-                             const TenantId& tenant_id, const std::string& key,
+    // Group state is sharded by hash(tenant, group_id), independent of object
+    // routing (hash(tenant, key)).
+    size_t GetGroupShardIndex(const TenantId& tenant_id,
+                              const std::string& group_id) const {
+        return getShardIndex(tenant_id, group_id);
+    }
+
+    void RegisterGroupMember(const TenantId& tenant_id, const std::string& key,
                              const std::string& group_id);
-    void UnregisterGroupMember(TenantState& tenant_state,
-                               const TenantId& tenant_id,
+    void UnregisterGroupMember(const TenantId& tenant_id,
                                const std::string& key,
                                const std::string& group_id);
+    // Reads the member keys registered for `group_id`; empty if unregistered.
+    std::vector<std::string> GetGroupMemberKeys(
+        const TenantId& tenant_id, const std::string& group_id) const;
+    // True when any member still holds a valid lease at `now`, so the group was
+    // recently used and must be skipped this eviction round. Members live in
+    // their own metadata shards (hash(tenant, key)); the trigger key's
+    // already-locked tenant state is reused instead of re-locking its shard.
+    bool GroupHasActiveLease(const TenantId& tenant_id,
+                             const std::vector<std::string>& member_keys,
+                             const std::string& trigger_key,
+                             const TenantState& trigger_tenant_state,
+                             std::chrono::system_clock::time_point now) const;
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -1908,10 +1969,7 @@ class MasterService {
         const std::string& why, const TenantId& tenant_id,
         const std::string& key, ObjectMetadata& metadata,
         const StaleHandleCleanupPlan& plan);
-    void RebuildGroupRoutingIndex();
-    void GrantLeaseForGroup(const TenantState& tenant_state,
-                            const std::string& key,
-                            const ObjectMetadata& metadata) const;
+    void RebuildGroupState();
     static void ApplySoftPinMetricDelta(int metric_delta);
     size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
     void ApplySoftPinEvaluation(
@@ -2113,8 +2171,8 @@ class MasterService {
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
             : service_(service),
               object_id_(std::move(object_id)),
-              shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
-                                                         object_id_.user_key)),
+              shard_idx_(service_->getShardIndex(object_id_.tenant_id,
+                                                 object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
               tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
               tenant_state_(tenant_it_ == shard_guard_->tenants.end()
@@ -2349,8 +2407,8 @@ class MasterService {
                            ObjectIdentity object_id)
             : service_(service),
               object_id_(std::move(object_id)),
-              shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
-                                                         object_id_.user_key)),
+              shard_idx_(service_->getShardIndex(object_id_.tenant_id,
+                                                 object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
               tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
               tenant_state_(tenant_it_ == shard_guard_->tenants.end()
