@@ -97,6 +97,15 @@ class MasterServiceTest : public ::testing::Test {
         service.replica_cleanup_worker_.Schedule();
     }
 
+    void ClearInvalidHandlesForTest(MasterService& service) {
+        service.ClearInvalidHandles();
+    }
+
+    size_t MetadataShardIndexForTest(MasterService& service,
+                                     const std::string& key) const {
+        return service.getMetadataShardIndex(TenantId::Default(), key);
+    }
+
     void ExpectKeyHiddenFromReadApis(MasterService& service,
                                      const std::string& key) {
         auto get = service.GetReplicaList(key, TenantId::Default());
@@ -4466,6 +4475,87 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
                   .buffer_descriptor.transport_endpoint_,
               segment2.name);
     EXPECT_EQ(2u, service_->GetKeyCount());
+}
+
+// A mass client expiry marks handles stale all over the metadata table, so
+// the sweep cleans a shard in bounded write-lock batches instead of holding
+// it exclusively for the whole walk. Dropping and retaking the lock mid-shard
+// must not cost coverage: every key of the departed segment is erased, and
+// every key of a live segment survives. The keys are forced onto one shard
+// because the batch bound is per shard.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
+    auto service = std::make_unique<MasterService>();
+    PauseReplicaCleanup(*service);
+
+    constexpr size_t kSegmentSize = 1024 * 1024 * 128;
+    const std::string stale_segment_name = "batch_sweep_stale_segment";
+    const std::string live_segment_name = "batch_sweep_live_segment";
+    const auto stale_segment = PrepareSimpleSegment(
+        *service, stale_segment_name, 0x300000000, kSegmentSize);
+    const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
+                                                   0x400000000, kSegmentSize);
+
+    // Enough keys per segment that draining the shard takes several batches.
+    constexpr size_t kKeysPerSegment = 100;
+    const size_t target_shard =
+        MetadataShardIndexForTest(*service, "batch_sweep_seed");
+
+    std::vector<std::string> stale_keys;
+    std::vector<std::string> live_keys;
+    for (size_t i = 0;
+         stale_keys.size() + live_keys.size() < 2 * kKeysPerSegment; ++i) {
+        ASSERT_LT(i, 1000000u)
+            << "could not gather enough keys on shard " << target_shard;
+        const std::string key = "batch_sweep_key_" + std::to_string(i);
+        if (MetadataShardIndexForTest(*service, key) != target_shard) {
+            continue;
+        }
+
+        const bool on_stale_segment = stale_keys.size() < kKeysPerSegment;
+        const UUID& client_id =
+            on_stale_segment ? stale_segment.client_id : live_segment.client_id;
+        const std::string& segment_name =
+            on_stale_segment ? stale_segment_name : live_segment_name;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {segment_name};
+
+        auto put_start = service->PutStart(client_id, key, TenantId::Default(),
+                                           1024, config);
+        ASSERT_TRUE(put_start.has_value()) << "key=" << key;
+        ASSERT_EQ(1u, put_start->size());
+        ASSERT_EQ(segment_name, (*put_start)[0]
+                                    .get_memory_descriptor()
+                                    .buffer_descriptor.transport_endpoint_);
+        ASSERT_TRUE(service
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value());
+        (on_stale_segment ? stale_keys : live_keys).push_back(key);
+    }
+
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    // GetKeyCount counts physical metadata, so it distinguishes "swept" from
+    // "merely hidden from the read paths by the unmount".
+    EXPECT_EQ(live_keys.size(), service->GetKeyCount());
+    for (const auto& key : stale_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get_result.has_value()) << "key=" << key;
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error())
+            << "key=" << key;
+    }
+    for (const auto& key : live_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(get_result.has_value()) << "key=" << key << " was swept";
+        ASSERT_EQ(1u, get_result->replicas.size()) << "key=" << key;
+        EXPECT_TRUE(get_result->replicas[0].is_memory_replica())
+            << "key=" << key;
+    }
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
