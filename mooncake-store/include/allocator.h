@@ -139,10 +139,6 @@ class BufferAllocatorBase {
     void AttachUsageTracker(
         const std::shared_ptr<StorageUsageTracker>& usage_tracker);
 
-    static void SetRecordDeallocationHookForTesting(void (*hook)()) noexcept {
-        record_deallocation_hook_.store(hook, std::memory_order_release);
-    }
-
    protected:
     [[nodiscard]] size_t GetUsageBytes() const noexcept {
         return cur_size_.load(std::memory_order_relaxed);
@@ -156,7 +152,6 @@ class BufferAllocatorBase {
    private:
     std::atomic_size_t cur_size_{0};
     std::unique_ptr<StorageUsageRegistration> usage_registration_;
-    static std::atomic<void (*)()> record_deallocation_hook_;
 };
 
 /**

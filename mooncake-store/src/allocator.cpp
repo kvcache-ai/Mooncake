@@ -11,8 +11,6 @@
 
 namespace mooncake {
 
-std::atomic<void (*)()> BufferAllocatorBase::record_deallocation_hook_{nullptr};
-
 void BufferAllocatorBase::AttachUsageTracker(
     const std::shared_ptr<StorageUsageTracker>& usage_tracker) {
     if (!usage_tracker || usage_registration_) {
@@ -30,9 +28,6 @@ void BufferAllocatorBase::RecordAllocation(size_t bytes) noexcept {
 }
 
 void BufferAllocatorBase::RecordDeallocation(size_t bytes) noexcept {
-    if (auto hook = record_deallocation_hook_.load(std::memory_order_acquire)) {
-        hook();
-    }
     cur_size_.fetch_sub(bytes, std::memory_order_relaxed);
     if (usage_registration_) {
         usage_registration_->RemoveUsedBytes(bytes);

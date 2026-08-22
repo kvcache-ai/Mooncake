@@ -13,11 +13,33 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <semaphore>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace mooncake {
+
+namespace {
+
+class BlockingOffsetBufferAllocator : public OffsetBufferAllocator {
+   public:
+    BlockingOffsetBufferAllocator(std::string segment_name, size_t base,
+                                  size_t size, std::string transport_endpoint)
+        : OffsetBufferAllocator(std::move(segment_name), base, size,
+                                std::move(transport_endpoint)) {}
+
+    void deallocate(AllocatedBuffer* handle) override {
+        entered_.release();
+        resume_.acquire();
+        OffsetBufferAllocator::deallocate(handle);
+    }
+
+    std::binary_semaphore entered_{0};
+    std::binary_semaphore resume_{0};
+};
+
+}  // namespace
 
 // Test fixture for Segment tests
 class SegmentTest : public ::testing::Test {
@@ -262,49 +284,36 @@ TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
     segment.base = 0x1C0000000;
     UUID client_id = generate_uuid();
 
-    std::shared_ptr<BufferAllocatorBase> allocator;
+    auto blocking = std::make_shared<BlockingOffsetBufferAllocator>(
+        segment.name, segment.base, segment.size, segment.te_endpoint);
     {
         auto segment_access = segment_manager.getSegmentAccess();
         ASSERT_EQ(segment_access.MountSegment(segment, client_id),
                   ErrorCode::OK);
-        allocator = segment_access.GetAllocator(segment.id);
+        auto original = segment_access.GetAllocator(segment.id);
+        ASSERT_NE(original, nullptr);
+        ASSERT_TRUE(segment_access.ReplaceAllocators(
+            {{segment.id, original, blocking}}));
     }
-    ASSERT_NE(allocator, nullptr);
-    auto buffer = allocator->allocate(kAllocationSize);
+    auto buffer = blocking->allocate(kAllocationSize);
     ASSERT_NE(buffer, nullptr);
 
-    std::atomic<int> phase{0};
-    static std::atomic<int>* phase_ptr = nullptr;
-    phase_ptr = &phase;
-    BufferAllocatorBase::SetRecordDeallocationHookForTesting([]() {
-        phase_ptr->store(1, std::memory_order_release);
-        while (phase_ptr->load(std::memory_order_acquire) != 2) {
-            std::this_thread::yield();
-        }
-    });
-
-    std::thread dealloc_thread([&buffer] { buffer.reset(); });
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    struct Cleanup {
-        std::atomic<int>& phase;
-        std::thread& thread;
-        ~Cleanup() {
-            phase.store(2, std::memory_order_release);
-            if (thread.joinable()) {
-                thread.join();
-            }
-            BufferAllocatorBase::SetRecordDeallocationHookForTesting(nullptr);
-        }
-    } cleanup{phase, dealloc_thread};
-
-    while (phase.load(std::memory_order_acquire) != 1) {
-        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
-            << "deallocate did not enter RecordDeallocation";
-        std::this_thread::yield();
-    }
-
     {
+        std::thread dealloc_thread([&buffer] { buffer.reset(); });
+        struct ResumeAndJoin {
+            BlockingOffsetBufferAllocator& blocking;
+            std::thread& thread;
+            ~ResumeAndJoin() {
+                blocking.resume_.release();
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+        } resume_and_join{*blocking, dealloc_thread};
+
+        ASSERT_TRUE(blocking->entered_.try_acquire_for(std::chrono::seconds(5)))
+            << "deallocate did not enter BlockingOffsetBufferAllocator";
+
         auto segment_access = segment_manager.getSegmentAccess();
         size_t metrics_dec_capacity = 0;
         ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
@@ -314,11 +323,7 @@ TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
                                                       metrics_dec_capacity),
                   ErrorCode::OK);
     }
-
-    cleanup.phase.store(2, std::memory_order_release);
-    dealloc_thread.join();
-    BufferAllocatorBase::SetRecordDeallocationHookForTesting(nullptr);
-    allocator.reset();
+    blocking.reset();
 
     const auto usage = segment_manager.GetMemoryUsage();
     EXPECT_EQ(usage.used_bytes, 0u);

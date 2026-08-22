@@ -551,6 +551,8 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
               0);
     EXPECT_EQ(metrics.get_segment_total_mem_capacity("stale_leader_segment"),
               0);
+    EXPECT_EQ(metrics_resp.body.find("stale_leader_segment"),
+              std::string::npos);
 
     auto leader_resp = FetchUrl(http_port, "/leader");
     EXPECT_EQ(leader_resp.http_status, 200);
@@ -569,6 +571,36 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
               std::string::npos);
 
     admin_server.Stop();
+}
+
+TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
+    auto& metrics = MasterMetricManager::instance();
+    const std::string mem_segment = "projected_removed_mem_segment";
+    const std::string nof_segment = "projected_removed_nof_segment";
+
+    TieredStorageUsageSnapshot snapshot;
+    snapshot.memory.used_bytes = 4096;
+    snapshot.memory.capacity_bytes = 8192;
+    snapshot.memory.segments[mem_segment] = {4096, 8192};
+    snapshot.nof.used_bytes = 1024;
+    snapshot.nof.capacity_bytes = 4096;
+    snapshot.nof.segments[nof_segment] = {1024, 4096};
+    metrics.project_storage_usage(snapshot);
+
+    const std::string with_labels = metrics.serialize_metrics();
+    EXPECT_NE(with_labels.find("segment=\"" + mem_segment + "\""),
+              std::string::npos);
+    EXPECT_NE(with_labels.find("segment=\"" + nof_segment + "\""),
+              std::string::npos);
+
+    metrics.project_storage_usage({});
+    const std::string after = metrics.serialize_metrics();
+    EXPECT_EQ(after.find("segment=\"" + mem_segment + "\""), std::string::npos);
+    EXPECT_EQ(after.find("segment=\"" + nof_segment + "\""), std::string::npos);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_allocated_nof_size(), 0);
+    EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
 }
 
 TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
@@ -627,6 +659,11 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     admin_server.SetServiceAvailable(false);
     EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
     EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    {
+        const std::string serialized = metrics.serialize_metrics();
+        EXPECT_EQ(serialized.find("segment=\"" + segment.name + "\""),
+                  std::string::npos);
+    }
     EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
 
@@ -635,6 +672,8 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     EXPECT_NE(metrics_resp.body.find("master_allocated_bytes 0"),
               std::string::npos);
     EXPECT_NE(metrics_resp.body.find("master_total_capacity_bytes 0"),
+              std::string::npos);
+    EXPECT_EQ(metrics_resp.body.find("segment=\"" + segment.name + "\""),
               std::string::npos);
     admin_server.SetServiceAvailable(true);
     metrics_resp = FetchUrl(http_port, "/metrics");

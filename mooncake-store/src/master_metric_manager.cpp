@@ -766,8 +766,10 @@ void MasterMetricManager::project_storage_usage(
         }
         for (const auto& segment_name : projected_segments) {
             if (!current_segments.contains(segment_name)) {
-                allocated_by_segment.update({segment_name}, 0);
-                capacity_by_segment.update({segment_name}, 0);
+                allocated_by_segment.remove_label_value(
+                    {{"segment", segment_name}});
+                capacity_by_segment.remove_label_value(
+                    {{"segment", segment_name}});
             }
         }
         projected_segments = std::move(current_segments);
