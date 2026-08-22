@@ -14,7 +14,7 @@
 
 #define private public
 #define protected public
-#include "async_metadata_notifier.h"
+#include "p2p/client/async_metadata_notifier.h"
 
 #include "p2p/master/p2p_master_client.h"
 #include "rpc_types.h"

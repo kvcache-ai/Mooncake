@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #define protected public
-#include "p2p_client_service.h"
+#include "p2p/client/p2p_client_service.h"
 #undef protected
 
 #ifdef STORE_USE_REDIS

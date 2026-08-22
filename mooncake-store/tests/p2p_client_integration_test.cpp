@@ -20,8 +20,8 @@
 #include <thread>
 #include <vector>
 
-#include "p2p_client_metric.h"
-#include "p2p_client_service.h"
+#include "p2p/client/p2p_client_metric.h"
+#include "p2p/client/p2p_client_service.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"
 

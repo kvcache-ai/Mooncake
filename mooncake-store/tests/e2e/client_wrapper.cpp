@@ -3,7 +3,7 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "p2p_client_service.h"
+#include "p2p/client/p2p_client_service.h"
 #include "utils.h"
 
 namespace mooncake {

@@ -1,11 +1,11 @@
-#include "client_metrics_aggregator.h"
+#include "p2p/client/client_metrics_aggregator.h"
 
 #include <glog/logging.h>
 
 #include <iomanip>
 #include <sstream>
 
-#include "p2p_client_metric.h"
+#include "p2p/client/p2p_client_metric.h"
 #include "utils.h"
 
 namespace mooncake {

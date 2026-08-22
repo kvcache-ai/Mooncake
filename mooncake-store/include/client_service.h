@@ -16,7 +16,7 @@
 
 #include "client_metric.h"
 #include "ha_helper.h"
-#include "inflight_tracker.h"
+#include "p2p/client/inflight_tracker.h"
 #include "transfer_engine.h"
 #include "types.h"
 #include "p2p/master/p2p_rpc_types.h"
@@ -27,7 +27,7 @@
 #include <ylt/coro_http/coro_http_server.hpp>
 #include "client_config_builder.h"
 #include "client_buffer.hpp"
-#include "runtime_config_store.h"
+#include "p2p/client/runtime_config_store.h"
 
 namespace mooncake {
 

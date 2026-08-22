@@ -15,16 +15,16 @@
 #include <async_simple/Try.h>
 #include <async_simple/coro/Lazy.h>
 
-#include "async_metadata_notifier.h"
+#include "p2p/client/async_metadata_notifier.h"
 #include "client_service.h"
-#include "data_manager.h"
-#include "client_rpc_service.h"
+#include "p2p/client/data_manager.h"
+#include "p2p/client/client_rpc_service.h"
 #include "ha_recovery_manager.h"
-#include "peer_client.h"
-#include "p2p_client_metric.h"
+#include "p2p/client/peer_client.h"
+#include "p2p/client/p2p_client_metric.h"
 #include "p2p/master/p2p_master_client.h"
-#include "route_cache.h"
-#include "task_handle.h"
+#include "p2p/client/route_cache.h"
+#include "p2p/client/task_handle.h"
 
 namespace mooncake {
 

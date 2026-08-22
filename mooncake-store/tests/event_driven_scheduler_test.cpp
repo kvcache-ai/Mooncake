@@ -10,7 +10,7 @@
 #include <thread>
 #include <vector>
 
-#include "p2p_client_metric.h"
+#include "p2p/client/p2p_client_metric.h"
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"  // TempDRAMBuffer
 #include "utils/common.h"                   // InitTieredBackendForTest

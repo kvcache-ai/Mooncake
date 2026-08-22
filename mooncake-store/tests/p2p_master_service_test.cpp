@@ -12,7 +12,7 @@
 #undef private
 
 #include "master_config.h"
-#include "p2p_client_meta.h"
+#include "p2p/client/p2p_client_meta.h"
 #include "p2p/master/p2p_rpc_types.h"
 #include "rpc_types.h"
 #include "types.h"

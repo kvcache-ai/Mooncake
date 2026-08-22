@@ -1,4 +1,4 @@
-#include "async_metadata_notifier.h"
+#include "p2p/client/async_metadata_notifier.h"
 
 #include <glog/logging.h>
 

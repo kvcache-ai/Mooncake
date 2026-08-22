@@ -19,15 +19,15 @@
 #include <async_simple/coro/Lazy.h>
 #include <ylt/coro_io/io_context_pool.hpp>
 #include <ylt/util/tl/expected.hpp>
-#include "async_memcpy_executor.h"
+#include "p2p/client/async_memcpy_executor.h"
 #include "client_buffer.hpp"
 #include "client_config_builder.h"
-#include "task_handle.h"
+#include "p2p/client/task_handle.h"
 #include "tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
 #include "types.h"
 #include "utils.h"
-#include "client_rpc_types.h"
+#include "p2p/client/client_rpc_types.h"
 
 namespace mooncake {
 

@@ -1,4 +1,4 @@
-#include "p2p_client_metric.h"
+#include "p2p/client/p2p_client_metric.h"
 
 #include <glog/logging.h>
 

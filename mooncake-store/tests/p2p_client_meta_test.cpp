@@ -6,7 +6,7 @@
 #include <random>
 #define private public
 #define protected public
-#include "p2p_client_meta.h"
+#include "p2p/client/p2p_client_meta.h"
 #undef private
 #undef protected
 #include "p2p/master/p2p_master_metric_manager.h"

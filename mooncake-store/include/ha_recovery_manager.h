@@ -9,8 +9,8 @@
 
 #include <boost/functional/hash.hpp>
 
-#include "async_metadata_notifier.h"
-#include "data_manager.h"
+#include "p2p/client/async_metadata_notifier.h"
+#include "p2p/client/data_manager.h"
 #include "p2p/master/p2p_master_client.h"
 #include "types.h"
 

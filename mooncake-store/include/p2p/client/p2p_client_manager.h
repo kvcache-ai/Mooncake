@@ -1,7 +1,7 @@
 #pragma once
 
 #include "client_manager.h"
-#include "p2p_client_meta.h"
+#include "p2p/client/p2p_client_meta.h"
 
 namespace mooncake {
 class P2PClientManager final : public ClientManager {

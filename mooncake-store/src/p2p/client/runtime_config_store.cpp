@@ -1,4 +1,4 @@
-#include "runtime_config_store.h"
+#include "p2p/client/runtime_config_store.h"
 
 #include <glog/logging.h>
 #include <type_traits>

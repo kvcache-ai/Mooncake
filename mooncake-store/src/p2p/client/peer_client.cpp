@@ -1,9 +1,9 @@
-#include "peer_client.h"
+#include "p2p/client/peer_client.h"
 
 #include <cstdlib>
 #include <glog/logging.h>
 
-#include "client_rpc_service.h"
+#include "p2p/client/client_rpc_service.h"
 #include "types.h"
 
 namespace mooncake {

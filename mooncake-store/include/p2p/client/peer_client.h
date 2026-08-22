@@ -1,6 +1,6 @@
 #pragma once
 
-#include "client_rpc_types.h"
+#include "p2p/client/client_rpc_types.h"
 #include "types.h"
 #include <csignal>
 #include <vector>

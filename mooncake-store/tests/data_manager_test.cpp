@@ -12,7 +12,7 @@
 
 #define private public
 #define protected public
-#include "data_manager.h"
+#include "p2p/client/data_manager.h"
 #include "tiered_cache/tiered_backend.h"
 #include "utils/common.h"
 #include "transfer_engine.h"

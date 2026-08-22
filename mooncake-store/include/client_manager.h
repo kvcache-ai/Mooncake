@@ -8,7 +8,7 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "heartbeat_type.h"
+#include "p2p/client/heartbeat_type.h"
 #include "client_meta.h"
 #include "mutex.h"
 #include "rpc_types.h"

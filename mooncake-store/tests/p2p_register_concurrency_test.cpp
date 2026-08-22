@@ -27,7 +27,7 @@
 // Read private heartbeat_running_ / registered_ for state assertions.
 #define private public
 #define protected public
-#include "p2p_client_service.h"
+#include "p2p/client/p2p_client_service.h"
 #undef protected
 #undef private
 

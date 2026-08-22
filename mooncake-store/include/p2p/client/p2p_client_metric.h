@@ -11,7 +11,7 @@
 #include <ylt/metric/gauge.hpp>
 
 #include "client_metric.h"
-#include "heartbeat_type.h"
+#include "p2p/client/heartbeat_type.h"
 #include "types.h"
 
 namespace mooncake {

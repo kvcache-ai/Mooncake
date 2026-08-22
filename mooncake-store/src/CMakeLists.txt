@@ -2,15 +2,12 @@
 add_subdirectory(cachelib_memory_allocator)
 
 set(MOONCAKE_STORE_SOURCES
-    async_memcpy_executor.cpp
     replica.cpp
     allocator.cpp
     master_service.cpp
     centralized_master_service.cpp
     client_service.cpp
     centralized_client_service.cpp
-    p2p_client_service.cpp
-    p2p_client_metric.cpp
     client_metric.cpp
     types.cpp
     master_client.cpp
@@ -18,7 +15,6 @@ set(MOONCAKE_STORE_SOURCES
     utils.cpp
     master_metric_manager.cpp
     centralized_master_metric_manager.cpp
-    client_metrics_aggregator.cpp
     storage_backend.cpp
     thread_pool.cpp
     etcd_helper.cpp
@@ -29,8 +25,6 @@ set(MOONCAKE_STORE_SOURCES
     client_manager.cpp
     centralized_client_manager.cpp
     centralized_client_meta.cpp
-    p2p_client_manager.cpp
-    p2p_client_meta.cpp
     transfer_task.cpp
     etcd_helper.cpp
     ha_helper.cpp
@@ -46,13 +40,7 @@ set(MOONCAKE_STORE_SOURCES
     tiered_cache/copier_registry.cpp
     tiered_cache/data_copier.cpp
     tiered_cache/tiered_backend.cpp
-    data_manager.cpp
-    route_cache.cpp
-    async_metadata_notifier.cpp
     ha_recovery_manager.cpp
-    client_rpc_service.cpp
-    peer_client.cpp
-    runtime_config_store.cpp
     tiered_cache/tiers/dram_tier.cpp
     tiered_cache/tiers/storage_tier.cpp
     tiered_cache/scheduler/simple_policy.cpp
@@ -170,6 +158,18 @@ set(MOONCAKE_STORE_P2P_SOURCES
     p2p/master/p2p_master_metric_manager.cpp
     p2p/master/p2p_segment_manager.cpp
     p2p/master/p2p_rpc_service.cpp
+    p2p/client/p2p_client_service.cpp
+    p2p/client/p2p_client_manager.cpp
+    p2p/client/p2p_client_meta.cpp
+    p2p/client/p2p_client_metric.cpp
+    p2p/client/peer_client.cpp
+    p2p/client/client_rpc_service.cpp
+    p2p/client/data_manager.cpp
+    p2p/client/route_cache.cpp
+    p2p/client/async_memcpy_executor.cpp
+    p2p/client/async_metadata_notifier.cpp
+    p2p/client/client_metrics_aggregator.cpp
+    p2p/client/runtime_config_store.cpp
 )
 
 add_library(mooncake_store_p2p ${MOONCAKE_STORE_P2P_SOURCES})

@@ -8,7 +8,7 @@
 #include "types.h"
 #include "p2p/master/p2p_rpc_types.h"
 #include "rpc_types.h"
-#include "runtime_config_store.h"
+#include "p2p/client/runtime_config_store.h"
 
 #include <cstdlib>  // for atexit
 #include <cstdint>

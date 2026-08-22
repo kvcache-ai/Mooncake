@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-#include "client_metrics_aggregator.h"
+#include "p2p/client/client_metrics_aggregator.h"
 #include "master_metric_manager.h"
 
 namespace mooncake {

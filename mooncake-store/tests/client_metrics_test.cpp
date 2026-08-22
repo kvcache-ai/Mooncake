@@ -12,7 +12,7 @@
 #include <ylt/struct_pack.hpp>
 
 #include "client_metric.h"
-#include "p2p_client_metric.h"
+#include "p2p/client/p2p_client_metric.h"
 #include "tiered_cache/tiers/cache_tier.h"
 
 namespace mooncake::test {

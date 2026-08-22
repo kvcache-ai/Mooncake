@@ -1,6 +1,6 @@
-#include "p2p_client_manager.h"
+#include "p2p/client/p2p_client_manager.h"
 #include "p2p/master/p2p_master_metric_manager.h"
-#include "p2p_client_meta.h"
+#include "p2p/client/p2p_client_meta.h"
 #include <glog/logging.h>
 #include <algorithm>
 

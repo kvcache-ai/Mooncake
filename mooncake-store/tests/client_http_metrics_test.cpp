@@ -9,7 +9,7 @@
 #include <csignal>
 #include "client_config_builder.h"
 #include "client_metric.h"
-#include "p2p_client_metric.h"
+#include "p2p/client/p2p_client_metric.h"
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_http/coro_http_client.hpp>
 

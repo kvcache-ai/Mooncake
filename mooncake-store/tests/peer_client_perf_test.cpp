@@ -17,10 +17,10 @@
 
 #include <cstring>
 
-#include "client_rpc_service.h"
-#include "client_rpc_types.h"
-#include "data_manager.h"
-#include "peer_client.h"
+#include "p2p/client/client_rpc_service.h"
+#include "p2p/client/client_rpc_types.h"
+#include "p2p/client/data_manager.h"
+#include "p2p/client/peer_client.h"
 #include "tiered_cache/tiered_backend.h"
 #include "utils/common.h"
 #include "transfer_engine.h"

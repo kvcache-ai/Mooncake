@@ -11,7 +11,7 @@
 #include <optional>
 #include <thread>
 
-#include "inflight_tracker.h"
+#include "p2p/client/inflight_tracker.h"
 
 namespace mooncake {
 
