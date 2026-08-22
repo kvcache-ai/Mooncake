@@ -1,5 +1,10 @@
 #include <gflags/gflags.h>
 #include <csignal>
+#include <cstring>
+#include <chrono>
+#include <thread>
+#include <asio/io_context.hpp>
+#include <asio/signal_set.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
@@ -27,6 +32,18 @@ DEFINE_bool(start_offload_rpc_server, true,
             "(batch_get_offload_object / release_offload_buffer). "
             "Effective only when --enable_offload is true. "
             "Disable for a write-only owner.");
+DEFINE_uint32(graceful_unmount_seconds, 0,
+              "Grace period, in seconds, for unmounting segments on shutdown. "
+              "0 (default) unmounts immediately. When greater than zero, a "
+              "termination signal first asks the master to stop allocating on "
+              "this client's segments while keeping them readable, and the "
+              "process stays alive (holding its memory registrations) until "
+              "the master released them, so peers that already hold segment "
+              "information can finish their reads. Standalone client only.");
+DEFINE_uint32(graceful_unmount_timeout_slack_seconds, 45,
+              "Extra seconds added to --graceful_unmount_seconds to bound the "
+              "shutdown wait. Covers the master-side scheduler delay and the "
+              "client-side confirmation retries.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -103,6 +120,34 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
 }
 }  // namespace mooncake
 
+namespace {
+
+// Runs the graceful-unmount sequence for the standalone client.
+//
+// The standalone binary owns the termination-signal policy: it decides the
+// grace period and the deadline, while Client only exposes the mechanism
+// (initiate + await). RealClient::tearDownAll() keeps its immediate,
+// deterministic semantics and is left to the regular teardown below.
+void GracefulUnmountBeforeExit(RealClient &client) {
+    if (FLAGS_graceful_unmount_seconds == 0 || !client.client_) {
+        return;
+    }
+    const auto grace = std::chrono::seconds(FLAGS_graceful_unmount_seconds);
+    const size_t requested = client.client_->GracefulUnmountAll(
+        std::chrono::duration_cast<std::chrono::milliseconds>(grace).count());
+    if (requested == 0) {
+        return;
+    }
+    // The deadline must outlast the announced grace period: the master applies
+    // it on its own scheduler and the client re-checks removal afterwards.
+    const auto deadline =
+        std::chrono::steady_clock::now() + grace +
+        std::chrono::seconds(FLAGS_graceful_unmount_timeout_slack_seconds);
+    client.client_->WaitForGracefulUnmountAll(deadline);
+}
+
+}  // namespace
+
 int main(int argc, char *argv[]) {
     // Attention !!!
     // Initialization of ResourceTracker must be the most earliest.
@@ -144,8 +189,53 @@ int main(int argc, char *argv[]) {
     coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, rpc_bind_host);
     RegisterClientRpcService(server, *client_inst);
 
+    // Termination signals are handled here, in the standalone entry point,
+    // rather than in the shared ResourceTracker: signal disposition is
+    // process-wide state and must not be claimed by a library that is also
+    // linked into Python and other embedders.
+    //
+    // asio::signal_set installs a process-wide handler, so the signal is caught
+    // no matter which thread the kernel picks. However, ResourceTracker blocks
+    // these signals in the main thread and every thread that inherits its mask,
+    // and a blocked signal is never delivered to a handler -- it stays pending
+    // for that sigwait thread instead. Unblocking them only on the thread that
+    // runs this io_context therefore makes delivery deterministic: it is the
+    // only thread eligible to take them, so asio always wins the race.
+    asio::io_context signal_io;
+    asio::signal_set signals(signal_io, SIGINT, SIGTERM, SIGHUP);
+    signals.async_wait([&](const asio::error_code &ec, int sig) {
+        if (ec) {
+            return;
+        }
+        LOG(INFO) << "Received signal " << sig << ", shutting down";
+        GracefulUnmountBeforeExit(*client_inst);
+        server.stop();
+    });
+
+    std::thread signal_thread([&signal_io]() {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGINT);
+        sigaddset(&set, SIGTERM);
+        sigaddset(&set, SIGHUP);
+        if (int rc = pthread_sigmask(SIG_UNBLOCK, &set, nullptr); rc != 0) {
+            LOG(ERROR) << "Failed to unblock termination signals on the signal "
+                          "thread: "
+                       << strerror(rc);
+            return;
+        }
+        signal_io.run();
+    });
+
     LOG(INFO) << "Starting real client service on " << rpc_bind_host << ":"
               << FLAGS_port;
 
-    return server.start();
+    const auto rc = server.start();
+
+    signals.cancel();
+    signal_io.stop();
+    if (signal_thread.joinable()) {
+        signal_thread.join();
+    }
+    return rc;
 }

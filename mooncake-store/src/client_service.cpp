@@ -517,6 +517,7 @@ Client::~Client() {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_.clear();
         gracefully_unmounting_segments_.clear();
+        gracefully_unmounting_done_cv_.notify_all();
     }
 
     for (auto& entry : graceful_cleanup_callbacks) {
@@ -3587,6 +3588,57 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentById(
     return {};
 }
 
+size_t Client::GracefulUnmountAll(uint64_t grace_period_ms) {
+    // Snapshot the ids first: UnmountSegmentById takes mounted_segments_mutex_
+    // itself, so we must not hold it across the calls.
+    std::vector<UUID> segment_ids;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        segment_ids.reserve(mounted_segments_.size());
+        for (const auto& [id, segment] : mounted_segments_) {
+            segment_ids.push_back(id);
+        }
+    }
+
+    size_t graceful_ok = 0;
+    for (const auto& id : segment_ids) {
+        auto result = UnmountSegmentById(id, grace_period_ms);
+        if (result.has_value()) {
+            graceful_ok++;
+        } else {
+            // Leave the failed segment mounted; ~Client() will unmount it
+            // immediately as the fallback path.
+            LOG(WARNING) << "Graceful unmount failed for segment "
+                         << UuidToString(id)
+                         << ", error=" << toString(result.error())
+                         << "; it will fall back to immediate unmount";
+        }
+    }
+    if (!segment_ids.empty()) {
+        LOG(INFO) << "Graceful unmount requested for " << graceful_ok << "/"
+                  << segment_ids.size()
+                  << " segments, grace_period_ms=" << grace_period_ms;
+    }
+    return graceful_ok;
+}
+
+bool Client::WaitForGracefulUnmountAll(
+    std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lock(mounted_segments_mutex_);
+    const bool drained = gracefully_unmounting_done_cv_.wait_until(
+        lock, deadline,
+        [this]() { return gracefully_unmounting_segments_.empty(); });
+    if (drained) {
+        LOG(INFO) << "Graceful unmount of all segments completed";
+    } else {
+        LOG(WARNING) << "Graceful unmount deadline reached with "
+                     << gracefully_unmounting_segments_.size()
+                     << " segments still pending; leftovers are handled by "
+                        "~Client() and master-side client expiry";
+    }
+    return drained;
+}
+
 bool Client::WaitForGracefulUnmountDelay(std::chrono::milliseconds delay) {
     std::unique_lock<std::mutex> lock(graceful_unmount_timer_mutex_);
     return graceful_unmount_timer_cv_.wait_for(
@@ -3643,6 +3695,7 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
                         << rc;
                 }
                 gracefully_unmounting_segments_.erase(it);
+                gracefully_unmounting_done_cv_.notify_all();
             }
             auto callback_it =
                 graceful_unmount_cleanup_callbacks_.find(segment_id);
