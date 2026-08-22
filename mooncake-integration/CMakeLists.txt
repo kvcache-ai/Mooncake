@@ -38,9 +38,15 @@ find_package(
   REQUIRED)
 
 # pybind11 enables full LTO for Release modules unless IPO is explicitly set.
-# GNU LTO is prohibitively resource-intensive on RISC-V build hosts, so keep
-# the regular Release optimizations while disabling IPO in this directory.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+# GNU LTO is prohibitively resource-intensive on RISC-V build hosts, so keep the
+# regular Release optimizations while disabling IPO in this directory.
+if(USE_RISCV)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+    message(
+      WARNING
+        "USE_RISCV is enabled, but CMAKE_SYSTEM_PROCESSOR is '${CMAKE_SYSTEM_PROCESSOR}'"
+    )
+  endif()
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
   message(STATUS "RISC-V: IPO disabled for Mooncake Python extensions")
 endif()

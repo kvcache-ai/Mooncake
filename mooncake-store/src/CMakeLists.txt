@@ -107,8 +107,8 @@ set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
 
 # Some architectures implement 16-byte atomic operations in libatomic rather
-# than emitting native instructions. Boost.Lockfree uses these operations in
-# the Store master, so detect and propagate the runtime library when needed.
+# than emitting native instructions. Boost.Lockfree uses these operations in the
+# Store master, so detect and propagate the runtime library when needed.
 include(CheckCXXSourceCompiles)
 check_cxx_source_compiles(
   "
@@ -215,7 +215,10 @@ int main() {
     set(MOONCAKE_HAVE_NVME_URING_CMD ON)
     message(STATUS "io_uring: NVMe uring command support enabled")
   else()
-    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+    message(
+      STATUS
+        "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled"
+    )
   endif()
 endif()
 
