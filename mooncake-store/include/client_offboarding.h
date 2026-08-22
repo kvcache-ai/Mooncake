@@ -17,6 +17,9 @@
 namespace mooncake {
 
 class MasterService;
+namespace test {
+class MasterServiceTest;
+}
 
 struct PendingSegmentOffboarding {
     UUID segment_id;
@@ -65,10 +68,17 @@ class ClientOffboardingWorker {
     }
 
    private:
+    friend class test::MasterServiceTest;
+
     void ThreadFunc();
     void CompleteJob(const ClientOffboardingJob& job);
     void DropJob(const ClientOffboardingJob& job, const char* reason);
     static std::chrono::seconds RetryDelay(uint64_t retry_count);
+    static bool ShouldAlert(uint64_t retry_count) {
+        return retry_count >= kAlertRetryThreshold;
+    }
+
+    static constexpr uint64_t kAlertRetryThreshold = 10;
 
     MasterService* service_;
     std::thread thread_;

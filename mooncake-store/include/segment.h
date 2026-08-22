@@ -159,7 +159,11 @@ class ScopedSegmentAccess {
      */
     ErrorCode CommitUnmountSegment(const UUID& segment_id,
                                    const UUID& client_id,
-                                   const size_t& metrics_dec_capacity);
+                                   const size_t& metrics_dec_capacity,
+                                   bool retain_name_registration = false);
+
+    void ReleaseUnmountedSegmentName(const UUID& segment_id,
+                                     const std::string& segment_name);
 
     /**
      * @brief Get all the segments of a client
@@ -345,6 +349,10 @@ class ScopedAllocatorAccess {
 
     const AllocatorManager& getAllocatorManager() const {
         return allocator_manager_;
+    }
+
+    AllocatorManager SnapshotAllocatorManager() const {
+        return allocator_manager_.Snapshot(client_by_name_);
     }
 
     std::vector<std::string> GetHostOrderedSegments(

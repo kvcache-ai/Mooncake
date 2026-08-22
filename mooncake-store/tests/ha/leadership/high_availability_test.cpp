@@ -297,7 +297,9 @@ TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
     supervisor_config.nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     supervisor_config.nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
-    supervisor_config.client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    supervisor_config.client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    supervisor_config.client_suspicion_ttl_sec =
+        DEFAULT_CLIENT_SUSPICION_TTL_SEC;
     supervisor_config.nof_heartbeat_interval_sec =
         DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     supervisor_config.nof_heartbeat_probe_timeout_ms =
