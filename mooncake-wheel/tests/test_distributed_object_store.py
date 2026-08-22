@@ -728,6 +728,46 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertIsInstance(config_str, str)
         self.assertIn("3", config_str)  # Should contain replica_num
 
+    def test_put_get_with_agent_hints_config(self):
+        """Test put/get succeeds when ReplicateConfig carries AgentHints."""
+        from mooncake.store import AgentHints, ReplicateConfig
+
+        hints = AgentHints()
+        hints.workflow_id = "wf-python"
+        hints.agent_id = "planner"
+        hints.step_id = "step-1"
+        hints.step_index = 1
+        hints.total_steps = 2
+        hints.children_step_ids = ["step-2"]
+        hints.tool_name = "search"
+        hints.expected_tool_duration_ms = 100
+        hints.cache_ttl_ms = 60000
+        hints.shared_prefix_hash = "prefix-hash"
+        hints.reuse_hint = "keep"
+
+        config = ReplicateConfig()
+        config.agent_hints = hints
+
+        key = f"agent_hints_put_get_{os.getpid()}"
+        value = b"agent hints payload"
+        self.assertEqual(self.store.put(key, value, config), 0)
+        self.assertEqual(self.store.get(key), value)
+        self.assertEqual(self.store.remove(key, force=True), 0)
+
+    def test_put_rejects_invalid_agent_hints_config(self):
+        """Test raw byte puts reject invalid AgentHints."""
+        from mooncake.store import AgentHints, ReplicateConfig
+
+        config = ReplicateConfig()
+        hints = AgentHints()
+        hints.reuse_hint = "maybe"
+        config.agent_hints = hints
+
+        invalid_reuse_key = f"agent_hints_bad_reuse_{os.getpid()}"
+        self.assertEqual(self.store.put(invalid_reuse_key, b"payload", config),
+                         -600)
+        self.assertEqual(self.store.get(invalid_reuse_key), b"")
+
     def test_batch_get_buffer_operations(self):
         """Test batch_get_buffer operations for multiple keys."""
         # Test data

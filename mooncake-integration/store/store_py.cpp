@@ -1911,6 +1911,22 @@ PYBIND11_MODULE(store, m) {
         .value("GENERAL", ObjectDataType::GENERAL)
         .export_values();
 
+    py::class_<AgentHints>(m, "AgentHints")
+        .def(py::init<>())
+        .def_readwrite("workflow_id", &AgentHints::workflow_id)
+        .def_readwrite("agent_id", &AgentHints::agent_id)
+        .def_readwrite("step_id", &AgentHints::step_id)
+        .def_readwrite("step_index", &AgentHints::step_index)
+        .def_readwrite("total_steps", &AgentHints::total_steps)
+        .def_readwrite("parent_step_id", &AgentHints::parent_step_id)
+        .def_readwrite("children_step_ids", &AgentHints::children_step_ids)
+        .def_readwrite("tool_name", &AgentHints::tool_name)
+        .def_readwrite("expected_tool_duration_ms",
+                       &AgentHints::expected_tool_duration_ms)
+        .def_readwrite("cache_ttl_ms", &AgentHints::cache_ttl_ms)
+        .def_readwrite("shared_prefix_hash", &AgentHints::shared_prefix_hash)
+        .def_readwrite("reuse_hint", &AgentHints::reuse_hint);
+
     py::enum_<SoftPinAction>(m, "SoftPinAction")
         .value("PRESERVE", SoftPinAction::PRESERVE)
         .value("ENABLE", SoftPinAction::ENABLE)
@@ -1934,6 +1950,7 @@ PYBIND11_MODULE(store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_readwrite("agent_hints", &ReplicateConfig::agent_hints)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;

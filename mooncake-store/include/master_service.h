@@ -1043,7 +1043,8 @@ class MasterService {
             bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
             std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-            std::string user_key_ = {})
+            std::string user_key_ = {},
+            std::optional<AgentHints> agent_hints_ = std::nullopt)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
@@ -1053,6 +1054,7 @@ class MasterService {
               user_key(std::move(user_key_)),
               lease_timeout(),
               soft_pin_timeout(std::move(committed_soft_pin_timeout)),
+              agent_hints(std::move(agent_hints_)),
               hard_pinned(enable_hard_pin),
               replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
@@ -1090,6 +1092,8 @@ class MasterService {
         // carry a generation token, so a stale End from the same client cannot
         // otherwise be distinguished from the current write.
         std::optional<PendingSoftPinAction> pending_soft_pin_action;
+        std::optional<AgentHints> agent_hints
+            GUARDED_BY(lock);           // optional agent metadata
         const bool hard_pinned{false};  // immutable, set at creation
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
@@ -1483,6 +1487,16 @@ class MasterService {
         bool IsHardPinned() const { return hard_pinned; }
 
         bool IsGrouped() const { return !group_id.empty(); }
+
+        std::optional<AgentHints> GetAgentHints() const {
+            SpinLocker locker(&lock);
+            return agent_hints;
+        }
+
+        void SetAgentHints(std::optional<AgentHints> new_agent_hints) {
+            SpinLocker locker(&lock);
+            agent_hints = std::move(new_agent_hints);
+        }
 
         // Check if the metadata is valid
         // Valid means it has at least one valid replica and size is greater
@@ -2246,7 +2260,8 @@ class MasterService {
         void Create(const UUID& client_id, uint64_t total_length,
                     std::vector<Replica> replicas, bool enable_hard_pin = false,
                     ObjectDataType data_type = ObjectDataType::UNKNOWN,
-                    std::string group_id = "") {
+                    std::string group_id = "",
+                    std::optional<AgentHints> agent_hints = std::nullopt) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -2255,10 +2270,11 @@ class MasterService {
             auto result = tenant_state_->metadata.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(object_id_.user_key),
-                std::forward_as_tuple(
-                    client_id, now, total_length, std::move(replicas),
-                    std::nullopt, enable_hard_pin, data_type, group_id,
-                    object_id_.tenant_id, object_id_.user_key));
+                std::forward_as_tuple(client_id, now, total_length,
+                                      std::move(replicas), std::nullopt,
+                                      enable_hard_pin, data_type, group_id,
+                                      object_id_.tenant_id, object_id_.user_key,
+                                      std::move(agent_hints)));
             it_ = result.first;
         }
 
