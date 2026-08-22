@@ -124,7 +124,7 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
                                    const std::function<void()>& before_delete) {
     std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
     if (deferred_cleanup_batches_.count(batch_id) != 0) {
-        return Status::BatchBusy(
+        return Status::BatchCleanupDeferred(
             "BatchID is invalid because cleanup has already been deferred");
     }
 
@@ -136,16 +136,15 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
     deferred_cleanup_batches_.emplace(batch_id, before_delete);
     if (!deferred_cleanup_thread_.joinable()) {
         // Start the cleanup worker lazily after taking ownership of a busy
-        // batch. BatchBusy preserves the signal that in-flight transport work
-        // may still own buffers, while the message tells callers that the batch
-        // handle itself is invalid and must not be reused.
+        // batch. BatchCleanupDeferred tells callers that in-flight transport
+        // work may still own buffers but the batch handle is already invalid.
         deferred_cleanup_thread_ =
             std::thread(&MultiTransport::deferredCleanupLoop, this);
     }
     deferred_cleanup_cv_.notify_one();
     LOG(WARNING) << "Batch " << batch_id
                  << " is still busy; cleanup has been deferred";
-    return Status::BatchBusy(
+    return Status::BatchCleanupDeferred(
         "BatchID is invalid because cleanup has been deferred");
 }
 
@@ -179,8 +178,8 @@ Status MultiTransport::tryFreeBatchID(
         }
     }
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    if (batch_desc.active_completion_callbacks.load(std::memory_order_acquire) !=
-        0) {
+    if (batch_desc.active_completion_callbacks.load(
+            std::memory_order_acquire) != 0) {
         return Status::BatchBusy(
             "BatchID cannot be freed until completion callbacks are quiescent");
     }
