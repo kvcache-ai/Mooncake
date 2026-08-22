@@ -57,6 +57,28 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
 
 
+def test_lightweight_modules_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+
+    for module in ("buffer_pool.py", "mooncake_config.py"):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "unit" / "test_mooncake_config.py"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "test_buffer_pool_native.py"
+    ).is_file()
+    assert not (
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_mooncake_config.py"
+    ).exists()
+    assert not (
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_buffer_pool_native.py"
+    ).exists()
+
+
 def test_pg_extension_build_stages_outside_the_source_tree(
     tmp_path: Path,
 ) -> None:

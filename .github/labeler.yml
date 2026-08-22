@@ -5,7 +5,12 @@ run-ci:
 
 store:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-store/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-store/**/*'
+      - 'python/mooncake/buffer_pool.py'
+      - 'python/mooncake/mooncake_config.py'
+      - 'python/tests/store/**/*'
+      - 'python/tests/unit/test_mooncake_config.py'
 
 Transfer Engine:
   - changed-files:
@@ -57,6 +62,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:
