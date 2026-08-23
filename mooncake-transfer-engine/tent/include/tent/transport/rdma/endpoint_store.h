@@ -107,6 +107,7 @@ class SIEVEEndpointStore : public EndpointStore {
     size_t size() override;
 
     int remove(RdmaEndPoint *ep) override;
+    void evictAll() override;
     void evictOne() override;
     void reclaim() override;
 
