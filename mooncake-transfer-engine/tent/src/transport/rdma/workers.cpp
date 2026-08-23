@@ -326,7 +326,9 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
                 return Status::NeedsRefreshCache(
                     "Segment type is not Memory" LOC_MARK);
             }
-            hint.topo = std::shared_ptr<const Topology>(hint.pin, &std::get<MemorySegmentDesc>(segment->detail).topology);
+            hint.topo = std::shared_ptr<const Topology>(
+                hint.pin,
+                &std::get<MemorySegmentDesc>(segment->detail).topology);
             if (target_id != LOCAL_SEGMENT_ID) {
                 rpc_server_addr = segment->rpc_server_addr;
             }
@@ -881,7 +883,8 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
             return Status::OK();
         }));
 
-    hint.topo = std::shared_ptr<const Topology>(hint.pin, &std::get<MemorySegmentDesc>(hint.segment->detail).topology);
+    hint.topo = std::shared_ptr<const Topology>(
+        hint.pin, &std::get<MemorySegmentDesc>(hint.segment->detail).topology);
     std::string location = hint.buffer->location;
     if (!hint.buffer->regions.empty()) {
         size_t offset = hint.buffer->addr;
