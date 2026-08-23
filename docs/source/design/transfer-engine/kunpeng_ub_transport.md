@@ -39,25 +39,24 @@ sudo make install
 ### 3. Build Dependencies
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install -y \
-    build-essential \
+# openEuler 24.03 LTS-SP3 (with the everything and EPOL repositories enabled)
+sudo dnf install -y \
+    gcc \
+    gcc-c++ \
+    make \
     cmake \
     git \
-    libgflags-dev \
-    libgoogle-glog-dev \
-    libjsoncpp-dev \
-    libnuma-dev \
-    libibverbs-dev \
-    libboost-dev \
-    libcurl4-openssl-dev \
-    libgtest-dev \
-    libmsgpack-dev \
-    libxxhash-dev \
-    libyaml-cpp-dev \
-    pybind11-dev \
-    python3-dev
+    gflags-devel \
+    glog-devel \
+    jsoncpp-devel \
+    numactl-devel \
+    rdma-core-devel \
+    boost-devel \
+    libcurl-devel \
+    gtest-devel \
+    yaml-cpp-devel \
+    python3-devel \
+    python3-pip
 
 # Install yalantinglibs (required)
 cd /tmp
