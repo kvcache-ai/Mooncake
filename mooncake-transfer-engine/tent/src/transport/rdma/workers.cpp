@@ -934,8 +934,9 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
     if (!rail.ready() || target.topo != rail.remote())
-        rail.load(source.topo, target.topo, rail_topo_json_,
-                  transport_->conf_.get());
+        rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
+                  std::shared_ptr<const Topology>(target.pin, target.topo),
+                  rail_topo_json_, transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
