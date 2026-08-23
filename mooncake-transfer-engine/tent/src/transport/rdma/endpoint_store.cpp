@@ -323,7 +323,9 @@ void SIEVEEndpointStore::evictAll() {
     {
         RWSpinlock::WriteGuard guard(endpoint_map_lock_);
         to_evict.reserve(endpoint_map_.size());
-        for (auto& entry : endpoint_map_) to_evict.push_back(entry.second.first);
+        for (auto& entry : endpoint_map_) {
+            to_evict.push_back(entry.second.first);
+        }
         endpoint_map_.clear();
         fifo_list_.clear();
         fifo_map_.clear();
