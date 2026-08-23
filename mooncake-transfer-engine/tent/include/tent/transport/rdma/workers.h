@@ -94,7 +94,12 @@ class Workers {
         SegmentDesc* segment;
         BufferDesc* buffer;
         const Topology::MemEntry* topo_entry;
-        const Topology* topo;
+        // Shared pointer to the Topology inside the segment snapshot.
+        // Uses the shared_ptr aliasing constructor to share ownership of
+        // the SegmentDesc (via pin) while pointing at its Topology member.
+        // This keeps the Topology alive as long as RailMonitor holds a
+        // reference, preventing UAF after peer restart / cache refresh.
+        std::shared_ptr<const Topology> topo;
         std::string location;
     };
 

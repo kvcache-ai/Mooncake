@@ -15,6 +15,8 @@
 #ifndef TENT_RAIL_MONITOR_H
 #define TENT_RAIL_MONITOR_H
 
+#include <memory>
+
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
@@ -72,9 +74,9 @@ class RailMonitor {
 
     int findBestRemoteDevice(int local_nic, int remote_numa);
 
-    const Topology *local() const { return local_.get(); }
+    std::shared_ptr<const Topology> local() { return local_; }
 
-    const Topology *remote() const { return remote_.get(); }
+    std::shared_ptr<const Topology> remote() { return remote_; }
 
    private:
     Status loadFromJson(const std::string &rail_topo_json);
