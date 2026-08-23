@@ -9,6 +9,7 @@
 #include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
+#include <csignal>
 #include <ylt/coro_io/coro_io.hpp>
 #include <ylt/util/tl/expected.hpp>
 
