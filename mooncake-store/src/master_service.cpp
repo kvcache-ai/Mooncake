@@ -190,6 +190,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
+      exist_key_grant_lease_(config.exist_key_grant_lease),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       nof_eviction_ratio_(config.nof_eviction_ratio),
@@ -2903,8 +2904,17 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     }
 
     // Grant a lease to the object as it may be further used by the client.
-    // Read path is group-agnostic: only the object's own lease is refreshed.
-    metadata.GrantReadLease(std::chrono::milliseconds(default_kv_lease_ttl_));
+    // Read path is group-agnostic: only the object's own lease is refreshed
+    // (grouped objects share one Lease, so this extends the whole group TTL).
+    // Skipped when exist_key_grant_lease_ is false: probes can arrive far more
+    // often than real reads (e.g. vLLM KV-offload lookup), and every hit would
+    // keep the object -- or, for grouped objects, the whole group -- out of
+    // eviction. Real reads stay protected either way: GetReplicaList grants
+    // its own lease.
+    if (exist_key_grant_lease_) {
+        metadata.GrantReadLease(
+            std::chrono::milliseconds(default_kv_lease_ttl_));
+    }
     return true;
 }
 
@@ -2960,8 +2970,11 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
                 results[i] = false;
                 continue;
             }
-            metadata.GrantReadLease(
-                std::chrono::milliseconds(default_kv_lease_ttl_));
+            // See ExistKey: skipped when exist_key_grant_lease_ is false.
+            if (exist_key_grant_lease_) {
+                metadata.GrantReadLease(
+                    std::chrono::milliseconds(default_kv_lease_ttl_));
+            }
             results[i] = true;
         }
     }

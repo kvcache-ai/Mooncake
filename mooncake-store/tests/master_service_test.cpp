@@ -738,6 +738,77 @@ TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
              {std::nullopt, std::nullopt, size_t{1}, size_t{1}}, true);
 }
 
+TEST_F(MasterServiceTest, ExistKeyGrantsLeaseByDefaultBlockingEviction) {
+    // Upstream default: an ExistKey hit grants a read lease, so the object
+    // survives an eviction pass even under full eviction pressure.
+    auto service_config = MasterServiceConfig::builder().build();
+    MasterService service(service_config);
+    const auto context = PrepareSimpleSegment(service);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "exist_lease_default";
+    PutCompletedObject(service, context.client_id, key, config);
+
+    auto exists = service.ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_TRUE(exists.value());
+
+    // ExistKey granted a lease -> not evictable.
+    service.RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
+}
+
+TEST_F(MasterServiceTest, ExistKeyDoesNotGrantLeaseWhenDisabled) {
+    // exist_key_grant_lease=false: ExistKey probes must not lease, so the
+    // object stays evictable. This is the read-heavy (e.g. vLLM KV-offload
+    // lookup) opt-out that keeps eviction from being starved.
+    auto service_config =
+        MasterServiceConfig::builder().set_exist_key_grant_lease(false).build();
+    MasterService service(service_config);
+    const auto context = PrepareSimpleSegment(service);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "exist_lease_disabled";
+    PutCompletedObject(service, context.client_id, key, config);
+
+    auto exists = service.ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_TRUE(exists.value());
+
+    // No lease from ExistKey -> object is evicted under full pressure.
+    service.RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_FALSE(service.GetReplicaList(key, TenantId::Default()).has_value());
+
+    // A real read still grants its own lease regardless of the flag, so a
+    // freshly re-put object protected by GetReplicaList survives eviction.
+    PutCompletedObject(service, context.client_id, key, config);
+    ASSERT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
+    service.RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
+}
+
+TEST_F(MasterServiceTest, BatchExistKeyDoesNotGrantLeaseWhenDisabled) {
+    auto service_config =
+        MasterServiceConfig::builder().set_exist_key_grant_lease(false).build();
+    MasterService service(service_config);
+    const auto context = PrepareSimpleSegment(service);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "batch_exist_lease_disabled";
+    PutCompletedObject(service, context.client_id, key, config);
+
+    auto results = service.BatchExistKey({key}, TenantId::Default());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_TRUE(results[0].value());
+
+    service.RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_FALSE(service.GetReplicaList(key, TenantId::Default()).has_value());
+}
+
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     const TenantId tenant_a("tenant_restore_a");
     const TenantId tenant_b("tenant_restore_b");
