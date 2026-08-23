@@ -48,6 +48,13 @@ class EndpointStore {
     virtual size_t size() = 0;
 
     virtual void evictOne() = 0;
+
+    // Evict all endpoints: move every entry to the waiting list and begin
+    // destroying it.  Called on port recovery so that QPs that entered
+    // IBV_QPS_ERR while the link was down are torn down and rebuilt on the
+    // next getOrInsert().
+    virtual void evictAll() = 0;
+
     virtual void reclaim() = 0;
 };
 

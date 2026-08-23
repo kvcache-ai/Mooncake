@@ -505,10 +505,19 @@ int RdmaContext::pause() {
     return (expected == DEVICE_PAUSED) ? 0 : -1;
 }
 
+void RdmaContext::evictEndpoints() {
+    if (endpoint_store_) endpoint_store_->evictAll();
+}
+
 int RdmaContext::resume() {
     DeviceStatus expected = DEVICE_PAUSED;
     status_.compare_exchange_strong(expected, DEVICE_ENABLED);
-    return (expected == DEVICE_ENABLED) ? 0 : -1;
+    if (expected != DEVICE_PAUSED) return -1;
+    // Port recovered: evict all cached endpoints so stale QPs (which may
+    // have entered IBV_QPS_ERR while the link was down) are torn down and
+    // rebuilt on the next getOrInsert() call.
+    evictEndpoints();
+    return 0;
 }
 
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
