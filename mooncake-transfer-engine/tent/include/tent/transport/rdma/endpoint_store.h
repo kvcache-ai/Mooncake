@@ -74,6 +74,7 @@ class FIFOEndpointStore : public EndpointStore {
 
     size_t size() override;
 
+    void evictAll() override;
     void evictOne() override;
     void reclaim() override;
 
