@@ -6937,6 +6937,56 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
                                        metadata.user_key);
 }
 
+void MasterService::CancelReplicationTaskForRemovedSource(
+    TenantState& tenant_state, ObjectMetadata& metadata,
+    const std::vector<ReplicaID>& removed_replica_ids) {
+    if (removed_replica_ids.empty()) return;
+
+    auto task_it = tenant_state.replication_tasks.find(metadata.user_key);
+    if (task_it == tenant_state.replication_tasks.end()) return;
+    auto& task = task_it->second;
+
+    // Only cancel when the removed replica is the source of this task.
+    if (std::find(removed_replica_ids.begin(), removed_replica_ids.end(),
+                  task.source_id) == removed_replica_ids.end()) {
+        return;
+    }
+
+    // Decrement the source refcnt that CopyStart/MoveStart incremented.
+    if (auto* source = metadata.GetReplicaByID(task.source_id);
+        source != nullptr) {
+        source->dec_refcnt();
+    }
+
+    // Discard the PROCESSING target replicas.
+    const auto target_pred = [&task](const Replica& r) {
+        return std::find(task.replica_ids.begin(), task.replica_ids.end(),
+                         r.id()) != task.replica_ids.end();
+    };
+    auto removed_targets =
+        metadata.PopReplicasWithCacheTotalAccounting(target_pred);
+    std::vector<ReplicaID> erased_ids;
+    erased_ids.reserve(removed_targets.size());
+    for (const auto& r : removed_targets) erased_ids.push_back(r.id());
+    RecordDynamicReplicaRemoval(metadata, erased_ids);
+    if (!removed_targets.empty()) {
+        FreeDfsReplicas(metadata.user_key, removed_targets);
+    }
+
+    // Release reserved quota and erase the task.
+    ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                       task.pending_quota_charge_bytes);
+    if (task.dynamic_replication_lease_id != UUID{} ||
+        task.dynamic_replication_version_epoch != 0) {
+        ClearDynamicReplicationStateForKey(tenant_state, metadata.user_key);
+    }
+    tenant_state.replication_tasks.erase(task_it);
+
+    LOG(INFO) << "Cancelled replication task for key " << metadata.user_key
+              << ": source replica was removed, released "
+              << erased_ids.size() << " target(s) and reserved quota";
+}
+
 bool MasterService::CleanupStaleHandles(
     TenantState& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
@@ -6969,6 +7019,8 @@ bool MasterService::CleanupStaleHandles(
     EraseReplicasWithCacheTotalAccounting(metadata, is_stale,
                                           &removed_replica_ids);
     CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
+                                          removed_replica_ids);
+    CancelReplicationTaskForRemovedSource(tenant_state, metadata,
                                           removed_replica_ids);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (enable_multi_tenants_ && before_charge > after_charge) {

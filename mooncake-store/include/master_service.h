@@ -2072,6 +2072,20 @@ class MasterService {
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
+    // When a replica that is the source_id of an in-flight Copy/Move
+    // replication task is removed (e.g. its segment unmounted), the task is
+    // stranded: its PROCESSING targets never complete, the reserved tenant
+    // quota is never released, and the source refcnt is never decremented.
+    // This cancels such a task promptly: discard the PROCESSING targets,
+    // release reserved quota, decrement the source refcnt, and erase the
+    // task. Mirrors the cleanup done by DiscardExpiredProcessingReplicas /
+    // EraseMetadata for a completed replication task. No-op when there is no
+    // replication task, or its source_id is not among the removed replicas.
+    void CancelReplicationTaskForRemovedSource(
+        TenantState& tenant_state, ObjectMetadata& metadata,
+        const std::vector<ReplicaID>& removed_replica_ids)
+        NO_THREAD_SAFETY_ANALYSIS;
+
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
