@@ -16,9 +16,8 @@ class DataProtoCatalog:
 
     Calls to one catalog instance must be serialized by its host. Direct
     handles remain metadata-only. DataProtoCatalogTransfer marks only fresh,
-    independent fragments as managed so their physical lifetime can follow
-    logical references and active readers; append-derived handles are not
-    managed catalog fragments.
+    independent fragments as managed so their physical lifetime, including
+    append-derived handles, can follow logical references and active readers.
     """
 
     def __init__(self) -> None:
@@ -70,6 +69,73 @@ class DataProtoCatalog:
 
     def ack_publication(self, operation_id: str) -> None:
         self._publications.pop(_nonempty_string(operation_id, "operation_id"), None)
+
+    def publish_append(
+        self,
+        operation_id: str,
+        fragment_id: str,
+        partition: str,
+        keys: Sequence[str],
+        *,
+        previous_handle: Mapping[str, Any],
+        handle: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Idempotently replace a managed fragment with its appended handle."""
+        operation_id = _nonempty_string(operation_id, "operation_id")
+        previous = self._publications.get(operation_id)
+        if previous is not None:
+            return copy.deepcopy(previous)
+        if self._drained:
+            raise RuntimeError("DataProto catalog is drained")
+        fragment_id = _nonempty_string(fragment_id, "fragment_id")
+        partition = _nonempty_string(partition, "partition")
+        keys = _names(keys, "keys")
+        previous_ref, normalized_previous = _normalize_handle(previous_handle)
+        ref, normalized = _normalize_handle(handle)
+        current = self._fragments.get(fragment_id)
+        if current is None or fragment_id not in self._managed_fragments:
+            raise ValueError(f"DataProto fragment is not managed: {fragment_id!r}")
+        if current != normalized_previous:
+            raise ValueError(f"stale DataProto append handle: {fragment_id!r}")
+        if (
+            ref.batch_size != previous_ref.batch_size
+            or ref.batch_size != len(keys)
+            or ref.partition != previous_ref.partition
+            or ref.partition != partition
+            or ref._storage_group_id != previous_ref._storage_group_id
+        ):
+            raise ValueError("appended DataProto handle changed fragment identity")
+        previous_fields = previous_ref.field_index
+        if any(
+            ref.field_index.get(name) != location
+            for name, location in previous_fields.items()
+        ):
+            raise ValueError("appended DataProto handle changed existing fields")
+        new_fields = [
+            field for field in ref.field_index if field not in previous_fields
+        ]
+
+        entries = self._partitions.get(partition, {})
+        missing = [key for key in keys if key not in entries]
+        if missing:
+            raise ValueError(f"keys not found in partition {partition!r}: {missing}")
+        for row, key in enumerate(keys):
+            for field in new_fields:
+                location = (fragment_id, row)
+                old_location = entries[key]["fields"].get(field)
+                if old_location is not None:
+                    self._drop_fragment_reference(old_location[0])
+                entries[key]["fields"][field] = location
+                self._fragment_refcounts[fragment_id] += 1
+        self._fragments[fragment_id] = normalized
+        result = {
+            "keys": list(keys),
+            "tags": [copy.deepcopy(entries[key]["tag"]) for key in keys],
+            "fields": _field_union(entries, keys),
+            **self._retired_result(),
+        }
+        self._publications[operation_id] = copy.deepcopy(result)
+        return result
 
     def _update(
         self,
@@ -295,15 +361,24 @@ class DataProtoCatalog:
     def ack_retired(self, handles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         """Forget retired handles whose Store objects were removed successfully."""
         for handle in handles:
-            _ref, fragment_id, normalized = _normalize_handle(handle)
-            pending = self._retired.get(fragment_id)
-            if pending is None:
+            ref, normalized = _normalize_handle(handle)
+            fragment_id = next(
+                (
+                    key
+                    for key, pending in self._retired.items()
+                    if pending == normalized
+                ),
+                None,
+            )
+            if fragment_id is not None:
+                del self._retired[fragment_id]
                 continue
-            if pending != normalized:
-                raise ValueError(
-                    f"retired DataProto fragment mismatch: {fragment_id!r}"
-                )
-            del self._retired[fragment_id]
+            if len(ref.stage_refs) == 1:
+                fragment_id = next(iter(ref.stage_refs.values())).manifest_key
+                if fragment_id in self._retired:
+                    raise ValueError(
+                        f"retired DataProto fragment mismatch: {fragment_id!r}"
+                    )
         return self._retired_result()
 
     def _drop_fragment_reference(self, fragment_id: str) -> None:
@@ -374,10 +449,9 @@ class DataProtoCatalogTransfer:
             )
         publication = {
             "operation_id": uuid.uuid4().hex,
-            "partition": partition,
-            "keys": normalized_keys,
-            "tags": normalized_tags,
-            "handle": handle,
+            "method": "publish",
+            "args": (partition, normalized_keys),
+            "kwargs": {"tags": normalized_tags, "handle": handle},
         }
         for attempt in range(2):
             try:
@@ -388,6 +462,66 @@ class DataProtoCatalogTransfer:
                         self._pending_publications.append(publication)
                     raise
                 logger.exception("Retrying DataProto Catalog publication")
+        raise AssertionError("unreachable")
+
+    def append(
+        self,
+        fragment_id: str,
+        handle: Mapping[str, Any],
+        data: Any,
+        *,
+        partition: str,
+        keys: Sequence[str],
+        stage: str,
+        **append_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Append fields and transfer managed-fragment ownership to the result."""
+        self._retry_publication_acks()
+        self._retry_publications(strict=True)
+        fragment_id = _nonempty_string(fragment_id, "fragment_id")
+        partition = _nonempty_string(partition, "partition")
+        normalized_keys = _names(keys, "keys")
+        if append_kwargs.get("overwrite"):
+            raise ValueError("catalog append does not support overwrite")
+        if len(data) != len(normalized_keys):
+            raise ValueError(
+                f"DataProto batch size {len(data)} does not match {len(normalized_keys)} logical keys"
+            )
+        previous_ref, previous_handle = _normalize_handle(handle)
+        if previous_ref.partition != partition:
+            raise ValueError(
+                "DataProto handle partition does not match Catalog partition"
+            )
+        plan = self._catalog_call(
+            "resolve", partition, normalized_keys, list(previous_ref.field_index)
+        )
+        if plan["handles"].get(fragment_id) != previous_handle:
+            raise ValueError(f"stale DataProto append handle: {fragment_id!r}")
+        from mooncake.structured_object_store import export_dataproto_ref
+
+        appended_handle = export_dataproto_ref(
+            self.transfer.append_dataproto_fields(
+                previous_handle, data, stage=stage, **append_kwargs
+            )
+        )
+        publication = {
+            "operation_id": uuid.uuid4().hex,
+            "method": "publish_append",
+            "args": (fragment_id, partition, normalized_keys),
+            "kwargs": {
+                "previous_handle": previous_handle,
+                "handle": appended_handle,
+            },
+        }
+        for attempt in range(2):
+            try:
+                return self._publish(publication)
+            except Exception:
+                if attempt:
+                    with self._cleanup_lock:
+                        self._pending_publications.append(publication)
+                    raise
+                logger.exception("Retrying DataProto Catalog append publication")
         raise AssertionError("unreachable")
 
     def resolve(
@@ -469,12 +603,10 @@ class DataProtoCatalogTransfer:
     def _publish(self, publication: Mapping[str, Any]) -> dict[str, Any]:
         operation_id = publication["operation_id"]
         result = self._catalog_call(
-            "publish",
+            publication["method"],
             operation_id,
-            publication["partition"],
-            publication["keys"],
-            tags=publication["tags"],
-            handle=publication["handle"],
+            *publication["args"],
+            **publication["kwargs"],
         )
         self._cleanup_retired(result)
         self._ack_publication(operation_id)
@@ -538,26 +670,26 @@ class DataProtoCatalogTransfer:
 
 def _normalize_handle(
     handle: Mapping[str, Any],
-) -> tuple[Any, str, dict[str, Any]]:
+) -> tuple[Any, dict[str, Any]]:
     from mooncake.structured_object_store import (
         export_dataproto_ref,
         import_dataproto_ref,
     )
 
     ref = import_dataproto_ref(handle)
+    return ref, export_dataproto_ref(ref)
+
+
+def _fragment(
+    handle: Mapping[str, Any], batch_size: int
+) -> tuple[str, dict[str, Any], tuple[str, ...]]:
+    ref, stored_handle = _normalize_handle(handle)
     if len(ref.stage_refs) != 1:
         raise ValueError("catalog fragments must contain exactly one DataProto stage")
     fragment_id = _nonempty_string(
         next(iter(ref.stage_refs.values())).manifest_key,
         "manifest_key",
     )
-    return ref, fragment_id, export_dataproto_ref(ref)
-
-
-def _fragment(
-    handle: Mapping[str, Any], batch_size: int
-) -> tuple[str, dict[str, Any], tuple[str, ...]]:
-    ref, fragment_id, stored_handle = _normalize_handle(handle)
     if ref.batch_size != batch_size:
         raise ValueError(
             f"DataProto batch size {ref.batch_size!r} does not match "

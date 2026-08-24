@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import mooncake.structured_object_store as sos
+from mooncake.dataproto_catalog import DataProtoCatalog, DataProtoCatalogTransfer
 from mooncake.structured_object_store import (
     BundleTransferPolicy,
     FieldSchema,
@@ -1034,6 +1035,116 @@ def test_imported_handle_append_recovers_group_without_scanning_old_stage() -> N
         list(config.group_ids) == [group_id]
         for config in store.put_configs[first_append_record:]
     )
+
+
+@pytest.mark.parametrize("append_stage", ["rollout", "value"])
+@pytest.mark.parametrize("ungrouped", [False, True])
+@pytest.mark.parametrize("lose_response", [False, True])
+def test_catalog_manages_appended_handle_lifetime(
+    append_stage, ungrouped, lose_response
+) -> None:
+    class SizedDataProto(SimpleDataProto):
+        def __len__(self) -> int:
+            return len(next(iter(self.batch.values())))
+
+    store = InMemoryStore()
+    writer = MooncakeBundleTransfer(store, key_prefix="catalog-append")
+    appender = MooncakeBundleTransfer(store, key_prefix="catalog-append")
+    catalog = DataProtoCatalog()
+    lost_responses = 2 if lose_response else 0
+
+    def call(method, *args, **kwargs):
+        nonlocal lost_responses
+        result = getattr(catalog, method)(*args, **kwargs)
+        if method == "publish_append" and lost_responses:
+            lost_responses -= 1
+            raise RuntimeError("response lost after commit")
+        return result
+
+    writer_client = DataProtoCatalogTransfer(writer, call)
+    appender_client = DataProtoCatalogTransfer(appender, call)
+    writer_client.put(
+        SizedDataProto(batch={"input_ids": np.arange(2)}),
+        partition="train",
+        keys=["a", "b"],
+        stage="rollout",
+        config=GroupConfig([""]) if ungrouped else None,
+    )
+    base_plan = writer_client.resolve("train", ["a", "b"])
+    fragment_id, base_handle = next(iter(base_plan["handles"].items()))
+    writer_client.put(
+        SizedDataProto(batch={"partial_score": np.arange(1)}),
+        partition="train",
+        keys=["a"],
+        stage="score",
+    )
+
+    with pytest.raises(ValueError, match="overwrite"):
+        appender_client.append(
+            fragment_id,
+            base_handle,
+            SizedDataProto(batch={"input_ids": np.arange(2) + 10}),
+            partition="train",
+            keys=["a", "b"],
+            stage="rollout",
+            overwrite=True,
+        )
+    stored_keys = (set(store.objects), set(store.tensor_objects))
+    with pytest.raises(ValueError, match="keys were not found"):
+        appender_client.append(
+            fragment_id,
+            base_handle,
+            SizedDataProto(batch={"values": np.arange(2) + 10}),
+            partition="train",
+            keys=["a", "missing"],
+            stage=append_stage,
+        )
+    assert (set(store.objects), set(store.tensor_objects)) == stored_keys
+    append_args = (
+        fragment_id,
+        base_handle,
+        SizedDataProto(batch={"values": np.arange(2) + 10}),
+    )
+    append_kwargs = {
+        "partition": "train",
+        "keys": ["a", "b"],
+        "stage": append_stage,
+    }
+    if lose_response:
+        with pytest.raises(RuntimeError, match="response lost"):
+            appender_client.append(*append_args, **append_kwargs)
+    else:
+        appender_client.append(*append_args, **append_kwargs)
+    latest_plan = appender_client.resolve(
+        "train", ["a", "b"], fields=["input_ids", "values"]
+    )
+    appended = import_dataproto_ref(latest_plan["handles"][fragment_id])
+    assert appended._storage_group_id == base_handle.get("storage_group_id")
+    assert np.array_equal(
+        appender.get_dataproto(appended)["batch"]["values"], np.arange(2) + 10
+    )
+    old_reader = writer.get_dataproto(import_dataproto_ref(base_handle))
+    assert np.array_equal(old_reader["batch"]["input_ids"], np.arange(2))
+    stored_keys = (set(store.objects), set(store.tensor_objects))
+    with pytest.raises(ValueError, match="stale"):
+        appender_client.append(
+            fragment_id,
+            base_handle,
+            SizedDataProto(batch={"rewards": np.arange(2) + 20}),
+            partition="train",
+            keys=["a", "b"],
+            stage="reward",
+        )
+    assert (set(store.objects), set(store.tensor_objects)) == stored_keys
+    appender_client.close()
+
+    appender_client.remove("train", ["a", "b"])
+    assert store.objects or store.tensor_objects
+    appender_client.release_read(latest_plan["read_token"])
+    assert store.objects or store.tensor_objects
+    writer_client.release_read(base_plan["read_token"])
+    assert store.objects == {}
+    assert store.tensor_objects == {}
 
 
 def test_legacy_v1_handle_append_get_and_cleanup_uses_caller_group() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -141,6 +142,10 @@ def test_catalog_only_retires_managed_fragments() -> None:
     retired = catalog.remove("train", ["a"])["retired_handles"]
     assert len(retired) == 1
     assert retired[0]["stage_refs"] == managed["stage_refs"]
+    mismatched = copy.deepcopy(retired[0])
+    mismatched["field_index"]["value"]["member"] = "batch.other"
+    with pytest.raises(ValueError, match="fragment mismatch"):
+        catalog.ack_retired([mismatched])
     assert catalog.ack_retired(retired)["retired_handles"] == []
 
 
@@ -152,6 +157,69 @@ def test_catalog_drain_is_terminal() -> None:
     retired = catalog.drain()["retired_handles"]
     with pytest.raises(RuntimeError, match="catalog is drained"):
         catalog.publish("pending-op", "train", ["a"], handle=managed)
+    assert catalog.ack_retired(retired)["retired_handles"] == []
+
+
+def test_catalog_append_replaces_managed_handle_ownership() -> None:
+    catalog = DataProtoCatalog()
+    base = handle("base", ["input", "value"], batch_size=1)
+    base["storage_group_id"] = "structured-test"
+    base["partition"] = "train"
+    catalog.publish("put-op", "train", ["a"], handle=base)
+    catalog.ack_publication("put-op")
+    catalog.update(
+        "train", ["a"], handle=handle("replacement", ["value"], batch_size=1)
+    )
+
+    appended = copy.deepcopy(base)
+    appended["stage_refs"]["value"] = {"manifest_key": "manifest/value"}
+    appended["field_index"]["score"] = {
+        "stage": "value",
+        "member": "batch.score",
+        "section": "batch",
+    }
+    with pytest.raises(ValueError, match="fragment identity"):
+        catalog.publish_append(
+            "wrong-partition",
+            "manifest/base",
+            "other",
+            ["a"],
+            previous_handle=base,
+            handle=appended,
+        )
+    catalog.publish_append(
+        "append-op",
+        "manifest/base",
+        "train",
+        ["a"],
+        previous_handle=base,
+        handle=appended,
+    )
+    assert catalog.publish_append(
+        "append-op",
+        "manifest/base",
+        "train",
+        ["a"],
+        previous_handle=base,
+        handle=appended,
+    )["fields"] == ["input", "value", "score"]
+    with pytest.raises(ValueError, match="stale"):
+        catalog.publish_append(
+            "stale-op",
+            "manifest/base",
+            "train",
+            ["a"],
+            previous_handle=base,
+            handle=appended,
+        )
+
+    plan = catalog.resolve("train", ["a"])
+    assert plan["fields"] == ["input", "value", "score"]
+    assert set(plan["handles"]) == {"manifest/base", "manifest/replacement"}
+    assert plan["handles"]["manifest/base"]["stage_refs"] == appended["stage_refs"]
+    assert plan["field_groups"][1]["locations"] == [("manifest/replacement", 0)]
+    retired = catalog.remove("train", ["a"])["retired_handles"]
+    assert retired == [plan["handles"]["manifest/base"]]
     assert catalog.ack_retired(retired)["retired_handles"] == []
 
 
