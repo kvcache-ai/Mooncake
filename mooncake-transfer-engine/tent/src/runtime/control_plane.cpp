@@ -176,12 +176,13 @@ void ControlClient::delegateAsync(const std::string& server_addr,
         [callback = std::move(callback)](Status status,
                                          std::string response_raw) mutable {
             if (!status.ok()) {
-                callback(std::move(status));
+                callback(std::move(status), false);
                 return;
             }
             callback(response_raw.empty()
                          ? Status::OK()
-                         : Status::RpcServiceError(response_raw));
+                         : Status::RpcServiceError(response_raw),
+                     true);
         });
 }
 
@@ -205,6 +206,25 @@ Status ControlClient::unpinStageBuffer(const std::string& server_addr,
     CHECK_STATUS(
         tl_rpc_agent.call(server_addr, Unpin, request_raw, response_raw));
     return Status::OK();
+}
+
+void ControlClient::unpinStageBufferAsync(const std::string& server_addr,
+                                          uint64_t addr,
+                                          UnpinStageBufferCallback callback) {
+    json j = addr;
+    std::string request_raw = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, Unpin, request_raw,
+        [callback = std::move(callback)](Status status,
+                                         std::string response_raw) mutable {
+            if (!status.ok()) {
+                callback(std::move(status));
+                return;
+            }
+            callback(response_raw.empty()
+                         ? Status::OK()
+                         : Status::RpcServiceError(response_raw));
+        });
 }
 
 ControlService::ControlService(const std::string& type,

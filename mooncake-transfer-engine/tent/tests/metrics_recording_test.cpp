@@ -710,6 +710,73 @@ TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordsSeparateCounter) {
 }
 
 // ---------------------------------------------------------------------------
+// A batch whose reclaim fails permanently is quarantined by lazyFreeBatch
+// after kMaxReclaimAttempts (4096) consecutive failures, and that event is
+// counted in tent_quarantined_batches_total. Drives the real sweep path.
+// ---------------------------------------------------------------------------
+
+// FakeTransport whose poll fails permanently once poisoned.
+class PoisonedPollFakeTransport : public FakeTransport {
+   public:
+    explicit PoisonedPollFakeTransport(TransportType type)
+        : FakeTransport(type) {}
+
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus& status) override {
+        if (poisoned.load(std::memory_order_acquire)) {
+            return Status::InternalError(
+                "injected permanent poll failure" LOC_MARK);
+        }
+        return FakeTransport::getTransferStatus(batch, task_id, status);
+    }
+
+    std::atomic<bool> poisoned{false};
+};
+
+TEST_F(MetricsRecordingTest, QuarantinedBatchIncrementsCounter) {
+    constexpr size_t kMaxReclaimAttempts = 4096;  // mirrors the impl constant
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<PoisonedPollFakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xAB);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    fake->poisoned.store(true, std::memory_order_release);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    // Each freeBatch call on an already free-requested batch runs one sweep.
+    ASSERT_TRUE(engine.freeBatch(batch).ok());
+    for (size_t i = 0; i + 1 < kMaxReclaimAttempts; ++i) {
+        (void)engine.freeBatch(batch);
+    }
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(after.counter("tent_quarantined_batches_total") -
+                  before.counter("tent_quarantined_batches_total"),
+              1)
+        << "quarantining a batch must increment "
+           "tent_quarantined_batches_total exactly once";
+    // Prometheus endpoint carries the series too.
+    EXPECT_EQ(after.series("tent_quarantined_batches_total") -
+                  before.series("tent_quarantined_batches_total"),
+              1);
+
+    // Unpoison so teardown drains cleanly; the batch itself is reclaimed by
+    // the engine destructor regardless.
+    fake->poisoned.store(false, std::memory_order_release);
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
 // A transfer whose deadline is in the future records a genuine MLU sample
 // into the histogram (feasible or missed, but real).
 // ---------------------------------------------------------------------------

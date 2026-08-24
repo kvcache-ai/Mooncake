@@ -555,6 +555,9 @@ jobs:
         df -h
       shell: bash
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
     - name: Configure project with TENT
       run: |
         mkdir build-tent
@@ -571,6 +574,28 @@ jobs:
         cd build-tent
         cmake --build .
         sudo cmake --install .
+      shell: bash
+
+    # Check the Transfer Engine Rust crate against the freshly built C++
+    # libraries. This is a compile/link check, so it is safe to run on every
+    # matrix leg (including the cuda-on leg, which only verifies that the
+    # USE_CUDA code paths compile).
+    - name: Check Transfer Engine Rust bindings, examples, and tests
+      run: |
+        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
+           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
+          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+        fi
+        if [ "${{ matrix.need_cuda }}" = "true" ]; then
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        fi
+        cd mooncake-transfer-engine/rust
+        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build-tent
+        export MOONCAKE_TE_LIB_DIR=$GITHUB_WORKSPACE/build-tent/mooncake-transfer-engine/src
+        export MOONCAKE_TE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-transfer-engine/include
+        cargo test --lib
+        cargo test --examples --tests --no-run
+        cargo clean
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
@@ -598,6 +623,23 @@ jobs:
         junit-report: build-tent/test-results/ctest.xml
         failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
         last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+
+    - name: Start Metadata Server
+      if: '!matrix.need_cuda'
+      run: |
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
+        python ./bootstrap_server.py &
+        sleep 2
+      shell: bash
+
+    - name: Run Transfer Engine Rust smoke test
+      if: '!matrix.need_cuda'
+      env:
+        MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build-tent
+        MOONCAKE_TE_RUST_LINK_ASAN: "0"
+      run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
+      shell: bash
 
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}

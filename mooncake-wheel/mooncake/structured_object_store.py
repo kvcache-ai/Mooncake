@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 import io
 import json
@@ -7,6 +8,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
@@ -127,6 +129,7 @@ class MooncakeDataProtoRef:
     partition: str = "default"
     global_indexes: list[int] | None = None
     encoded_non_tensor: dict[str, Any] = field(default_factory=dict)
+    _storage_group_id: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -306,6 +309,8 @@ class _DataProtoRowSelection:
 
 DATAPROTO_REF_HANDLE_TYPE = "mooncake_dataproto_ref"
 DATAPROTO_REF_HANDLE_VERSION = 1
+# Optional v1 extension; older readers ignore unknown top-level fields.
+STORAGE_GROUP_ID = "storage_group_id"
 DataProtoRefLike = MooncakeDataProtoRef | Mapping[str, Any]
 
 
@@ -340,6 +345,8 @@ def export_dataproto_ref(ref: MooncakeDataProtoRef) -> dict[str, Any]:
         "meta_info": _json_safe_value(ref.meta_info),
         "encoded_non_tensor": _json_safe_value(ref.encoded_non_tensor),
     }
+    if ref._storage_group_id is not None:
+        handle[STORAGE_GROUP_ID] = ref._storage_group_id
     json.dumps(handle, ensure_ascii=False)
     return handle
 
@@ -348,7 +355,8 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
     """Import a JSON-safe DataProto transport handle into a lazy ref."""
     if not is_dataproto_ref_handle(handle):
         raise ValueError("not a Mooncake DataProto ref handle")
-    if int(handle.get("version", -1)) != DATAPROTO_REF_HANDLE_VERSION:
+    version = int(handle.get("version", -1))
+    if version not in (DATAPROTO_REF_HANDLE_VERSION, 2):
         raise ValueError(
             f"unsupported DataProto ref handle version: {handle.get('version')!r}"
         )
@@ -401,6 +409,12 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
         field_index[name] = StructuredFieldLocation(
             stage=stage, member=member, section=section
         )
+    storage_group_id = handle.get(STORAGE_GROUP_ID)
+    if (version == 2 and storage_group_id is None) or (
+        storage_group_id is not None
+        and (not isinstance(storage_group_id, str) or not storage_group_id)
+    ):
+        raise ValueError("DataProto ref handle has invalid storage_group_id")
     return MooncakeDataProtoRef(
         batch_size=int(handle["batch_size"]),
         stage_refs=stage_refs,
@@ -412,6 +426,7 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
         encoded_non_tensor=dict(
             _require_mapping(handle.get("encoded_non_tensor", {}), "encoded_non_tensor")
         ),
+        _storage_group_id=storage_group_id,
     )
 
 
@@ -488,6 +503,35 @@ class MooncakeBundleTransfer:
             default_chunk_bytes=self.default_chunk_bytes,
         )
         self._structured_store = _StructuredObjectLayer(self._bundle_store)
+
+    def _new_storage_group_id(self, config: Any) -> str | None:
+        raw_group_ids = getattr(config, "group_ids", None)
+        if raw_group_ids is None:
+            group_id = None
+        elif isinstance(raw_group_ids, str):
+            group_id = raw_group_ids
+        else:
+            try:
+                group_ids = list(raw_group_ids)
+            except TypeError as error:
+                raise ValueError(
+                    "structured object store config.group_ids must contain strings"
+                ) from error
+            if len(group_ids) > 1:
+                raise ValueError(
+                    "structured object store config.group_ids must contain exactly one "
+                    "logical group id; it is expanded across internal Mooncake keys"
+                )
+            group_id = group_ids[0] if group_ids else None
+        if group_id is None:
+            return f"structured-{uuid.uuid4().hex}"
+        if not isinstance(group_id, str):
+            raise ValueError(
+                "structured object store config.group_ids must contain strings"
+            )
+        if group_id == "":
+            return None
+        return group_id
 
     def put_bundle(
         self,
@@ -1497,16 +1541,20 @@ class MooncakeBundleTransfer:
             if collisions:
                 raise ValueError(f"structured members already exist: {collisions}")
             merged_buffers.update(new_manifest["buffers"])
+            cleanup_keys = [
+                *old_manifest.get("cleanup_keys", []),
+                self._bundle_store.manifest_key(old_stage_ref),
+                *self._bundle_store.payload_keys(old_manifest["meta"]),
+                self._bundle_store.manifest_key(new_stage_ref),
+                *self._bundle_store.payload_keys(new_manifest["meta"]),
+            ]
             merged_ref = self._bundle_store.put_bundle_manifest(
                 _encode_structured_metadata(merged_metadata),
                 merged_buffers,
                 partition=partition,
                 chunk_bytes=chunk_bytes,
                 policy=policy,
-                cleanup_keys=[
-                    self._bundle_store.manifest_key(old_stage_ref),
-                    *self._bundle_store.payload_keys(old_manifest["meta"]),
-                ],
+                cleanup_keys=cleanup_keys,
                 config=config,
             )
         except Exception:
@@ -1613,7 +1661,9 @@ class MooncakeBundleTransfer:
                     partition=ref.partition,
                     global_indexes=ref.global_indexes,
                     encoded_non_tensor=dict(ref.encoded_non_tensor),
+                    _storage_group_id=ref._storage_group_id,
                 )
+            group_id = self._new_storage_group_id(config)
             return MooncakeDataProtoRef(
                 batch_size=batch_size,
                 stage_refs={},
@@ -1622,6 +1672,7 @@ class MooncakeBundleTransfer:
                 namespace=namespace,
                 partition=partition,
                 encoded_non_tensor={},
+                _storage_group_id=group_id,
             )
         duplicates = (
             sorted(set(ref.field_index) & set(field_updates)) if ref is not None else []
@@ -1638,6 +1689,20 @@ class MooncakeBundleTransfer:
                 raise ValueError(
                     f"DataProto overwrite for stage {stage!r} must include existing fields: {sorted(dangling)}"
                 )
+        if ref is None:
+            group_id = self._new_storage_group_id(config)
+            effective_config = (
+                config
+                if group_id is None
+                else _config_with_group_id(config, group_id)
+            )
+        else:
+            group_id = ref._storage_group_id
+            effective_config = (
+                config
+                if group_id is None
+                else _config_with_group_id(config, group_id)
+            )
         payload = StructuredObjectPayload(
             metadata={
                 "layout": "dataproto_stage",
@@ -1659,7 +1724,7 @@ class MooncakeBundleTransfer:
                 partition=partition,
                 chunk_bytes=chunk_bytes,
                 policy=policy,
-                config=config,
+                config=effective_config,
             )
         else:
             stage_ref = self.put_structured_object(
@@ -1667,7 +1732,7 @@ class MooncakeBundleTransfer:
                 partition=partition,
                 chunk_bytes=chunk_bytes,
                 policy=policy,
-                config=config,
+                config=effective_config,
             )
             if (
                 existing_stage_ref is not None
@@ -1700,6 +1765,7 @@ class MooncakeBundleTransfer:
             partition=partition,
             global_indexes=None if ref is None else ref.global_indexes,
             encoded_non_tensor=encoded_non_tensor,
+            _storage_group_id=group_id,
         )
 
 
@@ -3592,23 +3658,24 @@ class _BundleManifestStore:
                 config=config,
             )
             written_keys.extend(meta_keys)
+            cleanup_key_list = list(dict.fromkeys(cleanup_keys or []))
+            buffer_object_ids = {
+                self._object_id_from_bundle_key(str(payload_spec["key"]))
+                for payload_spec in buffers.values()
+            }
+            buffer_object_ids.update(
+                self._object_id_from_bundle_key(key) for key in cleanup_key_list
+            )
             manifest = {
                 "version": 1,
                 "layout": "bundle",
                 "object_id": object_id,
                 "meta": meta_spec,
                 "buffers": dict(buffers),
-                "buffer_object_ids": sorted(
-                    {
-                        str(payload_spec["key"])
-                        .removeprefix(f"{self._key_prefix}/")
-                        .split("/buffer/", 1)[0]
-                        for payload_spec in buffers.values()
-                    }
-                ),
+                "buffer_object_ids": sorted(item for item in buffer_object_ids if item),
             }
-            if cleanup_keys:
-                manifest["cleanup_keys"] = list(dict.fromkeys(cleanup_keys))
+            if cleanup_key_list:
+                manifest["cleanup_keys"] = cleanup_key_list
             self._validate_manifest(manifest)
             manifest_blob = _encode_manifest(manifest)
             _check_status(
@@ -4019,6 +4086,21 @@ class _BundleManifestStore:
             raise ValueError(f"unsupported copy_mode: {result.copy_mode}")
         return result
 
+    def _object_id_from_bundle_key(self, key: str) -> str | None:
+        prefix = f"{self._key_prefix}/"
+        if not key.startswith(prefix):
+            return None
+        suffix = key[len(prefix) :]
+        if suffix.endswith("/manifest"):
+            return suffix[: -len("/manifest")]
+        if suffix.endswith("/meta"):
+            return suffix[: -len("/meta")]
+        for marker in ("/meta/", "/buffer/"):
+            index = suffix.find(marker)
+            if index > 0:
+                return suffix[:index]
+        return None
+
     def _validate_manifest(self, manifest: Mapping[str, Any]) -> None:
         if manifest.get("version") != 1 or manifest.get("layout") != "bundle":
             raise ValueError("invalid bundle manifest")
@@ -4372,16 +4454,25 @@ class _MooncakePayloadTransport:
         value: _TensorPayload,
         config: Any = None,
     ) -> dict[str, Any] | None:
-        if config is not None:
-            return None
-        put_tensor = getattr(self._store, "put_tensor", None)
+        put_tensor = getattr(
+            self._store, "put_tensor" if config is None else "pub_tensor", None
+        )
         if not callable(put_tensor):
             return None
         tensor = value.tensor
         nbytes = int(getattr(tensor, "nbytes", 0))
         metadata_bytes = _tensor_metadata_size()
         total_bytes = metadata_bytes + nbytes
-        _check_status(put_tensor(key, tensor), "put_tensor", key)
+        _check_status(
+            _call_write_with_optional_config(
+                put_tensor,
+                key,
+                tensor,
+                config=_config_for_grouped_keys(config, 1),
+            ),
+            "put_tensor",
+            key,
+        )
         return {
             "key": key,
             "kind": "tensor",
@@ -4443,6 +4534,8 @@ class _MooncakePayloadTransport:
         # Stream one chunk at a time: acquire -> memcpy -> put -> release.
         # This keeps pool pressure minimal and allows RDMA transfers to pipeline.
         for chunk_key, group, size in zip(chunk_keys, chunk_groups, sizes):
+            # Each pool lease maps to one physical key, so a single logical group id
+            # stays length-1 for each batch_put_from call in this path.
             lease = pool.acquire(size)
             try:
                 _copy_memoryviews_to_lease(group, lease)
@@ -6034,15 +6127,106 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
     return fn(*args, config=config)
 
 
+_WRITE_CONFIG_COPY_FIELDS = (
+    "data_type",
+    "group_ids",
+    "nof_replica_num",
+    "prefer_alloc_in_same_node",
+    "preferred_nof_segments",
+    "preferred_segment",
+    "preferred_segments",
+    "replica_num",
+    "with_hard_pin",
+    "with_soft_pin",
+)
+
+
+def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
+    """Return a write config whose group_ids match the physical key count."""
+    if config is None or key_count <= 0:
+        return config
+    group_ids = getattr(config, "group_ids", None)
+    if group_ids is None:
+        return config
+    normalize_to_list = isinstance(group_ids, str)
+    if normalize_to_list:
+        group_ids = [group_ids]
+    else:
+        group_ids = list(group_ids)
+    if not group_ids:
+        ungrouped_config = _copy_write_config(config)
+        ungrouped_config.group_ids = None
+        return ungrouped_config
+    if len(group_ids) != 1:
+        raise ValueError(
+            "structured object store config.group_ids must contain exactly one "
+            "logical group id; it is expanded across internal Mooncake keys"
+        )
+    if key_count == 1 and not normalize_to_list:
+        return config
+    grouped_config = _copy_write_config(config)
+    grouped_config.group_ids = [group_ids[0]] * key_count
+    return grouped_config
+
+
+def _copy_write_config(config: Any) -> Any:
+    try:
+        return copy.copy(config)
+    except TypeError:
+        pass
+    try:
+        copied = type(config)()
+    except Exception as error:
+        raise TypeError(
+            "structured object store config must be copyable or default-constructible"
+        ) from error
+    for name in _WRITE_CONFIG_COPY_FIELDS:
+        if not hasattr(config, name):
+            continue
+        try:
+            value = getattr(config, name)
+        except Exception:
+            continue
+        if isinstance(value, list):
+            value = list(value)
+        elif isinstance(value, tuple):
+            value = tuple(value)
+        try:
+            setattr(copied, name, value)
+        except Exception as error:
+            raise TypeError(
+                f"structured object store config field {name!r} is not writable"
+            ) from error
+    return copied
+
+
+def _config_with_group_id(config: Any, group_id: str) -> Any:
+    configured_ids = getattr(_config_for_grouped_keys(config, 1), "group_ids", None)
+    if configured_ids and configured_ids[0] and configured_ids[0] != group_id:
+        raise ValueError(
+            "config.group_ids conflicts with the DataProto storage group"
+        )
+    grouped_config = (
+        getattr(_mooncake_store, "ReplicateConfig", SimpleNamespace)()
+        if config is None
+        else _copy_write_config(config)
+    )
+    grouped_config.group_ids = [group_id]
+    return grouped_config
+
+
 def _put_with_optional_config(
     store: BundleStore, key: str, value: Any, config: Any = None
 ) -> int:
-    return _call_write_with_optional_config(store.put, key, value, config=config)
+    return _call_write_with_optional_config(
+        store.put, key, value, config=_config_for_grouped_keys(config, 1)
+    )
 
 
 def _put_from_with_optional_config(
     store: BundleStore, key: str, ptr: int, size: int, config: Any = None
 ) -> int:
+    config = _config_for_grouped_keys(config, 1)
     put_tensor_from = getattr(store, "put_tensor_from", None)
     if config is None and callable(put_tensor_from):
         return put_tensor_from(key, ptr, size)
@@ -6060,7 +6244,11 @@ def _batch_put_from_with_optional_config(
     config: Any = None,
 ) -> Sequence[int]:
     return _call_write_with_optional_config(
-        batch_put_from, list(keys), list(ptrs), list(sizes), config=config
+        batch_put_from,
+        list(keys),
+        list(ptrs),
+        list(sizes),
+        config=_config_for_grouped_keys(config, len(keys)),
     )
 
 

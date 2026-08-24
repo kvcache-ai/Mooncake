@@ -360,6 +360,11 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_failed_total",
           "Total promotion tasks aborted by holder via "
           "NotifyPromotionFailure (holder reported a downstream failure)"),
+      promotion_execution_gave_up_(
+          "master_promotion_execution_gave_up_total",
+          "Total promotion admission chains permanently abandoned after "
+          "kMaxPromotionExecutionFailures consecutive execution failures "
+          "(self-sustaining cycle stopped; reads can still re-admit)"),
       promotion_cancelled_(
           "master_promotion_cancelled_total",
           "Total promotion tasks removed because the prerequisite went "
@@ -504,6 +509,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_completed_bytes_.inc(0);
     promotion_expired_.inc(0);
     promotion_failed_.inc(0);
+    promotion_execution_gave_up_.inc(0);
     promotion_cancelled_.inc(0);
     promotion_rejected_frequency_.inc(0);
     promotion_rejected_watermark_.inc(0);
@@ -1180,6 +1186,9 @@ void MasterMetricManager::inc_promotion_expired(int64_t val) {
 void MasterMetricManager::inc_promotion_failed(int64_t val) {
     promotion_failed_.inc(val);
 }
+void MasterMetricManager::inc_promotion_execution_gave_up(int64_t val) {
+    promotion_execution_gave_up_.inc(val);
+}
 void MasterMetricManager::inc_promotion_cancelled(int64_t val) {
     promotion_cancelled_.inc(val);
 }
@@ -1599,6 +1608,9 @@ int64_t MasterMetricManager::get_promotion_expired() {
 }
 int64_t MasterMetricManager::get_promotion_failed() {
     return promotion_failed_.value();
+}
+int64_t MasterMetricManager::get_promotion_execution_gave_up() {
+    return promotion_execution_gave_up_.value();
 }
 int64_t MasterMetricManager::get_promotion_cancelled() {
     return promotion_cancelled_.value();
