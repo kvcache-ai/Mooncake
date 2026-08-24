@@ -273,8 +273,9 @@ class RdmaContext {
 
     int socketId();
 
-    // Two-sided MsgChannel CQ registration (polled by WorkerPool).
-    void registerMsgChannel(MsgChannel *channel);
+    // Two-sided MsgChannel CQ registration (polled by WorkerPool). Held
+    // weakly: a rail may be replaced while the poller holds a reference.
+    void registerMsgChannel(std::shared_ptr<MsgChannel> channel);
     void unregisterMsgChannel(MsgChannel *channel);
     int pollMsgChannels(int max_per_channel = 16);
     bool hasMsgChannels() const;
@@ -343,7 +344,7 @@ class RdmaContext {
     std::atomic<bool> active_;
 
     mutable std::mutex msg_channels_mutex_;
-    std::vector<MsgChannel *> msg_channels_;
+    std::vector<std::weak_ptr<MsgChannel>> msg_channels_;
 };
 
 }  // namespace mooncake

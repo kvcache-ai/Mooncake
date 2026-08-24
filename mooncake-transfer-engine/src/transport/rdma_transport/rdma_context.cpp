@@ -1481,32 +1481,48 @@ int RdmaContext::poll(int num_entries, ibv_wc *wc, int cq_index) {
     return nr_poll;
 }
 
-void RdmaContext::registerMsgChannel(MsgChannel *channel) {
+void RdmaContext::registerMsgChannel(std::shared_ptr<MsgChannel> channel) {
     if (!channel) return;
     std::lock_guard<std::mutex> lock(msg_channels_mutex_);
-    for (auto *existing : msg_channels_) {
+    for (auto it = msg_channels_.begin(); it != msg_channels_.end();) {
+        auto existing = it->lock();
+        if (!existing) {
+            it = msg_channels_.erase(it);
+            continue;
+        }
         if (existing == channel) return;
+        ++it;
     }
-    msg_channels_.push_back(channel);
+    msg_channels_.push_back(std::move(channel));
 }
 
 void RdmaContext::unregisterMsgChannel(MsgChannel *channel) {
     if (!channel) return;
     std::lock_guard<std::mutex> lock(msg_channels_mutex_);
+    // Called from ~MsgChannel, where the weak_ptr no longer locks, so match on
+    // identity and drop expired entries as we go.
     msg_channels_.erase(
-        std::remove(msg_channels_.begin(), msg_channels_.end(), channel),
+        std::remove_if(msg_channels_.begin(), msg_channels_.end(),
+                       [channel](const std::weak_ptr<MsgChannel> &entry) {
+                           auto held = entry.lock();
+                           return !held || held.get() == channel;
+                       }),
         msg_channels_.end());
 }
 
 int RdmaContext::pollMsgChannels(int max_per_channel) {
-    std::vector<MsgChannel *> snapshot;
+    // Promote under the lock so each polled channel stays alive for the poll
+    // even if the transport replaces the rail concurrently.
+    std::vector<std::shared_ptr<MsgChannel>> snapshot;
     {
         std::lock_guard<std::mutex> lock(msg_channels_mutex_);
-        snapshot = msg_channels_;
+        snapshot.reserve(msg_channels_.size());
+        for (auto &entry : msg_channels_) {
+            if (auto channel = entry.lock()) snapshot.push_back(channel);
+        }
     }
     int processed = 0;
-    for (auto *channel : snapshot) {
-        if (!channel) continue;
+    for (auto &channel : snapshot) {
         int n = channel->pollCompletions(max_per_channel);
         if (n > 0) processed += n;
     }
@@ -1515,7 +1531,10 @@ int RdmaContext::pollMsgChannels(int max_per_channel) {
 
 bool RdmaContext::hasMsgChannels() const {
     std::lock_guard<std::mutex> lock(msg_channels_mutex_);
-    return !msg_channels_.empty();
+    for (auto &entry : msg_channels_) {
+        if (!entry.expired()) return true;
+    }
+    return false;
 }
 
 int RdmaContext::submitPostSend(

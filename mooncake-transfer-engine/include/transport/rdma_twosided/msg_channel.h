@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -33,7 +34,8 @@ class RdmaContext;
 class RdmaTwoSidedTransport;
 
 // Per-peer RC QP for two-sided data (SEND/RECV with TE bounce buffers).
-class MsgChannel {
+// Always owned by a shared_ptr; RdmaContext holds only weak references.
+class MsgChannel : public std::enable_shared_from_this<MsgChannel> {
    public:
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
