@@ -58,6 +58,14 @@ struct RouteEndpoint {
     bool operator==(const RouteEndpoint&) const = default;
 };
 
+// Process-level collective buffer in the registered device arena.
+struct DeviceCollectiveEndpoint {
+    uint64_t buffer_offset = 0;
+    uint64_t buffer_size = 0;
+
+    bool operator==(const DeviceCollectiveEndpoint&) const = default;
+};
+
 // Process-level bootstrap metadata for the device transfer service.
 // A peer publishes one immutable value for each rank epoch.
 struct DeviceTransferEndpoint {
@@ -69,12 +77,43 @@ struct DeviceTransferEndpoint {
     bool operator==(const DeviceTransferEndpoint&) const = default;
 };
 
-// Group-level device state inside the rank's transfer-service arena.
-struct DeviceCollectiveEndpoint {
-    uint64_t control_offset = 0;
-    uint64_t control_size = 0;
+// Group-level endpoint of one Ring AllReduce protocol instance. Signals are
+// communicator-local even though their backing memory comes from the
+// process-wide registered arena.
+struct RingAllReduceEndpoint {
+    uint64_t signal_offset = 0;
+    uint32_t signal_count = 0;
 
-    bool operator==(const DeviceCollectiveEndpoint&) const = default;
+    bool operator==(const RingAllReduceEndpoint&) const = default;
+};
+
+// Group-level endpoints published by the device collective protocols owned by
+// one communicator.
+struct DeviceCollectiveProtocolEndpoints {
+    std::optional<RingAllReduceEndpoint> ring_all_reduce;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return !ring_all_reduce.has_value();
+    }
+
+    // True when every protocol required by the New backend has published its
+    // group-level endpoint.
+    [[nodiscard]] bool hasAllProtocolEndpoints() const noexcept {
+        return ring_all_reduce.has_value();
+    }
+
+    [[nodiscard]] bool supportsBackend(
+        GpuCollectiveBackend backend) const noexcept {
+        switch (backend) {
+            case GpuCollectiveBackend::Legacy:
+                return true;
+            case GpuCollectiveBackend::New:
+                return hasAllProtocolEndpoints();
+        }
+        return false;
+    }
+
+    bool operator==(const DeviceCollectiveProtocolEndpoints&) const = default;
 };
 
 // Group-level, per-(group_id, rank) buffer/sync/P2P addresses.
@@ -94,9 +133,8 @@ struct GroupEndpointInfo {
     uint64_t p2p_credit_region = 0;
     uint64_t p2p_ack_region = 0;
 
-    // Capability metadata for the new GPU collective backend. CPU communicators
-    // and GPU ranks without this capability leave it empty.
-    std::optional<DeviceCollectiveEndpoint> collective_v2;
+    // Empty for CPU communicators and ranks without device protocols.
+    DeviceCollectiveProtocolEndpoints device_collective;
 
     bool operator==(const GroupEndpointInfo&) const = default;
 };

@@ -32,6 +32,7 @@ namespace mooncake {
 
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 class DeviceCollectiveRuntime;
+class DeviceCollectiveWorkspace;
 class StrongStream;
 #endif
 
@@ -70,7 +71,7 @@ struct MooncakePGContext {
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     std::unique_ptr<DeviceTransferService> device_transfer_service;
     std::unique_ptr<DeviceArena> device_arena;
-    std::optional<DeviceArenaSlice> device_collective_workspace;
+    std::unique_ptr<DeviceCollectiveWorkspace> device_collective_workspace;
     std::unique_ptr<StrongStream> device_collective_strong_stream;
     std::unique_ptr<DeviceCollectiveRecoveryWorker>
         device_collective_recovery_worker;

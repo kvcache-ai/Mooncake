@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "control_plane/control_types.h"
+#include "device_comm/device_transfer/transfer_types.cuh"
 #include "error_types.h"
 
 namespace mooncake {
@@ -39,6 +40,10 @@ class DeviceTransferService {
 
     // Device address of the stable kernel-facing service handle.
     const DeviceTransferHandle* deviceHandle();
+
+    // Read the selected route from the service's host route image. This is a
+    // control-path query; it does not synchronize with or copy from the GPU.
+    PGResult<DeviceRouteKind> routeKind(GlobalRank rank);
 
     // Install the immutable endpoint published by one peer for its current
     // rank epoch. Rank-epoch validation remains in the control plane.

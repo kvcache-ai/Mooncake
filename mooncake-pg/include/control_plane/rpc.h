@@ -27,7 +27,9 @@ struct RegisterAgentRequest {
     std::string te_server_name;
     uint64_t agent_session_id = 0;
     uint64_t warmup_recv_addr = 0;
-    DeviceTransferEndpoint transfer_service_endpoint;
+
+    std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
+    std::optional<DeviceCollectiveEndpoint> collective_endpoint;
 };
 
 struct RankConnectionMetadata {
@@ -36,7 +38,8 @@ struct RankConnectionMetadata {
     std::string agent_addr;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
-    DeviceTransferEndpoint transfer_service_endpoint;
+    std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
+    std::optional<DeviceCollectiveEndpoint> collective_endpoint;
 };
 
 struct RegisterAgentResponse {
@@ -198,7 +201,8 @@ struct PeerJoinedPush {
     uint64_t rank_epoch = 0;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
-    DeviceTransferEndpoint transfer_service_endpoint;
+    std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
+    std::optional<DeviceCollectiveEndpoint> collective_endpoint;
 };
 
 struct RankStatePush {
@@ -255,6 +259,11 @@ using CoordinatorEffect =
 struct InstallDeviceTransferEndpoint {
     GlobalRank rank = kInvalidGlobalRank;
     DeviceTransferEndpoint endpoint;
+};
+
+struct InstallDeviceCollectiveEndpoint {
+    GlobalRank rank = kInvalidGlobalRank;
+    DeviceCollectiveEndpoint endpoint;
 };
 
 struct EnablePeerProbe {
@@ -325,12 +334,12 @@ struct NotifyRanksActivated {
 };
 
 using AgentEffect =
-    std::variant<InstallDeviceTransferEndpoint, EnablePeerProbe, DisconnectLink,
-                 RequestLinkHealthCheck, SendLinkEventReport, StopReconnect,
-                 DisconnectAllLinks, ClearAllPeerMetadata,
-                 ApplyGroupStateToCommunicator, ApplyRankStateToCommunicator,
-                 ResetPeerState, RefreshPeerLink, NotifyLinkRefreshed,
-                 NotifyGroupReady, NotifyRanksActivated>;
+    std::variant<InstallDeviceTransferEndpoint, InstallDeviceCollectiveEndpoint,
+                 EnablePeerProbe, DisconnectLink, RequestLinkHealthCheck,
+                 SendLinkEventReport, StopReconnect, DisconnectAllLinks,
+                 ClearAllPeerMetadata, ApplyGroupStateToCommunicator,
+                 ApplyRankStateToCommunicator, ResetPeerState, RefreshPeerLink,
+                 NotifyLinkRefreshed, NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

@@ -25,9 +25,9 @@ struct HostTransferProxy::Lane {
     // `batch_id` belongs to exactly the transfer named by the current state:
     //
     //   WaitingForCommand
-    //        -> PayloadTransferInFlight (unless the payload is empty)
-    //        -> SignalReadInFlight
-    //        -> SignalWriteInFlight
+    //        -> PayloadTransferInFlight (when the payload is nonempty)
+    //        -> SignalReadInFlight       (when the action is Add)
+    //        -> SignalWriteInFlight      (when the action is Add)
     //        -> WaitingForCommand
     //
     // Only finishCommand() returns the command slot to the GPU producer.
@@ -241,10 +241,10 @@ bool HostTransferProxy::tryStartCommand(Lane& lane) {
     lane.target_segment_id = *segment;
 
     if (lane.command.size == 0) {
-        startSignalRead(lane);
+        startSignalAction(lane);
         return true;
     }
-    if (lane.command.local_addr == 0 || lane.command.remote_addr == 0) {
+    if (lane.command.local_addr == 0 || lane.command.remote_region_addr == 0) {
         finishCommand(lane, HostProxyCommandResult::Failed);
         return true;
     }
@@ -255,16 +255,30 @@ bool HostTransferProxy::tryStartCommand(Lane& lane) {
 
 void HostTransferProxy::startPayloadTransfer(Lane& lane) {
     lane.state = Lane::State::PayloadTransferInFlight;
-    if (!submitBatch(lane, TransferRequest{
-                               .opcode = TransferRequest::WRITE,
-                               .source = reinterpret_cast<void*>(
-                                   lane.command.local_addr),
-                               .target_id = lane.target_segment_id,
-                               .target_offset = lane.command.remote_addr,
-                               .length = static_cast<size_t>(lane.command.size),
-                           })) {
+    if (!submitBatch(
+            lane,
+            TransferRequest{
+                .opcode = TransferRequest::WRITE,
+                .source = reinterpret_cast<void*>(lane.command.local_addr),
+                .target_id = lane.target_segment_id,
+                .target_offset = lane.command.remote_region_addr +
+                                 lane.command.remote_offset,
+                .length = static_cast<size_t>(lane.command.size),
+            })) {
         finishCommand(lane, HostProxyCommandResult::Failed);
     }
+}
+
+void HostTransferProxy::startSignalAction(Lane& lane) {
+    switch (lane.command.signal.kind) {
+        case SignalAction::Kind::None:
+            finishCommand(lane, HostProxyCommandResult::Succeeded);
+            return;
+        case SignalAction::Kind::Add:
+            startSignalRead(lane);
+            return;
+    }
+    finishCommand(lane, HostProxyCommandResult::Failed);
 }
 
 void HostTransferProxy::startSignalRead(Lane& lane) {
@@ -272,27 +286,31 @@ void HostTransferProxy::startSignalRead(Lane& lane) {
     // contract lets the fallback route implement add as a remote read followed
     // by a write through this lane's registered staging word.
     lane.state = Lane::State::SignalReadInFlight;
-    if (!submitBatch(lane, TransferRequest{
-                               .opcode = TransferRequest::READ,
-                               .source = lane.signal_staging,
-                               .target_id = lane.target_segment_id,
-                               .target_offset = lane.command.signal_remote_addr,
-                               .length = sizeof(uint64_t),
-                           })) {
+    if (!submitBatch(lane,
+                     TransferRequest{
+                         .opcode = TransferRequest::READ,
+                         .source = lane.signal_staging,
+                         .target_id = lane.target_segment_id,
+                         .target_offset = lane.command.remote_region_addr +
+                                          lane.command.signal.add.remote_offset,
+                         .length = sizeof(uint64_t),
+                     })) {
         finishCommand(lane, HostProxyCommandResult::Failed);
     }
 }
 
 void HostTransferProxy::startSignalWrite(Lane& lane) {
-    *lane.signal_staging += lane.command.signal_delta;
+    *lane.signal_staging += lane.command.signal.add.delta;
     lane.state = Lane::State::SignalWriteInFlight;
-    if (!submitBatch(lane, TransferRequest{
-                               .opcode = TransferRequest::WRITE,
-                               .source = lane.signal_staging,
-                               .target_id = lane.target_segment_id,
-                               .target_offset = lane.command.signal_remote_addr,
-                               .length = sizeof(uint64_t),
-                           })) {
+    if (!submitBatch(lane,
+                     TransferRequest{
+                         .opcode = TransferRequest::WRITE,
+                         .source = lane.signal_staging,
+                         .target_id = lane.target_segment_id,
+                         .target_offset = lane.command.remote_region_addr +
+                                          lane.command.signal.add.remote_offset,
+                         .length = sizeof(uint64_t),
+                     })) {
         finishCommand(lane, HostProxyCommandResult::Failed);
     }
 }
@@ -304,7 +322,7 @@ bool HostTransferProxy::stepPayloadTransfer(Lane& lane) {
         finishCommand(lane, HostProxyCommandResult::Failed);
         return true;
     }
-    startSignalRead(lane);
+    startSignalAction(lane);
     return true;
 }
 
