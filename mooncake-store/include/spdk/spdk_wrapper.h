@@ -10,7 +10,6 @@
 #include <spdk/env.h>
 #include <spdk/nvme.h>
 
-// Added includes
 #include "nof_config.h"
 #include "nof_connection.h"
 #include "nof_segment.h"
@@ -158,7 +157,9 @@ class SpdkWrapper {
      */
     void CloseNofSegment(nof_seg_handle *handle);
 
-    // Added APIs
+    // Config accessors and the lower-level PipelineRead/Write entry points
+    // exposed on the singleton for callers that drive NVMe-oF directly
+    // (not part of the Mooncake transfer hot path).
     void SetConfig(const NofConfig &);
     const NofConfig &GetConfig() const { return config_; }
     // PipelineRead/Write accept an optional caller_ctx out-param.

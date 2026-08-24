@@ -6,7 +6,11 @@
 The Mooncake Store NoF (NVMe-over-Fabrics) subsystem provides high-performance
 block I/O to remote NVMe SSDs over RDMA/TCP fabrics.  Built on the Intel SPDK
 library, it extends the native single-qpair model with multi-qpair concurrent
-I/O, pipeline batching, adaptive degradation, and dynamic QID recovery.
+I/O, adaptive degradation, and dynamic QID recovery.  The subsystem also
+exposes a lower-level `PipelineRead`/`PipelineWrite` chunked-submission API for
+callers that want to drive NVMe-oF directly without going through
+`SpdkNofWorkerPool`; this API is **not** part of the Mooncake transfer hot
+path — see [Architecture](#architecture) and the `Pipeline I/O` section below.
 
 ## Architecture
 
@@ -26,8 +30,9 @@ I/O, pipeline batching, adaptive degradation, and dynamic QID recovery.
 │    · Multi-qpair allocation / Round-Robin dispatch               │
 │    · Sequential allocation + backoff retry + TryGrow             │
 ├──────────────────────────────────────────────────────────────────┤
-│  nof_segment.cpp — NofSegment / PipelineIO                       │
-│    · Single-request Submit API  · Pipeline batch I/O             │
+│  nof_segment.cpp — NofSegment                                    │
+│    · SubmitRead / SubmitWrite — used by Mooncake transfer hot path│
+│    · PipelineRead / PipelineWrite — lower-level bulk-transfer API │
 ├──────────────────────────────────────────────────────────────────┤
 │  SPDK lib — spdk_nvme_probe / alloc_io_qpair / cmd_rw            │
 └──────────────────────────────────────────────────────────────────┘
@@ -136,7 +141,7 @@ The caller-supplied `lba` is relative to the segment base.  Both methods
 translate to the absolute device LBA via `start_lba_` and reject requests
 that exceed the segment extent.
 
-**Pipeline I/O** (high-throughput bulk transfer):
+**Pipeline I/O** (lower-level API for high-throughput bulk transfer — not used by the Mooncake transfer hot path):
 ```cpp
 // Fire-and-forget (default, backward-compatible):
 ssize_t PipelineRead(void *buf, uint64_t lba, uint32_t total_blocks);
@@ -325,11 +330,17 @@ Thread 4 ────┘         │
                        ├── Worker 2 → (idle)
                        └── Worker 3 → (idle)
 
-Pipeline I/O loop:
+Multi-qpair submit/harvest loop (SubmitRead/SubmitWrite via SpdkNofTask — the actual Mooncake hot path):
   [qp0 ████░░░░] [qp1 ████░░░░] [qp2 ████░░░░] [qp3 ████░░░░]
       ↑ submit       ↑ submit       ↑ submit       ↑ submit
       ↓ complete     ↓ complete     ↓ complete     ↓ complete
   PollAll() harvests completions from all qpairs at once
+
+> Note: the diagram above describes the submit/harvest pattern used by
+> `SpdkNofWorkerPool` via `SpdkWrapper::SubmitRequest()` →
+> `NofSegment::SubmitRead/SubmitWrite`.  This is **not** the same loop as
+> `NofSegment::PipelineIO`; the latter is the lower-level API described in
+> the `Pipeline I/O` section above.
 ```
 
 ## QID Management
@@ -530,7 +541,7 @@ the same NQN onto a single controller.  The per-controller I/O Queue quota
 
 ## Changelog
 
-- **2026-07-31** — Initial multi-qpair implementation (NofQpairPool, NofConnection, NofSegment, PipelineIO)
+- **2026-07-31** — Initial multi-qpair implementation (NofQpairPool, NofConnection, NofSegment, PipelineIO).  Note: `PipelineIO` is a lower-level API; the Mooncake transfer hot path goes through `SpdkNofTask` → `SpdkWrapper::SubmitRequest` → `SubmitRead`/`SubmitWrite`.
 - **2026-08-03** — Sequential allocation + backoff retry + TryGrow rebalance + QidPressureGauge + flow-control backpressure
 - **2026-08-20** — Pipeline I/O lifetime and error-path safety
   - `PipelineCtx` is now heap-allocated (`shared_ptr`); callers may opt into
