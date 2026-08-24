@@ -244,11 +244,24 @@ TEST_F(RealTarget, TransferPathCloseOrdering) {
     nof_seg_handle *handle = wrapper.OpenNofSegment(target_);
     ASSERT_NE(handle, nullptr) << "OpenNofSegment failed for " << target_;
 
-    // Do a synchronous 1-block read at offset 0.
-    std::vector<char> buf(4096, 0);
-    auto n = wrapper.PipelineRead(handle, buf.data(), 0, 1);
+    // Do a synchronous 1-block read at offset 0.  The I/O buffer must
+    // be DMA-registered with SPDK's memory domain — a plain heap
+    // allocation (std::vector / new / malloc) has no MR registration
+    // and fails at nvme_rdma_req_init() with rc -22 (EINVAL), as
+    // observed in the SPDK log:
+    //   spdk_rdma_get_translation: No translation for ptr 0x...
+    //   nvme_rdma_get_memory_translation: rc -22
+    // spdk_zmalloc with SPDK_MALLOC_DMA guarantees the buffer is
+    // registered so the RDMA translation can resolve it.
+    void *buf = spdk_zmalloc(/*size=*/4096, /*align=*/0x1000,
+                             /*opts=*/nullptr, /*socket_id=*/-1,
+                             /*flags=*/SPDK_MALLOC_DMA);
+    ASSERT_NE(buf, nullptr) << "spdk_zmalloc failed";
+
+    auto n = wrapper.PipelineRead(handle, buf, 0, 1);
     EXPECT_GE(n, 0) << "PipelineRead failed";
 
+    spdk_free(buf);
     wrapper.CloseNofSegment(handle);
 
     // Subsequent open must still work (no leaked resources).
