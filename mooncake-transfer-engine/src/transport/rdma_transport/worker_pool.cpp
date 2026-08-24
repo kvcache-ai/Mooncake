@@ -961,12 +961,21 @@ void WorkerPool::transferWorker(int thread_id) {
     const bool can_post = workerCanPost(thread_id);
     const bool can_poll = workerCanPoll(thread_id);
     while (workers_running_.load(std::memory_order_relaxed)) {
+#ifndef USE_FAKE_POST_SEND
+        // Two-sided MsgChannel CQs live on this NIC; poll every loop so pure
+        // receivers keep making progress even with no one-sided traffic.
+        if (can_poll) {
+            context_.pollMsgChannels();
+        }
+#endif
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =
             submitted_slice_count_.load(std::memory_order_relaxed);
+        // Do not park while MsgChannels are registered: recv-only peers would
+        // otherwise stop polling after the one-sided idle timeout.
         if (processed_slice_count == submitted_slice_count &&
-            !hasOutstandingCq(thread_id)) {
+            !hasOutstandingCq(thread_id) && !context_.hasMsgChannels()) {
             uint64_t curr_wait_ts = getCurrentTimeInNano();
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
@@ -976,7 +985,8 @@ void WorkerPool::transferWorker(int thread_id) {
                 // producers that submit after it will notify this worker.
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
                         submitted_slice_count_.load() &&
-                    !hasOutstandingCq(thread_id)) {
+                    !hasOutstandingCq(thread_id) &&
+                    !context_.hasMsgChannels()) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
                 }
                 parked_worker_count_.fetch_sub(1, std::memory_order_acq_rel);

@@ -47,6 +47,7 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
+#include "transport/rdma_twosided/msg_channel.h"
 #include "transport/transport.h"
 
 namespace mooncake {
@@ -1478,6 +1479,43 @@ int RdmaContext::poll(int num_entries, ibv_wc *wc, int cq_index) {
         return ERR_CONTEXT;
     }
     return nr_poll;
+}
+
+void RdmaContext::registerMsgChannel(MsgChannel *channel) {
+    if (!channel) return;
+    std::lock_guard<std::mutex> lock(msg_channels_mutex_);
+    for (auto *existing : msg_channels_) {
+        if (existing == channel) return;
+    }
+    msg_channels_.push_back(channel);
+}
+
+void RdmaContext::unregisterMsgChannel(MsgChannel *channel) {
+    if (!channel) return;
+    std::lock_guard<std::mutex> lock(msg_channels_mutex_);
+    msg_channels_.erase(
+        std::remove(msg_channels_.begin(), msg_channels_.end(), channel),
+        msg_channels_.end());
+}
+
+int RdmaContext::pollMsgChannels(int max_per_channel) {
+    std::vector<MsgChannel *> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(msg_channels_mutex_);
+        snapshot = msg_channels_;
+    }
+    int processed = 0;
+    for (auto *channel : snapshot) {
+        if (!channel) continue;
+        int n = channel->pollCompletions(max_per_channel);
+        if (n > 0) processed += n;
+    }
+    return processed;
+}
+
+bool RdmaContext::hasMsgChannels() const {
+    std::lock_guard<std::mutex> lock(msg_channels_mutex_);
+    return !msg_channels_.empty();
 }
 
 int RdmaContext::submitPostSend(

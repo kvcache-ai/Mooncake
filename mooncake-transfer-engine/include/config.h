@@ -148,6 +148,38 @@ struct GlobalConfig {
     // handshake that may never complete.
     // MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS.
     uint32_t rdma_notify_connect_timeout_ms = 10000;
+    // Credit admission + SESSION/GRANT on CtrlChannel. MC_RDMA_CREDIT_ENABLED.
+    bool rdma_credit_enabled = true;
+    // One-sided sliding window (bytes / request slots). 0 disables that
+    // resource. MC_RDMA_CREDIT_WINDOW_BYTES / _REQUESTS.
+    uint64_t rdma_credit_window_bytes = 256ull << 20;  // 256 MiB
+    uint64_t rdma_credit_window_requests = 4096;
+    // Pending WAITING timeout; 0 = never. MC_RDMA_CREDIT_QUEUE_TIMEOUT_MS.
+    uint64_t rdma_credit_queue_timeout_ms = 0;
+    // Two-sided msg QP / bounce capability. MC_RDMA_MSG_ENABLED.
+    bool rdma_msg_enabled = true;
+    // Prefer managed two-sided when peer supports it. MC_RDMA_MSG_DEFAULT.
+    bool rdma_msg_default = true;
+    // Bounce slot size including msg header. MC_RDMA_MSG_SLOT_SIZE.
+    size_t rdma_msg_slot_size = (64 * 1024) + 64;
+    // Base / max posted bounce slots. MC_RDMA_MSG_POOL_BASE / _MAX.
+    // Defaults from eRDMA workload: base covers common concurrency with credit
+    // return; max caps QP WR depth for async expand.
+    size_t rdma_msg_pool_base = 64;
+    size_t rdma_msg_pool_max = 256;
+    // Bounce auto expand/shrink. Tuned on eRDMA two-sided WRITE smoke:
+    // step 16 balances reg_mr cost vs WAITING drain; watermarks avoid flapping.
+    size_t rdma_msg_expand_step = 16;
+    // Free-send ratio below this triggers expand (0-100).
+    size_t rdma_msg_expand_low_watermark_pct = 25;
+    // Free-send ratio above this (sustained) triggers shrink (0-100).
+    size_t rdma_msg_shrink_high_watermark_pct = 75;
+    // WAITING queue length that hints expand / CREDIT_REQUEST.
+    size_t rdma_msg_pending_expand_threshold = 4;
+    // Idle time at high watermark before shrink.
+    uint64_t rdma_msg_shrink_idle_ms = 2000;
+    // Bounce manager tick period.
+    uint64_t rdma_msg_bounce_manager_tick_ms = 50;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
     int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;

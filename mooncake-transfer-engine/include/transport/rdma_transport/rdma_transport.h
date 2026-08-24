@@ -141,6 +141,17 @@ class RdmaTransport : public Transport {
         return context_list_;
     }
 
+   protected:
+    // Local NIC topology, for subclasses that map peer NICs onto local rails
+    // (e.g. the two-sided MsgChannel path).
+    const std::shared_ptr<Topology> &localTopology() const {
+        return local_topology_;
+    }
+
+    // Advertised in the local SegmentDesc so senders can pick the two-sided
+    // path. Classic one-sided RDMA has no msg path, hence false.
+    virtual bool supportsTwoSidedMsg() const { return false; }
+
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
