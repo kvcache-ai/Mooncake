@@ -94,6 +94,12 @@ class RdmaTwoSidedTransport : public RdmaTransport {
 
     int sendInitialCreditGrant(const std::string &peer_server_name);
 
+    // Number of dispatches that resumed from a recorded offset after
+    // bounce-slot backpressure stopped them mid-transfer.
+    uint64_t twoSidedResumeCount() const {
+        return twosided_resume_count_.load(std::memory_order_relaxed);
+    }
+
    protected:
     // Peers select the two-sided path from this bit in our SegmentDesc, so it
     // tracks whether the msg path is actually enabled on this transport.
@@ -187,6 +193,9 @@ class RdmaTwoSidedTransport : public RdmaTransport {
         uint64_t task_id = 0;
         uint64_t total_bytes = 0;
         uint64_t acked_bytes = 0;
+        // Next unsent offset. A dispatch stopped by send-queue backpressure
+        // resumes from here instead of replaying chunks already on the wire.
+        uint64_t sent_bytes = 0;
         std::string peer;
         uint64_t peer_session = 0;
         // Session generation the reservation was made under; the ledger
@@ -252,6 +261,7 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     std::unordered_map<uint64_t, TwoSidedTaskState> twosided_tasks_;
     std::deque<TransferTask *> waiting_tasks_;
     std::atomic<uint64_t> next_task_id_{1};
+    std::atomic<uint64_t> twosided_resume_count_{0};
     // Tasks dispatched on MsgChannel awaiting DATA_ACK. Non-zero keeps the
     // ctrl worker spinning so ACKs are drained without the idle sleep.
     std::atomic<size_t> twosided_inflight_{0};

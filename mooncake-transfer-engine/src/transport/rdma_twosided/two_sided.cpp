@@ -17,10 +17,8 @@
 #include <glog/logging.h>
 
 #include <cassert>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -373,12 +371,22 @@ int RdmaTwoSidedTransport::dispatchTwoSidedTask(TransferTask *task) {
     if (max_payload == 0) return ERR_INVALID_ARGUMENT;
 
     uint64_t task_id = 0;
+    // Non-zero when resuming a task that was stopped mid-transfer; its
+    // reservation is still held, so it must not be reserved again.
+    uint64_t resume_off = 0;
+    bool credit_held = false;
+    uint64_t held_slots = 0;
+    uint64_t held_bytes = 0;
     {
         std::lock_guard<std::mutex> lock(twosided_mutex_);
         // Reuse existing state if redispatching a waiting task.
         for (auto &entry : twosided_tasks_) {
             if (entry.second.task == task) {
                 task_id = entry.first;
+                resume_off = entry.second.sent_bytes;
+                credit_held = entry.second.credit_reserved;
+                held_slots = entry.second.reserved_slots;
+                held_bytes = entry.second.reserved_bytes;
                 entry.second.waiting_credit = false;
                 entry.second.peer = peer;
                 entry.second.peer_session = session;
@@ -408,15 +416,34 @@ int RdmaTwoSidedTransport::dispatchTwoSidedTask(TransferTask *task) {
     // Credit reserve for full transfer (bounce slots ≈ ceil(len/payload)).
     size_t slots_needed = (length + max_payload - 1) / max_payload;
     if (slots_needed == 0) slots_needed = 1;
-    if (globalConfig().rdma_credit_enabled) {
+    uint64_t reserve_bytes = length;
+    if (credit_held) {
+        // Roll back exactly what was reserved, which may have been capped.
+        slots_needed = held_slots;
+        reserve_bytes = held_bytes;
+    } else if (globalConfig().rdma_credit_enabled) {
         // Credits exist only after the peer's CREDIT_GRANT activated the
         // session in the ledger. Dispatching before that is backpressure, not
         // an error, so queue the task; handleCreditGrant redispatches it.
         if (!session_known) return ERR_TOO_MANY_REQUESTS;
+        // A grant never exceeds the peer's bounce pool, so a transfer needing
+        // more slots than the whole pool would wait for credits that can never
+        // arrive. Reserve at most the full grant and let mid-transfer resume
+        // carry the rest.
+        uint64_t grant_slots = 0;
+        if (sender_credit_.grantTotal(peer, session, epoch,
+                                      CreditResource::BounceSlots,
+                                      grant_slots) == 0 &&
+            grant_slots && slots_needed > grant_slots) {
+            slots_needed = grant_slots;
+            reserve_bytes = std::min<uint64_t>(
+                length, grant_slots * static_cast<uint64_t>(
+                                          globalConfig().rdma_msg_slot_size));
+        }
         int rc = sender_credit_.tryReserve(
             peer, session, epoch,
             {{CreditResource::BounceSlots, slots_needed},
-             {CreditResource::BounceBytes, length}});
+             {CreditResource::BounceBytes, reserve_bytes}});
         if (rc) {
             for (auto &rail : rails) {
                 if (rail) rail->requestExpand();
@@ -428,39 +455,29 @@ int RdmaTwoSidedTransport::dispatchTwoSidedTask(TransferTask *task) {
         if (it != twosided_tasks_.end()) {
             it->second.credit_reserved = true;
             it->second.reserved_slots = slots_needed;
-            it->second.reserved_bytes = length;
+            it->second.reserved_bytes = reserve_bytes;
             it->second.peer_session = session;
             it->second.peer = peer;
         }
     }
 
-    // Once a chunk is on the wire the task is no longer replayable, so wait in
-    // place for a recycled slot rather than rolling back and resending it.
-    constexpr auto kMidTransferRetryWindow = std::chrono::milliseconds(200);
-
-    auto spraySend = [&](uint8_t seq, bool allow_wait, auto &&send_fn) -> int {
+    auto spraySend = [&](uint8_t seq, auto &&send_fn) -> int {
         const size_t n = rails.size();
         const size_t start = static_cast<size_t>(seq) % n;
-        const auto deadline =
-            std::chrono::steady_clock::now() + kMidTransferRetryWindow;
         int last_rc = ERR_ENDPOINT;
-        for (;;) {
-            for (size_t attempt = 0; attempt < n; ++attempt) {
-                auto &rail = rails[(start + attempt) % n];
-                if (!rail || !rail->connected()) continue;
-                last_rc = send_fn(rail);
-                if (last_rc == 0) return 0;
-                if (last_rc != ERR_TOO_MANY_REQUESTS) return last_rc;
-            }
-            // All rails out of slots: grow them, then wait for a DATA_ACK to
-            // recycle one if the caller cannot requeue.
-            for (auto &rail : rails) {
-                if (rail) rail->requestExpand();
-            }
-            if (!allow_wait || std::chrono::steady_clock::now() >= deadline)
-                return last_rc ? last_rc : ERR_TOO_MANY_REQUESTS;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        for (size_t attempt = 0; attempt < n; ++attempt) {
+            auto &rail = rails[(start + attempt) % n];
+            if (!rail || !rail->connected()) continue;
+            last_rc = send_fn(rail);
+            if (last_rc == 0) return 0;
+            if (last_rc != ERR_TOO_MANY_REQUESTS) return last_rc;
         }
+        // Every rail is out of bounce slots: grow them. The caller resumes
+        // from the next unsent offset once a DATA_ACK recycles one.
+        for (auto &rail : rails) {
+            if (rail) rail->requestExpand();
+        }
+        return last_rc;
     };
 
     // Safe after partial progress too: the peer never ACKs an incomplete task,
@@ -470,42 +487,36 @@ int RdmaTwoSidedTransport::dispatchTwoSidedTask(TransferTask *task) {
         sender_credit_.rollbackReservation(
             peer, session, epoch,
             {{CreditResource::BounceSlots, slots_needed},
-             {CreditResource::BounceBytes, length}});
+             {CreditResource::BounceBytes, reserve_bytes}});
         std::lock_guard<std::mutex> lock(twosided_mutex_);
         auto it = twosided_tasks_.find(task_id);
         if (it != twosided_tasks_.end()) it->second.credit_reserved = false;
     };
 
-    uint8_t seq = 0;
-    size_t sent_chunks = 0;
-    for (size_t off = 0; off < length; off += max_payload, ++seq) {
+    if (resume_off)
+        twosided_resume_count_.fetch_add(1, std::memory_order_relaxed);
+    for (size_t off = resume_off; off < length; off += max_payload) {
+        uint8_t seq = static_cast<uint8_t>(off / max_payload);
         uint32_t chunk =
             static_cast<uint32_t>(std::min(max_payload, length - off));
-        const bool partial = sent_chunks > 0;
-        int rc = spraySend(seq, /*allow_wait=*/partial,
-                           [&](const std::shared_ptr<MsgChannel> &msg) {
-                               if (opcode == TransferRequest::WRITE) {
-                                   return msg->sendDataWrite(
-                                       task_id, seq, target_offset + off,
-                                       static_cast<const char *>(source) + off,
-                                       chunk);
-                               }
-                               return msg->sendReadReq(
-                                   task_id, seq, target_offset + off, chunk);
-                           });
-        if (rc == 0) {
-            ++sent_chunks;
-            continue;
+        int rc = spraySend(seq, [&](const std::shared_ptr<MsgChannel> &msg) {
+            if (opcode == TransferRequest::WRITE) {
+                return msg->sendDataWrite(
+                    task_id, seq, target_offset + off,
+                    static_cast<const char *>(source) + off, chunk);
+            }
+            return msg->sendReadReq(task_id, seq, target_offset + off, chunk);
+        });
+        if (rc == 0) continue;
+        if (rc == ERR_TOO_MANY_REQUESTS && off > 0) {
+            // Keep the reservation and record where to resume: replaying the
+            // prefix would duplicate chunks the peer already counted.
+            std::lock_guard<std::mutex> lock(twosided_mutex_);
+            auto it = twosided_tasks_.find(task_id);
+            if (it != twosided_tasks_.end()) it->second.sent_bytes = off;
+            return rc;
         }
         rollbackReservation();
-        // Requeueing now would resend the prefix already on the wire, so
-        // backpressure has to become a hard failure.
-        if (partial && rc == ERR_TOO_MANY_REQUESTS) {
-            LOG(WARNING) << "MsgChannel: no bounce slot mid-transfer, failing"
-                         << " task_id=" << task_id << " peer=" << peer
-                         << " sent_chunks=" << sent_chunks;
-            return ERR_ENDPOINT;
-        }
         return rc;
     }
     // Publish the dispatch under ctrl_idle_mutex_ and wake the ctrl worker:
@@ -541,17 +552,29 @@ void RdmaTwoSidedTransport::completeTwoSidedAck(uint64_t task_id,
     TransferTask *task = nullptr;
     TwoSidedTaskState finished;
     bool do_rollback = false;
+    bool completed = false;
+    bool slot_recycled = false;
     {
         std::lock_guard<std::mutex> lock(twosided_mutex_);
         auto it = twosided_tasks_.find(task_id);
         if (it == twosided_tasks_.end()) return;
         if (acked_bytes > it->second.acked_bytes)
             it->second.acked_bytes = acked_bytes;
-        if (it->second.acked_bytes < it->second.total_bytes) return;
-        finished = it->second;
-        task = it->second.task;
-        do_rollback = it->second.credit_reserved;
-        twosided_tasks_.erase(it);
+        if (it->second.acked_bytes < it->second.total_bytes) {
+            // This ACK freed a bounce slot, which is exactly what a task
+            // stopped mid-transfer is queued for.
+            slot_recycled = !waiting_tasks_.empty();
+        } else {
+            finished = it->second;
+            task = it->second.task;
+            do_rollback = it->second.credit_reserved;
+            completed = true;
+            twosided_tasks_.erase(it);
+        }
+    }
+    if (!completed) {
+        if (slot_recycled) redispatchWaitingTasks();
+        return;
     }
     twosided_inflight_.fetch_sub(1, std::memory_order_acq_rel);
     if (do_rollback && globalConfig().rdma_credit_enabled) {

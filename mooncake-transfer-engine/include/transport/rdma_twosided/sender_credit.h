@@ -54,6 +54,11 @@ class SenderCreditLedger {
     int available(const std::string &peer, uint64_t session, uint64_t epoch,
                   CreditResource resource, uint64_t &out) const;
 
+    // Cumulative grant for the session, ignoring what is already consumed. It
+    // is the ceiling a single reservation can ever reach.
+    int grantTotal(const std::string &peer, uint64_t session, uint64_t epoch,
+                   CreditResource resource, uint64_t &out) const;
+
     // Sum available units of `resource` across all sessions for peer.
     uint64_t availableForPeer(const std::string &peer,
                               CreditResource resource) const;
