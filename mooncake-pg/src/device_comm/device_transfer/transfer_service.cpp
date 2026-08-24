@@ -13,8 +13,8 @@
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.h"
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.h"
+#include "device_comm/device_transfer/routes/route_provider.h"
 #include "gpu_runtime.h"
-#include "memory_location.h"
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -34,100 +34,6 @@ bool validEndpoint(const DeviceTransferEndpoint& endpoint) {
     return true;
 }
 
-// Concrete owner for the one stable device region exposed by the service.
-// Routes and DeviceArena only borrow this memory.
-class ServiceRegion {
-   public:
-    static PGResult<ServiceRegion> create(int device_index, size_t size,
-                                          device::P2pTransport* p2p_allocator) {
-        PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
-        ServiceRegion region(device_index, size);
-        if (p2p_allocator) {
-            region.addr_ = p2p_allocator->allocateBuffer(size);
-            PG_VALIDATE_STATE(region.addr_,
-                              "failed to allocate shareable service region");
-            region.p2p_allocator_ = p2p_allocator;
-        } else {
-            PG_TRY_CUDA(cudaMalloc(&region.addr_, size));
-        }
-        return region;
-    }
-
-    ~ServiceRegion() noexcept {
-        auto result = release();
-        if (!result.has_value()) {
-            LOG(ERROR) << "Failed to release device transfer service region: "
-                       << result.error().message;
-        }
-    }
-
-    ServiceRegion(const ServiceRegion&) = delete;
-    ServiceRegion& operator=(const ServiceRegion&) = delete;
-    ServiceRegion& operator=(ServiceRegion&&) = delete;
-
-    ServiceRegion(ServiceRegion&& other) noexcept
-        : device_index_(std::exchange(other.device_index_, -1)),
-          addr_(std::exchange(other.addr_, nullptr)),
-          size_(std::exchange(other.size_, 0)),
-          p2p_allocator_(std::exchange(other.p2p_allocator_, nullptr)),
-          host_proxy_engine_(std::exchange(other.host_proxy_engine_, nullptr)),
-          registered_for_host_proxy_(
-              std::exchange(other.registered_for_host_proxy_, false)) {}
-
-    PGResult<void> registerForHostProxy(TransferEngine& engine,
-                                        const std::string& location) {
-        PG_VALIDATE_STATE(addr_, "service region is not allocated");
-        PG_VALIDATE_STATE(!registered_for_host_proxy_,
-                          "service region is already registered for the "
-                          "host-proxy route");
-        PG_TRY_TE(engine.registerLocalMemory(addr_, size_, location));
-        host_proxy_engine_ = &engine;
-        registered_for_host_proxy_ = true;
-        return {};
-    }
-
-    PGResult<void> release() {
-        if (!addr_) return {};
-        PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
-
-        if (registered_for_host_proxy_) {
-            const int result = host_proxy_engine_->unregisterLocalMemory(addr_);
-            if (result != 0) {
-                LOG(ERROR) << "Failed to unregister device transfer service "
-                              "region, rc="
-                           << result;
-            }
-            host_proxy_engine_ = nullptr;
-            registered_for_host_proxy_ = false;
-        }
-
-        if (p2p_allocator_) {
-            p2p_allocator_->freeBuffer(addr_);
-        } else {
-            PG_TRY_CUDA(cudaFree(addr_));
-        }
-        addr_ = nullptr;
-        size_ = 0;
-        p2p_allocator_ = nullptr;
-        device_index_ = -1;
-        return {};
-    }
-
-    [[nodiscard]] void* addr() const noexcept { return addr_; }
-    [[nodiscard]] size_t size() const noexcept { return size_; }
-
-   private:
-    ServiceRegion(int device_index, size_t size) noexcept
-        : device_index_(device_index), size_(size) {}
-
-    int device_index_ = -1;
-    void* addr_ = nullptr;
-    size_t size_ = 0;
-    device::P2pTransport* p2p_allocator_ = nullptr;
-    TransferEngine* host_proxy_engine_ = nullptr;
-    bool registered_for_host_proxy_ = false;
-};
-
 template <typename Item>
 uint64_t reserveLayoutItems(uint64_t& cursor, uint64_t count = 1) {
     cursor += alignmentPadding(cursor, alignof(Item));
@@ -140,6 +46,25 @@ template <typename Item>
 Item* layoutItemsAt(void* base, uint64_t offset) noexcept {
     return reinterpret_cast<Item*>(static_cast<char*>(base) + offset);
 }
+
+// Adapt TE's P2P allocation API at the DTS boundary. DeviceTransferRegion
+// remains independent of both P2pTransport and its allocation modes.
+class P2pRegionAllocator {
+   public:
+    explicit P2pRegionAllocator(device::P2pTransport& transport) noexcept
+        : transport_(&transport) {}
+
+    [[nodiscard]] void* allocate(size_t bytes) const {
+        return transport_->allocateBuffer(bytes);
+    }
+
+    void deallocate(void* ptr, size_t) const noexcept {
+        transport_->freeBuffer(ptr);
+    }
+
+   private:
+    device::P2pTransport* transport_;
+};
 
 }  // namespace
 
@@ -165,9 +90,10 @@ struct DeviceTransferService::DeviceState {
 
     static PGResult<std::unique_ptr<DeviceState>> create(
         int device_index, GlobalRank self_rank, uint32_t max_world_size,
-        size_t region_size, TransferEngine& engine, LinkManager& link_manager) {
-        // P2P is an optional route. When it is unavailable, the service region
-        // remains usable through host-proxy routes.
+        size_t peer_accessible_capacity, size_t local_staging_capacity,
+        TransferEngine& engine, LinkManager& link_manager) {
+        // P2P is an optional route. When it is unavailable, the published
+        // region remains usable through host-proxy routes.
         auto* p2p_transport =
             engine.getOrCreateP2pTransport(static_cast<int>(max_world_size));
         PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
@@ -175,22 +101,29 @@ struct DeviceTransferService::DeviceState {
 
         // A P2P allocation must be released by the same P2P object. With
         // no P2P route, an ordinary device allocation is sufficient.
-        PG_TRY(auto region,
-               ServiceRegion::create(device_index, region_size, p2p_transport));
+        std::optional<DeviceTransferRegion> peer_accessible_region;
+        if (p2p_transport) {
+            PG_TRY(auto region, DeviceTransferRegion::create(
+                                    device_index, peer_accessible_capacity,
+                                    P2pRegionAllocator(*p2p_transport)));
+            peer_accessible_region.emplace(std::move(region));
+        } else {
+            PG_TRY(auto region, DeviceTransferRegion::create(
+                                    device_index, peer_accessible_capacity));
+            peer_accessible_region.emplace(std::move(region));
+        }
+
         // Every fallible acquisition below is recorded in state, so an early
         // return unwinds it through DeviceState::shutdown().
-        auto state = std::unique_ptr<DeviceState>(
-            new DeviceState(device_index, self_rank, max_world_size,
-                            std::move(route_stream), std::move(region)));
-        const auto location = GPU_PREFIX + std::to_string(device_index);
-        PG_TRY(state->region.registerForHostProxy(engine, location));
+        auto state = std::unique_ptr<DeviceState>(new DeviceState(
+            device_index, self_rank, max_world_size, local_staging_capacity,
+            std::move(route_stream), std::move(*peer_accessible_region)));
 
-        // Initialize all route providers before publishing any kernel-facing
-        // pointers or endpoint metadata.
+        // Initialize every route before registering the shared backing region.
         if (p2p_transport) {
             state->p2p_route = std::make_unique<P2pRoute>(
-                *p2p_transport, state->region.addr(), device_index, self_rank,
-                max_world_size);
+                *p2p_transport, state->peer_accessible_region.addr(),
+                device_index, self_rank, max_world_size);
             PG_TRY(state->p2p_route->initialize());
             state->route_providers.push_back(state->p2p_route.get());
         }
@@ -198,10 +131,14 @@ struct DeviceTransferService::DeviceState {
             engine, link_manager, max_world_size);
         PG_TRY(state->host_proxy_route->initialize(device_index));
         state->route_providers.push_back(state->host_proxy_route.get());
+        PG_TRY(state->registerRegion(DeviceRegionKind::PeerAccessible,
+                                     state->peer_accessible_region));
+        state->peer_accessible_region_registered = true;
 
         state->local_endpoint = DeviceTransferEndpoint{
-            .region_address = reinterpret_cast<uint64_t>(state->region.addr()),
-            .region_size = state->region.size(),
+            .region_address = reinterpret_cast<uint64_t>(
+                state->peer_accessible_region.addr()),
+            .region_size = state->peer_accessible_region.size(),
             .routes = {},
         };
         for (auto* provider : state->route_providers) {
@@ -242,8 +179,12 @@ struct DeviceTransferService::DeviceState {
         // Publish the kernel entry point last, after every pointer it exposes
         // refers to initialized state.
         const DeviceTransferHandle handle_image{
-            .local_region = state->region.addr(),
-            .local_region_size = state->region.size(),
+            .peer_accessible_region =
+                {
+                    .addr = state->peer_accessible_region.addr(),
+                    .size = state->peer_accessible_region.size(),
+                },
+            .local_staging_region = {},
             .routes = state->device_metadata.routes,
             .lane_results = state->device_metadata.lane_results,
             .host_proxy_command_slots =
@@ -256,11 +197,13 @@ struct DeviceTransferService::DeviceState {
     }
 
     DeviceState(int device_index, GlobalRank self_rank, uint32_t max_world_size,
-                GpuStream route_stream, ServiceRegion region)
+                size_t local_staging_capacity, GpuStream route_stream,
+                DeviceTransferRegion peer_accessible_region)
         : device_index(device_index),
           self_rank(self_rank),
           max_world_size(max_world_size),
-          region(std::move(region)),
+          local_staging_capacity(local_staging_capacity),
+          peer_accessible_region(std::move(peer_accessible_region)),
           route_stream(std::move(route_stream)) {}
 
     ~DeviceState() noexcept {
@@ -315,6 +258,26 @@ struct DeviceTransferService::DeviceState {
         return {};
     }
 
+    PGResult<void> registerRegion(DeviceRegionKind kind,
+                                  const DeviceTransferRegion& region) {
+        for (auto* provider : route_providers) {
+            PG_TRY(
+                provider->registerRegion(kind, region.addr(), region.size()));
+        }
+        return {};
+    }
+
+    PGResult<void> unregisterRegion(DeviceRegionKind kind,
+                                    const DeviceTransferRegion& region) {
+        for (auto current = route_providers.rbegin();
+             current != route_providers.rend(); ++current) {
+            auto* provider = *current;
+            PG_TRY(
+                provider->unregisterRegion(kind, region.addr(), region.size()));
+        }
+        return {};
+    }
+
     PGResult<void> publishRoutes() {
         PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
         PG_TRY_CUDA(cudaMemcpyAsync(
@@ -324,10 +287,46 @@ struct DeviceTransferService::DeviceState {
         return route_stream.synchronize();
     }
 
+    PGResult<RegionSlice> allocateLocalStaging(size_t size, size_t alignment) {
+        if (!local_staging_region) {
+            PG_TRY(auto staging, DeviceTransferRegion::create(
+                                     device_index, local_staging_capacity));
+            PG_TRY(registerRegion(DeviceRegionKind::LocalStaging, staging));
+            local_staging_region.emplace(std::move(staging));
+        }
+
+        if (!local_staging_handle_initialized) {
+            const DeviceLocalRegion device_region{
+                .addr = local_staging_region->addr(),
+                .size = local_staging_region->size(),
+            };
+            PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
+            PG_TRY_CUDA(cudaMemcpy(
+                &device_metadata.handle->local_staging_region, &device_region,
+                sizeof(device_region), cudaMemcpyHostToDevice));
+            local_staging_handle_initialized = true;
+        }
+        return local_staging_region->allocate(size, alignment);
+    }
+
     PGResult<void> shutdown() {
         if (shutdown_requested_) return {};
 
         PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
+        PG_TRY(quiesceRoutes());
+        if (local_staging_region) {
+            PG_TRY(unregisterRegion(DeviceRegionKind::LocalStaging,
+                                    *local_staging_region));
+            PG_TRY(local_staging_region->release());
+            local_staging_region.reset();
+            local_staging_handle_initialized = false;
+        }
+        if (peer_accessible_region_registered) {
+            PG_TRY(unregisterRegion(DeviceRegionKind::PeerAccessible,
+                                    peer_accessible_region));
+            peer_accessible_region_registered = false;
+        }
+        PG_TRY(peer_accessible_region.release());
         for (auto* provider : route_providers) PG_TRY(provider->shutdown());
 
         if (host_route_image) {
@@ -351,7 +350,6 @@ struct DeviceTransferService::DeviceState {
         route_providers.clear();
         p2p_route.reset();
         host_proxy_route.reset();
-        PG_TRY(region.release());
         shutdown_requested_ = true;
         return {};
     }
@@ -359,7 +357,11 @@ struct DeviceTransferService::DeviceState {
     int device_index;
     GlobalRank self_rank;
     uint32_t max_world_size;
-    ServiceRegion region;
+    size_t local_staging_capacity;
+    DeviceTransferRegion peer_accessible_region;
+    std::optional<DeviceTransferRegion> local_staging_region;
+    bool peer_accessible_region_registered = false;
+    bool local_staging_handle_initialized = false;
     GpuStream route_stream;
     std::unique_ptr<P2pRoute> p2p_route;
     std::unique_ptr<HostProxyRoute> host_proxy_route;
@@ -415,7 +417,7 @@ DeviceTransferService::~DeviceTransferService() noexcept {
 PGResult<void> DeviceTransferService::initialize(
     GlobalRank self_rank, uint32_t max_world_size, int device_index,
     TransferEngine& transfer_engine, LinkManager& link_manager,
-    size_t region_size) {
+    size_t peer_accessible_capacity, size_t local_staging_capacity) {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_STATE(!shutdown_requested_,
                       "DeviceTransferService is shutting down");
@@ -427,11 +429,15 @@ PGResult<void> DeviceTransferService::initialize(
         self_rank >= 0 && static_cast<uint32_t>(self_rank) < max_world_size,
         "device transfer self rank is out of range");
     PG_VALIDATE_ARG(device_index >= 0, "invalid CUDA device");
-    PG_VALIDATE_ARG(region_size != 0, "transfer-service region is empty");
+    PG_VALIDATE_ARG(peer_accessible_capacity != 0,
+                    "peer-accessible region is empty");
+    PG_VALIDATE_ARG(local_staging_capacity != 0,
+                    "local staging region is empty");
 
     PG_TRY(auto device,
            DeviceState::create(device_index, self_rank, max_world_size,
-                               region_size, transfer_engine, link_manager));
+                               peer_accessible_capacity, local_staging_capacity,
+                               transfer_engine, link_manager));
 
     device_ = std::move(device);
     return {};
@@ -461,12 +467,26 @@ const DeviceTransferEndpoint& DeviceTransferService::localEndpoint()
     return device_->local_endpoint;
 }
 
-void* DeviceTransferService::regionAddr() const noexcept {
-    return device_->region.addr();
+int DeviceTransferService::deviceIndex() const noexcept {
+    return device_->device_index;
 }
 
-size_t DeviceTransferService::regionSize() const noexcept {
-    return device_->region.size();
+PGResult<RegionSlice> DeviceTransferService::allocatePeerAccessible(
+    size_t size, size_t alignment) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PG_VALIDATE_STATE(device_, "DeviceTransferService is not initialized");
+    PG_VALIDATE_STATE(!shutdown_requested_,
+                      "DeviceTransferService is shutting down");
+    return deviceState().peer_accessible_region.allocate(size, alignment);
+}
+
+PGResult<RegionSlice> DeviceTransferService::allocateLocalStaging(
+    size_t size, size_t alignment) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PG_VALIDATE_STATE(device_, "DeviceTransferService is not initialized");
+    PG_VALIDATE_STATE(!shutdown_requested_,
+                      "DeviceTransferService is shutting down");
+    return deviceState().allocateLocalStaging(size, alignment);
 }
 
 PGResult<void> DeviceTransferService::installPeerEndpoint(

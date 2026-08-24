@@ -58,7 +58,7 @@ struct RouteEndpoint {
     bool operator==(const RouteEndpoint&) const = default;
 };
 
-// Process-level collective buffer in the registered device arena.
+// Process-level collective buffer in DTS's peer-accessible region.
 struct DeviceCollectiveEndpoint {
     uint64_t buffer_offset = 0;
     uint64_t buffer_size = 0;
@@ -79,7 +79,7 @@ struct DeviceTransferEndpoint {
 
 // Group-level endpoint of one Ring AllReduce protocol instance. Signals are
 // communicator-local even though their backing memory comes from the
-// process-wide registered arena.
+// process-wide peer-accessible region.
 struct RingAllReduceEndpoint {
     uint64_t signal_offset = 0;
     uint32_t signal_count = 0;

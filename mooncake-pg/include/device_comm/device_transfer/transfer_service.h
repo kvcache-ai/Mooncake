@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "control_plane/control_types.h"
+#include "device_comm/device_transfer/transfer_region.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "error_types.h"
 
@@ -28,14 +29,22 @@ class DeviceTransferService {
 
     PGResult<void> initialize(GlobalRank self_rank, uint32_t max_world_size,
                               int device_index, TransferEngine& transfer_engine,
-                              LinkManager& link_manager, size_t region_size);
+                              LinkManager& link_manager,
+                              size_t peer_accessible_capacity,
+                              size_t local_staging_capacity);
 
-    // The service owns one stable registered region from initialize() until
-    // shutdown(). DeviceArena may sub-allocate it but does not own it.
-    [[nodiscard]] void* regionAddr() const noexcept;
-    [[nodiscard]] size_t regionSize() const noexcept;
+    // Allocate a slice from the stable peer-accessible region. The backing
+    // region is published once through DeviceTransferEndpoint; individual
+    // slices require no additional publication.
+    PGResult<RegionSlice> allocatePeerAccessible(size_t size, size_t alignment);
+
+    // Allocate a slice from a local-only source region. Its backing memory is
+    // allocated and registered lazily on the first request and is never
+    // published to peers.
+    PGResult<RegionSlice> allocateLocalStaging(size_t size, size_t alignment);
 
     // Immutable bootstrap metadata for the initialized CUDA device.
+    [[nodiscard]] int deviceIndex() const noexcept;
     [[nodiscard]] const DeviceTransferEndpoint& localEndpoint() const noexcept;
 
     // Device address of the stable kernel-facing service handle.

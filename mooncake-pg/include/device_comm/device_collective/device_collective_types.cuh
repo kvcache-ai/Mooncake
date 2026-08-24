@@ -1,7 +1,6 @@
 #ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_TYPES_CUH
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_TYPES_CUH
 
-#include <cstddef>
 #include <cstdint>
 
 #include <cuda_alike.h>
@@ -13,7 +12,6 @@ namespace mooncake {
 
 inline constexpr uint32_t kMaxDeviceCollectiveChannels = 32;
 static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
-inline constexpr size_t kDeviceCollectiveBufferCapacity = 16ull << 20;
 
 inline constexpr bool isDeviceAllReduceCombinationSupported(
     DataType datatype, ReduceOp op) noexcept {

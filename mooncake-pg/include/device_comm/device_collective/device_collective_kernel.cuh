@@ -43,7 +43,8 @@ __device__ __forceinline__ void completeChannel(
             if (atomicAdd(failed, 0u) != 0u) {
                 const uint64_t generation =
                     device::mc_ld_acquire_u64(
-                        &recovery_mailbox->failure_generation) + 1;
+                        &recovery_mailbox->failure_generation) +
+                    1;
 
                 recovery_mailbox->failed_rank = invocation->failed_rank;
                 recovery_mailbox->failed_hint_address =
@@ -56,11 +57,10 @@ __device__ __forceinline__ void completeChannel(
                 // lets the host read the metadata and replace the Plan and
                 // protocol state only after all channels are quiescent.
                 __threadfence_system();
-                device::mc_st_release_u64(
-                    &recovery_mailbox->failure_generation, generation);
+                device::mc_st_release_u64(&recovery_mailbox->failure_generation,
+                                          generation);
                 while (device::mc_ld_acquire_u64(
-                           &recovery_mailbox->ready_generation) <
-                       generation) {
+                           &recovery_mailbox->ready_generation) < generation) {
                 }
             }
 

@@ -28,8 +28,16 @@ namespace {
 // task for the barrier.
 constexpr size_t kBarrierDummySize = 1;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
-constexpr size_t kDeviceCollectiveWorkspaceAlignment =
-    256;  // 256-byte alignment
+constexpr size_t kDefaultDeviceCollectiveBufferSize = 256ull * 1024 * 1024;
+// Headroom for other states, e.g. communicator-local signals
+constexpr size_t kDefaultDeviceCollectiveControlReserve = 512ull * 1024 * 1024;
+
+// Only remotely published resources occupy the eager peer-accessible region.
+// DTS allocates the local staging region lazily if a selected route needs one.
+constexpr size_t kDefaultPeerAccessibleCapacity =
+    kDefaultDeviceCollectiveBufferSize + kDefaultDeviceCollectiveControlReserve;
+constexpr size_t kDefaultLocalStagingCapacity =
+    kDefaultDeviceCollectiveBufferSize;
 #endif
 
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
@@ -192,16 +200,13 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
     auto transfer_service = std::make_unique<DeviceTransferService>();
     PG_TRY(transfer_service->initialize(
         static_cast<GlobalRank>(rank), static_cast<uint32_t>(world_size),
-        device_index, *engine, link_manager, kDefaultDeviceArenaSize));
+        device_index, *engine, link_manager, kDefaultPeerAccessibleCapacity,
+        kDefaultLocalStagingCapacity));
 
-    auto arena =
-        DeviceArena::create(device_index, transfer_service->regionAddr(),
-                            transfer_service->regionSize());
     PG_TRY(auto workspace, DeviceCollectiveWorkspace::create(
-                               *arena, static_cast<GlobalRank>(rank),
+                               *transfer_service, static_cast<GlobalRank>(rank),
                                static_cast<uint32_t>(world_size),
-                               kDeviceCollectiveBufferCapacity,
-                               kDeviceCollectiveWorkspaceAlignment));
+                               kDefaultDeviceCollectiveBufferSize));
 
     PG_TRY(auto strong_stream, StrongStream::create(device_index));
 
@@ -209,7 +214,6 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
     PG_TRY(recovery_worker->start());
 
     device_transfer_service = std::move(transfer_service);
-    device_arena = std::move(arena);
     device_collective_workspace = std::move(workspace);
     device_collective_strong_stream = std::move(strong_stream);
     device_collective_recovery_worker = std::move(recovery_worker);
@@ -402,7 +406,6 @@ PGResult<void> MooncakePGContext::shutdown() {
     }
     device_collective_strong_stream.reset();
     device_collective_workspace.reset();
-    device_arena.reset();
     if (device_transfer_service) {
         PG_TRY(device_transfer_service->shutdown());
         device_transfer_service.reset();
@@ -506,13 +509,12 @@ PGResult<void> MooncakeCommunicator::initialize(
     if (!is_cpu_) {
         PG_VALIDATE_STATE(context_.device_transfer_service,
                           "device transfer service is unavailable");
-        PG_VALIDATE_STATE(context_.device_arena &&
-                              context_.device_collective_workspace &&
+        PG_VALIDATE_STATE(context_.device_collective_workspace &&
                               context_.device_collective_strong_stream,
                           "device collective device resources are unavailable");
         PG_TRY(device_collective_,
                DeviceCollectiveRuntime::create(
-                   *context_.device_transfer_service, *context_.device_arena,
+                   *context_.device_transfer_service,
                    *context_.device_collective_workspace,
                    *context_.device_collective_strong_stream, device_index_,
                    rank_, max_group_size_, context_.collective_timeout_us));

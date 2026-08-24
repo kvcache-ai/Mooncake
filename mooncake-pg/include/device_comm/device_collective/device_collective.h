@@ -10,7 +10,6 @@
 
 #include "common_types.h"
 #include "control_plane/control_types.h"
-#include "device_comm/device_arena.h"
 #include "device_comm/device_collective/device_collective_recovery.h"
 #include "device_comm/device_collective/device_collective_types.cuh"
 #include "device_comm/device_transfer/transfer_service.h"
@@ -31,7 +30,7 @@ class DeviceCollectiveRuntime {
     using RecoveryHandler = std::function<PGResult<void>(InGroupRank)>;
 
     static PGResult<std::unique_ptr<DeviceCollectiveRuntime>> create(
-        DeviceTransferService& transfer_service, DeviceArena& arena,
+        DeviceTransferService& transfer_service,
         DeviceCollectiveWorkspace& workspace, StrongStream& strong_stream,
         int device_index, InGroupRank self_rank, uint32_t max_group_size,
         size_t collective_timeout_us);

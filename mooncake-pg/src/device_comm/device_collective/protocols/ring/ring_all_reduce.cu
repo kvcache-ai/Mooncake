@@ -14,11 +14,9 @@ namespace {
 
 template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ RingStepResult runRingTile(
-    const RingAllReducePlan& plan,
-    const RingPrimitives<T, Op>& primitives,
+    const RingAllReducePlan& plan, const RingPrimitives<T, Op>& primitives,
     const RingTileLayout& layout, uint64_t tile_index,
-    uint64_t* payload_slot_sequences,
-    cooperative_groups::thread_block block) {
+    uint64_t* payload_slot_sequences, cooperative_groups::thread_block block) {
     const uint64_t ring_steps = plan.participant_count - 1;
     // Reduce-scatter and all-gather share one alternating payload-slot
     // schedule for the whole tile traversal.
@@ -28,8 +26,8 @@ template <typename T, ReduceOp Op>
 
     // Start reduce-scatter by injecting this rank's contribution for its own
     // shard into the ring.
-    const uint32_t first_shard_index = ringShardAtDistance(
-        plan.self_active_index, plan.participant_count, 0);
+    const uint32_t first_shard_index =
+        ringShardAtDistance(plan.self_active_index, plan.participant_count, 0);
     const RingTile first_tile = layout.tile(first_shard_index, tile_index);
     auto curr_slot = slot_schedule.next();
     auto result = primitives.send(first_tile, curr_slot, block);
@@ -47,8 +45,7 @@ template <typename T, ReduceOp Op>
             plan.self_active_index, plan.participant_count, distance);
         const RingTile tile = layout.tile(shard_index, tile_index);
         next_slot = slot_schedule.next();
-        result =
-            primitives.recvReduceSend(tile, curr_slot, next_slot, block);
+        result = primitives.recvReduceSend(tile, curr_slot, next_slot, block);
         if (!result.succeeded()) return result;
         curr_slot = next_slot;
     }
@@ -60,8 +57,8 @@ template <typename T, ReduceOp Op>
     const RingTile completed_tile =
         layout.tile(completed_shard_index, tile_index);
     next_slot = slot_schedule.next();
-    result = primitives.recvReduceCopySend(
-        completed_tile, curr_slot, next_slot, block);
+    result = primitives.recvReduceCopySend(completed_tile, curr_slot, next_slot,
+                                           block);
     if (!result.succeeded()) return result;
     curr_slot = next_slot;
 
@@ -86,9 +83,8 @@ template <typename T, ReduceOp Op>
 }
 
 template <typename T, ReduceOp Op>
-__global__ void ringAllReduceKernel(
-    RingAllReduceKernelArgs request,
-    RingAllReduceDeviceState* state) {
+__global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
+                                    RingAllReduceDeviceState* state) {
     const auto block = cooperative_groups::this_thread_block();
     const uint32_t channel = blockIdx.x;
     PG_DEVICE_ASSERT(state);
@@ -124,38 +120,36 @@ __global__ void ringAllReduceKernel(
     }
     block.sync();
 
-    // Ring binds one algorithm channel to one fixed transfer lane. The current
-    // Plan supplies the buffer, optional staging and signal as offsets in
-    // the DTS arena.
     const auto* const transfer_handle = plan.transfer_handle;
     PG_DEVICE_ASSERT(transfer_handle);
-    PG_DEVICE_ASSERT(transfer_handle->local_region);
-    const uint64_t local_region_size = transfer_handle->local_region_size;
-
-    PG_DEVICE_ASSERT(plan.buffer_offset <= local_region_size);
-    PG_DEVICE_ASSERT(plan.buffer_size >= kRingBufferBytes);
-    PG_DEVICE_ASSERT(plan.buffer_size <=
-                     local_region_size - plan.buffer_offset);
+    PG_DEVICE_ASSERT(transfer_handle->peer_accessible_region.contains(
+        plan.buffer_ptr, plan.buffer_size));
     if (plan.staging_size != 0) {
-        PG_DEVICE_ASSERT(plan.staging_offset <= local_region_size);
-        PG_DEVICE_ASSERT(plan.staging_size >= kRingStagingBytes);
-        PG_DEVICE_ASSERT(plan.staging_size <=
-                         local_region_size - plan.staging_offset);
+        PG_DEVICE_ASSERT(plan.staging_size >= plan.buffer_size);
+        PG_DEVICE_ASSERT(transfer_handle->local_staging_region.contains(
+            plan.staging_ptr, plan.staging_size));
+    } else {
+        PG_DEVICE_ASSERT(plan.staging_ptr == nullptr);
     }
+
     const uint64_t signal_bytes =
         static_cast<uint64_t>(plan.signal_layout.total_signal_count) *
         sizeof(uint64_t);
-    PG_DEVICE_ASSERT(plan.signal_offset <= local_region_size);
-    PG_DEVICE_ASSERT(signal_bytes <=
-                     local_region_size - plan.signal_offset);
+    PG_DEVICE_ASSERT(transfer_handle->peer_accessible_region.contains(
+        plan.signal_ptr, signal_bytes));
 
-    const uint64_t channel_buffer_size =
-        kRingBufferBytes / channel_count;
-    PG_DEVICE_ASSERT(channel_buffer_size % kRingPipelineSlots == 0 &&
-                     channel_buffer_size / kRingPipelineSlots >=
-                         sizeof(T));
+    // Use the whole common buffer prefix modulo the small tail needed to keep
+    // every channel's two payload slots 16-byte aligned for ValuePack loads
+    // and stores. All ranks derive the same layout from the published Plan.
+    static_assert(kRingPayloadAlignment == alignof(ValuePack<T>));
+    const uint64_t unaligned_payload_slot_size =
+        plan.buffer_size / channel_count / kRingPipelineSlots;
     const uint64_t payload_slot_size =
-        channel_buffer_size / kRingPipelineSlots;
+        unaligned_payload_slot_size -
+        unaligned_payload_slot_size % kRingPayloadAlignment;
+    PG_DEVICE_ASSERT(payload_slot_size >= sizeof(T));
+    const uint64_t channel_buffer_size = payload_slot_size * kRingPipelineSlots;
+    PG_DEVICE_ASSERT(channel_buffer_size * channel_count <= plan.buffer_size);
 
     // full request -> channel -> ring shard -> tile
     const RingTileLayout tile_layout{
@@ -170,8 +164,7 @@ __global__ void ringAllReduceKernel(
         static_cast<uint64_t>(channel) * kRingPipelineSlots;
     uint64_t step_sequences[kRingPipelineSlots];
 #pragma unroll
-    for (uint32_t slot = 0;
-         slot < kRingPipelineSlots; ++slot) {
+    for (uint32_t slot = 0; slot < kRingPipelineSlots; ++slot) {
         step_sequences[slot] =
             device::mc_ld_acquire_u64(next_step_sequences + slot);
     }
@@ -180,15 +173,14 @@ __global__ void ringAllReduceKernel(
     const uint64_t recv_buffer_ready_sequence =
         device::mc_ld_acquire_u64(next_recv_buffer_ready_sequence);
 
-    const RingPrimitives<T, Op> primitives(
-        plan, input, output, channel_buffer_size, channel);
+    const RingPrimitives<T, Op> primitives(plan, input, output,
+                                           channel_buffer_size, channel);
     primitives.signalRecvBufferReady(block);
     const auto buffer_ready =
         primitives.waitRecvBufferReady(recv_buffer_ready_sequence, block);
     if (!buffer_ready.succeeded()) {
-        completeChannel(
-            plan.invocation_state, plan.recovery_mailbox, block,
-            buffer_ready.failed_rank, request.failed_ranks_hint);
+        completeChannel(plan.invocation_state, plan.recovery_mailbox, block,
+                        buffer_ready.failed_rank, request.failed_ranks_hint);
         return;
     }
 
@@ -200,21 +192,18 @@ __global__ void ringAllReduceKernel(
     // buffer is divided into two pipeline slots. Ring steps alternate between
     // them, and later tile indices reuse the same two slots.
     for (uint64_t tile_index = 0; tile_index < tile_count; ++tile_index) {
-        const auto result = runRingTile(
-            plan, primitives, tile_layout, tile_index, step_sequences,
-            block);
+        const auto result = runRingTile(plan, primitives, tile_layout,
+                                        tile_index, step_sequences, block);
         if (!result.succeeded()) {
-            completeChannel(
-                plan.invocation_state, plan.recovery_mailbox, block,
-                result.failed_rank, request.failed_ranks_hint);
+            completeChannel(plan.invocation_state, plan.recovery_mailbox, block,
+                            result.failed_rank, request.failed_ranks_hint);
             return;
         }
     }
 
     if (block.thread_rank() == 0) {
 #pragma unroll
-        for (uint32_t slot = 0;
-             slot < kRingPipelineSlots; ++slot) {
+        for (uint32_t slot = 0; slot < kRingPipelineSlots; ++slot) {
             device::mc_st_release_u64(next_step_sequences + slot,
                                       step_sequences[slot]);
         }
@@ -225,9 +214,9 @@ __global__ void ringAllReduceKernel(
 }
 
 template <typename T>
-cudaError_t launchReduction(
-    const RingAllReduceKernelArgs& request, RingAllReduceDeviceState* state,
-    dim3 grid, int protocol_threads, cudaStream_t stream) {
+cudaError_t launchReduction(const RingAllReduceKernelArgs& request,
+                            RingAllReduceDeviceState* state, dim3 grid,
+                            int protocol_threads, cudaStream_t stream) {
     switch (request.op) {
         case ReduceOp::Sum:
             ringAllReduceKernel<T, ReduceOp::Sum>
@@ -253,9 +242,10 @@ cudaError_t launchReduction(
 
 }  // namespace
 
-cudaError_t launchRingAllReduceKernel(
-    const RingAllReduceKernelArgs& request, RingAllReduceDeviceState* state,
-    uint32_t channel_count, cudaStream_t stream) {
+cudaError_t launchRingAllReduceKernel(const RingAllReduceKernelArgs& request,
+                                      RingAllReduceDeviceState* state,
+                                      uint32_t channel_count,
+                                      cudaStream_t stream) {
     constexpr int kProtocolThreads = 256;
     const dim3 grid(channel_count);
     switch (request.datatype) {
@@ -278,8 +268,8 @@ cudaError_t launchRingAllReduceKernel(
             return launchReduction<int64_t>(request, state, grid,
                                             kProtocolThreads, stream);
         case DataType::Bfloat16:
-            return launchReduction<__nv_bfloat16>(
-                request, state, grid, kProtocolThreads, stream);
+            return launchReduction<__nv_bfloat16>(request, state, grid,
+                                                  kProtocolThreads, stream);
         case DataType::Float32:
             return launchReduction<float>(request, state, grid,
                                           kProtocolThreads, stream);
@@ -287,8 +277,8 @@ cudaError_t launchRingAllReduceKernel(
             return launchReduction<double>(request, state, grid,
                                            kProtocolThreads, stream);
         case DataType::Bool:
-            return launchReduction<bool>(request, state, grid,
-                                         kProtocolThreads, stream);
+            return launchReduction<bool>(request, state, grid, kProtocolThreads,
+                                         stream);
         default:
             return cudaErrorInvalidValue;
     }
