@@ -47,6 +47,16 @@ def test_dependency_boundaries_are_declared() -> None:
         "structured",
         "vllm",
     }
+    assert set(metadata["optional-dependencies"]["vllm"]) == {
+        "fastapi",
+        "httpx",
+        "msgspec",
+        "numpy",
+        "pyzmq",
+        "torch",
+        "uvicorn",
+        "vllm",
+    }
 
 
 def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
@@ -55,6 +65,33 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_vllm_modules_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+
+    for module in ("mooncake_connector_v1.py", "vllm_v1_proxy_server.py"):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    assert (package_root / "README.md").is_file()
+    assert not (legacy_package_root / "README.md").exists()
+    assert (REPOSITORY_ROOT / "python" / "tests" / "vllm").is_dir()
+
+    direct_install = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    for module in ("mooncake_connector_v1.py", "vllm_v1_proxy_server.py"):
+        assert f"../python/mooncake/{module}" in direct_install
+        assert f"../mooncake-wheel/mooncake/{module}" not in direct_install
+
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert 'MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"' in legacy_builder
+    migrated_modules = (
+        "MIGRATED_PYTHON_MODULES=(mooncake_connector_v1.py " "vllm_v1_proxy_server.py)"
+    )
+    assert migrated_modules in legacy_builder
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(

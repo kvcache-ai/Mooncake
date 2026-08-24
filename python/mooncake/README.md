@@ -8,7 +8,8 @@ For 0.13.0 or later, please use the intree vllm mooncake_connector.
 
 ### Usage
 
-Add proper "--kv-transfer-config" parameters to your vLLM command. See comments in `mooncake_connector_v1.py`.
+Add proper `--kv-transfer-config` parameters to your vLLM command. See the
+comments in [`mooncake_connector_v1.py`](mooncake_connector_v1.py).
 
 For example, a whole demo could be:
 

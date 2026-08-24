@@ -57,6 +57,7 @@ vllm = [
     "numpy",
     "pyzmq",
     "torch",
+    "uvicorn",
     "vllm",
 ]
 administration = [

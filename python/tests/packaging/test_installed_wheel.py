@@ -41,8 +41,10 @@ def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
     clean_environment.pop("PYTHONPATH", None)
     clean_environment["PYTHONNOUSERSITE"] = "1"
     smoke_script = f"""
+import importlib.util
 from importlib import metadata
 from pathlib import Path
+import sys
 import mooncake
 import mooncake.engine
 import mooncake.reshard
@@ -54,6 +56,18 @@ assert not package_path.is_relative_to(repository_path), (package_path, reposito
 assert metadata.version("mooncake-transfer-engine") == {_project_version()!r}
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+optional_roots = {{
+    "fastapi", "httpx", "msgspec", "numpy", "torch", "uvicorn", "vllm", "zmq"
+}}
+for module_name in (
+    "mooncake.mooncake_connector_v1",
+    "mooncake.vllm_v1_proxy_server",
+):
+    spec = importlib.util.find_spec(module_name)
+    assert spec is not None and spec.origin is not None, module_name
+    module_path = Path(spec.origin).resolve()
+    assert module_path.parent == package_path.parent, (module_name, module_path)
+assert not (optional_roots & {{name.partition(".")[0] for name in sys.modules}})
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],
