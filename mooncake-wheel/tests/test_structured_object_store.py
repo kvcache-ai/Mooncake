@@ -1039,9 +1039,9 @@ def test_imported_handle_append_recovers_group_without_scanning_old_stage() -> N
 
 @pytest.mark.parametrize("append_stage", ["rollout", "value"])
 @pytest.mark.parametrize("ungrouped", [False, True])
-@pytest.mark.parametrize("lose_response", [False, True])
+@pytest.mark.parametrize("response_error", [None, RuntimeError, ValueError])
 def test_catalog_manages_appended_handle_lifetime(
-    append_stage, ungrouped, lose_response
+    append_stage, ungrouped, response_error
 ) -> None:
     class SizedDataProto(SimpleDataProto):
         def __len__(self) -> int:
@@ -1051,14 +1051,14 @@ def test_catalog_manages_appended_handle_lifetime(
     writer = MooncakeBundleTransfer(store, key_prefix="catalog-append")
     appender = MooncakeBundleTransfer(store, key_prefix="catalog-append")
     catalog = DataProtoCatalog()
-    lost_responses = 2 if lose_response else 0
+    lost_responses = 2 if response_error is not None else 0
 
     def call(method, *args, **kwargs):
         nonlocal lost_responses
         result = getattr(catalog, method)(*args, **kwargs)
         if method == "publish_append" and lost_responses:
             lost_responses -= 1
-            raise RuntimeError("response lost after commit")
+            raise response_error("response lost after commit")
         return result
 
     writer_client = DataProtoCatalogTransfer(writer, call)
@@ -1110,8 +1110,8 @@ def test_catalog_manages_appended_handle_lifetime(
         "keys": ["a", "b"],
         "stage": append_stage,
     }
-    if lose_response:
-        with pytest.raises(RuntimeError, match="response lost"):
+    if response_error is not None:
+        with pytest.raises(response_error, match="response lost"):
             appender_client.append(*append_args, **append_kwargs)
     else:
         appender_client.append(*append_args, **append_kwargs)
@@ -1253,6 +1253,224 @@ def test_concurrent_append_branches_inherit_group_without_merging_refs() -> None
         list(config.group_ids) == [group_id]
         for config in store.put_configs
     )
+
+
+@pytest.mark.parametrize("append_stage", ["rollout", "value"])
+@pytest.mark.parametrize("cleanup_failures", [0, 2])
+def test_catalog_concurrent_append_cleans_stale_loser(
+    append_stage, cleanup_failures, monkeypatch
+) -> None:
+    class SizedDataProto(SimpleDataProto):
+        def __len__(self) -> int:
+            return len(next(iter(self.batch.values())))
+
+    store = InMemoryStore()
+    writer = MooncakeBundleTransfer(store, key_prefix="catalog-concurrent-append")
+    first = MooncakeBundleTransfer(store, key_prefix="catalog-concurrent-append")
+    second = MooncakeBundleTransfer(store, key_prefix="catalog-concurrent-append")
+    catalog = DataProtoCatalog()
+    publish_barrier = threading.Barrier(3)
+    catalog_lock = threading.Lock()
+    publication_lock = threading.Lock()
+    seen_publications = set()
+
+    def call(method, *args, **kwargs):
+        if method == "publish_append":
+            with publication_lock:
+                first_attempt = args[0] not in seen_publications
+                seen_publications.add(args[0])
+            if first_attempt:
+                publish_barrier.wait(timeout=5)
+        with catalog_lock:
+            return getattr(catalog, method)(*args, **kwargs)
+
+    writer_client = DataProtoCatalogTransfer(writer, call)
+    first_client = DataProtoCatalogTransfer(first, call)
+    second_client = DataProtoCatalogTransfer(second, call)
+    remaining_cleanup_failures = cleanup_failures
+
+    def fail_cleanup(transfer):
+        original = transfer.cleanup_dataproto_append
+
+        def cleanup(*args):
+            nonlocal remaining_cleanup_failures
+            if remaining_cleanup_failures:
+                remaining_cleanup_failures -= 1
+                raise RuntimeError("injected append cleanup failure")
+            original(*args)
+
+        monkeypatch.setattr(transfer, "cleanup_dataproto_append", cleanup)
+
+    fail_cleanup(first)
+    fail_cleanup(second)
+    writer_client.put(
+        SizedDataProto(batch={"input_ids": np.arange(2)}),
+        partition="train",
+        keys=["a", "b"],
+        stage="rollout",
+    )
+    base_plan = writer_client.resolve("train", ["a", "b"])
+    fragment_id, base_handle = next(iter(base_plan["handles"].items()))
+
+    results = {}
+    failures = []
+    clients = {"first": first_client, "second": second_client}
+
+    def append(name: str) -> None:
+        try:
+            results[name] = clients[name].append(
+                fragment_id,
+                base_handle,
+                SizedDataProto(batch={name: np.arange(2) + 10}),
+                partition="train",
+                keys=["a", "b"],
+                stage=append_stage,
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    first_thread = threading.Thread(target=append, args=("first",))
+    second_thread = threading.Thread(target=append, args=("second",))
+    first_thread.start()
+    second_thread.start()
+    publish_barrier.wait(timeout=5)
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert len(results) == 1
+    assert len(failures) == 1
+    if cleanup_failures:
+        assert isinstance(failures[0], RuntimeError)
+        assert "cleanup failure" in str(failures[0])
+        pending_client = next(
+            client for client in clients.values() if client._pending_publications
+        )
+        pending_client.close()
+    else:
+        assert isinstance(failures[0], ValueError)
+        assert "stale" in str(failures[0])
+    assert first_client._pending_publications == []
+    assert second_client._pending_publications == []
+
+    winner_name = next(iter(results))
+    winner_client = clients[winner_name]
+    winner_plan = winner_client.resolve("train", ["a", "b"])
+    winner = import_dataproto_ref(winner_plan["handles"][fragment_id])
+    winner_data = winner_client.transfer.get_dataproto(winner)
+    assert set(winner_data["batch"]) == {"input_ids", winner_name}
+    assert np.array_equal(
+        winner_data["batch"][winner_name], np.arange(2) + 10
+    )
+    old_data = writer.get_dataproto(import_dataproto_ref(base_handle))
+    assert np.array_equal(old_data["batch"]["input_ids"], np.arange(2))
+
+    winner_client.remove("train", ["a", "b"])
+    winner_client.release_read(winner_plan["read_token"])
+    old_data = writer.get_dataproto(import_dataproto_ref(base_handle))
+    assert np.array_equal(old_data["batch"]["input_ids"], np.arange(2))
+    writer_client.release_read(base_plan["read_token"])
+    writer_client.close()
+    first_client.close()
+    second_client.close()
+    assert store.objects == {}
+    assert store.tensor_objects == {}
+
+
+@pytest.mark.parametrize("append_stage", ["rollout", "value"])
+@pytest.mark.parametrize("race", ["remove", "drain"])
+def test_catalog_cleans_append_rejected_after_remove_or_drain(
+    append_stage, race
+) -> None:
+    class SizedDataProto(SimpleDataProto):
+        def __len__(self) -> int:
+            return len(next(iter(self.batch.values())))
+
+    store = InMemoryStore()
+    writer = MooncakeBundleTransfer(store, key_prefix="catalog-append-race")
+    appender = MooncakeBundleTransfer(store, key_prefix="catalog-append-race")
+    catalog = DataProtoCatalog()
+    raced = False
+
+    def direct_call(method, *args, **kwargs):
+        return getattr(catalog, method)(*args, **kwargs)
+
+    writer_client = DataProtoCatalogTransfer(writer, direct_call)
+    drainer_client = DataProtoCatalogTransfer(writer, direct_call)
+
+    def call(method, *args, **kwargs):
+        nonlocal raced
+        if method == "publish_append" and not raced:
+            raced = True
+            if race == "remove":
+                writer_client.remove("train", ["a"])
+            else:
+                drainer_client.drain()
+        return direct_call(method, *args, **kwargs)
+
+    appender_client = DataProtoCatalogTransfer(appender, call)
+    writer_client.put(
+        SizedDataProto(batch={"input_ids": np.arange(2)}),
+        partition="train",
+        keys=["a", "b"],
+        stage="rollout",
+    )
+    plan = catalog.resolve("train", ["a", "b"])
+    fragment_id, base_handle = next(iter(plan["handles"].items()))
+
+    match = "keys not found" if race == "remove" else "catalog is drained"
+    with pytest.raises(ValueError, match=match):
+        appender_client.append(
+            fragment_id,
+            base_handle,
+            SizedDataProto(batch={"values": np.arange(2) + 10}),
+            partition="train",
+            keys=["a", "b"],
+            stage=append_stage,
+        )
+
+    appender_client.close()
+    if race == "remove":
+        writer_client.remove("train", ["b"])
+    assert store.objects == {}
+    assert store.tensor_objects == {}
+
+
+def test_same_stage_append_cleanup_tolerates_lost_manifest_remove_response(
+    monkeypatch,
+) -> None:
+    store, transfer = make_transfer(key_prefix="append-cleanup-response-loss")
+    base = transfer.put_dataproto(
+        SimpleDataProto(batch={"input_ids": np.arange(2)}), stage="rollout"
+    )
+    appended = transfer.append_dataproto_fields(
+        base,
+        SimpleDataProto(batch={"values": np.arange(2) + 10}),
+        stage="rollout",
+    )
+    appended_manifest = appended.stage_refs["rollout"].manifest_key
+    batch_remove = store.batch_remove
+    lose_response = True
+
+    def remove_then_lose_response(keys, force=False):
+        nonlocal lose_response
+        results = batch_remove(keys, force)
+        if lose_response and keys == [appended_manifest]:
+            lose_response = False
+            raise RuntimeError("manifest remove response lost")
+        return results
+
+    monkeypatch.setattr(store, "batch_remove", remove_then_lose_response)
+    with pytest.raises(RuntimeError, match="response lost"):
+        transfer.cleanup_dataproto_append(base, appended)
+    transfer.cleanup_dataproto_append(base, appended)
+
+    result = transfer.get_dataproto(base)
+    assert np.array_equal(result["batch"]["input_ids"], np.arange(2))
+    transfer.cleanup_dataproto(base)
+    assert store.objects == {}
+    assert store.tensor_objects == {}
 
 
 def test_append_rejects_conflicting_group_before_write() -> None:

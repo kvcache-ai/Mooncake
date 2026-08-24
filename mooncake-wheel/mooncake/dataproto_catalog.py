@@ -86,17 +86,21 @@ class DataProtoCatalog:
         if previous is not None:
             return copy.deepcopy(previous)
         if self._drained:
-            raise RuntimeError("DataProto catalog is drained")
+            return self._reject_append(operation_id, "DataProto catalog is drained")
         fragment_id = _nonempty_string(fragment_id, "fragment_id")
         partition = _nonempty_string(partition, "partition")
         keys = _names(keys, "keys")
         previous_ref, normalized_previous = _normalize_handle(previous_handle)
         ref, normalized = _normalize_handle(handle)
         current = self._fragments.get(fragment_id)
-        if current is None or fragment_id not in self._managed_fragments:
-            raise ValueError(f"DataProto fragment is not managed: {fragment_id!r}")
-        if current != normalized_previous:
-            raise ValueError(f"stale DataProto append handle: {fragment_id!r}")
+        if (
+            current is None
+            or fragment_id not in self._managed_fragments
+            or current != normalized_previous
+        ):
+            return self._reject_append(
+                operation_id, f"stale DataProto append handle: {fragment_id!r}"
+            )
         if (
             ref.batch_size != previous_ref.batch_size
             or ref.batch_size != len(keys)
@@ -104,13 +108,17 @@ class DataProtoCatalog:
             or ref.partition != partition
             or ref._storage_group_id != previous_ref._storage_group_id
         ):
-            raise ValueError("appended DataProto handle changed fragment identity")
+            return self._reject_append(
+                operation_id, "appended DataProto handle changed fragment identity"
+            )
         previous_fields = previous_ref.field_index
         if any(
             ref.field_index.get(name) != location
             for name, location in previous_fields.items()
         ):
-            raise ValueError("appended DataProto handle changed existing fields")
+            return self._reject_append(
+                operation_id, "appended DataProto handle changed existing fields"
+            )
         new_fields = [
             field for field in ref.field_index if field not in previous_fields
         ]
@@ -118,7 +126,10 @@ class DataProtoCatalog:
         entries = self._partitions.get(partition, {})
         missing = [key for key in keys if key not in entries]
         if missing:
-            raise ValueError(f"keys not found in partition {partition!r}: {missing}")
+            return self._reject_append(
+                operation_id,
+                f"keys not found in partition {partition!r}: {missing}",
+            )
         for row, key in enumerate(keys):
             for field in new_fields:
                 location = (fragment_id, row)
@@ -134,6 +145,11 @@ class DataProtoCatalog:
             "fields": _field_union(entries, keys),
             **self._retired_result(),
         }
+        self._publications[operation_id] = copy.deepcopy(result)
+        return result
+
+    def _reject_append(self, operation_id: str, message: str) -> dict[str, Any]:
+        result = {"append_rejected": message}
         self._publications[operation_id] = copy.deepcopy(result)
         return result
 
@@ -515,13 +531,18 @@ class DataProtoCatalogTransfer:
         }
         for attempt in range(2):
             try:
-                return self._publish(publication)
+                result = self._publish(publication)
             except Exception:
                 if attempt:
                     with self._cleanup_lock:
                         self._pending_publications.append(publication)
                     raise
                 logger.exception("Retrying DataProto Catalog append publication")
+            else:
+                rejection = result.get("append_rejected")
+                if rejection is not None:
+                    raise ValueError(rejection)
+                return result
         raise AssertionError("unreachable")
 
     def resolve(
@@ -608,6 +629,13 @@ class DataProtoCatalogTransfer:
             *publication["args"],
             **publication["kwargs"],
         )
+        if publication["method"] == "publish_append" and result.get(
+            "append_rejected"
+        ):
+            self.transfer.cleanup_dataproto_append(
+                publication["kwargs"]["previous_handle"],
+                publication["kwargs"]["handle"],
+            )
         self._cleanup_retired(result)
         self._ack_publication(operation_id)
         return result

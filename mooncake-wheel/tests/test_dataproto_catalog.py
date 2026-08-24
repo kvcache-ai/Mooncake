@@ -178,15 +178,14 @@ def test_catalog_append_replaces_managed_handle_ownership() -> None:
         "member": "batch.score",
         "section": "batch",
     }
-    with pytest.raises(ValueError, match="fragment identity"):
-        catalog.publish_append(
-            "wrong-partition",
-            "manifest/base",
-            "other",
-            ["a"],
-            previous_handle=base,
-            handle=appended,
-        )
+    assert "fragment identity" in catalog.publish_append(
+        "wrong-partition",
+        "manifest/base",
+        "other",
+        ["a"],
+        previous_handle=base,
+        handle=appended,
+    )["append_rejected"]
     catalog.publish_append(
         "append-op",
         "manifest/base",
@@ -203,15 +202,14 @@ def test_catalog_append_replaces_managed_handle_ownership() -> None:
         previous_handle=base,
         handle=appended,
     )["fields"] == ["input", "value", "score"]
-    with pytest.raises(ValueError, match="stale"):
-        catalog.publish_append(
-            "stale-op",
-            "manifest/base",
-            "train",
-            ["a"],
-            previous_handle=base,
-            handle=appended,
-        )
+    assert "stale" in catalog.publish_append(
+        "stale-op",
+        "manifest/base",
+        "train",
+        ["a"],
+        previous_handle=base,
+        handle=appended,
+    )["append_rejected"]
 
     plan = catalog.resolve("train", ["a"])
     assert plan["fields"] == ["input", "value", "score"]

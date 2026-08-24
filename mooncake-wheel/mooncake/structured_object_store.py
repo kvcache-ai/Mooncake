@@ -560,6 +560,58 @@ class MooncakeBundleTransfer:
         """Remove all Mooncake objects that belong to a stored bundle."""
         self._bundle_store.remove_bundle(ref)
 
+    def cleanup_dataproto_append(
+        self, previous: DataProtoRefLike, appended: DataProtoRefLike
+    ) -> None:
+        """Remove an unpublished append without touching the previous handle."""
+        previous = _resolve_dataproto_ref(previous)
+        appended = _resolve_dataproto_ref(appended)
+        for stage, stage_ref in appended.stage_refs.items():
+            previous_stage_ref = previous.stage_refs.get(stage)
+            if previous_stage_ref is None:
+                self.remove_bundle(stage_ref)
+                continue
+            if stage_ref.manifest_key == previous_stage_ref.manifest_key:
+                continue
+
+            is_exist = getattr(self.store, "is_exist", None)
+            if callable(is_exist) and is_exist(stage_ref.manifest_key) == 0:
+                continue
+            new_manifest = self._bundle_store.resolve_manifest(stage_ref)
+            old_buffer_names = {
+                location.member
+                for location in previous.field_index.values()
+                if location.stage == stage
+            }
+            for name, encoded in previous.encoded_non_tensor.items():
+                if previous.field_index[name].stage == stage:
+                    old_buffer_names.update(encoded["payload_members"].values())
+            new_payloads = [
+                payload
+                for name, payload in new_manifest["buffers"].items()
+                if name not in old_buffer_names
+            ]
+            new_object_ids = {
+                self._bundle_store._object_id_from_bundle_key(payload["key"])
+                for payload in new_payloads
+            }
+            cleanup_keys = [
+                *self._bundle_store.payload_keys(new_manifest["meta"]),
+                *[
+                    chunk["key"]
+                    for payload in new_payloads
+                    for chunk in payload["chunks"]
+                ],
+            ]
+            cleanup_keys.extend(
+                key
+                for key in new_manifest.get("cleanup_keys", [])
+                if self._bundle_store._object_id_from_bundle_key(key)
+                in new_object_ids
+            )
+            self._bundle_store.remove_keys(cleanup_keys, strict=True)
+            self._bundle_store.remove_keys([stage_ref.manifest_key], strict=True)
+
     def put_structured_object(
         self,
         payload: StructuredObjectPayload,
