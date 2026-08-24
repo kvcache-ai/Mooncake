@@ -40,6 +40,10 @@ def test_dependency_boundaries_are_declared() -> None:
     metadata = project["project"]
 
     assert set(metadata["dependencies"]) == {"aiohttp", "msgpack", "requests"}
+    assert set(metadata["optional-dependencies"]["structured"]) == {
+        "numpy",
+        "pillow",
+    }
     assert set(metadata["optional-dependencies"]) == {
         "administration",
         "dev",
@@ -55,6 +59,29 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_structured_object_storage_has_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    test_root = REPOSITORY_ROOT / "python" / "tests" / "store"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
+
+    for module in ("structured_object_store.py", "_fast_copy.c"):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    for test in ("test_structured_object_store.py", "test_fast_copy.py"):
+        assert (test_root / test).is_file()
+        assert not (legacy_test_root / test).exists()
+
+    cmake = (REPOSITORY_ROOT / "python" / "CMakeLists.txt").read_text()
+    legacy_build = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert '"${CMAKE_CURRENT_SOURCE_DIR}/mooncake/_fast_copy.c"' in cmake
+    assert (
+        "MIGRATED_PYTHON_MODULES=(structured_object_store.py _fast_copy.c)"
+        in legacy_build
+    )
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(
