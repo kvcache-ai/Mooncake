@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <unordered_map>
 
 #include "tent/common/status.h"
 #include "tent/runtime/slab.h"
@@ -51,6 +52,59 @@ Status restoreCudaDeviceForLocation(const LocationParser& location,
         saved_dev != location.index()) {
         CHECK_CUDA(cudaSetDevice(saved_dev));
     }
+    return Status::OK();
+}
+
+/// Thread-local cache of one caller-sync event per device. Events are
+/// created lazily and released at thread exit; the destructor restores the
+/// device around each destroy because event teardown must run on the
+/// event's device on some CUDA-compatible runtimes.
+class CallerSyncEventPool {
+   public:
+    cudaEvent_t getOrCreate(int device_id) {
+        auto it = events_.find(device_id);
+        if (it != events_.end()) return it->second;
+        cudaEvent_t event = nullptr;
+        if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) !=
+            cudaSuccess) {
+            return nullptr;
+        }
+        events_[device_id] = event;
+        return event;
+    }
+    ~CallerSyncEventPool() {
+        int saved_device = 0;
+        cudaGetDevice(&saved_device);
+        for (auto& entry : events_) {
+            cudaSetDevice(entry.first);
+            if (entry.second) cudaEventDestroy(entry.second);
+        }
+        cudaSetDevice(saved_device);
+    }
+
+   private:
+    std::unordered_map<int, cudaEvent_t> events_;
+};
+
+thread_local CallerSyncEventPool tl_caller_sync_events;
+
+/// Waits for producer work already queued on the caller's per-thread stream
+/// so the copy submitted on the transport's internal stream cannot read the
+/// source buffer before that work has executed. CPU-blocking
+/// cudaEventSynchronize mirrors IntraNodeNvlinkTransport and avoids the
+/// expensive cross-device cudaStreamWaitEvent on non-NVIDIA GPUs; it is
+/// complementary to (not a replacement for) the
+/// cudaMemcpySrcAccessOrderStream attribute applied at copy submission.
+Status syncWithCallerStream() {
+    int device_id = 0;
+    CHECK_CUDA(cudaGetDevice(&device_id));
+    cudaEvent_t event = tl_caller_sync_events.getOrCreate(device_id);
+    if (!event) {
+        return Status::InternalError(
+            "unable to create caller-sync event" LOC_MARK);
+    }
+    CHECK_CUDA(cudaEventRecord(event, cudaStreamPerThread));
+    CHECK_CUDA(cudaEventSynchronize(event));
     return Status::OK();
 }
 
@@ -131,6 +185,12 @@ Status NVLinkTransport::submitTransferTasks(
 
     if (request_list.size() + shm_batch->task_list.size() > shm_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+
+    // Producer work already queued on the caller's per-thread stream must be
+    // visible before the batched copy runs on the transport's internal
+    // stream; without this the copy races with (and can read the source
+    // before) that work. Same contract as IntraNodeNvlinkTransport.
+    CHECK_STATUS(syncWithCallerStream());
 
     // Get local segment for buffer lookup
     auto& segment_manager = metadata_->segmentManager();

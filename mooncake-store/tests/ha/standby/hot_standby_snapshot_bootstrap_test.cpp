@@ -189,6 +189,25 @@ TEST(StandbyControllerTest, OplogEnablementControlsReaderController) {
     EXPECT_EQ(ErrorCode::OK, unsupported->PromoteStandby());
 }
 
+TEST(StandbyControllerTest, HaWithoutOplogPromotesWithEmptyContext) {
+    ha::HABackendSpec spec{
+        .type = ha::HABackendType::ETCD,
+        .connstring = "http://localhost:2379",
+        .cluster_namespace = "ha-without-oplog-test",
+    };
+    MasterServiceSupervisorConfig config;
+    config.enable_oplog = false;
+
+    auto controller = ha::CreateStandbyController(spec, config);
+    ASSERT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
+
+    auto result = controller->PromoteStandbyAndExport();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(0u, result->applied_seq_id);
+    EXPECT_TRUE(result->objects.empty());
+    EXPECT_TRUE(result->segments.empty());
+}
+
 TEST(StandbyControllerTest,
      PromoteStandbyAndExport_ReturnsErrorWhenNotStarted) {
     ha::HABackendSpec spec{
