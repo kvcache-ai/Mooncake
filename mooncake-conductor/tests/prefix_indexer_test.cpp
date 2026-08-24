@@ -885,4 +885,68 @@ TEST(GlobalView, ReportsProfileRegistrationAndOwnerMapSize) {
     EXPECT_EQ(view.contexts[0].prefix_count, 2u);
 }
 
+TEST(Capacity, EvictsOldestWrittenPrefixesWhenOverLimit) {
+    PrefixCacheTable table(10);
+    RegisterOrFail(table, Registration());
+
+    for (uint64_t i = 1; i <= 14; ++i) {
+        ASSERT_EQ(table.StoreGpu(Gpu({Prefix(i)})), "");
+    }
+
+    const auto snapshot = PrefixCacheTableTestPeer::Snapshot(table);
+    const auto& blocks = snapshot.contexts.at(TestContext()).blocks;
+    EXPECT_LE(blocks.size(), 10u);
+    EXPECT_TRUE(blocks.contains(Prefix(14)));
+    EXPECT_FALSE(blocks.contains(Prefix(1)));
+}
+
+TEST(Capacity, UnlimitedWhenBlockLimitIsZero) {
+    PrefixCacheTable table(0);
+    RegisterOrFail(table, Registration());
+    for (uint64_t i = 1; i <= 50; ++i) {
+        ASSERT_EQ(table.StoreGpu(Gpu({Prefix(i)})), "");
+    }
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table)
+                  .contexts.at(TestContext())
+                  .blocks.size(),
+              50u);
+}
+
+TEST(Capacity, OrderTrackingStaysInSyncWithBlocks) {
+    PrefixCacheTable table(10);
+    RegisterOrFail(table, Registration());
+    const ContextKey context = TestContext();
+
+    for (uint64_t i = 1; i <= 6; ++i) {
+        ASSERT_EQ(table.StoreGpu(Gpu({Prefix(i)})), "");
+    }
+    auto sizes = PrefixCacheTableTestPeer::Order(table, context);
+    EXPECT_EQ(sizes.blocks, 6u);
+    EXPECT_EQ(sizes.write_order, 6u);
+    EXPECT_EQ(sizes.order_pos, 6u);
+
+    for (uint64_t i = 1; i <= 3; ++i) {
+        ASSERT_EQ(table.RemoveGpu(Gpu({Prefix(i)})), "");
+    }
+    sizes = PrefixCacheTableTestPeer::Order(table, context);
+    EXPECT_EQ(sizes.blocks, 3u);
+    EXPECT_EQ(sizes.write_order, 3u);
+    EXPECT_EQ(sizes.order_pos, 3u);
+
+    ASSERT_EQ(table.ClearGpu(ClearFor()), "");
+    sizes = PrefixCacheTableTestPeer::Order(table, context);
+    EXPECT_EQ(sizes.blocks, 0u);
+    EXPECT_EQ(sizes.write_order, 0u);
+    EXPECT_EQ(sizes.order_pos, 0u);
+
+    for (uint64_t i = 20; i <= 40; ++i) {
+        ASSERT_EQ(table.StoreGpu(Gpu({Prefix(i)})), "");
+    }
+    sizes = PrefixCacheTableTestPeer::Order(table, context);
+    EXPECT_LE(sizes.blocks, 10u);
+    EXPECT_EQ(sizes.write_order, sizes.blocks);
+    EXPECT_EQ(sizes.order_pos, sizes.blocks);
+    EXPECT_GT(sizes.evicted_by_capacity, 0);
+}
+
 }  // namespace

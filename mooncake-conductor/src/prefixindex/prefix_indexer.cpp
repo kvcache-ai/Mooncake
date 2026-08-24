@@ -125,9 +125,64 @@ std::set<SharedObjectOwner>& SharedOwners(BlockPresence& presence,
                                      : presence.disk_owners;
 }
 
+// Remove empty blocks and their order metadata. The caller holds state.mutex.
 void EraseEmptyBlocks(ContextState& state) {
-    std::erase_if(state.blocks,
-                  [](const auto& item) { return item.second.Empty(); });
+    std::erase_if(state.blocks, [&state](const auto& item) {
+        if (!item.second.Empty()) {
+            return false;
+        }
+        auto pos = state.order_pos.find(item.first);
+        if (pos != state.order_pos.end()) {
+            state.write_order.erase(pos->second);
+            state.order_pos.erase(pos);
+        }
+        return true;
+    });
+}
+
+// Remove a prefix from the insertion-order metadata. The caller holds
+// state.mutex.
+void ForgetOrder(ContextState& state, ProjectedPrefix prefix) {
+    auto pos = state.order_pos.find(prefix);
+    if (pos != state.order_pos.end()) {
+        state.write_order.erase(pos->second);
+        state.order_pos.erase(pos);
+    }
+}
+
+// Move a prefix to the front of the insertion-order list, adding it if absent.
+// The caller holds the state write lock.
+void TouchOrder(ContextState& state, ProjectedPrefix prefix) {
+    auto pos = state.order_pos.find(prefix);
+    if (pos != state.order_pos.end()) {
+        state.write_order.splice(state.write_order.begin(), state.write_order,
+                                 pos->second);
+        return;
+    }
+    state.write_order.push_front(prefix);
+    state.order_pos.emplace(prefix, state.write_order.begin());
+}
+
+// Evict oldest entries in batches until the target occupancy is reached. The
+// caller holds the state write lock.
+void EvictIfOverCapacity(ContextState& state) {
+    if (state.max_blocks == 0 || state.blocks.size() <= state.max_blocks) {
+        return;
+    }
+    const size_t target =
+        static_cast<size_t>(state.max_blocks * kEvictTargetRatio);
+    while (state.blocks.size() > target && !state.write_order.empty()) {
+        const ProjectedPrefix oldest = state.write_order.back();
+        state.write_order.pop_back();
+        state.order_pos.erase(oldest);
+        state.blocks.erase(oldest);
+        ++state.evicted_by_capacity;
+    }
+    LOG_EVERY_N(WARNING, 100)
+        << "Prefix index hit the capacity limit; oldest entries dropped."
+        << " limit=" << state.max_blocks << " now=" << state.blocks.size()
+        << " cumulative_evicted=" << state.evicted_by_capacity
+        << " (non-zero means stored/removed events are out of sync)";
 }
 
 int64_t TokensForBlocks(size_t block_count, int64_t block_size) {
@@ -169,7 +224,8 @@ RegistrationResult PrefixCacheTable::Register(
         return validation;
     }
 
-    auto candidate = std::make_shared<ContextState>(registration.profile);
+    auto candidate =
+        std::make_shared<ContextState>(registration.profile, block_limit_);
     candidate->instance_ranks[registration.instance_id].insert(
         registration.dp_rank);
 
@@ -276,7 +332,9 @@ std::string PrefixCacheTable::StoreGpu(const GpuMutation& mutation) {
     }
     for (ProjectedPrefix prefix : mutation.prefixes) {
         state->blocks[prefix].gpu_owners.insert(mutation.owner);
+        TouchOrder(*state, prefix);
     }
+    EvictIfOverCapacity(*state);
     return "";
 }
 
@@ -290,13 +348,17 @@ std::string PrefixCacheTable::RemoveGpu(const GpuMutation& mutation) {
     }
 
     std::unique_lock state_lock(state->mutex);
+    // Only prefixes in the mutation can become empty, so avoid a full scan.
     for (ProjectedPrefix prefix : mutation.prefixes) {
         auto block = state->blocks.find(prefix);
         if (block != state->blocks.end()) {
             block->second.gpu_owners.erase(mutation.owner);
+            if (block->second.Empty()) {
+                state->blocks.erase(block);
+                ForgetOrder(*state, prefix);
+            }
         }
     }
-    EraseEmptyBlocks(*state);
     return "";
 }
 
@@ -331,7 +393,9 @@ std::string PrefixCacheTable::StoreShared(const SharedMutation& mutation) {
     for (ProjectedPrefix prefix : mutation.prefixes) {
         SharedOwners(state->blocks[prefix], mutation.tier)
             .insert(mutation.owner);
+        TouchOrder(*state, prefix);
     }
+    EvictIfOverCapacity(*state);
     return "";
 }
 
@@ -345,13 +409,17 @@ std::string PrefixCacheTable::RemoveShared(const SharedMutation& mutation) {
     }
 
     std::unique_lock state_lock(state->mutex);
+    // Only prefixes in the mutation can become empty, so avoid a full scan.
     for (ProjectedPrefix prefix : mutation.prefixes) {
         auto block = state->blocks.find(prefix);
         if (block != state->blocks.end()) {
             SharedOwners(block->second, mutation.tier).erase(mutation.owner);
+            if (block->second.Empty()) {
+                state->blocks.erase(block);
+                ForgetOrder(*state, prefix);
+            }
         }
     }
-    EraseEmptyBlocks(*state);
     return "";
 }
 
@@ -388,20 +456,8 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         return results;
     }
 
-    std::shared_lock state_lock(state->mutex);
-    std::map<std::string, const std::set<int64_t>*> selected_instances;
-    if (instance_filter.has_value()) {
-        auto instance = state->instance_ranks.find(*instance_filter);
-        if (instance == state->instance_ranks.end()) {
-            return results;
-        }
-        selected_instances.emplace(instance->first, &instance->second);
-    } else {
-        for (const auto& [instance_id, ranks] : state->instance_ranks) {
-            selected_instances.emplace(instance_id, &ranks);
-        }
-    }
-
+    // The profile is immutable, and the shared_ptr keeps state alive while the
+    // hash strategy and chain are built without holding state.mutex.
     std::string strategy_error;
     auto strategy = CreateHashStrategy(state->profile, &strategy_error);
     if (!strategy) {
@@ -419,9 +475,59 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
     }
     const size_t block_count = chain->BlockCount();
 
-    // The chain hashes lazily: blocks are only hashed as cursors reach them,
-    // so queries that stall early (cold or short-matching prefixes) never
-    // pay for hashing the untouched tail.
+    // Resolve the optional filter and copy rank sets before probing. The copies
+    // remain valid while the probe releases and reacquires state.mutex.
+    std::map<std::string, std::set<int64_t>> selected_instances;
+    {
+        std::shared_lock select_lock(state->mutex);
+        if (instance_filter.has_value()) {
+            auto instance = state->instance_ranks.find(*instance_filter);
+            if (instance == state->instance_ranks.end()) {
+                return results;
+            }
+            selected_instances.emplace(instance->first, instance->second);
+        } else {
+            selected_instances = state->instance_ranks;
+        }
+    }
+    if (selected_instances.empty()) {
+        return results;
+    }
+
+    // Probe indexed block presence in chunks. Hashing runs outside the lock;
+    // each chunk holds a shared lock only for table lookups.
+    constexpr size_t kProbeChunkMin = 8;
+    constexpr size_t kProbeChunkMax = 512;
+    size_t chunk = kProbeChunkMin;
+    size_t probe_depth = 0;
+    bool probe_stalled = false;
+    while (!probe_stalled && probe_depth < block_count) {
+        const size_t chunk_end = std::min(probe_depth + chunk, block_count);
+        chunk = std::min(chunk * 2, kProbeChunkMax);
+        // Compute hashes without holding state.mutex; retain any error for the
+        // final check below.
+        for (size_t i = probe_depth; i < chunk_end; ++i) {
+            if (chain->At(i, &chain_error) == nullptr) {
+                probe_stalled = true;
+                break;
+            }
+        }
+        std::shared_lock probe_lock(state->mutex);
+        while (probe_depth < chunk_end) {
+            const HashBlock* hashed = chain->At(probe_depth, &chain_error);
+            if (hashed == nullptr ||
+                !state->blocks.contains(hashed->projected)) {
+                probe_stalled = true;
+                break;
+            }
+            ++probe_depth;
+        }
+    }
+
+    std::shared_lock state_lock(state->mutex);
+
+    // Hashes needed by the probe are memoized, so the final read-locked walk
+    // performs only vector access and indexed lookups.
     auto advance_cursor = [&](size_t& cursor, const auto& present) {
         while (cursor < block_count) {
             const HashBlock* hashed = chain->At(cursor, &chain_error);
@@ -440,7 +546,7 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
     for (const auto& [instance_id, ranks] : selected_instances) {
         CacheHitResult result;
 
-        for (int64_t rank : *ranks) {
+        for (int64_t rank : ranks) {
             auto gpu_present = [&](const BlockPresence& block) {
                 return std::any_of(
                     block.gpu_owners.begin(), block.gpu_owners.end(),

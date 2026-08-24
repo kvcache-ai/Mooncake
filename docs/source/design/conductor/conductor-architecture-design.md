@@ -251,10 +251,12 @@ detailed event validation and cleanup rules.
 - Conductor sees live events after it connects. The current Mooncake publisher
   does not send a startup list of objects that were cached earlier.
 - A jump in transport sequence numbers produces a warning and leaves existing
-  cache records in place. After reconnect, Conductor asks for missed events
-  only when `replay_endpoint` is configured and a previous sequence is known;
-  that request does not guarantee recovery. The current Mooncake publisher has
-  no replay service.
+  cache records in place. For vLLM subscriptions with a configured
+  `replay_endpoint`, Conductor immediately consumes the publisher's multipart
+  replay stream and dispatches the missing events before the live event. A
+  failed or incomplete range is retained for a later live-message or reconnect
+  retry; recovery is not guaranteed after the publisher evicts the range. The
+  current Mooncake publisher has no replay service.
 - Conductor processes Mooncake events in received batch order. It does not
   automatically ignore an event merely because its `event_id` repeats.
 - vLLM contributes only GPU information. Mooncake contributes only CPU or Disk
