@@ -21,17 +21,20 @@ const EXTENT_STORE_MAGIC: u32 = 0x4d45_5354; // MEST
 const EXTENT_STORE_HEADER_LEN: usize = 64;
 const EXTENT_STORE_RECORD_KIND_SINGLE: u16 = 0;
 const EXTENT_STORE_RECORD_KIND_PACKED: u16 = 1;
-const EXTENT_STORE_DENSE_RECORD_MAX_VALUE_LEN: u64 = 1024 * 1024;
-const EXTENT_STORE_DENSE_RECORD_MAX_VALUE_BYTES_ENV: &str =
-    "MC_STORE_RS_EXTENT_DENSE_RECORD_MAX_VALUE_BYTES";
 const EXTENT_STORE_DENSE_COALESCE_MAX_VALUE_LEN: u64 = 4 * 1024;
 const EXTENT_STORE_PACKED_BLOCK_TARGET_BYTES: u64 = 320 * 1024;
 const EXTENT_STORE_PACKED_BLOCK_MAX_ENTRIES: u64 = 64;
 const EXTENT_STORE_PACKED_BLOCK_MAX_PAYLOAD_BYTES: u64 = EXTENT_STORE_PACKED_BLOCK_TARGET_BYTES / 2;
 const EXTENT_STORE_PACKED_ENTRY_INDEX_LEN: u64 = 24;
-const EXTENT_STORE_DIRECT_SCRATCH_DEFAULT_MAX_RECORD_LEN: u64 = 16 * 1024;
-const EXTENT_STORE_DIRECT_SCRATCH_DEFAULT_MAX_READ_LEN: u64 = 16 * 1024;
+// Direct I/O requires a fully aligned record. Payloads arriving from the
+// cold-tier API are ordinary slices, so the worker may need a bounce buffer.
+// Keep the default bounded, while allowing larger records through the existing
+// environment override up to the hard 16 MiB ceiling.
 const EXTENT_STORE_DIRECT_SCRATCH_MAX_RECORD_LEN: u64 = 16 * 1024 * 1024;
+const EXTENT_STORE_DIRECT_SCRATCH_DEFAULT_MAX_RECORD_LEN: u64 =
+    EXTENT_STORE_DIRECT_SCRATCH_MAX_RECORD_LEN;
+const EXTENT_STORE_DIRECT_SCRATCH_DEFAULT_MAX_READ_LEN: u64 =
+    EXTENT_STORE_DIRECT_SCRATCH_MAX_RECORD_LEN;
 const EXTENT_STORE_DIRECT_SCRATCH_MAX_WRITE_BYTES_ENV: &str =
     "MC_STORE_RS_EXTENT_DIRECT_SCRATCH_MAX_WRITE_BYTES";
 const EXTENT_STORE_DIRECT_READS_ENV: &str = "MC_STORE_RS_EXTENT_DIRECT_READS";
@@ -107,6 +110,12 @@ const EXTENT_STORE_GENERIC_SPAN_MAX_READ_AMPLIFICATION_NUM: u64 = 2;
 const EXTENT_STORE_GENERIC_SPAN_MIN_READS: usize = 2;
 const EXTENT_STORE_IO_WORKER_FIXED_FILE_SLOTS: u32 = 1024;
 const EXTENT_STORE_IO_WORKER_FIXED_BUFFER_SLOTS: u32 = 128;
+// Keep fixed-buffer registrations small enough that exhausting every slot
+// cannot pin more than the write scratch budget. Larger aligned buffers still
+// use O_DIRECT; they are simply submitted as normal (non-fixed) buffers.
+const EXTENT_STORE_IO_WORKER_FIXED_BUFFER_MAX_BYTES: usize = 512 * 1024;
+const EXTENT_STORE_RECORD_BUFFER_POOL_MAX_BYTES: usize = 64 * 1024 * 1024;
+const EXTENT_STORE_RECORD_BUFFER_POOL_MAX_BUFFERS: usize = 16 * 1024;
 const EXTENT_STORE_GDS_ENABLED_ENV: &str = "MC_STORE_RS_EXTENT_GDS_ENABLED";
 const EXTENT_STORE_GDS_MIN_READ_SIZE_ENV: &str = "MC_STORE_RS_EXTENT_GDS_MIN_READ_SIZE";
 const EXTENT_STORE_GDS_ALLOW_HOST_DST_ENV: &str = "MC_STORE_RS_EXTENT_GDS_ALLOW_HOST_DST";
@@ -369,6 +378,8 @@ struct ExtentStoreIoWorkerQueue {
     state: Mutex<ExtentStoreIoWorkerState>,
     changed: Condvar,
     counters: std::sync::Arc<ExtentStoreIoCounters>,
+    #[cfg(test)]
+    fail_after_submit: AtomicBool,
 }
 
 #[derive(Default)]
@@ -452,7 +463,10 @@ enum ExtentStoreIoOp {
     },
     ReleaseBuffer {
         slot: u16,
+        buffer: AlignedExtentStoreBuffer,
+        completion: Sender<bool>,
     },
+    Nop,
     UnregisterFile {
         key: ExtentStoreFixedFileKey,
     },
@@ -478,6 +492,7 @@ impl ExtentStoreFixedFileKey {
 
 struct ExtentStoreFixedBufferRegistry {
     free_slots: Vec<u16>,
+    retired_buffers: Vec<AlignedExtentStoreBuffer>,
     legacy_sparse_buffers: bool,
     disabled: bool,
     counters: std::sync::Arc<ExtentStoreIoCounters>,
@@ -575,8 +590,10 @@ extent_store_io_counters! {
     (scratch_reuse_bytes, counter),
     (scratch_pool_buffers, gauge),
     (scratch_pool_bytes, gauge),
+    (worker_read_batches, counter),
     (worker_read_batch_ops, counter),
     (worker_read_batch_bytes, counter),
+    (worker_write_batches, counter),
     (worker_write_batch_ops, counter),
     (worker_write_batch_bytes, counter),
     (worker_write_byte_limited_turns, counter),
@@ -756,23 +773,65 @@ impl Drop for ExtentStoreIoPriorityPermit<'_> {
 
 impl ExtentStoreBufferPool {
     fn new(counters: std::sync::Arc<ExtentStoreIoCounters>) -> Self {
+        Self::new_with_max_bytes(counters, EXTENT_STORE_RECORD_BUFFER_POOL_MAX_BYTES)
+    }
+
+    fn new_with_max_bytes(
+        counters: std::sync::Arc<ExtentStoreIoCounters>,
+        max_bytes: usize,
+    ) -> Self {
         Self {
-            buffers: Mutex::new(Vec::new()),
+            state: Mutex::new(ExtentStoreBufferPoolState {
+                buffers: Vec::new(),
+                allocated_bytes: 0,
+            }),
+            max_bytes,
             counters,
         }
     }
 
     fn lease(self: &std::sync::Arc<Self>, len: usize) -> Result<ExtentStoreBufferLease> {
-        let buffer = {
-            let mut buffers = self.buffers.lock();
-            let buffer = buffers
-                .iter()
-                .position(|buffer| buffer.len() >= len)
-                .map(|index| buffers.swap_remove(index));
-            let pool_bytes = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
-            self.counters.record_scratch_pool(buffers.len(), pool_bytes);
-            buffer
+        if len > self.max_bytes {
+            return Err(StoreError::Backpressure(format!(
+                "extent store record buffer {len} exceeds pool budget {}",
+                self.max_bytes
+            )));
+        }
+        let mut state = self.state.lock();
+        let max_reuse_len = if len == 0 { 0 } else { len.saturating_mul(2) };
+        let reusable = state
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, buffer)| buffer.len() >= len && buffer.len() <= max_reuse_len)
+            .min_by_key(|(_, buffer)| buffer.len())
+            .map(|(index, _)| index);
+        let buffer = if let Some(index) = reusable {
+            Some(state.buffers.swap_remove(index))
+        } else {
+            while state.allocated_bytes.saturating_add(len) > self.max_bytes
+                && !state.buffers.is_empty()
+            {
+                let index = state
+                    .buffers
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, buffer)| buffer.len())
+                    .map(|(index, _)| index)
+                    .expect("record buffer pool checked non-empty");
+                let buffer = state.buffers.swap_remove(index);
+                state.allocated_bytes = state.allocated_bytes.saturating_sub(buffer.len());
+            }
+            if state.allocated_bytes.saturating_add(len) > self.max_bytes {
+                return Err(StoreError::Backpressure(format!(
+                    "extent store record buffer pool budget {} is fully leased",
+                    self.max_bytes
+                )));
+            }
+            state.allocated_bytes = state.allocated_bytes.saturating_add(len);
+            None
         };
+        drop(state);
         let buffer = match buffer {
             Some(buffer) => {
                 self.counters.record_scratch_reuse(len);
@@ -780,7 +839,14 @@ impl ExtentStoreBufferPool {
             }
             None => {
                 self.counters.record_scratch_alloc(len);
-                AlignedExtentStoreBuffer::uninitialized(len)?
+                match AlignedExtentStoreBuffer::uninitialized(len) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        let mut state = self.state.lock();
+                        state.allocated_bytes = state.allocated_bytes.saturating_sub(len);
+                        return Err(error);
+                    }
+                }
             }
         };
         Ok(ExtentStoreBufferLease {
@@ -791,10 +857,12 @@ impl ExtentStoreBufferPool {
     }
 
     fn release(&self, buffer: AlignedExtentStoreBuffer) {
-        let mut buffers = self.buffers.lock();
-        buffers.push(buffer);
-        let pool_bytes = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
-        self.counters.record_scratch_pool(buffers.len(), pool_bytes);
+        let mut state = self.state.lock();
+        if state.buffers.len() < EXTENT_STORE_RECORD_BUFFER_POOL_MAX_BUFFERS {
+            state.buffers.push(buffer);
+        } else {
+            state.allocated_bytes = state.allocated_bytes.saturating_sub(buffer.len());
+        }
     }
 }
 
@@ -920,9 +988,15 @@ impl ExtentStoreFreeExtents {
             .insert((segment_id, offset));
     }
 
-    fn take_exact(&mut self, len: u64) -> Option<(u64, u64)> {
+    fn take_exact_aligned(&mut self, len: u64) -> Option<(u64, u64)> {
         let offsets = self.exact_offsets_by_len.get_mut(&len)?;
-        let key = offsets.iter().next().copied()?;
+        // Legacy dense records can leave free extents at unaligned offsets.
+        // Reusing one for a new aligned record would silently force that write
+        // back to the buffered fd, so keep it until the whole segment is dead.
+        let key = offsets
+            .iter()
+            .find(|(_, offset)| is_aligned_u64(*offset))
+            .copied()?;
         offsets.remove(&key);
         if offsets.is_empty() {
             self.exact_offsets_by_len.remove(&len);
@@ -1306,6 +1380,40 @@ impl ExtentStoreEngine {
         if writes.is_empty() {
             return Vec::new();
         }
+        let mut results = Vec::with_capacity(writes.len());
+        let mut start = 0usize;
+        while start < writes.len() {
+            let mut end = start;
+            let mut physical_bytes = 0u64;
+            while end < writes.len() {
+                let write = &writes[end];
+                let minimum_value_offset =
+                    EXTENT_STORE_HEADER_LEN as u64 + write.logical_locator.len() as u64;
+                let estimated = align_up(
+                    align_up(minimum_value_offset, EXTENT_STORE_ALIGNMENT)
+                        .saturating_add(write.payload.len() as u64),
+                    EXTENT_STORE_ALIGNMENT,
+                );
+                if end > start
+                    && physical_bytes.saturating_add(estimated)
+                        > EXTENT_STORE_RECORD_BUFFER_POOL_MAX_BYTES as u64
+                {
+                    break;
+                }
+                physical_bytes = physical_bytes.saturating_add(estimated);
+                end += 1;
+            }
+            results.extend(self.put_batch_chunk_profiled(&writes[start..end], record_stage));
+            start = end;
+        }
+        results
+    }
+
+    fn put_batch_chunk_profiled(
+        &self,
+        writes: &[ExtentStoreWrite<'_>],
+        record_stage: &mut dyn FnMut(&'static str, std::time::Duration),
+    ) -> Vec<Result<String>> {
         let init_started = std::time::Instant::now();
         let mut results = (0..writes.len())
             .map(|_| {
@@ -1897,9 +2005,6 @@ impl ExtentStoreEngine {
         reads
             .iter()
             .map(|(_, locator)| -> Result<ExtentStoreReadFiles> {
-                if let Some(files) = files.get(&locator.segment_id) {
-                    return files.clone();
-                }
                 let segment = inner.segments.get(&locator.segment_id).ok_or_else(|| {
                     StoreError::NotFound(format!(
                         "extent store segment {} is not open",
@@ -1907,6 +2012,9 @@ impl ExtentStoreEngine {
                     ))
                 })?;
                 validate_extent_store_locator(segment, locator)?;
+                if let Some(files) = files.get(&locator.segment_id) {
+                    return files.clone();
+                }
                 let files_for_segment = Ok((segment.file.clone(), segment.direct_file.clone()));
                 files.insert(locator.segment_id, files_for_segment.clone());
                 files_for_segment
@@ -2111,42 +2219,65 @@ impl ExtentStoreEngine {
     ) -> Vec<Result<()>> {
         match &self.io {
             ExtentStoreIo::WorkerPair(pair) => {
-                let lanes = writes
-                    .iter()
-                    .map(|(_, write)| write_lane(write))
-                    .collect::<Vec<_>>();
-                let has_buffered = lanes
-                    .iter()
-                    .any(|lane| matches!(lane, ExtentStoreWriteLane::Buffered));
-                if has_buffered {
-                    let bytes = writes
-                        .iter()
-                        .map(|(_, write)| write.record.record_len as usize)
-                        .sum::<usize>();
-                    self.io_counters
-                        .buffered_write_ops
-                        .fetch_add(writes.len() as u64, AtomicOrdering::Relaxed);
-                    self.io_counters
-                        .record_buffered_write_blocking_batch(writes.len(), bytes);
-                    write_buffered_batch_blocking(writes)
-                } else {
-                    for lane in lanes {
-                        match lane {
-                            ExtentStoreWriteLane::Direct => self
-                                .io_counters
-                                .direct_write_ops
-                                .fetch_add(1, AtomicOrdering::Relaxed),
-                            ExtentStoreWriteLane::DirectScratch => self
-                                .io_counters
-                                .direct_scratch_write_ops
-                                .fetch_add(1, AtomicOrdering::Relaxed),
-                            ExtentStoreWriteLane::Buffered => unreachable!(
-                                "buffered writes are handled by the blocking batch path"
-                            ),
-                        };
+                // Keep buffered writes separate without splitting Direct and
+                // DirectScratch into separate synchronous submissions. Bound
+                // the materialized records in each direct-family run so the
+                // producer cannot stage an arbitrarily large batch before the
+                // worker's own inflight limit takes effect.
+                let mut results = Vec::with_capacity(writes.len());
+                let mut cursor = 0;
+                while cursor < writes.len() {
+                    let lane = write_lane(&writes[cursor].1);
+                    let direct_family = !matches!(lane, ExtentStoreWriteLane::Buffered);
+                    let mut staged_bytes = if matches!(lane, ExtentStoreWriteLane::DirectScratch) {
+                        writes[cursor].1.record.record_len as usize
+                    } else {
+                        0
+                    };
+                    let mut end = cursor + 1;
+                    while end < writes.len() {
+                        let next_lane = write_lane(&writes[end].1);
+                        if (!matches!(next_lane, ExtentStoreWriteLane::Buffered)) != direct_family {
+                            break;
+                        }
+                        if !direct_family {
+                            end += 1;
+                            continue;
+                        }
+                        let next_staged =
+                            if matches!(next_lane, ExtentStoreWriteLane::DirectScratch) {
+                                writes[end].1.record.record_len as usize
+                            } else {
+                                0
+                            };
+                        if staged_bytes != 0
+                            && staged_bytes.saturating_add(next_staged)
+                                > EXTENT_STORE_IO_WORKER_WRITE_PIPELINE_MAX_INFLIGHT_BYTES
+                        {
+                            break;
+                        }
+                        staged_bytes = staged_bytes.saturating_add(next_staged);
+                        end += 1;
                     }
-                    submit_write_batch_io_worker(&pair.write_worker, writes)
+                    let lane_results = if !direct_family {
+                        let run = &mut writes[cursor..end];
+                        let bytes = run
+                            .iter()
+                            .map(|(_, write)| write.record.record_len as usize)
+                            .sum::<usize>();
+                        self.io_counters
+                            .buffered_write_ops
+                            .fetch_add(run.len() as u64, AtomicOrdering::Relaxed);
+                        self.io_counters
+                            .record_buffered_write_blocking_batch(run.len(), bytes);
+                        write_buffered_batch_blocking(run)
+                    } else {
+                        submit_write_batch_io_worker(&pair.write_worker, &mut writes[cursor..end])
+                    };
+                    results.extend(lane_results);
+                    cursor = end;
                 }
+                results
             }
             ExtentStoreIo::Blocking(lock) => {
                 let _blocking = lock.lock();
@@ -2162,7 +2293,21 @@ impl ExtentStoreEngine {
                 writes
                     .iter()
                     .map(|(_, write)| match write_lane(write) {
-                        ExtentStoreWriteLane::Direct | ExtentStoreWriteLane::Buffered => {
+                        ExtentStoreWriteLane::Direct => {
+                            self.io_counters
+                                .direct_write_ops
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                            let file = write
+                                .direct_file
+                                .as_ref()
+                                .expect("direct write lane requires direct file");
+                            write_vectored_all_direct_at_blocking(
+                                file,
+                                write.locator.offset,
+                                &write.record,
+                            )
+                        }
+                        ExtentStoreWriteLane::Buffered => {
                             self.io_counters
                                 .buffered_write_ops
                                 .fetch_add(1, AtomicOrdering::Relaxed);
@@ -2557,7 +2702,7 @@ impl ExtentStoreEngine {
                                     .direct_file
                                     .as_ref()
                                     .expect("direct read lane requires direct file");
-                                read_exact_at_blocking(
+                                read_exact_direct_at_blocking(
                                     file,
                                     read.locator.offset + read.locator.value_offset,
                                     &mut read.dst[..value_len],
@@ -2684,6 +2829,18 @@ fn validate_extent_store_locator(
         let segment_len = segment.live_bytes.saturating_add(segment.dead_bytes);
         return Err(StoreError::InvalidState(format!(
             "extent store locator exceeds segment bounds: end {locator_end} segment_len {segment_len}"
+        )));
+    }
+    let value_end = locator
+        .value_offset
+        .checked_add(locator.value_len)
+        .ok_or_else(|| {
+            StoreError::InvalidState("extent store value bounds overflow".to_string())
+        })?;
+    if value_end > locator.record_len {
+        return Err(StoreError::InvalidState(format!(
+            "extent store value exceeds record bounds: end {value_end} record_len {}",
+            locator.record_len
         )));
     }
     Ok(())
@@ -2840,7 +2997,7 @@ fn reserve_extent_store_record_space(
     record_stage: &mut dyn FnMut(&'static str, std::time::Duration),
     record_len: u64,
 ) -> Result<ExtentStoreRecordAllocation> {
-    if let Some((segment_id, offset)) = inner.free_extents.take_exact(record_len) {
+    if let Some((segment_id, offset)) = inner.free_extents.take_exact_aligned(record_len) {
         if !inner.segments.contains_key(&segment_id) {
             inner
                 .free_extents
@@ -3184,9 +3341,6 @@ fn direct_file_for_write<'a>(
 }
 
 fn write_lane(write: &ReservedExtentStoreWrite<'_>) -> ExtentStoreWriteLane {
-    if write.record.payload.as_slice().is_none() {
-        return ExtentStoreWriteLane::Buffered;
-    }
     if direct_record_io_compatible(write.locator.offset, &write.record) {
         ExtentStoreWriteLane::Direct
     } else if direct_file_for_write(write).is_some() {
@@ -3201,10 +3355,7 @@ fn direct_record_io_compatible(offset: u64, record: &EncodedExtentStoreRecord<'_
     is_aligned_u64(offset)
         && is_aligned_u64(record.record_len)
         && direct_iovec_compatible(&record.prefix)
-        && record
-            .payload
-            .as_slice()
-            .is_some_and(direct_iovec_compatible)
+        && record.payload.direct_io_compatible()
         && direct_iovec_compatible(&record.suffix_padding)
 }
 
@@ -3248,14 +3399,19 @@ fn materialize_direct_record_into(
         )));
     }
     let value_offset = record.value_offset as usize;
-    let Some(payload) = record.payload.as_slice() else {
-        return Err(StoreError::InvalidState(
-            "extent store borrowed-slice record requires vectored write".to_string(),
-        ));
-    };
     buffer[..record.prefix.len()].copy_from_slice(&record.prefix);
-    buffer[value_offset..value_offset + payload.len()].copy_from_slice(payload);
-    let suffix_start = value_offset + payload.len();
+    let value_end = value_offset
+        .checked_add(record.value_len as usize)
+        .ok_or_else(|| StoreError::InvalidState("extent store value range overflow".to_string()))?;
+    if value_end > record_len {
+        return Err(StoreError::InvalidState(
+            "extent store value range exceeds record".to_string(),
+        ));
+    }
+    record
+        .payload
+        .copy_into(&mut buffer[value_offset..value_end])?;
+    let suffix_start = value_end;
     buffer[suffix_start..suffix_start + record.suffix_padding.len()]
         .copy_from_slice(&record.suffix_padding);
     Ok(())
@@ -3268,7 +3424,34 @@ fn write_direct_record_blocking(
     scratch: &mut ExtentStoreScratchWorkspace,
 ) -> Result<()> {
     let direct_record = scratch.materialize_record(record)?;
-    write_all_at_blocking(file, offset, direct_record)
+    write_all_direct_at_blocking(file, offset, direct_record)
+}
+
+fn write_all_direct_at_blocking(
+    file: &ExtentStoreFile,
+    mut offset: u64,
+    mut payload: &[u8],
+) -> Result<()> {
+    while !payload.is_empty() {
+        let written = file.write_at(payload, offset).map_err(|error| {
+            StoreError::Transport(format!(
+                "extent store blocking direct pwrite failed: {error}"
+            ))
+        })?;
+        if written == 0 {
+            return Err(StoreError::Transport(
+                "extent store direct write completed with zero bytes".to_string(),
+            ));
+        }
+        if written < payload.len() && !written.is_multiple_of(EXTENT_STORE_ALIGNMENT as usize) {
+            return Err(StoreError::Transport(format!(
+                "extent store blocking direct write completed at unaligned boundary: {written} bytes"
+            )));
+        }
+        offset = offset.saturating_add(written as u64);
+        payload = &payload[written..];
+    }
+    Ok(())
 }
 
 fn write_buffered_batch_blocking(
@@ -3543,15 +3726,84 @@ fn write_vectored_all_at_blocking(
     Ok(())
 }
 
+fn write_vectored_all_direct_at_blocking(
+    file: &ExtentStoreFile,
+    mut offset: u64,
+    record: &EncodedExtentStoreRecord<'_>,
+) -> Result<()> {
+    let mut written = 0usize;
+    while written < record.record_len as usize {
+        let remaining = record.record_len as usize - written;
+        let iovecs = record.iovecs_from(written);
+        let result = unsafe {
+            libc::pwritev(
+                file.as_raw_fd(),
+                iovecs.as_ptr(),
+                iovecs.len() as i32,
+                offset as libc::off_t,
+            )
+        };
+        if result < 0 {
+            return Err(StoreError::Transport(format!(
+                "extent store blocking direct pwritev failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        if result == 0 {
+            return Err(StoreError::Transport(
+                "extent store direct write completed with zero bytes".to_string(),
+            ));
+        }
+        let result = result as usize;
+        if result < remaining && !result.is_multiple_of(EXTENT_STORE_ALIGNMENT as usize) {
+            return Err(StoreError::Transport(format!(
+                "extent store blocking direct write completed at unaligned boundary: {result} bytes"
+            )));
+        }
+        written = written.saturating_add(result);
+        offset = offset.saturating_add(result as u64);
+    }
+    Ok(())
+}
+
 fn read_exact_with_scratch_at_blocking(
     file: &ExtentStoreFile,
     offset: u64,
     payload: &mut [u8],
     scratch: &mut ExtentStoreScratchWorkspace,
 ) -> Result<()> {
-    let scratch = scratch.read_buffer(payload.len())?;
-    read_exact_at_blocking(file, offset, scratch)?;
-    payload.copy_from_slice(scratch);
+    let aligned_len = align_up(payload.len() as u64, EXTENT_STORE_ALIGNMENT) as usize;
+    let scratch = scratch.read_buffer(aligned_len)?;
+    read_exact_direct_at_blocking(file, offset, scratch)?;
+    payload.copy_from_slice(&scratch[..payload.len()]);
+    Ok(())
+}
+
+fn read_exact_direct_at_blocking(
+    file: &ExtentStoreFile,
+    mut offset: u64,
+    mut payload: &mut [u8],
+) -> Result<()> {
+    while !payload.is_empty() {
+        let read = file.read_at(payload, offset).map_err(|error| {
+            StoreError::Transport(format!(
+                "extent store blocking direct pread failed: {error}"
+            ))
+        })?;
+        if read == 0 {
+            return Err(StoreError::NotFound(
+                "extent store direct read reached EOF".to_string(),
+            ));
+        }
+        if read < payload.len() && !read.is_multiple_of(EXTENT_STORE_ALIGNMENT as usize) {
+            return Err(StoreError::Transport(format!(
+                "extent store blocking direct read completed at unaligned boundary: {read} bytes"
+            )));
+        }
+        offset = offset.saturating_add(read as u64);
+        let (_, rest) = payload.split_at_mut(read);
+        payload = rest;
+    }
     Ok(())
 }
 
@@ -3589,18 +3841,58 @@ impl<'a> EncodedExtentStoreRecord<'a> {
 }
 
 impl<'a> EncodedExtentStorePayload<'a> {
-    fn as_slice(&self) -> Option<&[u8]> {
-        match self {
-            Self::Borrowed(payload) => Some(payload),
-            Self::BorrowedSlices(_) => None,
-        }
-    }
-
     fn slice_count(&self) -> usize {
         match self {
             Self::Borrowed(_) => 1,
             Self::BorrowedSlices(slices) => slices.len(),
         }
+    }
+
+    fn direct_io_compatible(&self) -> bool {
+        match self {
+            Self::Borrowed(payload) => direct_iovec_compatible(payload),
+            Self::BorrowedSlices(payloads) => payloads
+                .iter()
+                .all(|payload| direct_iovec_compatible(payload)),
+        }
+    }
+
+    fn copy_into(&self, destination: &mut [u8]) -> Result<()> {
+        let mut offset = 0usize;
+        match self {
+            Self::Borrowed(payload) => {
+                if destination.len() != payload.len() {
+                    return Err(StoreError::InvalidState(format!(
+                        "extent store payload length mismatch: expected {} actual {}",
+                        destination.len(),
+                        payload.len()
+                    )));
+                }
+                destination.copy_from_slice(payload);
+                return Ok(());
+            }
+            Self::BorrowedSlices(payloads) => {
+                for payload in payloads {
+                    let end = offset.checked_add(payload.len()).ok_or_else(|| {
+                        StoreError::InvalidState("extent store payload length overflow".to_string())
+                    })?;
+                    if end > destination.len() {
+                        return Err(StoreError::InvalidState(
+                            "extent store payload exceeds direct scratch".to_string(),
+                        ));
+                    }
+                    destination[offset..end].copy_from_slice(payload);
+                    offset = end;
+                }
+            }
+        }
+        if offset != destination.len() {
+            return Err(StoreError::InvalidState(format!(
+                "extent store payload length mismatch: expected {} actual {offset}",
+                destination.len()
+            )));
+        }
+        Ok(())
     }
 
     fn push_iovecs_after_skip(&self, iovecs: &mut Vec<libc::iovec>, remaining_skip: &mut usize) {
@@ -3790,18 +4082,12 @@ fn encode_extent_store_record<'a>(
     let logical_locator = logical_locator.as_bytes();
     let value_len = payload.len() as u64;
     let minimum_value_offset = EXTENT_STORE_HEADER_LEN as u64 + logical_locator.len() as u64;
-    let dense = value_len <= dense_record_max_value_len()
-        && value_len.saturating_add(minimum_value_offset) > EXTENT_STORE_ALIGNMENT;
-    let value_offset = if dense {
-        minimum_value_offset
-    } else {
-        align_up(minimum_value_offset, EXTENT_STORE_ALIGNMENT)
-    };
-    let record_len = if dense {
-        value_offset + value_len
-    } else {
-        align_up(value_offset + value_len, EXTENT_STORE_ALIGNMENT)
-    };
+    // Match the OffsetAllocator backend's on-disk contract: the value starts
+    // at an aligned file offset and the complete record occupies an aligned
+    // extent. Logical value_len remains unpadded in the header and locator;
+    // only record_len includes trailing zero padding.
+    let value_offset = align_up(minimum_value_offset, EXTENT_STORE_ALIGNMENT);
+    let record_len = align_up(value_offset + value_len, EXTENT_STORE_ALIGNMENT);
     if record_len > usize::MAX as u64 {
         return Err(StoreError::InvalidState(format!(
             "extent store record length {record_len} exceeds addressable memory"
@@ -4022,6 +4308,27 @@ mod extent_store_engine_tests {
 
     include!("extent_store_recovery_tests.rs");
     include!("extent_store_io_worker_tests.rs");
+
+    #[test]
+    fn disabled_fixed_buffer_registry_still_unbinds_existing_slot() {
+        let Ok(mut ring) = IoUring::new(8) else {
+            return;
+        };
+        let counters = std::sync::Arc::new(ExtentStoreIoCounters::default());
+        let Ok(mut registry) = ExtentStoreFixedBufferRegistry::new(&mut ring, counters) else {
+            return;
+        };
+        let buffer = AlignedExtentStoreBuffer::uninitialized(EXTENT_STORE_ALIGNMENT as usize)
+            .expect("fixed buffer should allocate");
+        let Some(slot) = registry.register(&mut ring, buffer.ptr, buffer.len) else {
+            return;
+        };
+
+        registry.disabled = true;
+        assert!(registry.release(&mut ring, slot, buffer));
+        assert!(registry.retired_buffers.is_empty());
+        registry.unregister(&ring);
+    }
 
     #[test]
     fn extent_store_pinned_read_requires_policy_enable() {
@@ -4739,6 +5046,19 @@ mod extent_store_engine_tests {
         assert!(!is_aligned_usize(100));
     }
 
+    #[test]
+    fn free_extent_reuse_skips_legacy_unaligned_offsets() {
+        let mut free = ExtentStoreFreeExtents::default();
+        free.insert_exact(1, 17, EXTENT_STORE_ALIGNMENT);
+        free.insert_exact(2, EXTENT_STORE_ALIGNMENT, EXTENT_STORE_ALIGNMENT);
+
+        assert_eq!(
+            free.take_exact_aligned(EXTENT_STORE_ALIGNMENT),
+            Some((2, EXTENT_STORE_ALIGNMENT))
+        );
+        assert_eq!(free.take_exact_aligned(EXTENT_STORE_ALIGNMENT), None);
+    }
+
     // --- Record header encoding ---
 
     #[test]
@@ -4829,6 +5149,760 @@ mod extent_store_engine_tests {
         assert!(direct_iovec_compatible(&[]));
     }
 
+    #[test]
+    fn single_record_keeps_logical_length_but_aligns_physical_layout() {
+        let counters = std::sync::Arc::new(ExtentStoreIoCounters::default());
+        let pool = std::sync::Arc::new(ExtentStoreBufferPool::new(counters));
+        let payload = vec![0x5au8; EXTENT_STORE_ALIGNMENT as usize + 17];
+        let record = encode_extent_store_record("unaligned/key", &payload, None, &pool)
+            .expect("record should encode");
+
+        assert_eq!(record.value_len, payload.len() as u64);
+        assert!(is_aligned_u64(record.value_offset));
+        assert!(is_aligned_u64(record.record_len));
+        assert!(record.value_offset + record.value_len <= record.record_len);
+
+        let mut direct = AlignedExtentStoreBuffer::uninitialized(record.record_len as usize)
+            .expect("direct record buffer should allocate");
+        direct.fill(0xcd);
+        materialize_direct_record_into(&record, &mut direct)
+            .expect("record should materialize into aligned buffer");
+        assert!(is_aligned_usize(direct.as_ptr() as usize));
+        let value_start = record.value_offset as usize;
+        let value_end = value_start + payload.len();
+        assert_eq!(&direct[value_start..value_end], payload.as_slice());
+        assert!(direct[value_end..record.record_len as usize]
+            .iter()
+            .all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn single_record_alignment_boundaries_preserve_logical_bytes() {
+        let counters = std::sync::Arc::new(ExtentStoreIoCounters::default());
+        let pool = std::sync::Arc::new(ExtentStoreBufferPool::new(counters));
+        let key_lengths = [
+            1usize,
+            EXTENT_STORE_ALIGNMENT as usize - EXTENT_STORE_HEADER_LEN,
+            EXTENT_STORE_ALIGNMENT as usize - EXTENT_STORE_HEADER_LEN + 1,
+        ];
+        let value_lengths = [0usize, 1, 4095, 4096, 4097];
+
+        for key_len in key_lengths {
+            let key = "k".repeat(key_len);
+            for value_len in value_lengths {
+                let payload = vec![0xabu8; value_len];
+                let record = encode_extent_store_record(&key, &payload, None, &pool)
+                    .expect("boundary record should encode");
+                let expected_value_offset = align_up(
+                    (EXTENT_STORE_HEADER_LEN + key_len) as u64,
+                    EXTENT_STORE_ALIGNMENT,
+                );
+                let expected_record_len = align_up(
+                    expected_value_offset + value_len as u64,
+                    EXTENT_STORE_ALIGNMENT,
+                );
+                assert_eq!(record.value_offset, expected_value_offset);
+                assert_eq!(record.value_len, value_len as u64);
+                assert_eq!(record.record_len, expected_record_len);
+
+                let mut direct =
+                    AlignedExtentStoreBuffer::uninitialized(record.record_len as usize)
+                        .expect("boundary direct buffer should allocate");
+                direct.fill(0xcd);
+                materialize_direct_record_into(&record, &mut direct)
+                    .expect("boundary record should materialize");
+                let key_end = EXTENT_STORE_HEADER_LEN + key_len;
+                let value_start = record.value_offset as usize;
+                let value_end = value_start + value_len;
+                assert_eq!(&direct[EXTENT_STORE_HEADER_LEN..key_end], key.as_bytes());
+                assert!(direct[key_end..value_start].iter().all(|byte| *byte == 0));
+                assert_eq!(&direct[value_start..value_end], payload.as_slice());
+                assert!(direct[value_end..record.record_len as usize]
+                    .iter()
+                    .all(|byte| *byte == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn record_buffer_pool_does_not_reuse_oversized_buffer_or_wait_on_budget() {
+        let counters = std::sync::Arc::new(ExtentStoreIoCounters::default());
+        let max_bytes = 8 * EXTENT_STORE_ALIGNMENT as usize;
+        let pool = std::sync::Arc::new(ExtentStoreBufferPool::new_with_max_bytes(
+            counters, max_bytes,
+        ));
+
+        let oversized = pool
+            .lease(max_bytes)
+            .expect("oversized record buffer should allocate");
+        drop(oversized);
+
+        let leases = (0..8)
+            .map(|_| {
+                let lease = pool
+                    .lease(EXTENT_STORE_ALIGNMENT as usize)
+                    .expect("small record buffer should allocate without waiting");
+                assert_eq!(
+                    lease
+                        .buffer
+                        .as_ref()
+                        .expect("leased buffer should exist")
+                        .len(),
+                    EXTENT_STORE_ALIGNMENT as usize
+                );
+                lease
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            pool.lease(EXTENT_STORE_ALIGNMENT as usize),
+            Err(StoreError::Backpressure(_))
+        ));
+        assert!(pool.state.lock().allocated_bytes <= max_bytes);
+        drop(leases);
+    }
+
+    #[test]
+    fn record_encoding_returns_backpressure_instead_of_self_deadlocking() {
+        let counters = std::sync::Arc::new(ExtentStoreIoCounters::default());
+        let max_bytes = 2 * EXTENT_STORE_ALIGNMENT as usize;
+        let pool = std::sync::Arc::new(ExtentStoreBufferPool::new_with_max_bytes(
+            counters, max_bytes,
+        ));
+        let key = "k".repeat(max_bytes - EXTENT_STORE_HEADER_LEN);
+
+        assert!(matches!(
+            encode_extent_store_record(&key, &[0x5a], None, &pool),
+            Err(StoreError::Backpressure(_))
+        ));
+        assert!(pool.state.lock().allocated_bytes <= max_bytes);
+    }
+
+    #[test]
+    fn packed_record_materializes_borrowed_slices_for_direct_io() {
+        let counters = std::sync::Arc::new(ExtentStoreIoCounters::default());
+        let pool = std::sync::Arc::new(ExtentStoreBufferPool::new(counters));
+        let first = vec![0x11u8; 1536];
+        let second = vec![0x22u8; 2049];
+        let writes = [
+            ExtentStoreWrite {
+                logical_locator: "packed/direct/a",
+                payload: &first,
+                checksum: None,
+            },
+            ExtentStoreWrite {
+                logical_locator: "packed/direct/b",
+                payload: &second,
+                checksum: None,
+            },
+        ];
+        let mut packed = encode_packed_extent_store_records(&writes, &pool);
+        let record = packed
+            .pop()
+            .expect("writes should form one packed record")
+            .record
+            .expect("packed record should encode");
+        assert!(is_aligned_u64(record.value_offset));
+        assert!(is_aligned_u64(record.record_len));
+
+        let mut direct = AlignedExtentStoreBuffer::zeroed(record.record_len as usize)
+            .expect("direct record buffer should allocate");
+        materialize_direct_record_into(&record, &mut direct)
+            .expect("packed record should materialize into aligned buffer");
+        let value_start = record.value_offset as usize;
+        let first_end = value_start + first.len();
+        let second_end = first_end + second.len();
+        assert_eq!(&direct[value_start..first_end], first.as_slice());
+        assert_eq!(&direct[first_end..second_end], second.as_slice());
+    }
+
+    #[test]
+    fn packed_unaligned_payloads_use_one_direct_scratch_write() {
+        let root = test_extent_store_root("packed-direct-scratch-write");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        if !matches!(&engine.io, ExtentStoreIo::WorkerPair(_))
+            || engine
+                .inner
+                .lock()
+                .segments
+                .values()
+                .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        let first = vec![0x11u8; 1536];
+        let second = vec![0x22u8; 2049];
+        let writes = [
+            ExtentStoreWrite {
+                logical_locator: "packed/direct-write/a",
+                payload: &first,
+                checksum: None,
+            },
+            ExtentStoreWrite {
+                logical_locator: "packed/direct-write/b",
+                payload: &second,
+                checksum: None,
+            },
+        ];
+        let before = engine.io_stats();
+        let locators = engine
+            .put_batch(&writes)
+            .into_iter()
+            .map(|result| result.expect("packed direct scratch write should succeed"))
+            .collect::<Vec<_>>();
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(delta.direct_scratch_write_ops, 1);
+        assert_eq!(delta.buffered_write_ops, 0);
+        for ((locator, write), expected) in
+            locators.iter().zip(writes.iter()).zip([&first, &second])
+        {
+            assert_eq!(
+                engine
+                    .get(locator, write.payload.len() as u64)
+                    .expect("packed direct scratch payload should read")
+                    .expect("packed direct scratch payload should exist"),
+                expected.as_slice()
+            );
+        }
+        drop(engine);
+
+        let recovered =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("packed direct scratch engine should recover");
+        for ((locator, write), expected) in
+            locators.iter().zip(writes.iter()).zip([&first, &second])
+        {
+            assert_eq!(
+                recovered
+                    .get(locator, write.payload.len() as u64)
+                    .expect("recovered packed payload should read")
+                    .expect("recovered packed payload should exist"),
+                expected.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn packed_aligned_payloads_use_direct_write_without_staging() {
+        let root = test_extent_store_root("packed-direct-no-staging");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        if !matches!(&engine.io, ExtentStoreIo::WorkerPair(_))
+            || engine
+                .inner
+                .lock()
+                .segments
+                .values()
+                .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        let first = aligned_kvcache_payload(EXTENT_STORE_ALIGNMENT as usize, 0x31);
+        let second = aligned_kvcache_payload(EXTENT_STORE_ALIGNMENT as usize, 0x72);
+        let writes = [
+            ExtentStoreWrite {
+                logical_locator: "packed/aligned/a",
+                payload: first.as_slice(),
+                checksum: None,
+            },
+            ExtentStoreWrite {
+                logical_locator: "packed/aligned/b",
+                payload: second.as_slice(),
+                checksum: None,
+            },
+        ];
+
+        let before = engine.io_stats();
+        let locators = engine
+            .put_batch(&writes)
+            .into_iter()
+            .map(|result| result.expect("packed aligned write should succeed"))
+            .collect::<Vec<_>>();
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(delta.direct_write_ops, 1);
+        assert_eq!(delta.direct_scratch_write_ops, 0);
+        assert_eq!(delta.buffered_write_ops, 0);
+
+        for ((locator, write), expected) in
+            locators.iter().zip(writes.iter()).zip([&first, &second])
+        {
+            assert_eq!(
+                engine
+                    .get(locator, write.payload.len() as u64)
+                    .expect("packed aligned payload should read")
+                    .expect("packed aligned payload should exist"),
+                expected.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_and_direct_scratch_share_one_worker_batch() {
+        let root = test_extent_store_root("direct-family-single-batch");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 512)
+                .expect("engine should start");
+        if !matches!(&engine.io, ExtentStoreIo::WorkerPair(_))
+            || engine
+                .inner
+                .lock()
+                .segments
+                .values()
+                .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        let first = aligned_kvcache_payload(EXTENT_STORE_ALIGNMENT as usize, 0x19);
+        let staged = vec![0x4eu8; EXTENT_STORE_IO_WORKER_FIXED_BUFFER_MAX_BYTES + 777];
+        let third = aligned_kvcache_payload(EXTENT_STORE_ALIGNMENT as usize, 0x83);
+        let writes = [
+            ExtentStoreWrite {
+                logical_locator: "direct-family/direct-a",
+                payload: first.as_slice(),
+                checksum: None,
+            },
+            ExtentStoreWrite {
+                logical_locator: "direct-family/scratch-b",
+                payload: &staged,
+                checksum: None,
+            },
+            ExtentStoreWrite {
+                logical_locator: "direct-family/direct-c",
+                payload: third.as_slice(),
+                checksum: None,
+            },
+        ];
+
+        let before = engine.io_stats();
+        let results = engine.put_batch(&writes);
+        for result in results {
+            result.expect("direct-family write should succeed");
+        }
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(delta.direct_write_ops, 2);
+        assert_eq!(delta.direct_scratch_write_ops, 1);
+        assert_eq!(delta.buffered_write_ops, 0);
+        assert_eq!(delta.worker_write_batches, 1);
+        assert_eq!(delta.worker_write_batch_ops, 3);
+    }
+
+    #[test]
+    fn unaligned_payload_uses_direct_scratch_write() {
+        let root = test_extent_store_root("direct-scratch-write");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 512)
+                .expect("engine should start");
+        if !matches!(&engine.io, ExtentStoreIo::WorkerPair(_))
+            || engine
+                .inner
+                .lock()
+                .segments
+                .values()
+                .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        let payload = vec![0x33u8; 256 * 1024 + 777];
+        let before = engine.io_stats();
+        let locator = engine
+            .put("direct/scratch/unaligned", &payload)
+            .expect("unaligned payload should write");
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(delta.direct_scratch_write_ops, 1);
+        assert_eq!(delta.buffered_write_ops, 0);
+        let mut destination = vec![0u8; payload.len()];
+        let before_read = engine.io_stats();
+        engine
+            .get_into(&locator, payload.len() as u64, &mut destination)
+            .expect("unaligned payload should read");
+        let read_delta = engine.io_stats().delta_since(before_read);
+        assert_eq!(read_delta.direct_scratch_read_ops, 1);
+        assert_eq!(read_delta.buffered_read_ops, 0);
+        assert_eq!(destination, payload);
+        assert_eq!(
+            engine
+                .get(&locator, payload.len() as u64)
+                .expect("payload should read")
+                .expect("payload should exist"),
+            payload
+        );
+    }
+
+    #[test]
+    fn blocking_direct_scratch_reads_unaligned_lengths() {
+        let root = test_extent_store_root("blocking-direct-scratch-read");
+        let mut engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        if engine
+            .inner
+            .lock()
+            .segments
+            .values()
+            .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        engine.io = ExtentStoreIo::Blocking(Mutex::new(ExtentStoreBlockingIo));
+
+        for value_len in [1usize, 4095, 4097] {
+            let payload = vec![(value_len % 251) as u8; value_len];
+            let locator = engine
+                .put(&format!("blocking/direct-scratch/{value_len}"), &payload)
+                .expect("blocking direct scratch payload should write");
+            let mut destination = vec![0u8; value_len];
+            assert_eq!(
+                engine
+                    .get_into(&locator, value_len as u64, &mut destination)
+                    .expect("blocking direct scratch payload should read"),
+                Some(value_len)
+            );
+            assert_eq!(destination, payload);
+        }
+    }
+
+    #[test]
+    fn blocking_aligned_payload_uses_direct_read_and_write() {
+        let root = test_extent_store_root("blocking-direct-aligned");
+        let mut engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        if engine
+            .inner
+            .lock()
+            .segments
+            .values()
+            .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        engine.io = ExtentStoreIo::Blocking(Mutex::new(ExtentStoreBlockingIo));
+        let mut payload = AlignedExtentStoreBuffer::uninitialized(EXTENT_STORE_ALIGNMENT as usize)
+            .expect("aligned payload should allocate");
+        payload.fill(0x7c);
+        let before = engine.io_stats();
+
+        let locator = engine
+            .put("blocking/direct/aligned", &payload)
+            .expect("blocking direct payload should write");
+        let mut destination =
+            AlignedExtentStoreBuffer::uninitialized(EXTENT_STORE_ALIGNMENT as usize)
+                .expect("aligned destination should allocate");
+        assert_eq!(
+            engine
+                .get_into(&locator, payload.len() as u64, &mut destination)
+                .expect("blocking direct payload should read"),
+            Some(payload.len())
+        );
+        assert_eq!(&*destination, &*payload);
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(delta.direct_write_ops, 1);
+        assert_eq!(delta.direct_scratch_write_ops, 0);
+        assert_eq!(delta.buffered_write_ops, 0);
+        assert_eq!(delta.direct_read_ops, 1);
+        assert_eq!(delta.direct_scratch_read_ops, 0);
+        assert_eq!(delta.buffered_read_ops, 0);
+    }
+
+    #[test]
+    fn direct_scratch_read_reuses_larger_buffer_without_overreading() {
+        let root = test_extent_store_root("direct-scratch-read-reuse");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 512)
+                .expect("engine should start");
+        if !matches!(&engine.io, ExtentStoreIo::WorkerPair(_))
+            || engine
+                .inner
+                .lock()
+                .segments
+                .values()
+                .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        let large = vec![0x41u8; 2 * EXTENT_STORE_ALIGNMENT as usize + 777];
+        let small = vec![0x92u8; EXTENT_STORE_ALIGNMENT as usize + 123];
+        let large_locator = engine
+            .put("direct/scratch/reuse-large", &large)
+            .expect("large scratch payload should write");
+        let small_locator = engine
+            .put("direct/scratch/reuse-small", &small)
+            .expect("small scratch payload should write");
+
+        let mut large_dst = vec![0u8; large.len()];
+        assert_eq!(
+            engine
+                .get_into(&large_locator, large.len() as u64, &mut large_dst)
+                .expect("large scratch payload should read"),
+            Some(large.len())
+        );
+        assert_eq!(large_dst, large);
+
+        let before = engine.io_stats();
+        let mut small_dst = vec![0u8; small.len()];
+        assert_eq!(
+            engine
+                .get_into(&small_locator, small.len() as u64, &mut small_dst)
+                .expect("small scratch payload should read"),
+            Some(small.len())
+        );
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(small_dst, small);
+        assert_eq!(delta.direct_scratch_read_ops, 1);
+        assert_eq!(
+            delta.direct_scratch_read_bytes,
+            align_up(small.len() as u64, EXTENT_STORE_ALIGNMENT)
+        );
+        assert!(delta.scratch_reuse_ops >= 1);
+        let read_arena = match &engine.io {
+            ExtentStoreIo::WorkerPair(pair) => pair.read_worker.scratch_arena(),
+            ExtentStoreIo::Blocking(_) => unreachable!("worker pair checked above"),
+        };
+        assert_eq!(read_arena.state.lock().leased_bytes, 0);
+    }
+
+    #[test]
+    fn direct_scratch_pool_respects_write_byte_budget() {
+        let root = test_extent_store_root("direct-scratch-pool-budget");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        let arena = match &engine.io {
+            ExtentStoreIo::WorkerPair(pair) => pair.write_worker.scratch_arena(),
+            ExtentStoreIo::Blocking(_) => return,
+        };
+        let oversized = arena
+            .lease(EXTENT_STORE_IO_WORKER_WRITE_PIPELINE_MAX_INFLIGHT_BYTES)
+            .expect("full-budget scratch lease should allocate");
+        drop(oversized);
+        let small = arena
+            .lease(EXTENT_STORE_ALIGNMENT as usize)
+            .expect("small lease should evict rather than reuse full-budget buffer");
+        assert_eq!(
+            small
+                .buffer
+                .as_ref()
+                .expect("small scratch buffer should exist")
+                .len(),
+            EXTENT_STORE_ALIGNMENT as usize
+        );
+        drop(small);
+
+        let lease_len = 8 * 1024 * 1024;
+        let leases = (0..8)
+            .map(|_| {
+                arena
+                    .lease(lease_len)
+                    .expect("scratch lease should allocate")
+            })
+            .collect::<Vec<_>>();
+        {
+            let state = arena.state.lock();
+            assert_eq!(state.allocated_bytes, 8 * lease_len);
+            assert_eq!(state.leased_bytes, 8 * lease_len);
+        }
+
+        assert!(matches!(
+            arena.lease(lease_len),
+            Err(StoreError::Backpressure(_))
+        ));
+        drop(leases);
+        let acquired = arena
+            .lease(lease_len)
+            .expect("scratch lease should acquire after budget is released");
+        {
+            let state = arena.state.lock();
+            assert_eq!(state.allocated_bytes, 8 * lease_len);
+            assert_eq!(state.leased_bytes, lease_len);
+        }
+        drop(acquired);
+
+        let stats = engine.io_stats();
+        assert!(
+            stats.scratch_pool_bytes
+                <= EXTENT_STORE_IO_WORKER_WRITE_PIPELINE_MAX_INFLIGHT_BYTES as u64
+        );
+        assert!(stats.scratch_pool_buffers <= EXTENT_STORE_IO_WORKER_FIXED_BUFFER_SLOTS as u64);
+    }
+
+    #[test]
+    fn direct_scratch_budget_exhaustion_records_buffered_fallback() {
+        let root = test_extent_store_root("direct-scratch-budget-fallback");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 256)
+                .expect("engine should start");
+        let arena = match &engine.io {
+            ExtentStoreIo::WorkerPair(pair) => pair.write_worker.scratch_arena(),
+            ExtentStoreIo::Blocking(_) => return,
+        };
+        if engine
+            .inner
+            .lock()
+            .segments
+            .values()
+            .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        let budget = arena
+            .lease(EXTENT_STORE_IO_WORKER_WRITE_PIPELINE_MAX_INFLIGHT_BYTES)
+            .expect("test should reserve the complete write scratch budget");
+        let payload = vec![0x6du8; 256 * 1024 + 777];
+        let before = engine.io_stats();
+
+        let locator = engine
+            .put("direct/scratch/budget-fallback", &payload)
+            .expect("scratch pressure should fall back to buffered write");
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(delta.direct_scratch_write_ops, 0);
+        assert_eq!(delta.direct_write_ops, 0);
+        assert_eq!(delta.buffered_write_ops, 1);
+
+        let restored = engine
+            .get(&locator, payload.len() as u64)
+            .expect("fallback payload should read")
+            .expect("fallback payload should exist");
+        assert_eq!(restored, payload);
+        drop(budget);
+    }
+
+    #[test]
+    fn direct_scratch_eviction_unbinds_fixed_buffer_before_reusing_slot() {
+        let root = test_extent_store_root("direct-scratch-fixed-buffer-eviction");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        let (queue, counters) = match &engine.io {
+            ExtentStoreIo::WorkerPair(pair) => (
+                pair.write_worker.queue.clone(),
+                pair.write_worker.counters.clone(),
+            ),
+            ExtentStoreIo::Blocking(_) => return,
+        };
+        let arena = std::sync::Arc::new(ExtentStoreScratchArena {
+            queue,
+            state: Mutex::new(ExtentStoreScratchArenaState {
+                buffers: Vec::new(),
+                retired_buffers: Vec::new(),
+                allocated_bytes: 0,
+                leased_bytes: 0,
+            }),
+            counters,
+            is_read: false,
+            max_bytes: 2 * EXTENT_STORE_ALIGNMENT as usize,
+        });
+
+        let first = arena
+            .lease(EXTENT_STORE_ALIGNMENT as usize)
+            .expect("first fixed scratch should allocate");
+        let Some(first_slot) = first.fixed_slot else {
+            return;
+        };
+        drop(first);
+
+        let replacement = arena
+            .lease(2 * EXTENT_STORE_ALIGNMENT as usize)
+            .expect("eviction should release enough budget for replacement");
+        assert_eq!(replacement.fixed_slot, Some(first_slot));
+        {
+            let state = arena.state.lock();
+            assert_eq!(state.allocated_bytes, 2 * EXTENT_STORE_ALIGNMENT as usize);
+            assert_eq!(state.leased_bytes, 2 * EXTENT_STORE_ALIGNMENT as usize);
+            assert!(state.retired_buffers.is_empty());
+        }
+        drop(replacement);
+    }
+
+    #[test]
+    fn fatal_ring_error_closes_worker_before_releasing_direct_scratch() {
+        let root = test_extent_store_root("direct-scratch-fatal-ring-error");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        let worker = match &engine.io {
+            ExtentStoreIo::WorkerPair(pair) => &pair.write_worker,
+            ExtentStoreIo::Blocking(_) => return,
+        };
+        worker
+            .queue
+            .fail_after_submit
+            .store(true, AtomicOrdering::SeqCst);
+        let payload = vec![0x5au8; EXTENT_STORE_ALIGNMENT as usize + 17];
+
+        assert!(matches!(
+            engine.put("fatal-ring/first", &payload),
+            Err(StoreError::Transport(_))
+        ));
+        assert!(worker.queue.state.lock().shutdown);
+        assert_eq!(worker.scratch_arena.state.lock().leased_bytes, 0);
+        assert!(matches!(
+            engine.put("fatal-ring/second", &payload),
+            Err(StoreError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn buffered_record_does_not_downgrade_direct_records_in_same_batch() {
+        let root = test_extent_store_root("mixed-direct-buffered-write");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 1024)
+                .expect("engine should start");
+        if !matches!(&engine.io, ExtentStoreIo::WorkerPair(_))
+            || engine
+                .inner
+                .lock()
+                .segments
+                .values()
+                .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        let first = aligned_kvcache_payload(EXTENT_STORE_ALIGNMENT as usize, 0x41);
+        let buffered = vec![0x52u8; EXTENT_STORE_DIRECT_SCRATCH_MAX_RECORD_LEN as usize + 777];
+        let third = aligned_kvcache_payload((EXTENT_STORE_ALIGNMENT * 2) as usize, 0x63);
+        let writes = [
+            ExtentStoreWrite {
+                logical_locator: "mixed/direct/a",
+                payload: first.as_slice(),
+                checksum: None,
+            },
+            ExtentStoreWrite {
+                logical_locator: "mixed/buffered/b",
+                payload: &buffered,
+                checksum: None,
+            },
+            ExtentStoreWrite {
+                logical_locator: "mixed/direct/c",
+                payload: third.as_slice(),
+                checksum: None,
+            },
+        ];
+
+        let before = engine.io_stats();
+        let locators = engine
+            .put_batch(&writes)
+            .into_iter()
+            .map(|result| result.expect("mixed batch write should succeed"))
+            .collect::<Vec<_>>();
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(delta.direct_write_ops, 2);
+        assert_eq!(delta.buffered_write_ops, 1);
+        assert_eq!(delta.buffered_write_blocking_batches, 1);
+        for (locator, write) in locators.iter().zip(writes.iter()) {
+            let decoded = ExtentStoreLocator::decode(locator).expect("mixed locator should decode");
+            assert_eq!(decoded.value_len, write.payload.len() as u64);
+            assert_eq!(
+                engine
+                    .get(locator, write.payload.len() as u64)
+                    .expect("mixed batch payload should read")
+                    .expect("mixed batch payload should exist"),
+                write.payload
+            );
+        }
+    }
+
     // --- Engine put/get/delete lifecycle ---
 
     #[test]
@@ -4857,6 +5931,67 @@ mod extent_store_engine_tests {
             after_delete.is_err(),
             "get after delete should return NotFound error"
         );
+    }
+
+    #[test]
+    fn engine_rejects_locator_value_outside_record_before_io() {
+        let root = test_extent_store_root("locator-value-outside-record");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                .expect("engine should start");
+        let locator = engine
+            .put("logical/invalid-value-bounds", b"payload")
+            .expect("seed record should write");
+        let mut locator = ExtentStoreLocator::decode(&locator).expect("locator should decode");
+        locator.value_offset = locator.record_len;
+        locator.value_len = 1;
+
+        let error = engine
+            .get(&locator.encode(), 1)
+            .expect_err("out-of-record value must fail before I/O");
+        assert!(matches!(error, StoreError::InvalidState(_)));
+        assert!(error.to_string().contains("value exceeds record bounds"));
+    }
+
+    #[test]
+    fn batch_validates_every_locator_when_segment_files_are_cached() {
+        let root = test_extent_store_root("batch-validates-every-locator");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                .expect("engine should start");
+        let payload = b"valid-payload";
+        let valid = engine
+            .put("logical/batch-valid", payload)
+            .expect("seed record should write");
+        let mut invalid = ExtentStoreLocator::decode(&valid).expect("locator should decode");
+        invalid.value_offset = invalid.record_len;
+        invalid.value_len = 1;
+        let invalid = invalid.encode();
+        let mut valid_dst = vec![0u8; payload.len()];
+        let mut invalid_dst = vec![0u8; 1];
+        let mut reads = [
+            ExtentStoreRead {
+                locator: &valid,
+                expected_len: payload.len() as u64,
+                dst: &mut valid_dst,
+            },
+            ExtentStoreRead {
+                locator: &invalid,
+                expected_len: 1,
+                dst: &mut invalid_dst,
+            },
+        ];
+
+        let results = engine.get_batch_into(&mut reads);
+        assert_eq!(
+            results[0]
+                .as_ref()
+                .expect("valid locator should read successfully"),
+            &Some(payload.len())
+        );
+        assert!(matches!(results[1], Err(StoreError::InvalidState(_))));
+        assert_eq!(valid_dst, payload);
+        assert_eq!(invalid_dst, vec![0u8; 1]);
     }
 
     #[test]
@@ -5185,7 +6320,9 @@ mod extent_store_engine_tests {
             "active segment is cleaned when a later rollover seals it"
         );
 
-        let rollover_payload = vec![2u8; EXTENT_STORE_ALIGNMENT as usize];
+        // One byte beyond a block forces a 3-block aligned record. That cannot
+        // reuse the deleted 2-block extent and therefore exercises rollover.
+        let rollover_payload = vec![2u8; EXTENT_STORE_ALIGNMENT as usize + 1];
         let second = engine
             .put("rollover-dead-active/b", &rollover_payload)
             .expect("second put should trigger rollover");
