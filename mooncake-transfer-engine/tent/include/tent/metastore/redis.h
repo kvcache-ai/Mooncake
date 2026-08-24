@@ -69,7 +69,8 @@ class RedisMetaStore : public MetaStore {
     redisContext *client_;
     // hiredis' synchronous redisContext is NOT thread-safe: concurrent
     // redisCommand() calls corrupt its shared command/reply buffers. tent's
-    // RDMA workers call get() concurrently, so serialize client_ with this lock.
+    // RDMA workers call get() concurrently, so serialize client_ with this
+    // lock.
     std::mutex client_mutex_;
 
     // Helper function for handling Redis replies

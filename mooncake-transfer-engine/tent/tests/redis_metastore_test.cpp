@@ -59,7 +59,8 @@ redisReply *makeStatusReply(const char *status) {
 // ever in flight at once. Without client_mutex_ the widened window overlaps.
 class FakeRedisMetaStore : public RedisMetaStore {
    public:
-    // connected_ is protected; client_ stays nullptr (redisFree() tolerates it).
+    // connected_ is protected; client_ stays nullptr (redisFree() tolerates
+    // it).
     FakeRedisMetaStore() { connected_ = true; }
 
     std::atomic<int> in_flight_{0};
