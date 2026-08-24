@@ -377,8 +377,7 @@ TEST_F(PosixFileTest, UringVectorIoHandlesUnalignedDirectIo) {
     neighbor_iov.iov_base = const_cast<char*>(neighbor.data());
     neighbor_iov.iov_len = neighbor.size();
     auto neighbor_write = uring_file.vector_write(&neighbor_iov, 1, 0);
-    ASSERT_TRUE(neighbor_write.has_value())
-        << toString(neighbor_write.error());
+    ASSERT_TRUE(neighbor_write.has_value()) << toString(neighbor_write.error());
 
     char header[48] = {};
     std::memcpy(header, "HDR", 3);
@@ -421,10 +420,8 @@ TEST_F(PosixFileTest, UringVectorIoHandlesUnalignedDirectIo) {
     iovec neighbor_read_iov;
     neighbor_read_iov.iov_base = out_neighbor.data();
     neighbor_read_iov.iov_len = out_neighbor.size();
-    auto neighbor_read =
-        uring_file.vector_read(&neighbor_read_iov, 1, 0);
-    ASSERT_TRUE(neighbor_read.has_value())
-        << toString(neighbor_read.error());
+    auto neighbor_read = uring_file.vector_read(&neighbor_read_iov, 1, 0);
+    ASSERT_TRUE(neighbor_read.has_value()) << toString(neighbor_read.error());
     EXPECT_EQ(out_neighbor, neighbor);
 
     remove(direct_filename.c_str());

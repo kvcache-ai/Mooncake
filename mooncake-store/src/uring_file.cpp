@@ -839,8 +839,8 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
 
     if (!use_direct_io_ ||
         IovecRegionDirectReady(iov, iovcnt, offset, ALIGNMENT_)) {
-        res = SharedUringRing::instance().vector_write(fd_, iov, iovcnt,
-                                                       offset);
+        res =
+            SharedUringRing::instance().vector_write(fd_, iov, iovcnt, offset);
     } else {
         const off_t aligned_off = offset & ~static_cast<off_t>(ALIGNMENT_ - 1);
         const size_t head = static_cast<size_t>(offset - aligned_off);
@@ -902,8 +902,7 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
 
     if (!use_direct_io_ ||
         IovecRegionDirectReady(iov, iovcnt, offset, ALIGNMENT_)) {
-        res =
-            SharedUringRing::instance().vector_read(fd_, iov, iovcnt, offset);
+        res = SharedUringRing::instance().vector_read(fd_, iov, iovcnt, offset);
     } else {
         const off_t aligned_off = offset & ~static_cast<off_t>(ALIGNMENT_ - 1);
         const size_t head = static_cast<size_t>(offset - aligned_off);
