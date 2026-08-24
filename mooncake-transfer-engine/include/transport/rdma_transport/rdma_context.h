@@ -262,7 +262,6 @@ class RdmaContext {
 
     int eventFd() const { return event_fd_; }
 
-    ibv_cq *cq();
     ibv_cq *cq(int cq_index);
 
     std::atomic<int> *cqOutstandingCount(int cq_index) {
@@ -270,6 +269,9 @@ class RdmaContext {
     }
 
     int cqCount() const { return cq_list_.size(); }
+    int postingThreadForPeer(const std::string &peer_nic_path) const;
+    int cqIndexForPostingThread(int thread_id) const;
+    int cqIndexForPeer(const std::string &peer_nic_path) const;
 
     int poll(int num_entries, ibv_wc *wc, int cq_index = 0);
 
@@ -332,8 +334,6 @@ class RdmaContext {
 
     std::atomic<int> next_comp_channel_index_;
     std::atomic<int> next_comp_vector_index_;
-    std::atomic<int> next_cq_list_index_;
-
     std::shared_ptr<WorkerPool> worker_pool_;
 
     std::atomic<bool> active_;

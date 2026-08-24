@@ -115,15 +115,11 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
 }
 
 int WorkerPool::postingThreadForPeer(const std::string &peer_nic_path) const {
-    return static_cast<int>(std::hash<std::string>{}(peer_nic_path) %
-                            static_cast<size_t>(kTransferWorkerCount));
+    return context_.postingThreadForPeer(peer_nic_path);
 }
 
 int WorkerPool::cqIndexForPostingThread(int thread_id) const {
-    const int cq_count = context_.cqCount();
-    if (cq_count <= 0) return 0;
-    if (thread_id >= 0 && thread_id < cq_count) return thread_id;
-    return thread_id >= 0 ? thread_id % cq_count : 0;
+    return context_.cqIndexForPostingThread(thread_id);
 }
 
 void WorkerPool::enqueueSliceToOwner(Transport::Slice *slice) {
@@ -541,7 +537,6 @@ void WorkerPool::performPollCq(int thread_id) {
     const static size_t kPollCount = 64;
     std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     std::unordered_set<RdmaEndPoint *> pinned_endpoints;
-    std::vector<ibv_wc> wc_list;
     const int cq_index = cqIndexForPostingThread(thread_id);
     ibv_wc wc[kPollCount];
     int nr_poll = context_.poll(kPollCount, wc, cq_index);
@@ -570,7 +565,6 @@ void WorkerPool::performPollCq(int thread_id) {
             pinned_endpoints.insert(slice->rdma.endpoint).second) {
             slice->rdma.endpoint->beginCompletionBatch();
         }
-        wc_list.push_back(wc[i]);
     }
     if (nr_poll)
         context_.cqOutstandingCount(cq_index)->fetch_sub(
@@ -579,15 +573,15 @@ void WorkerPool::performPollCq(int thread_id) {
     for (auto &entry : qp_depth_set)
         entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
 
-    if (!wc_list.empty()) processCompletions(thread_id, wc_list);
+    if (nr_poll > 0) processCompletions(thread_id, wc, nr_poll);
 
     for (auto *endpoint : pinned_endpoints) {
         endpoint->endCompletionBatch();
     }
 }
 
-void WorkerPool::processCompletions(int thread_id,
-                                    const std::vector<ibv_wc> &wc_list) {
+void WorkerPool::processCompletions(int thread_id, const ibv_wc *wc_list,
+                                    int count) {
     // Slices this call drove to a terminal state, successes and
     // retry-exhausted failures alike; folded into processed_slice_count_,
     // which gates worker parking. Every terminal outcome below goes through
@@ -617,15 +611,16 @@ void WorkerPool::processCompletions(int thread_id,
     SliceList failed_slice_list;
     SliceList local_failed_slice_list;
 
-    for (const auto &wc : wc_list) {
-        Transport::Slice *slice = (Transport::Slice *)wc.wr_id;
+    for (int i = 0; i < count; ++i) {
+        const ibv_wc &entry = wc_list[i];
+        Transport::Slice *slice = (Transport::Slice *)entry.wr_id;
         assert(slice);
-        if (wc.status != IBV_WC_SUCCESS) {
+        if (entry.status != IBV_WC_SUCCESS) {
             // Flush errors are generated when QPs transition to ERR state
             // during normal endpoint destruction (beginDestroy). They are not
             // real network errors and should not trigger rail failure handling
             // or endpoint deletion.
-            if (wc.status == IBV_WC_WR_FLUSH_ERR) {
+            if (entry.status == IBV_WC_WR_FLUSH_ERR) {
                 if (!context_.active()) {
                     if (globalConfig().trace)
                         LOG(INFO) << "Worker: WR flush error on inactive "
@@ -662,9 +657,9 @@ void WorkerPool::processCompletions(int thread_id,
                        << ", dest_rkey: " << slice->rdma.dest_rkey
                        << ", retry_cnt: " << slice->rdma.retry_cnt
                        << ", max_retry_cnt: " << slice->rdma.max_retry_cnt
-                       << "): " << ibv_wc_status_str(wc.status);
+                       << "): " << ibv_wc_status_str(entry.status);
             auto *retry_list = &failed_slice_list;
-            const bool local_wc_failure = isLocalWcFailure(wc);
+            const bool local_wc_failure = isLocalWcFailure(entry);
             if (!context_.active() || local_wc_failure) {
                 // A local completion fault retires the endpoint, and the slice
                 // is handed to another local RNIC that rebuilds its own
