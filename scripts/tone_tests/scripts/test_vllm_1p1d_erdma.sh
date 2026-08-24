@@ -77,10 +77,12 @@ run_proxy()
     local use_health_check=0
     if python3 -c "from packaging import version; import sys; sys.exit(0 if version.parse('$vllm_version') >= version.parse('0.16.0') else 1)" 2>/dev/null; then
         echo "Using Mooncake Connector Proxy (vLLM >= 0.16.0)"
-        # Official vLLM runtime images do not guarantee that examples are
-        # installed under /vllm-workspace. Use the versioned upstream proxy
-        # shipped with this test suite instead.
-        proxy_script="python3 -u /test_run/python/mooncake_connector_proxy.py --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
+        local proxy_path="/app/vllm/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py"
+        if ! ${docker_exec} "test -f '$proxy_path'"; then
+            echo "ERROR: vLLM Mooncake connector proxy not found: $proxy_path" >&2
+            return 1
+        fi
+        proxy_script="python3 -u $proxy_path --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
         ready_pattern="All prefiller instances are ready."
     else
         echo "Using NIXL Proxy (vLLM < 0.16.0)"

@@ -172,8 +172,8 @@ jobs:
     steps:
       # Pytest previously ran as root in a bind-mounted container and left
       # caches that the non-root runner could not remove on the next checkout.
-      # Use the already-pinned ROCm test image to repair only those generated
-      # paths before actions/checkout invokes git clean.
+      # Use the pinned ROCm test image to repair only those generated paths
+      # before actions/checkout invokes git clean.
       - name: Remove root-owned Python test caches
         shell: bash
         run: |
@@ -181,7 +181,7 @@ jobs:
           docker run --rm --network=none \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             --entrypoint /bin/rm \
-            "lmsysorg/sglang:v0.5.13.post1-rocm720-mi35x@sha256:552e7038a9309796ad0cd6c62e80568eca4f88ef1e1eb42db2f7ffaafcd79693" \
+            "lmsysorg/sglang:v0.5.18-rocm720-mi35x@sha256:6d68cd19206716cb3f1e31e2ad89cd0852d7ae614a792773c30a4277f8955c72" \
             -rf \
             /workspace/scripts/tone_tests/python/.pytest_cache \
             /workspace/scripts/tone_tests/python/__pycache__

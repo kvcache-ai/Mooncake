@@ -233,14 +233,6 @@ docker_launch(){
         # pin instead of duplicating the commit here.
         pip_cmd=$(append_str "${pip_cmd}" \
             'source /sgl-workspace/sglang/scripts/ci/utils/sgl_eval_ref.sh && pip install "$SGL_EVAL_SPEC"')
-
-        if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
-            # The pinned SGLang image stores generated token IDs in an
-            # array.array, while its incremental detokenizer assumes a list.
-            # Patch the installed source in the disposable test container.
-            pip_cmd=$(append_str "${pip_cmd}" \
-                "python3 /test_run/python/patch_sglang_detokenizer.py")
-        fi
     fi
 
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
