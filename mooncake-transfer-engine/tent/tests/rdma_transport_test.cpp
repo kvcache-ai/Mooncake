@@ -260,7 +260,7 @@ class RdmaContextTestPeer {
     }
 
     static void seedAddress(RdmaContext& context,
-                            const std::string& device_name, uint16_t lid,
+                            const std::string& device_name, uint32_t lid,
                             int gid_index, const ibv_gid& gid,
                             RdmaContext::DeviceStatus status) {
         std::lock_guard<std::mutex> guard(context.address_mutex_);
