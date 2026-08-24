@@ -101,14 +101,13 @@ class AllocatedBuffer {
         return allocator_.lock();
     }
 
-    [[nodiscard]] bool isClientServing() const {
+    [[nodiscard]] bool isAvailable() const {
+        if (!isAllocatorValid()) {
+            return false;
+        }
         const auto record = std::atomic_load_explicit(
             &client_liveness_, std::memory_order_acquire);
-        return record && record->IsServing();
-    }
-
-    [[nodiscard]] bool isAvailable() const {
-        return isAllocatorValid() && isClientServing();
+        return !record || record->IsServing();
     }
 
     void bindSegmentLifetime(SegmentLifetime lifetime) {

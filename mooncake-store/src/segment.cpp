@@ -11,10 +11,7 @@ namespace {
 bool HasAllocatorRegistration(
     const AllocatorManager& allocator_manager,
     const std::string& segment_name,
-    const SegmentAllocatorRegistration& registration) {
-    if (!registration) {
-        return false;
-    }
+    const std::shared_ptr<SegmentAllocatorRegistration>& registration) {
     const auto* allocators = allocator_manager.getAllocators(segment_name);
     if (allocators == nullptr) {
         return false;
@@ -175,12 +172,6 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                                             std::shared_ptr<
                                                 ClientLivenessRecord>
                                                 client_liveness) {
-    if (!client_liveness) {
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=missing_client_liveness_for_segment_mount";
-        return ErrorCode::INVALID_PARAMS;
-    }
-
     // SEGMENT_ALREADY_EXISTS is a liveness signal only for a confirmed replay
     // of the same mount. Keep this common to every memory protocol, including
     // CXL, instead of letting protocol-specific branches bypass it.
@@ -438,9 +429,7 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     // not detach usage here: in-flight deallocate calls hold a local
     // shared_ptr and must finish first. The allocator destructor RAII-detaches
     // when the last shared_ptr is dropped.
-    if (registration) {
-        registration->lifetime.setAvailable(false);
-    }
+    registration->Invalidate();
     mounted_segment.allocator_registration.reset();
     mounted_segment.buf_allocator.reset();
 
@@ -638,13 +627,10 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
     const auto& allocator_manager = segment_manager_->allocator_manager_;
     const auto& allocators = allocator_manager.getAllocators(segment);
     if (allocators != nullptr) {
-        for (const auto& allocator : *allocators) {
-            const auto buffer_allocator =
-                allocator ? allocator->GetAllocator() : nullptr;
-            if (buffer_allocator) {
-                total_used += buffer_allocator->size();
-                total_capacity += buffer_allocator->capacity();
-            }
+        for (const auto& registration : *allocators) {
+            const auto allocator = registration->GetAllocator();
+            total_used += allocator->size();
+            total_capacity += allocator->capacity();
         }
     }
 
@@ -1081,7 +1067,7 @@ SegmentSerializer::Deserialize(const std::vector<uint8_t>& data) {
                 mounted_segment.status == SegmentStatus::OK &&
                 mounted_segment.buf_allocator) {
                 mounted_segment.allocator_registration =
-                    segment_manager_->allocator_manager_.addRestoredAllocator(
+                    segment_manager_->allocator_manager_.addAllocator(
                         name, mounted_segment.buf_allocator);
                 break;
             }
@@ -1152,7 +1138,6 @@ bool ScopedSegmentAccess::IsSegmentAllocatable(
         segment_manager_->mounted_segments_.find(segment_id_it->second);
     return mounted_segment_it != segment_manager_->mounted_segments_.end() &&
            mounted_segment_it->second.status == SegmentStatus::OK &&
-           mounted_segment_it->second.allocator_registration &&
            mounted_segment_it->second.allocator_registration->IsServing();
 }
 
@@ -1285,8 +1270,8 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
     auto allocator = std::move(*created);
 
     allocator->AttachUsageTracker(nof_segment_manager_->usage_tracker_);
-    auto registration = nof_segment_manager_->allocator_manager_
-                            .addIndependentAllocator(segment.name, allocator);
+    auto registration = nof_segment_manager_->allocator_manager_.addAllocator(
+        segment.name, allocator);
     nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
     nof_segment_manager_->mounted_segments_[segment.id] = {
         segment, client_id, SegmentStatus::OK, std::move(allocator),
@@ -1347,9 +1332,7 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
                                                                  registration);
     }
 
-    if (registration) {
-        registration->lifetime.setAvailable(false);
-    }
+    registration->Invalidate();
     mounted_segment.allocator_registration.reset();
     mounted_segment.buf_allocator.reset();
     mounted_segment.status = SegmentStatus::UNMOUNTING;
@@ -1443,13 +1426,10 @@ ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& segment,
     const auto& allocator_manager = nof_segment_manager_->allocator_manager_;
     const auto& allocators = allocator_manager.getAllocators(segment);
     if (allocators != nullptr) {
-        for (const auto& allocator : *allocators) {
-            const auto buffer_allocator =
-                allocator ? allocator->GetAllocator() : nullptr;
-            if (buffer_allocator) {
-                total_used += buffer_allocator->size();
-                total_capacity += buffer_allocator->capacity();
-            }
+        for (const auto& registration : *allocators) {
+            const auto allocator = registration->GetAllocator();
+            total_used += allocator->size();
+            total_capacity += allocator->capacity();
         }
     }
 

@@ -2,16 +2,17 @@
 
 #include <algorithm>
 #include <memory>
-#include <random>
-#include <stdexcept>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 #include <iterator>
 #include <time.h>
 #include <ylt/util/tl/expected.hpp>
 
-#include "allocator.h"  // Contains BufferAllocator declaration
+#include "segment_allocator_registration.h"
 #include "replica.h"
 #include "types.h"
 #include "random.h"
@@ -20,88 +21,7 @@ namespace mooncake {
 
 class LocalSsdManager;
 class ScopedAllocatorAccess;
-
-struct SegmentAllocator {
-    explicit SegmentAllocator(
-        std::shared_ptr<BufferAllocatorBase> buffer_allocator,
-        std::shared_ptr<ClientLivenessRecord> client_liveness)
-        : allocator(std::move(buffer_allocator)),
-          client_liveness(std::move(client_liveness)) {
-        if (!this->client_liveness) {
-            throw std::invalid_argument(
-                "SegmentAllocator requires Client liveness");
-        }
-    }
-
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    SegmentLifetime lifetime;
-
-    [[nodiscard]] std::shared_ptr<ClientLivenessRecord> GetClientLiveness()
-        const {
-        return std::atomic_load_explicit(&client_liveness,
-                                         std::memory_order_acquire);
-    }
-
-    [[nodiscard]] bool IsServing() const {
-        const auto record = GetClientLiveness();
-        return GetAllocator() && record && record->IsServing() &&
-               lifetime.isAvailable();
-    }
-
-    [[nodiscard]] std::shared_ptr<BufferAllocatorBase> GetAllocator() const {
-        return std::atomic_load_explicit(&allocator,
-                                         std::memory_order_acquire);
-    }
-
-    void BindAllocator(std::shared_ptr<BufferAllocatorBase> replacement) {
-        std::atomic_store_explicit(&allocator, std::move(replacement),
-                                   std::memory_order_release);
-    }
-
-    void BindClientLiveness(std::shared_ptr<ClientLivenessRecord> record) {
-        if (!record) {
-            throw std::invalid_argument(
-                "SegmentAllocator requires Client liveness");
-        }
-        std::atomic_store_explicit(&client_liveness, std::move(record),
-                                   std::memory_order_release);
-    }
-
-    std::unique_ptr<AllocatedBuffer> allocate(size_t size) const {
-        if (!lifetime.isAvailable()) {
-            return nullptr;
-        }
-        const auto record = GetClientLiveness();
-        if (!record) {
-            return nullptr;
-        }
-        auto serving_guard = record->TryAcquireServingGuard();
-        if (!serving_guard) {
-            return nullptr;
-        }
-        const auto current_allocator = GetAllocator();
-        if (!current_allocator) {
-            return nullptr;
-        }
-        auto buffer = current_allocator->allocate(size);
-        if (!buffer) {
-            return nullptr;
-        }
-        buffer->bindSegmentLifetime(lifetime);
-        buffer->bindClientLiveness(record);
-        if (!lifetime.isAvailable()) {
-            return nullptr;
-        }
-        return buffer;
-    }
-
-   private:
-    // ReMount may replace a restore-time gate while descriptor reads and
-    // allocation attempts are concurrent.
-    std::shared_ptr<ClientLivenessRecord> client_liveness;
-};
-
-using SegmentAllocatorRegistration = std::shared_ptr<SegmentAllocator>;
+class ScopedSegmentAccess;
 
 /**
  * @brief A container for managing valid allocators.
@@ -128,50 +48,21 @@ class AllocatorManager {
      * @param name the name of the segment
      * @param allocator the buffer allocator to add for the segment
      */
-    SegmentAllocatorRegistration addAllocator(
+    std::shared_ptr<SegmentAllocatorRegistration> addAllocator(
+        const std::string& name,
+        const std::shared_ptr<BufferAllocatorBase>& allocator) {
+        return addAllocator(name, allocator, nullptr);
+    }
+
+    std::shared_ptr<SegmentAllocatorRegistration> addAllocator(
         const std::string& name,
         const std::shared_ptr<BufferAllocatorBase>& allocator,
         std::shared_ptr<ClientLivenessRecord> client_liveness) {
-        auto registration = std::make_shared<SegmentAllocator>(
-            allocator, std::move(client_liveness));
+        auto registration = std::shared_ptr<SegmentAllocatorRegistration>(
+            new SegmentAllocatorRegistration(allocator,
+                                             std::move(client_liveness)));
         addRegistration(name, registration);
         return registration;
-    }
-
-    // NoF availability is managed by its own heartbeat state machine. Keep
-    // that independent path explicit instead of using nullptr to mean Active.
-    SegmentAllocatorRegistration addIndependentAllocator(
-        const std::string& name,
-        const std::shared_ptr<BufferAllocatorBase>& allocator) {
-        return addAllocator(
-            name, allocator,
-            std::make_shared<ClientLivenessRecord>(
-                ClientLivenessRecord::Clock::now()));
-    }
-
-    // Snapshot decoding rebuilds allocator registrations before MasterService
-    // can reconstruct the canonical per-Client registry. The provisional
-    // Active record is replaced by RebuildClientLivenessAfterRestore().
-    SegmentAllocatorRegistration addRestoredAllocator(
-        const std::string& name,
-        const std::shared_ptr<BufferAllocatorBase>& allocator) {
-        return addAllocator(
-            name, allocator,
-            std::make_shared<ClientLivenessRecord>(
-                ClientLivenessRecord::Clock::now()));
-    }
-
-    void addRegistration(
-        const std::string& name,
-        const SegmentAllocatorRegistration& registration) {
-        if (!registration) {
-            throw std::invalid_argument(
-                "Cannot add an empty Segment allocator registration");
-        }
-        if (!allocators_.contains(name)) {
-            names_.push_back(name);
-        }
-        allocators_[name].push_back(registration);
     }
 
     /**
@@ -179,29 +70,26 @@ class AllocatorManager {
      *        also removes the name if there are no allocators after the
      *        removal.
      * @param name the name of the segment
-     * @param allocator the buffer allocator to remove from the segment
-     * @return true if the allocator is removed, false if the allocator does
-     *         not exist
+     * @param registration the allocator registration to remove
+     * @return true if the registration is removed, false if it does not exist
      */
     bool removeAllocator(
         const std::string& name,
-        const SegmentAllocatorRegistration& registration) {
+        const std::shared_ptr<SegmentAllocatorRegistration>& registration) {
         auto it = allocators_.find(name);
         if (it == allocators_.end()) {
             return false;
         }
 
-        // Try removing the allocator.
-        bool allocator_removed = false;
-        auto alloc_it =
+        bool registration_removed = false;
+        auto registration_it =
             std::find(it->second.begin(), it->second.end(), registration);
-        if (alloc_it != it->second.end()) {
-            it->second.erase(alloc_it);
-            allocator_removed = true;
+        if (registration_it != it->second.end()) {
+            it->second.erase(registration_it);
+            registration_removed = true;
         }
 
         if (it->second.empty()) {
-            // If there is no allocator left, remove the name too.
             allocators_.erase(name);
             auto name_it = std::find(names_.begin(), names_.end(), name);
             if (name_it != names_.end()) {
@@ -210,7 +98,7 @@ class AllocatorManager {
             }
         }
 
-        return allocator_removed;
+        return registration_removed;
     }
 
     struct Replacement {
@@ -227,15 +115,10 @@ class AllocatorManager {
             if (it == allocators_.end() || !replacement.replacement) {
                 return false;
             }
-            // Match on the registration's wrapped allocator: a replacement
-            // swaps the underlying buffer allocator in place, preserving the
-            // registration identity (SegmentLifetime and Client liveness
-            // binding stay attached to the same SegmentAllocator).
             auto target = std::find_if(
                 it->second.begin(), it->second.end(),
-                [&replacement](const SegmentAllocatorRegistration& reg) {
-                    return reg &&
-                           reg->GetAllocator() == replacement.expected;
+                [&replacement](const auto& registration) {
+                    return registration->GetAllocator() == replacement.expected;
                 });
             if (target == it->second.end()) {
                 return false;
@@ -253,13 +136,14 @@ class AllocatorManager {
         AllocatorManager snapshot;
         snapshot.names_ = names_;
         snapshot.allocators_ = allocators_;
-        if (owners != nullptr) {
+        if (owners) {
             snapshot.owner_by_name_ = *owners;
         }
         return snapshot;
     }
 
-    std::optional<UUID> GetOwnerClientId(const std::string& name) const {
+    [[nodiscard]] std::optional<UUID> GetOwnerClientId(
+        const std::string& name) const {
         const auto owner = owner_by_name_.find(name);
         return owner == owner_by_name_.end()
                    ? std::nullopt
@@ -273,16 +157,14 @@ class AllocatorManager {
      */
     const std::vector<std::string>& getNames() const { return names_; }
 
-    std::vector<std::string> getServingNames() const {
+    [[nodiscard]] std::vector<std::string> getServingNames() const {
         std::vector<std::string> serving_names;
         serving_names.reserve(names_.size());
         for (const auto& name : names_) {
-            const auto* registrations = getAllocators(name);
-            if (registrations != nullptr &&
-                std::any_of(registrations->begin(), registrations->end(),
+            const auto& registrations = allocators_.at(name);
+            if (std::any_of(registrations.begin(), registrations.end(),
                             [](const auto& registration) {
-                                return registration &&
-                                       registration->IsServing();
+                                return registration->IsServing();
                             })) {
                 serving_names.push_back(name);
             }
@@ -291,11 +173,11 @@ class AllocatorManager {
     }
 
     /**
-     * @brief Get allocators belongs to the given segment name.
-     * @return a vector of allocators belongs to the given segment name
+     * @brief Get allocator registrations belonging to the given segment name.
+     * @return a vector of registrations belonging to the segment name
      */
-    const std::vector<SegmentAllocatorRegistration>* getAllocators(
-        const std::string& name) const {
+    const std::vector<std::shared_ptr<SegmentAllocatorRegistration>>*
+    getAllocators(const std::string& name) const {
         auto it = allocators_.find(name);
         if (it != allocators_.end()) {
             return &it->second;
@@ -305,14 +187,25 @@ class AllocatorManager {
     }
 
    private:
+    void addRegistration(
+        const std::string& name,
+        const std::shared_ptr<SegmentAllocatorRegistration>& registration) {
+        if (!allocators_.contains(name)) {
+            names_.push_back(name);
+        }
+        allocators_[name].push_back(registration);
+    }
+
     // Name array for randomly picking allocators.
     std::vector<std::string> names_;
-    // Segment name to allocators mapping.
-    std::unordered_map<std::string,
-                       std::vector<SegmentAllocatorRegistration>>
+    // Segment name to allocator registrations mapping.
+    std::unordered_map<
+        std::string,
+        std::vector<std::shared_ptr<SegmentAllocatorRegistration>>>
         allocators_;
     std::unordered_map<std::string, UUID> owner_by_name_;
-    friend class SegmentSerializer;  // for fork serialize
+    friend class ScopedSegmentAccess;
+    friend class SegmentSerializer;
 };
 
 /**
@@ -539,9 +432,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         const auto num_segs = allocators->size();
         if (num_segs == 1) {
             // Fast path for single segment
-            const auto& registration = (*allocators)[0];
-            return registration ? registration->allocate(slice_length)
-                                : nullptr;
+            return (*allocators)[0]->Allocate(slice_length);
         }
 
         // Randomly select a start point to distribute
@@ -551,10 +442,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
         for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
             const auto& registration =
                 (*allocators)[(i + seg_offset) % num_segs];
-            if (registration) {
-                if (auto buffer = registration->allocate(slice_length)) {
-                    return buffer;
-                }
+            if (auto buffer = registration->Allocate(slice_length)) {
+                return buffer;
             }
         }
 
@@ -709,14 +598,11 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
 
         uint64_t total_capacity = 0;
         uint64_t total_free = 0;
-        for (const auto& allocator : *allocators) {
-            if (!allocator || !allocator->IsServing()) {
+        for (const auto& registration : *allocators) {
+            if (!registration->IsServing()) {
                 continue;
             }
-            const auto buffer_allocator = allocator->GetAllocator();
-            if (!buffer_allocator) {
-                continue;
-            }
+            const auto buffer_allocator = registration->GetAllocator();
             const auto capacity =
                 static_cast<uint64_t>(buffer_allocator->capacity());
             total_capacity += capacity;
@@ -795,8 +681,8 @@ class CxlAllocationStrategy : public AllocationStrategy {
 
         std::unique_ptr<AllocatedBuffer> buffer;
         for (const auto& registration : *cxl_allocators) {
-            if (registration && registration->IsServing()) {
-                buffer = registration->allocate(slice_length);
+            if (registration->IsServing()) {
+                buffer = registration->Allocate(slice_length);
                 if (buffer) {
                     break;
                 }

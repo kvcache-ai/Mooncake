@@ -1084,12 +1084,12 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
 }
 
 TEST_F(MasterServiceHATest,
-       StandbyMemoryUsesRestoreGateUntilActualOwnerRemounts) {
+       StandbyMemoryRemainsUnaffiliatedUntilActualOwnerRemounts) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
-    const std::string key = "standby_restore_gate_key";
-    const std::string endpoint = "standby_restore_gate_segment";
+    const std::string key = "standby_unaffiliated_key";
+    const std::string endpoint = "standby_unaffiliated_segment";
     auto object = MakeStandbyObject(key, endpoint);
     const UUID writer_id = object.metadata.client_id;
     object.metadata.replicas.front()
