@@ -10,7 +10,9 @@
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#ifdef YLT_ENABLE_IBV
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
+#endif
 
 #include "client_metric.h"
 #include "replica.h"
@@ -40,10 +42,12 @@ inline constexpr bool variant_contains_v =
 
 template <typename SocketConfigVariant>
 inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
+#ifdef YLT_ENABLE_IBV
     if constexpr (variant_contains_v<SocketConfigVariant,
                                      coro_io::ib_socket_t::config_t>) {
         socket_config = coro_io::ib_socket_t::config_t{};
     }
+#endif
 }
 
 // Applies the RPC timeout overrides to any mooncake-store RPC client config.

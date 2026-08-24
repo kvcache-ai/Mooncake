@@ -15,6 +15,9 @@
 #include "tent/transport/rdma/endpoint.h"
 
 #include <glog/logging.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -54,7 +57,7 @@ static inline const std::string statusToString(
 // Forward declaration for notification QP setup
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const std::string& peer_gid_str,
-                                   uint16_t peer_lid, uint32_t peer_qp_num,
+                                   uint32_t peer_lid, uint32_t peer_qp_num,
                                    uint16_t pkey_index,
                                    uint8_t service_level = 0,
                                    uint8_t traffic_class = 0);
@@ -440,7 +443,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
     // Blocking operations (RPC / direct call) happen here without holding
     // lock_, so the RPC handler can freely acquire locks on peer endpoints.
     std::string peer_gid;
-    uint16_t peer_lid = 0;
+    uint32_t peer_lid = 0;
     if (same_nic) {
         peer_gid = context_->gid();
         peer_lid = context_->lid();
@@ -677,7 +680,7 @@ const QpPoolSegment* RdmaEndPoint::poolForQp(int qp_index) const {
     return nullptr;
 }
 
-int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
+int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint32_t peer_lid,
                               std::vector<uint32_t> peer_qp_num_list,
                               std::string* reply_msg) {
     if (status_.load(std::memory_order_relaxed) == EP_READY) {
@@ -885,7 +888,7 @@ void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
 }
 
 int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
-                             uint16_t peer_lid, uint32_t peer_qp_num,
+                             uint32_t peer_lid, uint32_t peer_qp_num,
                              std::string* reply_msg) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     auto& qp = qp_list_[qp_index];
@@ -943,7 +946,11 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     attr.ah_attr.grh.hop_limit = params_->hop_limit;
     attr.ah_attr.grh.flow_label = params_->flow_label;
     attr.ah_attr.grh.traffic_class = qp_traffic_class;
-    attr.ah_attr.dlid = peer_lid;
+#ifdef USE_SHCA
+    attr.ah_attr.dlid = u32_to_17(peer_lid);
+#else
+    attr.ah_attr.dlid = static_cast<uint16_t>(peer_lid);
+#endif
     attr.ah_attr.sl = qp_service_level;
     attr.ah_attr.src_path_bits = params_->src_path_bits;
     attr.ah_attr.static_rate = params_->static_rate;
@@ -1024,7 +1031,7 @@ void RdmaEndPoint::repostAllNotifyRecvs() {
 
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const std::string& peer_gid_str,
-                                   uint16_t peer_lid, uint32_t peer_qp_num,
+                                   uint32_t peer_lid, uint32_t peer_qp_num,
                                    uint16_t pkey_index, uint8_t service_level,
                                    uint8_t traffic_class) {
     // Reconnect path may call this when QP is already in RTS; force a clean
@@ -1069,7 +1076,11 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.max_dest_rd_atomic = 1;
     qp_attr.min_rnr_timer = 0x12;
     qp_attr.ah_attr.is_global = 1;
-    qp_attr.ah_attr.dlid = peer_lid;
+#ifdef USE_SHCA
+    qp_attr.ah_attr.dlid = u32_to_17(peer_lid);
+#else
+    qp_attr.ah_attr.dlid = static_cast<uint16_t>(peer_lid);
+#endif
     qp_attr.ah_attr.sl = service_level;
     qp_attr.ah_attr.src_path_bits = 0;
     qp_attr.ah_attr.port_num = ctx->portNum();

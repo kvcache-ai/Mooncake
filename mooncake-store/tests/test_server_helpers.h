@@ -91,9 +91,16 @@ class InProcMaster {
                 /*thread_num=*/4, /*port=*/rpc_port_, /*address=*/"0.0.0.0",
                 std::chrono::seconds(0), /*tcp_no_delay=*/true);
             const char* value = std::getenv("MC_RPC_PROTOCOL");
+#ifdef YLT_ENABLE_IBV
             if (value && std::string_view(value) == "rdma") {
                 server_->init_ibv();
             }
+#else
+            if (value && std::string_view(value) == "rdma") {
+                LOG(WARNING)
+                    << "RDMA RPC is disabled at compile time; using TCP RPC";
+            }
+#endif
 
             uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
             if (config.default_kv_lease_ttl.has_value()) {
