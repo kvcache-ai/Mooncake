@@ -178,7 +178,10 @@ int main() {
     set(MOONCAKE_HAVE_NVME_URING_CMD ON)
     message(STATUS "io_uring: NVMe uring command support enabled")
   else()
-    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+    message(
+      STATUS
+        "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled"
+    )
   endif()
 endif()
 
@@ -218,7 +221,6 @@ if(USE_NOF)
       ${SPDK_LIB_DIR}/libspdk_nvme.a
       ${SPDK_LIB_DIR}/libspdk_sock_posix.a
       -Wl,--no-whole-archive
-      # 在 SPDK_STATIC_LIBS 中添加:
       ${SPDK_LIB_DIR}/libisal.a
       ${SPDK_LIB_DIR}/libisal_crypto.a
       ${SPDK_LIB_DIR}/libspdk_vfio_user.a
@@ -391,6 +393,14 @@ target_link_libraries(
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
+endif()
+if(BUILD_UNIT_TESTS AND USE_NOF)
+  # Expose the file-scope pipeline_io_cb test hook in the client-side static
+  # archive only when both BUILD_UNIT_TESTS and USE_NOF are on. Keeps production
+  # binaries free of the test-only symbol while letting
+  # nof_segment_pipeline_test link against it.
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_TEST_PIPELINE_IO=1)
 endif()
 if(USE_NOF)
   target_include_directories(mooncake_store_client_objects

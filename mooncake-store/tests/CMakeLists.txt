@@ -78,6 +78,40 @@ add_store_test(master_service_promotion_test_for_snapshot
                ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+  # nof_segment_pipeline_test covers the PipelineIO UAF fix.  Compiles the test
+  # target with -DMOONCAKE_TEST_PIPELINE_IO=1 so the file- scope pipeline_io_cb
+  # can be driven from gtest via the mooncake::detail test hook.
+  #
+  # We also compile ../src/spdk/nof_segment.cpp directly into the test target so
+  # the test gets a private copy of mooncake::detail::InvokePipelineIoCbForTest.
+  # Without this, the test depends on the OBJECT library having been built with
+  # MOONCAKE_TEST_PIPELINE_IO=1, which only happens when both BUILD_UNIT_TESTS
+  # and USE_NOF are on at the OBJECT library's CMake configure time.  Any
+  # configuration drift between the OBJECT library and the test target yields
+  # the linker error "undefined reference to InvokePipelineIoCbForTest".
+  #
+  # --allow-multiple-definition lets the test executable carry its own copy of
+  # nof_segment.cpp symbols (OpenNofSegment, PipelineRead, ...) alongside the
+  # copies already inside the linked mooncake_store library.  The test
+  # executable only ever *calls* the test hook, which is the only symbol with
+  # the -DMOONCAKE_TEST_PIPELINE_IO flag in this build, so the duplicates are
+  # benign.
+  add_store_test(nof_segment_pipeline_test nof_segment_pipeline_test.cpp)
+  target_compile_definitions(nof_segment_pipeline_test
+                             PRIVATE MOONCAKE_TEST_PIPELINE_IO=1)
+  target_sources(
+    nof_segment_pipeline_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/spdk/nof_segment.cpp)
+  target_link_options(nof_segment_pipeline_test PRIVATE
+                      -Wl,--allow-multiple-definition)
+  # nof_qpair_inflight_test verifies the NofQpairPool counter semantics in
+  # isolation using a stubbed pool with no real qpairs, so no SPDK target is
+  # required at runtime.
+  add_store_test(nof_qpair_inflight_test nof_qpair_inflight_test.cpp)
+  # nof_qpair_inflight_real_test verifies the NofQpairPool root-cause fix
+  # against a real NVMe-oF target.  Gated by MC_TEST_NOF_TARGET (SPDK transport
+  # string); tests GTEST_SKIP when unset so the build is no-op without infra.
+  add_store_test(nof_qpair_inflight_real_test nof_qpair_inflight_real_test.cpp)
 endif()
 add_store_test(client_integration_test client_integration_test.cpp)
 add_test(

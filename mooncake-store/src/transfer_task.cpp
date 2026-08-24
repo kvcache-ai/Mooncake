@@ -124,6 +124,13 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
 
 static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
     if (task->remaining_lba == 0 && task->outstanding_sub_io == 0) {
+        // Remove from the qos's active_tasks registry.  nof_qos may be
+        // null only on freshly-constructed tasks that have not yet been
+        // handed to a worker (defensive guard — production paths always
+        // set it before SpdkNofTaskCompletion can fire).
+        if (task->nof_qos) {
+            task->nof_qos->active_tasks.erase(task);
+        }
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
                                        : mooncake::ErrorCode::OK);
@@ -157,6 +164,14 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
         LOG(ERROR) << "task outstanding io < 0";
     }
 
+    // Mirror the segment-level inflight_blocks decrement onto the
+    // per-task counter so FailAllInflightTasks can correctly release
+    // inflight_blocks when it force-completes this task.
+    task->inflight_block_count -= sub_task->submit_lba_count;
+    if (task->inflight_block_count < 0) {
+        LOG(ERROR) << "task inflight_block_count < 0";
+    }
+
     if (spdk_nvme_cpl_is_error(cpl)) {
         LOG(ERROR) << "task_complete: I/O failed"
                    << spdk_nvme_cpl_get_status_string(&cpl->status);
@@ -180,12 +195,114 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 
     blocks_per_chunk =
         std::max(1, GetSpdkNofSubmitChunkBytes() / block_size_int);
-    inflight_blocks_limit =
+    // Save the absolute cap from MC_NOF_INFLIGHT_BYTES_LIMIT so that
+    // UpdateInflightLimit can shrink the inflight limit (degradation) but
+    // never RAISE it past the originally-configured ceiling.  Without this,
+    // a partially-degraded pool could compute a pool-derived limit larger
+    // than the absolute one — see UpdateInflightLimit for the formula.
+    absolute_inflight_limit =
         std::max(1, GetSpdkNofInflightBytesLimit() / block_size_int);
+    inflight_blocks_limit = absolute_inflight_limit;
     for (int i = 0; i < kSpdkNofOpNum; ++i) {
         inflight_blocks[i] = 0;
         head[i] = nullptr;
         tail[i] = nullptr;
+    }
+}
+
+// Force-complete every task tracked by this qos as failed.
+//
+// Two passes:
+//   1) Walk head/tail chains head-to-tail; pop each task and force-complete.
+//   2) Walk a snapshot of active_tasks to catch off-chain tasks (popped
+//      from chain but still waiting for callbacks) — the qpair is dead so
+//      callbacks will never fire.
+//
+// Each task gets:
+//   - failed = true
+//   - remaining_lba = 0
+//   - outstanding_sub_io = 0
+//   - inflight_block_count = 0
+//   - inflight_blocks[op] decremented by the lost blocks
+//   - *task->io_count decremented by the lost sub-IOs
+//   - state->set_completed(TRANSFER_FAIL) (via SpdkNofTaskCompletion)
+//   - delete (since on_chain is forced to false)
+//
+// Safe to invoke from the same worker thread that owns this qos; callbacks
+// cannot fire concurrently because we only poll from that thread.
+void SpdkNofQos::FailAllInflightTasks() {
+    // First pass: drain head/tail chains.
+    for (int op = 0; op < kSpdkNofOpNum; ++op) {
+        while (head[op]) {
+            SpdkNofTask* task = head[op];
+            int lost_sub_io = task->outstanding_sub_io;
+            int lost_blocks = task->inflight_block_count;
+
+            PopTask(op);
+            task->on_chain = false;
+            task->failed = true;
+            task->remaining_lba = 0;
+            task->outstanding_sub_io = 0;
+            task->inflight_block_count = 0;
+
+            inflight_blocks[op] -= lost_blocks;
+            if (inflight_blocks[op] < 0) {
+                LOG(ERROR) << "task outstanding io < 0";
+                inflight_blocks[op] = 0;
+            }
+            if (lost_sub_io > 0) {
+                *task->io_count -= lost_sub_io;
+                if (*task->io_count < 0) {
+                    LOG(ERROR) << "total outstanding io < 0";
+                    *task->io_count = 0;
+                }
+            }
+
+            // SpdkNofTaskCompletion removes from active_tasks and may
+            // delete the task (on_chain is now false).  After this call
+            // head[op] points to the next chain entry or nullptr.
+            SpdkNofTaskCompletion(task);
+        }
+        // Defensive: tail must not dangle past head.
+        tail[op] = nullptr;
+    }
+
+    // Second pass: off-chain tasks (outstanding_sub_io > 0 already
+    // submitted but not in chain).  These tasks live in active_tasks
+    // until SpdkNofTaskCompletion fires.  Iterate over a snapshot
+    // because SpdkNofTaskCompletion may delete tasks.
+    std::vector<SpdkNofTask*> to_fail(active_tasks.begin(), active_tasks.end());
+    for (SpdkNofTask* task : to_fail) {
+        if (!task) continue;
+        if (task->on_chain) {
+            // Should not happen — the first pass already handled all
+            // on-chain tasks.  Defensive: just skip to avoid double-
+            // decrementing counters.
+            continue;
+        }
+        int lost_sub_io = task->outstanding_sub_io;
+        int lost_blocks = task->inflight_block_count;
+        int op = task->op;
+
+        task->failed = true;
+        task->remaining_lba = 0;
+        task->outstanding_sub_io = 0;
+        task->inflight_block_count = 0;
+
+        inflight_blocks[op] -= lost_blocks;
+        if (inflight_blocks[op] < 0) {
+            LOG(ERROR) << "task outstanding io < 0";
+            inflight_blocks[op] = 0;
+        }
+        if (lost_sub_io > 0) {
+            *task->io_count -= lost_sub_io;
+            if (*task->io_count < 0) {
+                LOG(ERROR) << "total outstanding io < 0";
+                *task->io_count = 0;
+            }
+        }
+
+        SpdkNofTaskCompletion(task);
     }
 }
 #endif
@@ -404,9 +521,12 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
     }
 
     {
-        // Flow control: block the caller when the worker's task queue
-        // is full, creating backpressure that prevents unbounded backlog
-        // in task_queue_ + seg_to_qos under degraded conditions.
+        // Flow control: block the caller when the worker's task queue is
+        // full, creating backpressure that prevents unbounded growth
+        // in task_queue_ under degraded conditions.  Per-segment
+        // seg_to_qos chains remain bounded only by the inflight cap
+        // (see SpdkNofQos::inflight_blocks_limit); they are NOT
+        // controlled by this backpressure check.
         // When max_queue_depth_ == 0 the check is skipped (no limit).
         std::unique_lock<std::mutex> lock(queue_mutex_[worker_idx]);
         if (max_queue_depth_ > 0 &&
@@ -629,6 +749,12 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             task->idx++;
                             task->remaining_lba -= submit_lba_count;
                             nof_qos->inflight_blocks[i] += submit_lba_count;
+                            // Track the per-task inflight count so
+                            // FailAllInflightTasks can correctly release
+                            // nof_qos->inflight_blocks[op] on a qpair
+                            // poll error.  Mirrored against the
+                            // segment-level counter via nvmf_io_complete.
+                            task->inflight_block_count += submit_lba_count;
                             avail_blocks -= submit_lba_count;
                             task->outstanding_sub_io++;
                             total_outstanding_io++;
@@ -644,13 +770,30 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         }
 
         if (total_outstanding_io > 0) {
-            int64_t ret = 0;
-            for (auto& it : seg_to_qos) {
-                ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
-                    it.first, 0);
+            bool poll_failed = false;
+            for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+                int64_t ret =
+                    SpdkWrapper::GetInstance().NvmePollProcessCompletion(
+                        seg_handle, 0);
                 if (ret < 0) {
-                    LOG(ERROR) << "poll completion error: ret " << ret;
+                    poll_failed = true;
+                    LOG(ERROR) << "poll completion error: ret " << ret
+                               << " — terminating in-flight tasks for seg "
+                               << seg_handle;
+                    // Force-complete every queued + in-flight task for
+                    // this segment.  Without this, outstanding_sub_io /
+                    // total_outstanding_io / inflight_blocks stay
+                    // positive, leaving TransferFuture waiters blocked
+                    // forever and blocking TransferSubmitter teardown.
+                    nof_qos->FailAllInflightTasks();
                 }
+            }
+            if (poll_failed) {
+                // Skip the rest of this iteration: tasks are now all
+                // failed, counters are balanced, and the next loop
+                // iteration will re-check the shutdown predicate and
+                // exit cleanly if requested.
+                continue;
             }
         }
 
@@ -1149,8 +1292,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
             << memcpy_enabled_;
 }
 
-// Added 2026-07-31: release cached NoF handles so that QIDs are recycled
-// when a client is closed, rather than lingering until process exit.
+// Release cached NoF handles so that QIDs are recycled when a client is
+// closed, rather than lingering until process exit.
 //
 // Ordering: spdk_nvmf_pool_ must be stopped and joined BEFORE cached NoF
 // handles are closed.  Worker threads may still own queued/inflight
@@ -1618,51 +1761,84 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
     // Per-TransferSubmitter handle cache — reuses the connection
     // across multiple put() calls from the same client to avoid
     // exhausting QIDs and SPDK internal state with new connections.
-    // Double-checked locking: fast path acquires the mutex for a
-    // cache lookup; slow path drops the mutex before the blocking
-    // OpenNofSegment call and re-checks the cache on re-acquire.
+    // First-open is single-flight per endpoint so concurrent submitters
+    // for the same endpoint wait for the designated opener instead of
+    // racing to OpenNofSegment (which can fail spuriously when one
+    // caller loses QIDs while another succeeds and populates the cache).
+    const std::string& endpoint = handle.transport_endpoint_;
     nof_seg_handle* seg_handle = nullptr;
+    bool became_opener = false;
     {
-        std::lock_guard<std::mutex> lock(nof_cache_mutex_);
-        auto cache_it = nof_handle_cache_.find(handle.transport_endpoint_);
-        if (cache_it != nof_handle_cache_.end()) {
-            seg_handle = cache_it->second;
+        std::unique_lock<std::mutex> open_lock(nof_open_inflight_mutex_);
+
+        // Wait while another thread is opening this endpoint.  The
+        // predicate is "this endpoint is NOT in flight" — once cleared
+        // by the prior opener, either the cache is populated (so we
+        // become a cache-hit caller) or the slot is free for a new
+        // opener.
+        nof_open_done_cv_.wait(open_lock, [this, &endpoint] {
+            return nof_open_inflight_.find(endpoint) ==
+                   nof_open_inflight_.end();
+        });
+
+        // Re-check cache after the wait (populated by a prior opener).
+        {
+            std::lock_guard<std::mutex> cache_lock(nof_cache_mutex_);
+            auto cache_it = nof_handle_cache_.find(endpoint);
+            if (cache_it != nof_handle_cache_.end()) {
+                seg_handle = cache_it->second;
+            }
+        }
+
+        if (!seg_handle) {
+            // Designated opener: mark in-flight and release open_lock
+            // before the slow OpenNofSegment call so concurrent
+            // submitters for OTHER endpoints are not blocked.
+            nof_open_inflight_.insert(endpoint);
+            became_opener = true;
         }
     }
 
-    if (!seg_handle) {
-        // Slow path: open a new connection outside the lock so that
-        // backoff/retry does not block cache hits for other callers.
-        auto* new_handle = SpdkWrapper::GetInstance().OpenNofSegment(
-            handle.transport_endpoint_);
-        if (!new_handle) {
-            LOG(ERROR) << "Failed to open NoF segment endpoint="
-                       << handle.transport_endpoint_;
-            return std::nullopt;
-        }
+    if (became_opener) {
+        // Slow path: open without holding any lock so backoff/retry
+        // does not block cache lookups for other endpoints or waiters
+        // for this one.
+        auto* new_handle = SpdkWrapper::GetInstance().OpenNofSegment(endpoint);
 
-        // Double-checked locking: re-acquire the cache lock and test
-        // whether another thread beat us to this endpoint.  If so, use
-        // the existing handle and defer destroying ours until after the
-        // lock is released — CloseNofSegment performs SPDK controller
-        // teardown and should not block other cache lookups.
+        // Publish: populate cache on success, drop on failure.  Then
+        // clear in-flight so waiters can proceed.
         nof_seg_handle* handle_to_discard = nullptr;
         {
-            std::lock_guard<std::mutex> lock(nof_cache_mutex_);
-            auto cache_it = nof_handle_cache_.find(handle.transport_endpoint_);
-            if (cache_it != nof_handle_cache_.end()) {
-                // Another thread already created a handle for this endpoint.
-                // Use the existing one and discard ours to avoid violating
-                // the QID budget this cache is meant to protect.
-                handle_to_discard = new_handle;
-                seg_handle = cache_it->second;
-            } else {
-                nof_handle_cache_[handle.transport_endpoint_] = new_handle;
-                seg_handle = new_handle;
+            std::lock_guard<std::mutex> cache_lock(nof_cache_mutex_);
+            if (new_handle) {
+                auto cache_it = nof_handle_cache_.find(endpoint);
+                if (cache_it != nof_handle_cache_.end()) {
+                    // Another opener won the race while we were
+                    // opening (possible across TransferSubmitters
+                    // sharing this handle map — currently impossible
+                    // since each TransferSubmitter owns its own cache,
+                    // but kept defensively in case that changes).
+                    handle_to_discard = new_handle;
+                    seg_handle = cache_it->second;
+                } else {
+                    nof_handle_cache_[endpoint] = new_handle;
+                    seg_handle = new_handle;
+                }
             }
         }
+        {
+            std::lock_guard<std::mutex> open_lock(nof_open_inflight_mutex_);
+            nof_open_inflight_.erase(endpoint);
+        }
+        nof_open_done_cv_.notify_all();
+
         if (handle_to_discard) {
             SpdkWrapper::GetInstance().CloseNofSegment(handle_to_discard);
+        }
+
+        if (!seg_handle) {
+            LOG(ERROR) << "Failed to open NoF segment endpoint=" << endpoint;
+            return std::nullopt;
         }
     }
 

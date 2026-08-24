@@ -1,15 +1,4 @@
-/*
- * Copyright (c) 2026 绿算技术
- * All rights reserved.
- *
- * @File: mooncake-store/include/spdk/nof_connection.h
- * @Description: NofQpairPool + NofConnection class declarations
- *
- * Changelog:
- *   2026-07-31  Initial multi-qpair implementation.
- *   2026-08-03  NofQpairPool: added TryGrow / GetTargetCount for
- *               runtime rebalancing.
- */
+// NofQpairPool + NofConnection class declarations.
 #pragma once
 
 #include <atomic>
@@ -61,16 +50,63 @@ class NofQpairPool {
     /// @return total number of completions processed (or negative on error).
     int32_t PollAll(uint32_t max_completions = 0);
 
-    /// Inflight tracking for pipeline flow control.
+    /// Inflight tracking — true source of truth for "CQE may still fire".
+    ///
+    /// Pairing contract:
+    ///   - IncrementInflight() MUST be called BEFORE spdk_nvme_ns_cmd_*
+    ///     so that any callback (including late ones delivered after the
+    ///     caller returns) is accounted for.
+    ///   - DecrementInflight() MUST be called in the CQE callback, AFTER
+    ///     the user callback has returned.
+    ///   - InflightCount() == 0 implies no callback is in flight and none
+    ///     will be issued (because all submits are accounted for).
+    ///
+    /// Memory ordering: release/acquire pair guarantees that InflightCount()
+    /// == 0 forms a synchronizes-with edge with the last DecrementInflight,
+    /// so all release-stores in the callback are visible to a thread that
+    /// observes InflightCount() == 0.
+    ///
+    /// First IncrementInflight sets was_ever_used_with_inflight_ so that
+    /// ~NofQpairPool can distinguish "truly quiescent" from "inflight
+    /// trivially 0 because no submit path uses Increment".
+    ///
+    /// Motivation: transfer paths (PipelineRead/PipelineWrite via the
+    /// worker pool) do NOT call IncrementInflight — they track in-flight
+    /// via task->outstanding_sub_io in the worker loop.  For those
+    /// paths, InflightCount()==0 is trivially satisfied even when real
+    /// I/O is in flight.  Without this metadata, ~NofQpairPool would
+    /// log "InflightCount==0 proven via WaitForInflightCompletion"
+    /// even when nothing was actually proven.  The metadata lets us
+    /// log a different (and accurate) message for the transfer-path
+    /// case: "InflightCount trivially 0; safety relies on caller
+    /// ordering" (see CloseNofSegment's safety contract).
     void IncrementInflight() {
-        inflight_count_.fetch_add(1, std::memory_order_relaxed);
+        inflight_count_.fetch_add(1, std::memory_order_release);
+        // Set metadata on first Increment.  release (not relaxed) so
+        // that the subsequent acquire load in ~NofQpairPool forms a
+        // synchronizes-with edge with this store: any prior Increment
+        // is guaranteed to be observable when the destructor reads
+        // was_ever_used_with_inflight_==true.
+        was_ever_used_with_inflight_.store(true, std::memory_order_release);
     }
     void DecrementInflight() {
-        inflight_count_.fetch_sub(1, std::memory_order_relaxed);
+        inflight_count_.fetch_sub(1, std::memory_order_release);
     }
     int32_t InflightCount() const {
-        return inflight_count_.load(std::memory_order_relaxed);
+        return inflight_count_.load(std::memory_order_acquire);
     }
+    bool WasEverUsedWithInflight() const {
+        return was_ever_used_with_inflight_.load(std::memory_order_acquire);
+    }
+
+    /// Synchronization primitive: poll until InflightCount() == 0 or
+    /// budget_us elapses.  Used by ~NofQpairPool as the proof point that
+    /// "no CQE will fire after free_io_qpair".
+    ///
+    /// Returns true iff InflightCount() == 0 was observed within budget_us.
+    ///
+    /// Does NOT modify inflight_count_; only observes it.
+    bool WaitForInflightCompletion(uint32_t budget_us);
 
     size_t Size() const { return qpairs_.size(); }
     uint32_t MaxInflight() const {
@@ -98,6 +134,9 @@ class NofQpairPool {
     std::vector<spdk_nvme_qpair *> qpairs_;
     std::atomic<uint32_t> round_robin_idx_{0};
     std::atomic<int32_t> inflight_count_{0};
+    // Set on first IncrementInflight; read by ~NofQpairPool to
+    // distinguish "truly quiescent" from "inflight trivially 0".
+    std::atomic<bool> was_ever_used_with_inflight_{false};
     uint32_t max_inflight_per_qpair_;
 
     // Target qpair count requested at construction time.

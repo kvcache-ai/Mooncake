@@ -13,6 +13,7 @@
 #include <stack>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "transfer_engine.h"
@@ -369,6 +370,12 @@ struct SpdkNofTask {
     int idx;  // subop idx
     bool failed;
     bool on_chain;
+    // Sum of submit_lba_count across this task's currently outstanding
+    // sub-IOs.  Mirrors nof_qos->inflight_blocks[op] but per task so
+    // FailAllInflightTasks can correctly release the segment-level
+    // counter when a qpair poll error forces terminal cleanup of all
+    // in-flight tasks.
+    int inflight_block_count = 0;
     std::shared_ptr<SpdkNofOperationState> state;
     int64_t* io_count;
     SpdkNofQos* nof_qos;
@@ -403,9 +410,20 @@ constexpr int kDefaultSpdkNofInflightBytesLimit = (1 << 25);  // 32M
 struct SpdkNofQos {
     int inflight_blocks[kSpdkNofOpNum];
     int blocks_per_chunk;
+    // Saved at construction from GetSpdkNofInflightBytesLimit / block_size.
+    // UpdateInflightLimit applies min(this, pool_capacity) when the qpair
+    // pool shrinks (degradation) or grows (recovery) so the inflight cap
+    // never exceeds the originally-configured absolute ceiling.
+    int absolute_inflight_limit = 0;
     int inflight_blocks_limit;
     SpdkNofTask* head[kSpdkNofOpNum];
     SpdkNofTask* tail[kSpdkNofOpNum];
+    // All tasks currently tracked by this qos (queued in head/tail chains
+    // OR off-chain waiting for callbacks).  Populated by PushTask and
+    // drained by SpdkNofTaskCompletion so FailAllInflightTasks can reach
+    // off-chain tasks whose callbacks would otherwise never fire after a
+    // qpair poll error.
+    std::unordered_set<SpdkNofTask*> active_tasks;
 
     explicit SpdkNofQos(uint32_t block_size);
 
@@ -419,15 +437,19 @@ struct SpdkNofQos {
      *
      * When the number of qpairs changes (degradation or TryGrow recovery),
      * adjust the inflight cap accordingly.
-     * inflight_blocks_limit = min(absolute limit, qpair pool I/O capacity).
-     * blocks_per_chunk serves as the lower bound, guaranteeing that at least
+     *
+     * Formula:
+     *   pool_limit = num_qpairs * max_inflight_per_qpair * blocks_per_chunk
+     *   new_limit  = min(absolute_inflight_limit, pool_limit)
+     *   applied    = max(blocks_per_chunk, new_limit)
+     *
+     * The min against absolute_inflight_limit guarantees degradation never
+     * RAISES the cap above the originally-configured ceiling under partial
+     * degradation.  blocks_per_chunk remains the lower bound so at least
      * one chunk can be submitted.
      *
      * @param num_qpairs              Current number of qpairs.
      * @param max_inflight_per_qpair  Maximum inflight I/Os per qpair.
-     *
-     * Changelog:
-     * - 2026-08-03 | Added (this PR)
      */
     void UpdateInflightLimit(int num_qpairs, int max_inflight_per_qpair) {
         // num_qpairs * max_inflight_per_qpair yields an I/O count, but
@@ -439,7 +461,8 @@ struct SpdkNofQos {
         // would be throttled at 256 blocks (~1 MiB) instead of the intended
         // 8192 blocks (~32 MiB).
         int pool_limit = num_qpairs * max_inflight_per_qpair * blocks_per_chunk;
-        inflight_blocks_limit = std::max(blocks_per_chunk, pool_limit);
+        int pool_capped = std::min(absolute_inflight_limit, pool_limit);
+        inflight_blocks_limit = std::max(blocks_per_chunk, pool_capped);
     }
 
     void PushTask(SpdkNofTask* task) {
@@ -451,13 +474,47 @@ struct SpdkNofQos {
             tail[op]->nxt = task;
             tail[op] = task;
         }
+        active_tasks.insert(task);
     }
 
     void PopTask(int op) {
         if (head[op]) {
             head[op] = head[op]->nxt;
+            if (head[op] == nullptr) {
+                tail[op] = nullptr;
+            }
         }
     }
+
+    /**
+     * @brief Force-complete every task tracked by this qos as failed.
+     *
+     * Called by the worker pool when NvmePollProcessCompletion returns a
+     * negative value, signalling a fatal qpair error.  Without this,
+     * outstanding_sub_io / total_outstanding_io / inflight_blocks all
+     * stay non-zero, leaving TransferFuture waiters blocked forever and
+     * blocking TransferSubmitter teardown (the worker cannot exit while
+     * counters remain positive).
+     *
+     * Two passes:
+     *   1) Walk head/tail chains; pop each task and force-complete.
+     *   2) Walk active_tasks (snapshot) to catch off-chain tasks whose
+     *      outstanding_sub_io is still > 0 (callbacks will not fire
+     *      because the qpair is dead).
+     *
+     * Each task gets:
+     *   - failed = true
+     *   - remaining_lba = 0
+     *   - outstanding_sub_io = 0
+     *   - inflight_block_count = 0
+     *   - inflight_blocks[op] decremented by the lost blocks
+     *   - *task->io_count decremented by the lost sub-IOs
+     *   - state->set_completed(TRANSFER_FAIL) (via SpdkNofTaskCompletion)
+     *   - delete (since on_chain is forced to false)
+     *
+     * Safe to invoke from the same worker thread that owns this qos.
+     */
+    void FailAllInflightTasks();
 };
 
 /**
@@ -494,8 +551,6 @@ class SpdkNofWorkerPool {
     std::unique_ptr<std::mutex[]> queue_mutex_;
     std::unique_ptr<std::condition_variable[]> queue_cv_;
 
-    // Changelog:
-    // - 2026-08-03 | Added task queue backpressure (this PR)
     // When task_queue_ depth reaches max_queue_depth_, submitTask blocks.
     // Prevents unbounded request accumulation from causing memory
     // exhaustion in degradation scenarios.
@@ -510,8 +565,6 @@ class SpdkNofWorkerPool {
 
 /// Rebalance check interval (seconds). Worker threads check at this interval
 /// whether a degraded qpair pool can be recovered via TryGrow.
-/// Changelog:
-/// - 2026-08-03 | Added (this PR)
 constexpr int kRebalanceIntervalSeconds = 30;
 #endif
 
@@ -582,8 +635,8 @@ class TransferSubmitter {
                                TransferMetric* transfer_metric = nullptr,
                                int numa_socket_id = 0);
 
-    // Added 2026-07-31: release cached NoF handles via CloseNofSegment
-    // so QIDs are recycled when client is closed.
+    // Release cached NoF handles via CloseNofSegment so QIDs are
+    // recycled when client is closed.
     ~TransferSubmitter();
 
     /**
@@ -655,15 +708,33 @@ class TransferSubmitter {
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
 #ifdef USE_NOF
     std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
-    // [Added 2026-07-31] Per-TransferSubmitter handle cache.
-    // Each client independently caches its nof_seg_handle, so multiple put()
-    // calls from the same client reuse the same connection. Not shared across
-    // TransferSubmitters, to avoid multiple WorkerPools concurrently accessing
-    // the same SPDK qpair pool.
+    // Per-TransferSubmitter handle cache.  Each client independently caches
+    // its nof_seg_handle, so multiple put() calls from the same client
+    // reuse the same connection. Not shared across TransferSubmitters,
+    // to avoid multiple WorkerPools concurrently accessing the same
+    // SPDK qpair pool.
     // Protected by nof_cache_mutex_ — concurrent submissions on the same
-    // TransferSubmitter must not race on the first-use cache-insertion path.
+    // TransferSubmitter must not race on the first-use cache-insertion
+    // path.
     std::map<std::string, nof_seg_handle*> nof_handle_cache_;
     mutable std::mutex nof_cache_mutex_;
+    // Per-endpoint single-flight state for the slow path.  Tracks
+    // endpoints currently being opened so concurrent submitters for
+    // the same endpoint wait for the designated opener instead of
+    // racing to OpenNofSegment.  Without this, two submitters for the
+    // same endpoint could both attempt the slow path: if one loses
+    // QIDs and fails while the other succeeds and populates the
+    // cache, the failed caller would return nullopt unnecessarily
+    // even though a valid handle is now cached.
+    //
+    // Lock ordering (avoids deadlock):
+    //   nof_open_inflight_mutex_ -> nof_cache_mutex_
+    // A waiter briefly holds both (open_lock for the cv wait, then
+    // cache_lock for re-check).  An opener publishes with cache_lock
+    // alone, then acquires open_lock only after releasing cache_lock.
+    std::unordered_set<std::string> nof_open_inflight_;
+    std::mutex nof_open_inflight_mutex_;
+    std::condition_variable nof_open_done_cv_;
 #endif
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;

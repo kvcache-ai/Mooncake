@@ -27,8 +27,7 @@ void SpdkNoF_UnregisterWorkerPool() {
     g_active_worker_count.fetch_sub(1, std::memory_order_relaxed);
 }
 
-// [Migrated] Old nof_seg_handle_ / tr_info / ctrlr_info structs removed.
-// The new design manages NVMe-oF resources through the NofConnection +
+// NVMe-oF resources are managed through the NofConnection +
 // NofSegment abstraction layer; nof_seg_handle is defined in the header.
 
 SpdkWrapper::SpdkWrapper() = default;
@@ -98,10 +97,10 @@ void SpdkWrapper::Cleanup() {
                 << "all SpdkNofWorkerPool instances.";
         }
 
-        // [Migrated] Clean up the new open_segments_ design:
-        // NofConnection is auto-destroyed by unique_ptr (including qpair
-        // pool and ctrlr detach); only NofSegment and nof_seg_handle
-        // must be freed manually.
+        // Clean up the new open_segments_ design: NofConnection is
+        // auto-destroyed by unique_ptr (including qpair pool and ctrlr
+        // detach); only NofSegment and nof_seg_handle must be freed
+        // manually.
         {
             std::lock_guard<std::mutex> lock(segments_mutex_);
             for (auto &[handle, conn] : open_segments_) {
@@ -148,6 +147,17 @@ void SpdkWrapper::Free(void *ptr) {
 
 void SpdkWrapper::ProbeReadComplete(void *ctx,
                                     const struct spdk_nvme_cpl *cpl) {
+    // ctx is guaranteed alive because:
+    //   (a) ProbeNofSegment pushed its shared_ptr to ProbeCtxRecycler
+    //       before returning;
+    //   (b) ProbeCtxRecycler drains only at the start of the next
+    //       probe, after ~NofQpairPool has finished
+    //       (fail + drain + free_io_qpair), so any callback firing
+    //       now or in the future finds the ctx alive.
+    // No self-extending shared_ptr is needed: lifecycle is managed by
+    // ownership transfer to ProbeCtxRecycler, not by re-acquiring
+    // shared_from_this (which would risk bad_weak_ptr if SPDK ever
+    // fired the callback after the recycler drained).
     auto *probe_ctx = reinterpret_cast<ProbeRequestContext *>(ctx);
     if (spdk_nvme_cpl_is_error(cpl)) {
         {
@@ -161,63 +171,162 @@ void SpdkWrapper::ProbeReadComplete(void *ctx,
         probe_ctx->success.store(true, std::memory_order_release);
     }
     probe_ctx->done.store(true, std::memory_order_release);
-    // Do NOT recycle probe_ctx here.  ProbeNofSegment() still reads
-    // success / error_reason after the poll loop, and a concurrent probe
-    // could acquire and reset the same context before those reads complete.
-    // The caller (ProbeNofSegment) is now responsible for recycling the
-    // context after it has copied the results.
 }
 
-void SpdkWrapper::ReplenishProbeRequestContextPoolLocked(size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        auto probe_ctx = std::make_unique<ProbeRequestContext>();
-        probe_request_context_pool_.push(probe_ctx.get());
-        probe_request_contexts_.push_back(std::move(probe_ctx));
-    }
-}
-
-SpdkWrapper::ProbeRequestContext *SpdkWrapper::AcquireProbeRequestContext() {
-    std::lock_guard<std::mutex> lock(probe_request_context_pool_mutex_);
-    if (probe_request_context_pool_.empty()) {
-        ReplenishProbeRequestContextPoolLocked(8);
-    }
-    auto *probe_ctx = probe_request_context_pool_.top();
-    probe_request_context_pool_.pop();
-    probe_ctx->Reset();
-    return probe_ctx;
-}
-
-void SpdkWrapper::RecycleProbeRequestContext(ProbeRequestContext *ctx) {
-    if (ctx == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(probe_request_context_pool_mutex_);
-    probe_request_context_pool_.push(ctx);
-}
-
-// [Migrated] Delegates to NofSegment::PollCompletion instead of the
-// old direct seg->qpair access.
+// Delegates to NofSegment::PollCompletion.
 int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
                                                uint32_t complete_per_seg) {
     if (!seg || !seg->segment) return -1;
     return seg->segment->PollCompletion(complete_per_seg);
 }
 
-// [Removed] ParseTransPortStr / ConnectController removed.
-// Transport parsing and controller connection are now handled centrally
-// by NofConnection::Connect().
+// ---------------------------------------------------------------------------
+// ProbeCtxRecycler — defers release of probe context to the next probe.
+// ---------------------------------------------------------------------------
+//
+// Single-instance holder for probe_ctx shared_ptrs that have outlived
+// their conn. The recycler drains at the start of the next probe, after
+// the previous probe's NofConnection (and ~NofQpairPool) has been fully
+// torn down.  By the time Drain() releases its entries, SPDK cannot
+// possibly still be holding a reference to any of them.
+ProbeCtxRecycler &ProbeCtxRecycler::Instance() {
+    static ProbeCtxRecycler inst;
+    return inst;
+}
 
-// OpenNofSegment: uses the new connection layer.
-// 2026-07-31: Endpoint→handle dedup added (I/O-path reuse later removed).
-// 2026-07-31: spdk_nvme_probe is not thread-safe — added connect_mutex_
-//             to serialise all Connect() calls.
-// 2026-07-31: Removed I/O-path connection reuse.
-//   Rationale: each ClientService owns an independent SpdkNofWorkerPool.
-//   Sharing a handle across WorkerPools would let multiple worker threads
-//   access the same qpair pool concurrently, stealing each other's
-//   completions and underflowing inflight counters.  SPDK requires each
-//   qpair to be owned by a single thread.  Each client now holds an
-//   independent connection: 4 clients × 4 qpairs = 20 QIDs (well under 64).
+void ProbeCtxRecycler::Push(std::shared_ptr<ProbeRequestContext> ctx) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_.push_back(std::move(ctx));
+}
+
+void ProbeCtxRecycler::PushWithConn(std::shared_ptr<ProbeRequestContext> ctx,
+                                    std::unique_ptr<NofConnection> conn) {
+    // Convenience overload for callers that do NOT have a wrapper to
+    // defer (e.g. legacy/test paths).  Forwards to the wrapper-aware
+    // variant with a null wrapper shared_ptr.
+    PushWithConn(std::move(ctx), std::move(conn), nullptr);
+}
+
+void ProbeCtxRecycler::PushWithConn(
+    std::shared_ptr<ProbeRequestContext> ctx,
+    std::unique_ptr<NofConnection> conn,
+    std::shared_ptr<ProbeSubmitWrapper> wrapper) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_.push_back(std::move(ctx));
+    // Ownership of the conn transfers here.  When pending_conns_ is
+    // drained, ~NofConnection runs, which runs ~NofQpairPool, which
+    // performs the quiescent wait + free_io_qpair.  By that time
+    // SPDK must have stopped delivering CQEs for this ctx.
+    pending_conns_.push_back(std::move(conn));
+    // Wrapper lifetime extension: when the timeout-fallback path is
+    // used, the wrapper holds a raw pool pointer that would dangle
+    // once the local submit_wrapper_sp in ProbeNofSegment goes out of
+    // scope.  Push the wrapper here too so it survives until after
+    // ~NofQpairPool has freed the qpair.  Drain() drops
+    // pending_wrappers_ AFTER pending_conns_ for exactly this reason.
+    if (wrapper) {
+        pending_wrappers_.push_back(std::move(wrapper));
+    }
+}
+
+void ProbeCtxRecycler::Drain() {
+    // Swap all three pending lists out under the lock, then release
+    // outside.  Releasing outside the lock keeps Drain() short and
+    // avoids holding the recycler mutex across user-supplied
+    // destructors.
+    //
+    // Destruction order:
+    //   1) ctx shared_ptrs drop → ProbeRequestContext freed.
+    //   2) conn unique_ptrs drop → ~NofConnection → ~NofQpairPool
+    //      → drain + WaitForInflightCompletion + free_io_qpair.
+    //   3) wrapper shared_ptrs drop → ProbeSubmitWrapper freed.
+    // We deliberately drop ctx FIRST so that by the time ~NofQpairPool
+    // frees the qpair, no user code can dereference the ctx anymore.
+    // We drop conn BEFORE wrappers so that any callback firing during
+    // the quiescent wait (step 2) still finds a valid wrapper
+    // (ProbeIoTrampoline accesses w->pool and w->probe_ctx).
+    //
+    // We achieve the desired destruction order with three nested
+    // scope blocks: the outermost local is destroyed LAST, so we
+    // declare the wrapper list outermost.
+    std::vector<std::shared_ptr<ProbeSubmitWrapper>> to_release_wrapper;
+    {
+        std::vector<std::unique_ptr<NofConnection>> to_release_conn;
+        {
+            std::vector<std::shared_ptr<ProbeRequestContext>> to_release_ctx;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                to_release_ctx.swap(pending_);
+                to_release_conn.swap(pending_conns_);
+                to_release_wrapper.swap(pending_wrappers_);
+            }
+            // to_release_ctx drops FIRST here (innermost scope ends).
+        }
+        // to_release_conn drops SECOND here → ~NofConnection →
+        // ~NofQpairPool → drain + WaitForInflightCompletion + free_io_qpair.
+        // Any callback firing during the quiescent wait still has a
+        // valid wrapper (held by to_release_wrapper in the outer scope).
+    }
+    // to_release_wrapper drops LAST here.  By this point free_io_qpair
+    // has returned, so no callback can fire against the wrapper.
+}
+
+// ---------------------------------------------------------------------------
+// ProbeSubmitWrapper — bridges the user-callback API to the inflight counter.
+//
+// The struct itself is declared top-level in spdk_wrapper.h (so
+// ProbeCtxRecycler can hold shared_ptr<ProbeSubmitWrapper> and extend
+// its lifetime).  This file contributes only the trampoline.
+//
+// Why we need this:
+//   ProbeNofSegment submits via SubmitRequest, which takes a user callback
+//   (void(void*, const spdk_nvme_cpl*)).  We need every callback to:
+//     (a) call ProbeReadComplete (writes done/success);
+//     (b) DecrementInflight on the qpair pool (so WaitForInflightCompletion
+//         can prove quiescence).
+//   We can't store a pool pointer in ProbeRequestContext itself because
+//   the ctx outlives the conn (it's transferred to ProbeCtxRecycler), and
+//   a dangling pool pointer would be a UAF.
+//
+//   Lifetime:
+//   - Happy path: submit_wrapper_sp is dropped at ProbeNofSegment return,
+//     AFTER WaitForInflightCompletion observed InflightCount==0.  No
+//     callback can fire in the future.
+//   - Timeout-fallback path: submit_wrapper_sp is moved into
+//     ProbeCtxRecycler alongside ctx and conn.  Drain() drops the wrapper
+//     AFTER the conn destructor (which runs ~NofQpairPool's quiescent
+//     wait + free_io_qpair).  This closes the window where a late
+//     callback could fire against a freed wrapper.
+//
+//   The trampoline receives the raw pointer (void* ctx parameter).  It
+//   does NOT free the wrapper — the caller (ProbeNofSegment) or the
+//   recycler drops it once we are guaranteed no callback can fire.
+// ---------------------------------------------------------------------------
+namespace {
+
+void ProbeIoTrampoline(void *ctx, const struct spdk_nvme_cpl *cpl) {
+    auto *w = static_cast<ProbeSubmitWrapper *>(ctx);
+    SpdkWrapper::ProbeReadComplete(w->probe_ctx.get(), cpl);
+    w->pool->DecrementInflight();
+    // The wrapper is NOT freed here.  It is held alive by either:
+    //   (a) submit_wrapper_sp in ProbeNofSegment (happy path), or
+    //   (b) ProbeCtxRecycler::pending_wrappers_ (timeout-fallback path).
+    // Both keep the wrapper valid until SPDK cannot fire any more
+    // callbacks on this qpair.  See ProbeSubmitWrapper's lifetime
+    // contract in spdk_wrapper.h for details.
+}
+
+}  // anonymous namespace
+
+// OpenNofSegment uses NofConnection::Connect() under connect_mutex_
+// because spdk_nvme_probe is not thread-safe.
+//
+// Each connection holds an independent set of qpairs (1 connection per
+// ClientService).  SPDK requires each qpair to be owned by a single
+// thread, and each SpdkNofWorkerPool is dedicated to one ClientService.
+// Sharing a handle across WorkerPools would let multiple worker threads
+// access the same qpair pool concurrently, stealing each other's
+// completions and underflowing inflight counters.
 nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
     if (!InitializeEnv()) return nullptr;
 
@@ -312,6 +421,29 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
 }
 
 // CloseNofSegment: release all resources allocated by OpenNofSegment.
+//
+// Safety contract:
+//   The caller MUST have joined any SpdkNofWorkerPool that may have
+//   submitted I/O through this handle.  Closing the handle while a
+//   worker is still running will cause in-flight callbacks (e.g.
+//   nvmf_io_complete) to access freed SpdkNofSubTask/SpdkNofTask
+//   memory.
+//
+//   Today only ~TransferSubmitter is a legitimate caller.  Its
+//   destructor body runs `spdk_nvmf_pool_.reset()` BEFORE iterating
+//   nof_handle_cache_ to call CloseNofSegment — this guarantees
+//   worker pool join precedes handle close.
+//
+//   Why we don't track this automatically: transfer tasks do NOT call
+//   NofQpairPool::IncrementInflight (they track in-flight via
+//   task->outstanding_sub_io and total_outstanding_io in the worker
+//   loop).  So ~NofQpairPool's WaitForInflightCompletion is a
+//   no-op for transfer paths — InflightCount==0 trivially — and the
+//   safety guarantee comes from caller ordering, not from the pool
+//   itself.  Future callers MUST follow the same protocol.
+//
+//   Probe paths (ProbeNofSegment) use a separate temporary conn that
+//   is auto-destructed; they are unaffected by CloseNofSegment.
 void SpdkWrapper::CloseNofSegment(nof_seg_handle *handle) {
     if (!handle) return;
 
@@ -326,12 +458,15 @@ void SpdkWrapper::CloseNofSegment(nof_seg_handle *handle) {
 
     delete handle->segment;  // alloc'd by OpenNofSegment
     delete handle;           // alloc'd by OpenNofSegment
-    open_segments_.erase(
-        it);  // ~unique_ptr<NofConnection> → qpair pool → ctrlr detach
+    // ~unique_ptr<NofConnection> runs:
+    //   ~NofConnection → reset qpair_pool_ →
+    //   ~NofQpairPool → drain + WaitForInflightCompletion (silent
+    //   no-op for transfer paths) + free_io_qpair.
+    // Safety relies on caller having joined the worker pool first.
+    open_segments_.erase(it);
 }
 
-// [Migrated] Obtain block size via NofSegment instead of the old
-// direct seg_handle->ns access.
+// Obtain block size via NofSegment.
 uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     if (!seg_handle || !seg_handle->segment) {
         return INVALID_BLOCK_SIZE;
@@ -382,13 +517,23 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
     return probe_buffer.get();
 }
 
-// 2026-07-31: Rewritten to use NofConnection::Connect() directly,
-// creating an independent temporary connection.  Does NOT go through
-// OpenNofSegment (I/O-path shared connection), does NOT insert into
-// open_segments_, and does NOT share qpairs with worker threads — this
-// avoids violating the SPDK qpair single-thread constraint.  The
-// NofConnection auto-destructs on return → qpair pool freed → ctrlr
-// detached → all QIDs reclaimed.
+// ProbeNofSegment creates an independent temporary connection via
+// NofConnection::Connect() directly.  Does NOT go through OpenNofSegment,
+// does NOT insert into open_segments_, and does NOT share qpairs with
+// worker threads — this avoids violating the SPDK qpair single-thread
+// constraint.
+//
+// Synchronization point for the timeout UAF is the inflight counter on
+// NofQpairPool:
+//
+//   IncrementInflight()       ── before spdk_nvme_ns_cmd_read
+//   ProbeIoTrampoline         ── calls ProbeReadComplete, then
+//                                DecrementInflight
+//   WaitForInflightCompletion ── blocks until InflightCount==0
+//
+// After WaitForInflightCompletion returns true, no callback can fire
+// in the future for this conn; freeing probe_ctx and the wrapper is
+// safe.  The Recycler remains as a belt-and-suspenders fallback.
 bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
                                   uint32_t timeout_ms,
                                   std::string *error_reason) {
@@ -398,6 +543,14 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         }
         return false;
     }
+
+    // Drain the recycler before opening a new connection.
+    // pending_conns_ entries run ~NofConnection → ~NofQpairPool →
+    // quiescent wait + free_io_qpair.  By the time Drain() returns,
+    // SPDK has stopped scheduling on those qpairs and the
+    // corresponding ctx shared_ptrs are no longer reachable by
+    // callbacks.
+    ProbeCtxRecycler::Instance().Drain();
 
     // Create an independent probe connection — exclusive to the
     // heartbeat thread, never shared with worker threads.
@@ -430,39 +583,111 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         if (error_reason) {
             *error_reason = "invalid_block_size";
         }
-        return false;  // conn auto-destructs → QIDs reclaimed
+        return false;  // conn auto-destructs → ~NofQpairPool quiescent wait
     }
 
     ProbeBuffer *probe_buffer =
         GetOrCreateProbeBuffer(tr_str, block_size, error_reason);
     if (!probe_buffer || !probe_buffer->ptr) {
-        return false;  // conn auto-destructs → QIDs reclaimed
+        return false;  // conn auto-destructs → ~NofQpairPool quiescent wait
     }
 
-    ProbeRequestContext *probe_ctx = AcquireProbeRequestContext();
-    int ret = SubmitRequest(&seg_handle, probe_buffer->ptr, 0, 1,
-                            kSpdkNofOpRead, ProbeReadComplete, probe_ctx);
+    // Each probe allocates a fresh ctx (shared_ptr) AND a fresh submit
+    // wrapper.  The wrapper holds the pool pointer so the trampoline
+    // can DecrementInflight; its lifetime is bound to submit_wrapper_sp
+    // on the local stack.
+    auto probe_ctx = std::make_shared<ProbeRequestContext>();
+    auto submit_wrapper_sp = std::make_shared<ProbeSubmitWrapper>();
+    submit_wrapper_sp->probe_ctx = probe_ctx;
+    submit_wrapper_sp->pool = &conn->GetQpairPool();
+
+    // Increment BEFORE submit so that any callback (including the
+    // one that fires after our Phase 1 / Phase 1b window) is
+    // accounted for.  Without this, late CQEs are invisible to
+    // WaitForInflightCompletion.
+    conn->GetQpairPool().IncrementInflight();
+
+    int ret =
+        SubmitRequest(&seg_handle, probe_buffer->ptr, 0, 1, kSpdkNofOpRead,
+                      ProbeIoTrampoline, submit_wrapper_sp.get());
     if (ret != 0) {
-        RecycleProbeRequestContext(probe_ctx);
+        // Submit failed synchronously — roll back the Increment.
+        // No callback will fire, so InflightCount returns to 0.
+        conn->GetQpairPool().DecrementInflight();
         if (error_reason) {
             *error_reason = "submit_fail";
         }
-        return false;  // conn auto-destructs → QIDs reclaimed
+        return false;
     }
 
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(timeout_ms);
-    while (!probe_ctx->done.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < deadline) {
-        segment.PollCompletion(0);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // ──────────────────────────────────────────────────────────────
+    // Phase 1: soft timeout window.
+    //
+    // Wait for done==true within timeout_ms.  This is the user-
+    // perceived latency budget.
+    // ──────────────────────────────────────────────────────────────
+    {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+        while (!probe_ctx->done.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            segment.PollCompletion(0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Phase 1b: terminal-state proof.
+    //
+    // If Phase 1 timed out (done==false), the request may still be
+    // in flight.  We prove termination by waiting for the qpair
+    // pool's InflightCount to reach 0.  This is the actual fix for
+    // the timeout-path UAF: by the time WaitForInflightCompletion
+    // returns true, ProbeIoTrampoline has fired, DecrementInflight
+    // has happened, and no callback can fire in the future.
+    //
+    // 30 s budget matches ~NofQpairPool's budget so the conn
+    // destructor (which runs on function return) can finish
+    // promptly: if Phase 1b succeeds here, ~NofQpairPool will see
+    // InflightCount==0 immediately; if Phase 1b fails here, we
+    // defer the conn itself to ProbeCtxRecycler.
+    // ──────────────────────────────────────────────────────────────
+    if (!probe_ctx->done.load(std::memory_order_acquire)) {
+        constexpr uint32_t kProbeHardBudgetUs = 30'000'000;
+        bool quiescent =
+            conn->GetQpairPool().WaitForInflightCompletion(kProbeHardBudgetUs);
+        if (!quiescent) {
+            // 30 s wasn't enough.  Defer the ctx, the conn, AND the
+            // submit wrapper to ProbeCtxRecycler; the next probe's
+            // Drain() will drop them in this order:
+            //   1) ctx (ProbeRequestContext freed first)
+            //   2) conn (~NofConnection → ~NofQpairPool → quiescent
+            //      wait + free_io_qpair)
+            //   3) wrapper (last — only dropped after free_io_qpair)
+            // Closing the window: any callback firing during
+            // step 2 finds a valid wrapper (so ProbeIoTrampoline can
+            // safely access w->pool and w->probe_ctx).
+            LOG(ERROR) << "ProbeNofSegment: qpair pool did not quiesce "
+                          "within 30 s — deferring destruction to "
+                          "next probe";
+            ProbeCtxRecycler::Instance().PushWithConn(
+                std::move(probe_ctx), std::move(conn),
+                std::move(submit_wrapper_sp));
+            if (error_reason) {
+                *error_reason = "completion_timeout";
+            }
+            return false;
+        }
+        // Quiescent reached — the callback fired but did not set
+        // done.  This is a bug in ProbeReadComplete; treat as
+        // completion error.
     }
 
     bool ok = probe_ctx->done.load(std::memory_order_acquire) &&
               probe_ctx->success.load(std::memory_order_acquire);
     if (!ok && error_reason) {
         if (!probe_ctx->done.load(std::memory_order_acquire)) {
-            *error_reason = "completion_timeout";
+            *error_reason = "completion_error_no_done";
         } else {
             std::lock_guard<std::mutex> lock(probe_ctx->error_mutex);
             *error_reason = probe_ctx->error_reason.empty()
@@ -471,37 +696,67 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         }
     }
 
-    // Recycle the probe context only after we have copied all results.
-    // The callback (ProbeReadComplete) only publishes terminal state;
-    // deferring recycle here eliminates the race where a concurrent
-    // probe could acquire and Reset() the context while we still read
-    // success / error_reason from it.
-    RecycleProbeRequestContext(probe_ctx);
+    // ──────────────────────────────────────────────────────────────
+    // SAFE-TO-DESTROY: at this point, InflightCount==0 (proven by
+    // Phase 1 / Phase 1b), so ProbeIoTrampoline has already run and
+    // will not fire again.  All release-stores in the trampoline
+    // (probe_ctx->done / success) are visible via acquire load.
+    //
+    // Destruction order on return (happy path):
+    //   1) submit_wrapper_sp drops → wrapper freed (safe: no callback
+    //      can fire, InflightCount==0 proven above).
+    //   2) probe_ctx pushed to ProbeCtxRecycler (paranoid belt-and-
+    //      suspenders; the next probe's Drain() will release it
+    //      after the previous probe's conn is gone).
+    //   3) seg_handle / segment: trivially destructible.
+    //   4) conn: → ~NofConnection → ~NofQpairPool
+    //      → WaitForInflightCompletion sees InflightCount==0 →
+    //      free_io_qpair.  Safe because no callback can fire after.
+    //
+    // Note: in the timeout-fallback path (above), the wrapper was
+    // moved into ProbeCtxRecycler so it survives until after
+    // free_io_qpair — see the lifetime contract on ProbeSubmitWrapper
+    // in spdk_wrapper.h.
+    // ──────────────────────────────────────────────────────────────
+    ProbeCtxRecycler::Instance().Push(std::move(probe_ctx));
 
-    // conn goes out of scope → ~NofConnection() → ~NofQpairPool() →
-    // free io qpairs → spdk_nvme_detach().  All QIDs are reclaimed.
     return ok;
 }
 
-// [Migrated] SetConfig / PipelineRead / PipelineWrite.
+// SetConfig / PipelineRead / PipelineWrite.
 //
-// NOTE: PipelineRead/Write are fully implemented at the segment layer
-// (NofSegment::PipelineIO) but are NOT currently wired into the Mooncake
-// NoF transfer hot path.  TransferSubmitter still submits individual
-// SpdkNofTasks through SubmitRequest/poll.  These pipeline APIs are
-// available for future integration into the worker pool.
+// PipelineRead/Write are lower-level APIs that submit a multi-chunk
+// request across all qpairs in a single call.  They are not part of
+// Mooncake's NoF transfer hot path (see TransferSubmitter →
+// submitTask → SubmitRequest); they exist for callers that want to
+// drive NVMe-oF directly without going through SpdkNofWorkerPool.
+//
+// The caller_ctx out-param gives explicit lifetime control.  Pass
+// nullptr (the default) for fire-and-forget semantics; pass a non-null
+// pointer for the explicit-lifetime contract.  See
+// NofSegment::PipelineRead/Write for the full contract, including
+// PipelineCtxRecycler fallback behaviour.
 void SpdkWrapper::SetConfig(const NofConfig &config) { config_ = config; }
 
 ssize_t SpdkWrapper::PipelineRead(nof_seg_handle *handle, void *buf,
-                                  uint64_t lba, uint32_t total_blocks) {
+                                  uint64_t lba, uint32_t total_blocks,
+                                  std::shared_ptr<PipelineCtx> *caller_ctx) {
     if (!handle || !handle->segment) return -1;
-    return handle->segment->PipelineRead(buf, lba, total_blocks);
+    return handle->segment->PipelineRead(buf, lba, total_blocks, caller_ctx);
 }
 
 ssize_t SpdkWrapper::PipelineWrite(nof_seg_handle *handle, const void *buf,
-                                   uint64_t lba, uint32_t total_blocks) {
+                                   uint64_t lba, uint32_t total_blocks,
+                                   std::shared_ptr<PipelineCtx> *caller_ctx) {
     if (!handle || !handle->segment) return -1;
-    return handle->segment->PipelineWrite(buf, lba, total_blocks);
+    return handle->segment->PipelineWrite(buf, lba, total_blocks, caller_ctx);
+}
+
+void SpdkWrapper::PipelineDrain(nof_seg_handle *handle,
+                                const std::shared_ptr<PipelineCtx> &ctx_sp,
+                                uint32_t budget_us) {
+    if (!handle || !handle->segment) return;
+    handle->segment->DrainForInflight(ctx_sp, budget_us);
 }
 
 }  // namespace mooncake

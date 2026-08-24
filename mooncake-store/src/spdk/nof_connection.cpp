@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -27,9 +28,109 @@ NofQpairPool::NofQpairPool(std::vector<spdk_nvme_qpair *> qpairs,
                                      : static_cast<uint32_t>(qpairs_.size())),
       ctrlr_(ctrlr) {}
 
+bool NofQpairPool::WaitForInflightCompletion(uint32_t budget_us) {
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::microseconds(budget_us);
+    while (inflight_count_.load(std::memory_order_acquire) > 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        // PollAll surfaces pending CQEs synchronously; the CQE callback
+        // decrements inflight_count_ via release, which we observe on
+        // the next acquire load.  This is the active side of the
+        // synchronizes-with edge.
+        int32_t processed = PollAll(0);
+        if (processed < 0) {
+            // qpair dead; further polling is futile.  Caller's
+            // responsibility to break out.
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    return inflight_count_.load(std::memory_order_acquire) == 0;
+}
+
 NofQpairPool::~NofQpairPool() {
     for (auto *qp : qpairs_) {
-        if (qp) spdk_nvme_ctrlr_free_io_qpair(qp);
+        if (qp) {
+            // ─────────────────────────────────────────────────────────
+            // Synchronous proof of "no CQE will fire
+            // after this returns" BEFORE free_io_qpair.
+            //
+            // Three-step protocol:
+            //   Step 1: drain pending CQEs (bounded, cheap).
+            //   Step 2: WaitForInflightCompletion with a hard cap.
+            //           InflightCount()==0 is the actual proof that
+            //           all CQEs have been processed (or that no path
+            //           ever called IncrementInflight).
+            //   Step 3: free_io_qpair.
+            //
+            // Without Step 2, free_io_qpair may be called while a CQE
+            // is still in SPDK's internal queue, and that CQE would
+            // fire on already-freed user memory.
+            //
+            // Note: SPDK does NOT expose a public API to forcibly fail
+            // an in-flight qpair.  The helper `nvme_qpair_fail` exists
+            // in lib/nvme/nvme_qpair.c but is declared `static` and
+            // not exported via spdk/nvme.h.  The closest public
+            // alternative, `spdk_nvme_ctrlr_abort_queued_requests`,
+            // matches by SQID/CID mask and only aborts requests still
+            // in the controller's submission queue — it does NOT abort
+            // already-submitted ones that have left the SQ, so it
+            // does not help in our timeout-fallback case.
+            //
+            // We therefore rely on WaitForInflightCompletion's 30 s
+            // budget.  Two preconditions make this sound:
+            //   (a) callers should already have drained in-flight
+            //       before reaching ~NofQpairPool (e.g.
+            //       ~TransferSubmitter joins workers first;
+            //       ProbeNofSegment's Phase 1b waits for quiescent);
+            //   (b) for the timeout-fallback path, ProbeNofSegment
+            //       defers BOTH ctx AND conn (and the submit wrapper)
+            //       to ProbeCtxRecycler, which keeps the wrapper's
+            //       pool pointer valid until the next probe's Drain().
+            // ─────────────────────────────────────────────────────────
+
+            // Step 1: bounded drain of any pending CQEs.
+            for (int i = 0; i < 1000; ++i) {
+                int processed = spdk_nvme_qpair_process_completions(qp, 0);
+                if (processed <= 0) break;
+            }
+
+            // Step 2: synchronous wait for inflight to reach 0.
+            // 30 s is generous: a stuck CQE either resolves in
+            // milliseconds (network blip) or is genuinely broken
+            // (target crash).  30 s catches the former; the latter
+            // is logged as ERROR below.
+            constexpr uint32_t kQuiescentBudgetUs = 30'000'000;
+            bool quiescent = WaitForInflightCompletion(kQuiescentBudgetUs);
+            if (quiescent) {
+                if (was_ever_used_with_inflight_.load(
+                        std::memory_order_acquire)) {
+                    VLOG(2) << "[NofQpairPool::~NofQpairPool] "
+                            << "InflightCount==0 proven via "
+                            << "WaitForInflightCompletion";
+                } else {
+                    // No submit path used Increment on this conn.
+                    // Synchronization is provided by caller ordering
+                    // (see CloseNofSegment docs: ~TransferSubmitter
+                    // resets worker pool first).
+                    VLOG(2) << "[NofQpairPool::~NofQpairPool] "
+                            << "InflightCount trivially 0 (no Increment "
+                            << "path); safety relies on caller ordering";
+                }
+            } else {
+                LOG(ERROR) << "[NofQpairPool::~NofQpairPool] InflightCount="
+                           << InflightCount()
+                           << " after 30 s quiescent budget — target likely "
+                           << "crashed. Freeing qpair anyway; late callbacks "
+                           << "may access freed memory. This is a known "
+                           << "limitation when InflightCount is non-zero and "
+                           << "no fail mechanism (spdk_nvme_qpair_fail) is "
+                           << "invoked.";
+            }
+
+            // Step 3: free the qpair.
+            spdk_nvme_ctrlr_free_io_qpair(qp);
+        }
     }
     qpairs_.clear();
 }

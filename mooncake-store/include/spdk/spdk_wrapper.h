@@ -5,7 +5,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <stack>
 #include <string>
 #include <vector>
 #include <spdk/env.h>
@@ -24,8 +23,7 @@ constexpr int kSpdkNofOpRead = 0;
 constexpr int kSpdkNofOpWrite = 1;
 constexpr int kSpdkNofOpNum = 2;
 
-// [Migrated] tr_info / ctrlr_info forward declarations removed; transport
-// parsing is now handled internally by NofConnection::Connect().
+// Transport parsing is handled internally by NofConnection::Connect().
 struct nof_seg_handle;
 
 /**
@@ -40,8 +38,6 @@ struct nof_seg_handle;
  * Thread safety: Record() and GetRecommended() are protected by an
  * internal mutex and can safely be called from multiple threads
  * concurrently.
- *
- * Changelog | 2026-08-03 | Added (this PR)
  */
 class QidPressureGauge {
    public:
@@ -149,15 +145,35 @@ class SpdkWrapper {
      * Frees the NofSegment, the nof_seg_handle, and triggers
      * NofConnection destruction (qpair pool + ctrlr detach).
      * Safe to call with nullptr (no-op).
-     * Added 2026-07-31 to fix ProbeNofSegment connection leak.
+     *
+     * Safety contract:
+     *   The caller MUST have joined any SpdkNofWorkerPool that may have
+     *   submitted I/O through this handle.  Closing while a worker is
+     *   still running will cause in-flight callbacks to access freed
+     *   SpdkNofSubTask/SpdkNofTask memory.  Today only ~TransferSubmitter
+     *   is a legitimate caller; it joins the worker pool before closing
+     *   cached handles.  Future explicit callers MUST follow the same
+     *   protocol — see ~NofQpairPool's documentation on why
+     *   WaitForInflightCompletion is not sufficient for transfer paths.
      */
     void CloseNofSegment(nof_seg_handle *handle);
 
     // Added APIs
     void SetConfig(const NofConfig &);
     const NofConfig &GetConfig() const { return config_; }
-    ssize_t PipelineRead(nof_seg_handle *, void *, uint64_t, uint32_t);
-    ssize_t PipelineWrite(nof_seg_handle *, const void *, uint64_t, uint32_t);
+    // PipelineRead/Write accept an optional caller_ctx out-param.
+    // Pass nullptr to keep the legacy fire-and-forget behaviour;
+    // pass a non-null ptr for explicit lifetime control.  See
+    // NofSegment::PipelineRead for the full contract.
+    ssize_t PipelineRead(nof_seg_handle *, void *, uint64_t, uint32_t,
+                         std::shared_ptr<PipelineCtx> *caller_ctx = nullptr);
+    ssize_t PipelineWrite(nof_seg_handle *, const void *, uint64_t, uint32_t,
+                          std::shared_ptr<PipelineCtx> *caller_ctx = nullptr);
+    // Re-exported so callers can drain a caller-supplied ctx_sp without
+    // depending on the NofSegment header directly.
+    void PipelineDrain(nof_seg_handle *,
+                       const std::shared_ptr<PipelineCtx> &ctx_sp,
+                       uint32_t budget_us = 0);
 
     uint32_t GetBlockSize(const nof_seg_handle *seg_handle);
 
@@ -196,54 +212,87 @@ class SpdkWrapper {
         ProbeBuffer &operator=(ProbeBuffer &&) = delete;
     };
 
-    struct ProbeRequestContext {
-        std::atomic<bool> done{false};
-        std::atomic<bool> success{false};
-        std::mutex error_mutex;
-        std::string error_reason;
-
-        // Reset state before reuse.  Caller must hold
-        // probe_request_context_pool_mutex_ or otherwise guarantee
-        // exclusive access.
-        void Reset() {
-            std::lock_guard<std::mutex> lock(error_mutex);
-            done.store(false, std::memory_order_release);
-            success.store(false, std::memory_order_release);
-            error_reason.clear();
-        }
-    };
-
     explicit SpdkWrapper();
     ~SpdkWrapper();
 
-    // [Removed] ParseTransPortStr / ConnectController — handled
-    // uniformly by NofConnection::Connect() in the new design.
+    // Transport parsing is handled uniformly by NofConnection::Connect().
     ProbeBuffer *GetOrCreateProbeBuffer(const std::string &tr_str,
                                         uint32_t block_size,
                                         std::string *error_reason);
-    ProbeRequestContext *AcquireProbeRequestContext();
-    void RecycleProbeRequestContext(ProbeRequestContext *ctx);
-    void ReplenishProbeRequestContextPoolLocked(size_t count);
+
+   public:
+    // Static SPDK callback invoked via the file-scope ProbeIoTrampoline
+    // (see spdk_wrapper.cpp).  Public so the trampoline — which lives in
+    // an anonymous namespace and therefore cannot be friended — can
+    // forward the completion here.  Takes ownership bookkeeping only;
+    // it does not touch any SpdkWrapper instance state.
     static void ProbeReadComplete(void *ctx, const struct spdk_nvme_cpl *cpl);
 
+   private:
     std::atomic<bool> initialized{false};
     std::mutex init_mutex;
-    // [Removed] connected_ctrlrs / ctrlrs_mutex — the new design
-    // manages connections via open_segments_.
     std::map<std::string, std::unique_ptr<ProbeBuffer>> probe_buffers_;
     std::mutex probe_buffers_mutex_;
-    std::vector<std::unique_ptr<ProbeRequestContext>> probe_request_contexts_;
-    std::stack<ProbeRequestContext *> probe_request_context_pool_;
-    std::mutex probe_request_context_pool_mutex_;
 
-    // Added 2026-07-31: serializes the slow path (first connection).
-    // spdk_nvme_probe() is not thread-safe — concurrent Connect calls
-    // from multiple threads cause a namespace activation race where all
-    // return namespace_inactive.
-    // This mutex ensures only one thread executes
+    // Serializes the slow path (first connection).  spdk_nvme_probe()
+    // is not thread-safe — concurrent Connect calls from multiple
+    // threads cause a namespace activation race where all return
+    // namespace_inactive.  This mutex ensures only one thread executes
     // NofConnection::Connect() at a time.
     std::mutex connect_mutex_;
 };
+// ---------------------------------------------------------------------------
+// ProbeRequestContext — per-probe request context.
+//
+// Defined at top-level (not nested in SpdkWrapper) so that ProbeCtxRecycler,
+// also defined at top-level below, can hold shared_ptr<ProbeRequestContext>.
+// ---------------------------------------------------------------------------
+struct ProbeRequestContext {
+    std::atomic<bool> done{false};
+    std::atomic<bool> success{false};
+    std::mutex error_mutex;
+    std::string error_reason;
+};
+
+// ---------------------------------------------------------------------------
+// ProbeSubmitWrapper — bridges the user-callback API to the inflight counter.
+//
+// Heap-allocated small struct that lives across the SPDK callback window.
+// Holds:
+//   - probe_ctx (shared_ptr): keeps the request context alive until SPDK
+//     has delivered the CQE.  Lifetime may extend BEYOND ProbeNofSegment's
+//     return in the timeout-fallback path (see ProbeCtxRecycler below).
+//   - pool (raw pointer): the qpair pool whose InflightCount must be
+//     decremented when the CQE arrives.  The pool is owned by the
+//     NofConnection that was active during submission.
+//
+// Why we need it:
+//   ProbeNofSegment submits via SubmitRequest with a C-style callback
+//   (void(void*, const spdk_nvme_cpl*)).  We need every callback to:
+//     (a) call ProbeReadComplete (writes done/success);
+//     (b) DecrementInflight on the qpair pool (so WaitForInflightCompletion
+//         can prove quiescence).
+//   Storing the pool pointer in ProbeRequestContext itself would be
+//   unsafe: probe_ctx outlives the conn (it is transferred to
+//   ProbeCtxRecycler), and a dangling pool pointer would be a UAF if a
+//   late callback fired after ~NofConnection.
+//
+// Lifetime invariants:
+//   - In the happy path, the wrapper's local shared_ptr in
+//     ProbeNofSegment is dropped AFTER the function returns.  By that
+//     point InflightCount has been observed == 0, so no callback can
+//     fire in the future and dropping the wrapper is safe.
+//   - In the timeout-fallback path (WaitForInflightCompletion timed
+//     out), the wrapper is moved into ProbeCtxRecycler alongside the
+//     ctx and conn.  Drain() drops wrappers AFTER the conn destructor
+//     runs (~NofQpairPool → free_io_qpair), guaranteeing the wrapper
+//     outlives any possible callback firing during the quiescent wait.
+// ---------------------------------------------------------------------------
+struct ProbeSubmitWrapper {
+    std::shared_ptr<ProbeRequestContext> probe_ctx;
+    NofQpairPool *pool{nullptr};
+};
+
 // ---------------------------------------------------------------------------
 // nof_seg_handle — opaque handle wrapping a NofSegment.
 // The connection (NofConnection) is owned by SpdkWrapper.
@@ -252,11 +301,97 @@ struct nof_seg_handle {
     NofSegment *segment = nullptr;
 };
 
-// Added 2026-07-31: WorkerPool lifecycle tracking — free functions,
-// NOT SpdkWrapper methods. Reason: during static destruction the
-// SpdkWrapper singleton may already be destroyed, but the
-// SpdkNofWorkerPool destructor still needs to unregister. Free
-// functions can safely access file-level global counters.
+// ---------------------------------------------------------------------------
+// ProbeCtxRecycler — defers release of probe context to the next probe.
+// ---------------------------------------------------------------------------
+//
+// Holds probe_ctx shared_ptrs until SPDK has guaranteed no further
+// callback can fire on them.  Each probe transfers ownership of its ctx
+// to the recycler at ProbeNofSegment exit; the recycler drains at the
+// start of the next probe, after the previous probe's NofConnection
+// (and ~NofQpairPool) has been fully torn down.
+//
+// Why this is needed:
+//   The previous design let probe_ctx be destroyed when ProbeNofSegment
+//   returned, by RAII.  If SPDK scheduled a callback that arrived after
+//   free_io_qpair had been called, the callback would access a
+//   destroyed ctx (UAF).  By deferring the release to the next probe,
+//   we guarantee that:
+//     (1) the previous NofConnection is destroyed;
+//     (2) ~NofQpairPool has drained pending completions and waited
+//         up to 30 s for the inflight counter to reach 0, then freed
+//         the qpair.  SPDK does NOT expose a public
+//         spdk_nvme_qpair_fail symbol (it is a static helper inside
+//         lib/nvme), so the drain + WaitForInflightCompletion pair
+//         is what bridges the gap;
+//     (3) SPDK has had ample time to deliver any pending callback
+//         (it cannot fire after free_io_qpair returns in normal SPDK
+//         behaviour);
+//     (4) no code holds a strong reference to ctx anymore.
+//
+// Ownership path of probe_ctx during one probe:
+//   1) here in ProbeNofSegment: refcount=1
+//   2) transferred to ProbeCtxRecycler before return: refcount=1
+//   3) drained at the START of the next probe: refcount=0 → destroyed
+//
+// Thread safety: single heartbeat thread drives the probe loop today,
+// but ProbeCtxRecycler is mutex-protected for forward compatibility
+// (e.g. parallel probes in the future).
+class ProbeCtxRecycler {
+   public:
+    static ProbeCtxRecycler &Instance();
+
+    // Take ownership of a ctx.  Called from ProbeNofSegment just before
+    // it returns.  The caller MUST NOT keep its own shared_ptr after
+    // this call.
+    void Push(std::shared_ptr<ProbeRequestContext> ctx);
+
+    // Take ownership of BOTH a ctx and its associated NofConnection.
+    // Used by ProbeNofSegment's fallback path when the qpair pool did
+    // not reach quiescent within the 30 s budget.  Both objects are
+    // released together at the next probe's Drain(), AFTER the previous
+    // conn's ~NofQpairPool has completed its quiescent wait.
+    //
+    // Forward declaration of NofConnection avoids forcing this header
+    // to depend on nof_connection.h transitively (it already does,
+    // but the forward decl documents intent).
+    void PushWithConn(std::shared_ptr<ProbeRequestContext> ctx,
+                      std::unique_ptr<class NofConnection> conn);
+
+    // Extended variant that also takes the submit wrapper.  Used in
+    // the timeout-fallback path so the wrapper's lifetime matches the
+    // conn's lifetime — both are released at the next probe's Drain()
+    // AFTER ~NofQpairPool has freed the qpair.  This closes the
+    // window where a late callback could fire against a freed wrapper.
+    void PushWithConn(std::shared_ptr<ProbeRequestContext> ctx,
+                      std::unique_ptr<class NofConnection> conn,
+                      std::shared_ptr<ProbeSubmitWrapper> wrapper);
+
+    // Release every pending ctx (and conn/wrapper, if any).  Called at
+    // the start of each probe.  Must run after the previous probe's
+    // NofConnection is destroyed (i.e. at the entry of
+    // ProbeNofSegment, before any new conn is created).
+    void Drain();
+
+   private:
+    ProbeCtxRecycler() = default;
+    std::mutex mutex_;
+    std::vector<std::shared_ptr<ProbeRequestContext>> pending_;
+    // Deferred-destruction conns paired with their ctx.  Drained
+    // together with pending_ at the next probe's Drain().
+    std::vector<std::unique_ptr<class NofConnection>> pending_conns_;
+    // Deferred-destruction submit wrappers paired with their conn.
+    // Drained AFTER pending_conns_ so the wrapper outlives
+    // ~NofQpairPool (and thus any callback that might fire during the
+    // quiescent wait).
+    std::vector<std::shared_ptr<ProbeSubmitWrapper>> pending_wrappers_;
+};
+
+// WorkerPool lifecycle tracking — free functions, NOT SpdkWrapper
+// methods. Reason: during static destruction the SpdkWrapper singleton
+// may already be destroyed, but the SpdkNofWorkerPool destructor still
+// needs to unregister. Free functions can safely access file-level
+// global counters.
 void SpdkNoF_RegisterWorkerPool();
 void SpdkNoF_UnregisterWorkerPool();
 

@@ -54,6 +54,7 @@ environment variables; unset variables keep their default values.
 | `enable_degradation` | true | Enable adaptive degradation |
 | `max_queue_depth` | 256 | Worker task queue depth limit (0 = no limit) |
 | `adaptive_inflight` | true | Adaptive inflight capping based on qpair count |
+| `pipeline_drain_budget_us` | 1000 | PipelineIO drain budget (µs); valid range [100, 100000] via `MC_NVME_PIPELINE_DRAIN_BUDGET_US` |
 
 ### 2. NofQpairPool (`include/spdk/nof_connection.h`)
 
@@ -137,8 +138,17 @@ that exceed the segment extent.
 
 **Pipeline I/O** (high-throughput bulk transfer):
 ```cpp
+// Fire-and-forget (default, backward-compatible):
 ssize_t PipelineRead(void *buf, uint64_t lba, uint32_t total_blocks);
 ssize_t PipelineWrite(const void *buf, uint64_t lba, uint32_t total_blocks);
+
+// Explicit-lifetime (caller-managed ctx_sp):
+std::shared_ptr<PipelineCtx> ctx_sp;
+ssize_t n = PipelineRead(buf, lba, total_blocks, &ctx_sp);
+if (n > 0) {
+    // ... use buf ...
+    DrainForInflight(ctx_sp);  // synchronous wait, then release
+}
 ```
 
 Pipeline I/O loop:
@@ -149,13 +159,76 @@ while (blocks remain OR inflight I/O > 0):
        - GetNextQpair() select a qpair
        - spdk_nvme_ns_cmd_read/write() submit
     2. Poll phase: PollAll(0) harvest completions from all qpairs
-    3. Error handling: drain all inflight I/O, then return -1
+    3. Error handling: drain remaining I/O within pipeline_drain_budget_us
+       (default 1000 µs), then return -1
 ```
 
-> **Note**: PipelineRead/Write are fully implemented at the segment layer but
-> are not currently wired into the Mooncake NoF transfer hot path.
-> TransferSubmitter still submits individual SpdkNofTasks through
-> SubmitRequest/poll.  These pipeline APIs are available for future integration.
+> **Lower-level API**: `PipelineRead`/`PipelineWrite` are chunked-submission
+> APIs for callers that need explicit control over how many I/Os are in
+> flight across all qpairs simultaneously.  They are **not** used by
+> Mooncake's NoF transfer hot path — `TransferSubmitter` drives every
+> transfer via `SpdkNofTask` → `submitTask()` → `SpdkWrapper::SubmitRequest()`
+> → `SubmitRead`/`SubmitWrite`.  Callers integrating NVMe-oF outside the
+> Mooncake transfer flow (e.g. custom bulk-loaders) can use these APIs
+> directly; see `nof_segment.h` for the explicit-lifetime contract.
+
+#### Pipeline Ctx Lifecycle
+
+`PipelineCtx` is **heap-allocated** (`std::shared_ptr<PipelineCtx>`) so it
+can outlive the caller's stack frame.  Two ownership paths exist:
+
+| Path | When | Where the ctx lives |
+|---|---|---|
+| **Explicit lifetime** (`caller_ctx != nullptr`) | Caller manages lifetime | Caller owns the shared_ptr until the caller itself releases it |
+| **Fire-and-forget** (`caller_ctx == nullptr`, default) | Caller does not manage lifetime | `PipelineCtxRecycler` holds the shared_ptr until the next `PipelineIO` entry's `Drain()` |
+
+The fire-and-forget path keeps the heap object alive past `PipelineIO`'s
+return: any late CQE that arrives *before* the next `PipelineIO` call still
+sees a live object.  Together with the explicit-lifetime path and
+`DrainForInflight`, this gives callers:
+
+1. **Default safety** (recycler-as-fallback) — `PipelineCtxRecycler::Push()`
+   runs at the end of every `PipelineIO`; `Drain()` runs at the start of
+   every `PipelineIO`.
+2. **Explicit lifetime for short-lived `buf`** — `caller_ctx` and
+   `DrainForInflight` synchronously wait for in-flight callbacks before
+   the caller releases `buf` or `ctx_sp`.
+
+The drain helper (`DrainPipelineInflight`, file-scope in `nof_segment.cpp`)
+respects a bounded wall-clock budget (`pipeline_drain_budget_us`,
+default 1000 µs).  On budget expiry, the recycler still holds the ctx,
+so the object stays alive until the next `PipelineIO` entry's `Drain()`.
+
+The `inflight`/`error` fields use `memory_order_release`/`acquire` to
+keep the pair consistently ordered across the callback boundary.  In
+single-thread-per-pool operation this documents intent; on contract
+violation it prevents a stale error flag from racing ahead of its
+`inflight` decrement.
+
+#### DrainForInflight
+
+`DrainForInflight(ctx_sp, budget_us=0)` polls all qpairs until
+`ctx_sp->inflight` reaches 0 or `budget_us` elapses.  After it returns,
+the caller may safely release both `ctx_sp` and the buffer that was passed
+to `PipelineRead/Write`.  `budget_us == 0` selects
+`NofConfig::pipeline_drain_budget_us`; an explicit value overrides the
+config.  `SpdkWrapper::PipelineDrain` exposes the same logic through the
+singleton for callers that don't have a direct `NofSegment*` handle.
+
+#### Layer-1 Tests (`tests/nof_segment_pipeline_test.cpp`)
+
+18 unit tests cover:
+- `PipelineCtxRecycler` (5): singleton identity, Push/Drain release,
+  multi-Push/single-Drain, empty-Drain idempotency, external
+  reference outlives recycler transfer.
+- `PipelineIoCb` (4): success decrement, error flag + decrement,
+  multi-callback accumulation, error monotonicity latch.
+  Driven via `mooncake::detail::InvokePipelineIoCbForTest` test hook
+  (compiled in only under `-DMOONCAKE_TEST_PIPELINE_IO=1`).
+- `NofConfigEnv` (6): default value, valid parse, low / high clamp,
+  invalid (non-numeric), boundary values [100, 100000] not clamped.
+- `PipelineCtx` (3): default state, `static_assert` atomic-field type
+  enforcement, only-atomic compile-time guard.
 
 ### 5. SpdkWrapper (`include/spdk/spdk_wrapper.h`)
 
@@ -459,5 +532,16 @@ the same NQN onto a single controller.  The per-controller I/O Queue quota
 
 - **2026-07-31** — Initial multi-qpair implementation (NofQpairPool, NofConnection, NofSegment, PipelineIO)
 - **2026-08-03** — Sequential allocation + backoff retry + TryGrow rebalance + QidPressureGauge + flow-control backpressure
+- **2026-08-20** — Pipeline I/O lifetime and error-path safety
+  - `PipelineCtx` is now heap-allocated (`shared_ptr`); callers may opt into
+    explicit lifetime control via the new `caller_ctx` out-param on
+    `PipelineRead/Write`
+  - `DrainForInflight` + `SpdkWrapper::PipelineDrain` synchronously wait
+    for in-flight callbacks before the caller releases the buffer
+  - `pipeline_drain_budget_us` env-tunable drain budget (default 1000 µs)
+    bounds the wait after a qpair transport error
+  - `PollAll(0)` negative return is now handled (drain + return -1)
+    instead of spinning without checking
+  - 18 Layer-1 unit tests in `tests/nof_segment_pipeline_test.cpp`
 
 ---

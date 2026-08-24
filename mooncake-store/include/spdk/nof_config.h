@@ -11,9 +11,9 @@ namespace mooncake {
 /**
  * @brief NVMe-oF I/O configuration.
  *
- * All fields are populated from MC_NVME_* environment variables via
- * FromEnv(), with sensible defaults derived from benchmark data on the
- * FORINN HWE62P447T6L00LN NVMe-oF target.
+ * All fields are populated from MC_NVME_* / MC_NOF_* environment
+ * variables via FromEnv().  Defaults are documented per-field; tune via
+ * the corresponding environment variables.
  */
 struct NofConfig {
     // ---- Controller options ----
@@ -36,12 +36,22 @@ struct NofConfig {
     uint32_t max_inflight_per_qpair = 64;
 
     // I/O chunk size in blocks.  512 blocks = 2 MiB with 4 KiB blocks.
-    // Benchmark showed 512 gives best read throughput (3,345 MB/s)
-    // and peak write (3,087 MB/s) on FORINN HWE62P447T6L00LN.
+    // Tune via MC_NVME_CHUNK_BLOCKS, valid range [32, 1024].
     uint32_t chunk_blocks = 512;
 
+    // PipelineIO drain budget (microseconds).  When PipelineIO needs to drain
+    // in-flight callbacks (caller_ctx==nullptr path's error handling, or
+    // DrainForInflight with default budget), it polls until the ctx's inflight
+    // counter reaches 0 or until this budget expires.  After the budget
+    // elapses, any callback still pending is delivered to a live heap object
+    // (ctx_sp is held by PipelineCtxRecycler or by the caller).
+    //
+    // Default 1000 us matches the existing 1ms budget used in
+    // NofQpairPool::~NofQpairPool (1000 CQEs per qpair).  Tune via
+    // MC_NVME_PIPELINE_DRAIN_BUDGET_US, valid range [100, 100000].
+    uint32_t pipeline_drain_budget_us = 1000;
+
     // ---- Degradation / fallback ----
-    // Changelog | 2026-08-03 | Added degradation config fields (this PR)
 
     // Minimum acceptable I/O qpair count.  Even when the target QID pool is
     // nearly exhausted, the connection will succeed as long as at least this
@@ -67,7 +77,7 @@ struct NofConfig {
     // Env var: MC_NVME_ENABLE_DEGRADATION (1=on, 0=off).
     bool enable_degradation = true;
 
-    // ---- Flow control (Changelog | 2026-08-03 | this PR) ----
+    // ---- Flow control ----
 
     // Maximum per-worker task queue depth.  0 = no limit.
     // When exceeded, submitTask() blocks the caller to create backpressure,
@@ -99,7 +109,6 @@ struct NofConfig {
     /// Dedicated heartbeat-probe configuration: minimum qpair count
     /// (num_io_queues=1).  Probes need only a single 1-block read and must
     /// not compete with the I/O path for QIDs.
-    /// Changelog | 2026-08-03 | Added (this PR)
     static NofConfig ForProbe();
 };
 
@@ -157,8 +166,10 @@ inline NofConfig NofConfig::FromEnv() {
         cfg.max_inflight_per_qpair = static_cast<uint32_t>(v);
     if (ParseEnvU64_("MC_NVME_CHUNK_BLOCKS", &v))
         cfg.chunk_blocks = static_cast<uint32_t>(v);
+    if (ParseEnvU64_("MC_NVME_PIPELINE_DRAIN_BUDGET_US", &v))
+        cfg.pipeline_drain_budget_us = static_cast<uint32_t>(v);
 
-    // Degradation / fallback (Changelog | 2026-08-03 | this PR)
+    // Degradation / fallback
     if (ParseEnvU64_("MC_NVME_MIN_IO_QUEUES", &v))
         cfg.min_io_queues = static_cast<uint32_t>(v);
     if (ParseEnvU64_("MC_NVME_RETRY_MAX_ATTEMPTS", &v))
@@ -168,7 +179,7 @@ inline NofConfig NofConfig::FromEnv() {
     if (ParseEnvBool_("MC_NVME_ENABLE_DEGRADATION", &bv))
         cfg.enable_degradation = bv;
 
-    // Flow control (Changelog | 2026-08-03 | this PR)
+    // Flow control
     if (ParseEnvU64_("MC_NOF_MAX_QUEUE_DEPTH", &v))
         cfg.max_queue_depth = static_cast<int>(v);
     if (ParseEnvBool_("MC_NOF_ADAPTIVE_INFLIGHT", &bv))
@@ -181,8 +192,11 @@ inline NofConfig NofConfig::FromEnv() {
     if (cfg.chunk_blocks > 1024) cfg.chunk_blocks = 1024;
     if (cfg.max_inflight_per_qpair < 1) cfg.max_inflight_per_qpair = 1;
     if (cfg.max_inflight_per_qpair > 256) cfg.max_inflight_per_qpair = 256;
+    if (cfg.pipeline_drain_budget_us < 100) cfg.pipeline_drain_budget_us = 100;
+    if (cfg.pipeline_drain_budget_us > 100000)
+        cfg.pipeline_drain_budget_us = 100000;
 
-    // Degradation sanity checks (Changelog | 2026-08-03 | this PR)
+    // Degradation sanity checks
     if (cfg.min_io_queues < 1) cfg.min_io_queues = 1;
     if (cfg.min_io_queues > cfg.num_io_queues)
         cfg.min_io_queues = cfg.num_io_queues;
@@ -190,7 +204,7 @@ inline NofConfig NofConfig::FromEnv() {
     if (cfg.retry_backoff_ms < 10) cfg.retry_backoff_ms = 10;
     if (cfg.retry_backoff_ms > 5000) cfg.retry_backoff_ms = 5000;
 
-    // Flow control sanity checks (Changelog | 2026-08-03 | this PR)
+    // Flow control sanity checks
     if (cfg.max_queue_depth < 0) cfg.max_queue_depth = 0;
     if (cfg.max_queue_depth > 4096) cfg.max_queue_depth = 4096;
 
@@ -209,7 +223,6 @@ inline NofConfig NofConfig::ForWrite() {
     return cfg;
 }
 
-// Changelog | 2026-08-03 | Added (this PR)
 // Dedicated heartbeat-probe configuration: minimum qpair count for probing.
 // Probes need only a single 1-block read.  Using num_io_queues=1 drops the
 // per-probe QID cost from 17 to 2, avoiding contention with the I/O path
