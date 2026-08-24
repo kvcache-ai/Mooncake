@@ -41,8 +41,9 @@ def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
     clean_environment.pop("PYTHONPATH", None)
     clean_environment["PYTHONNOUSERSITE"] = "1"
     smoke_script = f"""
-from importlib import metadata
+from importlib import metadata, util
 from pathlib import Path
+import sys
 import mooncake
 import mooncake.engine
 import mooncake.reshard
@@ -60,6 +61,20 @@ for ep_module in (
     "mooncake_elastic_buffer.py",
 ):
     assert (package_path.parent / ep_module).is_file(), ep_module
+for module in (
+    "mooncake.mooncake_ssd_register",
+    "mooncake.mooncake_ssd_unregister",
+    "mooncake.spdk_tgt_create",
+):
+    assert util.find_spec(module) is not None, module
+assert "paramiko" not in sys.modules
+
+installed_files = {{str(path) for path in metadata.files("mooncake-transfer-engine") or []}}
+assert {{
+    "mooncake/mooncake_ssd_register.py",
+    "mooncake/mooncake_ssd_unregister.py",
+    "mooncake/spdk_tgt_create.py",
+}} <= installed_files
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],
