@@ -16,10 +16,9 @@ PGResult<bool> payloadWriterRequiresStaging(
         case DeviceRouteKind::HostProxy:
             return true;
         case DeviceRouteKind::Unreachable:
-            return makePGError(
-                PGErrorCode::InvalidState,
-                "PayloadWriter peer " + std::to_string(peer) +
-                    " has no device transfer route");
+            return makePGError(PGErrorCode::InvalidState,
+                               "PayloadWriter peer " + std::to_string(peer) +
+                                   " has no device transfer route");
     }
     return makePGError(PGErrorCode::NotSupported,
                        "PayloadWriter selected an unsupported transfer route");

@@ -8,10 +8,12 @@
 #include <vector>
 
 #include "control_plane/control_types.h"
-#include "device_comm/device_arena.h"
+#include "device_comm/device_transfer/transfer_region.h"
 #include "error_types.h"
 
 namespace mooncake {
+
+class DeviceTransferService;
 
 // Context-wide payload storage shared by device collective protocols. The
 // buffer is published once as the rank-level DeviceCollectiveEndpoint during
@@ -19,12 +21,13 @@ namespace mooncake {
 // allocated lazily when a route first needs it.
 //
 // StrongStream serializes protocol kernels that borrow these buffers, so one
-// pair can be shared by every communicator in the context.
+// published buffer and one optional staging slice can be shared by every
+// communicator in the context.
 class DeviceCollectiveWorkspace {
    public:
     static PGResult<std::unique_ptr<DeviceCollectiveWorkspace>> create(
-        DeviceArena& arena, GlobalRank self_rank, uint32_t max_world_size,
-        size_t buffer_size, size_t alignment);
+        DeviceTransferService& transfer_service, GlobalRank self_rank,
+        uint32_t max_world_size, size_t buffer_size);
 
     ~DeviceCollectiveWorkspace() noexcept = default;
 
@@ -32,7 +35,9 @@ class DeviceCollectiveWorkspace {
     DeviceCollectiveWorkspace& operator=(const DeviceCollectiveWorkspace&) =
         delete;
 
-    [[nodiscard]] const DeviceArenaSlice& buffer() const noexcept;
+    [[nodiscard]] const RegionSlice& buffer() const noexcept;
+    PGResult<const RegionSlice*> staging();
+
     [[nodiscard]] const DeviceCollectiveEndpoint& localEndpoint()
         const noexcept;
 
@@ -40,23 +45,18 @@ class DeviceCollectiveWorkspace {
         GlobalRank rank, const DeviceCollectiveEndpoint& endpoint);
     PGResult<DeviceCollectiveEndpoint> endpoint(GlobalRank rank) const;
 
-    // Allocates at most once. The returned slice has the same size and
-    // alignment as buffer() and is never published in an endpoint.
-    PGResult<const DeviceArenaSlice*> ensureStaging();
-
    private:
-    DeviceCollectiveWorkspace(
-        DeviceArena& arena, DeviceArenaSlice buffer, size_t alignment,
-        GlobalRank self_rank, uint32_t max_world_size,
-        DeviceCollectiveEndpoint local_endpoint);
+    DeviceCollectiveWorkspace(DeviceTransferService& transfer_service,
+                              RegionSlice buffer, GlobalRank self_rank,
+                              uint32_t max_world_size,
+                              DeviceCollectiveEndpoint local_endpoint);
 
-    DeviceArena& arena_;
-    DeviceArenaSlice buffer_;
-    size_t alignment_ = 0;
+    DeviceTransferService& transfer_service_;
+    RegionSlice buffer_;
+    std::optional<RegionSlice> staging_;
     GlobalRank self_rank_ = kInvalidGlobalRank;
     DeviceCollectiveEndpoint local_endpoint_;
     std::vector<std::optional<DeviceCollectiveEndpoint>> endpoints_;
-    std::optional<DeviceArenaSlice> staging_;
     mutable std::mutex mutex_;
 };
 

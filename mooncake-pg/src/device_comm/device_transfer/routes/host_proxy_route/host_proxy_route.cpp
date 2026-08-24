@@ -3,12 +3,14 @@
 
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.h"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_transfer_proxy.h"
+#include "memory_location.h"
 
 namespace mooncake {
 HostProxyRoute::HostProxyRoute(TransferEngine& engine,
                                LinkManager& link_manager,
                                uint32_t max_world_size)
-    : proxy_(std::make_unique<HostTransferProxy>(engine, link_manager,
+    : engine_(engine),
+      proxy_(std::make_unique<HostTransferProxy>(engine, link_manager,
                                                  max_world_size)),
       max_world_size_(max_world_size) {}
 
@@ -19,6 +21,7 @@ PGResult<void> HostProxyRoute::initialize(int device_index) {
     if (initialized_) return {};
     PG_TRY(proxy_->start());
     PG_TRY(device_slots_, proxy_->initializeDevice(device_index));
+    device_location_ = GPU_PREFIX + std::to_string(device_index);
     initialized_ = true;
     return {};
 }
@@ -69,6 +72,49 @@ PGResult<std::vector<DeviceTransferRoute>> HostProxyRoute::resolveRoutes(
     return routes;
 }
 
+PGResult<void> HostProxyRoute::registerRegion(DeviceRegionKind kind, void* addr,
+                                              size_t size) {
+    PG_VALIDATE_STATE(initialized_, "HostProxyRoute is not initialized");
+    PG_VALIDATE_ARG(addr && size != 0, "host-proxy region is empty");
+
+    switch (kind) {
+        case DeviceRegionKind::PeerAccessible: {
+            PG_TRY_TE(engine_.registerLocalMemory(addr, size, device_location_,
+                                                  /*remote_accessible=*/true,
+                                                  /*update_metadata=*/true));
+            return {};
+        }
+        case DeviceRegionKind::LocalStaging: {
+            // Source-only staging is local metadata: peers never address it
+            // and no registration update needs to be published.
+            PG_TRY_TE(engine_.registerLocalMemory(addr, size, device_location_,
+                                                  /*remote_accessible=*/false,
+                                                  /*update_metadata=*/false));
+            return {};
+        }
+    }
+    return makePGError(PGErrorCode::InvalidArgument,
+                       "unknown host-proxy device region kind");
+}
+
+PGResult<void> HostProxyRoute::unregisterRegion(DeviceRegionKind kind,
+                                                void* addr, size_t size) {
+    PG_VALIDATE_STATE(initialized_, "HostProxyRoute is not initialized");
+    PG_VALIDATE_ARG(addr && size != 0, "host-proxy region is empty");
+    switch (kind) {
+        case DeviceRegionKind::PeerAccessible:
+            PG_TRY_TE(
+                engine_.unregisterLocalMemory(addr, /*update_metadata=*/true));
+            return {};
+        case DeviceRegionKind::LocalStaging:
+            PG_TRY_TE(
+                engine_.unregisterLocalMemory(addr, /*update_metadata=*/false));
+            return {};
+    }
+    return makePGError(PGErrorCode::InvalidArgument,
+                       "unknown host-proxy device region kind");
+}
+
 PGResult<void> HostProxyRoute::quiesce() {
     PG_VALIDATE_STATE(initialized_, "HostProxyRoute is not initialized");
     return proxy_->waitUntilIdle();
@@ -85,6 +131,7 @@ PGResult<void> HostProxyRoute::shutdown() {
     PG_TRY(proxy_->shutdown());
     shutdown_requested_ = true;
     device_slots_ = nullptr;
+    device_location_.clear();
     initialized_ = false;
     return {};
 }
