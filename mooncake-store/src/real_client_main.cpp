@@ -174,6 +174,23 @@ int main(int argc, char *argv[]) {
             return;
         }
         LOG(INFO) << "Received signal " << sig << ", shutting down";
+
+        // Stop ingress before the graceful wait. Close() can block for the
+        // grace period plus the confirmation budget, and while the server is
+        // still serving, a handler could mount a segment that
+        // GracefulUnmountAll() has already snapshotted past, or still be
+        // running when Close() resets the client. stop() closes the acceptors,
+        // closes the live connections and joins the handler pool, so no handler
+        // is running by the time it returns.
+        //
+        // This does not shorten the grace period. What the grace period keeps
+        // alive is peers reading these segments directly through the transfer
+        // engine, which only needs the memory registrations and the master-side
+        // segment state that Close() holds; it does not go through this RPC
+        // port. The port only serves this host's own dummy clients, which are
+        // going away with the process anyway.
+        server.stop();
+
         CloseOptions options;
         options.grace_period =
             std::chrono::seconds(FLAGS_graceful_unmount_seconds);
@@ -182,7 +199,6 @@ int main(int argc, char *argv[]) {
             LOG(ERROR) << "Client shutdown reported an error: "
                        << toString(closed.error());
         }
-        server.stop();
     });
 
     std::thread signal_thread([&signal_io]() { signal_io.run(); });
@@ -192,8 +208,17 @@ int main(int argc, char *argv[]) {
 
     const auto rc = server.start();
 
-    signals.cancel();
+    // Safe to call from any thread, and it does not interrupt a handler that is
+    // already executing. If no signal arrived, this is what lets run() return
+    // instead of blocking on the pending async_wait; if one did, the handler
+    // keeps running Close() and this has no effect on it.
     signal_io.stop();
+
+    // The handler calls server.stop() first, so start() returns while Close()
+    // may still be running. This join is what actually waits for it, and it has
+    // to happen before client_inst goes out of scope. `signals` is deliberately
+    // left alone: asio's signal_set is not safe for concurrent access, and
+    // ~signal_set cancels any operation that is still pending.
     if (signal_thread.joinable()) {
         signal_thread.join();
     }

@@ -65,10 +65,14 @@ namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 
 // Time the client needs, on top of the announced grace period, to observe that
-// the master has released every segment: Client checks 10s after the period
-// elapses and then retries up to three times at 10s intervals, so 40s plus a
-// small margin. Used when CloseOptions::timeout is left unset.
-constexpr std::chrono::seconds kGracefulCloseConfirmationBudget{45};
+// the master has released every segment. Derived from the client's own
+// confirmation schedule (first check one interval after the period elapses,
+// then kGracefulUnmountConfirmRetries retries one interval apart) plus one
+// interval of margin for the master round trips. Used when
+// CloseOptions::timeout is left unset. The schedule is driven by a single
+// aggregate task, so this bound holds for any number of segments.
+constexpr std::chrono::seconds kGracefulCloseConfirmationBudget =
+    kGracefulUnmountConfirmInterval * (kGracefulUnmountConfirmRetries + 2);
 
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
@@ -1373,6 +1377,19 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 }
 
 tl::expected<void, ErrorCode> RealClient::Close(const CloseOptions &options) {
+    // Validate before entering the closing state: a rejected call must leave
+    // the client fully usable, so this has to happen before closed_ is set.
+    // Only exactly zero carries the documented immediate/derived semantics;
+    // CloseOptions uses signed durations, so a negative value is a caller bug
+    // rather than a request for the default.
+    if (options.grace_period < std::chrono::milliseconds::zero() ||
+        options.timeout < std::chrono::milliseconds::zero()) {
+        LOG(ERROR) << "Close() rejected negative CloseOptions: grace_period_ms="
+                   << options.grace_period.count()
+                   << ", timeout_ms=" << options.timeout.count();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
@@ -1719,6 +1736,11 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
 int RealClient::allocateAndMountSegment(
     size_t size, const std::string &protocol, const std::string &location,
     std::vector<std::string> &out_segment_ids, size_t *out_allocated_size) {
+    if (IsClosing()) {
+        LOG(WARNING) << "Rejecting allocateAndMountSegment: client is closing";
+        return -1;
+    }
+
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
@@ -2390,6 +2412,11 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
 tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     int fd, uint64_t dummy_base_addr, size_t shm_size, bool is_local_buffer,
     int32_t physical_device_id, const UUID &client_id) {
+    if (IsClosing()) {
+        LOG(WARNING) << "Rejecting map_shm: client is closing";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     std::stringstream addr_stream;
     addr_stream << "0x" << std::hex << dummy_base_addr;
 
@@ -2512,6 +2539,10 @@ tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
     uint64_t dummy_base_addr, size_t vmm_size, bool is_local_buffer,
     const std::string &shareable_handle_bytes, int32_t device_id,
     const UUID &client_id) {
+    if (IsClosing()) {
+        LOG(WARNING) << "Rejecting ascend_shm: client is closing";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 #ifdef USE_ASCEND_DIRECT
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -2593,6 +2624,10 @@ tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
     uint64_t dummy_base_addr, size_t mem_size, bool is_local_buffer,
     const std::string &ipc_key_bytes, int32_t device_id,
     const UUID &client_id) {
+    if (IsClosing()) {
+        LOG(WARNING) << "Rejecting ascend_ipc_shm: client is closing";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 #ifdef USE_ASCEND_DIRECT
     constexpr size_t kIPCKeyLen = 65;
     if (!client_) {

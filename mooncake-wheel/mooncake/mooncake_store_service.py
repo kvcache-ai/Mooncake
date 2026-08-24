@@ -83,12 +83,29 @@ class MooncakeStoreService:
     - protocol: Communication protocol (tcp or rdma).
     - device_name: The name of the device to use.
     - master_server_address: The address of the master server.
+
+    Shutdown policy (not part of the config file, see
+    --graceful-unmount-seconds):
+    - graceful_unmount_seconds: Grace period applied when stop() closes the
+      store. 0 unmounts immediately.
     """
 
-    def __init__(self, config_path: str = None, cli_config: dict = None):
+    def __init__(
+        self,
+        config_path: str = None,
+        cli_config: dict = None,
+        graceful_unmount_seconds: int = 0,
+    ):
         self.store = None
         self.config = None
         self._setup_logging()
+
+        # Shutdown policy owned by this process-facing wrapper and forwarded to
+        # store.close(); the client itself runs the whole transition. 0 keeps
+        # the previous immediate teardown.
+        if graceful_unmount_seconds < 0:
+            raise ValueError("graceful_unmount_seconds must not be negative")
+        self.graceful_unmount_seconds = graceful_unmount_seconds
 
         # State for /api/reconfigure (Prefill/Decode mode switch)
         self.current_mode = "prefill"  # "prefill" or "decode"
@@ -776,7 +793,15 @@ class MooncakeStoreService:
 
     async def stop(self):
         if self.store:
-            ret = self.store.close()
+            # Forward this process's shutdown policy; close() releases the GIL
+            # while the client waits for the master to release the segments.
+            grace_seconds = getattr(self, "graceful_unmount_seconds", 0)
+            if grace_seconds:
+                logging.info(
+                    "Closing Mooncake store with a %ss graceful unmount period",
+                    grace_seconds,
+                )
+            ret = self.store.close(grace_seconds)
             self.store = None
             if ret != 0:
                 logging.warning("Mooncake service close returned %s", ret)
@@ -810,6 +835,20 @@ def parse_arguments():
         default=60,
         required=False,
     )
+    parser.add_argument(
+        "--graceful-unmount-seconds",
+        type=int,
+        help=(
+            "Grace period, in seconds, for unmounting segments on shutdown "
+            "(default: 0, unmount immediately). When greater than zero, a "
+            "termination signal first asks the master to stop allocating on "
+            "this process's segments while keeping them readable, and the "
+            "process stays alive until the master released them, so peers that "
+            "already hold segment information can finish their reads."
+        ),
+        default=0,
+        required=False,
+    )
     return parser.parse_args()
 
 
@@ -825,7 +864,11 @@ async def main():
         else:
             logging.warning(f"Ignoring invalid CLI config: {item}")
 
-    service = MooncakeStoreService(args.config, cli_config)
+    service = MooncakeStoreService(
+        args.config,
+        cli_config,
+        graceful_unmount_seconds=args.graceful_unmount_seconds,
+    )
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 

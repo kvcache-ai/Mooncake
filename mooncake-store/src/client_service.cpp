@@ -417,6 +417,9 @@ Client::Client(const std::string& local_hostname,
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
+      graceful_unmount_scheduler_([this](const GracefulUnmountCheck& check) {
+          this->OnGracefulUnmountTimer(check);
+      }),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
@@ -459,11 +462,10 @@ Client::~Client() {
         leader_monitor_thread_.join();
     }
 
-    {
-        std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
-        graceful_unmount_timer_stopping_ = true;
-    }
-    graceful_unmount_timer_cv_.notify_all();
+    // Join the confirmation timer thread before tearing down segment state:
+    // its callback touches mounted_segments_ and the transfer engine, and the
+    // teardown below must be the single owner of whatever is left pending.
+    graceful_unmount_scheduler_.Stop();
 
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
@@ -3639,25 +3641,20 @@ bool Client::WaitForGracefulUnmountAll(
     return drained;
 }
 
-bool Client::WaitForGracefulUnmountDelay(std::chrono::milliseconds delay) {
-    std::unique_lock<std::mutex> lock(graceful_unmount_timer_mutex_);
-    return graceful_unmount_timer_cv_.wait_for(
-        lock, delay, [this]() { return graceful_unmount_timer_stopping_; });
-}
-
 void Client::StartGracefulUnmountTimer(const UUID& segment_id,
                                        uint64_t grace_period_ms) {
-    auto delay =
-        std::chrono::milliseconds(grace_period_ms) + std::chrono::seconds(10);
-    task_thread_pool_.enqueue([this, segment_id, delay]() {
-        if (this->WaitForGracefulUnmountDelay(delay)) {
-            return;
-        }
-        this->OnGracefulUnmountTimer(segment_id, /*retry_left=*/3);
-    });
+    // One scheduler entry rather than one blocked worker, so N segments get N
+    // concurrent deadlines instead of being serialized by the pool width.
+    graceful_unmount_scheduler_.Schedule(
+        GracefulUnmountCheck{segment_id, kGracefulUnmountConfirmRetries},
+        std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(grace_period_ms) +
+            kGracefulUnmountConfirmInterval);
 }
 
-void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
+void Client::OnGracefulUnmountTimer(const GracefulUnmountCheck& check) {
+    const UUID& segment_id = check.segment_id;
+
     // Query master to confirm the segment has been removed
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
@@ -3710,18 +3707,10 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
         return;
     }
 
-    if (retry_left > 0) {
-        try {
-            task_thread_pool_.enqueue([this, segment_id, retry_left]() {
-                if (this->WaitForGracefulUnmountDelay(
-                        std::chrono::seconds(10))) {
-                    return;
-                }
-                this->OnGracefulUnmountTimer(segment_id, retry_left - 1);
-            });
-        } catch (const std::runtime_error& e) {
-            VLOG(1) << "Skip graceful unmount retry enqueue: " << e.what();
-        }
+    if (check.retry_left > 0) {
+        graceful_unmount_scheduler_.Schedule(
+            GracefulUnmountCheck{segment_id, check.retry_left - 1},
+            std::chrono::steady_clock::now() + kGracefulUnmountConfirmInterval);
     } else {
         LOG(WARNING) << "Graceful unmount cleanup timeout for segment "
                      << UuidToString(segment_id);

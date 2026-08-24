@@ -1036,8 +1036,20 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::string> &keys, const UUID &client_id) const;
 
-    // Ensure cleanup executes at most once across multiple entry points
+    // Ensure cleanup executes at most once across multiple entry points, and
+    // marks the client as closing so that operations which would create new
+    // resources are rejected instead of racing the teardown.
     std::atomic<bool> closed_{false};
+
+    // True once Close()/tearDownAll() has entered the shutdown transition.
+    // Segment-creating entry points check this: a segment mounted after
+    // GracefulUnmountAll() took its snapshot would never be unmounted
+    // gracefully, and any resource created here can outlive client_.reset().
+    //
+    // Still needed even when a frontend stops its RPC server first: the IPC
+    // channel is only torn down by stop_ipc_server(), which runs after the
+    // graceful wait, so it stays reachable for the whole grace period.
+    bool IsClosing() const { return closed_.load(std::memory_order_acquire); }
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
