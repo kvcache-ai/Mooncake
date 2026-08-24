@@ -784,6 +784,50 @@ TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {
               promoted_sequence_id + 2);
 }
 
+TEST_F(P2PHotStandbyServiceTest,
+       RestorePromotedMetadataCanContinueFromStoreLatestSequence) {
+    P2PMasterService master(MakeMasterConfig());
+    const UUID client_id{37, 37};
+    const UUID segment_id{38, 38};
+    const auto segment = MakeSegment(segment_id);
+
+    RegisterClient(master, client_id, segment);
+    AddReplica(master, "lagged-key-before-promotion", client_id, segment_id,
+               2048);
+
+    P2PHotStandbyService standby(MakeStandbyConfig());
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    ASSERT_TRUE(
+        standby.WaitForAppliedSequence(2, std::chrono::milliseconds(2000)));
+    ASSERT_EQ(standby.Promote(), ErrorCode::OK);
+
+    const uint64_t applied_sequence_id = standby.GetLatestAppliedSequenceId();
+    ASSERT_EQ(applied_sequence_id, 2u);
+
+    LocalFsOpLogStore writer(kClusterId, test_dir_.string(),
+                             /*enable_batch_write=*/false);
+    ASSERT_EQ(writer.Init(), ErrorCode::OK);
+    ASSERT_EQ(writer.UpdateLatestSequenceId(5), ErrorCode::OK);
+
+    uint64_t latest_sequence_id = 0;
+    ASSERT_EQ(standby.GetLatestOpLogSequenceId(latest_sequence_id),
+              ErrorCode::OK);
+    ASSERT_EQ(latest_sequence_id, 5u);
+
+    const uint64_t initial_sequence_id =
+        latest_sequence_id > applied_sequence_id ? latest_sequence_id
+                                                 : applied_sequence_id;
+    P2PMasterService restored_master(MakeMasterConfig());
+    ASSERT_EQ(restored_master.RestoreFromStandbyMetadata(
+                  standby.ExportMetadata(), initial_sequence_id),
+              ErrorCode::OK);
+
+    AddReplica(restored_master, "lagged-key-after-promotion", client_id,
+               segment_id, 1024);
+    ASSERT_NE(restored_master.GetOpLogManager(), nullptr);
+    EXPECT_EQ(restored_master.GetOpLogManager()->GetLastSequenceId(), 6u);
+}
+
 TEST_F(P2PHotStandbyServiceTest, RestorePromotedMetadataIntoWrappedRuntime) {
     P2PMasterService primary_master(MakeMasterConfig());
     const UUID client_id{17, 17};
