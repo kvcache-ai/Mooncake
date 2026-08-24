@@ -87,6 +87,174 @@
     }
 
     #[test]
+    fn extent_store_seals_legacy_unaligned_tail_before_new_writes() {
+        let root = test_extent_store_root("legacy-unaligned-tail");
+        let segment_size = EXTENT_STORE_ALIGNMENT * 4;
+        let logical_locator = "legacy/dense";
+        let payload = vec![0x6du8; EXTENT_STORE_ALIGNMENT as usize];
+        let value_offset = EXTENT_STORE_HEADER_LEN as u64 + logical_locator.len() as u64;
+        let record_len = value_offset + payload.len() as u64;
+        assert!(!is_aligned_u64(value_offset));
+        assert!(!is_aligned_u64(record_len));
+
+        let segments = root.path().join("segments");
+        std::fs::create_dir_all(&segments).expect("segments directory should be created");
+        let path = segments.join(format!("{:016x}.seg", 1));
+        let mut record = vec![0u8; record_len as usize];
+        encode_record_header(
+            &mut record[..EXTENT_STORE_HEADER_LEN],
+            EXTENT_STORE_RECORD_KIND_SINGLE,
+            logical_locator.len() as u64,
+            payload.len() as u64,
+            payload_checksum(&payload),
+            value_offset,
+            record_len,
+        );
+        record[EXTENT_STORE_HEADER_LEN..EXTENT_STORE_HEADER_LEN + logical_locator.len()]
+            .copy_from_slice(logical_locator.as_bytes());
+        record[value_offset as usize..].copy_from_slice(&payload);
+        std::fs::write(&path, &record).expect("legacy dense record should be written");
+
+        let engine = ExtentStoreEngine::new_with_segment_size(root.path(), segment_size)
+            .expect("legacy dense segment should recover");
+        let legacy_locator = ExtentStoreLocator {
+            segment_id: 1,
+            offset: 0,
+            record_len,
+            value_offset,
+            value_len: payload.len() as u64,
+            generation: 1,
+        }
+        .encode();
+        assert_eq!(
+            engine
+                .get(&legacy_locator, payload.len() as u64)
+                .expect("legacy payload should read")
+                .expect("legacy payload should exist"),
+            payload
+        );
+
+        let next = engine
+            .put("aligned/after-upgrade", b"new-data")
+            .expect("new aligned record should write");
+        let next = ExtentStoreLocator::decode(&next).expect("new locator should decode");
+        assert_eq!(next.segment_id, 2);
+        assert_eq!(next.offset, 0);
+        assert!(is_aligned_u64(next.value_offset));
+        assert!(is_aligned_u64(next.record_len));
+    }
+
+    #[test]
+    fn legacy_dense_aligned_value_start_without_padding_uses_buffered_read() {
+        let root = test_extent_store_root("legacy-aligned-start-unpadded-tail");
+        let segment_size = EXTENT_STORE_ALIGNMENT * 4;
+        let logical_locator = "k".repeat(EXTENT_STORE_ALIGNMENT as usize - EXTENT_STORE_HEADER_LEN);
+        let payload = vec![0x7du8; EXTENT_STORE_ALIGNMENT as usize + 1];
+        let value_offset = EXTENT_STORE_HEADER_LEN as u64 + logical_locator.len() as u64;
+        let record_len = value_offset + payload.len() as u64;
+        assert!(is_aligned_u64(value_offset));
+        assert!(!is_aligned_u64(record_len));
+
+        let segments = root.path().join("segments");
+        std::fs::create_dir_all(&segments).expect("segments directory should be created");
+        let path = segments.join(format!("{:016x}.seg", 1));
+        let mut record = vec![0u8; record_len as usize];
+        encode_record_header(
+            &mut record[..EXTENT_STORE_HEADER_LEN],
+            EXTENT_STORE_RECORD_KIND_SINGLE,
+            logical_locator.len() as u64,
+            payload.len() as u64,
+            payload_checksum(&payload),
+            value_offset,
+            record_len,
+        );
+        record[EXTENT_STORE_HEADER_LEN..EXTENT_STORE_HEADER_LEN + logical_locator.len()]
+            .copy_from_slice(logical_locator.as_bytes());
+        record[value_offset as usize..].copy_from_slice(&payload);
+        std::fs::write(&path, &record).expect("legacy dense record should be written");
+
+        let engine = ExtentStoreEngine::new_with_segment_size(root.path(), segment_size)
+            .expect("legacy dense segment should recover");
+        let legacy_locator = ExtentStoreLocator {
+            segment_id: 1,
+            offset: 0,
+            record_len,
+            value_offset,
+            value_len: payload.len() as u64,
+            generation: 1,
+        };
+        assert_eq!(direct_scratch_read_len(&legacy_locator), None);
+        let encoded = legacy_locator.encode();
+        let before = engine.io_stats();
+        let mut destination = vec![0u8; payload.len()];
+        assert_eq!(
+            engine
+                .get_into(&encoded, payload.len() as u64, &mut destination)
+                .expect("legacy unpadded payload should read"),
+            Some(payload.len())
+        );
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(destination, payload);
+        assert_eq!(delta.direct_scratch_read_ops, 0);
+    }
+
+    #[test]
+    fn legacy_deleted_unaligned_tail_is_removed_during_recovery() {
+        let root = test_extent_store_root("legacy-deleted-tail-cleanup");
+        let segment_size = EXTENT_STORE_ALIGNMENT * 4;
+        let logical_locator = "legacy/deleted-tail";
+        let payload = vec![0x55u8; EXTENT_STORE_ALIGNMENT as usize + 17];
+        let value_offset = EXTENT_STORE_HEADER_LEN as u64 + logical_locator.len() as u64;
+        let record_len = value_offset + payload.len() as u64;
+        assert!(!is_aligned_u64(record_len));
+
+        let segments = root.path().join("segments");
+        let meta = root.path().join("meta");
+        std::fs::create_dir_all(&segments).expect("segments directory should be created");
+        std::fs::create_dir_all(&meta).expect("meta directory should be created");
+        let segment_path = segments.join(format!("{:016x}.seg", 1));
+        let mut record = vec![0u8; record_len as usize];
+        encode_record_header(
+            &mut record[..EXTENT_STORE_HEADER_LEN],
+            EXTENT_STORE_RECORD_KIND_SINGLE,
+            logical_locator.len() as u64,
+            payload.len() as u64,
+            payload_checksum(&payload),
+            value_offset,
+            record_len,
+        );
+        record[EXTENT_STORE_HEADER_LEN..EXTENT_STORE_HEADER_LEN + logical_locator.len()]
+            .copy_from_slice(logical_locator.as_bytes());
+        record[value_offset as usize..].copy_from_slice(&payload);
+        std::fs::write(&segment_path, &record).expect("legacy dense record should be written");
+
+        let locator = ExtentStoreLocator {
+            segment_id: 1,
+            offset: 0,
+            record_len,
+            value_offset,
+            value_len: payload.len() as u64,
+            generation: 1,
+        };
+        std::fs::write(
+            delete_journal_path(root.path()),
+            encode_delete_journal_record(&locator),
+        )
+        .expect("legacy delete journal should be written");
+
+        let engine = ExtentStoreEngine::new_with_segment_size(root.path(), segment_size)
+            .expect("legacy deleted segment should recover");
+        assert!(!segment_path.exists());
+        assert_eq!(engine.inner.lock().active_segment_id, 2);
+        let next = engine
+            .put("aligned/after-deleted-legacy", b"new-data")
+            .expect("new aligned record should write");
+        let next = ExtentStoreLocator::decode(&next).expect("new locator should decode");
+        assert_eq!(next.segment_id, 2);
+        assert_eq!(next.offset, 0);
+    }
+
+    #[test]
     fn extent_store_persists_delete_across_restart() {
         let root = test_extent_store_root("delete-restart");
         let payload = b"delete-me".to_vec();

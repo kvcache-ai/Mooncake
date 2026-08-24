@@ -61,11 +61,20 @@ fn recover_extent_store_segments(
     }
     recover_extent_store_delete_journal(root, &mut inner)?;
     remove_fully_dead_sealed_segments(&mut inner, max_recovered_segment_id)?;
-    if inner.active_offset >= inner.segment_size {
+    // Older dense records may leave an unaligned append tail. Preserve those
+    // records for reads, but seal the segment: appending an aligned-length
+    // record at that tail would still violate O_DIRECT's offset contract and
+    // keep every later write in the segment on the buffered lane.
+    if inner.active_offset >= inner.segment_size || !is_aligned_u64(inner.active_offset) {
         inner.active_segment_id = inner.active_segment_id.checked_add(1).ok_or_else(|| {
             StoreError::InvalidState("extent store segment id overflow during recovery".to_string())
         })?;
         inner.active_offset = 0;
+        // The former active segment is sealed now. A delete journal may have
+        // made it fully dead after the first cleanup pass, so give it the same
+        // removal treatment as every other sealed segment.
+        let active_segment_id = inner.active_segment_id;
+        remove_fully_dead_sealed_segments(&mut inner, active_segment_id)?;
     }
     if !inner.segments.contains_key(&inner.active_segment_id) {
         let segment = open_segment(root, inner.active_segment_id, inner.segment_size)?;

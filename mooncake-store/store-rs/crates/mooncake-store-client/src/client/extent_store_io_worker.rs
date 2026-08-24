@@ -37,6 +37,7 @@ impl ExtentStoreFixedBufferRegistry {
             free_slots: (0..EXTENT_STORE_IO_WORKER_FIXED_BUFFER_SLOTS as u16)
                 .rev()
                 .collect(),
+            retired_buffers: Vec::new(),
             legacy_sparse_buffers,
             disabled: false,
             counters,
@@ -80,14 +81,45 @@ impl ExtentStoreFixedBufferRegistry {
         Some(slot)
     }
 
-    fn release(&mut self, slot: u16) {
+    fn release(
+        &mut self,
+        ring: &mut IoUring,
+        slot: u16,
+        buffer: AlignedExtentStoreBuffer,
+    ) -> bool {
+        let update = if self.legacy_sparse_buffers {
+            register_buffers_update(ring.as_raw_fd(), slot as u32, &[empty_iovec()])
+        } else {
+            unsafe {
+                ring.submitter().register_buffers_update(
+                    slot as u32,
+                    &[empty_iovec()],
+                    None,
+                )
+            }
+        };
+        if let Err(error) = update {
+            warn!(
+                error = %error,
+                slot,
+                "extent store fixed buffer release update failed; retaining backing allocation"
+            );
+            self.counters.record_fixed_buffer_update_errno(&error);
+            self.retired_buffers.push(buffer);
+            return false;
+        }
         if !self.disabled {
             self.free_slots.push(slot);
         }
+        true
     }
 
-    fn unregister(self, ring: &IoUring) {
-        let _ = ring.submitter().unregister_buffers();
+    fn unregister(mut self, ring: &IoUring) {
+        if ring.submitter().unregister_buffers().is_err() {
+            for buffer in self.retired_buffers.drain(..) {
+                std::mem::forget(buffer);
+            }
+        }
     }
 }
 
@@ -459,12 +491,18 @@ impl ExtentStoreIoOp {
                 let _ = completion.send(slot);
                 return None;
             }
-            Self::ReleaseBuffer { slot } => {
-                if let Some(buffers) = fixed_buffers {
-                    buffers.release(slot);
-                }
+            Self::ReleaseBuffer {
+                slot,
+                buffer,
+                completion,
+            } => {
+                let released = fixed_buffers
+                    .map(|buffers| buffers.release(ring, slot, buffer))
+                    .unwrap_or(true);
+                let _ = completion.send(released);
                 return None;
             }
+            Self::Nop => return None,
             Self::UnregisterFile { .. } => return None,
         };
         let entry = entry.user_data(user_data);
@@ -484,9 +522,17 @@ impl ExtentStoreIoOp {
 
 struct ExtentStoreScratchArena {
     queue: std::sync::Arc<ExtentStoreIoWorkerQueue>,
-    buffers: Mutex<Vec<ExtentStoreScratchPooledBuffer>>,
+    state: Mutex<ExtentStoreScratchArenaState>,
     counters: std::sync::Arc<ExtentStoreIoCounters>,
     is_read: bool,
+    max_bytes: usize,
+}
+
+struct ExtentStoreScratchArenaState {
+    buffers: Vec<ExtentStoreScratchPooledBuffer>,
+    retired_buffers: Vec<AlignedExtentStoreBuffer>,
+    allocated_bytes: usize,
+    leased_bytes: usize,
 }
 
 struct ExtentStoreScratchPooledBuffer {
@@ -501,8 +547,14 @@ struct ExtentStoreScratchLease {
 }
 
 struct ExtentStoreBufferPool {
-    buffers: Mutex<Vec<AlignedExtentStoreBuffer>>,
+    state: Mutex<ExtentStoreBufferPoolState>,
+    max_bytes: usize,
     counters: std::sync::Arc<ExtentStoreIoCounters>,
+}
+
+struct ExtentStoreBufferPoolState {
+    buffers: Vec<AlignedExtentStoreBuffer>,
+    allocated_bytes: usize,
 }
 
 struct ExtentStoreBufferLease {
@@ -717,6 +769,8 @@ impl ExtentStoreIoWorker {
             state: Mutex::new(ExtentStoreIoWorkerState::default()),
             changed: Condvar::new(),
             counters: counters.clone(),
+            #[cfg(test)]
+            fail_after_submit: AtomicBool::new(false),
         });
         let worker_queue = queue.clone();
         let scratch_arena = std::sync::Arc::new(ExtentStoreScratchArena::new(
@@ -1100,15 +1154,24 @@ fn iouring_read_lane(read: &ReservedExtentStoreRead<'_>) -> ExtentStoreLocalRead
         })
     {
         ExtentStoreLocalReadLane::IoUringDirect
-    } else if read.direct_file.as_ref().is_some_and(|_| {
-        is_aligned_u64(read.locator.offset + read.locator.value_offset)
-            && is_aligned_u64(read.locator.value_len)
-            && read.locator.value_len <= direct_scratch_max_read_len()
-    }) {
+    } else if read.direct_file.is_some() && direct_scratch_read_len(&read.locator).is_some() {
         ExtentStoreLocalReadLane::IoUringDirectScratch
     } else {
         ExtentStoreLocalReadLane::Buffered
     }
+}
+
+fn direct_scratch_read_len(locator: &ExtentStoreLocator) -> Option<usize> {
+    let value_start = locator.offset.checked_add(locator.value_offset)?;
+    if !is_aligned_u64(value_start) || locator.value_len > direct_scratch_max_read_len() {
+        return None;
+    }
+    let aligned_len = align_up(locator.value_len, EXTENT_STORE_ALIGNMENT);
+    let physical_available = locator.record_len.checked_sub(locator.value_offset)?;
+    if aligned_len > physical_available {
+        return None;
+    }
+    usize::try_from(aligned_len).ok()
 }
 
 fn direct_reads_enabled() -> bool {
@@ -1209,16 +1272,6 @@ fn pinned_cold_ordinary_fallback_enabled() -> bool {
 fn segment_preallocate_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| env_bool_default(EXTENT_STORE_SEGMENT_PREALLOCATE_ENV, false))
-}
-
-fn dense_record_max_value_len() -> u64 {
-    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        env_u64(
-            EXTENT_STORE_DENSE_RECORD_MAX_VALUE_BYTES_ENV,
-            EXTENT_STORE_DENSE_RECORD_MAX_VALUE_LEN,
-        )
-    })
 }
 
 fn env_bool(key: &str) -> bool {
@@ -1389,6 +1442,39 @@ fn run_extent_store_io_worker(
                     let _ = request.completion.send(result);
                 }
             }
+            ExtentStoreIoWorkerPipelineOutcome::Fatal(results) => {
+                let mut pending = {
+                    let mut state = queue.state.lock();
+                    state.shutdown = true;
+                    state.first_read_wait = None;
+                    state.first_write_wait = None;
+                    let mut pending = state.reads.drain(..).collect::<Vec<_>>();
+                    pending.extend(state.writes.drain(..));
+                    queue.counters.record_worker_queue_depths(0, 0);
+                    queue.changed.notify_all();
+                    pending
+                };
+                if let Some(buffers) = fixed_buffers.take() {
+                    buffers.unregister(&ring);
+                }
+                if let Some(files) = fixed_files.take() {
+                    files.unregister(&ring);
+                }
+                // Closing the ring cancels and joins requests that may have
+                // been accepted before submit/submit_and_wait failed. Keep
+                // every caller-owned buffer alive until after this point.
+                drop(ring);
+                for (request, result) in requests.drain(..).zip(results) {
+                    let _ = request.completion.send(result);
+                }
+                let stopped = StoreError::Transport(
+                    "extent store io_uring worker stopped after a fatal ring error".to_string(),
+                );
+                for request in pending.drain(..) {
+                    let _ = request.completion.send(Err(stopped.clone()));
+                }
+                return;
+            }
             ExtentStoreIoWorkerPipelineOutcome::Preempted {
                 results,
                 next_unsubmitted,
@@ -1477,7 +1563,7 @@ fn submit_extent_store_io_worker_batch(
     mut fixed_buffers: Option<&mut ExtentStoreFixedBufferRegistry>,
     counters: &ExtentStoreIoCounters,
     requests: &mut [ExtentStoreIoRequest],
-) -> Vec<Result<usize>> {
+) -> ExtentStoreIoWorkerBatchOutcome {
     let mut results = (0..requests.len())
         .map(|_| {
             Err(StoreError::Transport(
@@ -1490,7 +1576,7 @@ fn submit_extent_store_io_worker_batch(
     for (index, request) in requests.iter_mut().enumerate() {
         let op = std::mem::replace(
             &mut request.op,
-            ExtentStoreIoOp::ReleaseBuffer { slot: u16::MAX },
+            ExtentStoreIoOp::Nop,
         );
         if let ExtentStoreIoOp::UnregisterFile { key } = op {
             results[index] = fixed_files
@@ -1519,7 +1605,10 @@ fn submit_extent_store_io_worker_batch(
         submitted[index] = true;
     }
     if submitted_indices.is_empty() {
-        return results;
+        return ExtentStoreIoWorkerBatchOutcome {
+            results,
+            fatal: false,
+        };
     }
     let submitted_count = submitted_indices.len();
     if let Err(error) = ring.submit_and_wait(submitted_count) {
@@ -1528,9 +1617,13 @@ fn submit_extent_store_io_worker_batch(
                 "extent store io_uring worker submit failed: {error}"
             )));
         }
-        return results;
+        return ExtentStoreIoWorkerBatchOutcome {
+            results,
+            fatal: true,
+        };
     }
     let mut completed = 0usize;
+    let mut fatal = false;
     while completed < submitted_count {
         let completion = ring
             .completion()
@@ -1538,13 +1631,14 @@ fn submit_extent_store_io_worker_batch(
             .map(|completion| (completion.user_data(), completion.result()));
         let Some((user_data, result)) = completion else {
             if let Err(error) = ring.submit_and_wait(1) {
-                for index in submitted_indices {
-                    if results[index].is_err() {
+                for &index in &submitted_indices {
+                    if submitted[index] {
                         results[index] = Err(StoreError::Transport(format!(
                             "extent store io_uring completion wait failed: {error}"
                         )));
                     }
                 }
+                fatal = true;
                 break;
             }
             continue;
@@ -1564,7 +1658,12 @@ fn submit_extent_store_io_worker_batch(
             results[index] = Ok(result as usize);
         }
     }
-    results
+    ExtentStoreIoWorkerBatchOutcome { results, fatal }
+}
+
+struct ExtentStoreIoWorkerBatchOutcome {
+    results: Vec<Result<usize>>,
+    fatal: bool,
 }
 
 fn submit_extent_store_io_worker_write_pipeline(
@@ -1582,6 +1681,8 @@ fn submit_extent_store_io_worker_write_pipeline(
         |op| matches!(op, ExtentStoreIoOp::Write { .. } | ExtentStoreIoOp::Writev { .. }),
         ExtentStoreIoWorkerPipelineContext {
             counters: &queue.counters,
+            #[cfg(test)]
+            fail_after_submit: &queue.fail_after_submit,
             preempt_queue: None,
             read_turn: false,
             config: ExtentStoreIoWorkerPipelineConfig {
@@ -1608,6 +1709,8 @@ fn submit_extent_store_io_worker_read_pipeline(
         |op| matches!(op, ExtentStoreIoOp::Read { .. }),
         ExtentStoreIoWorkerPipelineContext {
             counters: &queue.counters,
+            #[cfg(test)]
+            fail_after_submit: &queue.fail_after_submit,
             preempt_queue: None,
             read_turn: true,
             config: ExtentStoreIoWorkerPipelineConfig {
@@ -1621,6 +1724,7 @@ fn submit_extent_store_io_worker_read_pipeline(
 
 enum ExtentStoreIoWorkerPipelineOutcome {
     Complete(Vec<Result<usize>>),
+    Fatal(Vec<Result<usize>>),
     Preempted {
         results: Vec<Result<usize>>,
         next_unsubmitted: usize,
@@ -1635,6 +1739,8 @@ struct ExtentStoreIoWorkerPipelineConfig {
 
 struct ExtentStoreIoWorkerPipelineContext<'a> {
     counters: &'a ExtentStoreIoCounters,
+    #[cfg(test)]
+    fail_after_submit: &'a AtomicBool,
     /// When `Some`, pipeline will check the opposite queue for starvation and
     /// preempt if needed. Split workers pass `None` to disable preemption.
     preempt_queue: Option<&'a ExtentStoreIoWorkerQueue>,
@@ -1651,13 +1757,18 @@ fn submit_extent_store_io_worker_pipeline(
     context: ExtentStoreIoWorkerPipelineContext<'_>,
 ) -> ExtentStoreIoWorkerPipelineOutcome {
     if requests.iter().any(|request| !accepts(&request.op)) {
-        return ExtentStoreIoWorkerPipelineOutcome::Complete(submit_extent_store_io_worker_batch(
+        let outcome = submit_extent_store_io_worker_batch(
             ring,
             fixed_files,
             fixed_buffers,
             context.counters,
             requests,
-        ));
+        );
+        return if outcome.fatal {
+            ExtentStoreIoWorkerPipelineOutcome::Fatal(outcome.results)
+        } else {
+            ExtentStoreIoWorkerPipelineOutcome::Complete(outcome.results)
+        };
     }
 
     let mut results = (0..requests.len())
@@ -1678,6 +1789,7 @@ fn submit_extent_store_io_worker_pipeline(
     let mut acc_ring_submit_us: u64 = 0;
     let mut acc_ring_wait_us: u64 = 0;
     let mut acc_drain_cqe_us: u64 = 0;
+    let mut fatal = false;
 
     while completed_count < requests.len() {
         let t_build = std::time::Instant::now();
@@ -1691,7 +1803,7 @@ fn submit_extent_store_io_worker_pipeline(
             let request_len = requests[next_index].len;
             let op = std::mem::replace(
                 &mut requests[next_index].op,
-                ExtentStoreIoOp::ReleaseBuffer { slot: u16::MAX },
+                ExtentStoreIoOp::Nop,
             );
             let Some(entry) = op.build_entry(
                 ring,
@@ -1732,6 +1844,23 @@ fn submit_extent_store_io_worker_pipeline(
                         )));
                     }
                 }
+                fatal = true;
+                break;
+            }
+            #[cfg(test)]
+            if context
+                .fail_after_submit
+                .swap(false, AtomicOrdering::SeqCst)
+            {
+                for index in 0..next_index {
+                    if submitted[index] {
+                        submitted[index] = false;
+                        results[index] = Err(StoreError::Transport(
+                            "injected extent store io_uring fatal submit error".to_string(),
+                        ));
+                    }
+                }
+                fatal = true;
                 break;
             }
             let submit_elapsed = submit_started.elapsed();
@@ -1812,6 +1941,7 @@ fn submit_extent_store_io_worker_pipeline(
                     )));
                 }
             }
+            fatal = true;
             break;
         }
         let wait_elapsed = wait_started.elapsed();
@@ -1838,7 +1968,11 @@ fn submit_extent_store_io_worker_pipeline(
     record_io_uring_phase_duration("drain_cqe", Duration::from_micros(acc_drain_cqe_us));
     record_io_uring_ops("complete", completed_count as u64);
 
-    ExtentStoreIoWorkerPipelineOutcome::Complete(results)
+    if fatal {
+        ExtentStoreIoWorkerPipelineOutcome::Fatal(results)
+    } else {
+        ExtentStoreIoWorkerPipelineOutcome::Complete(results)
+    }
 }
 
 fn complete_extent_store_io_worker_request(
@@ -1883,6 +2017,7 @@ fn submit_write_batch_io_worker(
 ) -> Vec<Result<()>> {
     let mut results = (0..writes.len()).map(|_| Ok(())).collect::<Vec<_>>();
     let mut written = vec![0usize; writes.len()];
+    let mut buffered_fallback = vec![false; writes.len()];
     let scratch_arena = worker.scratch_arena();
     let mut inflight_buffers = (0..writes.len()).map(|_| None).collect::<Vec<_>>();
     let mut remaining = writes.len();
@@ -1897,40 +2032,88 @@ fn submit_write_batch_io_worker(
             }
             let write = &writes[index].1;
             let offset = write.locator.offset.saturating_add(written[index] as u64);
-            let op = match write_lane(write) {
+            let lane = if buffered_fallback[index] {
+                ExtentStoreWriteLane::Buffered
+            } else {
+                write_lane(write)
+            };
+            let op = match lane {
                 ExtentStoreWriteLane::DirectScratch => {
                     if inflight_buffers[index].is_none() {
-                        match materialize_direct_record(&scratch_arena, &write.record) {
-                            Ok(record) => {
-                                inflight_buffers[index] = Some(ExtentStoreWriteBuffers::Direct(record));
+                        let record_len = write.record.record_len as usize;
+                        match scratch_arena.lease(record_len) {
+                            Ok(mut buffer) => {
+                                if let Err(error) =
+                                    materialize_direct_record_into(&write.record, &mut buffer)
+                                {
+                                    results[index] = Err(error);
+                                    remaining = remaining.saturating_sub(1);
+                                    continue;
+                                }
+                                if written[index] == 0 {
+                                    worker
+                                        .counters
+                                        .direct_scratch_write_ops
+                                        .fetch_add(1, AtomicOrdering::Relaxed);
+                                }
+                                inflight_buffers[index] = Some(ExtentStoreWriteBuffers::Direct(
+                                    ExtentStoreScratchRecord { buffer, record_len },
+                                ));
                             }
-                            Err(error) => {
-                                results[index] = Err(error);
-                                remaining = remaining.saturating_sub(1);
-                                continue;
+                            Err(_) => {
+                                buffered_fallback[index] = true;
+                                worker
+                                    .counters
+                                    .buffered_write_ops
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                inflight_buffers[index] = Some(ExtentStoreWriteBuffers::Iovecs(
+                                    write.record.iovecs_from(written[index]),
+                                ));
                             }
                         }
                     }
-                    let record = match inflight_buffers[index].as_mut() {
-                        Some(ExtentStoreWriteBuffers::Direct(record)) => record,
-                        _ => unreachable!("direct scratch record should be materialized before submission"),
-                    };
-                    let file = write
-                        .direct_file
-                        .as_ref()
-                        .expect("direct scratch lane requires direct file");
-                    ExtentStoreIoOp::Write {
-                        fd: file.as_raw_fd(),
-                        buf: record.buffer[written[index]..].as_ptr(),
-                        len: (record.record_len - written[index]) as u32,
-                        offset,
-                        fixed_file_key: Some(ExtentStoreFixedFileKey::for_direct(
-                            write.locator.segment_id,
-                        )),
-                        fixed_buffer: record.buffer.fixed_slot,
+                    if buffered_fallback[index] {
+                        let iovecs = match inflight_buffers[index].as_ref() {
+                            Some(ExtentStoreWriteBuffers::Iovecs(iovecs)) => iovecs,
+                            _ => unreachable!("buffered fallback requires stable iovec storage"),
+                        };
+                        ExtentStoreIoOp::Writev {
+                            fd: write.file.as_raw_fd(),
+                            iovecs: iovecs.as_ptr(),
+                            len: iovecs.len() as u32,
+                            offset,
+                            fixed_file_key: Some(ExtentStoreFixedFileKey::for_buffered(
+                                write.locator.segment_id,
+                            )),
+                        }
+                    } else {
+                        let record = match inflight_buffers[index].as_mut() {
+                            Some(ExtentStoreWriteBuffers::Direct(record)) => record,
+                            _ => unreachable!("direct scratch record should be materialized before submission"),
+                        };
+                        let file = write
+                            .direct_file
+                            .as_ref()
+                            .expect("direct scratch lane requires direct file");
+                        ExtentStoreIoOp::Write {
+                            fd: file.as_raw_fd(),
+                            buf: record.buffer[written[index]..].as_ptr(),
+                            len: (record.record_len - written[index]) as u32,
+                            offset,
+                            fixed_file_key: Some(ExtentStoreFixedFileKey::for_direct(
+                                write.locator.segment_id,
+                            )),
+                            fixed_buffer: record.buffer.fixed_slot,
+                        }
                     }
                 }
                 ExtentStoreWriteLane::Direct => {
+                    if written[index] == 0 {
+                        worker
+                            .counters
+                            .direct_write_ops
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
                     inflight_buffers[index] = Some(ExtentStoreWriteBuffers::Iovecs(
                         write.record.iovecs_from(written[index]),
                     ));
@@ -1953,6 +2136,12 @@ fn submit_write_batch_io_worker(
                     }
                 }
                 ExtentStoreWriteLane::Buffered => {
+                    if written[index] == 0 && !buffered_fallback[index] {
+                        worker
+                            .counters
+                            .buffered_write_ops
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
                     inflight_buffers[index] = Some(ExtentStoreWriteBuffers::Iovecs(
                         write.record.iovecs_from(written[index]),
                     ));
@@ -2004,15 +2193,35 @@ fn submit_write_batch_io_worker(
                     continue;
                 }
             };
-            if result == 0 {
+                            if result == 0 {
                 results[index] = Err(StoreError::Transport(
                     "extent store write completed with zero bytes".to_string(),
                 ));
                 remaining = remaining.saturating_sub(1);
                 continue;
             }
+            let record_len = writes[index].1.record.record_len as usize;
+            let remaining_len = record_len.saturating_sub(written[index]);
+            if result > remaining_len {
+                results[index] = Err(StoreError::Transport(format!(
+                    "extent store write completed beyond request: remaining {remaining_len} actual {result}"
+                )));
+                remaining = remaining.saturating_sub(1);
+                continue;
+            }
+            if !buffered_fallback[index]
+                && !matches!(write_lane(&writes[index].1), ExtentStoreWriteLane::Buffered)
+                && result < remaining_len
+                && !result.is_multiple_of(EXTENT_STORE_ALIGNMENT as usize)
+            {
+                results[index] = Err(StoreError::Transport(format!(
+                    "extent store direct write completed at unaligned boundary: {result} bytes"
+                )));
+                remaining = remaining.saturating_sub(1);
+                continue;
+            }
             written[index] = written[index].saturating_add(result);
-            if written[index] >= writes[index].1.record.record_len as usize {
+            if written[index] >= record_len {
                 remaining = remaining.saturating_sub(1);
             }
         }
@@ -2060,6 +2269,7 @@ fn submit_read_batch_io_worker(
             &mut batch_entries,
             &mut entries,
         );
+        let mut staged_bytes = entries.iter().map(|entry| entry.len).sum::<usize>();
         for index in 0..reads.len() {
             if completed.get(index).copied().unwrap_or(false)
                 || results[index].is_err()
@@ -2082,12 +2292,17 @@ fn submit_read_batch_io_worker(
                 && read.direct_file.as_ref().is_some_and(|_| {
                     direct_payload_io_compatible(payload_start, &read.dst[payload_offset..value_len])
                 });
-            let use_direct_scratch = !use_direct
-                && read.direct_file.as_ref().is_some_and(|_| {
-                    is_aligned_u64(read.locator.offset + read.locator.value_offset)
-                        && is_aligned_u64(read.locator.value_len)
-                        && read.locator.value_len <= direct_scratch_max_read_len()
-                });
+            let mut direct_scratch_len = (!use_direct && read.direct_file.is_some())
+                .then(|| direct_scratch_read_len(&read.locator))
+                .flatten();
+            if let Some(aligned_len) = direct_scratch_len {
+                if staged_bytes != 0
+                    && staged_bytes.saturating_add(aligned_len)
+                        > EXTENT_STORE_IO_WORKER_READ_PIPELINE_MAX_INFLIGHT_BYTES
+                {
+                    continue;
+                }
+            }
             let op = if use_direct {
                 let file = read
                     .direct_file
@@ -2104,35 +2319,50 @@ fn submit_read_batch_io_worker(
                     )),
                     fixed_buffer: None,
                 }
-            } else if use_direct_scratch {
+            } else if direct_scratch_len.is_some() {
+                let aligned_len = direct_scratch_len
+                    .expect("direct scratch length checked before allocating buffer");
                 if direct_scratch_buffers[index].is_none() {
-                    match scratch_arena.lease(value_len) {
+                    match scratch_arena.lease(aligned_len) {
                         Ok(buffer) => {
                             direct_scratch_buffers[index] = Some(buffer);
+                            staged_bytes = staged_bytes.saturating_add(aligned_len);
                         }
-                        Err(error) => {
-                            results[index] = Err(error);
-                            remaining = remaining.saturating_sub(1);
-                            continue;
+                        Err(_) => {
+                            direct_scratch_len = None;
                         }
                     }
                 }
-                let file = read
-                    .direct_file
-                    .as_ref()
-                    .expect("direct scratch file checked above");
-                let scratch = direct_scratch_buffers[index]
-                    .as_mut()
-                    .expect("direct scratch read buffer should be allocated before submission");
-                ExtentStoreIoOp::Read {
-                    fd: file.as_raw_fd(),
-                    buf: scratch[payload_offset..value_len].as_mut_ptr(),
-                    len: (value_len - payload_offset) as u32,
-                    offset,
-                    fixed_file_key: Some(ExtentStoreFixedFileKey::for_direct(
-                        read.locator.segment_id,
-                    )),
-                    fixed_buffer: scratch.fixed_slot,
+                if let Some(aligned_len) = direct_scratch_len {
+                    let file = read
+                        .direct_file
+                        .as_ref()
+                        .expect("direct scratch file checked above");
+                    let scratch = direct_scratch_buffers[index]
+                        .as_mut()
+                        .expect("direct scratch read buffer should be allocated before submission");
+                    ExtentStoreIoOp::Read {
+                        fd: file.as_raw_fd(),
+                        buf: scratch[payload_offset..aligned_len].as_mut_ptr(),
+                        len: (aligned_len - payload_offset) as u32,
+                        offset,
+                        fixed_file_key: Some(ExtentStoreFixedFileKey::for_direct(
+                            read.locator.segment_id,
+                        )),
+                        fixed_buffer: scratch.fixed_slot,
+                    }
+                } else {
+                    let payload = &mut read.dst[payload_offset..value_len];
+                    ExtentStoreIoOp::Read {
+                        fd: read.file.as_raw_fd(),
+                        buf: payload.as_mut_ptr(),
+                        len: payload.len() as u32,
+                        offset,
+                        fixed_file_key: Some(ExtentStoreFixedFileKey::for_buffered(
+                            read.locator.segment_id,
+                        )),
+                        fixed_buffer: None,
+                    }
                 }
             } else {
                 let payload = &mut read.dst[payload_offset..value_len];
@@ -2147,10 +2377,14 @@ fn submit_read_batch_io_worker(
                     fixed_buffer: None,
                 }
             };
-            let len = value_len - payload_offset;
+            let len = if let Some(aligned_len) = direct_scratch_len {
+                aligned_len - payload_offset
+            } else {
+                value_len - payload_offset
+            };
             if use_direct {
                 worker.counters().record_direct_read(len);
-            } else if use_direct_scratch {
+            } else if direct_scratch_len.is_some() {
                 worker.counters().record_direct_scratch_read(len);
             } else {
                 worker.counters().record_buffered_read(len);
@@ -2184,7 +2418,7 @@ fn submit_read_batch_io_worker(
                         reads,
                         &mut results,
                         &mut read_offsets,
-                        &direct_scratch_buffers,
+                        &mut direct_scratch_buffers,
                         &mut remaining,
                         index,
                         completion,
@@ -2285,6 +2519,7 @@ fn coalesce_and_submit_span_reads(
         return;
     }
     candidates.sort_by_key(|(segment_id, start, _, _, _)| (*segment_id, *start));
+    let mut staged_bytes = entries.iter().map(|entry| entry.len).sum::<usize>();
     let mut cursor = 0usize;
     while cursor < candidates.len() {
         let (segment_id, span_start, first_end, first_index, first_requested) = candidates[cursor];
@@ -2317,10 +2552,17 @@ fn coalesce_and_submit_span_reads(
             continue;
         }
         let span_len = (span_end - span_start) as usize;
+        if staged_bytes != 0
+            && staged_bytes.saturating_add(span_len)
+                > EXTENT_STORE_IO_WORKER_READ_PIPELINE_MAX_INFLIGHT_BYTES
+        {
+            continue;
+        }
         let mut scratch = match scratch_arena.lease(span_len) {
             Ok(scratch) => scratch,
             Err(_) => continue,
         };
+        staged_bytes = staged_bytes.saturating_add(span_len);
         let fixed_slot = scratch.fixed_slot;
         let fd = reads[indices[0]]
             .1
@@ -2426,27 +2668,29 @@ fn plan_coalesced_direct_scratch_reads(
                     payload_start,
                     &read.dst[..read.locator.value_len as usize],
                 );
-            let aligned_payload =
-                is_aligned_u64(payload_start) && is_aligned_u64(read.locator.value_len);
+            let aligned_start = is_aligned_u64(payload_start);
             let direct_scratch_sized = read.locator.value_len <= direct_scratch_max_read_len();
             let dense_payload = read.locator.value_len <= EXTENT_STORE_DENSE_COALESCE_MAX_VALUE_LEN;
-            if (!aligned_payload && !dense_payload)
-                || (aligned_payload && !direct_scratch_sized && !direct_compatible)
+            if (!aligned_start && !dense_payload)
+                || (aligned_start && !direct_scratch_sized && !direct_compatible)
                 || (direct_compatible
                     && read.locator.value_len > EXTENT_STORE_COALESCE_DIRECT_COMPATIBLE_MAX_VALUE_LEN)
             {
                 return None;
             }
-            let span_start = if aligned_payload {
+            let span_start = if aligned_start {
                 payload_start
             } else {
                 align_down(payload_start, EXTENT_STORE_ALIGNMENT)
             };
-            let span_end = if aligned_payload {
-                payload_start + read.locator.value_len
-            } else {
-                align_up(payload_start + read.locator.value_len, EXTENT_STORE_ALIGNMENT)
-            };
+            let span_end = align_up(
+                payload_start + read.locator.value_len,
+                EXTENT_STORE_ALIGNMENT,
+            );
+            let record_end = read.locator.offset.checked_add(read.locator.record_len)?;
+            if span_end > record_end {
+                return None;
+            }
             Some((
                 read.locator.segment_id,
                 span_start,
@@ -2476,7 +2720,7 @@ fn apply_single_read_completion(
     reads: &mut [(usize, ReservedExtentStoreRead<'_>)],
     results: &mut [Result<()>],
     read_offsets: &mut [usize],
-    direct_scratch_buffers: &[Option<ExtentStoreScratchLease>],
+    direct_scratch_buffers: &mut [Option<ExtentStoreScratchLease>],
     remaining: &mut usize,
     index: usize,
     completion: Result<usize>,
@@ -2487,24 +2731,37 @@ fn apply_single_read_completion(
     let result = match completion {
         Ok(result) => result,
         Err(error) => {
+            direct_scratch_buffers[index].take();
             results[index] = Err(error);
             *remaining = remaining.saturating_sub(1);
             return;
         }
     };
     if result == 0 {
+        direct_scratch_buffers[index].take();
         results[index] = Err(StoreError::NotFound(
             "extent store read reached EOF".to_string(),
         ));
         *remaining = remaining.saturating_sub(1);
         return;
     }
+    if let Some(scratch) = direct_scratch_buffers[index].take() {
+        let value_len = reads[index].1.locator.value_len as usize;
+        let aligned_len = align_up(value_len as u64, EXTENT_STORE_ALIGNMENT) as usize;
+        if result != aligned_len {
+            results[index] = Err(StoreError::NotFound(format!(
+                "extent store direct scratch read completed short: expected {aligned_len} actual {result}"
+            )));
+            *remaining = remaining.saturating_sub(1);
+            return;
+        }
+        reads[index].1.dst[..value_len].copy_from_slice(&scratch[..value_len]);
+        read_offsets[index] = value_len;
+        *remaining = remaining.saturating_sub(1);
+        return;
+    }
     read_offsets[index] = read_offsets[index].saturating_add(result);
     if read_offsets[index] >= reads[index].1.locator.value_len as usize {
-        if let Some(scratch) = direct_scratch_buffers[index].as_ref() {
-            let value_len = reads[index].1.locator.value_len as usize;
-            reads[index].1.dst[..value_len].copy_from_slice(&scratch[..value_len]);
-        }
         *remaining = remaining.saturating_sub(1);
     }
 }
@@ -2585,50 +2842,110 @@ impl ExtentStoreScratchArena {
     ) -> Self {
         Self {
             queue,
-            buffers: Mutex::new(Vec::new()),
+            state: Mutex::new(ExtentStoreScratchArenaState {
+                buffers: Vec::new(),
+                retired_buffers: Vec::new(),
+                allocated_bytes: 0,
+                leased_bytes: 0,
+            }),
             counters,
             is_read,
+            max_bytes: if is_read {
+                EXTENT_STORE_IO_WORKER_READ_PIPELINE_MAX_INFLIGHT_BYTES
+            } else {
+                EXTENT_STORE_IO_WORKER_WRITE_PIPELINE_MAX_INFLIGHT_BYTES
+            },
         }
     }
 
     fn lease(self: &std::sync::Arc<Self>, len: usize) -> Result<ExtentStoreScratchLease> {
-        let pooled = {
-            let mut buffers = self.buffers.lock();
-            let buffer = buffers
+        if len > self.max_bytes {
+            return Err(StoreError::Backpressure(format!(
+                "extent store scratch request {len} exceeds arena budget {}",
+                self.max_bytes
+            )));
+        }
+        let max_reuse_len = if len == 0 { 0 } else { len.saturating_mul(2) };
+        let pooled = loop {
+            let mut state = self.state.lock();
+            let reusable = state
+                .buffers
                 .iter()
-                .position(|pooled| pooled.buffer.len() >= len)
-                .map(|index| buffers.swap_remove(index));
-            let pool_bytes = buffers
+                .enumerate()
+                .filter(|(_, pooled)| {
+                    pooled.buffer.len() >= len && pooled.buffer.len() <= max_reuse_len
+                })
+                .min_by_key(|(_, pooled)| pooled.buffer.len())
+                .map(|(index, _)| index);
+            if let Some(index) = reusable {
+                let buffer = state.buffers.swap_remove(index);
+                let pool_bytes = state
+                    .buffers
+                    .iter()
+                    .map(|pooled| pooled.buffer.len())
+                    .sum::<usize>();
+                self.counters
+                    .record_scratch_pool(state.buffers.len(), pool_bytes);
+                state.leased_bytes = state.leased_bytes.saturating_add(buffer.buffer.len());
+                break Some(buffer);
+            }
+            if state.allocated_bytes.saturating_add(len) <= self.max_bytes {
+                state.allocated_bytes = state.allocated_bytes.saturating_add(len);
+                state.leased_bytes = state.leased_bytes.saturating_add(len);
+                let pool_bytes = state
+                    .buffers
+                    .iter()
+                    .map(|pooled| pooled.buffer.len())
+                    .sum::<usize>();
+                self.counters
+                    .record_scratch_pool(state.buffers.len(), pool_bytes);
+                break None;
+            }
+            let Some(index) = state
+                .buffers
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, pooled)| pooled.buffer.len())
+                .map(|(index, _)| index)
+            else {
+                return Err(StoreError::Backpressure(format!(
+                    "extent store scratch arena budget {} is fully leased",
+                    self.max_bytes
+                )));
+            };
+            let evicted = state.buffers.swap_remove(index);
+            let pool_bytes = state
+                .buffers
                 .iter()
                 .map(|pooled| pooled.buffer.len())
                 .sum::<usize>();
-            self.counters.record_scratch_pool(buffers.len(), pool_bytes);
-            buffer
+            self.counters
+                .record_scratch_pool(state.buffers.len(), pool_bytes);
+            drop(state);
+            self.retire_buffer(evicted);
         };
-        let (mut buffer, fixed_slot) = match pooled {
+        let (buffer, fixed_slot) = match pooled {
             Some(mut pooled) => {
                 self.counters.record_scratch_reuse(len);
-                pooled.buffer[..len].fill(0);
                 (pooled.buffer, pooled.fixed_slot.take())
             }
             None => {
                 self.counters.record_scratch_alloc(len);
-                let buffer = AlignedExtentStoreBuffer::zeroed(len)?;
+                // Every caller either materializes the complete submitted
+                // write range or lets DMA overwrite the complete read range.
+                // Avoid an otherwise redundant full-buffer memset here.
+                let buffer = match AlignedExtentStoreBuffer::uninitialized(len) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        self.release_allocation(len);
+                        return Err(error);
+                    }
+                };
                 let fixed_slot = self.register_fixed_buffer(&buffer);
                 (buffer, fixed_slot)
             }
         };
-        let buffer_len = buffer.len();
-        let fixed_slot = if buffer_len < len {
-            if let Some(slot) = fixed_slot {
-                self.release_fixed_buffer(slot);
-            }
-            self.counters.record_scratch_alloc(len);
-            buffer = AlignedExtentStoreBuffer::zeroed(len)?;
-            self.register_fixed_buffer(&buffer)
-        } else {
-            fixed_slot
-        };
+        debug_assert!(buffer.len() >= len);
         Ok(ExtentStoreScratchLease {
             buffer: Some(buffer),
             fixed_slot,
@@ -2637,6 +2954,9 @@ impl ExtentStoreScratchArena {
     }
 
     fn register_fixed_buffer(&self, buffer: &AlignedExtentStoreBuffer) -> Option<u16> {
+        if buffer.len() > EXTENT_STORE_IO_WORKER_FIXED_BUFFER_MAX_BYTES {
+            return None;
+        }
         let (tx, rx) = extent_store_channel();
         {
             let mut state = self.queue.state.lock();
@@ -2663,32 +2983,82 @@ impl ExtentStoreScratchArena {
         rx.recv().ok().flatten()
     }
 
-    fn release_fixed_buffer(&self, slot: u16) {
+    fn release_fixed_buffer(&self, slot: u16, buffer: AlignedExtentStoreBuffer) -> bool {
+        let (release_tx, release_rx) = extent_store_channel();
         let mut state = self.queue.state.lock();
-        if !state.shutdown {
-            let request = ExtentStoreIoRequest {
-                op: ExtentStoreIoOp::ReleaseBuffer { slot },
-                len: 0,
-                completion: extent_store_channel().0,
-                enqueue_time: std::time::Instant::now(),
-            };
-            if self.is_read {
-                state.reads.push_back(request);
-            } else {
-                state.writes.push_back(request);
-            }
-            self.queue.changed.notify_one();
+        if state.shutdown {
+            drop(state);
+            self.state.lock().retired_buffers.push(buffer);
+            return false;
+        }
+        let request = ExtentStoreIoRequest {
+            op: ExtentStoreIoOp::ReleaseBuffer {
+                slot,
+                buffer,
+                completion: release_tx,
+            },
+            len: 0,
+            completion: extent_store_channel().0,
+            enqueue_time: std::time::Instant::now(),
+        };
+        if self.is_read {
+            state.reads.push_back(request);
+        } else {
+            state.writes.push_back(request);
+        }
+        self.queue.changed.notify_one();
+        drop(state);
+        release_rx.recv().unwrap_or(false)
+    }
+
+    fn retire_buffer(&self, buffer: ExtentStoreScratchPooledBuffer) {
+        let buffer_len = buffer.buffer.len();
+        let released = if let Some(slot) = buffer.fixed_slot {
+            self.release_fixed_buffer(slot, buffer.buffer)
+        } else {
+            drop(buffer.buffer);
+            true
+        };
+        if released {
+            let mut state = self.state.lock();
+            state.allocated_bytes = state.allocated_bytes.saturating_sub(buffer_len);
         }
     }
 
     fn release(&self, buffer: AlignedExtentStoreBuffer, fixed_slot: Option<u16>) {
-        let mut buffers = self.buffers.lock();
-        buffers.push(ExtentStoreScratchPooledBuffer { buffer, fixed_slot });
-        let pool_bytes = buffers
+        let mut state = self.state.lock();
+        state.leased_bytes = state.leased_bytes.saturating_sub(buffer.len());
+        let pool_bytes = state
+            .buffers
             .iter()
             .map(|pooled| pooled.buffer.len())
             .sum::<usize>();
-        self.counters.record_scratch_pool(buffers.len(), pool_bytes);
+        if state.buffers.len() < EXTENT_STORE_IO_WORKER_FIXED_BUFFER_SLOTS as usize
+            && pool_bytes.saturating_add(buffer.len()) <= self.max_bytes
+        {
+            state
+                .buffers
+                .push(ExtentStoreScratchPooledBuffer { buffer, fixed_slot });
+        } else {
+            drop(state);
+            self.retire_buffer(ExtentStoreScratchPooledBuffer { buffer, fixed_slot });
+            return;
+        }
+        let pool_bytes = state
+            .buffers
+            .iter()
+            .map(|pooled| pooled.buffer.len())
+            .sum::<usize>();
+        self.counters
+            .record_scratch_pool(state.buffers.len(), pool_bytes);
+        drop(state);
+    }
+
+    fn release_allocation(&self, len: usize) {
+        let mut state = self.state.lock();
+        state.allocated_bytes = state.allocated_bytes.saturating_sub(len);
+        state.leased_bytes = state.leased_bytes.saturating_sub(len);
+        drop(state);
     }
 }
 
@@ -2777,11 +3147,15 @@ impl ExtentStoreIoCounters {
 
     fn record_worker_batch(&self, read: bool, ops: usize, bytes: usize) {
         if read {
+            self.worker_read_batches
+                .fetch_add(1, AtomicOrdering::Relaxed);
             self.worker_read_batch_ops
                 .fetch_add(ops as u64, AtomicOrdering::Relaxed);
             self.worker_read_batch_bytes
                 .fetch_add(bytes as u64, AtomicOrdering::Relaxed);
         } else {
+            self.worker_write_batches
+                .fetch_add(1, AtomicOrdering::Relaxed);
             self.worker_write_batch_ops
                 .fetch_add(ops as u64, AtomicOrdering::Relaxed);
             self.worker_write_batch_bytes
@@ -3097,6 +3471,8 @@ impl ExtentStoreIoWorkerPool {
             state: Mutex::new(ExtentStoreIoWorkerState::default()),
             changed: Condvar::new(),
             counters: counters.clone(),
+            #[cfg(test)]
+            fail_after_submit: AtomicBool::new(false),
         });
         let scratch_arena = std::sync::Arc::new(ExtentStoreScratchArena::new(
             queue.clone(),
@@ -3324,6 +3700,36 @@ fn run_pool_read_worker(
                 for (request, result) in requests.drain(..).zip(results) {
                     let _ = request.completion.send(result);
                 }
+            }
+            ExtentStoreIoWorkerPipelineOutcome::Fatal(results) => {
+                let mut pending = {
+                    let mut state = queue.state.lock();
+                    state.shutdown = true;
+                    state.first_read_wait = None;
+                    state.first_write_wait = None;
+                    let mut pending = state.reads.drain(..).collect::<Vec<_>>();
+                    pending.extend(state.writes.drain(..));
+                    queue.counters.record_worker_queue_depths(0, 0);
+                    queue.changed.notify_all();
+                    pending
+                };
+                if let Some(buffers) = fixed_buffers.take() {
+                    buffers.unregister(&ring);
+                }
+                if let Some(files) = fixed_files.take() {
+                    files.unregister(&ring);
+                }
+                drop(ring);
+                for (request, result) in requests.drain(..).zip(results) {
+                    let _ = request.completion.send(result);
+                }
+                let stopped = StoreError::Transport(
+                    "extent store io_uring read pool stopped after a fatal ring error".to_string(),
+                );
+                for request in pending.drain(..) {
+                    let _ = request.completion.send(Err(stopped.clone()));
+                }
+                return;
             }
             ExtentStoreIoWorkerPipelineOutcome::Preempted {
                 results,
