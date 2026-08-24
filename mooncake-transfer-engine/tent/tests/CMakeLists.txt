@@ -380,6 +380,13 @@ target_include_directories(tent_topology_priority_matrix_test
 add_test(NAME tent_topology_priority_matrix_test
          COMMAND tent_topology_priority_matrix_test)
 
+add_executable(tent_strict_local_numa_test strict_local_numa_test.cpp)
+target_link_libraries(tent_strict_local_numa_test PRIVATE gtest gtest_main
+                                                          tent_link_group)
+target_include_directories(tent_strict_local_numa_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_strict_local_numa_test COMMAND tent_strict_local_numa_test)
+
 if(USE_UB)
   add_executable(
     tent_ub_teardown_test

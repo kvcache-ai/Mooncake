@@ -124,6 +124,7 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
         // Use devices from the first non-empty rank only
         thread_local uint64_t tl_rr_counter = 0;
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+            if (!isNumaRankEligible(rank)) continue;
             thread_local std::vector<int> tl_eligible;
             tl_eligible.clear();
             for (int dev_id : entry->device_list[rank]) {
@@ -208,11 +209,7 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
 
     // First pass: filter by device priority (QoS filtering)
     for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
-        // Skip last (cross-NUMA) rank; empty-candidates fallback still retries all tiers.
-        if (sched_params_.strict_local_numa &&
-            rank == Topology::DevicePriorityRanks - 1) {
-            continue;
-        }
+        if (!isNumaRankEligible(rank)) continue;
         for (int dev_id : entry->device_list[rank]) {
             if (!usable(dev_id)) continue;
             if ((device_mask & (1ULL << dev_id)) == 0) continue;
@@ -227,10 +224,11 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         }
     }
 
-    // If no devices after priority filtering, fall back to every usable
-    // device. Availability is not a QoS filter and is never relaxed here.
+    // No QoS-eligible devices: retry without priority filtering. Availability
+    // and the NUMA rank exclusion are not QoS filters and stay in force.
     if (candidates.empty()) {
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+            if (!isNumaRankEligible(rank)) continue;
             for (int dev_id : entry->device_list[rank]) {
                 if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;

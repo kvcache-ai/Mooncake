@@ -182,7 +182,8 @@ class DeviceSelector {
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};
 
-        // Skip last (cross-NUMA) rank; fall back only if no same-NUMA NIC.
+        // Skip last (cross-NUMA) rank on every selection path; never fall back
+        // to a remote NIC.
         bool strict_local_numa = false;
 
         // EWMA bandwidth learning rate (0.0 = full adaptation, 1.0 = no
@@ -241,6 +242,14 @@ class DeviceSelector {
         auto it = devices_.find(dev_id);
         return it != devices_.end() &&
                it->second.available.load(std::memory_order_relaxed);
+    }
+
+    // Cross-NUMA NICs live in the last priority rank. Under strict_local_numa
+    // they must never be eligible on any selection path (baseline, smart first
+    // pass, and smart fallback all share this rule).
+    bool isNumaRankEligible(size_t rank) const {
+        return !(sched_params_.strict_local_numa &&
+                 rank == Topology::DevicePriorityRanks - 1);
     }
 
     Status buildCandidates(const Topology::MemEntry *entry,

@@ -201,7 +201,10 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry>& nic_list,
         entry.type = Topology::MEM_CUDA;
 
         // Tier 0 is same-NUMA only; PCIe distance is secondary. Distance can
-        // collapse (ties / realpath failure) and would otherwise pick a remote NIC.
+        // collapse (ties / realpath failure) and would otherwise pick a remote
+        // NIC. Cross-NUMA NICs are never promoted here: when no same-NUMA NIC
+        // exists rank 0 stays empty and all NICs fall into the cross-NUMA rank,
+        // so strict_local_numa selection can hard-exclude them.
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;
         int nic_id = 0;
@@ -218,23 +221,6 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry>& nic_list,
         if (!distance_map.empty()) {
             int pick = distance_map.count(0) ? 0 : min_distance;
             entry.device_list[0] = std::move(distance_map[pick]);
-        } else {
-            // No same-NUMA NIC (or NUMA unknown): rank all NICs by PCIe distance.
-            int fb_min_distance = INT_MAX;
-            std::unordered_map<int, std::vector<int>> fb_distance_map;
-            int fb_dev_id = 0;
-            for (const auto& device : nic_list) {
-                int dist =
-                    getPciDistance(device.pci_bus_id.c_str(), pci_bus_id);
-                fb_distance_map[dist].push_back(fb_dev_id);
-                fb_min_distance = std::min(fb_min_distance, dist);
-                fb_dev_id++;
-            }
-            if (fb_distance_map.count(0))
-                entry.device_list[0] = std::move(fb_distance_map[0]);
-            else if (fb_distance_map.count(fb_min_distance))
-                entry.device_list[0] =
-                    std::move(fb_distance_map[fb_min_distance]);
         }
 
         std::unordered_set<int> preferred_set;
