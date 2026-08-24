@@ -46,7 +46,7 @@ CentralizedClientService::~CentralizedClientService() {
 void CentralizedClientService::Stop() {
     {
         // Hold registration_mutex_ across MarkShuttingDown() so the lock order
-        // is always registration_mutex_ -> local_inflight_tracker_.rwlock_,
+        // is always registration_mutex_ before local_inflight_tracker_ drain,
         // matching RegisterClient(). This blocks new registrations and lets
         // active ones finish before the in-flight tracker is drained, avoiding
         // a lock-inversion deadlock with the registration path.
