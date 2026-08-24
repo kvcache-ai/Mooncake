@@ -43,8 +43,16 @@ def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
     smoke_script = f"""
 from importlib import metadata
 from pathlib import Path
+import sys
+import types
+
+aiohttp = types.ModuleType("aiohttp")
+aiohttp.web = types.SimpleNamespace()
+sys.modules["aiohttp"] = aiohttp
+
 import mooncake
 import mooncake.engine
+import mooncake.mooncake_store_service
 import mooncake.reshard
 import mooncake.store
 
@@ -54,6 +62,14 @@ assert not package_path.is_relative_to(repository_path), (package_path, reposito
 assert metadata.version("mooncake-transfer-engine") == {_project_version()!r}
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+assert mooncake.mooncake_store_service.MooncakeStoreService is not None
+store_entry_points = metadata.entry_points(
+    group="console_scripts", name="mc_store_rest_server"
+)
+assert len(store_entry_points) == 1
+store_entry_point = store_entry_points[0]
+assert store_entry_point.value == "mooncake.mooncake_store_service:sync_main"
+assert store_entry_point.load() is mooncake.mooncake_store_service.sync_main
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],

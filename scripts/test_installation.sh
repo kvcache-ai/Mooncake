@@ -32,6 +32,7 @@ sudo apt-get install -y $SYSTEM_PACKAGES
 
 echo "Verifying that import succeeds after installation..."
 python -c "import mooncake.engine" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
+python -c "import mooncake.mooncake_store_service" && echo "Success: Store REST service import succeeded after installation" || { echo "ERROR: Store REST service import failed after installation!"; exit 1; }
 python -c "import mooncake.reshard.weight" && echo "Success: Reshard import succeeded after installation" || { echo "ERROR: Reshard import failed after installation!"; exit 1; }
 
 echo "Running import structure test..."
@@ -65,6 +66,11 @@ echo "Verifying transfer_engine_bench entry point..."
 # Check if the transfer_engine_bench entry point is installed and executable
 which transfer_engine_bench || { echo "ERROR: transfer_engine_bench entry point not found!"; exit 1; }
 echo "Success: transfer_engine_bench entry point found"
+
+echo "Verifying mc_store_rest_server entry point..."
+which mc_store_rest_server || { echo "ERROR: mc_store_rest_server entry point not found!"; exit 1; }
+mc_store_rest_server --help >/dev/null
+echo "Success: mc_store_rest_server entry point found"
 
 cd ..
 

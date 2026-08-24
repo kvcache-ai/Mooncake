@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import importlib.util
 import json
 import logging
 import signal
@@ -13,7 +14,13 @@ from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+for module_name in tuple(sys.modules):
+    if module_name == "mooncake" or module_name.startswith("mooncake."):
+        del sys.modules[module_name]
+mooncake_package = types.ModuleType("mooncake")
+mooncake_package.__path__ = [str(REPOSITORY_ROOT / "mooncake-wheel" / "mooncake")]
+sys.modules["mooncake"] = mooncake_package
 
 try:
     from aiohttp import web as _unused_web  # noqa: F401
@@ -44,12 +51,29 @@ except ModuleNotFoundError:
     store_module.MooncakeDistributedStore = MooncakeDistributedStore
     sys.modules["mooncake.store"] = store_module
 
-from mooncake.mooncake_store_service import (
-    MooncakeStoreService,
-    _install_shutdown_signal_handlers,
-    _shm_name_to_path,
-    main as store_service_main,
+STORE_SERVICE_PATH = (
+    REPOSITORY_ROOT / "python" / "mooncake" / "mooncake_store_service.py"
 )
+STORE_SERVICE_SPEC = importlib.util.spec_from_file_location(
+    "mooncake.mooncake_store_service", STORE_SERVICE_PATH
+)
+assert STORE_SERVICE_SPEC is not None
+assert STORE_SERVICE_SPEC.loader is not None
+store_service_module = importlib.util.module_from_spec(STORE_SERVICE_SPEC)
+sys.modules[STORE_SERVICE_SPEC.name] = store_service_module
+STORE_SERVICE_SPEC.loader.exec_module(store_service_module)
+mooncake_package.mooncake_store_service = store_service_module
+
+MooncakeStoreService = store_service_module.MooncakeStoreService
+_install_shutdown_signal_handlers = (
+    store_service_module._install_shutdown_signal_handlers
+)
+_shm_name_to_path = store_service_module._shm_name_to_path
+store_service_main = store_service_module.main
+
+
+def test_store_service_loads_from_canonical_source() -> None:
+    assert Path(store_service_module.__file__).resolve() == STORE_SERVICE_PATH
 
 
 class FakeStore:
@@ -319,7 +343,9 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         # subsequent same-path detection keeps working.
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/old")
 
-    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(self):
+    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(
+        self,
+    ):
         # A remount to the SAME path that fails to mount must not destroy the
         # still-healthy previous segments: the node keeps serving from them and
         # stays in decode mode (make-before-break). Same-path MBB is safe here
@@ -397,7 +423,9 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.current_mode, "decode")
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/new")
 
-    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(self):
+    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(
+        self,
+    ):
         # New mount succeeds, but retiring the previous segments only PARTIALLY
         # fails. unmount_segment reports the first error for a batch, so the old
         # ids must be unmounted individually; mounted_segment_ids must then hold
@@ -596,7 +624,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_handle_put_missing_value(self):
         self.fake_store.put = lambda key, value: 0
         resp = await self.service.handle_put(FakeRequest({"key": "k"}))
-        self.assertEqual(resp.status, 500)
+        self.assertEqual(resp.status, 400)
 
     async def test_handle_put_store_failure(self):
         self.fake_store.put = lambda key, value: -1
@@ -847,7 +875,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.service.mounted_segment_ids = [sid]
         resp = await self.service.handle_reconfigure(FakeRequest({"mode": "prefill"}))
         self.assertEqual(resp.status, 200)
-        self.assertEqual(self.fake_store.unmount_calls, [[sid]])
+        self.assertEqual(self.fake_store.unmount_calls, [([sid], 0)])
         self.assertEqual(self.service.mounted_segment_ids, [])
         self.assertEqual(self.service.current_mode, "prefill")
 
@@ -888,7 +916,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(resp.status, 200)
-        self.assertEqual(self.fake_store.unmount_calls, [[old_id]])
+        self.assertEqual(self.fake_store.unmount_calls, [([old_id], 0)])
         self.assertEqual(self.service.current_mode, "decode")
 
     # ==================== /api/mount edge cases ====================
@@ -985,7 +1013,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(
             self.fake_store.unmount_calls,
-            [["00000000-0000-0000-0000-000000000001"]],
+            [(["00000000-0000-0000-0000-000000000001"], 0)],
         )
 
     async def test_unmount_shm_empty_list(self):
@@ -1008,6 +1036,8 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             enable_ssd_offload=False,
             ssd_offload_path="",
             tenant_id="",
+            enable_client_http_server=False,
+            client_http_port=9300,
         )
 
     async def test_shutdown_event_stops_startup_retry_sleep(self):
@@ -1077,9 +1107,7 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             await self.service.stop()
 
         self.assertIsNone(self.service.store)
-        self.assertTrue(
-            any("close returned 7" in message for message in logs.output)
-        )
+        self.assertTrue(any("close returned 7" in message for message in logs.output))
         await self.service.stop()
         store.close.assert_called_once_with()
 
