@@ -166,6 +166,10 @@ add_store_test(master_snapshot_codec_test
                ha/snapshot/master_snapshot_codec_test.cpp)
 add_ha_test(batch_oplog_snapshot_types_test
             ha/snapshot/batch_oplog/metadata_test.cpp)
+add_ha_test(batch_oplog_snapshot_codec_test
+            ha/snapshot/batch_oplog/codec_test.cpp)
+add_ha_test(batch_oplog_snapshot_writer_test
+            ha/snapshot/batch_oplog/writer_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)

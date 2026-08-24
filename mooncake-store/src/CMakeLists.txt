@@ -38,7 +38,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/standby_controller.cpp
     ha/standby_metadata_store.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
+    ha/snapshot/batch_oplog/codec.cpp
     ha/snapshot/batch_oplog/metadata.cpp
+    ha/snapshot/batch_oplog/writer.cpp
     ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/local_ssd_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
@@ -61,6 +63,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
+    client_buffer_allocation.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp

@@ -1,9 +1,15 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <array>
+#include <cstdlib>
+#include <memory>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <string_view>
+#include <vector>
 #include "file_interface.h"
+#include "../src/uring_submit.h"
 
 namespace mooncake {
 
@@ -30,6 +36,68 @@ class PosixFileTest : public ::testing::Test {
     std::string test_filename;
     int test_fd = -1;
 };
+
+#ifdef USE_URING
+TEST(UringSubmitTest, ContinuesAfterPositiveShortSubmit) {
+    unsigned pending = 8;
+    std::vector<unsigned> requested;
+    std::array<int, 2> returns{3, 5};
+    size_t call = 0;
+
+    auto result = detail::submit_all_pending(
+        [&] { return pending; },
+        [&](unsigned requested_count) {
+            requested.push_back(requested_count);
+            int submitted = returns[call++];
+            pending -= static_cast<unsigned>(submitted);
+            return submitted;
+        },
+        [] {});
+
+    EXPECT_EQ(result.error, 0);
+    EXPECT_EQ(result.submitted, 8U);
+    EXPECT_EQ(result.pending, 0U);
+    EXPECT_EQ(requested, (std::vector<unsigned>{8, 5}));
+}
+
+TEST(UringSubmitTest, RetriesTransientSubmissionErrors) {
+    unsigned pending = 4;
+    std::array<int, 3> returns{-EINTR, -EAGAIN, 4};
+    size_t call = 0;
+    unsigned yields = 0;
+
+    auto result = detail::submit_all_pending(
+        [&] { return pending; },
+        [&](unsigned) {
+            int ret = returns[call++];
+            if (ret > 0) pending -= static_cast<unsigned>(ret);
+            return ret;
+        },
+        [&] { ++yields; });
+
+    EXPECT_EQ(result.error, 0);
+    EXPECT_EQ(result.submitted, 4U);
+    EXPECT_EQ(result.pending, 0U);
+    EXPECT_EQ(yields, 2U);
+}
+
+TEST(UringSubmitTest, StopsAfterBoundedNoProgress) {
+    unsigned pending = 4;
+    unsigned calls = 0;
+    auto submit = [&](unsigned) {
+        ++calls;
+        return -ENOMEM;
+    };
+
+    auto result =
+        detail::submit_all_pending([&] { return pending; }, submit, [] {}, 2);
+
+    EXPECT_EQ(result.error, -ENOMEM);
+    EXPECT_EQ(result.submitted, 0U);
+    EXPECT_EQ(result.pending, pending);
+    EXPECT_EQ(calls, 3U);
+}
+#endif
 
 // Test basic file lifecycle
 TEST_F(PosixFileTest, FileLifecycle) {
@@ -172,6 +240,125 @@ TEST_F(PosixFileTest, FileLocking) {
         EXPECT_TRUE(lock.is_locked());
     }
 }
+
+#ifdef USE_URING
+TEST_F(PosixFileTest, UringBatchReadReportsPerRequestResultsAcrossQueueDepth) {
+    constexpr size_t kBlockSize = 128;
+    constexpr int kRequestCount = 40;
+    std::vector<std::array<char, kBlockSize>> expected(kRequestCount);
+    for (int i = 0; i < kRequestCount; ++i) {
+        expected[i].fill(static_cast<char>('A' + i % 26));
+        ASSERT_EQ(pwrite(test_fd, expected[i].data(), expected[i].size(),
+                         static_cast<off_t>(i * kBlockSize)),
+                  static_cast<ssize_t>(expected[i].size()));
+    }
+
+    int uring_fd = dup(test_fd);
+    ASSERT_GE(uring_fd, 0);
+    UringFile uring_file(test_filename, uring_fd, 32, false);
+    std::vector<std::array<char, kBlockSize>> actual(kRequestCount);
+    std::vector<UringFile::ReadDesc> descs;
+    descs.reserve(kRequestCount);
+    for (int i = 0; i < kRequestCount; ++i) {
+        descs.push_back(
+            UringFile::ReadDesc{actual[i].data(), actual[i].size(),
+                                static_cast<off_t>(i * kBlockSize)});
+    }
+
+    auto result = uring_file.batch_read(descs.data(), descs.size());
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    for (int i = 0; i < kRequestCount; ++i) {
+        EXPECT_TRUE(descs[i].completed);
+        EXPECT_EQ(descs[i].error, ErrorCode::OK);
+        EXPECT_EQ(descs[i].bytes_read, kBlockSize);
+        EXPECT_EQ(actual[i], expected[i]);
+    }
+}
+
+TEST_F(PosixFileTest, UringBatchReadReportsShortReadPerRequest) {
+    constexpr std::string_view data = "abcdef";
+    ASSERT_EQ(pwrite(test_fd, data.data(), data.size(), 0),
+              static_cast<ssize_t>(data.size()));
+
+    int uring_fd = dup(test_fd);
+    ASSERT_GE(uring_fd, 0);
+    UringFile uring_file(test_filename, uring_fd, 32, false);
+    std::array<char, 3> complete{};
+    std::array<char, 8> short_read{};
+    std::array<UringFile::ReadDesc, 2> descs{
+        UringFile::ReadDesc{complete.data(), complete.size(), 0},
+        UringFile::ReadDesc{short_read.data(), short_read.size(), 4}};
+
+    auto result = uring_file.batch_read(descs.data(), descs.size());
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    EXPECT_TRUE(descs[0].completed);
+    EXPECT_EQ(descs[0].error, ErrorCode::OK);
+    EXPECT_EQ(descs[0].bytes_read, complete.size());
+    EXPECT_TRUE(descs[1].completed);
+    EXPECT_EQ(descs[1].error, ErrorCode::OK);
+    EXPECT_EQ(descs[1].bytes_read, 2U);
+}
+
+TEST_F(PosixFileTest, UringBatchReadRejectsMisalignedDirectIoDescriptors) {
+    int uring_fd = dup(test_fd);
+    ASSERT_GE(uring_fd, 0);
+    UringFile uring_file(test_filename, uring_fd, 32, true);
+
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, 4096, 8192), 0);
+    std::unique_ptr<void, decltype(&std::free)> buffer(allocation, &std::free);
+    auto* aligned = static_cast<char*>(buffer.get());
+
+    auto expect_invalid = [&](UringFile::ReadDesc desc) {
+        auto result = uring_file.batch_read(&desc, 1);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::FILE_INVALID_BUFFER);
+        EXPECT_FALSE(desc.completed);
+    };
+
+    expect_invalid(UringFile::ReadDesc{aligned + 1, 4096, 0});
+    expect_invalid(UringFile::ReadDesc{aligned, 4095, 0});
+    expect_invalid(UringFile::ReadDesc{aligned, 4096, 1});
+}
+
+TEST_F(PosixFileTest, UringBatchReadDrainsErrorsBeforeNextOperation) {
+    std::array<char, 16> first{};
+    std::array<char, 16> second{};
+    {
+        int invalid_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        ASSERT_GE(invalid_fd, 0);
+        UringFile invalid_file("/dev/null", invalid_fd, 32, false);
+        std::array<UringFile::ReadDesc, 2> invalid_descs{
+            UringFile::ReadDesc{first.data(), first.size(), 0},
+            UringFile::ReadDesc{second.data(), second.size(), 0}};
+
+        auto invalid_result =
+            invalid_file.batch_read(invalid_descs.data(), invalid_descs.size());
+        ASSERT_FALSE(invalid_result.has_value());
+        EXPECT_EQ(invalid_result.error(), ErrorCode::FILE_READ_FAIL);
+        EXPECT_TRUE(invalid_descs[0].completed);
+        EXPECT_EQ(invalid_descs[0].error, ErrorCode::FILE_READ_FAIL);
+        EXPECT_TRUE(invalid_descs[1].completed);
+        EXPECT_EQ(invalid_descs[1].error, ErrorCode::FILE_READ_FAIL);
+    }
+
+    constexpr std::string_view data = "ring-remains-usable";
+    ASSERT_EQ(pwrite(test_fd, data.data(), data.size(), 0),
+              static_cast<ssize_t>(data.size()));
+    int valid_fd = dup(test_fd);
+    ASSERT_GE(valid_fd, 0);
+    UringFile valid_file(test_filename, valid_fd, 32, false);
+    std::vector<char> output(data.size());
+    UringFile::ReadDesc desc{output.data(), output.size(), 0};
+
+    auto valid_result = valid_file.batch_read(&desc, 1);
+    ASSERT_TRUE(valid_result.has_value()) << toString(valid_result.error());
+    EXPECT_TRUE(desc.completed);
+    EXPECT_EQ(desc.error, ErrorCode::OK);
+    EXPECT_EQ(desc.bytes_read, data.size());
+    EXPECT_EQ(std::string_view(output.data(), output.size()), data);
+}
+#endif
 
 }  // namespace mooncake
 

@@ -1832,6 +1832,21 @@ int RealClient::unmountAndFreeSegment(
     return first_error;
 }
 
+int RealClient::drainLocalDiskSegment(uint64_t grace_period_seconds) {
+    if (!client_) {
+        LOG(ERROR) << "Client not initialized";
+        return -1;
+    }
+    if (!file_storage_) {
+        LOG(WARNING) << "action=drain_local_disk_segment, "
+                        "warn=ssd_offload_not_enabled";
+        return 0;
+    }
+    auto result =
+        file_storage_->DrainLocalDiskSegment(grace_period_seconds * 1000);
+    return result ? 0 : -1;
+}
+
 int RealClient::health_check() {
     if (closed_.load()) return HC_NOT_INITIALIZED;
     if (!client_) return HC_NOT_INITIALIZED;
@@ -6926,6 +6941,13 @@ ClientRequester::ClientRequester() {
     pool_conf.reconnect_wait_time = std::chrono::milliseconds{1000};
     pool_conf.host_alive_detect_duration = std::chrono::milliseconds{0};
 
+    // Honour the same timeout overrides as the master pool. Without this the
+    // connect timeout stays at coro_rpc's built-in 30s, so a read that picks a
+    // peer which is gone blocks for connect_retry_count * 30s plus the waits
+    // between retries -- 91s with the defaults above -- and no configuration
+    // can shorten it. Defaults are unchanged when the variables are unset.
+    detail::ApplyRpcTimeoutEnvOverrides(pool_conf.client_config);
+
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
             pool_conf, GetStoreRpcClientIoContextPool());
@@ -6981,6 +7003,10 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
             }
             auto result = co_await std::move(ret.value());
             if (!result) {
+                if (result.error().code == coro_rpc::errc::timed_out) {
+                    LOG(ERROR) << "RPC call timed out: " << result.error().msg;
+                    co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                }
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }

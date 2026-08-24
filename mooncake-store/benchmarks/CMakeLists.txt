@@ -58,3 +58,6 @@ if(STORE_USE_ETCD)
     oplog_batch_bench PRIVATE mooncake_store glog::glog gflags::gflags
                               JsonCpp::JsonCpp)
 endif()
+
+add_executable(uring_batch_read_bench uring_batch_read_bench.cpp)
+target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)

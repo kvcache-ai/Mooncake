@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <optional>
@@ -121,6 +122,52 @@ class FileStorageTest : public ::testing::Test {
     // FileStorageTest is friended; TEST_F-generated subclasses are not.
     static bool CallIsPerBucketSoftOffloadError(ErrorCode error) {
         return FileStorage::IsPerBucketSoftOffloadError(error);
+    }
+
+    // Funnel to the private FileStorage::Heartbeat, for the drain tests.
+    static tl::expected<void, ErrorCode> FileStorageHeartbeat(
+        FileStorage& fileStorage) {
+        return fileStorage.Heartbeat();
+    }
+
+    // Drives the drain-vs-heartbeat interleaving deterministically: a
+    // heartbeat tick that has already passed its entry draining_ check parks
+    // on offloading_mutex_, a drain runs, and the parked tick resumes only
+    // around the drain's own critical section. The fixture holds the mutex
+    // as the scheduler while both threads are launched, so the tick is
+    // provably not inside its RPC section when the drain latches. After the
+    // release the two race for the lock; the postcondition (segment
+    // deregistered, never re-mounted) must hold in both wake orders, so the
+    // assertions do not depend on the schedule. Without the drain taking
+    // offloading_mutex_, the parked tick would resume after the drain
+    // finished, get SEGMENT_NOT_FOUND, and re-mount the segment.
+    tl::expected<void, ErrorCode> DrainWhileHeartbeatTickParked(
+        FileStorage& fileStorage) {
+        // The parked tick may win the lock and run a full pass, which is
+        // only supported on an initialized backend (Init() is also what
+        // starts the heartbeat thread in production).
+        EXPECT_TRUE(fileStorage.storage_backend_->Init());
+        tl::expected<void, ErrorCode> drain_result =
+            tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        std::thread heartbeat_thread;
+        std::thread drain_thread;
+        {
+            MutexLocker scheduler(&fileStorage.offloading_mutex_);
+            heartbeat_thread =
+                std::thread([&fileStorage] { fileStorage.Heartbeat(); });
+            // Let the tick pass the entry check and park on the mutex we
+            // hold. The assertions do not depend on it parking -- a tick
+            // that has not reached the lock is caught by the entry check
+            // instead -- the pause just pins the adversarial schedule.
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            drain_thread = std::thread([&fileStorage, &drain_result] {
+                drain_result = fileStorage.DrainLocalDiskSegment(0);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        heartbeat_thread.join();
+        drain_thread.join();
+        return drain_result;
     }
 
     void AssertHeartbeatEvictsAllKeys(
@@ -521,6 +568,89 @@ TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
     }
 
     AssertHeartbeatEvictsAllKeys(file_storage, expected_keys, batch_object);
+}
+
+// A drain deregisters the disk tier; the heartbeat re-mounts the segment
+// whenever the master answers SEGMENT_NOT_FOUND. These pin the interleavings
+// where the two overlap: the drain must win in every schedule.
+
+TEST_F(FileStorageTest, HeartbeatAfterDrainDoesNotRemount) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "drain_hb_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/drain_hb";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+
+    ASSERT_TRUE(file_storage.DrainLocalDiskSegment(0).has_value());
+
+    // A tick after the drain is a no-op: it must not take the
+    // SEGMENT_NOT_FOUND recovery branch and re-mount the segment.
+    ASSERT_TRUE(FileStorageHeartbeat(file_storage).has_value());
+
+    std::vector<OffloadTaskItem> offload_items;
+    auto heartbeat_rpc =
+        client.value()->OffloadObjectHeartbeat(true, offload_items);
+    ASSERT_FALSE(heartbeat_rpc.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
+}
+
+TEST_F(FileStorageTest, DrainSurvivesParkedHeartbeatTick) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "drain_race_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/drain_race";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+
+    // A tick that passed its entry draining_ check is parked on
+    // offloading_mutex_ while the drain runs (see the fixture helper). It
+    // must not resume into the SEGMENT_NOT_FOUND recovery branch and
+    // re-mount the segment the drain deregistered.
+    auto drain_result = DrainWhileHeartbeatTickParked(file_storage);
+    ASSERT_TRUE(drain_result.has_value());
+
+    std::vector<OffloadTaskItem> offload_items;
+    auto heartbeat_rpc =
+        client.value()->OffloadObjectHeartbeat(true, offload_items);
+    ASSERT_FALSE(heartbeat_rpc.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
 }
 
 TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {

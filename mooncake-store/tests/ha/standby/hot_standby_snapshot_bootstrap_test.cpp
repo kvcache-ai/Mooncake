@@ -77,9 +77,12 @@ class HotStandbySnapshotBootstrapTest
             GetParam(), cluster_id_, FLAGS_redis_endpoint));
     }
 
-    void PublishSnapshot() {
-        auto result = PublishSnapshotPayload(*object_store_, *catalog_store_,
-                                             descriptor_);
+    void PublishSnapshot(
+        SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
+        auto result = PublishSnapshotPayload(
+            *object_store_, *catalog_store_, descriptor_, UUID{1, 2},
+            kDefaultTestObjectKey, kDefaultTestDiskFilePath,
+            kDefaultTestObjectSize, format);
         ASSERT_TRUE(result.has_value()) << result.error();
         snapshot_published_ = true;
     }
@@ -186,6 +189,25 @@ TEST(StandbyControllerTest, OplogEnablementControlsReaderController) {
     EXPECT_EQ(ErrorCode::OK, unsupported->PromoteStandby());
 }
 
+TEST(StandbyControllerTest, HaWithoutOplogPromotesWithEmptyContext) {
+    ha::HABackendSpec spec{
+        .type = ha::HABackendType::ETCD,
+        .connstring = "http://localhost:2379",
+        .cluster_namespace = "ha-without-oplog-test",
+    };
+    MasterServiceSupervisorConfig config;
+    config.enable_oplog = false;
+
+    auto controller = ha::CreateStandbyController(spec, config);
+    ASSERT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
+
+    auto result = controller->PromoteStandbyAndExport();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(0u, result->applied_seq_id);
+    EXPECT_TRUE(result->objects.empty());
+    EXPECT_TRUE(result->segments.empty());
+}
+
 TEST(StandbyControllerTest,
      PromoteStandbyAndExport_ReturnsErrorWhenNotStarted) {
     ha::HABackendSpec spec{
@@ -218,7 +240,7 @@ TEST(StandbyControllerTest,
 
 TEST_P(HotStandbySnapshotBootstrapTest,
        PromoteStandbyAndExport_SuccessWithSnapshot) {
-    PublishSnapshot();
+    PublishSnapshot(SnapshotMetadataFormat::kHardPinnedOnly);
 
     ha::HABackendSpec spec{
         .type = ha::HABackendType::UNKNOWN,
@@ -244,6 +266,7 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     ASSERT_EQ(1u, ctx.objects.size());
     EXPECT_EQ(kDefaultTestObjectKey, ctx.objects[0].key);
     EXPECT_EQ(kDefaultTestObjectSize, ctx.objects[0].metadata.size);
+    EXPECT_TRUE(ctx.objects[0].metadata.hard_pinned.value_or(false));
     EXPECT_TRUE(ctx.segments.empty());
 }
 
