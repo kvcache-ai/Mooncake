@@ -56,9 +56,8 @@ bool stream_is_capturing(cudaStream_t stream) {
 constexpr int kTopkShadowMaxTokens = 1024;
 constexpr int kTopkShadowMaxTopk = 32;
 constexpr int kTopkShadowSlots = 8;
-constexpr size_t kTopkShadowBytes =
-    static_cast<size_t>(kTopkShadowMaxTokens) * kTopkShadowMaxTopk *
-    sizeof(int64_t);
+constexpr size_t kTopkShadowBytes = static_cast<size_t>(kTopkShadowMaxTokens) *
+                                    kTopkShadowMaxTopk * sizeof(int64_t);
 
 int64_t* topk_shadow(void* workspace, int shadow_slot, int num_experts) {
     auto* base = reinterpret_cast<uint8_t*>(workspace) +

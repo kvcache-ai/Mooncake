@@ -260,9 +260,8 @@ void MooncakeWorker::putTaskCuda(
     cudaStreamCaptureStatus enq_capture = cudaStreamCaptureStatusNone;
     PG_ASSERT_CUDA(cudaStreamIsCapturing(issue_stream.get(), &issue_capture));
     PG_ASSERT_CUDA(cudaStreamIsCapturing(enq_stream.get(), &enq_capture));
-    const bool is_capturing =
-        issue_capture != cudaStreamCaptureStatusNone ||
-        enq_capture != cudaStreamCaptureStatusNone;
+    const bool is_capturing = issue_capture != cudaStreamCaptureStatusNone ||
+                              enq_capture != cudaStreamCaptureStatusNone;
     if (is_capturing) {
         GpuEvent event_start(issue_stream.deviceIndex());
         event_start.record(issue_stream);
