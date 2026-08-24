@@ -427,8 +427,8 @@ void ControlService::onSendData(const std::string_view& request,
     }
 
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        auto status = Platform::getLoader().copy((void*)peer_mem_addr, &desc[1],
-                                                 length);
+        auto status =
+            Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
         if (!status.ok()) {
             // A non-empty response is interpreted as an RPC error by the
             // client (see ControlClient::sendData). Without this the sender's
