@@ -13,4 +13,6 @@ except ModuleNotFoundError:
         f"Mooncake PG was not built against torch=={torch_version}.\n"
         f"Open an issue at https://github.com/kvcache-ai/Mooncake/issues."
     )
-globals().update({k: v for k, v in backend_module.__dict__.items() if not k.startswith("_")})
+globals().update(
+    {k: v for k, v in backend_module.__dict__.items() if not k.startswith("_")}
+)

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
@@ -28,6 +29,8 @@ def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
 
     wheel = Path(wheel_value).resolve()
     assert wheel.is_file(), f"wheel does not exist: {wheel}"
+    with zipfile.ZipFile(wheel) as archive:
+        assert archive.namelist().count("mooncake/pg.py") == 1
 
     environment = tmp_path / "environment"
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
@@ -42,7 +45,10 @@ def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
     clean_environment["PYTHONNOUSERSITE"] = "1"
     smoke_script = f"""
 from importlib import metadata
+import importlib
 from pathlib import Path
+import sys
+from types import ModuleType
 import mooncake
 import mooncake.engine
 import mooncake.reshard
@@ -54,6 +60,19 @@ assert not package_path.is_relative_to(repository_path), (package_path, reposito
 assert metadata.version("mooncake-transfer-engine") == {_project_version()!r}
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+assert "mooncake.pg" not in sys.modules
+assert "torch" not in sys.modules
+
+torch = ModuleType("torch")
+torch.__version__ = "2.7.1+cu128"
+sys.modules["torch"] = torch
+backend = ModuleType("mooncake.pg_2_7_1")
+backend.installed_wheel_marker = object()
+sys.modules[backend.__name__] = backend
+
+pg = importlib.import_module("mooncake.pg")
+assert Path(pg.__file__).resolve().parent == package_path.parent
+assert pg.installed_wheel_marker is backend.installed_wheel_marker
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],

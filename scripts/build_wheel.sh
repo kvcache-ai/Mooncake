@@ -180,15 +180,19 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
-# Stage the reshard Python package for the combined Mooncake wheel. The tracked
-# source of truth remains in the top-level module.
+# Stage the migrated PG loader and the Reshard Python package for the combined
+# Mooncake wheel. Their tracked sources remain in their authoritative trees.
+PG_SOURCE="python/mooncake/pg.py"
+PG_STAGING_PATH="$(pwd)/mooncake-wheel/mooncake/pg.py"
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
-cleanup_reshard_staging() {
+cleanup_migrated_python_staging() {
+    rm -f "${PG_STAGING_PATH}"
     rm -rf "${RESHARD_STAGING_DIR}"
 }
-trap cleanup_reshard_staging EXIT
-rm -rf "${RESHARD_STAGING_DIR}"
+trap cleanup_migrated_python_staging EXIT
+cleanup_migrated_python_staging
+cp "${PG_SOURCE}" "${PG_STAGING_PATH}"
 cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
 
 # Build the wheel package
@@ -204,7 +208,7 @@ WHEEL_DIR="$(pwd)"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
-    cleanup_reshard_staging
+    cleanup_migrated_python_staging
 }
 trap cleanup_wheel_metadata_state EXIT
 
