@@ -128,8 +128,6 @@ class AllocatedBuffer {
                                          std::memory_order_acquire);
     }
 
-    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const;
-
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
 
