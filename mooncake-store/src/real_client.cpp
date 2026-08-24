@@ -5079,6 +5079,14 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::vector<Slice> slices;
         uint64_t total_size;
     };
+    struct ValidLocalDiskKeyInfo {
+        std::string key;
+        size_t original_index;
+        QueryResult query_result;
+        Replica::Descriptor replica;
+        std::vector<Slice> slices;
+        uint64_t total_size;
+    };
     struct DiskKeyInfo {
         std::string key;
         size_t original_index;
@@ -5089,7 +5097,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     };
 
     std::vector<ValidKeyInfo> valid_operations;
-    std::unordered_map<std::string, ValidKeyInfo> valid_local_disk_operations;
+    std::unordered_map<std::string, ValidLocalDiskKeyInfo>
+        valid_local_disk_operations;
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
@@ -5144,12 +5153,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             std::vector<Slice> key_slices;
             allocateSlices(key_slices, replica, buffers[i]);
             valid_local_disk_operations.emplace(
-                key,
-                ValidKeyInfo{.key = key,
-                             .original_index = i,
-                             .query_result = std::move(query_result_values),
-                             .slices = std::move(key_slices),
-                             .total_size = total_size});
+                key, ValidLocalDiskKeyInfo{
+                         .key = key,
+                         .original_index = i,
+                         .query_result = std::move(query_result_values),
+                         .replica = replica,
+                         .slices = std::move(key_slices),
+                         .total_size = total_size});
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
@@ -5289,21 +5299,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         offload_objects;
 
     for (const auto &op_it : valid_local_disk_operations) {
-        // Find the LOCAL_DISK replica from the list — replicas may be in
-        // any order from Master.
-        const Replica::Descriptor *replica_ptr = nullptr;
-        for (const auto &r : op_it.second.query_result.replicas) {
-            if (r.is_local_disk_replica()) {
-                replica_ptr = &r;
-                break;
-            }
-        }
-        if (!replica_ptr) {
-            LOG(ERROR) << "No LOCAL_DISK replica found for key: "
-                       << op_it.first;
-            continue;
-        }
-        const auto &replica = *replica_ptr;
+        const auto &replica = op_it.second.replica;
         auto [store_segment_it, _] = offload_objects.try_emplace(
             replica.get_local_disk_descriptor().transport_endpoint);
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
