@@ -446,6 +446,16 @@ const DeviceTransferHandle* DeviceTransferService::deviceHandle() {
     return deviceState().device_metadata.handle;
 }
 
+PGResult<DeviceRouteKind> DeviceTransferService::routeKind(GlobalRank rank) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PG_VALIDATE_STATE(device_, "DeviceTransferService is not initialized");
+    const auto& state = deviceState();
+    PG_VALIDATE_ARG(
+        rank >= 0 && static_cast<uint32_t>(rank) < state.max_world_size,
+        "transfer rank is out of range");
+    return state.host_route_image[rank].kind;
+}
+
 const DeviceTransferEndpoint& DeviceTransferService::localEndpoint()
     const noexcept {
     return device_->local_endpoint;

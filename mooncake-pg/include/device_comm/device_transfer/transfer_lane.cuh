@@ -14,19 +14,9 @@
 
 namespace mooncake {
 
-__device__ __forceinline__ bool transferRangeFits(uint64_t offset,
-                                                  uint64_t size,
-                                                  uint64_t capacity) {
-    return offset <= capacity && size <= capacity - offset;
-}
-
 __device__ __forceinline__ bool transferTimedOut(uint64_t start,
                                                  uint64_t timeout_ticks) {
     return timeout_ticks != 0 && clock64() - start >= timeout_ticks;
-}
-
-__device__ __forceinline__ bool validSignalDelta(uint64_t delta) {
-    return delta != 0 && delta < (uint64_t{1} << 63);
 }
 
 // Rolling comparison keeps "reached" meaningful across uint64_t overflow as
@@ -75,60 +65,34 @@ class TransferTicket {
 class TransferLane {
    public:
     __device__ __forceinline__ TransferTicket
-    putAndSignal(GlobalRank rank, const PutAndSignalRequest& request,
-                 cooperative_groups::thread_block block) const {
-        PG_DEVICE_ASSERT(service_ && service_->local_region &&
-                         service_->routes && service_->lane_results &&
-                         lane_index_ < kTransferLaneCount && rank >= 0 &&
-                         static_cast<uint32_t>(rank) <
-                             service_->max_world_size);
-
-        const bool valid_request =
-            validSignalDelta(request.signal.delta) &&
-            request.signal.remote_offset % alignof(uint64_t) == 0 &&
-            transferRangeFits(request.local_offset, request.size,
-                              service_->local_region_size);
-        PG_DEVICE_ASSERT(valid_request);
-
+    put(GlobalRank rank, const PutRequest& request,
+        cooperative_groups::thread_block block) const {
         const auto& route = service_->routes[rank];
-        if (route.kind == DeviceRouteKind::Unreachable) {
-            return TransferTicket();
-        }
-        PG_DEVICE_ASSERT(transferRangeFits(request.remote_offset, request.size,
-                                           route.region_size) &&
-                         transferRangeFits(request.signal.remote_offset,
-                                           sizeof(uint64_t),
-                                           route.region_size));
-
-        const void* const source =
-            static_cast<char*>(service_->local_region) + request.local_offset;
+        const void* const source = service_->localPtr(request.local_offset);
 
         switch (route.kind) {
             case DeviceRouteKind::P2p:
-                return TransferTicket(p2pPutAndSignal(
-                    route.p2p.mapped_region_address, source,
-                    request.remote_offset, request.size,
-                    request.signal.remote_offset, request.signal.delta, block));
+                return TransferTicket(p2pPut(route.p2p.mapped_region_address,
+                                             source, request.remote_offset,
+                                             request.size, request.signal,
+                                             block));
 
             case DeviceRouteKind::HostProxy: {
-                PG_DEVICE_ASSERT(service_->host_proxy_command_slots &&
-                                 route.host_proxy.remote_region_address != 0);
                 // The source buffer may have been filled cooperatively. Every
                 // writer publishes its bytes to system scope before the leader
                 // hands the device address to the host worker.
                 __threadfence_system();
                 block.sync();
-                return TransferTicket(hostProxyPutAndSignal(
+                return TransferTicket(hostProxyPut(
                     service_->host_proxy_command_slots,
                     route.host_proxy.remote_region_address, rank, source,
-                    request.remote_offset, request.size,
-                    request.signal.remote_offset, request.signal.delta,
+                    request.remote_offset, request.size, request.signal,
                     request.timeout_ticks, lane_index_,
                     service_->lane_results + lane_index_, block));
             }
 
             case DeviceRouteKind::Unreachable:
-                break;
+                return TransferTicket();
         }
         PG_DEVICE_UNREACHABLE();
         return TransferTicket();
@@ -137,38 +101,21 @@ class TransferLane {
     __device__ __forceinline__ TransferTicket
     signal(GlobalRank rank, const SignalRequest& request,
            cooperative_groups::thread_block block) const {
-        PG_DEVICE_ASSERT(
-            service_ && service_->routes && service_->lane_results &&
-            lane_index_ < kTransferLaneCount && rank >= 0 &&
-            static_cast<uint32_t>(rank) < service_->max_world_size &&
-            validSignalDelta(request.signal.delta) &&
-            request.signal.remote_offset % alignof(uint64_t) == 0);
-
         const auto& route = service_->routes[rank];
-        if (route.kind == DeviceRouteKind::Unreachable) {
-            return TransferTicket();
-        }
-        PG_DEVICE_ASSERT(transferRangeFits(
-            request.signal.remote_offset, sizeof(uint64_t), route.region_size));
-
         switch (route.kind) {
             case DeviceRouteKind::P2p:
                 return TransferTicket(p2pSignal(route.p2p.mapped_region_address,
-                                                request.signal.remote_offset,
-                                                request.signal.delta, block));
+                                                request.signal, block));
 
             case DeviceRouteKind::HostProxy:
-                PG_DEVICE_ASSERT(service_->host_proxy_command_slots &&
-                                 route.host_proxy.remote_region_address != 0);
                 return TransferTicket(hostProxySignal(
                     service_->host_proxy_command_slots,
                     route.host_proxy.remote_region_address, rank,
-                    request.signal.remote_offset, request.signal.delta,
-                    request.timeout_ticks, lane_index_,
+                    request.signal, request.timeout_ticks, lane_index_,
                     service_->lane_results + lane_index_, block));
 
             case DeviceRouteKind::Unreachable:
-                break;
+                return TransferTicket();
         }
         PG_DEVICE_UNREACHABLE();
         return TransferTicket();
@@ -177,31 +124,30 @@ class TransferLane {
     __device__ __forceinline__ SignalWaitResult
     waitSignal(const SignalWaitRequest& request,
                cooperative_groups::thread_block block) const {
-        PG_DEVICE_ASSERT(
-            service_ && service_->local_region && service_->lane_results &&
-            lane_index_ < kTransferLaneCount &&
-            request.local_offset % alignof(uint64_t) == 0 &&
-            transferRangeFits(request.local_offset, sizeof(uint64_t),
-                              service_->local_region_size));
-
-        auto* const wait_result = service_->lane_results + lane_index_;
+        __shared__ uint64_t block_wait_result;
         if (block.thread_rank() == 0) {
             const auto* const signal = reinterpret_cast<const uint64_t*>(
-                static_cast<const char*>(service_->local_region) +
-                request.local_offset);
+                service_->localPtr(request.local_offset));
             const uint64_t start_ticks = clock64();
             uint64_t observed = 0;
             while (true) {
-                observed = device::mc_ld_acquire_u64(signal);
-                if (signalReached(observed, request.least) ||
-                    transferTimedOut(start_ticks, request.timeout_ticks)) {
+                observed = device::mc_ld_volatile_u64(signal);
+                if (signalReached(observed, request.least)) {
+                    // Poll cheaply, then acquire once before the CTA consumes
+                    // the payload published by the matching release signal.
+                    observed = device::mc_ld_acquire_u64(signal);
+                    if (signalReached(observed, request.least)) {
+                        break;
+                    }
+                }
+                if (transferTimedOut(start_ticks, request.timeout_ticks)) {
                     break;
                 }
             }
-            device::mc_st_release_u64(wait_result, observed);
+            block_wait_result = observed;
         }
         block.sync();
-        const uint64_t observed = device::mc_ld_acquire_u64(wait_result);
+        const uint64_t observed = block_wait_result;
         block.sync();
         return SignalWaitResult{
             .status = signalReached(observed, request.least)

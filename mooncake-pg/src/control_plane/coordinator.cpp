@@ -13,16 +13,20 @@
 namespace mooncake {
 namespace {
 
+bool validDeviceCollectiveEndpoint(
+    const DeviceCollectiveEndpoint& endpoint,
+    const DeviceTransferEndpoint& transfer_endpoint) noexcept {
+    return endpoint.buffer_size != 0 &&
+           endpoint.buffer_offset <= transfer_endpoint.region_size &&
+           endpoint.buffer_size <=
+               transfer_endpoint.region_size - endpoint.buffer_offset;
+}
+
 bool memberSupportsGpuCollectiveBackend(const GroupMember& member,
                                         GpuCollectiveBackend backend) {
-    switch (backend) {
-        case GpuCollectiveBackend::Legacy:
-            return true;
-        case GpuCollectiveBackend::New:
-            return member.endpoint.has_value() &&
-                   member.endpoint->collective_v2.has_value();
-    }
-    return false;
+    if (backend == GpuCollectiveBackend::Legacy) return true;
+    return member.endpoint.has_value() &&
+           member.endpoint->device_collective.supportsBackend(backend);
 }
 
 }  // namespace
@@ -54,6 +58,14 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
         result.response.reject_reason = "rank out of valid range";
         return result;
     }
+    if (req.collective_endpoint &&
+        (!req.transfer_service_endpoint ||
+         !validDeviceCollectiveEndpoint(*req.collective_endpoint,
+                                        *req.transfer_service_endpoint))) {
+        result.response.success = false;
+        result.response.reject_reason = "invalid device collective endpoint";
+        return result;
+    }
     auto& info = ranks_[req.rank];
 
     // agent_session_id is the idempotency key for a logical registration.
@@ -68,10 +80,11 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
             result.response.require_new_session = true;
             return result;
         }
-        if (info.transfer_service_endpoint != req.transfer_service_endpoint) {
+        if (info.transfer_service_endpoint != req.transfer_service_endpoint ||
+            info.collective_endpoint != req.collective_endpoint) {
             result.response.success = false;
             result.response.reject_reason =
-                "transfer-service endpoint changed within one agent session";
+                "rank endpoint changed within one agent session";
             result.response.require_new_session = true;
             return result;
         }
@@ -101,6 +114,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     info.agent_addr = req.agent_addr;
     info.te_server_name = req.te_server_name;
     info.transfer_service_endpoint = req.transfer_service_endpoint;
+    info.collective_endpoint = req.collective_endpoint;
     info.agent_session_id = req.agent_session_id;
     info.warmup_recv_addr = req.warmup_recv_addr;
     info.last_heartbeat = std::chrono::steady_clock::now();
@@ -148,6 +162,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
         .te_server_name = info.te_server_name,
         .warmup_recv_addr = info.warmup_recv_addr,
         .transfer_service_endpoint = info.transfer_service_endpoint,
+        .collective_endpoint = info.collective_endpoint,
     }});
     result.effects.push_back(makeRankStateEffect(req.rank));
 
@@ -197,6 +212,7 @@ void CentralizedCoordinatorStateMachine::populateRegisterAgentResponse(
         connection.warmup_recv_addr = ranks_[i].warmup_recv_addr;
         connection.transfer_service_endpoint =
             ranks_[i].transfer_service_endpoint;
+        connection.collective_endpoint = ranks_[i].collective_endpoint;
         response.rank_connections.push_back(std::move(connection));
     }
 }
@@ -375,11 +391,20 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
 
         auto& view = it->second;
         auto& member = view.members[req.rank];
-        if (view.gpu_collective_backend == GpuCollectiveBackend::New &&
-            member.isActive() && !ep.endpoint_info.collective_v2.has_value()) {
+        const auto& protocol_endpoints = ep.endpoint_info.device_collective;
+        if (!protocol_endpoints.empty() &&
+            !ranks_[req.rank].collective_endpoint.has_value()) {
             result.response.success = false;
             result.response.reject_reason =
-                "active member does not support the group's new GPU collective "
+                "device protocol uses a collective buffer, but the rank did "
+                "not publish one";
+            return result;
+        }
+        if (view.gpu_collective_backend && member.isActive() &&
+            !protocol_endpoints.supportsBackend(*view.gpu_collective_backend)) {
+            result.response.success = false;
+            result.response.reject_reason =
+                "active member does not support the group's GPU collective "
                 "backend";
             return result;
         }

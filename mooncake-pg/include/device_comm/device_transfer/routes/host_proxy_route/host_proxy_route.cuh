@@ -76,12 +76,12 @@ __device__ __forceinline__ void publishHostProxyCommand(
     device::mc_st_release_u64(&slot.submitted_sequence, sequence);
 }
 
-__device__ __forceinline__ HostProxyTransferTicket hostProxyPutAndSignal(
-    HostProxyCommandSlot* command_slots, uint64_t remote_region_address,
-    GlobalRank target_rank, const void* source, uint64_t remote_payload_offset,
-    uint64_t size, uint64_t remote_signal_offset, uint64_t signal_delta,
-    uint64_t timeout_ticks, uint32_t lane, uint64_t* wait_result,
-    cooperative_groups::thread_block block) {
+__device__ __forceinline__ HostProxyTransferTicket
+hostProxyPut(HostProxyCommandSlot* command_slots,
+             uint64_t remote_region_address, GlobalRank target_rank,
+             const void* source, uint64_t remote_payload_offset, uint64_t size,
+             const SignalAction& signal, uint64_t timeout_ticks, uint32_t lane,
+             uint64_t* wait_result, cooperative_groups::thread_block block) {
     HostProxyTransferTicket ticket(wait_result);
     // Submission is leader-only. Other threads only carry wait_result; wait()
     // reads the leader's private ticket state and broadcasts its result.
@@ -106,10 +106,10 @@ __device__ __forceinline__ HostProxyTransferTicket hostProxyPutAndSignal(
     const uint64_t sequence = submitted + 1;
     HostProxyCommand command;
     command.local_addr = reinterpret_cast<uint64_t>(source);
-    command.remote_addr = remote_region_address + remote_payload_offset;
+    command.remote_region_addr = remote_region_address;
+    command.remote_offset = remote_payload_offset;
     command.size = size;
-    command.signal_remote_addr = remote_region_address + remote_signal_offset;
-    command.signal_delta = signal_delta;
+    command.signal = signal;
     command.target_rank = target_rank;
     publishHostProxyCommand(*slot, command, sequence);
     return HostProxyTransferTicket(HostProxyTransferTicket::State::Submitted,
@@ -119,14 +119,14 @@ __device__ __forceinline__ HostProxyTransferTicket hostProxyPutAndSignal(
 
 __device__ __forceinline__ HostProxyTransferTicket hostProxySignal(
     HostProxyCommandSlot* command_slots, uint64_t remote_region_address,
-    GlobalRank target_rank, uint64_t remote_signal_offset,
-    uint64_t signal_delta, uint64_t timeout_ticks, uint32_t lane,
-    uint64_t* wait_result, cooperative_groups::thread_block block) {
-    return hostProxyPutAndSignal(
-        command_slots, remote_region_address, target_rank,
-        /*source=*/nullptr, /*remote_payload_offset=*/0, /*size=*/0,
-        remote_signal_offset, signal_delta, timeout_ticks, lane, wait_result,
-        block);
+    GlobalRank target_rank, const SignalAction& signal, uint64_t timeout_ticks,
+    uint32_t lane, uint64_t* wait_result,
+    cooperative_groups::thread_block block) {
+    device::mc_fence_barrier_fence();
+    return hostProxyPut(command_slots, remote_region_address, target_rank,
+                        /*source=*/nullptr, /*remote_payload_offset=*/0,
+                        /*size=*/0, signal, timeout_ticks, lane, wait_result,
+                        block);
 }
 
 __device__ __forceinline__ TransferResult
