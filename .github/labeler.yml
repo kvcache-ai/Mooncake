@@ -5,11 +5,17 @@ run-ci:
 
 store:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-store/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-store/**/*'
+      - 'python/mooncake/cli.py'
+      - 'python/mooncake/cli_client.py'
 
 Transfer Engine:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-transfer-engine/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-transfer-engine/**/*'
+      - 'python/mooncake/cli_bench.py'
+      - 'python/mooncake/transfer_engine_topology_dump.py'
 
 PyTorch Backend:
   - changed-files:
@@ -21,7 +27,12 @@ Mooncake EP:
 
 Installation:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-wheel/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-wheel/**/*'
+      - 'python/mooncake/cli.py'
+      - 'python/mooncake/cli_client.py'
+      - 'python/mooncake/cli_bench.py'
+      - 'python/mooncake/transfer_engine_topology_dump.py'
 
 P2P Store:
   - changed-files:
@@ -57,6 +68,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:

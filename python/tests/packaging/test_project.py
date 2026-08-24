@@ -14,6 +14,18 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+CLI_MODULES = (
+    "cli.py",
+    "cli_client.py",
+    "cli_bench.py",
+    "transfer_engine_topology_dump.py",
+)
+CLI_ENTRY_POINTS = {
+    "mooncake_master": "mooncake.cli:main",
+    "mooncake_client": "mooncake.cli_client:main",
+    "transfer_engine_bench": "mooncake.cli_bench:main",
+    "transfer_engine_topology_dump": "mooncake.transfer_engine_topology_dump:main",
+}
 
 
 def test_scikit_build_core_is_the_only_build_backend() -> None:
@@ -55,6 +67,47 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_cli_has_one_authoritative_source_and_test_location() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+
+    for module in CLI_MODULES:
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "integration" / "test_cli.py"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "unit" / "test_cli_modules.py"
+    ).is_file()
+    assert not (REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_cli.py").exists()
+
+
+def test_cli_entry_points_remain_stable_across_build_interfaces() -> None:
+    for project_file in (
+        REPOSITORY_ROOT / "pyproject.toml",
+        REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml",
+    ):
+        project = tomllib.loads(project_file.read_text())
+        scripts = project["project"]["scripts"]
+        assert {name: scripts[name] for name in CLI_ENTRY_POINTS} == CLI_ENTRY_POINTS
+
+
+def test_cli_build_inputs_use_the_canonical_sources() -> None:
+    legacy_build = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert 'MIGRATED_CLI_SOURCE_DIR="python/mooncake"' in legacy_build
+    for module in CLI_MODULES:
+        assert module in legacy_build
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    for module in ("cli.py", "cli_bench.py", "transfer_engine_topology_dump.py"):
+        assert f"../python/mooncake/{module}" in integration_cmake
+        assert f"../mooncake-wheel/mooncake/{module}" not in integration_cmake
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(
