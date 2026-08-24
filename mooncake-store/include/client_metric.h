@@ -109,6 +109,12 @@ struct TransferMetric {
           batch_get_latency_us("mooncake_transfer_batch_get_latency",
                                "Batch Get transfer latency (us)",
                                kLatencyBucket, labels),
+          batch_get_metadata_latency_us(
+              "mooncake_transfer_batch_get_metadata_latency",
+              "Batch Get metadata query latency (us)", kLatencyBucket, labels),
+          batch_get_data_latency_us("mooncake_transfer_batch_get_data_latency",
+                                    "Batch Get data transfer latency (us)",
+                                    kLatencyBucket, labels),
           get_latency_us("mooncake_transfer_get_latency",
                          "Get transfer latency (us)", kLatencyBucket, labels),
           put_latency_us("mooncake_transfer_put_latency",
@@ -119,6 +125,8 @@ struct TransferMetric {
     ylt::metric::counter_t total_write_bytes;
     ylt::metric::histogram_t batch_put_latency_us;
     ylt::metric::histogram_t batch_get_latency_us;
+    ylt::metric::histogram_t batch_get_metadata_latency_us;
+    ylt::metric::histogram_t batch_get_data_latency_us;
     ylt::metric::histogram_t get_latency_us;
     ylt::metric::histogram_t put_latency_us;
 
@@ -127,6 +135,8 @@ struct TransferMetric {
         total_write_bytes.serialize(str);
         batch_put_latency_us.serialize(str);
         batch_get_latency_us.serialize(str);
+        batch_get_metadata_latency_us.serialize(str);
+        batch_get_data_latency_us.serialize(str);
         get_latency_us.serialize(str);
         put_latency_us.serialize(str);
     }
@@ -155,6 +165,10 @@ struct TransferMetric {
         ss << "Put: " << format_latency_summary(put_latency_us) << "\n";
         ss << "Batch Get: " << format_latency_summary(batch_get_latency_us)
            << "\n";
+        ss << "Batch Get Metadata: "
+           << format_latency_summary(batch_get_metadata_latency_us) << "\n";
+        ss << "Batch Get Data: "
+           << format_latency_summary(batch_get_data_latency_us) << "\n";
         ss << "Batch Put: " << format_latency_summary(batch_put_latency_us)
            << "\n";
 

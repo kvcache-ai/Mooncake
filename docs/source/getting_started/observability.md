@@ -208,3 +208,26 @@ curl http://<client-host>:9300/metrics/summary
 Set `MC_STORE_CLIENT_METRIC=0` to disable client metric collection. If the
 client HTTP server remains enabled while metrics are disabled, `/metrics` and
 `/metrics/summary` return HTTP 503 with `metrics not available`.
+
+### Batch Get Latency Breakdown
+
+A batch get spends its time in two distinct phases: querying object metadata
+from the master, and transferring the data over RDMA or reading it back from
+disk. Both phases are exported separately so that a slow load can be attributed
+without correlating several mixed metrics.
+
+| Metric | Description |
+|--------|-------------|
+| `mooncake_transfer_batch_get_latency` | End-to-end batch get latency |
+| `mooncake_transfer_batch_get_metadata_latency` | Time spent in the metadata query (master RPC) |
+| `mooncake_transfer_batch_get_data_latency` | Time spent in the data transfer (RDMA / disk read) |
+
+The same breakdown for the most recent call is also available from Python,
+which lets a KV-cache connector report per-request metadata and data latency
+separately instead of a single mixed load metric:
+
+```python
+store.batch_get_into_multi_buffers(keys, all_buffer_ptrs, all_sizes)
+timings = store.get_last_batch_get_timings()
+# {'metadata_us': 412, 'data_us': 1893, 'total_us': 2340}
+```

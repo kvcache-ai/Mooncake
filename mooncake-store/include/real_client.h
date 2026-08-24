@@ -177,6 +177,25 @@ class RealClient : public PyClient {
         bool prefer_same_node);
 
     /**
+     * @brief Per-stage latency breakdown (in microseconds) of a batch get
+     */
+    struct BatchGetTimings {
+        uint64_t metadata_us = 0;  // Metadata query (master RPC)
+        uint64_t data_us = 0;      // Data transfer (RDMA / disk read)
+        uint64_t total_us = 0;     // Whole batch_get_into_multi_buffers call
+    };
+
+    /**
+     * @brief Get the latency breakdown of the last batch_get_into_multi_buffers
+     * @return Timings of the most recent call, all zero if none has completed
+     * @note Cumulative histograms are also exported through the client metrics
+     * endpoint; this accessor is meant for callers that attribute the latency
+     * of an individual load, e.g. a KV-cache connector reporting per-request
+     * metadata and data latency separately
+     */
+    [[nodiscard]] BatchGetTimings getLastBatchGetTimings() const;
+
+    /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
      * @param buffer Pointer to Store-managed registered memory, either
@@ -1071,6 +1090,14 @@ class RealClient : public PyClient {
     std::unordered_map<std::string, AllocatedSegmentRecord>
         allocated_segment_records_;
     std::mutex allocated_segment_records_mutex_;
+
+    // Latency breakdown of the most recent batch_get_into_multi_buffers call
+    mutable std::mutex last_batch_get_timings_mutex_;
+    BatchGetTimings last_batch_get_timings_;
+
+    // Store the breakdown for getLastBatchGetTimings() and feed the cumulative
+    // client metric histograms.
+    void RecordBatchGetTimings(const BatchGetTimings &timings);
 
     void ReleaseMountedSegmentRecord(const std::string &segment_id);
     void ReleaseAllMountedSegmentRecords();

@@ -209,6 +209,32 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;
 }
 
+TEST_F(ClientMetricsTest, BatchGetBreakdownIsReported) {
+    ClientMetric metrics;
+
+    std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("Batch Get Metadata: No data") !=
+                std::string::npos);
+    EXPECT_TRUE(summary.find("Batch Get Data: No data") != std::string::npos);
+
+    metrics.transfer_metric.batch_get_metadata_latency_us.observe(300);
+    metrics.transfer_metric.batch_get_data_latency_us.observe(1500);
+    metrics.transfer_metric.batch_get_data_latency_us.observe(2000);
+
+    summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("Batch Get Metadata: count=1") !=
+                std::string::npos);
+    EXPECT_TRUE(summary.find("Batch Get Data: count=2") != std::string::npos);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_TRUE(
+        serialized.find("mooncake_transfer_batch_get_metadata_latency") !=
+        std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_transfer_batch_get_data_latency") !=
+                std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, ByteFormattingTest) {
     TransferMetric metrics;
 
