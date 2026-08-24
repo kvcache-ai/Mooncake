@@ -125,6 +125,18 @@ fn compiler_print_file_name(file_name: &str) -> Option<PathBuf> {
     None
 }
 
+fn emit_compiler_runtime_search(file_name: &str) -> bool {
+    let Some(path) = compiler_print_file_name(file_name) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    println!("cargo:rustc-link-search=native={}", parent.display());
+    true
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=MOONCAKE_TE_LIB_DIR");
@@ -328,6 +340,16 @@ fn main() {
         if has_library(&search_dirs, name) {
             println!("cargo:rustc-link-lib={name}");
         }
+    }
+
+    // Coverage-instrumented C++ archives reference __gcov_* symbols. Cargo
+    // links the Rust test binary directly, so add the compiler's gcov runtime
+    // when it is available.
+    if emit_compiler_runtime_search("libgcov.a")
+        || emit_compiler_runtime_search("libgcov.so")
+        || has_library(&search_dirs, "gcov")
+    {
+        println!("cargo:rustc-link-lib=gcov");
     }
 
     let include_dir = env::var("MOONCAKE_TE_INCLUDE_DIR").unwrap_or_else(|_| {
