@@ -47,6 +47,10 @@ def test_dependency_boundaries_are_declared() -> None:
         "structured",
         "vllm",
     }
+    assert set(metadata["optional-dependencies"]["structured"]) == {
+        "numpy",
+        "pillow",
+    }
 
 
 def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
@@ -55,6 +59,23 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_dataproto_catalog_has_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    tests_root = REPOSITORY_ROOT / "python" / "tests"
+    legacy_root = REPOSITORY_ROOT / "mooncake-wheel"
+
+    assert (package_root / "dataproto_catalog.py").is_file()
+    assert (
+        tests_root / "integration" / "dataproto" / "test_dataproto_catalog.py"
+    ).is_file()
+    assert not (legacy_root / "mooncake" / "dataproto_catalog.py").exists()
+    assert not (legacy_root / "tests" / "test_dataproto_catalog.py").exists()
+    assert (
+        'PATTERN "dataproto_catalog.py" EXCLUDE'
+        in (REPOSITORY_ROOT / "python" / "CMakeLists.txt").read_text()
+    )
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(

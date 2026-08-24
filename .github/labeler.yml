@@ -21,7 +21,10 @@ Mooncake EP:
 
 Installation:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-wheel/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-wheel/**/*'
+      - 'python/mooncake/dataproto_catalog.py'
+      - 'python/tests/integration/dataproto/**/*'
 
 P2P Store:
   - changed-files:
@@ -57,6 +60,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/integration/dataproto/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:
