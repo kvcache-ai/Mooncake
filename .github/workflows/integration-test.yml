@@ -16,6 +16,11 @@ on:
         required: false
         default: true
         type: boolean
+      run_rocm_sglang:
+        description: 'Run SGLang cases in the ROCm external PD suite'
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   test-sglang-integration:
@@ -181,7 +186,7 @@ jobs:
           docker run --rm --network=none \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             --entrypoint /bin/rm \
-            "lmsysorg/sglang:v0.5.18-rocm720-mi35x@sha256:6d68cd19206716cb3f1e31e2ad89cd0852d7ae614a792773c30a4277f8955c72" \
+            "vllm/vllm-openai-rocm:v0.21.0@sha256:98a77b20df03adeb1cfc0ced009b4df6dd52b0a994ab99a32421f30876a9ae0c" \
             -rf \
             /workspace/scripts/tone_tests/python/.pytest_cache \
             /workspace/scripts/tone_tests/python/__pycache__
@@ -197,6 +202,7 @@ jobs:
           clean: true
 
       - name: Download Python 3.10 ROCm wheel
+        if: inputs.run_rocm_sglang
         uses: actions/download-artifact@v4
         with:
           name: mooncake-wheel-rocm-ubuntu-py310
@@ -276,7 +282,11 @@ jobs:
             fi
           }
           trap cleanup EXIT INT TERM
-          bash scripts/tone_tests/scripts/run_test.sh run-all
+          if ${{ inputs.run_rocm_sglang }}; then
+            bash scripts/tone_tests/scripts/run_test.sh run-all
+          else
+            bash scripts/tone_tests/scripts/run_test.sh run-all VLLM
+          fi
 
       - name: Upload ROCm external PD logs
         if: always()

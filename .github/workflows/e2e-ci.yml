@@ -35,6 +35,7 @@ jobs:
     uses: ./.github/workflows/ci_rocm.yml
     with:
       checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
+      python_versions: '["3.12"]'
 
   integration-test:
     if: >
@@ -47,6 +48,7 @@ jobs:
       pr_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
       pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
       run_sglang: false
+      run_rocm_sglang: false
     secrets: inherit
 
   e2e-gate:

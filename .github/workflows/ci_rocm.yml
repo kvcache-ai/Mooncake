@@ -13,6 +13,11 @@ on:
         description: 'Git revision to build (used by trusted E2E dispatches)'
         required: false
         type: string
+      python_versions:
+        description: 'JSON array of Python versions to build'
+        required: false
+        default: '["3.10", "3.12"]'
+        type: string
 
 jobs:
   build-wheel-rocm:
@@ -25,7 +30,7 @@ jobs:
       fail-fast: false
       matrix:
         # 3.10 covers the SGLang ROCm image; 3.12 covers vLLM ROCm.
-        python-version: ['3.10', '3.12']
+        python-version: ${{ fromJSON(inputs.python_versions) }}
     env:
       HIP_BUILD: "1"
       SCCACHE_GHA_ENABLED: "true"
