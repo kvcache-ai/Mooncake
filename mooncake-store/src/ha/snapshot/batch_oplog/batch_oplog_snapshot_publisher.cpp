@@ -26,8 +26,8 @@ ErrorCode ReadPointer(HaKvBackend& backend, const std::string& key,
 
 }  // namespace
 
-BatchOpLogSnapshotPublisher::BatchOpLogSnapshotPublisher(
-    HaKvBackend& backend, std::string cluster_id)
+BatchOpLogSnapshotPublisher::BatchOpLogSnapshotPublisher(HaKvBackend& backend,
+                                                         std::string cluster_id)
     : backend_(backend), cluster_id_(std::move(cluster_id)) {}
 
 ErrorCode BatchOpLogSnapshotPublisher::Publish(
@@ -41,8 +41,8 @@ ErrorCode BatchOpLogSnapshotPublisher::Publish(
 ErrorCode BatchOpLogSnapshotPublisher::PublishImpl(
     std::string_view owner_token, std::string_view descriptor_json,
     const SnapshotMaintenanceLease& lease) {
-    if (owner_token.empty() || !lease.IsHeld() ||
-        !backend_.SupportsTxn() || cluster_id_.empty()) {
+    if (owner_token.empty() || !lease.IsHeld() || !backend_.SupportsTxn() ||
+        cluster_id_.empty()) {
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -78,23 +78,33 @@ ErrorCode BatchOpLogSnapshotPublisher::PublishImpl(
     if (err != ErrorCode::OK) {
         return err;
     }
-    if (!latest_exists && fallback_exists) {
-        return ErrorCode::INTERNAL_ERROR;
-    }
-    if (fallback_exists &&
-        !ha::DecodeBatchOpLogSnapshotDescriptor(fallback)) {
-        return ErrorCode::INTERNAL_ERROR;
-    }
-    if (latest_exists) {
-        auto decoded_latest =
-            ha::DecodeBatchOpLogSnapshotDescriptor(latest);
-        if (!decoded_latest) {
+    bool fallback_valid = false;
+    uint64_t fallback_batch_id = 0;
+    if (fallback_exists) {
+        auto decoded_fallback =
+            ha::DecodeBatchOpLogSnapshotDescriptor(fallback);
+        if (!decoded_fallback) {
             return ErrorCode::INTERNAL_ERROR;
         }
-        if (candidate->last_included_batch_id <=
-            decoded_latest->last_included_batch_id) {
-            return ErrorCode::ETCD_TRANSACTION_FAIL;
+        fallback_valid = true;
+        fallback_batch_id = decoded_fallback->last_included_batch_id;
+    }
+
+    bool latest_valid = false;
+    uint64_t latest_batch_id = 0;
+    if (latest_exists) {
+        auto decoded_latest = ha::DecodeBatchOpLogSnapshotDescriptor(latest);
+        if (decoded_latest) {
+            latest_valid = true;
+            latest_batch_id = decoded_latest->last_included_batch_id;
         }
+    }
+    if (latest_valid && candidate->last_included_batch_id <= latest_batch_id) {
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
+    }
+    if (!latest_valid && fallback_valid &&
+        candidate->last_included_batch_id <= fallback_batch_id) {
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
     }
 
     // Re-check immediately before the fenced transaction. A keepalive can
@@ -107,21 +117,21 @@ ErrorCode BatchOpLogSnapshotPublisher::PublishImpl(
     txn.compares.push_back({.key = maintenance_key,
                             .kind = KvCompareKind::kValueEquals,
                             .expected_value = std::string(owner_token)});
-    txn.compares.push_back(
-        {.key = latest_key,
-         .kind = latest_exists ? KvCompareKind::kValueEquals
-                               : KvCompareKind::kKeyNotExists,
-         .expected_value = latest});
-    txn.compares.push_back(
-        {.key = fallback_key,
-         .kind = fallback_exists ? KvCompareKind::kValueEquals
-                                 : KvCompareKind::kKeyNotExists,
-         .expected_value = fallback});
-    if (latest_exists) {
+    txn.compares.push_back({.key = latest_key,
+                            .kind = latest_exists
+                                        ? KvCompareKind::kValueEquals
+                                        : KvCompareKind::kKeyNotExists,
+                            .expected_value = latest});
+    txn.compares.push_back({.key = fallback_key,
+                            .kind = fallback_exists
+                                        ? KvCompareKind::kValueEquals
+                                        : KvCompareKind::kKeyNotExists,
+                            .expected_value = fallback});
+    if (latest_valid) {
         txn.puts.push_back({.key = fallback_key, .value = latest});
     }
-    txn.puts.push_back({.key = latest_key,
-                        .value = std::string(descriptor_json)});
+    txn.puts.push_back(
+        {.key = latest_key, .value = std::string(descriptor_json)});
     return backend_.Txn(txn);
 }
 

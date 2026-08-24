@@ -21,15 +21,14 @@ SnapshotMaintenanceLease::SnapshotMaintenanceLease(std::string cluster_id,
       lock_created_(testing),
       keepalive_stopped_(!testing) {}
 
-SnapshotMaintenanceLease::~SnapshotMaintenanceLease() {
-    (void)Release();
-}
+SnapshotMaintenanceLease::~SnapshotMaintenanceLease() { (void)Release(); }
 
 std::unique_ptr<SnapshotMaintenanceLease>
-SnapshotMaintenanceLease::MakeForTesting(
-    std::string cluster_id, std::string owner_token) {
-    return std::unique_ptr<SnapshotMaintenanceLease>(new SnapshotMaintenanceLease(
-        std::move(cluster_id), std::move(owner_token), true));
+SnapshotMaintenanceLease::MakeForTesting(std::string cluster_id,
+                                         std::string owner_token) {
+    return std::unique_ptr<SnapshotMaintenanceLease>(
+        new SnapshotMaintenanceLease(std::move(cluster_id),
+                                     std::move(owner_token), true));
 }
 
 ErrorCode SnapshotMaintenanceLease::Acquire() {
@@ -75,9 +74,9 @@ ErrorCode SnapshotMaintenanceLease::Acquire() {
         return err;
     }
     EtcdRevisionId revision = 0;
-    err = EtcdHelper::CreateWithLease(
-        lock_key_.c_str(), lock_key_.size(), owner_token_.c_str(),
-        owner_token_.size(), lease_id_, revision);
+    err = EtcdHelper::CreateWithLease(lock_key_.c_str(), lock_key_.size(),
+                                      owner_token_.c_str(), owner_token_.size(),
+                                      lease_id_, revision);
     if (err != ErrorCode::OK) {
         (void)StopKeepAlive(true);
         return err;

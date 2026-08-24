@@ -55,7 +55,8 @@ class FakeBackend final : public HaKvBackend {
             const auto it = values.find(compare.key);
             if (compare.kind == KvCompareKind::kKeyNotExists) {
                 if (it != values.end()) return ErrorCode::ETCD_TRANSACTION_FAIL;
-            } else if (it == values.end() || it->second != compare.expected_value) {
+            } else if (it == values.end() ||
+                       it->second != compare.expected_value) {
                 return ErrorCode::ETCD_TRANSACTION_FAIL;
             }
         }
@@ -77,8 +78,8 @@ std::string MakeDescriptor(uint64_t batch_id, int64_t lease_id = 101,
     descriptor.last_included_seq = batch_id * 10;
     descriptor.last_included_batch_id = batch_id;
     descriptor.producer_view_version = producer_view;
-    descriptor.manifest_key = "snapshots/batch-oplog/" + descriptor.snapshot_id +
-                              "/manifest.json";
+    descriptor.manifest_key =
+        "snapshots/batch-oplog/" + descriptor.snapshot_id + "/manifest.json";
     descriptor.manifest_size = 1;
     descriptor.created_at_ms = 1234;
     return ha::EncodeBatchOpLogSnapshotDescriptor(descriptor);
@@ -96,14 +97,85 @@ TEST(BatchOpLogSnapshotPublisherTest, PublishesAndRotatesPointersAtomically) {
 
     const auto first = MakeDescriptor(1);
     EXPECT_EQ(ErrorCode::OK, publisher.Publish(*lease, first));
-    EXPECT_EQ(first, backend.values[ha::BuildBatchOpLogSnapshotLatestKey("cluster")]);
+    EXPECT_EQ(first,
+              backend.values[ha::BuildBatchOpLogSnapshotLatestKey("cluster")]);
     EXPECT_FALSE(backend.values.contains(
         ha::BuildBatchOpLogSnapshotFallbackKey("cluster")));
 
     const auto second = MakeDescriptor(2);
     EXPECT_EQ(ErrorCode::OK, publisher.Publish(*lease, second));
-    EXPECT_EQ(second, backend.values[ha::BuildBatchOpLogSnapshotLatestKey("cluster")]);
-    EXPECT_EQ(first, backend.values[ha::BuildBatchOpLogSnapshotFallbackKey("cluster")]);
+    EXPECT_EQ(second,
+              backend.values[ha::BuildBatchOpLogSnapshotLatestKey("cluster")]);
+    EXPECT_EQ(
+        first,
+        backend.values[ha::BuildBatchOpLogSnapshotFallbackKey("cluster")]);
+}
+
+TEST(BatchOpLogSnapshotPublisherTest,
+     RepairsMissingLatestAndPreservesFallback) {
+    FakeBackend backend;
+    auto lease = SnapshotMaintenanceLease::MakeForTesting("cluster", "101");
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotMaintenanceKey("cluster"),
+                          "101"));
+    const auto fallback = MakeDescriptor(5);
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotFallbackKey("cluster"),
+                          fallback));
+    BatchOpLogSnapshotPublisher publisher(backend, "cluster");
+
+    const auto candidate = MakeDescriptor(6);
+    EXPECT_EQ(ErrorCode::OK, publisher.Publish(*lease, candidate));
+    EXPECT_EQ(candidate,
+              backend.values[ha::BuildBatchOpLogSnapshotLatestKey("cluster")]);
+    EXPECT_EQ(
+        fallback,
+        backend.values[ha::BuildBatchOpLogSnapshotFallbackKey("cluster")]);
+}
+
+TEST(BatchOpLogSnapshotPublisherTest,
+     RepairsCorruptLatestAndPreservesFallback) {
+    FakeBackend backend;
+    auto lease = SnapshotMaintenanceLease::MakeForTesting("cluster", "101");
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotMaintenanceKey("cluster"),
+                          "101"));
+    const auto fallback = MakeDescriptor(5);
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotFallbackKey("cluster"),
+                          fallback));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotLatestKey("cluster"),
+                          "not-json"));
+    BatchOpLogSnapshotPublisher publisher(backend, "cluster");
+
+    const auto candidate = MakeDescriptor(6);
+    EXPECT_EQ(ErrorCode::OK, publisher.Publish(*lease, candidate));
+    EXPECT_EQ(candidate,
+              backend.values[ha::BuildBatchOpLogSnapshotLatestKey("cluster")]);
+    EXPECT_EQ(
+        fallback,
+        backend.values[ha::BuildBatchOpLogSnapshotFallbackKey("cluster")]);
+}
+
+TEST(BatchOpLogSnapshotPublisherTest,
+     RejectsRepairCandidateNotNewerThanFallback) {
+    FakeBackend backend;
+    auto lease = SnapshotMaintenanceLease::MakeForTesting("cluster", "101");
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotMaintenanceKey("cluster"),
+                          "101"));
+    const auto fallback = MakeDescriptor(5);
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotFallbackKey("cluster"),
+                          fallback));
+    BatchOpLogSnapshotPublisher publisher(backend, "cluster");
+
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
+              publisher.Publish(*lease, MakeDescriptor(5)));
+    EXPECT_FALSE(backend.values.contains(
+        ha::BuildBatchOpLogSnapshotLatestKey("cluster")));
+    EXPECT_EQ(0u, backend.txn_count);
 }
 
 TEST(BatchOpLogSnapshotPublisherTest, RejectsStaleAndLostLeaseWithoutTxn) {
@@ -115,12 +187,14 @@ TEST(BatchOpLogSnapshotPublisherTest, RejectsStaleAndLostLeaseWithoutTxn) {
     const auto first = MakeDescriptor(4);
     ASSERT_EQ(ErrorCode::OK, publisher.Publish(*lease, first));
     const auto txn_count = backend.txn_count;
-    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, publisher.Publish(*lease, first));
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
+              publisher.Publish(*lease, first));
     EXPECT_EQ(txn_count, backend.txn_count);
 
     lease->Release();
     const auto next = MakeDescriptor(5);
-    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, publisher.Publish(*lease, next));
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
+              publisher.Publish(*lease, next));
     EXPECT_EQ(txn_count, backend.txn_count);
 }
 
@@ -133,7 +207,8 @@ TEST(BatchOpLogSnapshotPublisherTest, LeavesPointersUnchangedOnCasFailure) {
     BatchOpLogSnapshotPublisher publisher(backend, "cluster");
     const auto first = MakeDescriptor(1);
     backend.next_txn_error = ErrorCode::ETCD_TRANSACTION_FAIL;
-    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, publisher.Publish(*lease, first));
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
+              publisher.Publish(*lease, first));
     EXPECT_FALSE(backend.values.contains(
         ha::BuildBatchOpLogSnapshotLatestKey("cluster")));
 }
@@ -162,8 +237,9 @@ TEST(BatchOpLogSnapshotPublisherTest, FencesLatestAndFallbackRaces) {
     backend.mutate_value = first;
     EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
               publisher.Publish(*lease, MakeDescriptor(2)));
-    EXPECT_EQ(first,
-              backend.values[ha::BuildBatchOpLogSnapshotFallbackKey("cluster")]);
+    EXPECT_EQ(
+        first,
+        backend.values[ha::BuildBatchOpLogSnapshotFallbackKey("cluster")]);
 }
 
 TEST(BatchOpLogSnapshotPublisherTest, RejectsCandidateFromAnotherLease) {
@@ -178,15 +254,18 @@ TEST(BatchOpLogSnapshotPublisherTest, RejectsCandidateFromAnotherLease) {
     EXPECT_EQ(0u, backend.txn_count);
 }
 
-TEST(BatchOpLogSnapshotPublisherTest, AllowsOlderProducerViewWhenCursorAdvances) {
+TEST(BatchOpLogSnapshotPublisherTest,
+     AllowsOlderProducerViewWhenCursorAdvances) {
     FakeBackend backend;
     auto lease = SnapshotMaintenanceLease::MakeForTesting("cluster", "101");
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(ha::BuildBatchOpLogSnapshotMaintenanceKey("cluster"),
                           "101"));
     BatchOpLogSnapshotPublisher publisher(backend, "cluster");
-    ASSERT_EQ(ErrorCode::OK, publisher.Publish(*lease, MakeDescriptor(1, 101, 9)));
-    EXPECT_EQ(ErrorCode::OK, publisher.Publish(*lease, MakeDescriptor(2, 101, 3)));
+    ASSERT_EQ(ErrorCode::OK,
+              publisher.Publish(*lease, MakeDescriptor(1, 101, 9)));
+    EXPECT_EQ(ErrorCode::OK,
+              publisher.Publish(*lease, MakeDescriptor(2, 101, 3)));
 }
 
 TEST(BatchOpLogSnapshotPublisherTest, LockOwnerRaceCannotPublish) {
@@ -225,15 +304,21 @@ TEST(BatchOpLogSnapshotPublisherTest, RealEtcdLeaseAndPublisherLifecycle) {
     if (EtcdHelper::ConnectToEtcdStoreClient(kEndpoints) != ErrorCode::OK) {
         GTEST_SKIP() << "etcd is not available at " << kEndpoints;
     }
+    const std::string probe_key =
+        "/oplog/n04-probe-" + std::to_string(static_cast<long long>(getpid()));
+    std::string probe_value;
+    EtcdRevisionId probe_revision = 0;
+    const auto probe = EtcdHelper::Get(probe_key.c_str(), probe_key.size(),
+                                       probe_value, probe_revision);
+    if (probe != ErrorCode::OK && probe != ErrorCode::ETCD_KEY_NOT_EXIST) {
+        GTEST_SKIP() << "etcd is not reachable at " << kEndpoints << ": "
+                     << static_cast<int>(probe);
+    }
 
     const std::string cluster =
         "n04-real-" + std::to_string(static_cast<long long>(getpid()));
     SnapshotMaintenanceLease first(cluster);
-    const auto first_acquire = first.Acquire();
-    if (first_acquire != ErrorCode::OK) {
-        GTEST_SKIP() << "etcd lease unavailable: "
-                     << static_cast<int>(first_acquire);
-    }
+    ASSERT_EQ(ErrorCode::OK, first.Acquire());
     SnapshotMaintenanceLease second(cluster);
     EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, second.Acquire());
 
