@@ -86,6 +86,11 @@ struct TransferHandshakeUtil {
             root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
             root["ctrl_channel"] = desc.ctrl_channel;
         }
+        if (desc.msg_qp_num != 0 || desc.msg_channel) {
+            root["msg_qp_num"] = Json::UInt(desc.msg_qp_num);
+            root["msg_rq_depth"] = Json::UInt(desc.msg_rq_depth);
+            root["msg_channel"] = desc.msg_channel;
+        }
         root["reply_msg"] = desc.reply_msg;
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
@@ -133,6 +138,9 @@ struct TransferHandshakeUtil {
         desc.notify_qp_num = 0;
         desc.notify_rq_depth = 0;
         desc.ctrl_channel = false;
+        desc.msg_qp_num = 0;
+        desc.msg_rq_depth = 0;
+        desc.msg_channel = false;
         if (root.isMember("notify_qp_num") && root["notify_qp_num"].isUInt()) {
             desc.notify_qp_num = root["notify_qp_num"].asUInt();
         }
@@ -144,6 +152,17 @@ struct TransferHandshakeUtil {
         }
         if (root.isMember("ctrl_channel") && root["ctrl_channel"].isBool()) {
             desc.ctrl_channel = root["ctrl_channel"].asBool();
+        }
+        if (root.isMember("msg_qp_num") && root["msg_qp_num"].isUInt()) {
+            desc.msg_qp_num = root["msg_qp_num"].asUInt();
+        }
+        if (root.isMember("msg_rq_depth") && root["msg_rq_depth"].isUInt()) {
+            unsigned int depth = root["msg_rq_depth"].asUInt();
+            if (depth > 0xFFFFu) return ERR_INVALID_ARGUMENT;
+            desc.msg_rq_depth = static_cast<uint16_t>(depth);
+        }
+        if (root.isMember("msg_channel") && root["msg_channel"].isBool()) {
+            desc.msg_channel = root["msg_channel"].asBool();
         }
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
@@ -326,6 +345,9 @@ static int encodeMultiProtocolSegmentDesc(
     if (!desc.rdma_server_name.empty()) {
         segmentJSON["rdma_server_name"] = desc.rdma_server_name;
     }
+    if (desc.supports_two_sided_msg) {
+        segmentJSON["supports_two_sided_msg"] = true;
+    }
     Json::Value protocolJSON(Json::arrayValue);
     for (const auto &proto : protocols) {
         if (proto == "rdma") {
@@ -429,6 +451,9 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["timestamp"] = getCurrentDateTime();
     if (!desc.rdma_server_name.empty()) {
         segmentJSON["rdma_server_name"] = desc.rdma_server_name;
+    }
+    if (desc.supports_two_sided_msg) {
+        segmentJSON["supports_two_sided_msg"] = true;
     }
 
     if (segmentJSON["protocol"] == "rdma" ||
@@ -648,6 +673,11 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
         desc->timestamp = segmentJSON["timestamp"].asString();
     if (segmentJSON.isMember("rdma_server_name"))
         desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
+    if (segmentJSON.isMember("supports_two_sided_msg") &&
+        segmentJSON["supports_two_sided_msg"].isBool()) {
+        desc->supports_two_sided_msg =
+            segmentJSON["supports_two_sided_msg"].asBool();
+    }
 
     for (const auto &protocolStr : segmentJSON["protocol"]) {
         std::string proto = protocolStr.asString();
@@ -817,6 +847,11 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->timestamp = segmentJSON["timestamp"].asString();
     if (segmentJSON.isMember("rdma_server_name"))
         desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
+    if (segmentJSON.isMember("supports_two_sided_msg") &&
+        segmentJSON["supports_two_sided_msg"].isBool()) {
+        desc->supports_two_sided_msg =
+            segmentJSON["supports_two_sided_msg"].asBool();
+    }
 
     if (desc->protocol == "rdma" || desc->protocol == "barex" ||
         desc->protocol == "efa" || desc->protocol == "cxi") {

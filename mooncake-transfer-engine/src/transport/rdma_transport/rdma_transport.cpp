@@ -687,6 +687,7 @@ int RdmaTransport::allocateLocalSegmentID() {
         desc->devices.push_back(device_desc);
     }
     desc->topology = *(local_topology_.get());
+    desc->supports_two_sided_msg = supportsTwoSidedMsg();
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;

@@ -138,6 +138,11 @@ class TransferMetadata {
         // of `name`.
         std::string rdma_server_name;
 
+        // Peer advertises the TE two-sided msg path (Ctrl/Msg + bounce).
+        // Managed buffers are TE-local only and are NOT published as registered
+        // BufferDesc entries; senders select two-sided via this capability bit.
+        bool supports_two_sided_msg = false;
+
         // Returns the server name to use for NIC path construction.
         // Uses rdma_server_name when available, otherwise falls back
         // to name.
@@ -184,6 +189,11 @@ class TransferMetadata {
         uint32_t notify_qp_num = 0;
         uint16_t notify_rq_depth = 0;
         bool ctrl_channel = false;
+        // Per-peer MsgChannel (two-sided data QP). When msg_channel is true,
+        // this handshake only sets up the msg path (qp_num may be empty).
+        uint32_t msg_qp_num = 0;
+        uint16_t msg_rq_depth = 0;
+        bool msg_channel = false;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
