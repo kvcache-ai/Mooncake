@@ -1,6 +1,7 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <sstream>
 #include <transfer_engine.h>
@@ -41,6 +42,20 @@ cudaStream_t create_comm_stream() {
     CUDA_CHECK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking,
                                             greatest_priority));
     return stream;
+}
+
+// CUDA Graph capture is initiated by PyTorch on the caller's stream, while
+// the decoupled EP implementation normally launches communication on its own
+// stream.  A raw CUDA capture query keeps this boundary Torch-free and lets
+// the legacy path stay on the capturing stream for the duration of capture.
+bool stream_is_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    auto error = cudaStreamIsCapturing(stream, &status);
+    if (error != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return status != cudaStreamCaptureStatusNone;
 }
 
 }  // namespace
@@ -222,9 +237,12 @@ MooncakeEpBuffer::dispatch(
     // handle is allowed to be nullptr in CUDA/PyTorch.
     auto compute_stream_raw =
         reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    auto launch_stream = return_recv_hook ? compute_stream_raw : comm_stream;
+    const bool graph_capture = stream_is_capturing(compute_stream_raw);
+    auto launch_stream =
+        (return_recv_hook || graph_capture) ? compute_stream_raw : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream_raw);
+    if (not return_recv_hook and not graph_capture)
+        stream_wait(launch_stream, compute_stream_raw);
 
     // Allocate packed tensors
     void* x = reinterpret_cast<void*>(x_ptr);
@@ -300,17 +318,25 @@ MooncakeEpBuffer::dispatch(
             num_ranks, use_fp8, workspace, launch_stream, timeout_ticks, phases,
             active_qps_per_rank);
     };
-    if (return_recv_hook) {
-        launcher(LOW_LATENCY_SEND_PHASE);
-        mark_send_done();
-    } else {
+    // During CUDA graph capture, skip the RDMA kernel launch entirely.
+    // The dispatch/combine kernels spin-wait on cudaHostAllocMapped signal
+    // buffers, which are inaccessible during capture and cause
+    // cudaErrorIllegalAddress.  The eager warmup passes (graph_capture==false)
+    // execute the full path and verify correctness; the capture pass only
+    // needs to record GPU-resident work on compute_stream.
+    if (!graph_capture) {
+        if (return_recv_hook) {
+            launcher(LOW_LATENCY_SEND_PHASE);
+            mark_send_done();
+        } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        launcher(LOW_LATENCY_SEND_PHASE);
-        mark_and_wait_peer_send_done();
-        launcher(LOW_LATENCY_RECV_PHASE);
+            launcher(LOW_LATENCY_SEND_PHASE);
+            mark_and_wait_peer_send_done();
+            launcher(LOW_LATENCY_RECV_PHASE);
 #else
-        launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
+            launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
 #endif
+        }
     }
 
     // Wait streams
@@ -322,7 +348,7 @@ MooncakeEpBuffer::dispatch(
         event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
     } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
         event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
-    } else if (not return_recv_hook) {
+    } else if (not return_recv_hook and not graph_capture) {
         stream_wait(compute_stream_raw, launch_stream);
     }
 
@@ -330,6 +356,12 @@ MooncakeEpBuffer::dispatch(
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() {
+            // Skip the recv-phase launch when the hook fires inside a CUDA
+            // graph capture.  The hook is returned to Python and may be
+            // invoked from TBO's execute path, which runs on the capture
+            // stream.  Calling launcher() (which spin-waits on mapped
+            // host buffers) during capture causes cudaErrorIllegalAddress.
+            if (graph_capture) return;
             if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
@@ -380,9 +412,12 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     // handle is allowed to be nullptr in CUDA/PyTorch.
     auto compute_stream_raw =
         reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    auto launch_stream = return_recv_hook ? compute_stream_raw : comm_stream;
+    const bool graph_capture = stream_is_capturing(compute_stream_raw);
+    auto launch_stream =
+        (return_recv_hook || graph_capture) ? compute_stream_raw : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream_raw);
+    if (not return_recv_hook and not graph_capture)
+        stream_wait(launch_stream, compute_stream_raw);
 
     int64_t timeout_ticks =
         timeout_us == -1 ? -1
@@ -435,17 +470,19 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
             zero_copy, active_qps_per_rank);
     };
-    if (return_recv_hook) {
-        launcher(LOW_LATENCY_SEND_PHASE);
-        mark_send_done();
-    } else {
+    if (!graph_capture) {
+        if (return_recv_hook) {
+            launcher(LOW_LATENCY_SEND_PHASE);
+            mark_send_done();
+        } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        launcher(LOW_LATENCY_SEND_PHASE);
-        mark_and_wait_peer_send_done();
-        launcher(LOW_LATENCY_RECV_PHASE);
+            launcher(LOW_LATENCY_SEND_PHASE);
+            mark_and_wait_peer_send_done();
+            launcher(LOW_LATENCY_RECV_PHASE);
 #else
-        launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
+            launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
 #endif
+        }
     }
 
     // Wait streams
@@ -457,7 +494,7 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
         event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
     } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
         event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
-    } else if (not return_recv_hook) {
+    } else if (not return_recv_hook and not graph_capture) {
         stream_wait(compute_stream_raw, launch_stream);
     }
 
@@ -465,6 +502,8 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() {
+            // Skip during CUDA graph capture for the same reason as dispatch.
+            if (graph_capture) return;
             if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
