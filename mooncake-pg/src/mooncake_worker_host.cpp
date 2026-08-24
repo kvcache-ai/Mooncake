@@ -314,7 +314,9 @@ void MooncakeWorker::putTaskCuda(
     GpuEvent event_end(enq_stream.deviceIndex());
     event_end.record(enq_stream);
     issue_stream.waitEvent(event_end);
-    PG_ASSERT_CUDA(cudaStreamSynchronize(issue_stream.get()));
+    if (!is_capturing) {
+        PG_ASSERT_CUDA(cudaStreamSynchronize(issue_stream.get()));
+    }
 }
 
 }  // namespace mooncake
