@@ -14,6 +14,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+ALLOCATOR_MODULES = (
+    "allocator.py",
+    "allocator_ascend_npu.py",
+    "fabric_allocator_utils.py",
+)
 
 
 def test_scikit_build_core_is_the_only_build_backend() -> None:
@@ -55,6 +60,35 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_allocators_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_root = REPOSITORY_ROOT / "mooncake-integration"
+
+    for module in ALLOCATOR_MODULES:
+        assert (package_root / module).is_file()
+        assert not (legacy_root / module).exists()
+
+    tests_root = REPOSITORY_ROOT / "python" / "tests" / "allocators"
+    assert (tests_root / "test_allocator.py").is_file()
+    assert (tests_root / "test_allocator_ascend_npu.py").is_file()
+    assert (tests_root / "test_fabric_allocator_utils.py").is_file()
+
+
+def test_allocator_build_inputs_use_the_canonical_source() -> None:
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    python_cmake = (REPOSITORY_ROOT / "python" / "CMakeLists.txt").read_text()
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+
+    assert "../python/mooncake" in integration_cmake
+    assert 'MIGRATED_ALLOCATOR_SOURCE_DIR="python/mooncake"' in legacy_builder
+    for module in ALLOCATOR_MODULES:
+        assert f'"${{MOONCAKE_PYTHON_SOURCE_DIR}}/{module}"' in integration_cmake
+        assert f'PATTERN "{module}" EXCLUDE' in python_cmake
+        assert f"mooncake-integration/{module}" not in legacy_builder
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(

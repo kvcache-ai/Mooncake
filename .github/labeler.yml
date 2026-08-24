@@ -29,7 +29,12 @@ P2P Store:
 
 Integration:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-integration/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-integration/**/*'
+      - 'python/mooncake/allocator.py'
+      - 'python/mooncake/allocator_ascend_npu.py'
+      - 'python/mooncake/fabric_allocator_utils.py'
+      - 'python/tests/allocators/**/*'
 
 Common:
   - changed-files:
@@ -57,11 +62,14 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:
   - changed-files:
     - any-glob-to-any-file:
       - '**/ascend*/**'
+      - 'python/mooncake/allocator_ascend_npu.py'
+      - 'python/tests/allocators/test_allocator_ascend_npu.py'
       - 'scripts/ascend/**'
       - '.github/workflows/*ascend*'
