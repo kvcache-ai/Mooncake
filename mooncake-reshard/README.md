@@ -101,7 +101,10 @@ public JSON APIs. Their wire format contains only canonical fields, and
 deserialization rejects alternate field names rather than translating
 framework-specific input.
 
-Run the logical planner tests from the repository root:
+The root Python project is the authoritative source. The former
+`PYTHONPATH=mooncake-reshard/python` source-tree workflow is intentionally no
+longer supported. Install the root project in editable mode and run the logical
+planner tests from the repository root:
 
 ```bash
 python3 -m pip install -e '.[dev]'

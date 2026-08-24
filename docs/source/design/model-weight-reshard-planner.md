@@ -1,6 +1,6 @@
 # Model Weight Logical Reshard Planner
 
-`mooncake-reshard` plans an address-free conversion between complete model
+`mooncake.reshard` plans an address-free conversion between complete model
 weight placements. It turns a source placement or committed logical Store
 snapshot and a target placement into compact N-D transfer regions. It does not
 inspect framework runtime objects or assign physical GPU addresses.
