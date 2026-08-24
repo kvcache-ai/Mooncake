@@ -241,7 +241,7 @@ else
 fi
 
 echo "Running CLI entry point tests..."
-python test_cli.py
+python ../../python/tests/integration/test_cli.py
 
 ENABLE_EMBEDDED_METADATA_SERVER=true
 if [ "$RUN_TESTS_METADATA_SERVER_MODE" = "managed" ]; then
