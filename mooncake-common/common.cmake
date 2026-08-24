@@ -107,6 +107,7 @@ option(
   OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -676,3 +677,9 @@ if(GH_MIRROR)
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/FindYLT.cmake)
+
+if(USE_SHCA)
+  add_compile_definitions(USE_SHCA)
+else()
+  add_compile_definitions(YLT_ENABLE_IBV)
+endif()

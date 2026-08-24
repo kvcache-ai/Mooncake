@@ -49,6 +49,19 @@ check_success() {
     fi
 }
 
+# Detect ScaleFabric SHCA (shca-tools).
+has_shca_tools() {
+    if command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W -f='${Status}' shca-tools 2>/dev/null | grep -q "install ok installed"
+        return $?
+    fi
+    if command -v rpm >/dev/null 2>&1; then
+        rpm -q shca-tools >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
 read_os_release_value() {
     local key="$1"
     awk -F= -v key="$key" '
@@ -183,6 +196,16 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libc6-dev \
                      libc-bin"
 
+    # ScaleFabric SHCA (shca-tools) ships its own libibverbs headers/libs; installing
+    # libibverbs-dev conflicts with it. libboost-all-dev pulls OpenMPI/libfabric,
+    # which also depend on distro ibverbs and fail on SHCA systems.
+    if has_shca_tools; then
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/libibverbs-dev//g')
+        SAFE_BOOST="libboost-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-program-options-dev libboost-regex-dev libboost-serialization-dev"
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed "s/libboost-all-dev/$SAFE_BOOST/g")
+        echo -e "${GREEN}shca-tools package detected. Adjusting system packages accordingly; build with -DUSE_SHCA=ON to enable SHCA support.${NC}"
+    fi
+
     apt-get install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
 
@@ -214,6 +237,12 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      patchelf  \
                      xxhash-devel \
                      libbsd-devel"
+
+    # Same SHCA conflict on RHEL-family: skip rdma-core-devel when shca-tools is present.
+    if has_shca_tools; then
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/rdma-core-devel//g')
+        echo -e "${GREEN}shca-tools package detected. Skipping rdma-core-devel (provided by shca-tools).${NC}"
+    fi
 
     yum install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"

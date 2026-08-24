@@ -218,7 +218,7 @@ class RdmaContext {
     std::string nicPath() const;
 
    public:
-    uint16_t lid() const { return lid_; }
+    uint32_t lid() const { return lid_; }
 
     std::string gid() const;
 
@@ -304,7 +304,7 @@ class RdmaContext {
     ibv_comp_channel **comp_channel_ = nullptr;
 
     uint8_t port_ = 0;
-    uint16_t lid_ = 0;
+    uint32_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;
     int active_width_ = 1;

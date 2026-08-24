@@ -20,6 +20,9 @@
 #include <sys/epoll.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <atomic>
 #include <cassert>
@@ -823,7 +826,11 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     }
 
     native_context_ = context.release();
+#ifdef USE_SHCA
+    lid_ = u17_to_32(port_attr.lid);
+#else
     lid_ = port_attr.lid;
+#endif
     return 0;
 }
 }  // namespace tent
