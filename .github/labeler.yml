@@ -9,7 +9,10 @@ store:
 
 Transfer Engine:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-transfer-engine/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-transfer-engine/**/*'
+      - 'python/mooncake/shared_segment.py'
+      - 'python/tests/engine/**/*'
 
 PyTorch Backend:
   - changed-files:
@@ -57,6 +60,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:

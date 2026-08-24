@@ -40,13 +40,16 @@ def test_dependency_boundaries_are_declared() -> None:
     metadata = project["project"]
 
     assert set(metadata["dependencies"]) == {"aiohttp", "msgpack", "requests"}
-    assert set(metadata["optional-dependencies"]) == {
+    optional_dependencies = metadata["optional-dependencies"]
+    assert set(optional_dependencies) == {
         "administration",
         "dev",
         "hardware",
         "structured",
         "vllm",
     }
+    assert "torch" not in metadata["dependencies"]
+    assert "torch" in optional_dependencies["hardware"]
 
 
 def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
@@ -55,6 +58,26 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_shared_segment_has_one_authoritative_source() -> None:
+    canonical_source = REPOSITORY_ROOT / "python" / "mooncake" / "shared_segment.py"
+    legacy_source = REPOSITORY_ROOT / "mooncake-integration" / "shared_segment.py"
+
+    assert canonical_source.is_file()
+    assert not legacy_source.exists()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "engine" / "test_shared_segment.py"
+    ).is_file()
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert "../python/mooncake/shared_segment.py" in integration_cmake
+    assert "mooncake-integration/shared_segment.py" not in integration_cmake
+    assert "cp python/mooncake/shared_segment.py" in legacy_build_script
+    assert "mooncake-integration/shared_segment.py" not in legacy_build_script
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(
