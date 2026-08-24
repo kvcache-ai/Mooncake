@@ -18,6 +18,7 @@
 #include "types.h"
 #include "master_config.h"
 #include "master_metric_manager.h"
+#include "version.h"
 
 namespace mooncake::test {
 
@@ -1032,6 +1033,42 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     // Clean up.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     service_.Remove(ssd_only_key, "default");
+}
+
+// Build info is an "info"-style metric: the value is always 1 and the version
+// strings are carried by labels, so serialization must emit a single series
+// containing both version labels.
+TEST_F(MasterMetricsTest, BuildInfoMetricIsSerialized) {
+    auto& metrics = MasterMetricManager::instance();
+
+    const std::string serialized = metrics.serialize_metrics();
+
+    ASSERT_NE(serialized.find("mooncake_build_info"), std::string::npos)
+        << "build info metric missing from serialized output";
+    // Label order inside the series is not asserted: only the presence of both
+    // labels with the compiled-in values matters for scraping and grouping.
+    EXPECT_NE(serialized.find("version=\"" + GetMooncakeStoreVersion() + "\""),
+              std::string::npos)
+        << "RPC handshake version missing from build info labels";
+    EXPECT_NE(serialized.find("display_version=\"" +
+                              std::string(MOONCAKE_DISPLAY_VERSION) + "\""),
+              std::string::npos)
+        << "display version missing from build info labels";
+
+    // The series value is fixed at 1; extract the number after the closing
+    // brace of the build info series to confirm it is exposed as such.
+    const auto metric_pos = serialized.find("mooncake_build_info{");
+    ASSERT_NE(metric_pos, std::string::npos)
+        << "build info metric has no labelled series";
+    const auto brace_end = serialized.find('}', metric_pos);
+    ASSERT_NE(brace_end, std::string::npos);
+    const auto line_end = serialized.find('\n', brace_end);
+    const std::string value_part =
+        serialized.substr(brace_end + 1, line_end == std::string::npos
+                                             ? std::string::npos
+                                             : line_end - brace_end - 1);
+    EXPECT_NE(value_part.find('1'), std::string::npos)
+        << "build info value should be 1, got:" << value_part;
 }
 
 }  // namespace mooncake::test

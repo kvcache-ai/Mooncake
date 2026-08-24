@@ -21,6 +21,7 @@
 #include "master_metric_manager.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -480,6 +481,20 @@ void MasterAdminServer::HandleHealth(coro_http::coro_http_request&,
         payload.view_version = snapshot.leader_view->view_version;
     }
     WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+}
+
+struct HttpVersionResponse {
+    std::string version;
+    std::string display_version;
+};
+YLT_REFL(HttpVersionResponse, version, display_version);
+
+void MasterAdminServer::HandleVersion(coro_http::coro_http_request&,
+                                      coro_http::coro_http_response& resp) {
+    WriteJsonResponse(
+        resp, coro_http::status_type::ok,
+        HttpVersionResponse{.version = GetMooncakeStoreVersion(),
+                            .display_version = MOONCAKE_DISPLAY_VERSION});
 }
 
 struct HttpLeaderResponse {
@@ -1189,6 +1204,10 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/health", [this](coro_http_request& req, coro_http_response& resp) {
             HandleHealth(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/version", [this](coro_http_request& req, coro_http_response& resp) {
+            HandleVersion(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/role", [this](coro_http_request& req, coro_http_response& resp) {
