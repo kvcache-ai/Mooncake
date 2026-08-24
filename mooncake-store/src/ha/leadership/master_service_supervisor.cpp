@@ -409,9 +409,16 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         coro_rpc::coro_rpc_server server(
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
+#ifdef YLT_ENABLE_IBV
         if (RpcProtocolConfig::FromEnvironment().use_rdma) {
             server.init_ibv();
         }
+#else
+        if (RpcProtocolConfig::FromEnvironment().use_rdma) {
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+        }
+#endif
 
         mooncake::WrappedMasterServiceConfig wrapped_config(
             config, leadership_session->view.view_version);

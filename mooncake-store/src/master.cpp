@@ -1605,7 +1605,14 @@ int main(int argc, char* argv[]) {
 
     const auto rpc_protocol_config =
         mooncake::RpcProtocolConfig::FromEnvironment();
+#ifdef YLT_ENABLE_IBV
     const std::string protocol = rpc_protocol_config.use_rdma ? "rdma" : "tcp";
+#else
+    const std::string protocol = "tcp";
+    if (rpc_protocol_config.use_rdma) {
+        LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP RPC";
+    }
+#endif
 
     // enable_metadata_cleanup_on_timeout requires a reachable HTTP metadata
     // server. Two topologies are supported:
@@ -1765,9 +1772,16 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        if (mooncake::RpcProtocolConfig::FromEnvironment().use_rdma) {
+#ifdef YLT_ENABLE_IBV
+        if (rpc_protocol_config.use_rdma) {
             server.init_ibv();
         }
+#else
+        if (rpc_protocol_config.use_rdma) {
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+        }
+#endif
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(
                 mooncake::WrappedMasterServiceConfig(master_config, version),
