@@ -156,6 +156,19 @@ class RdmaTransport : public Transport {
     std::unordered_map<uint32_t, std::weak_ptr<RdmaEndPoint>>
         notify_qp_to_endpoint_;
 
+    enum class NotifyCompletionAction {
+        SkipSilently,         // expected flush from a retiring or gone endpoint
+        ReportOnly,           // no live endpoint left to act on
+        DisableNotification,  // fault confined to the notify QP
+        RetireEndpoint,       // the peer or the path may be gone
+    };
+
+    // Decides what a failed notification completion costs. Only defined for
+    // error completions; endpoint_ready means the endpoint is still EP_READY.
+    static NotifyCompletionAction classifyNotifyCompletion(ibv_wc_status status,
+                                                          bool endpoint_alive,
+                                                          bool endpoint_ready);
+
     // Register/unregister notification QP (called by Endpoint)
     void registerNotifyQp(uint32_t qp_num,
                           const std::shared_ptr<RdmaEndPoint>& endpoint);
