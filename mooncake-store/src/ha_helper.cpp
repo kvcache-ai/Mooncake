@@ -9,6 +9,7 @@
 #include "redis_master_view_helper.h"
 #endif
 
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <iomanip>
@@ -335,8 +336,34 @@ int MasterServiceSupervisor::Start() {
                 keep_leader_thread.join();
                 return -1;
             }
-            p2p_promoted_sequence_id =
+            const uint64_t p2p_promoted_applied_sequence_id =
                 p2p_standby->GetLatestAppliedSequenceId();
+            p2p_promoted_sequence_id = p2p_promoted_applied_sequence_id;
+            uint64_t p2p_latest_oplog_sequence_id = 0;
+            auto latest_sequence_err = p2p_standby->GetLatestOpLogSequenceId(
+                p2p_latest_oplog_sequence_id);
+            if (latest_sequence_err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to read latest P2P OpLog sequence after "
+                              "promotion"
+                           << ", error=" << toString(latest_sequence_err)
+                           << ", applied_sequence_id="
+                           << p2p_promoted_applied_sequence_id;
+                mv_helper->CancelKeepAlive(lease_id);
+                keep_leader_thread.join();
+                return -1;
+            }
+            p2p_promoted_sequence_id = std::max(
+                p2p_promoted_applied_sequence_id, p2p_latest_oplog_sequence_id);
+            if (p2p_promoted_sequence_id > p2p_promoted_applied_sequence_id) {
+                LOG(WARNING)
+                    << "P2P promoted standby is behind latest OpLog; "
+                       "continuing new Primary sequence from OpLog latest"
+                    << ", applied_sequence_id="
+                    << p2p_promoted_applied_sequence_id
+                    << ", latest_oplog_sequence_id="
+                    << p2p_latest_oplog_sequence_id
+                    << ", initial_sequence_id=" << p2p_promoted_sequence_id;
+            }
             p2p_promoted_metadata = p2p_standby->ExportMetadata();
 #ifdef STORE_USE_REDIS
             if (master_registry_heartbeat) {

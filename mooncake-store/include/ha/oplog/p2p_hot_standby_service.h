@@ -84,6 +84,7 @@ class P2PHotStandbyService {
     P2PStandbySyncStatus GetSyncStatus() const;
     bool IsReadyForPromotion() const;
     uint64_t GetLatestAppliedSequenceId() const;
+    ErrorCode GetLatestOpLogSequenceId(uint64_t& sequence_id) const;
 
     P2PStandbyMetadataStore::ExportedMetadata ExportMetadata() const;
     bool WaitForAppliedSequence(
@@ -115,7 +116,6 @@ class P2PHotStandbyService {
         uint64_t& baseline_sequence_id,
         const std::vector<std::string>& discovered_endpoints = {});
     ErrorCode ResyncFromSnapshotLocked();
-    ErrorCode GetLatestOpLogSequenceId(uint64_t& sequence_id) const;
     bool WaitForAppliedSequenceLocked(
         uint64_t sequence_id,
         std::chrono::milliseconds timeout = std::chrono::seconds(30),
