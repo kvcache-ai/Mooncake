@@ -219,6 +219,12 @@ class Workers {
         // Next time to check for priority promotions (nanoseconds)
         uint64_t next_promotion_check_ns = 0;
 
+        // Tick-internal re-enqueues that found their target queue full
+        // (target priority, entry). Parked items stay counted in
+        // inflight_slices, which both keeps the accounting continuous and
+        // keeps the worker from suspending while a flush is pending.
+        std::vector<std::pair<int, RdmaSliceList>> requeue_overflow;
+
         // Values are held via unique_ptr so that map rehashing does not
         // invalidate pointers into RailMonitor stored on in-flight slices
         // (see RdmaSlice::rail_monitor).
@@ -229,6 +235,12 @@ class Workers {
 
     // Promote timed-out low priority requests to higher priority queues
     void promoteTimedOutRequests(WorkerContext& worker);
+
+    // Tick-internal re-enqueue: the worker thread must never block on its own
+    // queue (issue #3637), so these park into requeue_overflow on a full queue
+    // and the flush retries on the next tick.
+    void submitFromTick(WorkerContext& worker, RdmaSlice* slice);
+    void flushTickOverflow(WorkerContext& worker);
 
     WorkerContext* worker_context_;
     uint64_t slice_timeout_ns_;
