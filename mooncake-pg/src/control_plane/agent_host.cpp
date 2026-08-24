@@ -11,6 +11,7 @@
 #include "control_plane/rpc_runtime.h"
 #include "device_comm/device_collective/device_collective_feature.h"
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
+#include "device_comm/device_collective/device_collective_workspace.h"
 #include "device_comm/device_transfer/transfer_service.h"
 #endif
 #include "pg_utils.h"
@@ -57,11 +58,13 @@ void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 AgentHost::AgentHost(std::string coordinator_addr, const std::string& host_ip,
                      GlobalRank rank, int max_world_size,
                      DeviceTransferService* device_transfer_service,
+                     DeviceCollectiveWorkspace* device_collective_workspace,
                      LinkManager& link_manager,
                      int64_t fault_reconciliation_window_us)
     : agent_(rank, max_world_size),
       executor_("AgentHost"),
       device_transfer_service_(device_transfer_service),
+      device_collective_workspace_(device_collective_workspace),
       link_manager_(link_manager),
       host_ip_(host_ip),
       rank_(rank),
@@ -507,6 +510,9 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
         req.transfer_service_endpoint =
             device_transfer_service_->localEndpoint();
     }
+    if (device_collective_workspace_) {
+        req.collective_endpoint = device_collective_workspace_->localEndpoint();
+    }
 #endif
     req.agent_session_id = agent_session_id_;
     const uint64_t request_session_id = req.agent_session_id;
@@ -642,6 +648,15 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
                     PG_ASSERT_OK(device_transfer_service_->installPeerEndpoint(
                         e.rank, e.endpoint));
+#else
+                    (void)e;
+#endif
+                },
+                [this](const InstallDeviceCollectiveEndpoint& e) {
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+                    PG_ASSERT_OK(
+                        device_collective_workspace_->installPeerEndpoint(
+                            e.rank, e.endpoint));
 #else
                     (void)e;
 #endif

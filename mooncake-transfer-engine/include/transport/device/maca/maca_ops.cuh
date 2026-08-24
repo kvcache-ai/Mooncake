@@ -19,6 +19,10 @@ __device__ __forceinline__ uint64_t mc_ld_acquire_u64(const uint64_t* ptr) {
     return *const_cast<volatile const uint64_t*>(ptr);
 }
 
+__device__ __forceinline__ uint64_t mc_ld_volatile_u64(const uint64_t* ptr) {
+    return *const_cast<volatile const uint64_t*>(ptr);
+}
+
 __device__ __forceinline__ void mc_st_release(const int* ptr, int val) {
     *const_cast<volatile int*>(ptr) = val;
     __threadfence_system();

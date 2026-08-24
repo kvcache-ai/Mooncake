@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "common_types.h"
+#include "device_comm/device_transfer/transfer_types.cuh"
 
 namespace mooncake {
 
@@ -15,10 +16,10 @@ enum class HostProxyCommandResult : uint32_t {
 
 struct HostProxyCommand {
     uint64_t local_addr = 0;
-    uint64_t remote_addr = 0;
+    uint64_t remote_region_addr = 0;
+    uint64_t remote_offset = 0;
     uint64_t size = 0;
-    uint64_t signal_remote_addr = 0;
-    uint64_t signal_delta = 0;
+    SignalAction signal;
     GlobalRank target_rank = kInvalidGlobalRank;
 };
 
@@ -31,7 +32,7 @@ struct HostProxyCommand {
 //   system fence
 //   release submitted_sequence = N  -->  acquire submitted_sequence == N
 //                                        snapshot command
-//                                        execute payload, then add notification
+//                                        execute payload, then signal action
 //                                        write result
 //   acquire completed_sequence = N  <--  release completed_sequence = N
 //   read result

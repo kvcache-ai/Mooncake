@@ -62,6 +62,7 @@ class HostTransferProxy {
     BatchPollResult pollBatch(Lane& lane);
     bool tryStartCommand(Lane& lane);
     void startPayloadTransfer(Lane& lane);
+    void startSignalAction(Lane& lane);
     void startSignalRead(Lane& lane);
     void startSignalWrite(Lane& lane);
     bool stepPayloadTransfer(Lane& lane);

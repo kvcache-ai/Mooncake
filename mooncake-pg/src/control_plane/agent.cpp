@@ -127,11 +127,20 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
         .transfer_service_endpoint = push.transfer_service_endpoint,
+        .collective_endpoint = push.collective_endpoint,
     };
-    effects.push_back(InstallDeviceTransferEndpoint{
-        .rank = push.rank,
-        .endpoint = push.transfer_service_endpoint,
-    });
+    if (push.transfer_service_endpoint) {
+        effects.push_back(InstallDeviceTransferEndpoint{
+            .rank = push.rank,
+            .endpoint = *push.transfer_service_endpoint,
+        });
+    }
+    if (push.collective_endpoint) {
+        effects.push_back(InstallDeviceCollectiveEndpoint{
+            .rank = push.rank,
+            .endpoint = *push.collective_endpoint,
+        });
+    }
     effects.push_back(EnablePeerProbe{push.rank, push.rank_epoch,
                                       push.te_server_name,
                                       push.warmup_recv_addr});
@@ -323,12 +332,20 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
             continue;
 
         rank_connections_[connection.rank] = connection;
-        // Install rank-scoped transfer endpoints before applying any restored
-        // group state that may reference them.
-        effects.push_back(InstallDeviceTransferEndpoint{
-            .rank = connection.rank,
-            .endpoint = connection.transfer_service_endpoint,
-        });
+        // Install rank-scoped endpoints before applying any restored group
+        // state that may reference them.
+        if (connection.transfer_service_endpoint) {
+            effects.push_back(InstallDeviceTransferEndpoint{
+                .rank = connection.rank,
+                .endpoint = *connection.transfer_service_endpoint,
+            });
+        }
+        if (connection.collective_endpoint) {
+            effects.push_back(InstallDeviceCollectiveEndpoint{
+                .rank = connection.rank,
+                .endpoint = *connection.collective_endpoint,
+            });
+        }
         effects.push_back(EnablePeerProbe{
             .rank = connection.rank,
             .rank_epoch = connection.rank_epoch,
