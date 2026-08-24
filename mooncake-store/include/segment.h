@@ -58,7 +58,7 @@ struct MountedSegment {
     Segment segment;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
-    SegmentAllocatorRegistration allocator_registration;
+    std::shared_ptr<SegmentAllocatorRegistration> allocator_registration;
 };
 
 struct MountedNoFSegment {
@@ -66,7 +66,7 @@ struct MountedNoFSegment {
     UUID client_id;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
-    SegmentAllocatorRegistration allocator_registration;
+    std::shared_ptr<SegmentAllocatorRegistration> allocator_registration;
 };
 
 struct MountedNoFSegmentSnapshot {
@@ -113,7 +113,7 @@ class ScopedSegmentAccess {
      */
     ErrorCode MountSegment(
         const Segment& segment, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+        std::shared_ptr<ClientLivenessRecord> client_liveness = nullptr);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the

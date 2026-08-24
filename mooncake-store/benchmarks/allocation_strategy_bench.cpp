@@ -341,7 +341,7 @@ static AllocatorManager createCluster(int num_segments, size_t base_capacity,
         uint64_t base_addr = kPrimaryBaseAddr + (global_i * base_capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             name, base_addr, capacity, name);
-        manager.addIndependentAllocator(name, allocator);
+        manager.addAllocator(name, allocator);
     }
     return manager;
 }
@@ -365,7 +365,7 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
                              (static_cast<uint64_t>(id_offset + i) * capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             name, base_addr, capacity, name);
-        manager.addIndependentAllocator(name, allocator);
+        manager.addAllocator(name, allocator);
         new_allocs.push_back(allocator);
     }
     return new_allocs;
@@ -382,7 +382,8 @@ static double computeAverageUtilAll(const AllocatorManager& manager) {
     for (const auto& name : names) {
         const auto* allocators = manager.getAllocators(name);
         if (!allocators || allocators->empty()) continue;
-        for (const auto& alloc : *allocators) {
+        for (const auto& registration : *allocators) {
+            const auto alloc = registration->GetAllocator();
             double cap = static_cast<double>(alloc->capacity());
             if (cap == 0) continue;
             sum += static_cast<double>(alloc->size()) / cap;
@@ -397,8 +398,8 @@ static size_t computeTotalCapacity(const AllocatorManager& manager) {
     for (const auto& name : manager.getNames()) {
         const auto* allocs = manager.getAllocators(name);
         if (!allocs) continue;
-        for (const auto& alloc : *allocs) {
-            total += alloc->capacity();
+        for (const auto& registration : *allocs) {
+            total += registration->GetAllocator()->capacity();
         }
     }
     return total;
@@ -417,7 +418,8 @@ static double computeUtilizationStdDev(const AllocatorManager& manager) {
     for (const auto& name : names) {
         const auto* allocators = manager.getAllocators(name);
         if (!allocators || allocators->empty()) continue;
-        for (const auto& alloc : *allocators) {
+        for (const auto& registration : *allocators) {
+            const auto alloc = registration->GetAllocator();
             double cap = static_cast<double>(alloc->capacity());
             if (cap == 0) continue;
             double used = static_cast<double>(alloc->size());
@@ -508,9 +510,10 @@ static FragmentationSnapshot computeFragmentationSnapshot(
         const auto* allocs = manager.getAllocators(name);
         if (!allocs) continue;
 
-        for (const auto& alloc : *allocs) {
+        for (const auto& registration : *allocs) {
             auto offset_alloc =
-                std::dynamic_pointer_cast<OffsetBufferAllocator>(alloc);
+                std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                    registration->GetAllocator());
             if (!offset_alloc) continue;
 
             auto allocator = offset_alloc->getOffsetAllocator();
