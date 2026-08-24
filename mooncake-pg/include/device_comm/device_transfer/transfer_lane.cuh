@@ -68,14 +68,17 @@ class TransferLane {
     put(GlobalRank rank, const PutRequest& request,
         cooperative_groups::thread_block block) const {
         const auto& route = service_->routes[rank];
-        const void* const source = service_->localPtr(request.local_offset);
+        PG_DEVICE_ASSERT(service_->peer_accessible_region.contains(
+                             request.local_ptr, request.size) ||
+                         service_->local_staging_region.contains(
+                             request.local_ptr, request.size));
 
         switch (route.kind) {
             case DeviceRouteKind::P2p:
-                return TransferTicket(p2pPut(route.p2p.mapped_region_address,
-                                             source, request.remote_offset,
-                                             request.size, request.signal,
-                                             block));
+                return TransferTicket(
+                    p2pPut(route.p2p.mapped_region_address, request.local_ptr,
+                           request.remote_offset, request.size, request.signal,
+                           block));
 
             case DeviceRouteKind::HostProxy: {
                 // The source buffer may have been filled cooperatively. Every
@@ -85,9 +88,9 @@ class TransferLane {
                 block.sync();
                 return TransferTicket(hostProxyPut(
                     service_->host_proxy_command_slots,
-                    route.host_proxy.remote_region_address, rank, source,
-                    request.remote_offset, request.size, request.signal,
-                    request.timeout_ticks, lane_index_,
+                    route.host_proxy.remote_region_address, rank,
+                    request.local_ptr, request.remote_offset, request.size,
+                    request.signal, request.timeout_ticks, lane_index_,
                     service_->lane_results + lane_index_, block));
             }
 
@@ -126,16 +129,14 @@ class TransferLane {
                cooperative_groups::thread_block block) const {
         __shared__ uint64_t block_wait_result;
         if (block.thread_rank() == 0) {
-            const auto* const signal = reinterpret_cast<const uint64_t*>(
-                service_->localPtr(request.local_offset));
             const uint64_t start_ticks = clock64();
             uint64_t observed = 0;
             while (true) {
-                observed = device::mc_ld_volatile_u64(signal);
+                observed = device::mc_ld_volatile_u64(request.local_ptr);
                 if (signalReached(observed, request.least)) {
                     // Poll cheaply, then acquire once before the CTA consumes
                     // the payload published by the matching release signal.
-                    observed = device::mc_ld_acquire_u64(signal);
+                    observed = device::mc_ld_acquire_u64(request.local_ptr);
                     if (signalReached(observed, request.least)) {
                         break;
                     }

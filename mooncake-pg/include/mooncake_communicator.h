@@ -19,7 +19,6 @@
 #include "control_plane/link_manager.h"
 #include "device_comm/device_collective/device_collective_feature.h"
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
-#include "device_comm/device_arena.h"
 #include "device_comm/device_collective/device_collective_recovery.h"
 #include "device_comm/device_transfer/transfer_service.h"
 #endif
@@ -70,7 +69,6 @@ struct MooncakePGContext {
 
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     std::unique_ptr<DeviceTransferService> device_transfer_service;
-    std::unique_ptr<DeviceArena> device_arena;
     std::unique_ptr<DeviceCollectiveWorkspace> device_collective_workspace;
     std::unique_ptr<StrongStream> device_collective_strong_stream;
     std::unique_ptr<DeviceCollectiveRecoveryWorker>

@@ -19,8 +19,8 @@ namespace mooncake {
     return left < right ? left : right;
 }
 
-[[nodiscard]] __device__ __forceinline__ uint64_t divideRoundUp(
-    uint64_t value, uint64_t divisor) {
+[[nodiscard]] __device__ __forceinline__ uint64_t
+divideRoundUp(uint64_t value, uint64_t divisor) {
     return value / divisor + (value % divisor != 0 ? 1 : 0);
 }
 
@@ -42,8 +42,8 @@ struct RingTileLayout {
     uint64_t shard_element_capacity = 0;
     uint64_t tile_element_capacity = 0;
 
-    [[nodiscard]] __device__ __forceinline__ RingTile tile(
-        uint32_t shard_index, uint64_t tile_index) const {
+    [[nodiscard]] __device__ __forceinline__ RingTile
+    tile(uint32_t shard_index, uint64_t tile_index) const {
         // With S = shard_element_capacity, shard i covers the channel-relative
         // interval [i * S, min((i + 1) * S, channel_elements)).
         const uint64_t shard_begin =
@@ -59,8 +59,7 @@ struct RingTileLayout {
         const uint64_t tile_begin = tile_index * tile_element_capacity;
         const uint64_t count =
             tile_begin < shard_elements
-                ? minimum(tile_element_capacity,
-                          shard_elements - tile_begin)
+                ? minimum(tile_element_capacity, shard_elements - tile_begin)
                 : 0;
 
         // Short shards still execute the common lock-step tile schedule. Use
@@ -98,8 +97,8 @@ struct RingPayloadSlotSchedule {
     // Advance the common alternating slot schedule and allocate the next
     // generation of the selected physical payload slot.
     [[nodiscard]] __device__ __forceinline__ RingPayloadSlot next() {
-        const uint32_t slot_index = static_cast<uint32_t>(
-            action_index % kRingPipelineSlots);
+        const uint32_t slot_index =
+            static_cast<uint32_t>(action_index % kRingPipelineSlots);
         ++action_index;
 
         const uint64_t sequence = next_sequences[slot_index];
@@ -111,8 +110,8 @@ struct RingPayloadSlotSchedule {
     }
 };
 
-[[nodiscard]] __device__ __forceinline__ uint32_t wrapActiveIndex(
-    int64_t value, uint32_t participants) {
+[[nodiscard]] __device__ __forceinline__ uint32_t
+wrapActiveIndex(int64_t value, uint32_t participants) {
     value %= static_cast<int64_t>(participants);
     if (value < 0) value += participants;
     return static_cast<uint32_t>(value);
@@ -130,23 +129,22 @@ struct RingPayloadSlotSchedule {
 // distance 2   shard 2  shard 3  shard 0  shard 1
 // distance 3   shard 1  shard 2  shard 3  shard 0
 [[nodiscard]] __device__ __forceinline__ uint32_t ringShardAtDistance(
-    int32_t self_active_index, uint32_t participant_count,
-    uint64_t distance) {
+    int32_t self_active_index, uint32_t participant_count, uint64_t distance) {
     return wrapActiveIndex(static_cast<int64_t>(self_active_index) -
                                static_cast<int64_t>(distance),
                            participant_count);
 }
 
-[[nodiscard]] __device__ __forceinline__ StagingRegion stagingForChannel(
-    const RingAllReducePlan& plan, uint64_t channel_offset,
-    uint64_t channel_size) {
+[[nodiscard]] __device__ __forceinline__ StagingRegion
+stagingForChannel(const RingAllReducePlan& plan, uint64_t channel_offset,
+                  uint64_t channel_size) {
     if (plan.staging_size == 0) return {};
 
+    PG_DEVICE_ASSERT(plan.staging_ptr != nullptr);
     PG_DEVICE_ASSERT(channel_offset <= plan.staging_size);
     PG_DEVICE_ASSERT(channel_size <= plan.staging_size - channel_offset);
-    PG_DEVICE_ASSERT(plan.staging_offset <= UINT64_MAX - channel_offset);
     return StagingRegion{
-        .region_offset = plan.staging_offset + channel_offset,
+        .ptr = plan.staging_ptr + channel_offset,
         .size = channel_size,
     };
 }
@@ -155,34 +153,33 @@ struct RingPayloadSlotSchedule {
 template <typename T, ReduceOp Op>
 class RingPrimitives {
    public:
-    __device__ __forceinline__ RingPrimitives(
-        const RingAllReducePlan& plan, const T* input, T* output,
-        uint64_t channel_buffer_size, uint32_t channel_index)
+    __device__ __forceinline__ RingPrimitives(const RingAllReducePlan& plan,
+                                              const T* input, T* output,
+                                              uint64_t channel_buffer_size,
+                                              uint32_t channel_index)
         : transfer_lane_(plan.transfer_handle->lane(channel_index)),
           self_rank_(plan.self_rank),
           successor_(plan.successor),
           predecessor_(plan.predecessor),
           input_(input),
           output_(output),
-          recv_payload_buffer_(plan.transfer_handle->localPtr(
-              plan.buffer_offset + static_cast<uint64_t>(channel_index) *
-                                       channel_buffer_size)),
+          recv_payload_buffer_(plan.buffer_ptr +
+                               static_cast<uint64_t>(channel_index) *
+                                   channel_buffer_size),
           send_writer_(
-              *plan.transfer_handle, transfer_lane_,
-              plan.successor.global_rank,
+              *plan.transfer_handle, transfer_lane_, plan.successor.global_rank,
               stagingForChannel(
                   plan,
                   static_cast<uint64_t>(channel_index) * channel_buffer_size,
                   channel_buffer_size),
               RemotePayloadRegion{
-                  .region_offset =
-                      plan.successor.buffer_offset +
-                      static_cast<uint64_t>(channel_index) *
-                          channel_buffer_size,
+                  .region_offset = plan.successor.buffer_offset +
+                                   static_cast<uint64_t>(channel_index) *
+                                       channel_buffer_size,
                   .size = channel_buffer_size,
               }),
           payload_slot_size_(channel_buffer_size / kRingPipelineSlots),
-          signal_offset_(plan.signal_offset),
+          signal_ptr_(plan.signal_ptr),
           timeout_ticks_(plan.timeout_ticks),
           signal_layout_(plan.signal_layout),
           channel_index_(channel_index) {}
@@ -194,21 +191,18 @@ class RingPrimitives {
         cooperative_groups::thread_block block) const {
         SignalRequest ready;
         ready.signal.kind = SignalAction::Kind::Add;
-        ready.signal.add.remote_offset =
-            signal_layout_.recvBufferReadyOffset(
-                predecessor_.signal_offset, channel_index_, self_rank_);
+        ready.signal.add.remote_offset = signal_layout_.recvBufferReadyOffset(
+            predecessor_.signal_offset, channel_index_, self_rank_);
         ready.timeout_ticks = timeout_ticks_;
         (void)transfer_lane_.signal(predecessor_.global_rank, ready, block);
     }
 
-    [[nodiscard]] __device__ __forceinline__ RingStepResult
-    waitRecvBufferReady(uint64_t sequence,
-                        cooperative_groups::thread_block block) const {
+    [[nodiscard]] __device__ __forceinline__ RingStepResult waitRecvBufferReady(
+        uint64_t sequence, cooperative_groups::thread_block block) const {
         const auto ready = transfer_lane_.waitSignal(
             SignalWaitRequest{
-                .local_offset = signal_layout_.recvBufferReadyOffset(
-                    signal_offset_, channel_index_,
-                    successor_.in_group_rank),
+                .local_ptr = signal_layout_.recvBufferReadyPtr(
+                    signal_ptr_, channel_index_, successor_.in_group_rank),
                 .least = sequence,
                 .timeout_ticks = timeout_ticks_,
             },
@@ -222,9 +216,9 @@ class RingPrimitives {
         return {};
     }
 
-    [[nodiscard]] __device__ __forceinline__ RingStepResult send(
-        const RingTile& tile, RingPayloadSlot send_slot,
-        cooperative_groups::thread_block block) const {
+    [[nodiscard]] __device__ __forceinline__ RingStepResult
+    send(const RingTile& tile, RingPayloadSlot send_slot,
+         cooperative_groups::thread_block block) const {
         const auto available = waitPreviousPayloadConsumed(send_slot, block);
         if (!available.succeeded()) return available;
 
@@ -243,10 +237,10 @@ class RingPrimitives {
     // sourced from that slot to complete. A Direct path cannot move the
     // consumed wait because it materializes the new payload directly in the
     // successor's slot.
-    [[nodiscard]] __device__ __forceinline__ RingStepResult recvReduceSend(
-        const RingTile& tile, RingPayloadSlot recv_slot,
-        RingPayloadSlot send_slot,
-        cooperative_groups::thread_block block) const {
+    [[nodiscard]] __device__ __forceinline__ RingStepResult
+    recvReduceSend(const RingTile& tile, RingPayloadSlot recv_slot,
+                   RingPayloadSlot send_slot,
+                   cooperative_groups::thread_block block) const {
         const auto arrived = waitPayloadReady(recv_slot, block);
         if (!arrived.succeeded()) return arrived;
         const auto available = waitPreviousPayloadConsumed(send_slot, block);
@@ -254,9 +248,8 @@ class RingPrimitives {
 
         const auto* const received_payload = receivedPayload(recv_slot);
         const auto outgoing_payload = outgoingPayload(send_slot);
-        reduceValuesTo<T, Op>(input_ + tile.begin, received_payload,
-                              tile.count, block,
-                              outgoing_payload.template dataAs<T>());
+        reduceValuesTo<T, Op>(input_ + tile.begin, received_payload, tile.count,
+                              block, outgoing_payload.template dataAs<T>());
         publishPayload(outgoing_payload, send_slot, tile.count, block);
         signalPayloadConsumed(recv_slot, block);
         return {};
@@ -273,18 +266,18 @@ class RingPrimitives {
 
         const auto* const received_payload = receivedPayload(recv_slot);
         const auto outgoing_payload = outgoingPayload(send_slot);
-        reduceValuesTo<T, Op>(input_ + tile.begin, received_payload,
-                              tile.count, block, output_ + tile.begin,
+        reduceValuesTo<T, Op>(input_ + tile.begin, received_payload, tile.count,
+                              block, output_ + tile.begin,
                               outgoing_payload.template dataAs<T>());
         publishPayload(outgoing_payload, send_slot, tile.count, block);
         signalPayloadConsumed(recv_slot, block);
         return {};
     }
 
-    [[nodiscard]] __device__ __forceinline__ RingStepResult recvCopySend(
-        const RingTile& tile, RingPayloadSlot recv_slot,
-        RingPayloadSlot send_slot,
-        cooperative_groups::thread_block block) const {
+    [[nodiscard]] __device__ __forceinline__ RingStepResult
+    recvCopySend(const RingTile& tile, RingPayloadSlot recv_slot,
+                 RingPayloadSlot send_slot,
+                 cooperative_groups::thread_block block) const {
         const auto arrived = waitPayloadReady(recv_slot, block);
         if (!arrived.succeeded()) return arrived;
         const auto available = waitPreviousPayloadConsumed(send_slot, block);
@@ -299,9 +292,9 @@ class RingPrimitives {
         return {};
     }
 
-    [[nodiscard]] __device__ __forceinline__ RingStepResult recvCopyAndDrain(
-        const RingTile& tile, RingPayloadSlot final_slot,
-        cooperative_groups::thread_block block) const {
+    [[nodiscard]] __device__ __forceinline__ RingStepResult
+    recvCopyAndDrain(const RingTile& tile, RingPayloadSlot final_slot,
+                     cooperative_groups::thread_block block) const {
         const auto arrived = waitPayloadReady(final_slot, block);
         if (!arrived.succeeded()) return arrived;
 
@@ -326,8 +319,8 @@ class RingPrimitives {
             static_cast<uint64_t>(recv_slot.index) * payload_slot_size_);
     }
 
-    [[nodiscard]] __device__ __forceinline__ PayloadWriteView outgoingPayload(
-        RingPayloadSlot send_slot) const {
+    [[nodiscard]] __device__ __forceinline__ PayloadWriteView
+    outgoingPayload(RingPayloadSlot send_slot) const {
         const uint64_t staging_offset =
             static_cast<uint64_t>(send_slot.index) * payload_slot_size_;
         const uint64_t remote_offset =
@@ -343,22 +336,22 @@ class RingPrimitives {
         publication.size = count * sizeof(T);
         publication.signal.kind = SignalAction::Kind::Add;
         publication.signal.add.remote_offset =
-            signal_layout_.payloadReadyOffset(
-                successor_.signal_offset, channel_index_, self_rank_,
-                send_slot.index);
+            signal_layout_.payloadReadyOffset(successor_.signal_offset,
+                                              channel_index_, self_rank_,
+                                              send_slot.index);
         publication.signal.add.delta = 1;
         publication.timeout_ticks = timeout_ticks_;
         (void)payload.publish(publication, block);
     }
 
-    [[nodiscard]] __device__ __forceinline__ RingStepResult waitPayloadReady(
-        RingPayloadSlot recv_slot,
-        cooperative_groups::thread_block block) const {
+    [[nodiscard]] __device__ __forceinline__ RingStepResult
+    waitPayloadReady(RingPayloadSlot recv_slot,
+                     cooperative_groups::thread_block block) const {
         const auto arrival = transfer_lane_.waitSignal(
             SignalWaitRequest{
-                .local_offset = signal_layout_.payloadReadyOffset(
-                    signal_offset_, channel_index_,
-                    predecessor_.in_group_rank, recv_slot.index),
+                .local_ptr = signal_layout_.payloadReadyPtr(
+                    signal_ptr_, channel_index_, predecessor_.in_group_rank,
+                    recv_slot.index),
                 .least = recv_slot.sequence,
                 .timeout_ticks = timeout_ticks_,
             },
@@ -377,10 +370,9 @@ class RingPrimitives {
         cooperative_groups::thread_block block) const {
         SignalRequest ack;
         ack.signal.kind = SignalAction::Kind::Add;
-        ack.signal.add.remote_offset =
-            signal_layout_.payloadConsumedOffset(
-                predecessor_.signal_offset, channel_index_, self_rank_,
-                recv_slot.index);
+        ack.signal.add.remote_offset = signal_layout_.payloadConsumedOffset(
+            predecessor_.signal_offset, channel_index_, self_rank_,
+            recv_slot.index);
         ack.timeout_ticks = timeout_ticks_;
         (void)transfer_lane_.signal(predecessor_.global_rank, ack, block);
     }
@@ -395,8 +387,7 @@ class RingPrimitives {
     [[nodiscard]] __device__ __forceinline__ RingStepResult
     waitPayloadConsumed(RingPayloadSlot send_slot,
                         cooperative_groups::thread_block block) const {
-        return waitConsumedSequence(send_slot.index, send_slot.sequence,
-                                    block);
+        return waitConsumedSequence(send_slot.index, send_slot.sequence, block);
     }
 
     [[nodiscard]] __device__ __forceinline__ RingStepResult
@@ -404,9 +395,9 @@ class RingPrimitives {
                          cooperative_groups::thread_block block) const {
         const auto ack = transfer_lane_.waitSignal(
             SignalWaitRequest{
-                .local_offset = signal_layout_.payloadConsumedOffset(
-                    signal_offset_, channel_index_,
-                    successor_.in_group_rank, payload_slot),
+                .local_ptr = signal_layout_.payloadConsumedPtr(
+                    signal_ptr_, channel_index_, successor_.in_group_rank,
+                    payload_slot),
                 .least = sequence,
                 .timeout_ticks = timeout_ticks_,
             },
@@ -429,7 +420,7 @@ class RingPrimitives {
     const char* recv_payload_buffer_;
     PayloadWriter send_writer_;
     uint64_t payload_slot_size_;
-    uint64_t signal_offset_;
+    const uint64_t* signal_ptr_;
     uint64_t timeout_ticks_;
     RingSignalLayout signal_layout_;
     uint32_t channel_index_;

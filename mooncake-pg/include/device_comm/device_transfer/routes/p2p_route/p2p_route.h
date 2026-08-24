@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_P2P_ROUTE_P2P_ROUTE_H
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_P2P_ROUTE_P2P_ROUTE_H
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -28,6 +29,10 @@ class P2pRoute : public RouteProvider {
 
     [[nodiscard]] std::string_view routeKey() const noexcept override;
     [[nodiscard]] uint32_t routeVersion() const noexcept override;
+    PGResult<void> registerRegion(DeviceRegionKind kind, void* addr,
+                                  size_t size) override;
+    PGResult<void> unregisterRegion(DeviceRegionKind kind, void* addr,
+                                    size_t size) override;
     [[nodiscard]] std::optional<RouteEndpoint> localEndpoint() override;
     [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> resolveRoutes(
         std::span<const std::optional<DeviceTransferEndpoint>> endpoints)

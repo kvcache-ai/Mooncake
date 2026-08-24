@@ -92,13 +92,12 @@ void DeviceCollectiveRuntime::releaseState() noexcept {
 
 PGResult<std::unique_ptr<DeviceCollectiveRuntime>>
 DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
-                                DeviceArena& arena,
                                 DeviceCollectiveWorkspace& workspace,
                                 StrongStream& strong_stream, int device_index,
                                 InGroupRank self_rank, uint32_t max_group_size,
                                 size_t collective_timeout_us) {
-    PG_VALIDATE_ARG(arena.deviceIndex() == device_index,
-                    "device collective arena belongs to another device");
+    PG_VALIDATE_ARG(transfer_service.deviceIndex() == device_index,
+                    "device transfer service belongs to another device");
     PG_VALIDATE_ARG(
         self_rank >= 0 && static_cast<uint32_t>(self_rank) < max_group_size,
         "device collective self rank is outside the group");
@@ -135,7 +134,7 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
     }
     PG_TRY(runtime->all_reduce_,
            RingAllReduceProtocol::create(
-               transfer_service, arena, workspace, runtime->invocation_state_,
+               transfer_service, workspace, runtime->invocation_state_,
                device_recovery_mailbox, timeout_ticks, runtime->control_stream_,
                device_index, self_rank, max_group_size));
     return runtime;
