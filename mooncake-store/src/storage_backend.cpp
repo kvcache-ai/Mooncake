@@ -3764,7 +3764,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 #ifdef USE_URING
         if (file_storage_config_.use_uring) {
             data_file_ = std::make_shared<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
+                data_file_path_, fd_guard.release(), 32, false);
         } else
 #endif
         {
@@ -4551,7 +4551,7 @@ OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
 #ifdef USE_URING
         if (file_storage_config_.use_uring) {
             data_file_ = std::make_shared<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
+                data_file_path_, fd_guard.release(), 32, false);
         } else
 #endif
         {
@@ -5471,7 +5471,7 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
 #ifdef USE_URING
             if (file_storage_config_.use_uring) {
                 data_file_ =
-                    std::make_shared<UringFile>(data_file_path_, fd, 32, true);
+                    std::make_shared<UringFile>(data_file_path_, fd, 32, false);
             } else
 #endif
             {
