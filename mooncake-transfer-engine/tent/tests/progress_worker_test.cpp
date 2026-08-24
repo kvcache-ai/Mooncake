@@ -1327,6 +1327,179 @@ TEST(ProxyManager, DestructorWaitsForDeferredBatchBeforeFreeingStageMemory) {
         engine.unregisterLocalMemory(target.data(), target.size()).ok());
 }
 
+// ---------------------------------------------------------------------------
+// lazyFreeBatch head-of-line blocking. freelist is insertion-ordered; a batch
+// whose poll fails permanently must not stop every batch behind it from being
+// reclaimed.
+// ---------------------------------------------------------------------------
+
+// Polls succeed except for requests whose source is `poison_source`, which
+// fail permanently. Also counts freeSubBatch so a test can see reclamation.
+class PoisonedPollTransport : public FakeTransport {
+   public:
+    explicit PoisonedPollTransport(TransportType type) : FakeTransport(type) {}
+
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus& status) override {
+        auto* fb = static_cast<FakeSubBatch*>(batch);
+        if (task_id >= 0 && task_id < (int)fb->requests.size() &&
+            fb->requests[task_id].source ==
+                poison_source.load(std::memory_order_acquire)) {
+            poisoned_polls.fetch_add(1, std::memory_order_relaxed);
+            return Status::InternalError(
+                "injected permanent poll failure" LOC_MARK);
+        }
+        return FakeTransport::getTransferStatus(batch, task_id, status);
+    }
+
+    Status freeSubBatch(SubBatchRef& batch) override {
+        free_sub_batch_calls.fetch_add(1, std::memory_order_relaxed);
+        return FakeTransport::freeSubBatch(batch);
+    }
+
+    std::atomic<const void*> poison_source{nullptr};
+    std::atomic<int> free_sub_batch_calls{0};
+    std::atomic<int> poisoned_polls{0};
+};
+
+TEST(BatchLifecycle, FreeListSweepSkipsAStuckBatchInsteadOfStopping) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<PoisonedPollTransport>(RDMA);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> stuck_buf(kBufLen, 0xA1);
+    std::vector<uint8_t> healthy_buf(kBufLen, 0xB2);
+    ASSERT_TRUE(engine.registerLocalMemory(stuck_buf.data(), kBufLen).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(healthy_buf.data(), kBufLen).ok());
+
+    auto make_request = [&](std::vector<uint8_t>& buf) {
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = buf.data();
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+        req.length = kBufLen;
+        return req;
+    };
+
+    // Batch A polls with a permanent error, so lazyFreeBatch can neither
+    // reclaim it nor decide it is still pending.
+    BatchID stuck = engine.allocateBatch(1);
+    ASSERT_NE(stuck, (BatchID)0);
+    ASSERT_TRUE(engine.submitTransfer(stuck, {make_request(stuck_buf)}).ok());
+    fake_rdma->poison_source.store(stuck_buf.data(), std::memory_order_release);
+
+    // Batch B completes normally.
+    BatchID healthy = engine.allocateBatch(1);
+    ASSERT_NE(healthy, (BatchID)0);
+    ASSERT_TRUE(
+        engine.submitTransfer(healthy, {make_request(healthy_buf)}).ok());
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(healthy, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+
+    // A enters the freelist first and stays there; B lands behind it.
+    EXPECT_TRUE(engine.freeBatch(stuck).ok());
+    EXPECT_TRUE(engine.freeBatch(healthy).ok());
+
+    // B must be reclaimed even though A, ahead of it, cannot be: its SubBatch
+    // is returned to the transport and its handle is no longer alive.
+    EXPECT_EQ(fake_rdma->free_sub_batch_calls.load(std::memory_order_acquire),
+              1)
+        << "the healthy batch behind the stuck one was never reclaimed";
+    TransferStatus after_free{};
+    EXPECT_FALSE(engine.getTransferStatus(healthy, after_free).ok())
+        << "a reclaimed batch handle must not stay alive";
+
+    // Unpoison so the stuck batch drains at teardown.
+    fake_rdma->poison_source.store(nullptr, std::memory_order_release);
+    EXPECT_TRUE(engine.unregisterLocalMemory(stuck_buf.data(), kBufLen).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(healthy_buf.data(), kBufLen).ok());
+}
+
+// A batch whose reclaim fails on every pass must eventually be parked: after
+// kMaxReclaimAttempts (4096) consecutive failures the sweep stops polling and
+// warning about it, later frees are unaffected, and engine teardown still
+// reclaims it unconditionally.
+TEST(BatchLifecycle, PermanentlyStuckBatchIsQuarantinedNotRetriedForever) {
+    constexpr size_t kMaxReclaimAttempts = 4096;  // mirrors the impl constant
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> stuck_buf(kBufLen, 0xA1);
+    std::vector<uint8_t> late_buf(kBufLen, 0xB2);
+    auto fake_rdma = std::make_shared<PoisonedPollTransport>(RDMA);
+
+    {
+        auto cfg = makeMinimalP2PConfig();
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
+        std::string seg = engine.getSegmentName();
+        ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+        engine.swapTransportForTest(RDMA, fake_rdma);
+        ASSERT_TRUE(engine.registerLocalMemory(stuck_buf.data(), kBufLen).ok());
+        ASSERT_TRUE(engine.registerLocalMemory(late_buf.data(), kBufLen).ok());
+
+        auto make_request = [&](std::vector<uint8_t>& buf) {
+            Request req;
+            req.opcode = Request::WRITE;
+            req.source = buf.data();
+            req.target_id = LOCAL_SEGMENT_ID;
+            req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+            req.length = kBufLen;
+            return req;
+        };
+
+        BatchID stuck = engine.allocateBatch(1);
+        ASSERT_NE(stuck, (BatchID)0);
+        ASSERT_TRUE(
+            engine.submitTransfer(stuck, {make_request(stuck_buf)}).ok());
+        fake_rdma->poison_source.store(stuck_buf.data(),
+                                       std::memory_order_release);
+        ASSERT_TRUE(engine.freeBatch(stuck).ok());
+
+        // Drive sweeps past the quarantine threshold. Re-freeing an already
+        // free-requested batch runs one sweep per call and returns the sweep
+        // error while the batch is still being retried.
+        bool saw_error = false;
+        for (size_t i = 0; i + 1 < kMaxReclaimAttempts; ++i) {
+            saw_error |= !engine.freeBatch(stuck).ok();
+        }
+        EXPECT_TRUE(saw_error);
+
+        // Quarantined: further sweeps neither poll the batch nor report its
+        // error.
+        const int polls_at_quarantine =
+            fake_rdma->poisoned_polls.load(std::memory_order_acquire);
+        for (int i = 0; i < 100; ++i) {
+            EXPECT_TRUE(engine.freeBatch(stuck).ok());
+        }
+        EXPECT_EQ(fake_rdma->poisoned_polls.load(std::memory_order_acquire),
+                  polls_at_quarantine)
+            << "a quarantined batch must not be re-polled";
+
+        // Healthy batches are still reclaimed normally alongside it.
+        BatchID late = engine.allocateBatch(1);
+        ASSERT_NE(late, (BatchID)0);
+        ASSERT_TRUE(engine.submitTransfer(late, {make_request(late_buf)}).ok());
+        TransferStatus status{};
+        ASSERT_TRUE(engine.getTransferStatus(late, status).ok());
+        ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_TRUE(engine.freeBatch(late).ok());
+        EXPECT_EQ(
+            fake_rdma->free_sub_batch_calls.load(std::memory_order_acquire), 1)
+            << "batches behind a quarantined one must still be reclaimed";
+    }  // engine teardown reclaims the quarantined batch unconditionally
+
+    EXPECT_EQ(fake_rdma->free_sub_batch_calls.load(std::memory_order_acquire),
+              2)
+        << "teardown must reclaim the quarantined batch";
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
