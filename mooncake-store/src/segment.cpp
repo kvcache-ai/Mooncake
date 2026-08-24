@@ -5,8 +5,6 @@
 #include "utils/zstd_util.h"
 
 #include <functional>
-#include <unordered_set>
-
 namespace mooncake {
 namespace {
 
@@ -278,15 +276,6 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
 
     return ErrorCode::OK;
-}
-
-std::vector<UUID> ScopedSegmentAccess::GetStoreClientIds() const {
-    std::unordered_set<UUID, boost::hash<UUID>> unique_clients;
-    unique_clients.reserve(segment_manager_->client_segments_.size());
-    for (const auto& [client_id, _] : segment_manager_->client_segments_) {
-        unique_clients.insert(client_id);
-    }
-    return {unique_clients.begin(), unique_clients.end()};
 }
 
 void ScopedSegmentAccess::BindClientLiveness(

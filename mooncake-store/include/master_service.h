@@ -2950,10 +2950,6 @@ class MasterService {
     // Key: transport_endpoint, Value: allocator.
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         standby_allocator_keepalive_;
-    // Promotion snapshots do not carry the memory Segment owner. Restored
-    // buffers remain immediately readable through this process-local gate
-    // until ReMount binds them to the reporting Client's canonical record.
-    std::shared_ptr<ClientLivenessRecord> standby_restore_gate_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
 

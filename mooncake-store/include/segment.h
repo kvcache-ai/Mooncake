@@ -172,12 +172,6 @@ class ScopedSegmentAccess {
                                 std::vector<Segment>& segments) const;
 
     /**
-     * @brief Return every Store Client that owns a restored memory or local
-     *        disk segment.
-     */
-    std::vector<UUID> GetStoreClientIds() const;
-
-    /**
      * @brief Rebind restored client-owned segment resources to a fresh
      *        liveness record. Segment snapshots intentionally do not persist
      *        record implementation state.

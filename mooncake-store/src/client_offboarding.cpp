@@ -127,7 +127,6 @@ void ClientOffboardingWorker::ThreadFunc() {
         }
 
         ++job.retry_count;
-        MasterMetricManager::instance().inc_client_offboarding_failure();
         MasterMetricManager::instance().inc_client_offboarding_retry();
         const bool alert = ShouldAlert(job.retry_count);
         if (alert) {

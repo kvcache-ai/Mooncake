@@ -109,14 +109,6 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
             reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
 }
 
-bool AllocatedBuffer::getDescriptorIfAvailable(Descriptor& descriptor) const {
-    if (!isAvailable()) {
-        return false;
-    }
-    descriptor = get_descriptor();
-    return isAvailable();
-}
-
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
     uint64_t offset_raw = reinterpret_cast<uintptr_t>(buffer_ptr_);
     buffer_ptr_ = reinterpret_cast<void*>(offset_raw - DEFAULT_CXL_BASE);

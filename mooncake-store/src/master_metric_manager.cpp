@@ -88,9 +88,6 @@ MasterMetricManager::MasterMetricManager()
           "master_client_offboarding_duration_ms",
           "Asynchronous Store Client offboarding duration in milliseconds",
           {1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000}),
-      client_offboarding_failures_(
-          "master_client_offboarding_failures_total",
-          "Failed Store Client offboarding attempts"),
       client_offboarding_retries_(
           "master_client_offboarding_retries_total",
           "Retried Store Client offboarding attempts"),
@@ -556,7 +553,6 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     client_liveness_suspected_transitions_.inc(0);
     client_liveness_recoveries_.inc(0);
     client_liveness_offline_transitions_.inc(0);
-    client_offboarding_failures_.inc(0);
     client_offboarding_retries_.inc(0);
     client_offboarding_alerts_.inc(0);
     promotion_completed_.inc(0);
@@ -997,10 +993,6 @@ void MasterMetricManager::inc_client_offboarding_queue_depth(int64_t jobs) {
 
 void MasterMetricManager::dec_client_offboarding_queue_depth(int64_t jobs) {
     pending_client_offboarding_jobs_metric_.dec(jobs);
-}
-
-void MasterMetricManager::inc_client_offboarding_failure() {
-    client_offboarding_failures_.inc(1);
 }
 
 void MasterMetricManager::inc_client_offboarding_retry() {
@@ -1970,7 +1962,6 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(client_liveness_suspected_transitions_);
     serialize_metric(client_liveness_recoveries_);
     serialize_metric(client_liveness_offline_transitions_);
-    serialize_metric(client_offboarding_failures_);
     serialize_metric(client_offboarding_retries_);
     serialize_metric(client_offboarding_alerts_);
 

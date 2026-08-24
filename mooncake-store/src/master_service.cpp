@@ -3591,7 +3591,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
         std::move(restored_accounted_memory_bytes);
     standby_memory_segments_ = std::move(restored_memory_segments);
     standby_allocator_keepalive_ = std::move(restored_allocators);
-    standby_restore_gate_ = restore_gate;
     for (auto& [client_id, record] : new_known_owner_records) {
         client_liveness_records_.emplace(client_id, std::move(record));
         MasterMetricManager::instance().client_liveness_record_created();

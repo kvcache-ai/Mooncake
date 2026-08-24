@@ -146,7 +146,6 @@ class MasterMetricManager {
     void reset_client_liveness_metrics(int64_t active_records = 0);
     void inc_client_offboarding_queue_depth(int64_t jobs = 1);
     void dec_client_offboarding_queue_depth(int64_t jobs = 1);
-    void inc_client_offboarding_failure();
     void inc_client_offboarding_retry();
     void inc_client_offboarding_alert();
     void observe_client_offboarding_duration_ms(int64_t duration_ms);
@@ -600,7 +599,6 @@ class MasterMetricManager {
     ylt::metric::counter_t client_liveness_offline_transitions_;
     ylt::metric::gauge_t pending_client_offboarding_jobs_metric_;
     ylt::metric::histogram_t client_offboarding_duration_ms_;
-    ylt::metric::counter_t client_offboarding_failures_;
     ylt::metric::counter_t client_offboarding_retries_;
     ylt::metric::counter_t client_offboarding_alerts_;
 
