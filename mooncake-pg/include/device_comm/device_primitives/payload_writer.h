@@ -10,7 +10,7 @@ class DeviceTransferService;
 
 // Host-side resource query for the device PayloadWriter. The selected route
 // remains a DTS implementation detail; callers only learn whether they must
-// provide registered staging before publishing a Plan.
+// ask DTS to prepare local staging before publishing a Plan.
 PGResult<bool> payloadWriterRequiresStaging(
     DeviceTransferService& transfer_service, GlobalRank peer);
 

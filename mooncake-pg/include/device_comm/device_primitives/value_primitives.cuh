@@ -241,8 +241,8 @@ struct alignas(16) ValuePack {
         return reinterpret_cast<ValuePack*>(values);
     }
 
-    [[nodiscard]] __device__ __forceinline__ static const ValuePack*
-    fromValues(const T* values) {
+    [[nodiscard]] __device__ __forceinline__ static const ValuePack* fromValues(
+        const T* values) {
         return reinterpret_cast<const ValuePack*>(values);
     }
 
@@ -257,9 +257,8 @@ template <typename T, typename... Remaining>
 [[nodiscard]] __device__ __forceinline__ uint64_t packCountIfAligned(
     uint64_t value_count, const T* first, Remaining... remaining) {
     static_assert(sizeof(ValuePack<T>) == 16);
-    const uintptr_t combined =
-        (reinterpret_cast<uintptr_t>(first) | ... |
-         reinterpret_cast<uintptr_t>(remaining));
+    const uintptr_t combined = (reinterpret_cast<uintptr_t>(first) | ... |
+                                reinterpret_cast<uintptr_t>(remaining));
     if ((combined & (alignof(ValuePack<T>) - 1)) != 0) {
         return 0;
     }

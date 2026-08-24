@@ -51,25 +51,33 @@ struct DeviceTransferRoute {
 
 struct HostProxyCommandSlot;
 
+// Non-owning device view of one DTS-managed local allocation.
+struct DeviceLocalRegion {
+    void* addr = nullptr;
+    uint64_t size = 0;
+
+    [[nodiscard]] __device__ __forceinline__ bool contains(
+        const void* ptr, uint64_t bytes) const {
+        if (!addr || !ptr) return false;
+        const auto begin = reinterpret_cast<uintptr_t>(addr);
+        const auto address = reinterpret_cast<uintptr_t>(ptr);
+        if (address < begin) return false;
+        const uint64_t bytes_from_begin = address - begin;
+        return bytes_from_begin <= size && bytes <= size - bytes_from_begin;
+    }
+};
+
 // Stable device-resident state owned by DeviceTransferService. It contains
 // only device-wide resources; a caller supplies its own peer selection,
 // buffers, signals, and algorithm state.
 struct DeviceTransferHandle {
-    void* local_region = nullptr;
-    uint64_t local_region_size = 0;
+    DeviceLocalRegion peer_accessible_region;
+    DeviceLocalRegion local_staging_region;
     const DeviceTransferRoute* routes = nullptr;
     uint64_t* lane_results = nullptr;
     HostProxyCommandSlot* host_proxy_command_slots = nullptr;
 
     uint32_t max_world_size = 0;
-
-    // Return a byte address relative to the local registered service region.
-    // The caller remains responsible for validating the complete accessed
-    // range against local_region_size.
-    [[nodiscard]] __device__ __forceinline__ char* localPtr(
-        uint64_t local_offset) const {
-        return static_cast<char*>(local_region) + local_offset;
-    }
 
     // Return a directly addressable pointer into a peer's registered region.
     // A null result means the selected route is not directly addressable. This
@@ -120,21 +128,24 @@ struct SignalRequest {
     uint64_t timeout_ticks = 0;
 };
 
-// Transfer one payload between registered-region offsets.
+// Transfer one payload from DTS-prepared local memory into the peer's
+// peer-accessible region. local_ptr must be fully contained in either the
+// peer-accessible region or the local staging allocation.
 // When signal is not None, observing the attached notification implies this
 // payload is visible, but says nothing about unrelated transfer operations.
 struct PutRequest {
-    uint64_t local_offset = 0;
+    const void* local_ptr = nullptr;
     uint64_t remote_offset = 0;
     uint64_t size = 0;
     SignalAction signal;
     uint64_t timeout_ticks = 0;
 };
 
-// Acquire-wait for a local notification counter to reach `least` under
-// uint64_t rolling comparison.
+// Acquire-wait for a notification counter in the local peer-accessible region
+// to reach `least` under uint64_t rolling comparison. local_ptr must be a
+// valid, naturally aligned counter for the lifetime of the wait.
 struct SignalWaitRequest {
-    uint64_t local_offset = 0;
+    const uint64_t* local_ptr = nullptr;
     uint64_t least = 0;
     uint64_t timeout_ticks = 0;
 };

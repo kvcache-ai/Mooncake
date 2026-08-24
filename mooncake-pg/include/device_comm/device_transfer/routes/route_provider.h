@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_ROUTE_PROVIDER_H
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_ROUTE_PROVIDER_H
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -13,8 +14,15 @@
 
 namespace mooncake {
 
+// Host-side role of one region registered with a route. PeerAccessible is the
+// published remote target region; LocalStaging is a source-only local region.
+enum class DeviceRegionKind : uint32_t {
+    PeerAccessible = 0,
+    LocalStaging = 1,
+};
+
 // Host-side control path for one way of reaching peers. Implementations manage
-// route-specific resources and metadata, but only borrow the service region.
+// route-specific resources and metadata, but only borrow DTS backing regions.
 // Device execution remains statically dispatched through DeviceRouteKind.
 class RouteProvider {
    public:
@@ -22,6 +30,14 @@ class RouteProvider {
 
     [[nodiscard]] virtual std::string_view routeKey() const noexcept = 0;
     [[nodiscard]] virtual uint32_t routeVersion() const noexcept = 0;
+
+    // Prepare one complete DTS backing region for this route. Providers only
+    // borrow the allocation and must undo the same preparation in
+    // unregisterRegion().
+    virtual PGResult<void> registerRegion(DeviceRegionKind kind, void* addr,
+                                          size_t size) = 0;
+    virtual PGResult<void> unregisterRegion(DeviceRegionKind kind, void* addr,
+                                            size_t size) = 0;
 
     // An unavailable local route returns std::nullopt instead of publishing an
     // unusable endpoint.

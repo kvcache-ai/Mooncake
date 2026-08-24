@@ -11,13 +11,12 @@
 
 namespace mooncake {
 
-// Caller-supplied staging space in the device-transfer service's registered
-// local region. PayloadWriter resolves region_offset through its transfer
-// handle. On a non-direct path, the calling GPU kernel writes the payload
-// directly into this range, and publish() passes region_offset as the source
-// offset to TransferLane::put(). PayloadWriter never adds another staging copy.
+// Protocol-supplied subrange of the DTS's local-only staging region.
+// On a non-direct path, the calling GPU kernel writes the payload directly
+// into this range, and publish() passes that address to TransferLane::put().
+// PayloadWriter never adds another staging copy.
 struct StagingRegion {
-    uint64_t region_offset = 0;
+    void* ptr = nullptr;
     uint64_t size = 0;
 };
 
@@ -29,7 +28,7 @@ struct RemotePayloadRegion {
 
 // Describes where the calling GPU kernel materializes an outgoing payload, not
 // which concrete route later publishes it. Direct writes into peer memory;
-// Staging writes into caller-supplied staging used as the source passed to
+// Staging writes into DTS-owned local staging used as the source passed to
 // TransferLane::put().
 enum class PayloadWritePath : uint32_t {
     Direct = 0,
@@ -76,9 +75,9 @@ class PayloadWriteView {
     // Submission starts before this function returns. The returned ticket
     // proves local completion when waited; an attached remote signal remains
     // the publication point for a peer consumer.
-    [[nodiscard]] __device__ __forceinline__ TransferTicket publish(
-        const PayloadPublishRequest& request,
-        cooperative_groups::thread_block block) const {
+    [[nodiscard]] __device__ __forceinline__ TransferTicket
+    publish(const PayloadPublishRequest& request,
+            cooperative_groups::thread_block block) const {
         PG_DEVICE_ASSERT(request.size <= capacity_);
 
         switch (path_) {
@@ -99,7 +98,7 @@ class PayloadWriteView {
 
             case PayloadWritePath::Staging: {
                 PutRequest put;
-                put.local_offset = local_offset_;
+                put.local_ptr = data_;
                 put.remote_offset = remote_offset_;
                 put.size = request.size;
                 put.signal = request.signal;
@@ -114,17 +113,18 @@ class PayloadWriteView {
    private:
     friend class PayloadWriter;
 
-    __device__ __forceinline__ PayloadWriteView(
-        const TransferLane& lane, GlobalRank peer,
-        DeviceRouteKind route_kind, PayloadWritePath path, void* data,
-        uint64_t capacity, uint64_t local_offset, uint64_t remote_offset)
+    __device__ __forceinline__ PayloadWriteView(const TransferLane& lane,
+                                                GlobalRank peer,
+                                                DeviceRouteKind route_kind,
+                                                PayloadWritePath path,
+                                                void* data, uint64_t capacity,
+                                                uint64_t remote_offset)
         : lane_(lane),
           peer_(peer),
           route_kind_(route_kind),
           path_(path),
           data_(data),
           capacity_(capacity),
-          local_offset_(local_offset),
           remote_offset_(remote_offset) {}
 
     TransferLane lane_;
@@ -133,7 +133,6 @@ class PayloadWriteView {
     PayloadWritePath path_ = PayloadWritePath::Staging;
     void* data_ = nullptr;
     uint64_t capacity_ = 0;
-    uint64_t local_offset_ = 0;
     uint64_t remote_offset_ = 0;
 };
 
@@ -148,37 +147,31 @@ class PayloadWriteView {
 //
 // On the direct path, payload.data() points into peer memory, and publish()
 // releases the calling GPU kernel's writes before notifying the peer. On the
-// Staging path, payload.data() points into caller-supplied staging, and
+// Staging path, payload.data() points into the bound DTS staging range, and
 // publish() submits a put with the same attached notification.
 // Construction performs the capability query once; view() and publish() do not
 // allocate memory or copy between intermediate buffers.
 class PayloadWriter {
    public:
-    __device__ __forceinline__ PayloadWriter(
-        const DeviceTransferHandle& transfer_handle, const TransferLane& lane,
-        GlobalRank peer, StagingRegion staging,
-        RemotePayloadRegion remote_region)
+    __device__ __forceinline__
+    PayloadWriter(const DeviceTransferHandle& transfer_handle,
+                  const TransferLane& lane, GlobalRank peer,
+                  StagingRegion staging, RemotePayloadRegion remote_region)
         : lane_(lane),
           peer_(peer),
           staging_(staging),
           remote_region_(remote_region) {
         PG_DEVICE_ASSERT(peer_ != kInvalidGlobalRank);
         route_kind_ = transfer_handle.routeKind(peer_);
-        payload_base_ = transfer_handle.remotePtr(
-            peer_, remote_region_.region_offset);
+        payload_base_ =
+            transfer_handle.remotePtr(peer_, remote_region_.region_offset);
         if (payload_base_) {
             path_ = PayloadWritePath::Direct;
         } else {
-            PG_DEVICE_ASSERT(transfer_handle.local_region != nullptr);
+            PG_DEVICE_ASSERT(staging_.ptr != nullptr);
             PG_DEVICE_ASSERT(staging_.size != 0);
-            PG_DEVICE_ASSERT(
-                staging_.region_offset <= transfer_handle.local_region_size);
-            PG_DEVICE_ASSERT(
-                staging_.size <= transfer_handle.local_region_size -
-                                     staging_.region_offset);
             path_ = PayloadWritePath::Staging;
-            payload_base_ =
-                transfer_handle.localPtr(staging_.region_offset);
+            payload_base_ = staging_.ptr;
         }
     }
 
@@ -194,9 +187,9 @@ class PayloadWriter {
     // destination subranges. Each offset is relative to its corresponding
     // bound region. The Direct path ignores `staging_offset`; `capacity` bounds
     // the bytes a later publish may expose.
-    [[nodiscard]] __device__ __forceinline__ PayloadWriteView view(
-        uint64_t staging_offset, uint64_t remote_offset,
-        uint64_t capacity) const {
+    [[nodiscard]] __device__ __forceinline__ PayloadWriteView
+    view(uint64_t staging_offset, uint64_t remote_offset,
+         uint64_t capacity) const {
         PG_DEVICE_ASSERT(remote_offset <= remote_region_.size);
         PG_DEVICE_ASSERT(capacity <= remote_region_.size - remote_offset);
         PG_DEVICE_ASSERT(remote_region_.region_offset <=
@@ -204,23 +197,17 @@ class PayloadWriter {
 
         const auto selected_path = path();
         void* destination = nullptr;
-        uint64_t local_offset = 0;
         if (selected_path == PayloadWritePath::Direct) {
-            destination =
-                static_cast<char*>(payload_base_) + remote_offset;
+            destination = static_cast<char*>(payload_base_) + remote_offset;
         } else {
             PG_DEVICE_ASSERT(staging_offset <= staging_.size);
             PG_DEVICE_ASSERT(capacity <= staging_.size - staging_offset);
-            PG_DEVICE_ASSERT(staging_.region_offset <=
-                             UINT64_MAX - staging_offset);
-            destination =
-                static_cast<char*>(payload_base_) + staging_offset;
-            local_offset = staging_.region_offset + staging_offset;
+            destination = static_cast<char*>(payload_base_) + staging_offset;
         }
 
-        return PayloadWriteView(
-            lane_, peer_, route_kind_, selected_path, destination, capacity,
-            local_offset, remote_region_.region_offset + remote_offset);
+        return PayloadWriteView(lane_, peer_, route_kind_, selected_path,
+                                destination, capacity,
+                                remote_region_.region_offset + remote_offset);
     }
 
    private:

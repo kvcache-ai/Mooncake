@@ -52,6 +52,7 @@ std::string_view P2pRoute::routeKey() const noexcept { return kRouteKey; }
 uint32_t P2pRoute::routeVersion() const noexcept { return kEndpointVersion; }
 
 std::optional<RouteEndpoint> P2pRoute::localEndpoint() {
+    if (!local_region_) return std::nullopt;
     const auto handle = localHandle();
     if (handle.empty()) return std::nullopt;
     return RouteEndpoint{
@@ -68,6 +69,8 @@ std::vector<int32_t> P2pRoute::localHandle() const {
 PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
     std::span<const std::optional<DeviceTransferEndpoint>> endpoints) {
     PG_VALIDATE_STATE(snapshot_stream_, "P2P route is not initialized");
+    PG_VALIDATE_STATE(local_region_,
+                      "P2P peer-accessible region is not configured");
     PG_VALIDATE_ARG(endpoints.size() == max_world_size_,
                     "P2P route endpoint snapshot size does not match max world "
                     "size");
@@ -120,6 +123,36 @@ PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
         };
     }
     return routes;
+}
+
+PGResult<void> P2pRoute::registerRegion(DeviceRegionKind kind, void* addr,
+                                        size_t size) {
+    PG_VALIDATE_STATE(snapshot_stream_, "P2P route is not initialized");
+    PG_VALIDATE_ARG(addr && size != 0, "P2P region is empty");
+    PG_ASSERT(kind == DeviceRegionKind::PeerAccessible ||
+                  kind == DeviceRegionKind::LocalStaging,
+              "P2P route received an unknown device region kind");
+
+    // P2P preparation is tied to allocation rather than registration in the
+    // current TE device API:
+    //
+    // - PeerAccessible is allocated through P2pTransport, which retains the
+    //   Fabric/MACA metadata needed when P2pRoute exports its base address.
+    // - LocalStaging is not exported; a P2P put reads it as ordinary local
+    //   device memory.
+    //
+    // Neither region requires additional work here.
+    return {};
+}
+
+PGResult<void> P2pRoute::unregisterRegion(DeviceRegionKind kind, void* addr,
+                                          size_t size) {
+    PG_VALIDATE_STATE(snapshot_stream_, "P2P route is not initialized");
+    PG_VALIDATE_ARG(addr && size != 0, "P2P region is empty");
+    PG_ASSERT(kind == DeviceRegionKind::PeerAccessible ||
+                  kind == DeviceRegionKind::LocalStaging,
+              "P2P route received an unknown device region kind");
+    return {};
 }
 
 }  // namespace mooncake
