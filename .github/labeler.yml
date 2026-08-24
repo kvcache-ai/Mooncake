@@ -5,7 +5,10 @@ run-ci:
 
 store:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-store/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-store/**/*'
+      - 'python/mooncake/http_metadata_server.py'
+      - 'python/tests/services/test_http_metadata_server.py'
 
 Transfer Engine:
   - changed-files:
@@ -21,7 +24,9 @@ Mooncake EP:
 
 Installation:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-wheel/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-wheel/**/*'
+      - 'python/mooncake/http_metadata_server.py'
 
 P2P Store:
   - changed-files:
@@ -57,6 +62,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/services/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:

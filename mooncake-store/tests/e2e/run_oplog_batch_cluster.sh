@@ -220,7 +220,7 @@ require_executable() {
 up_cluster() {
   MASTER_BIN="$BUILD_DIR/mooncake-store/src/mooncake_master"
   INSPECTOR_BIN="$BUILD_DIR/mooncake-store/tools/oplog_batch_inspector"
-  METADATA_SCRIPT="$REPO_ROOT/mooncake-wheel/mooncake/http_metadata_server.py"
+  METADATA_SCRIPT="$REPO_ROOT/python/mooncake/http_metadata_server.py"
   require_executable "$MASTER_BIN"
   [[ "$USE_ETCD_OBSERVER" != true ]] || require_executable "$INSPECTOR_BIN"
   [[ -f "$METADATA_SCRIPT" ]] || die "missing executable: $METADATA_SCRIPT"

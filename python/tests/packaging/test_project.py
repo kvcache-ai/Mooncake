@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -55,6 +56,63 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_http_metadata_service_has_one_authoritative_source(
+    tmp_path: Path,
+) -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    test_root = REPOSITORY_ROOT / "python" / "tests" / "services"
+    legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
+
+    module = package_root / "http_metadata_server.py"
+    assert module.is_file()
+    assert not (legacy_package_root / module.name).exists()
+    assert (test_root / "test_http_metadata_server.py").is_file()
+    assert not (legacy_test_root / "test_http_metadata_server.py").exists()
+
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    legacy_project = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+    entry_point = "mooncake.http_metadata_server:main"
+    assert project["project"]["scripts"]["mooncake_http_metadata_server"] == entry_point
+    assert (
+        legacy_project["project"]["scripts"]["mooncake_http_metadata_server"]
+        == entry_point
+    )
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    assert "../python/mooncake/http_metadata_server.py" in integration_cmake
+    assert "../mooncake-wheel/mooncake/http_metadata_server.py" not in integration_cmake
+
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert "MIGRATED_PYTHON_MODULES=(http_metadata_server.py)" in legacy_build_script
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(REPOSITORY_ROOT / "mooncake-wheel"),
+            str(REPOSITORY_ROOT / "python"),
+        ]
+    )
+    environment["PYTHONNOUSERSITE"] = "1"
+    import_check = f"""
+from pathlib import Path
+import mooncake.http_metadata_server as service
+
+assert Path(service.__file__).resolve() == Path({str(module)!r}).resolve()
+assert service.KVBootstrapServer is not None
+"""
+    subprocess.run(
+        [sys.executable, "-c", import_check],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+    )
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(
