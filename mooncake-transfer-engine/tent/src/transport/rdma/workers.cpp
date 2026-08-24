@@ -179,13 +179,26 @@ Workers::Workers(RdmaTransport* transport)
     // ============================================================
 
     params.default_bandwidth_gbps =
-        conf->get("transports/rdma/default_bandwidth_gbps", 400.0);
-    params.min_bandwidth_gbps =
-        conf->get("transports/rdma/min_bandwidth_gbps", 10.0);
-    params.max_bandwidth_gbps =
-        conf->get("transports/rdma/max_bandwidth_gbps", 800.0);
+        conf->get("transports/rdma/default_bandwidth_gbps",
+                  params.default_bandwidth_gbps);
+    params.min_bandwidth_gbps = conf->get("transports/rdma/min_bandwidth_gbps",
+                                          params.min_bandwidth_gbps);
+    params.max_bandwidth_gbps = conf->get("transports/rdma/max_bandwidth_gbps",
+                                          params.max_bandwidth_gbps);
 
     device_selector_->setSchedulingParams(params);
+
+    // Seed each device's bandwidth from the speed its port negotiated.
+    // context_set_ is indexed by NicID, the same id the selector uses; an
+    // inert slot (NIC skipped at init) has no port to read, so leave it on
+    // the configured default without logging a second warning for it.
+    for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
+         ++dev_id) {
+        const auto& context = transport_->context_set_[dev_id];
+        if (!context || context->status() == RdmaContext::DEVICE_UNINIT)
+            continue;
+        device_selector_->setDeviceBandwidth(dev_id, context->linkSpeedGbps());
+    }
 
     // ============================================================
     // Shared Memory Configuration

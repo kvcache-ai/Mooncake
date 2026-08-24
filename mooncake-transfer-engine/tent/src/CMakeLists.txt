@@ -61,6 +61,18 @@ if(IBVERBS_LIB AND IBVERBS_INCLUDE)
   target_compile_definitions(tent_interface INTERFACE USE_RDMA)
   target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
   target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
+  # ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
+  # newer rdma-core adds active_speed_ex to carry it.
+  include(CheckStructHasMember)
+  set(CMAKE_REQUIRED_INCLUDES ${IBVERBS_INCLUDE})
+  check_struct_has_member(
+    "struct ibv_port_attr" active_speed_ex infiniband/verbs.h
+    HAVE_IBV_ACTIVE_SPEED_EX LANGUAGE CXX)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(HAVE_IBV_ACTIVE_SPEED_EX)
+    target_compile_definitions(tent_interface
+                               INTERFACE HAVE_IBV_ACTIVE_SPEED_EX)
+  endif()
 else()
   message(STATUS "RDMA: Disabled")
 endif()

@@ -18,6 +18,8 @@
 #include "tent/common/utils/random.h"
 #include "tent/common/utils/os.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
@@ -31,13 +33,39 @@ Status DeviceSelector::loadTopology(std::shared_ptr<Topology>& local_topology) {
         if (!entry || entry->type != Topology::NIC_RDMA) continue;
         DeviceInfo& info = devices_[dev_id];
         info.dev_id = dev_id;
-        info.bw_gbps = kDefaultBwGbps;
+        info.bw_gbps = 0.0;  // unknown until setDeviceBandwidth
         info.numa_id = entry->numa_node;
-        info.ewma_bandwidth_bps.store(info.getTheoreticalBandwidth(),
+        info.ewma_bandwidth_bps.store(theoreticalBandwidth(info),
                                       std::memory_order_relaxed);
     }
     // Initialize device base priorities after all devices are loaded
     fillDevicePriorities();
+    return Status::OK();
+}
+
+double DeviceSelector::theoreticalBandwidth(const DeviceInfo& dev) const {
+    const auto& p = sched_params_;
+    double gbps = dev.bw_gbps;
+    if (gbps < p.min_bandwidth_gbps || gbps > p.max_bandwidth_gbps)
+        gbps = p.default_bandwidth_gbps;
+    return gbps * 1e9 / 8.0;
+}
+
+Status DeviceSelector::setDeviceBandwidth(int dev_id, double gbps) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end())
+        return Status::InvalidArgument("device not found");
+    auto& dev = it->second;
+    const auto& p = sched_params_;
+    if (gbps < p.min_bandwidth_gbps || gbps > p.max_bandwidth_gbps) {
+        LOG(WARNING) << "Device " << local_topology_->getNicName(dev_id)
+                     << " link speed " << gbps << " Gbps is "
+                     << (gbps <= 0.0 ? "unknown" : "outside the valid range")
+                     << ", assuming " << p.default_bandwidth_gbps << " Gbps";
+    }
+    dev.bw_gbps = gbps;
+    dev.ewma_bandwidth_bps.store(theoreticalBandwidth(dev),
+                                 std::memory_order_relaxed);
     return Status::OK();
 }
 
@@ -333,7 +361,7 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     double new_ewma = alpha * current_ewma + (1.0 - alpha) * observed_bw;
 
     // Clamp to [min_multiplier, max_multiplier] of theoretical bandwidth
-    double theoretical_bw = dev.getTheoreticalBandwidth();
+    double theoretical_bw = theoreticalBandwidth(dev);
     new_ewma = std::max(
         sched_params_.ewma_min_multiplier * theoretical_bw,
         std::min(sched_params_.ewma_max_multiplier * theoretical_bw, new_ewma));

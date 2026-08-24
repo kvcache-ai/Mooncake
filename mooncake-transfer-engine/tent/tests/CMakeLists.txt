@@ -214,6 +214,13 @@ target_include_directories(tent_endpoint_store_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_endpoint_store_test COMMAND tent_endpoint_store_test)
 
+add_executable(tent_device_selector_test device_selector_test.cpp)
+target_link_libraries(tent_device_selector_test PRIVATE gtest gtest_main
+                                                        tent_link_group)
+target_include_directories(tent_device_selector_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_device_selector_test COMMAND tent_device_selector_test)
+
 add_executable(tent_rdma_transport_test rdma_transport_test.cpp)
 target_link_libraries(tent_rdma_transport_test PRIVATE gtest gtest_main
                                                        tent_link_group ibverbs)

@@ -30,11 +30,6 @@
 namespace mooncake {
 namespace tent {
 
-// Bandwidth constants (Gbps)
-static constexpr double kDefaultBwGbps = 400.0;
-static constexpr double kMinBwGbps = 10.0;
-static constexpr double kMaxBwGbps = 800.0;
-
 class SharedSlotManager;
 
 /**
@@ -93,12 +88,6 @@ class DeviceSelector {
         double getEwmaBandwidth() const {
             return ewma_bandwidth_bps.load(std::memory_order_relaxed);
         }
-
-        double getTheoreticalBandwidth() const {
-            if (bw_gbps >= kMinBwGbps && bw_gbps <= kMaxBwGbps)
-                return bw_gbps * 1e9 / 8.0;
-            return kDefaultBwGbps * 1e9 / 8.0;
-        }
     };
 
    public:
@@ -109,6 +98,12 @@ class DeviceSelector {
     DeviceSelector &operator=(const DeviceSelector &) = delete;
 
     Status loadTopology(std::shared_ptr<Topology> &local_topology);
+
+    // Record the link speed ibv_query_port reported for dev_id and re-seed
+    // its EWMA from it. A value outside [min, max]_bandwidth_gbps (including
+    // 0 = unknown) falls back to default_bandwidth_gbps. Call after
+    // setSchedulingParams and before any traffic.
+    Status setDeviceBandwidth(int dev_id, double gbps);
 
     std::shared_ptr<Topology> getTopology() const { return local_topology_; }
 
@@ -188,10 +183,11 @@ class DeviceSelector {
         double ewma_min_multiplier = 0.1;   // 10% of theoretical
         double ewma_max_multiplier = 10.0;  // 1000% of theoretical
 
-        // Default bandwidth (Gbps) when topology info unavailable
-        double default_bandwidth_gbps = 400.0;  // Default NIC bandwidth
-        double min_bandwidth_gbps = 10.0;       // Minimum valid NIC bandwidth
-        double max_bandwidth_gbps = 800.0;      // Maximum valid NIC bandwidth
+        // Bandwidth (Gbps) assumed for a device whose link speed is unknown
+        // or outside [min, max]
+        double default_bandwidth_gbps = 400.0;
+        double min_bandwidth_gbps = 10.0;   // Minimum valid NIC bandwidth
+        double max_bandwidth_gbps = 800.0;  // Maximum valid NIC bandwidth
 
         // Shared slot rotation interval (milliseconds)
         int slot_rotation_interval_ms = 2;
@@ -213,6 +209,10 @@ class DeviceSelector {
     std::shared_ptr<SharedSlotManager> slot_manager_;
     bool smart_selection_enabled_ = true;
     SchedulingParams sched_params_;
+
+    // Bytes/s the device is rated for: bw_gbps when it is inside the
+    // configured [min, max], default_bandwidth_gbps otherwise.
+    double theoreticalBandwidth(const DeviceInfo &dev) const;
 
     Status buildCandidates(const Topology::MemEntry *entry,
                            uint64_t slice_bytes, uint64_t device_mask,

@@ -112,6 +112,9 @@ class RdmaContext {
 
     uint8_t portNum() const { return params_->device.port; }
 
+    // Negotiated port speed in Gbps, 0 when it could not be determined.
+    double linkSpeedGbps() const;
+
     int eventFd() const { return event_fd_; }
 
     RdmaCQ *cq(int index);
@@ -151,6 +154,8 @@ class RdmaContext {
     std::vector<ibv_comp_channel *> comp_channel_;
 
     uint16_t lid_ = 0;
+    int active_speed_ = 0;
+    int active_width_ = 0;
     int gid_index_ = -1;
     ibv_gid gid_;
 

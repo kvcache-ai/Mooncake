@@ -263,14 +263,18 @@ All slice spraying parameters are configurable via the configuration file:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `default_bandwidth_gbps` | float | `400.0` | Default NIC bandwidth when topology info unavailable |
+| `default_bandwidth_gbps` | float | `400.0` | NIC bandwidth assumed when the port speed is unknown or out of range |
 | `min_bandwidth_gbps` | float | `10.0` | Minimum valid NIC bandwidth (Gbps) |
 | `max_bandwidth_gbps` | float | `800.0` | Maximum valid NIC bandwidth (Gbps) |
 
 **Notes**:
-- These constants define the valid range and default for device bandwidth
-- Used in EWMA calculations and theoretical bandwidth estimation
-- If a device's reported bandwidth is outside [min, max], default_bandwidth is used
+- Each device's bandwidth is read from the speed and width its port
+  negotiated (`ibv_query_port`), so a 100G and a 400G NIC in the same host
+  start from different theoretical rates
+- The theoretical rate seeds the EWMA and bounds it to
+  `[ewma_min_multiplier, ewma_max_multiplier]` times that rate
+- If a device's port speed cannot be read or is outside [min, max],
+  `default_bandwidth_gbps` is used and a warning is logged
 
 ## Usage Examples
 

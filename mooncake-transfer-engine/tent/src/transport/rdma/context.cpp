@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "ib_link_speed.h"
 #include "tent/common/status.h"
 #include "tent/transport/rdma/endpoint_store.h"
 
@@ -849,7 +850,19 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
 
     native_context_ = context.release();
     lid_ = port_attr.lid;
+    active_speed_ = port_attr.active_speed;
+#ifdef HAVE_IBV_ACTIVE_SPEED_EX
+    // XDR (encoding 256) overflows the uint8_t field above, which then
+    // reads 0; the extended field carries it on rdma-core builds that have
+    // one.
+    if (port_attr.active_speed_ex) active_speed_ = port_attr.active_speed_ex;
+#endif
+    active_width_ = port_attr.active_width;
     return 0;
+}
+
+double RdmaContext::linkSpeedGbps() const {
+    return ibLinkSpeedGbps(active_speed_, active_width_);
 }
 }  // namespace tent
 }  // namespace mooncake
