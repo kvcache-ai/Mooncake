@@ -221,6 +221,7 @@ void TentMetrics::registerMetrics() {
         &transport_attempts_total_,
         &transport_attempt_failures_total_,
         &deadline_infeasible_total_,
+        &quarantined_batches_total_,
     };
 
     // Register the N=1 per-transport histograms with their bucket boundaries
@@ -293,6 +294,12 @@ void TentMetrics::recordDeadlineInfeasible(TransportType tp) {
         return;
     deadline_infeasible_total_.inc(
         std::array<std::string, 1>{transportTypeName(tp)});
+}
+
+void TentMetrics::recordBatchQuarantined() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    quarantined_batches_total_.inc();
 }
 
 void TentMetrics::recordStageLatency(Stage stage, TransportType tp,
@@ -607,6 +614,8 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&transport_attempt_failures_total_);
         root[deadline_infeasible_total_.str_name()] =
             sumCounterValues(&deadline_infeasible_total_);
+        root[quarantined_batches_total_.str_name()] =
+            static_cast<int64_t>(quarantined_batches_total_.value());
 
         // Histograms: sum bucket counts across all transport labels. The
         // templated helper also reads back the parallel sum counter so the
@@ -679,7 +688,9 @@ std::string TentMetrics::getSummaryString() {
         << "Write: " << formatBytes(write_bytes) << " ("
         << static_cast<uint64_t>(write_reqs) << " reqs, "
         << static_cast<uint64_t>(write_fails) << " fails) | "
-        << "Failovers: " << static_cast<uint64_t>(failovers);
+        << "Failovers: " << static_cast<uint64_t>(failovers)
+        << " | Quarantined batches: "
+        << static_cast<uint64_t>(quarantined_batches_total_.value());
 
     return oss.str();
 }
@@ -708,6 +719,7 @@ void TentMetrics::recordTransportAttemptFinished(TransportType, Request::OpCode,
                                                  TransferStatusEnum, double) {}
 void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
+void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordStageLatency(Stage, TransportType, double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {

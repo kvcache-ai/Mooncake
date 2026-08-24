@@ -112,6 +112,12 @@ class TentMetrics {
     // distinguishable from genuine MLU samples in the histogram above.
     void recordDeadlineInfeasible(TransportType tp);
 
+    // Record a batch abandoned by lazyFreeBatch after repeated failed reclaim
+    // attempts. Such a batch stays on the freelist without further retries and
+    // is only reclaimed at engine teardown, so a nonzero value means resources
+    // are parked until shutdown and the last reclaim error is in the log.
+    void recordBatchQuarantined();
+
     enum class Stage {
         QueueWait,
         Dispatch,
@@ -224,6 +230,12 @@ class TentMetrics {
         "tent_deadline_infeasible_total",
         "Transfers whose deadline was already in the past at submit",
         kTransportLabel};
+    // Label-less: quarantine is a batch-lifecycle event, not a per-transport
+    // one (a batch may hold SubBatches on several transports).
+    ylt::metric::counter_t quarantined_batches_total_{
+        "tent_quarantined_batches_total",
+        "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
+        "attempts; reclaimed only at engine teardown"};
 
     // Histograms - paired with their bucket boundaries in a single vector so
     // the two cannot drift out of sync (ylt histogram doesn't expose its
@@ -457,6 +469,14 @@ class ScopedLatencyRecorder {
         }                                                                      \
     } while (0)
 
+#define TENT_RECORD_BATCH_QUARANTINED()                   \
+    do {                                                  \
+        if (::mooncake::tent::TentMetrics::isEnabled()) { \
+            ::mooncake::tent::TentMetrics::instance()     \
+                .recordBatchQuarantined();                \
+        }                                                 \
+    } while (0)
+
 #define TENT_SCOPED_READ_LATENCY(tp, bytes)                               \
     ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_(      \
         ::mooncake::tent::ScopedLatencyRecorder::OperationType::Read, tp, \
@@ -491,6 +511,7 @@ class ScopedLatencyRecorder {
 #define TENT_RECORD_READ_FAILED(tp) ((void)0)
 #define TENT_RECORD_WRITE_FAILED(tp) ((void)0)
 #define TENT_RECORD_TRANSPORT_FAILOVER(from, to) ((void)0)
+#define TENT_RECORD_BATCH_QUARANTINED() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(tp, bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(tp, bytes) ((void)0)
 #define TENT_RECORD_STAGE_LATENCY(stage, tp, latency_us) ((void)0)

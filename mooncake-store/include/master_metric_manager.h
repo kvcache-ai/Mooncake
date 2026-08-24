@@ -311,6 +311,7 @@ class MasterMetricManager {
     void inc_promotion_completed_bytes(int64_t bytes);
     void inc_promotion_expired(int64_t val = 1);
     void inc_promotion_failed(int64_t val = 1);
+    void inc_promotion_execution_gave_up(int64_t val = 1);
     void inc_promotion_cancelled(int64_t val = 1);
     void inc_promotion_rejected_frequency(int64_t val = 1);
     void inc_promotion_rejected_watermark(int64_t val = 1);
@@ -336,6 +337,7 @@ class MasterMetricManager {
     int64_t get_promotion_completed_bytes();
     int64_t get_promotion_expired();
     int64_t get_promotion_failed();
+    int64_t get_promotion_execution_gave_up();
     int64_t get_promotion_cancelled();
     int64_t get_promotion_rejected_frequency();
     int64_t get_promotion_rejected_watermark();
@@ -695,6 +697,7 @@ class MasterMetricManager {
     ylt::metric::counter_t promotion_completed_bytes_;
     ylt::metric::counter_t promotion_expired_;
     ylt::metric::counter_t promotion_failed_;
+    ylt::metric::counter_t promotion_execution_gave_up_;
     ylt::metric::counter_t promotion_cancelled_;
     ylt::metric::counter_t promotion_rejected_frequency_;
     ylt::metric::counter_t promotion_rejected_watermark_;
