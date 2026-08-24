@@ -3802,6 +3802,150 @@ TEST_F(StorageBackendTest,
     EXPECT_FALSE(oldest_exists.value());
 }
 
+// Regression for #3465: silent offload failure where keys stay listed via
+// get_all_keys but get_value returns empty after eviction offload.
+//
+// The storage-backend invariant behind the symptom: when a bucket is evicted
+// (its keys removed from the backend's index and the LOCAL_DISK replica
+// NACKed by the master), a stale master replica must never keep the key
+// "listed but unreadable". The backend must refuse the read (BatchLoad fails,
+// IsExist==false) instead of yielding empty bytes. This test drives LRU +
+// watermark eviction and asserts survivors read back byte-identical while the
+// evicted key is reported absent and its read fails — never silent empty.
+TEST_F(StorageBackendTest, BucketLruEvictionReadBackAfterEvict3465) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    // Sized like BucketWatermarkEvictionUsesHandlerAndKeepsNewest: 3x 6 KB
+    // buckets (~19.5 KB total) exceed 30 KB * 0.60, so EvictAboveDiskWatermark
+    // with high=0.60 triggers eviction.
+    bucket_config.max_total_size = 30 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Offload three keys, each in its own bucket. Each value is 6 KB; the
+    // bucket's data_size accumulates value + key size, so three buckets land
+    // just over the 60% high watermark (~18.4 KB), triggering eviction.
+    std::vector<std::unique_ptr<char[]>> buffers;
+    std::vector<std::string> values;
+    auto make_batch = [&](const std::string& key, int fill) {
+        auto buf = std::make_unique<char[]>(6 * 1024);
+        std::memset(buf.get(), fill, 6 * 1024);
+        buffers.push_back(std::move(buf));
+        values.emplace_back(6 * 1024, static_cast<char>(fill));
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(
+            key, std::vector<Slice>{Slice{buffers.back().get(), 6 * 1024}});
+        return batch;
+    };
+
+    auto complete_handler = [](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+    std::vector<std::string> evicted_keys;
+    auto eviction_handler =
+        [&evicted_keys](const std::vector<std::string>& keys) {
+            evicted_keys.insert(evicted_keys.end(), keys.begin(), keys.end());
+            return tl::expected<void, ErrorCode>{};
+        };
+
+    // Bucket A: offload key_0 ('A'). BatchOffload stamps its LRU timestamp
+    // with the current time (t_A). Reading key_0 later bumps t_A to "now"
+    // (newest).
+    auto r0 = storage_backend.BatchOffload(
+        make_batch("key_3465_0", 'A'), complete_handler, eviction_handler);
+    ASSERT_TRUE(r0.has_value());
+
+    // Bucket B: offload key_1 ('B'). Its stamp t_B > t_A (B is newer than A).
+    auto r1 = storage_backend.BatchOffload(
+        make_batch("key_3465_1", 'B'), complete_handler, eviction_handler);
+    ASSERT_TRUE(r1.has_value());
+
+    // Read key_0 (bucket A) so its timestamp becomes newest. Order is now
+    // B (oldest) < C(not yet) < A(newest). This makes key_1 (bucket B) the LRU
+    // victim rather than key_0.
+    {
+        auto read_buf = std::make_unique<char[]>(6 * 1024);
+        std::unordered_map<std::string, Slice> load;
+        load.emplace("key_3465_0", Slice{read_buf.get(), 6 * 1024});
+        ASSERT_TRUE(storage_backend.BatchLoad(load).has_value());
+    }
+
+    // Bucket C: offload key_2 ('C'). Its stamp t_C is newest.
+    auto r2 = storage_backend.BatchOffload(
+        make_batch("key_3465_2", 'C'), complete_handler, eviction_handler);
+    ASSERT_TRUE(r2.has_value());
+
+    // Drive watermark eviction explicitly. With total_size ~= 18.7 KB and high
+    // watermark = 30 KB * 0.60 = 18 KB, eviction triggers. With low watermark
+    // = 30 KB * 0.55 = 16.5 KB, evicting one bucket (~6.3 KB) brings total to
+    // ~12.4 KB < 16.5 KB, so exactly one bucket is evicted.
+    // The LRU victim must be bucket B (key_1): it is the oldest after key_0
+    // was read (which bumped key_0 to newest). key_2 is newest.
+    auto evict_result = storage_backend.EvictAboveDiskWatermark(
+        /*high_watermark_ratio=*/0.60, /*low_watermark_ratio=*/0.55,
+        eviction_handler);
+    ASSERT_TRUE(evict_result.has_value());
+
+    // The first LRU victim must be bucket B (key_3465_1).
+    ASSERT_GE(evicted_keys.size(), 1u);
+    EXPECT_EQ(evicted_keys[0], "key_3465_1")
+        << "LRU victim must be the oldest bucket (key_1), since key_0 was read "
+           "after offload and key_2 is the newest";
+
+    // Survivor key_3465_0 (bucket A, read after eviction) must read back
+    // byte-for-byte identical to what was offloaded.
+    {
+        auto read_buf = std::make_unique<char[]>(6 * 1024);
+        std::unordered_map<std::string, Slice> load;
+        load.emplace("key_3465_0", Slice{read_buf.get(), 6 * 1024});
+        auto load_res = storage_backend.BatchLoad(load);
+        ASSERT_TRUE(load_res.has_value())
+            << "survivor key_3465_0 must be readable; got: "
+            << (load_res ? "ok" : toString(load_res.error()));
+        EXPECT_EQ(std::string(read_buf.get(), 6 * 1024), values[0])
+            << "survivor key_3465_0 data must match what was offloaded";
+    }
+
+    // Survivor key_3465_2 (bucket C, newest) reads back byte-for-byte identical.
+    {
+        auto read_buf = std::make_unique<char[]>(6 * 1024);
+        std::unordered_map<std::string, Slice> load;
+        load.emplace("key_3465_2", Slice{read_buf.get(), 6 * 1024});
+        auto load_res = storage_backend.BatchLoad(load);
+        ASSERT_TRUE(load_res.has_value())
+            << "survivor key_3465_2 must be readable; got: "
+            << (load_res ? "ok" : toString(load_res.error()));
+        EXPECT_EQ(std::string(read_buf.get(), 6 * 1024), values[2])
+            << "survivor key_3465_2 data must match what was offloaded";
+    }
+
+    // The evicted key must be reported absent (IsExist false), and a read must
+    // fail rather than silently returning empty bytes. This is the
+    // storage-backend invariant behind #3465's "listed but empty" symptom: if a
+    // stale master replica ever keeps such a key listed, the backend must still
+    // refuse the read instead of yielding empty data.
+    auto evicted_exists = storage_backend.IsExist("key_3465_1");
+    ASSERT_TRUE(evicted_exists.has_value());
+    EXPECT_FALSE(evicted_exists.value())
+        << "evicted key_3465_1 must no longer exist after eviction";
+
+    {
+        auto read_buf = std::make_unique<char[]>(6 * 1024);
+        std::unordered_map<std::string, Slice> load;
+        load.emplace("key_3465_1", Slice{read_buf.get(), 6 * 1024});
+        auto load_res = storage_backend.BatchLoad(load);
+        EXPECT_FALSE(load_res.has_value())
+            << "reading evicted key_3465_1 must fail, not return empty bytes";
+    }
+}
+
 TEST_F(StorageBackendTest, BucketWatermarkEvictionNoopsWhenPolicyIsNone) {
     FileStorageConfig config;
     config.storage_filepath = data_path;

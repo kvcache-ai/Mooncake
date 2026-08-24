@@ -6964,7 +6964,7 @@ void MasterService::CancelReplicationTaskForRemovedSource(
                          r.id()) != task.replica_ids.end();
     };
     auto removed_targets =
-        metadata.PopReplicasWithCacheTotalAccounting(target_pred);
+        PopReplicasWithCacheTotalAccounting(metadata, target_pred);
     std::vector<ReplicaID> erased_ids;
     erased_ids.reserve(removed_targets.size());
     for (const auto& r : removed_targets) erased_ids.push_back(r.id());
