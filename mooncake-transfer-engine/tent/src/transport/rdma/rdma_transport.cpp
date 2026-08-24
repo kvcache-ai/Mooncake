@@ -865,10 +865,10 @@ int RdmaTransport::processNotifyCompletions() {
                 // alone the endpoint stays EP_READY and every later
                 // sendNotification() silently flushes. Retiring it also moves
                 // the data QPs to ERR, so that is reserved for faults which may
-                // mean the peer restarted or the path died. Both acting branches
-                // re-take the notify_endpoint_map_lock_ ReadGuard released above
-                // via unregisterNotifyQp(); the locally held shared_ptr keeps
-                // the endpoint alive across the call.
+                // mean the peer restarted or the path died. Both acting
+                // branches re-take the notify_endpoint_map_lock_ ReadGuard
+                // released above via unregisterNotifyQp(); the locally held
+                // shared_ptr keeps the endpoint alive across the call.
                 const bool endpoint_ready =
                     endpoint && endpoint->status() == RdmaEndPoint::EP_READY;
                 auto action = classifyNotifyCompletion(
