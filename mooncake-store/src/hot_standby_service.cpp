@@ -13,6 +13,7 @@
 #include "ha/oplog/oplog_batch_standby_reader.h"
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
 namespace mooncake {
 
@@ -84,6 +85,7 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     }
     batch_standby_reader_.reset();
     batch_standby_kv_backend_.reset();
+    batch_snapshot_baseline_.reset();
 
     last_error_.store(ErrorCode::OK, std::memory_order_release);
 
@@ -158,6 +160,9 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 
     oplog_applier_ =
         std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id_);
+    if (batch_oplog_snapshot_provider_ && config_.enable_snapshot_bootstrap) {
+        return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id);
+    }
     if (!config_.enable_oplog_following) {
         if (metadata_store_ && metadata_store_->GetKeyCount() > 0) {
             LOG(INFO) << "Snapshot-only restart discards local metadata and "
@@ -249,6 +254,30 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     return ErrorCode::OK;
 }
 
+ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
+    uint64_t& baseline_seq_id) {
+    baseline_seq_id = 0;
+    auto temporary_metadata = std::make_unique<StandbyMetadataStore>();
+    auto temporary_applier =
+        std::make_unique<OpLogApplier>(temporary_metadata.get(), cluster_id_);
+    StandbySegmentRegistry temporary_registry;
+    auto restored = batch_oplog_snapshot_provider_->RestoreBaseline(
+        *temporary_metadata, temporary_registry, temporary_applier.get());
+    if (!restored) {
+        return restored.error();
+    }
+
+    // The provider has already replayed the suffix in temporary state. The
+    // running reader/applier starts from that proven final sequence.
+    metadata_store_ = std::move(temporary_metadata);
+    oplog_applier_ = std::move(temporary_applier);
+    baseline_seq_id = oplog_applier_->GetExpectedSequenceId() - 1;
+    batch_snapshot_baseline_ =
+        DurablePrefix{.batch_id = restored->last_included_batch_id,
+                      .last_seq = restored->last_included_seq};
+    return ErrorCode::OK;
+}
+
 ErrorCode HotStandbyService::StartOplogFollowingLocked(
     uint64_t baseline_seq_id) {
     (void)baseline_seq_id;
@@ -259,6 +288,13 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
     }
     batch_standby_reader_ = std::make_unique<OpLogBatchStandbyReader>(
         cluster_id_, *batch_standby_kv_backend_, *oplog_applier_);
+    if (batch_snapshot_baseline_) {
+        const ErrorCode cursor_error =
+            batch_standby_reader_->SetBaselineCursor(*batch_snapshot_baseline_);
+        if (cursor_error != ErrorCode::OK) {
+            return cursor_error;
+        }
+    }
 
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
     replication_loop_running_.store(true, std::memory_order_release);
@@ -496,7 +532,8 @@ ErrorCode HotStandbyService::Promote() {
 
     LOG(INFO) << "Promoting Standby to Primary. Applied seq_id: "
               << current_applied_seq_id << ", lag: " << status.lag_entries
-              << " entries" << ", state: " << StandbyStateToString(GetState());
+              << " entries"
+              << ", state: " << StandbyStateToString(GetState());
 
     auto internal_err = PromoteLockedInternal(current_applied_seq_id);
     if (internal_err != ErrorCode::OK) {
@@ -755,6 +792,12 @@ void HotStandbyService::SetSnapshotProvider(
     } else {
         snapshot_provider_ = std::make_unique<NoopSnapshotProvider>();
     }
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotProvider(
+    std::unique_ptr<BatchOpLogSnapshotProvider> provider) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    batch_oplog_snapshot_provider_ = std::move(provider);
 }
 
 void HotStandbyService::ReplicationLoop() {
