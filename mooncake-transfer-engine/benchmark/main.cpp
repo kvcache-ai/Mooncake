@@ -22,22 +22,52 @@
 #include "tent_backend.h"
 #endif
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+
 using namespace mooncake::tent;
+
+uint64_t steadyClockNs() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+}
+
+double gbPerSecond(uint64_t bytes, double duration_us) {
+    if (duration_us <= 0.0) return 0.0;
+    return static_cast<double>(bytes) / (1000.0 * duration_us);
+}
 
 int processBatchSizes(
     BenchRunner& runner, size_t block_size, size_t batch_size, int num_threads,
     const std::vector<QosClassConfig>& qos_classes,
     const std::vector<WorkloadClassConfig>& workload_classes = {}) {
     bool mixed_opcode = false;
+    bool write_seed = false;
+    bool read_verify = false;
     OpCode opcode = READ;
+    if (XferBenchConfig::check_consistency &&
+        (XferBenchConfig::op_type == "write_seed" ||
+         XferBenchConfig::op_type == "read_verify")) {
+        LOG(ERROR) << "--check_consistency cannot be combined with "
+                      "write_seed/read_verify";
+        exit(EXIT_FAILURE);
+    }
     if (XferBenchConfig::check_consistency || XferBenchConfig::op_type == "mix")
         mixed_opcode = true;
     else if (XferBenchConfig::op_type == "read")
         opcode = READ;
     else if (XferBenchConfig::op_type == "write")
         opcode = WRITE;
-    else {
-        LOG(ERROR) << "Invalid args: workload only support read|write|mix";
+    else if (XferBenchConfig::op_type == "write_seed") {
+        opcode = WRITE;
+        write_seed = true;
+    } else if (XferBenchConfig::op_type == "read_verify") {
+        opcode = READ;
+        read_verify = true;
+    } else {
+        LOG(ERROR) << "Invalid args: workload only support "
+                      "read|write|mix|write_seed|read_verify";
         exit(EXIT_FAILURE);
     }
 
@@ -46,23 +76,40 @@ int processBatchSizes(
     XferBenchStats tight_stats;
     XferBenchStats loose_stats;
     std::mutex mutex;
+    std::atomic<int> measurement_ready{0};
+    std::atomic<bool> measurement_started{false};
+    auto paceRequest = [&]() {
+        if (XferBenchConfig::request_interval_us == 0) return;
+        const uint64_t interval_ns =
+            XferBenchConfig::request_interval_us * 1000ull;
+        const uint64_t target_ns = steadyClockNs() + interval_ns;
+        while (steadyClockNs() < target_ns) {
+            std::this_thread::yield();
+        }
+    };
     size_t address_stride_bytes =
         XferBenchConfig::max_block_size * XferBenchConfig::max_batch_size;
     if (!workload_classes.empty()) {
         address_stride_bytes = 0;
         for (const auto& config : workload_classes) {
-            address_stride_bytes = std::max(
-                address_stride_bytes, config.block_size * config.batch_size);
+            address_stride_bytes =
+                std::max(address_stride_bytes,
+                         checkedMul(config.block_size, config.batch_size,
+                                    "workload address stride"));
         }
     }
     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
         auto local_gpu_offset = std::max(0, XferBenchConfig::local_gpu_id);
         auto target_gpu_offset = std::max(0, XferBenchConfig::target_gpu_id);
+        const int target_thread_id =
+            static_cast<int>(target_gpu_offset * runner.getTargetCount()) +
+            thread_id;
         uint64_t local_addr = runner.getLocalBufferBase(
             local_gpu_offset + thread_id, address_stride_bytes, 1);
         uint64_t target_addr = runner.getTargetBufferBase(
-            target_gpu_offset + thread_id, address_stride_bytes, 1);
+            target_thread_id, address_stride_bytes, 1);
+        uint64_t target_id = runner.getTargetSegmentId(target_thread_id);
         const bool qos_enabled = !qos_classes.empty();
         const size_t qos_class =
             qos_enabled ? qosClassForThread(qos_classes, thread_id) : 0;
@@ -90,39 +137,73 @@ int processBatchSizes(
 
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {
-            runner.runSingleTransfer(local_addr, target_addr, thread_block_size,
-                                     thread_batch_size, opcode, deadlineNs(),
-                                     intent_type);
+            runner.runSingleTransfer(local_addr, target_id, target_addr,
+                                     thread_block_size, thread_batch_size,
+                                     opcode, deadlineNs(), intent_type);
+        }
+        if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+            num_threads) {
+            measurement_started.store(true, std::memory_order_release);
+        } else {
+            while (!measurement_started.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
         }
         timer.reset();
         std::vector<double> transfer_duration;
+        std::vector<double> thread_instant_bandwidth;
         if (mixed_opcode) {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
+                const size_t bytes =
+                    checkedMul(thread_block_size, thread_batch_size,
+                               "consistency payload size");
+                const uint64_t batch_bytes = bytes;
                 uint8_t pattern = 0;
                 if (XferBenchConfig::check_consistency)
-                    pattern = fillData((void*)local_addr,
-                                       thread_block_size * thread_batch_size);
+                    pattern = fillData((void*)local_addr, bytes);
+                paceRequest();
                 auto val = runner.runSingleTransfer(
-                    local_addr, target_addr, thread_block_size,
+                    local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
+                thread_instant_bandwidth.push_back(
+                    gbPerSecond(batch_bytes, val));
                 transfer_duration.push_back(val);
-                fillData((void*)local_addr,
-                         thread_block_size * thread_batch_size);
+                fillData((void*)local_addr, bytes);
+                paceRequest();
                 val = runner.runSingleTransfer(
-                    local_addr, target_addr, thread_block_size,
+                    local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
+                thread_instant_bandwidth.push_back(
+                    gbPerSecond(batch_bytes, val));
                 if (XferBenchConfig::check_consistency)
                     verifyData((void*)local_addr,
-                               thread_block_size * thread_batch_size, pattern);
+                               checkedMul(thread_block_size, thread_batch_size,
+                                          "consistency payload size"),
+                               pattern);
                 transfer_duration.push_back(val);
             }
         } else {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
+                const size_t bytes =
+                    checkedMul(thread_block_size, thread_batch_size,
+                               "operation payload size");
+                const uint64_t batch_bytes = bytes;
+                if (write_seed) {
+                    fillData((void*)local_addr, bytes,
+                             stableDataSeed(target_addr));
+                }
+                paceRequest();
                 auto val = runner.runSingleTransfer(
-                    local_addr, target_addr, thread_block_size,
+                    local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
+                thread_instant_bandwidth.push_back(
+                    gbPerSecond(batch_bytes, val));
+                if (read_verify) {
+                    verifyData((void*)local_addr, bytes,
+                               stableDataSeed(target_addr));
+                }
                 transfer_duration.push_back(val);
             }
         }
@@ -130,9 +211,12 @@ int processBatchSizes(
         std::lock_guard<std::mutex> lock(mutex);
         stats.total_duration.add(total_duration);
         stats.transfer_duration.add(transfer_duration);
+        stats.instant_bandwidth.add(thread_instant_bandwidth);
         if (qos_enabled) {
             qos_stats[qos_class].total_duration.add(total_duration);
             qos_stats[qos_class].transfer_duration.add(transfer_duration);
+            qos_stats[qos_class].instant_bandwidth.add(
+                thread_instant_bandwidth);
         }
         auto& group_stats = tight ? tight_stats : loose_stats;
         group_stats.total_duration.add(total_duration);
@@ -321,8 +405,16 @@ int main(int argc, char* argv[]) {
             for (size_t batch_size = XferBenchConfig::start_batch_size;
                  !interrupted && batch_size <= XferBenchConfig::max_batch_size;
                  batch_size *= 2) {
-                if (block_size * batch_size * num_threads >
-                    XferBenchConfig::total_buffer_size) {
+                const size_t bytes_per_thread = checkedMul(
+                    block_size, batch_size, "benchmark operation size");
+                if (XferBenchConfig::target_range_size != 0 &&
+                    bytes_per_thread > XferBenchConfig::target_range_size) {
+                    LOG(ERROR) << "target range is smaller than one operation";
+                    interrupted = true;
+                } else if (num_threads != 0 &&
+                           bytes_per_thread >
+                               XferBenchConfig::total_buffer_size /
+                                   num_threads) {
                     LOG(INFO) << "Skipped for block_size " << block_size
                               << " batch_size " << batch_size;
                 } else {

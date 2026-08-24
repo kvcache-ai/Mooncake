@@ -63,14 +63,35 @@ class CoroRpcAgent {
    public:
     using Function = std::function<void(const std::string_view & /* request */,
                                         std::string & /* response */)>;
-    Status registerFunction(int func_id, const Function &func);
 
-    Status start(uint16_t &port, bool ipv6 = false);
+    // Handlers run on the server io_context thread pool (the threads
+    // argument of start(), 1 by default), so a blocking one stalls every
+    // connection sharing its thread, not just its own.
+    //
+    // offload=false (default): inline, no thread hop. Right for anything that
+    // returns promptly.
+    // offload=true: runs on ylt's blocking executor while the connection
+    // coroutine suspends, keeping the io_context free. Callers see the same
+    // request/response, but ordering within a connection is no longer
+    // guaranteed.
+    Status registerFunction(int func_id, const Function &func,
+                            bool offload = false);
+
+    // threads: number of io_context worker threads (default 1, the
+    // historical behavior). The TCP data-path handlers do full-payload
+    // blocking copies inline, so a single thread caps TCP throughput;
+    // sourced from the rpc_server_threads config key.
+    Status start(uint16_t &port, bool ipv6 = false, size_t threads = 1);
 
     Status stop();
 
     Status call(const std::string &server_addr, int func_id,
                 const std::string_view &request, std::string &response);
+
+    // Same as call(), but moves the request into the coroutine instead of
+    // copying it, for large payloads.
+    Status callOwned(const std::string &server_addr, int func_id,
+                     std::string request, std::string &response);
 
     using AsyncCallback = std::function<void(Status, std::string)>;
     void callAsync(const std::string &server_addr, int func_id,
@@ -80,21 +101,25 @@ class CoroRpcAgent {
         std::string server_addr, int func_id, std::string request);
 
    private:
-    void process(int func_id);
+    async_simple::coro::Lazy<void> process(int func_id);
 
     std::shared_ptr<ClientPool> getOrCreatePool(const std::string &server_addr);
 
    private:
+    struct Handler {
+        Function func;
+        bool offload = false;
+    };
+
     coro_rpc::coro_rpc_server *server_ = nullptr;
 
     std::mutex pools_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ClientPool>> pools_;
 
     std::mutex func_map_mutex_;
-    std::unordered_map<int, Function> func_map_;
+    std::unordered_map<int, Handler> func_map_;
 
     std::atomic<bool> running_{false};
-    constexpr static size_t kRpcThreads = 1;
 };
 
 }  // namespace tent

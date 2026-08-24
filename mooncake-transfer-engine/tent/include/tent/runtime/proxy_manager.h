@@ -15,9 +15,11 @@
 #ifndef PROXY_MANAGER_H_
 #define PROXY_MANAGER_H_
 
+#include <memory>
+#include <shared_mutex>
+
 #include "tent/common/types.h"
 #include "tent/common/status.h"
-#include "tent/common/concurrent/thread_pool.h"
 
 #include "tent/runtime/transport.h"
 
@@ -28,6 +30,9 @@ namespace tent {
 class TransferEngineImpl;
 class TaskInfo;
 struct StageBufferCache;
+namespace internal {
+class RemoteStageOperation;
+}
 
 struct StagingTask {
     TaskInfo* native{nullptr};
@@ -64,7 +69,11 @@ class ProxyManager {
    private:
     void runner(size_t id);
 
-    Status transferEventLoop(StagingTask& task, StageBufferCache* cache);
+    Status transferEventLoop(
+        StagingTask& task, StageBufferCache* cache,
+        bool& buffers_safe_to_release, std::vector<BatchID>& undrained_batches,
+        std::vector<std::shared_ptr<internal::RemoteStageOperation>>&
+            undrained_remote_operations);
 
     Status transferSync(StagingTask& task, StageBufferCache* cache);
 
@@ -91,16 +100,35 @@ class ProxyManager {
                            const Request& request, uint64_t remote_stage_buffer,
                            uint64_t chunk_length, uint64_t offset);
 
-    void submitRemoteStage(const std::string& server_addr,
-                           const Request& request, uint64_t remote_stage_buffer,
-                           uint64_t chunk_length, uint64_t offset,
-                           std::future<Status>& handle);
+    void submitRemoteStage(
+        const std::string& server_addr, const Request& request,
+        uint64_t remote_stage_buffer, uint64_t chunk_length, uint64_t offset,
+        std::shared_ptr<internal::RemoteStageOperation>& operation);
+
+    void flushPendingCleanups(bool unpin_remote_buffers = true);
 
    private:
+    struct PendingBufferCleanup {
+        std::vector<uint64_t> local_addrs;
+        std::vector<std::pair<std::string, uint64_t>> remote_addrs;
+        std::vector<BatchID> batches;
+        std::vector<std::shared_ptr<internal::RemoteStageOperation>>
+            remote_operations;
+    };
+
     const size_t chunk_size_;
     const size_t chunk_count_;
     TransferEngineImpl* impl_;
+    // Guards the map, not the chunk bitmaps in it: those are atomic_flags and
+    // stay lock-free under a shared lock. Exclusive only to insert or erase an
+    // entry, at most once per location. Reached by the kShards staging workers
+    // via StageBufferCache and by the RPC thread via Pin/Unpin.
+    mutable std::shared_mutex stage_buffers_mutex_;
     std::unordered_map<std::string, StageBuffers> stage_buffers_;
+    std::recursive_mutex stage_buffers_mu_;
+    std::vector<PendingBufferCleanup> pending_cleanups_;
+    std::mutex pending_cleanups_mu_;
+    std::atomic<bool> has_pending_cleanups_{false};
     std::atomic<bool> running_;
     struct WorkerShard {
         std::thread thread;
@@ -110,7 +138,6 @@ class ProxyManager {
     };
     const static size_t kShards = 8;
     WorkerShard shards_[kShards];
-    ThreadPool delegate_pool_;
 };
 }  // namespace tent
 }  // namespace mooncake

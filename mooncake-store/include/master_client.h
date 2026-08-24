@@ -46,6 +46,22 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
     }
 }
 
+// Applies the RPC timeout overrides to any mooncake-store RPC client config.
+// Shared by the client->master pool and the store->store offload pool so the
+// two cannot drift. Unset variables leave coro_rpc's built-in 30s defaults in
+// place. A negative request timeout disables the per-request timer.
+template <typename ClientConfig>
+inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
+    if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
+        client_config.request_timeout_duration =
+            std::chrono::milliseconds(std::atoll(timeout_ms));
+    }
+    if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
+        client_config.connect_timeout_duration =
+            std::chrono::milliseconds(std::atoll(connect_ms));
+    }
+}
+
 inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
     RpcClientPool::PoolConfig config;
     const char* value = std::getenv("MC_RPC_PROTOCOL");
@@ -53,16 +69,7 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
-    // Default request and connect timeouts remain coro_rpc's built-in 30s.
-    // A negative request timeout disables the per-request timer.
-    if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
-        config.client_config.request_timeout_duration =
-            std::chrono::milliseconds(std::atoll(timeout_ms));
-    }
-    if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
-        config.client_config.connect_timeout_duration =
-            std::chrono::milliseconds(std::atoll(connect_ms));
-    }
+    ApplyRpcTimeoutEnvOverrides(config.client_config);
     return config;
 }
 
@@ -414,6 +421,13 @@ class MasterClient {
         const UUID& client_id, bool enable_offloading);
 
     /**
+     * @brief Deregisters this client's local disk segment from the master,
+     * dropping the LOCAL_DISK replicas it owns. Idempotent.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
+        const UUID& client_id);
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-persisted objects.
      * @param enable_offloading Indicates whether persistence is enabled for
@@ -504,6 +518,13 @@ class MasterClient {
         const std::string& key, const std::string& tenant_id,
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode>
+    DynamicReplicaCopyStart(const std::string& key,
+                            const std::string& tenant_id,
+                            const std::string& src_segment,
+                            const std::vector<std::string>& tgt_segments,
+                            const UUID& dynamic_replication_lease_id,
+                            uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief End a copy operation
@@ -513,6 +534,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Revoke a copy operation
@@ -523,6 +548,10 @@ class MasterClient {
         const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Start a move operation

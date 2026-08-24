@@ -37,6 +37,11 @@ enum class TransferStrategy {
     SPDK_NVMF = 4  // Spdk nvmf operation
 };
 
+enum class OffloadBufferAccess {
+    kTransferEngine,
+    kLocalAddress,
+};
+
 /**
  * @brief Stream operator for TransferStrategy
  */
@@ -560,6 +565,10 @@ class TransferSubmitter {
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         uint64_t src_offset);
 
+    std::optional<TransferFuture> submitRangeWrite(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        uint64_t dst_offset);
+
     TransferEngine::ScatterTransferOperation submitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers);
 
@@ -573,7 +582,10 @@ class TransferSubmitter {
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
-            batched_slices);
+            batched_slices,
+        OffloadBufferAccess buffer_access);
+
+    [[nodiscard]] bool canUseLocalMemcpy(const std::string& endpoint) const;
 
     /**
      * @brief Pure comparison helper: returns true iff both endpoints are
@@ -609,15 +621,16 @@ class TransferSubmitter {
                                     const std::vector<Slice>& slices) const;
 
     /**
-     * @brief Check if all handles refer to local segments
-     */
-    bool isLocalTransfer(const AllocatedBuffer::Descriptor& handle) const;
-
-    /**
      * @brief Validate transfer parameters
      */
     bool validateTransferParams(const AllocatedBuffer::Descriptor& handle,
                                 const std::vector<Slice>& slices) const;
+
+    void appendMemcpyOperations(const AllocatedBuffer::Descriptor& handle,
+                                const std::vector<Slice>& slices,
+                                TransferRequest::OpCode op_code,
+                                uint64_t buffer_offset,
+                                std::vector<MemcpyOperation>& operations);
 
     /**
      * @brief Submit memcpy operation asynchronously
@@ -626,6 +639,9 @@ class TransferSubmitter {
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         uint64_t src_offset = 0);
+
+    std::optional<TransferFuture> submitMemcpyOperations(
+        std::vector<MemcpyOperation> operations);
 
 #ifdef USE_NOF
     /**
@@ -648,6 +664,10 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitMemoryReadOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, uint64_t src_offset);
+
+    std::optional<TransferFuture> submitMemoryWriteOperation(
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices, uint64_t dst_offset);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,

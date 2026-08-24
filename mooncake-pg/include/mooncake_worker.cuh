@@ -31,8 +31,12 @@ class MooncakeCommunicator;
 //   Isolated --(Active view)--> Normal
 //
 // Joining member:
-//   Isolated --(joinGroup: drain preparation collectives)--> Quiescing
+//   Isolated ---------(joinGroup: drain operations)--------> Quiescing
 //            -----------------(Active view)----------------> Normal
+//
+// In-place rejoining member:
+//   Normal + inactive --(joinGroup: drain operations)------> Quiescing
+//                     ---------(Active view)---------------> Normal
 //
 // Isolated admits local-only collectives with an {self} active ranks mask.
 // Quiescing rejects new collectives while waiting for activation. Normal uses

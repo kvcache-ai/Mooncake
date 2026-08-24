@@ -14,6 +14,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <random>
 #include <string>
@@ -86,6 +87,127 @@ class MasterServiceTest : public ::testing::Test {
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
+
+    void PauseReplicaCleanup(MasterService& service) {
+        service.replica_cleanup_worker_.Stop();
+    }
+
+    void ResumeReplicaCleanup(MasterService& service) {
+        service.replica_cleanup_worker_.Start();
+        service.replica_cleanup_worker_.Schedule();
+    }
+
+    void ExpectKeyHiddenFromReadApis(MasterService& service,
+                                     const std::string& key) {
+        auto get = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get.has_value());
+        EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get.error());
+
+        auto exists = service.ExistKey(key, TenantId::Default());
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(*exists);
+
+        auto batch_exists = service.BatchExistKey({key}, TenantId::Default());
+        ASSERT_EQ(1u, batch_exists.size());
+        ASSERT_TRUE(batch_exists[0].has_value());
+        EXPECT_FALSE(*batch_exists[0]);
+
+        auto all_keys = service.GetAllKeys(TenantId::Default());
+        ASSERT_TRUE(all_keys.has_value());
+        EXPECT_EQ(all_keys->end(),
+                  std::find(all_keys->begin(), all_keys->end(), key));
+    }
+
+    std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
+        MasterService& service, const std::string& key,
+        const std::string& tenant_id = "default") {
+        const TenantId normalized_tenant =
+            service.ResolveRequestTenantId(TenantId(tenant_id));
+        const size_t shard_idx =
+            service.getMetadataShardIndex(normalized_tenant, key);
+        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
+        const auto tenant_it = shard->tenants.find(normalized_tenant);
+        if (tenant_it == shard->tenants.end()) {
+            return std::nullopt;
+        }
+        const auto metadata_it = tenant_it->second.metadata.find(key);
+        if (metadata_it == tenant_it->second.metadata.end()) {
+            return std::nullopt;
+        }
+        return metadata_it->second.GetCommittedSoftPinTimeout();
+    }
+
+    void CleanupExpiredSoftPinsAt(
+        MasterService& service,
+        const std::chrono::system_clock::time_point& now) {
+        service.CleanupExpiredSoftPins(now);
+    }
+
+    void SetSoftPinDeadlineForTest(
+        MasterService& service, const std::string& key,
+        const std::chrono::system_clock::time_point& deadline,
+        const std::string& tenant_id = "default") {
+        const TenantId normalized_tenant =
+            service.ResolveRequestTenantId(TenantId(tenant_id));
+        const size_t shard_idx =
+            service.getMetadataShardIndex(normalized_tenant, key);
+        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        auto& metadata = shard->tenants.at(normalized_tenant).metadata.at(key);
+        {
+            SpinLocker locker(&metadata.lock);
+            metadata.soft_pin_timeout = deadline;
+        }
+        service.soft_pin_deadline_index_.Upsert(
+            normalized_tenant.MakeScopedKey(key), shard_idx, deadline);
+    }
+
+    size_t SoftPinDeadlineHeapSize(MasterService& service) {
+        return service.soft_pin_deadline_index_.HeapSizeForTest();
+    }
+
+    size_t SoftPinRegistrationCount(MasterService& service) {
+        return service.soft_pin_deadline_index_.RegistrationCountForTest();
+    }
+
+    std::optional<uint32_t> GetReplicaRefcntBySegmentName(
+        MasterService& service, const std::string& key,
+        const std::string& segment_name) {
+        MasterService::MetadataAccessorRO accessor(
+            &service,
+            service.MakeObjectIdentityForRequest(key, TenantId::Default()));
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            for (const auto& name : replica.get_segment_names()) {
+                if (name.has_value() && *name == segment_name) {
+                    return replica.get_refcnt();
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    void UpsertSoftPinDeadlineIndexForTest(
+        MasterService& service, const std::string& key, size_t shard_idx,
+        const std::chrono::system_clock::time_point& deadline,
+        const std::string& tenant_id = "default") {
+        service.soft_pin_deadline_index_.Upsert(
+            TenantId(tenant_id).MakeScopedKey(key), shard_idx, deadline);
+    }
+
+    size_t PopExpiredSoftPinDeadlinesForTest(
+        MasterService& service,
+        const std::chrono::system_clock::time_point& now) {
+        return service.soft_pin_deadline_index_.PopExpired(now).size();
+    }
+
+    std::chrono::system_clock::time_point ComputeSoftPinDeadlineForTest(
+        const std::chrono::system_clock::time_point& now, uint64_t ttl_ms) {
+        return MasterService::ObjectMetadata::ComputeSoftPinDeadline(now,
+                                                                     ttl_ms);
+    }
 
     std::string WriteTenantPolicyFile(
         const std::map<std::string, uint64_t>& tenant_quotas) {
@@ -668,6 +790,83 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result3.error());
 }
 
+TEST_F(MasterServiceTest, SoftPinRequestValidation) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_soft_pin_ttl(50)
+                              .set_max_kv_soft_pin_ttl(100)
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.soft_pin_ttl_ms = 10;
+    auto preserve_with_ttl = service->PutStart(
+        client_id, "preserve_with_ttl", TenantId::Default(), 1024, config);
+    ASSERT_FALSE(preserve_with_ttl.has_value());
+    EXPECT_EQ(preserve_with_ttl.error(), ErrorCode::INVALID_PARAMS);
+
+    config.soft_pin_action = SoftPinAction::DISABLE;
+    auto disable_with_ttl = service->PutStart(
+        client_id, "disable_with_ttl", TenantId::Default(), 1024, config);
+    ASSERT_FALSE(disable_with_ttl.has_value());
+    EXPECT_EQ(disable_with_ttl.error(), ErrorCode::INVALID_PARAMS);
+
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    config.soft_pin_ttl_ms = 101;
+    auto over_limit = service->PutStart(client_id, "over_limit",
+                                        TenantId::Default(), 1024, config);
+    ASSERT_FALSE(over_limit.has_value());
+    EXPECT_EQ(over_limit.error(), ErrorCode::INVALID_PARAMS);
+
+    config.soft_pin_action = static_cast<SoftPinAction>(255);
+    config.soft_pin_ttl_ms.reset();
+    auto invalid_action = service->PutStart(client_id, "invalid_action",
+                                            TenantId::Default(), 1024, config);
+    ASSERT_FALSE(invalid_action.has_value());
+    EXPECT_EQ(invalid_action.error(), ErrorCode::INVALID_PARAMS);
+
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    config.soft_pin_ttl_ms = 0;
+    ASSERT_TRUE(
+        service
+            ->PutStart(client_id, "zero_ttl", TenantId::Default(), 1024, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "zero_ttl", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "zero_ttl").has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+}
+
+TEST_F(MasterServiceTest, SoftPinMasterConfigRejectsDefaultAboveMaximum) {
+    auto invalid_config = MasterServiceConfig::builder()
+                              .set_default_kv_soft_pin_ttl(101)
+                              .set_max_kv_soft_pin_ttl(100)
+                              .build();
+    EXPECT_THROW(MasterService service(invalid_config), std::invalid_argument);
+}
+
+TEST_F(MasterServiceTest, SoftPinDeadlineCalculationSaturatesAtMaximum) {
+    using Clock = std::chrono::system_clock;
+
+    const auto normal_now = Clock::time_point(std::chrono::seconds(10));
+    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now, 25),
+              normal_now + std::chrono::milliseconds(25));
+    EXPECT_EQ(ComputeSoftPinDeadlineForTest(
+                  normal_now, std::numeric_limits<uint64_t>::max()),
+              Clock::time_point::max());
+
+    const auto near_max =
+        Clock::time_point::max() - std::chrono::milliseconds(5);
+    EXPECT_EQ(ComputeSoftPinDeadlineForTest(near_max, 10),
+              Clock::time_point::max());
+}
+
 #ifdef USE_NOF
 TEST_F(MasterServiceTest, PutEndAllCompletesMemoryAndNoFReplicas) {
     std::unique_ptr<MasterService> service_(new MasterService());
@@ -746,6 +945,73 @@ TEST_F(MasterServiceTest, PutEndMemoryDoesNotCompleteNoFReplica) {
               ReplicaStatus::COMPLETE);
 }
 
+TEST_F(MasterServiceTest, PartialRevokePreservesPendingSoftPin) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service);
+    NoFSegment nof_segment =
+        MakeNoFSegment("soft_pin_nof", "soft_pin_nof_endpoint");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountNoFSegment(nof_segment, client_id).has_value());
+
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "partial_revoke_soft_pin",
+                               TenantId::Default(), 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutRevoke(client_id, "partial_revoke_soft_pin",
+                                TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "partial_revoke_soft_pin",
+                             TenantId::Default(), ReplicaType::NOF_SSD)
+                    .has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+    EXPECT_TRUE(
+        GetSoftPinDeadline(*service, "partial_revoke_soft_pin").has_value());
+}
+
+TEST_F(MasterServiceTest, LaterReplicaEndDoesNotRefreshSoftPin) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service);
+    NoFSegment nof_segment =
+        MakeNoFSegment("soft_pin_later_end", "soft_pin_later_end_endpoint");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountNoFSegment(nof_segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "later_end_soft_pin",
+                               TenantId::Default(), 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "later_end_soft_pin",
+                             TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    const auto first_deadline =
+        GetSoftPinDeadline(*service, "later_end_soft_pin");
+    ASSERT_TRUE(first_deadline.has_value());
+
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "later_end_soft_pin",
+                             TenantId::Default(), ReplicaType::NOF_SSD)
+                    .has_value());
+    EXPECT_EQ(GetSoftPinDeadline(*service, "later_end_soft_pin"),
+              first_deadline);
+}
+
 TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
@@ -761,6 +1027,202 @@ TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
     EXPECT_TRUE(put_start_result->front().is_memory_replica());
 }
 #endif
+
+TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
+    const auto dfs_root = (std::filesystem::temp_directory_path() /
+                           ("master_dfs_sync_" + std::to_string(::getpid())))
+                              .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        auto start = service.PutStart(context.client_id, "dfs_atomic",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start.has_value());
+        ASSERT_EQ(start->size(), 2);
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "dfs_atomic",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        auto query = service.GetReplicaList("dfs_atomic", TenantId::Default());
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query->replicas.size(), 2);
+        for (const auto& replica : query->replicas) {
+            EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
+        }
+
+        ReplicateConfig mismatched_config;
+        mismatched_config.replica_num = 1;
+        auto upsert =
+            service.UpsertStart(context.client_id, "dfs_atomic",
+                                TenantId::Default(), 4096, mismatched_config);
+        ASSERT_FALSE(upsert.has_value());
+        EXPECT_EQ(upsert.error(), ErrorCode::INVALID_PARAMS);
+
+        query = service.GetReplicaList("dfs_atomic", TenantId::Default());
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query->replicas.size(), 2);
+        for (const auto& replica : query->replicas) {
+            EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
+        }
+
+        auto revoke_start = service.PutStart(context.client_id, "dfs_revoke",
+                                             TenantId::Default(), 4096, config);
+        ASSERT_TRUE(revoke_start.has_value());
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "dfs_revoke",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+        auto revoked =
+            service.GetReplicaList("dfs_revoke", TenantId::Default());
+        ASSERT_FALSE(revoked.has_value());
+        EXPECT_EQ(revoked.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    {
+        MasterService service(MakeStrictTenantConfig({"default"}));
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig dfs_config;
+        dfs_config.replica_num = 1;
+        dfs_config.dfs_replica_num = 1;
+
+        auto failed = service.PutStart(context.client_id, "dfs_quota_failure",
+                                       TenantId::Default(),
+                                       kStrictTenantQuotaBytes, dfs_config);
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+        ReplicateConfig memory_config;
+        memory_config.replica_num = 1;
+        auto retry = service.PutStart(
+            context.client_id, "quota_after_dfs_failure", TenantId::Default(),
+            kStrictTenantQuotaBytes, memory_config);
+        ASSERT_TRUE(retry.has_value()) << toString(retry.error());
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "quota_after_dfs_failure",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
+    auto run_case = [&](const std::string& case_name,
+                        const std::vector<size_t>& leased_indexes,
+                        const std::vector<std::optional<size_t>>&
+                            expected_replica_counts,
+                        bool evict_memory_first = false) {
+        const auto dfs_root = (std::filesystem::temp_directory_path() /
+                               ("master_dfs_evict_" +
+                                std::to_string(::getpid()) + "_" + case_name))
+                                  .string();
+        std::filesystem::create_directories(dfs_root);
+        ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+        ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+        ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+        ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+        ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "32768");
+        ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+        // Keep the background path disabled so the test drives one exact
+        // transaction through the public test hook.
+        ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+        ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK",
+                                    "0.9");
+        ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK",
+                                   "0.7");
+        ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+        ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+        {
+            MasterService service;
+            const auto context = PrepareSimpleSegment(service);
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.dfs_replica_num = 1;
+
+            std::vector<std::string> keys;
+            for (int i = 0; i < 4; ++i) {
+                keys.push_back("dfs_evict_" + std::to_string(i));
+                auto start = service.PutStart(context.client_id, keys.back(),
+                                              TenantId::Default(), 100, config);
+                ASSERT_TRUE(start.has_value()) << "allocation " << i;
+                ASSERT_TRUE(service
+                                .PutEnd(context.client_id, keys.back(),
+                                        TenantId::Default(), ReplicaType::ALL)
+                                .has_value());
+            }
+
+            for (const size_t index : leased_indexes) {
+                ASSERT_LT(index, keys.size());
+                ASSERT_TRUE(
+                    service.GetReplicaList(keys[index], TenantId::Default())
+                        .has_value());
+            }
+
+            if (evict_memory_first) {
+                service.RunBatchEvictForTesting(1.0, 1.0);
+            }
+            service.RunDfsEvictionForTesting();
+
+            for (size_t i = 0; i < keys.size(); ++i) {
+                auto result =
+                    service.GetReplicaList(keys[i], TenantId::Default());
+                if (!expected_replica_counts[i].has_value()) {
+                    ASSERT_FALSE(result.has_value()) << "key=" << keys[i];
+                    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND)
+                        << "key=" << keys[i];
+                    continue;
+                }
+                ASSERT_TRUE(result.has_value());
+                EXPECT_EQ(result->replicas.size(), *expected_replica_counts[i])
+                    << "key=" << keys[i];
+            }
+
+            if (evict_memory_first) {
+                auto reclaimed =
+                    service.PutStart(context.client_id, "dfs_evict_reclaimed",
+                                     TenantId::Default(), 100, config);
+                ASSERT_TRUE(reclaimed.has_value()) << reclaimed.error();
+                ASSERT_TRUE(
+                    service
+                        .PutRevoke(context.client_id, "dfs_evict_reclaimed",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+            }
+        }
+
+        std::error_code ec;
+        std::filesystem::remove_all(dfs_root, ec);
+    };
+
+    run_case("commit", {}, {1, 1, 2, 2});
+    run_case("reject", {0, 1, 2, 3}, {2, 2, 2, 2});
+    // k1 shares the first prepared batch with k0. Rejecting k1 must not roll
+    // back k0, and the same high-watermark trigger must continue to k2 so the
+    // shard reaches its low watermark.
+    run_case("mixed", {1}, {1, 2, 1, 2});
+    // Memory eviction may leave DFS as the only remaining replica. DFS
+    // eviction must still reclaim those allocations and erase metadata for
+    // objects whose final replica was removed.
+    run_case("last_replica", {},
+             {std::nullopt, std::nullopt, size_t{1}, size_t{1}}, true);
+}
 
 TEST_F(MasterServiceTest, PutStartGroupIdsValidation) {
     std::unique_ptr<MasterService> service_(new MasterService());
@@ -879,8 +1341,11 @@ TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     metadata.size = 128;
     metadata.replicas.push_back(replica.get_descriptor());
 
-    service.RestoreFromStandbySnapshot({{tenant_a.value(), key, metadata}},
-                                       /*initial_oplog_sequence_id=*/0, {});
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({{tenant_a.value(), key, metadata}},
+                                        /*initial_oplog_sequence_id=*/0, {})
+            .has_value());
 
     EXPECT_TRUE(service.ExistKey(key, tenant_a).value_or(false));
     EXPECT_FALSE(service.ExistKey(key, tenant_b).value_or(true));
@@ -2051,6 +2516,30 @@ TEST_F(MasterServiceTest, LocalFirstPutPrefersWriterHost) {
               "segment_host1");
 }
 
+TEST_F(MasterServiceTest, PreferSameNodeUsesHostAwareLocalFirstPlacement) {
+    MasterService service;
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host1 = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.prefer_alloc_in_same_node = true;
+    config.host_id = "host1";
+
+    auto put_start = service.PutStart(writer_client_id, "prefer_same_node_key",
+                                      TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
+}
+
 TEST_F(MasterServiceTest, LocalFirstPutFallsBackToNextOrderedHost) {
     auto service_config =
         MasterServiceConfig::builder()
@@ -2188,55 +2677,6 @@ TEST_F(MasterServiceTest, ExplicitPreferredSegmentFallsBackToLocalFirst) {
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               "segment_host1");
-}
-
-TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    const UUID client_id = generate_uuid();
-
-    // Mount 5 segments, each 16MB
-    constexpr size_t kBaseAddr = 0x300000000;
-    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
-    for (int i = 0; i < 5; ++i) {
-        [[maybe_unused]] const auto context = PrepareSimpleSegment(
-            *service_, "segment_" + std::to_string(i),
-            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
-    }
-
-    // Test PutStart
-    std::string key = "test_key";
-    uint64_t value_length = 1024;
-    ReplicateConfig config;
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(1, 5);
-    int random_number = dis(gen);
-    config.replica_num = random_number;
-    auto put_start_result = service_->PutStart(
-        client_id, key, TenantId::Default(), value_length, config);
-    EXPECT_TRUE(put_start_result.has_value());
-    replica_list = put_start_result.value();
-    EXPECT_FALSE(replica_list.empty());
-    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
-    // During put, Get/Remove should fail
-    auto get_result = service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_FALSE(get_result.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
-    auto remove_result = service_->Remove(key, TenantId::Default());
-    EXPECT_FALSE(remove_result.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, remove_result.error());
-    // Test PutEnd
-    auto put_end_result = service_->PutEnd(client_id, key, TenantId::Default(),
-                                           ReplicaType::MEMORY);
-    EXPECT_TRUE(put_end_result.has_value());
-    // Verify replica list after PutEnd
-    auto get_result2 = service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_TRUE(get_result2.has_value());
-    replica_list = get_result2.value().replicas;
-    EXPECT_EQ(random_number, replica_list.size());
-    for (int i = 0; i < random_number; ++i) {
-        EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[i].status);
-    }
 }
 
 TEST_F(MasterServiceTest, GetReplicaListByRegex) {
@@ -2422,97 +2862,6 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
         // matches.
         ASSERT_TRUE(get_result.has_value());
         EXPECT_TRUE(get_result.value().empty());
-    }
-}
-
-TEST_F(MasterServiceTest, GetReplicaList) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    const UUID client_id = generate_uuid();
-    // Test getting non-existent key
-    auto get_result =
-        service_->GetReplicaList("non_existent", TenantId::Default());
-    EXPECT_FALSE(get_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
-
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-
-    std::string key = "test_key";
-    uint64_t value_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-    auto put_start_result = service_->PutStart(
-        client_id, key, TenantId::Default(), value_length, config);
-    ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, TenantId::Default(),
-                                           ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end_result.has_value());
-
-    // Test getting existing key
-    auto get_result2 = service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_TRUE(get_result2.has_value());
-    auto replica_list_local = get_result2.value().replicas;
-    EXPECT_FALSE(replica_list_local.empty());
-}
-
-TEST_F(MasterServiceTest, RemoveObject) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    std::string key = "test_key";
-    uint64_t value_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-    auto put_start_result = service_->PutStart(
-        client_id, key, TenantId::Default(), value_length, config);
-    ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, TenantId::Default(),
-                                           ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end_result.has_value());
-
-    // Test removing the object
-    auto remove_result = service_->Remove(key, TenantId::Default());
-    EXPECT_TRUE(remove_result.has_value());
-
-    // Verify object is removed
-    auto get_result = service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_FALSE(get_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
-
-    // Test removing non-existent object
-    auto remove_result2 = service_->Remove("non_existent", TenantId::Default());
-    EXPECT_FALSE(remove_result2.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result2.error());
-}
-
-TEST_F(MasterServiceTest, RandomRemoveObject) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-    int times = 10;
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(1, 1000);
-    while (times--) {
-        std::string key = "test_key" + std::to_string(dis(gen));
-        uint64_t value_length = 1024;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), value_length, config);
-        ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(
-            client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-        ASSERT_TRUE(put_end_result.has_value());
-
-        // Test removing the object
-        auto remove_result = service_->Remove(key, TenantId::Default());
-        EXPECT_TRUE(remove_result.has_value());
-
-        // Verify object is removed
-        auto get_result = service_->GetReplicaList(key, TenantId::Default());
-        EXPECT_FALSE(get_result.has_value());
-        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
     }
 }
 
@@ -3135,6 +3484,61 @@ TEST_F(MasterServiceTest, MoveEnd) {
     move_end_result = service_->MoveEnd(client_id, key, TenantId::Default());
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, move_end_result.error());
+
+    // Remount segment_2 for target-gone test.
+    const auto remounted_context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+
+    // Put another object with 1 replica on segment_1 for target-gone test.
+    std::string target_gone_key = "target_gone_key";
+    config.preferred_segment = "segment_1";
+    put_start_result = service_->PutStart(
+        client_id, target_gone_key, TenantId::Default(), slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    put_end_result = service_->PutEnd(client_id, target_gone_key,
+                                      TenantId::Default(), ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // MoveStart the object from segment_1 to segment_2, then unmount
+    // segment_2
+    move_start_result =
+        service_->MoveStart(client_id, target_gone_key, TenantId::Default(),
+                            "segment_1", "segment_2");
+    ASSERT_TRUE(move_start_result.has_value());
+
+    // Unmount segment_2 to simulate target gone
+    unmount_result = service_->UnmountSegment(remounted_context2.segment_id,
+                                              remounted_context2.client_id);
+    ASSERT_TRUE(unmount_result.has_value());
+
+    // Test Case 7: MoveEnd, should fail because the target is gone, but the
+    // source refcnt must be released before the move task is erased.
+    move_end_result =
+        service_->MoveEnd(client_id, target_gone_key, TenantId::Default());
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, move_end_result.error());
+
+    const auto source_refcnt =
+        GetReplicaRefcntBySegmentName(*service_, target_gone_key, "segment_1");
+    ASSERT_TRUE(source_refcnt.has_value());
+    EXPECT_EQ(0, source_refcnt.value());
+
+    auto upsert_start_result = service_->UpsertStart(
+        client_id, target_gone_key, TenantId::Default(), slice_length, config);
+    EXPECT_TRUE(upsert_start_result.has_value());
+
+    auto move_revoke_result =
+        service_->MoveRevoke(client_id, target_gone_key, TenantId::Default());
+    EXPECT_FALSE(move_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK,
+              move_revoke_result.error());
+
+    if (upsert_start_result.has_value()) {
+        EXPECT_TRUE(service_
+                        ->UpsertRevoke(client_id, target_gone_key,
+                                       TenantId::Default(), ReplicaType::MEMORY)
+                        .has_value());
+    }
 }
 
 TEST_F(MasterServiceTest, MoveRevoke) {
@@ -3973,7 +4377,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     }
 }
 
-TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
+TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount two segments for testing
@@ -3998,19 +4402,53 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    // Unmount segment1
+    PauseReplicaCleanup(*service_);
+
+    // Unmount segment1. The allocator becomes unavailable synchronously while
+    // physical metadata cleanup runs on the background worker.
     auto unmount_result1 = service_->UnmountSegment(segment1.id, client_id);
     ASSERT_TRUE(unmount_result1.has_value());
-    // Umount will remove all objects in the segment, include the key1
-    ASSERT_EQ(1, service_->GetKeyCount());
-    // Verify objects in segment1 is gone
+
+    // Query paths must not expose the unavailable replica while its physical
+    // metadata is still waiting for background cleanup.
+    ASSERT_EQ(2u, service_->GetKeyCount());
     auto get_result1 = service_->GetReplicaList(key1, TenantId::Default());
     ASSERT_FALSE(get_result1.has_value());
-    ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+
+    auto exists1 = service_->ExistKey(key1, TenantId::Default());
+    ASSERT_TRUE(exists1.has_value());
+    EXPECT_FALSE(*exists1);
+    auto exists2 = service_->ExistKey(key2, TenantId::Default());
+    ASSERT_TRUE(exists2.has_value());
+    EXPECT_TRUE(*exists2);
+
+    auto batch_exists =
+        service_->BatchExistKey({key1, key2}, TenantId::Default());
+    ASSERT_EQ(2u, batch_exists.size());
+    ASSERT_TRUE(batch_exists[0].has_value());
+    EXPECT_FALSE(*batch_exists[0]);
+    ASSERT_TRUE(batch_exists[1].has_value());
+    EXPECT_TRUE(*batch_exists[1]);
+
+    auto all_keys = service_->GetAllKeys(TenantId::Default());
+    ASSERT_TRUE(all_keys.has_value());
+    EXPECT_EQ(all_keys->end(),
+              std::find(all_keys->begin(), all_keys->end(), key1));
+    EXPECT_NE(all_keys->end(),
+              std::find(all_keys->begin(), all_keys->end(), key2));
 
     // Verify objects in segment2 is still there
     auto get_result2 = service_->GetReplicaList(key2, TenantId::Default());
     ASSERT_TRUE(get_result2.has_value());
+
+    // The worker eventually removes the old physical metadata, after which
+    // the same key can be inserted again.
+    ResumeReplicaCleanup(*service_);
+    for (size_t i = 0; i < 100 && service_->GetKeyCount() != 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(1u, service_->GetKeyCount());
 
     // Verify put key1 will put into segment2 rather than segment1
     auto put_start_result = service_->PutStart(
@@ -4027,6 +4465,79 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               segment2.name);
+    EXPECT_EQ(2u, service_->GetKeyCount());
+}
+
+TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
+    auto config = MasterServiceConfig::builder().set_enable_ha(true).build();
+    auto service = std::make_unique<MasterService>(config);
+
+    auto segment = MakeSegment("ha_sync_segment");
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    const auto key = GenerateKeyForSegment(client_id, service, segment.name);
+    auto exists = service->ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    ASSERT_TRUE(exists.value());
+
+    ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
+    EXPECT_EQ(0u, service->GetKeyCount());
+}
+
+TEST_F(MasterServiceTest, CopyInProgressDoesNotKeepUnmountedSourceVisible) {
+    auto service = std::make_unique<MasterService>();
+    const auto source =
+        PrepareSimpleSegment(*service, "copy_source", kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "copy_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "copy_source";
+    PutCompletedObject(*service, client_id, "copy_key", config);
+    ASSERT_TRUE(service
+                    ->CopyStart(client_id, "copy_key", TenantId::Default(),
+                                "copy_source", {"copy_target"})
+                    .has_value());
+
+    PauseReplicaCleanup(*service);
+    ASSERT_TRUE(service->UnmountSegment(source.segment_id, source.client_id)
+                    .has_value());
+
+    ExpectKeyHiddenFromReadApis(*service, "copy_key");
+
+    ASSERT_TRUE(service->CopyRevoke(client_id, "copy_key", TenantId::Default())
+                    .has_value());
+    ResumeReplicaCleanup(*service);
+}
+
+TEST_F(MasterServiceTest, MoveInProgressDoesNotKeepUnmountedSourceVisible) {
+    auto service = std::make_unique<MasterService>();
+    const auto source =
+        PrepareSimpleSegment(*service, "move_source", kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "move_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "move_source";
+    PutCompletedObject(*service, client_id, "move_key", config);
+    ASSERT_TRUE(service
+                    ->MoveStart(client_id, "move_key", TenantId::Default(),
+                                "move_source", "move_target")
+                    .has_value());
+
+    PauseReplicaCleanup(*service);
+    ASSERT_TRUE(service->UnmountSegment(source.segment_id, source.client_id)
+                    .has_value());
+
+    ExpectKeyHiddenFromReadApis(*service, "move_key");
+
+    ASSERT_TRUE(service->MoveRevoke(client_id, "move_key", TenantId::Default())
+                    .has_value());
+    ResumeReplicaCleanup(*service);
 }
 
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
@@ -4083,6 +4594,10 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     auto get_after_unmount = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(get_after_unmount.has_value())
         << "Object should remain accessible with surviving replica";
+    ASSERT_EQ(1u, get_after_unmount->replicas.size());
+    EXPECT_EQ(segment2.name, get_after_unmount->replicas[0]
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.transport_endpoint_);
 }
 
 TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
@@ -4429,7 +4944,7 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
-    config.with_soft_pin = true;
+    config.soft_pin_action = SoftPinAction::ENABLE;
 
     // Verify soft pin does not block remove
     ASSERT_TRUE(service_
@@ -4440,7 +4955,9 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
         service_
             ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
             .has_value());
+    EXPECT_EQ(SoftPinRegistrationCount(*service_), 1u);
     EXPECT_TRUE(service_->Remove(key, TenantId::Default()).has_value());
+    EXPECT_EQ(SoftPinRegistrationCount(*service_), 0u);
 
     // Verify soft pin does not block RemoveAll
     ASSERT_TRUE(service_
@@ -4451,7 +4968,322 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
         service_
             ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
             .has_value());
+    EXPECT_EQ(SoftPinRegistrationCount(*service_), 1u);
     EXPECT_EQ(1, service_->RemoveAll());
+    EXPECT_EQ(SoftPinRegistrationCount(*service_), 0u);
+}
+
+TEST_F(MasterServiceTest, SoftPinActionsCommitOnFirstReadableUpsert) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_soft_pin_ttl(10000)
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+
+    ReplicateConfig enable;
+    enable.soft_pin_action = SoftPinAction::ENABLE;
+    enable.soft_pin_ttl_ms = 5000;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "action_key", TenantId::Default(),
+                               1024, enable)
+                    .has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+    const auto before_first_completion = std::chrono::system_clock::now();
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "action_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    const auto initial_deadline = GetSoftPinDeadline(*service, "action_key");
+    ASSERT_TRUE(initial_deadline.has_value());
+    EXPECT_GT(*initial_deadline,
+              before_first_completion + std::chrono::seconds(4));
+    EXPECT_LT(*initial_deadline,
+              before_first_completion + std::chrono::seconds(9));
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+
+    ReplicateConfig preserve;
+    ASSERT_TRUE(service
+                    ->UpsertStart(client_id, "action_key", TenantId::Default(),
+                                  1024, preserve)
+                    .has_value());
+    EXPECT_EQ(GetSoftPinDeadline(*service, "action_key"), initial_deadline);
+    ASSERT_TRUE(service
+                    ->UpsertEnd(client_id, "action_key", TenantId::Default(),
+                                ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(GetSoftPinDeadline(*service, "action_key"), initial_deadline);
+
+    ReplicateConfig disable;
+    disable.soft_pin_action = SoftPinAction::DISABLE;
+    ASSERT_TRUE(service
+                    ->UpsertStart(client_id, "action_key", TenantId::Default(),
+                                  2048, disable)
+                    .has_value());
+    EXPECT_TRUE(GetSoftPinDeadline(*service, "action_key").has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+    ASSERT_TRUE(service
+                    ->UpsertEnd(client_id, "action_key", TenantId::Default(),
+                                ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "action_key").has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+
+    ReplicateConfig enable_again;
+    enable_again.soft_pin_action = SoftPinAction::ENABLE;
+    enable_again.soft_pin_ttl_ms = 3000;
+    ASSERT_TRUE(service
+                    ->UpsertStart(client_id, "action_key", TenantId::Default(),
+                                  2048, enable_again)
+                    .has_value());
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "action_key").has_value());
+    const auto before_enable_again = std::chrono::system_clock::now();
+    ASSERT_TRUE(service
+                    ->UpsertEnd(client_id, "action_key", TenantId::Default(),
+                                ReplicaType::MEMORY)
+                    .has_value());
+    const auto enabled_again_deadline =
+        GetSoftPinDeadline(*service, "action_key");
+    ASSERT_TRUE(enabled_again_deadline.has_value());
+    EXPECT_GT(*enabled_again_deadline,
+              before_enable_again + std::chrono::seconds(2));
+    EXPECT_LT(*enabled_again_deadline,
+              before_enable_again + std::chrono::seconds(5));
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+}
+
+TEST_F(MasterServiceTest, SoftPinDeadlineIndexExpiresOnlyDueEntries) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+
+    ReplicateConfig config;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    PutCompletedObject(*service, client_id, "deadline_key", config);
+
+    ReplicateConfig grouped_config = config;
+    grouped_config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard("grouped_deadline_key")};
+    PutCompletedObject(*service, client_id, "grouped_deadline_key",
+                       grouped_config);
+
+    const auto first_deadline =
+        std::chrono::system_clock::now() + std::chrono::hours(1);
+    const auto second_deadline = first_deadline + std::chrono::seconds(1);
+    SetSoftPinDeadlineForTest(*service, "deadline_key", first_deadline);
+    SetSoftPinDeadlineForTest(*service, "grouped_deadline_key",
+                              second_deadline);
+
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 2u);
+    CleanupExpiredSoftPinsAt(*service, first_deadline);
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "deadline_key").has_value());
+    EXPECT_EQ(GetSoftPinDeadline(*service, "grouped_deadline_key"),
+              second_deadline);
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 1u);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+
+    CleanupExpiredSoftPinsAt(*service, second_deadline);
+    EXPECT_FALSE(
+        GetSoftPinDeadline(*service, "grouped_deadline_key").has_value());
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 0u);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+}
+
+TEST_F(MasterServiceTest, SoftPinTtlUpdateInvalidatesOldHeapEntry) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_soft_pin_ttl(5000)
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+
+    ReplicateConfig enable;
+    enable.soft_pin_action = SoftPinAction::ENABLE;
+    PutCompletedObject(*service, client_id, "ttl_update_key", enable);
+    const auto first_deadline = GetSoftPinDeadline(*service, "ttl_update_key");
+    ASSERT_TRUE(first_deadline.has_value());
+
+    enable.soft_pin_ttl_ms = 20000;
+    ASSERT_TRUE(service
+                    ->UpsertStart(client_id, "ttl_update_key",
+                                  TenantId::Default(), 1024, enable)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->UpsertEnd(client_id, "ttl_update_key",
+                                TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    const auto updated_deadline =
+        GetSoftPinDeadline(*service, "ttl_update_key");
+    ASSERT_TRUE(updated_deadline.has_value());
+    EXPECT_GT(*updated_deadline, *first_deadline);
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 1u);
+    EXPECT_GE(SoftPinDeadlineHeapSize(*service), 2u);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+
+    CleanupExpiredSoftPinsAt(*service, *first_deadline);
+    EXPECT_EQ(GetSoftPinDeadline(*service, "ttl_update_key"), updated_deadline);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+
+    CleanupExpiredSoftPinsAt(*service, *updated_deadline);
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "ttl_update_key").has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+}
+
+TEST_F(MasterServiceTest,
+       SizeChangingUpsertIndexesInheritedDeadlineBeforeCompletion) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+
+    ReplicateConfig enable;
+    enable.soft_pin_action = SoftPinAction::ENABLE;
+    PutCompletedObject(*service, client_id, "resize_pending", enable);
+    const auto inherited_deadline =
+        std::chrono::system_clock::now() + std::chrono::hours(1);
+    SetSoftPinDeadlineForTest(*service, "resize_pending", inherited_deadline);
+
+    ReplicateConfig preserve;
+    ASSERT_TRUE(service
+                    ->UpsertStart(client_id, "resize_pending",
+                                  TenantId::Default(), 2048, preserve)
+                    .has_value());
+    EXPECT_EQ(GetSoftPinDeadline(*service, "resize_pending"),
+              inherited_deadline);
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 1u);
+
+    CleanupExpiredSoftPinsAt(*service, inherited_deadline);
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "resize_pending").has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+
+    ASSERT_TRUE(service
+                    ->UpsertEnd(client_id, "resize_pending",
+                                TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "resize_pending").has_value());
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 0u);
+}
+
+TEST_F(MasterServiceTest, SoftPinDeadlineHeapCompactsRepeatedUpdates) {
+    MasterService service;
+    const auto base = std::chrono::system_clock::now();
+    constexpr size_t kUpdates = 5000;
+    for (size_t i = 0; i < kUpdates; ++i) {
+        UpsertSoftPinDeadlineIndexForTest(
+            service, "compaction_key", 0,
+            base + std::chrono::milliseconds(i + 1));
+    }
+
+    EXPECT_EQ(SoftPinRegistrationCount(service), 1u);
+    EXPECT_LE(SoftPinDeadlineHeapSize(service), 4096u);
+    EXPECT_EQ(PopExpiredSoftPinDeadlinesForTest(
+                  service, base + std::chrono::milliseconds(kUpdates - 1)),
+              0u);
+    EXPECT_EQ(SoftPinRegistrationCount(service), 1u);
+    EXPECT_EQ(PopExpiredSoftPinDeadlinesForTest(
+                  service, base + std::chrono::milliseconds(kUpdates)),
+              1u);
+}
+
+TEST_F(MasterServiceTest,
+       ExpiredSoftPinIsNotCarriedAcrossUpsertMetadataReplacement) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+
+    ReplicateConfig enable;
+    enable.soft_pin_action = SoftPinAction::ENABLE;
+    enable.soft_pin_ttl_ms = 10000;
+    ReplicateConfig preserve;
+
+    ASSERT_TRUE(
+        service
+            ->PutStart(client_a, "preempted", TenantId::Default(), 1024, enable)
+            .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_a, "preempted", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    SetSoftPinDeadlineForTest(
+        *service, "preempted",
+        std::chrono::system_clock::now() - std::chrono::seconds(1));
+    ASSERT_TRUE(service
+                    ->UpsertStart(client_a, "preempted", TenantId::Default(),
+                                  1024, preserve)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->UpsertStart(client_b, "preempted", TenantId::Default(),
+                                  1024, preserve)
+                    .has_value());
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "preempted").has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+
+    ASSERT_TRUE(
+        service
+            ->PutStart(client_a, "resized", TenantId::Default(), 1024, enable)
+            .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_a, "resized", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    SetSoftPinDeadlineForTest(
+        *service, "resized",
+        std::chrono::system_clock::now() - std::chrono::seconds(1));
+    ASSERT_TRUE(service
+                    ->UpsertStart(client_a, "resized", TenantId::Default(),
+                                  2048, preserve)
+                    .has_value());
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "resized").has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+}
+
+TEST_F(MasterServiceTest, RepeatedPutEndDoesNotRefreshSoftPin) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    config.soft_pin_ttl_ms = 5000;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "repeat_end", TenantId::Default(),
+                               1024, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "repeat_end", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    const auto first_deadline = GetSoftPinDeadline(*service, "repeat_end");
+    ASSERT_TRUE(first_deadline.has_value());
+
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "repeat_end", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(GetSoftPinDeadline(*service, "repeat_end"), first_deadline);
 }
 
 TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
@@ -4485,7 +5317,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
             uint64_t slice_length = value_size;
             ReplicateConfig soft_pin_config;
             soft_pin_config.replica_num = 1;
-            soft_pin_config.with_soft_pin = true;
+            soft_pin_config.soft_pin_action = SoftPinAction::ENABLE;
 
             ASSERT_TRUE(service_
                             ->PutStart(client_id, pin_key, TenantId::Default(),
@@ -4562,7 +5394,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
         uint64_t slice_length = value_size;
         ReplicateConfig config;
         config.replica_num = 1;
-        config.with_soft_pin = true;
+        config.soft_pin_action = SoftPinAction::ENABLE;
         if (service_
                 ->PutStart(client_id, key, TenantId::Default(), slice_length,
                            config)
@@ -4582,98 +5414,51 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
     service_->RemoveAll();
 }
 
-TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
+TEST_F(MasterServiceTest, SoftPinExpiresAndGetDoesNotReactivate) {
     const uint64_t kv_lease_ttl = 200;
-    // The soft pin ttl shall not be too large, otherwise the test will take too
-    // long
-    const uint64_t kv_soft_pin_ttl = 1000;
-    static_assert(
-        kv_soft_pin_ttl > kv_lease_ttl,
-        "kv_soft_pin_ttl must be larger than kv_lease_ttl in this test");
-    const double eviction_ratio = 0.5;
-    const bool allow_evict_soft_pinned_objects = true;
+    const uint64_t kv_soft_pin_ttl = 20;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(
-                                  allow_evict_soft_pinned_objects)
-                              .set_eviction_ratio(eviction_ratio)
                               .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
-    // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
     constexpr size_t segment_size = 1024 * 1024 * 16;
-    constexpr size_t value_size = 1024 * 1024;
+    constexpr size_t value_size = 1024;
     [[maybe_unused]] const auto context =
         PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
 
-    // The eviction has random factors, so test 3 times
-    for (int test_i = 0; test_i < 3; test_i++) {
-        // Put pin_key first
-        for (int i = 0; i < 2; i++) {
-            std::string pin_key = "pin_key" + std::to_string(i);
-            uint64_t slice_length = value_size;
-            ReplicateConfig soft_pin_config;
-            soft_pin_config.replica_num = 1;
-            soft_pin_config.with_soft_pin = true;
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    ReplicateConfig config;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, "pin_key", TenantId::Default(),
+                               value_size, config)
+                    .has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, "pin_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
 
-            ASSERT_TRUE(service_->PutStart(client_id, pin_key,
-                                           TenantId::Default(), slice_length,
-                                           soft_pin_config));
-            ASSERT_TRUE(service_
-                            ->PutEnd(client_id, pin_key, TenantId::Default(),
-                                     ReplicaType::MEMORY)
-                            .has_value());
-        }
+    const auto deadline = GetSoftPinDeadline(*service_, "pin_key");
+    ASSERT_TRUE(deadline.has_value());
+    CleanupExpiredSoftPinsAt(*service_, *deadline);
+    ASSERT_TRUE(
+        service_->GetReplicaList("pin_key", TenantId::Default()).has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
 
-        // Wait for the soft pin to expire
-        std::this_thread::sleep_for(std::chrono::milliseconds(kv_soft_pin_ttl));
-
-        // Get the pin_key to extend the soft pin
-        for (int i = 0; i < 2; i++) {
-            std::string pin_key = "pin_key" + std::to_string(i);
-            ASSERT_TRUE(service_->GetReplicaList(pin_key, TenantId::Default())
-                            .has_value());
-        }
-
-        // Fill the segment to trigger eviction
-        int failed_puts = 0;
-        for (int i = 0; i < 16; i++) {
-            std::string key = "key" + std::to_string(i);
-            uint64_t slice_length = value_size;
-            ReplicateConfig config;
-            config.replica_num = 1;
-            if (service_
-                    ->PutStart(client_id, key, TenantId::Default(),
-                               slice_length, config)
-                    .has_value()) {
-                ASSERT_TRUE(service_
-                                ->PutEnd(client_id, key, TenantId::Default(),
-                                         ReplicaType::MEMORY)
-                                .has_value());
-            } else {
-                failed_puts++;
-            }
-        }
-        ASSERT_GT(failed_puts, 0);
-
-        // wait for eviction
-        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-
-        // pin_key should still be accessible
-        for (int i = 0; i < 2; i++) {
-            std::string pin_key = "pin_key" + std::to_string(i);
-            ASSERT_TRUE(service_->GetReplicaList(pin_key, TenantId::Default())
-                            .has_value());
-        }
-
-        // wait for the lease to expire
-        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-        // remove all objects before the next turn
-        service_->RemoveAll();
-    }
+    ASSERT_TRUE(service_->ExistKey("pin_key", TenantId::Default()).value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+    service_->RemoveAll();
 }
 
 TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
@@ -4706,7 +5491,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
         uint64_t slice_length = value_size;
         ReplicateConfig config;
         config.replica_num = 1;
-        config.with_soft_pin = true;
+        config.soft_pin_action = SoftPinAction::ENABLE;
         if (service_
                 ->PutStart(client_id, key, TenantId::Default(), slice_length,
                            config)
@@ -5668,7 +6453,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearSpecificSegment) {
     ASSERT_TRUE(put_end_result.has_value());
 
     // 4. Wait for lease to expire and verify it's actually expired
-    // PutEnd calls GrantLease(0, ...) which sets lease_timeout to now.
+    // PutEnd grants a zero-duration read lease, setting lease_timeout to now.
     // Due to clock precision and timing, we need to ensure the lease is
     // actually expired before calling BatchReplicaClear.
     // Use a small delay and then poll to ensure lease is expired.
@@ -6809,41 +7594,6 @@ TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
 }
 // ===================== Upsert Tests =====================
 
-TEST_F(MasterServiceTest, UpsertNewKey) {
-    // Case A: key does not exist — behaves like PutStart
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    std::string key = "upsert_new_key";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    auto upsert_result = service_->UpsertStart(
-        client_id, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(upsert_result.has_value());
-    auto replicas = upsert_result.value();
-    EXPECT_EQ(1, replicas.size());
-    EXPECT_EQ(ReplicaStatus::PROCESSING, replicas[0].status);
-
-    // During upsert, GetReplicaList should return not ready
-    auto get_result = service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_FALSE(get_result.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
-
-    // UpsertEnd completes the operation
-    auto end_result = service_->UpsertEnd(client_id, key, TenantId::Default(),
-                                          ReplicaType::MEMORY);
-    ASSERT_TRUE(end_result.has_value());
-
-    // Verify replica is COMPLETE
-    auto final_result = service_->GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(final_result.has_value());
-    EXPECT_EQ(1, final_result.value().replicas.size());
-    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
-}
-
 TEST_F(MasterServiceTest, UpsertSameSize) {
     // Case B: key exists with same size — in-place update
     std::unique_ptr<MasterService> service_(new MasterService());
@@ -6890,43 +7640,6 @@ TEST_F(MasterServiceTest, UpsertSameSize) {
     auto final_result = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(final_result.has_value());
     EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
-}
-
-TEST_F(MasterServiceTest, UpsertSameSizeRefreshesMetadata) {
-    // Case B: verify client_id and put_start_time are refreshed
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id_a = generate_uuid();
-    const UUID client_id_b = generate_uuid();
-
-    std::string key = "upsert_refresh_metadata";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // Create object with client_a
-    auto put_result = service_->PutStart(client_id_a, key, TenantId::Default(),
-                                         slice_length, config);
-    ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id_a, key, TenantId::Default(),
-                                    ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end.has_value());
-
-    // UpsertStart with client_b
-    auto upsert_result = service_->UpsertStart(
-        client_id_b, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(upsert_result.has_value());
-
-    // UpsertEnd with client_a should fail (client_id was refreshed to client_b)
-    auto end_fail = service_->UpsertEnd(client_id_a, key, TenantId::Default(),
-                                        ReplicaType::MEMORY);
-    EXPECT_FALSE(end_fail.has_value());
-    EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, end_fail.error());
-
-    // UpsertEnd with client_b should succeed
-    auto end_ok = service_->UpsertEnd(client_id_b, key, TenantId::Default(),
-                                      ReplicaType::MEMORY);
-    ASSERT_TRUE(end_ok.has_value());
 }
 
 TEST_F(MasterServiceTest, UpsertDifferentSize) {
@@ -7017,111 +7730,6 @@ TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
     EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, upsert_result.error());
 }
 
-TEST_F(MasterServiceTest, UpsertPreemptsInProgressPut) {
-    // Upsert should preempt an in-progress Put (no discard timeout needed
-    // for preemption via Upsert — Upsert always preempts immediately)
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_a = generate_uuid();
-    const UUID client_b = generate_uuid();
-
-    std::string key = "upsert_preempt";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // Client A starts a Put but doesn't finish
-    auto put_result = service_->PutStart(client_a, key, TenantId::Default(),
-                                         slice_length, config);
-    ASSERT_TRUE(put_result.has_value());
-
-    // Client B upserts the same key — should preempt client A
-    auto upsert_result = service_->UpsertStart(
-        client_b, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(upsert_result.has_value());
-    auto upsert_replicas = upsert_result.value();
-    EXPECT_EQ(1, upsert_replicas.size());
-    EXPECT_EQ(ReplicaStatus::PROCESSING, upsert_replicas[0].status);
-
-    // Client A's PutEnd should fail
-    auto put_end_a = service_->PutEnd(client_a, key, TenantId::Default(),
-                                      ReplicaType::MEMORY);
-    EXPECT_FALSE(put_end_a.has_value());
-
-    // Client B's UpsertEnd should succeed
-    auto upsert_end = service_->UpsertEnd(client_b, key, TenantId::Default(),
-                                          ReplicaType::MEMORY);
-    ASSERT_TRUE(upsert_end.has_value());
-
-    // Verify final state
-    auto final_result = service_->GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(final_result.has_value());
-    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
-}
-
-TEST_F(MasterServiceTest, UpsertRevoke) {
-    // UpsertRevoke should clean up like PutRevoke
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    std::string key = "upsert_revoke";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // UpsertStart (Case A — new key)
-    auto upsert_result = service_->UpsertStart(
-        client_id, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(upsert_result.has_value());
-
-    // UpsertRevoke
-    auto revoke_result = service_->UpsertRevoke(
-        client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-    ASSERT_TRUE(revoke_result.has_value());
-
-    // Key should be gone
-    auto exist_result = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exist_result.has_value());
-    EXPECT_FALSE(exist_result.value());
-}
-
-TEST_F(MasterServiceTest, UpsertInPlaceThenRevoke) {
-    // UpsertRevoke after in-place UpsertStart should clean up
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    std::string key = "upsert_inplace_revoke";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // Create object first
-    auto put_result = service_->PutStart(client_id, key, TenantId::Default(),
-                                         slice_length, config);
-    ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id, key, TenantId::Default(),
-                                    ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end.has_value());
-
-    // UpsertStart in-place (same size)
-    const UUID new_client = generate_uuid();
-    auto upsert_result = service_->UpsertStart(
-        new_client, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(upsert_result.has_value());
-
-    // UpsertRevoke — replicas are PROCESSING, should be erased
-    auto revoke_result = service_->UpsertRevoke(
-        new_client, key, TenantId::Default(), ReplicaType::MEMORY);
-    ASSERT_TRUE(revoke_result.has_value());
-
-    // Key should be gone (no valid replicas left)
-    auto exist_result = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exist_result.has_value());
-    EXPECT_FALSE(exist_result.value());
-}
-
 TEST_F(MasterServiceTest, BatchUpsertStart) {
     // Test batch upsert with a mix of new and existing keys
     std::unique_ptr<MasterService> service_(new MasterService());
@@ -7155,107 +7763,6 @@ TEST_F(MasterServiceTest, BatchUpsertStart) {
     ASSERT_EQ(2, end_results.size());
     EXPECT_TRUE(end_results[0].has_value());
     EXPECT_TRUE(end_results[1].has_value());
-}
-
-TEST_F(MasterServiceTest, UpsertPreemptsInProgressUpsert) {
-    // Upsert should preempt an in-progress Upsert (Case B in-place).
-    // After preemption, all replicas were PROCESSING (no COMPLETE survives),
-    // so metadata is erased and the new upsert falls through to Case A.
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_a = generate_uuid();
-    const UUID client_b = generate_uuid();
-    const UUID client_c = generate_uuid();
-
-    std::string key = "upsert_preempt_upsert";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // Step 1: Create the object via Put
-    auto put_result = service_->PutStart(client_a, key, TenantId::Default(),
-                                         slice_length, config);
-    ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_a, key, TenantId::Default(),
-                                    ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end.has_value());
-
-    // Step 2: Client B starts in-place upsert (Case B) — marks COMPLETE →
-    // PROCESSING
-    auto upsert_b = service_->UpsertStart(client_b, key, TenantId::Default(),
-                                          slice_length, config);
-    ASSERT_TRUE(upsert_b.has_value());
-
-    // Key should be unreadable now (all replicas are PROCESSING)
-    auto get_mid = service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_FALSE(get_mid.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_mid.error());
-
-    // Step 3: Client C upserts the same key — preempts Client B
-    auto upsert_c = service_->UpsertStart(client_c, key, TenantId::Default(),
-                                          slice_length, config);
-    ASSERT_TRUE(upsert_c.has_value());
-    EXPECT_EQ(1, upsert_c.value().size());
-
-    // Step 4: Client B's UpsertEnd should fail (preempted)
-    auto end_b = service_->UpsertEnd(client_b, key, TenantId::Default(),
-                                     ReplicaType::MEMORY);
-    EXPECT_FALSE(end_b.has_value());
-
-    // Step 5: Client C's UpsertEnd should succeed
-    auto end_c = service_->UpsertEnd(client_c, key, TenantId::Default(),
-                                     ReplicaType::MEMORY);
-    ASSERT_TRUE(end_c.has_value());
-
-    // Final verification
-    auto final_result = service_->GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(final_result.has_value());
-    EXPECT_EQ(1, final_result.value().replicas.size());
-    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
-}
-
-TEST_F(MasterServiceTest, UpsertDifferentSizeThenRevoke) {
-    // Case C (different size) followed by UpsertRevoke.
-    // Old replicas go to discarded_replicas_, new replicas are erased by
-    // revoke. The key should disappear entirely.
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    std::string key = "upsert_diff_revoke";
-    uint64_t original_size = 1024;
-    uint64_t new_size = 2048;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // Create object with original size
-    auto put_result = service_->PutStart(client_id, key, TenantId::Default(),
-                                         original_size, config);
-    ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id, key, TenantId::Default(),
-                                    ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end.has_value());
-
-    // Verify the key exists
-    auto exist_before = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exist_before.has_value());
-    EXPECT_TRUE(exist_before.value());
-
-    // UpsertStart with different size (Case C) — old replicas discarded,
-    // new replicas allocated
-    auto upsert_result = service_->UpsertStart(
-        client_id, key, TenantId::Default(), new_size, config);
-    ASSERT_TRUE(upsert_result.has_value());
-
-    // Revoke — erase the newly allocated PROCESSING replicas
-    auto revoke_result = service_->UpsertRevoke(
-        client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-    ASSERT_TRUE(revoke_result.has_value());
-
-    // Key should be gone (old replicas in discarded, new replicas erased)
-    auto exist_after = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exist_after.has_value());
-    EXPECT_FALSE(exist_after.value());
 }
 
 // ===================== Hard Pin Tests =====================
@@ -7364,7 +7871,7 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
     {
         ReplicateConfig config;
         config.replica_num = 1;
-        config.with_soft_pin = true;
+        config.soft_pin_action = SoftPinAction::ENABLE;
         ASSERT_TRUE(service_
                         ->PutStart(client_id, "soft_pinned",
                                    TenantId::Default(), value_size, config)

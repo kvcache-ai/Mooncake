@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
 
@@ -522,10 +524,11 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
-        // Try PutEnd the discarded replica.
+        // PutEnd must reject a replica discarded after the write expired.
         put_end_result =
             service_->PutEnd(client_id, key, TenantId::Default(), discard_type);
-        EXPECT_TRUE(put_end_result.has_value());
+        ASSERT_FALSE(put_end_result.has_value());
+        EXPECT_EQ(put_end_result.error(), ErrorCode::INVALID_WRITE);
 
         // Check that the key has only one replica.
         auto get_result = service_->GetReplicaList(key, TenantId::Default());
@@ -936,6 +939,248 @@ TEST_F(MasterServiceSSDTest,
         << "%\n"
         << "  A→C  total overhead vs origin:" << (ratio_c_a - 1.0) * 100.0
         << "%\n\n";
+}
+
+// A LOCAL_DISK segment used to leave the master only when its client expired,
+// so a store that was shutting down stayed advertised as the owner of its
+// offloaded keys for up to one client_ttl and readers were handed a peer that
+// could no longer serve. These cover the operation that lets it deregister
+// itself instead.
+
+TEST_F(MasterServiceSSDTest, UnmountLocalDiskSegmentRequiresOffloadEnabled) {
+    auto service = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+
+    auto result = service->UnmountLocalDiskSegment(generate_uuid());
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::UNABLE_OFFLOAD, result.error());
+}
+
+TEST_F(MasterServiceSSDTest, UnmountLocalDiskSegmentIsIdempotent) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "ssd_unmount_idem_segment",
+                            0xd00000000);
+
+    ASSERT_TRUE(service->UnmountLocalDiskSegment(client_id).has_value());
+    // A repeat finds nothing to do and still succeeds, the way
+    // MountLocalDiskSegment reports an already-mounted segment as success.
+    EXPECT_TRUE(service->UnmountLocalDiskSegment(client_id).has_value());
+    // So does a client that never mounted one.
+    EXPECT_TRUE(service->UnmountLocalDiskSegment(generate_uuid()).has_value());
+}
+
+TEST_F(MasterServiceSSDTest, UnmountLocalDiskSegmentStopsOffloadWork) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "ssd_unmount_hb_segment",
+                            0xe00000000);
+    ASSERT_TRUE(service->OffloadObjectHeartbeat(client_id, true).has_value());
+
+    ASSERT_TRUE(service->UnmountLocalDiskSegment(client_id).has_value());
+
+    // The master hands this client no further offload work. The client reads
+    // this as its cue to re-mount, which is why a draining store must latch
+    // offloading off before calling.
+    auto heartbeat = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_FALSE(heartbeat.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat.error());
+}
+
+TEST_F(MasterServiceSSDTest, UnmountLocalDiskSegmentDropsOnlyItsOwnReplicas) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID leaving = generate_uuid();
+    UUID staying = generate_uuid();
+    const std::string leaving_segment = "ssd_unmount_leaving_segment";
+    const std::string staying_segment = "ssd_unmount_staying_segment";
+    MountMemoryAndLocalDisk(*service, leaving, leaving_segment, 0xf00000000);
+    MountMemoryAndLocalDisk(*service, staying, staying_segment, 0x1000000000);
+
+    PutAndOffload(*service, leaving, "ssd_unmount_leaving_key", 1024,
+                  leaving_segment);
+    PutAndOffload(*service, staying, "ssd_unmount_staying_key", 1024,
+                  staying_segment);
+
+    // Neither client has remounted, so neither is in the master's alive set.
+    // That is the case that catches a deregistration which sweeps by liveness
+    // instead of by owner: it would take the staying store's disk replicas with
+    // it.
+    ASSERT_TRUE(service->UnmountLocalDiskSegment(leaving).has_value());
+
+    // The departing store is no longer advertised for its own key, while the
+    // memory replica of that key is untouched.
+    auto leaving_replicas =
+        service->GetReplicaList("ssd_unmount_leaving_key", TenantId::Default());
+    ASSERT_TRUE(leaving_replicas.has_value());
+    ASSERT_EQ(1u, leaving_replicas.value().replicas.size());
+    EXPECT_TRUE(leaving_replicas.value().replicas[0].is_memory_replica());
+
+    // The other store keeps both of its replicas.
+    auto staying_replicas =
+        service->GetReplicaList("ssd_unmount_staying_key", TenantId::Default());
+    ASSERT_TRUE(staying_replicas.has_value());
+    EXPECT_EQ(2u, staying_replicas.value().replicas.size());
+    bool staying_has_disk = false;
+    for (const auto& replica : staying_replicas.value().replicas) {
+        staying_has_disk |= replica.is_local_disk_replica();
+    }
+    EXPECT_TRUE(staying_has_disk);
+}
+
+TEST_F(MasterServiceSSDTest, UnmountLocalDiskSegmentKeepsReAdoptionWorking) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client_id = generate_uuid();
+    const std::string segment = "ssd_unmount_readopt_segment";
+    MountMemoryAndLocalDisk(*service, client_id, segment, 0x1100000000);
+
+    // A key whose only replica is that disk, which is what a store's own files
+    // look like to the master after it re-registers them.
+    StorageObjectMetadata metadata;
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = segment;
+    OffloadTaskItem task{.tenant_id = TenantId::Default().value(),
+                         .key = "ssd_unmount_disk_only_key",
+                         .size = 1024};
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {task}, {metadata})
+                    .has_value());
+    ASSERT_TRUE(
+        service
+            ->GetReplicaList("ssd_unmount_disk_only_key", TenantId::Default())
+            .has_value());
+
+    ASSERT_TRUE(service->UnmountLocalDiskSegment(client_id).has_value());
+
+    // Erased, the same as on client expiry: the disk held its last replica. A
+    // read gets a clean miss rather than a dead peer.
+    EXPECT_FALSE(
+        service
+            ->GetReplicaList("ssd_unmount_disk_only_key", TenantId::Default())
+            .has_value());
+
+    // A store that comes back re-adopts its files, so deregistering costs a
+    // restart nothing.
+    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {task}, {metadata})
+                    .has_value());
+    auto restored = service->GetReplicaList("ssd_unmount_disk_only_key",
+                                            TenantId::Default());
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_EQ(1u, restored.value().replicas.size());
+    EXPECT_TRUE(restored.value().replicas[0].is_local_disk_replica());
+}
+
+TEST_F(MasterServiceSSDTest, NotifyOffloadSuccessAfterUnmountIsRefused) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client_id = generate_uuid();
+    const std::string segment = "ssd_gate_segment";
+    MountMemoryAndLocalDisk(*service, client_id, segment, 0x1200000000);
+    PutAndOffload(*service, client_id, "ssd_gate_key", 1024, segment);
+
+    ASSERT_TRUE(service->UnmountLocalDiskSegment(client_id).has_value());
+
+    // A registration that arrives after the deregistration -- an in-flight
+    // rescan batch, or an offload completion racing the drain -- is refused,
+    // so it cannot land after the sweep and leave the master advertising a
+    // departed owner.
+    StorageObjectMetadata metadata;
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = segment;
+    OffloadTaskItem swept_task{.tenant_id = TenantId::Default().value(),
+                               .key = "ssd_gate_key",
+                               .size = 1024};
+    auto refused =
+        service->NotifyOffloadSuccess(client_id, {swept_task}, {metadata});
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, refused.error());
+
+    // The swept key kept only its memory replica; the disk replica was not
+    // re-created.
+    auto replicas =
+        service->GetReplicaList("ssd_gate_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(1u, replicas.value().replicas.size());
+    EXPECT_TRUE(replicas.value().replicas[0].is_memory_replica());
+
+    // The orphan re-adoption path (a key the master has no metadata for) is
+    // refused too, and the key is not created.
+    OffloadTaskItem orphan_task{.tenant_id = TenantId::Default().value(),
+                                .key = "ssd_gate_orphan_key",
+                                .size = 1024};
+    refused =
+        service->NotifyOffloadSuccess(client_id, {orphan_task}, {metadata});
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, refused.error());
+    EXPECT_FALSE(
+        service->GetReplicaList("ssd_gate_orphan_key", TenantId::Default())
+            .has_value());
+}
+
+// Friended by MasterService: runs the two halves of UnmountLocalDiskSegment
+// (deregistration, replica sweep) as separate steps, so a competing mount +
+// register can be serialized between them -- the interleaving is pinned by
+// construction instead of hoping a scheduler produces it. The helpers are
+// members of this class because friendship does not extend to the
+// TEST_F-generated subclasses.
+class LocalDiskUnmountInterleavingTest : public MasterServiceSSDTest {
+   protected:
+    static void DeregisterHalf(MasterService& service, const UUID& client_id) {
+        std::unique_lock<std::shared_mutex> snapshot_lock(
+            service.snapshot_mutex_);
+        service.local_ssd_manager_.UnregisterClient(client_id);
+    }
+
+    static void SweepHalf(MasterService& service, const UUID& client_id) {
+        service.ClearLocalDiskHandlesOwnedBy(client_id);
+    }
+};
+
+TEST_F(LocalDiskUnmountInterleavingTest,
+       MountAndRegisterBetweenRemovalAndSweepSurvives) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID leaving = generate_uuid();
+    UUID late = generate_uuid();
+    const std::string leaving_segment = "ssd_interleave_leaving_segment";
+    const std::string late_segment = "ssd_interleave_late_segment";
+    MountMemoryAndLocalDisk(*service, leaving, leaving_segment, 0x1300000000);
+    PutAndOffload(*service, leaving, "ssd_interleave_leaving_key", 1024,
+                  leaving_segment);
+
+    // First half of UnmountLocalDiskSegment(leaving): the client is
+    // deregistered; the sweep has not run.
+    DeregisterHalf(*service, leaving);
+
+    // The interleaving under test: another store mounts and registers a
+    // replica before the sweep reaches its shard. Whether the client monitor
+    // has admitted `late` to the alive set yet does not matter to an
+    // owner-targeted sweep -- while a liveness-complement sweep taken before
+    // this mount would classify the replica stale and erase it, and with it
+    // the key, since this disk replica is the key's only one.
+    MountMemoryAndLocalDisk(*service, late, late_segment, 0x1400000000);
+    StorageObjectMetadata late_metadata;
+    late_metadata.data_size = 1024;
+    late_metadata.transport_endpoint = late_segment;
+    OffloadTaskItem late_task{.tenant_id = TenantId::Default().value(),
+                              .key = "ssd_interleave_late_key",
+                              .size = 1024};
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(late, {late_task}, {late_metadata})
+            .has_value());
+
+    // Second half: the sweep.
+    SweepHalf(*service, leaving);
+
+    // The leaving owner's disk replica is gone (the memory replica stays)...
+    auto leaving_replicas = service->GetReplicaList(
+        "ssd_interleave_leaving_key", TenantId::Default());
+    ASSERT_TRUE(leaving_replicas.has_value());
+    ASSERT_EQ(1u, leaving_replicas.value().replicas.size());
+    EXPECT_TRUE(leaving_replicas.value().replicas[0].is_memory_replica());
+
+    // ...while the late mounter's registration survived the sweep.
+    auto late_replicas =
+        service->GetReplicaList("ssd_interleave_late_key", TenantId::Default());
+    ASSERT_TRUE(late_replicas.has_value());
+    ASSERT_EQ(1u, late_replicas.value().replicas.size());
+    EXPECT_TRUE(late_replicas.value().replicas[0].is_local_disk_replica());
 }
 
 }  // namespace mooncake::test

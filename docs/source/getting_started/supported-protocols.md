@@ -11,12 +11,14 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **efa** | AWS EFA-capable instance | High-performance on AWS (libfabric SRD) | ✅ Primary |
 | **nvmeof** | NVMe-oF capable storage | Direct NVMe storage access | ⚠️ Advanced |
 | **nvlink** | NVIDIA MNNVL | Inter-node GPU communication | ⚠️ Advanced |
+| **musa** | Moore Threads GPU + MTLink | Intra-node GPU IPC/P2P | ⚠️ Advanced |
 | **nvlink_intra** | NVIDIA NVLink | Intra-node GPU communication | ⚠️ Advanced |
 | **hip** | AMD ROCm/HIP | AMD GPU communication | ⚠️ Advanced |
 | **barex** | RDMA-capable NIC | Bare-metal RDMA extension | ⚠️ Advanced |
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
+| **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
 
 ## Commonly Used Protocols (Python API)
 
@@ -204,6 +206,52 @@ export MC_FORCE_MNNVL=true
 
 **Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
 
+### MUSA Transport (musa)
+
+**Description:** Moore Threads GPU IPC transport for P2P copies over the
+intra-node MTLink path. It reuses the NVLink transport's transfer bookkeeping,
+but opens imported IPC memory and submits copies using MUSA-specific device
+context rules.
+
+**Requirements:**
+- Moore Threads GPUs with peer access (validated on S5000)
+- MUSA SDK/runtime; MUSA 5.2 or newer enables the low-CPU transfer-batch API
+- Compiled with `USE_MUSA=ON`
+
+**Configuration:**
+```bash
+# Use the same runtime-visible logical-device mapping in every peer process.
+export MUSA_VISIBLE_DEVICES=0,1
+export MC_FORCE_MUSA=1
+
+# Safe defaults shown explicitly. Opt in to metadata after checking the
+# visibility contract below; "default" rolls back to per-slice copies.
+export MC_MUSA_IPC_OPEN_DEVICE=current
+export MC_MUSA_COPY_API=auto
+
+# Performance path after both peers use the same logical device mapping.
+export MC_MUSA_IPC_OPEN_DEVICE=metadata
+```
+
+`MTHREADS_VISIBLE_DEVICES` is consumed by mt-container-toolkit when the
+container is created; Mooncake does not use it to infer the MUSA runtime's
+logical device mapping. Buffer metadata uses runtime-visible logical ordinals
+such as `musa:0`. With `metadata`, every peer must map each logical ordinal to
+the same physical GPU. Mooncake validates that the advertised ordinal exists
+locally, but it cannot prove cross-peer identity from environment variables.
+Both peers must run a version that recognizes the `musa` protocol; rolling
+interoperability with an older peer advertising only `nvlink` is not supported.
+`MC_MUSA_IPC_OPEN_DEVICE=current` is the safe default; select `metadata` only
+when peers satisfy the logical mapping contract above. Python bindings that
+register the default wildcard location (`*`) resolve the owning MUSA device
+during registration; an older peer that still advertises `*` falls back to the
+current-device open path.
+
+In `auto` mode, batches whose copies are at least 1 MiB use
+`muMemoryTransferBatchAsync`; set `MC_MUSA_TRANSFER_BATCH_MIN_BYTES` to tune the
+threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
+`MC_MUSA_COPY_API=default` to use the CUDA-compatible per-slice path.
+
 ### Intra-Node NVLink (nvlink_intra)
 
 **Description:** NVIDIA NVLink for GPU-to-GPU communication within a single node.
@@ -214,7 +262,15 @@ export MC_FORCE_MNNVL=true
 
 **Requirements:**
 - NVIDIA NVLink hardware
-- Compiled with `USE_INTRA_NVLINK=ON`
+- Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
+
+**Configuration:**
+```bash
+# Select the intra-node NVLink transport. Cannot be combined with MC_FORCE_MNNVL.
+export MC_INTRANODE_NVLINK=true
+```
+
+**Note:** On a build without `USE_MNNVL=ON`, leaving `MC_INTRANODE_NVLINK` unset keeps the usual RDMA (or TCP, when no HCA is detected) selection.
 
 ### HIP Transport (hip)
 
@@ -299,6 +355,35 @@ planned as a follow-up.
   transport and the cross-node hop to RDMA/TCP.
 - DMA-mapped (pinned) staging buffers for true async device DMA are a planned
   performance follow-up.
+
+### MPComm Transport (mpcomm)
+
+**Description:** UCL-MPComm (Unified Communication Library - Memory Pool Communication) is an RDMA
+library for heterogeneous memory pooling, integrated as a TENT transport. It drives multiple RDMA
+NICs concurrently with two-level load balancing (across NICs, and across QPs within a NIC) and
+NUMA-aware worker placement, exposing one-sided put/get primitives. It is shortened to MPComm
+below.
+
+**Status:** TENT only. There is no MPComm backend on the legacy Transfer Engine transport path,
+so it cannot be selected through `MOONCAKE_PROTOCOL` or `transfer_engine_bench --protocol=`.
+
+**Use When:**
+- The host has several RDMA NICs and you want them saturated by a single transfer stream
+- Multi-NUMA hosts where NIC-to-NUMA affinity matters
+
+**Requirements:**
+- Built with `-DUSE_TENT=ON -DUSE_MPCOMM=ON -DMPCOMM_ROOT=<prefix>`
+- MPComm installed, providing `include/mpcomm.h` and `lib/libmpcomm.so`
+  (<https://github.com/Tencent/UCL-MPComm>)
+- `libmpcomm.so` reachable by the dynamic linker at run time
+
+**Enable:**
+```json
+{ "transports": { "mpcomm": { "enable": true } } }
+```
+
+See [MPComm Transport](../design/transfer-engine/mpcomm_transport.md) for the full guide,
+including selection via transport policy, tuning environment variables, and troubleshooting.
 
 ## Configuration Examples
 

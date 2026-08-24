@@ -29,6 +29,15 @@
 namespace py = pybind11;
 using namespace mooncake::tent;
 
+// The enumerators below are exposed to Python as plain integers, so their
+// values are a compatibility contract shared with the C API macros. Pin them
+// here so that any divergence is a build failure instead of a protocol break
+// that only shows up between mismatched peers.
+static_assert(static_cast<int>(TransportType::UB) == TRANSPORT_UB,
+              "UB wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::MPCOMM) == TRANSPORT_MPCOMM,
+              "MPCOMM wire value must match the C API macro");
+
 // =============================================================================
 // Custom Exception Hierarchy
 // =============================================================================
@@ -302,6 +311,7 @@ PYBIND11_MODULE(tent, m) {
         .value("SUNRISE_LINK", TransportType::SUNRISE_LINK)
         .value("TPU", TransportType::TPU)
         .value("UB", TransportType::UB)
+        .value("MPCOMM", TransportType::MPCOMM)
         .export_values();
 
     py::enum_<IntentType>(m, "IntentType")
@@ -436,6 +446,9 @@ PYBIND11_MODULE(tent, m) {
         .def("get_segment_name", &TransferEngine::getSegmentName)
         .def("get_rpc_server_address", &TransferEngine::getRpcServerAddress)
         .def("get_rpc_server_port", &TransferEngine::getRpcServerPort)
+        .def("get_local_topology", &TransferEngine::getLocalTopologyString,
+             "Dump local topology as native TENT JSON (nics/mems with "
+             "rank0/1/2)")
 
         // ---------------------------------------------------------------------
         // export/import: out param -> return

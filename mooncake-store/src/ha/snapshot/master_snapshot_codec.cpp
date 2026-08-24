@@ -2,6 +2,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "master_service.h"
@@ -30,8 +31,9 @@ MasterSnapshotCodec::Encode(MasterSnapshotStateView& state_view) const {
     payloads.metadata = std::move(metadata_result.value());
 
     // 2. Encode segments (memory segments + NoF segments)
-    auto segments_result = EncodeSegments(state_view.segment_manager,
-                                          state_view.nof_segment_manager);
+    auto segments_result =
+        EncodeSegments(state_view.segment_manager, state_view.local_ssd_manager,
+                       state_view.nof_segment_manager);
     if (!segments_result) {
         return tl::make_unexpected(segments_result.error());
     }
@@ -118,19 +120,23 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeMetadata(
 
 tl::expected<std::vector<uint8_t>, SerializationError>
 MasterSnapshotCodec::EncodeSegments(
-    SegmentManager& segment_manager,
+    SegmentManager& segment_manager, LocalSsdManager& local_ssd_manager,
     NoFSegmentManager& nof_segment_manager) const {
-    // Use the existing SegmentSerializer which only handles SegmentManager
     // Note: NoFSegmentManager is not currently serialized in snapshots
     SegmentSerializer serializer(&segment_manager);
-    return serializer.Serialize();
+    return serializer.Serialize(local_ssd_manager.ExportPersistedState());
 }
 
 tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeSegments(
     MasterService* master_service, const std::vector<uint8_t>& data) const {
-    // Access the segment managers from MasterService
     SegmentSerializer serializer(&master_service->segment_manager_);
-    return serializer.Deserialize(data);
+    auto local_ssd_state = serializer.Deserialize(data);
+    if (!local_ssd_state) {
+        return tl::unexpected(local_ssd_state.error());
+    }
+    master_service->local_ssd_manager_.RestorePersistedState(
+        std::move(*local_ssd_state));
+    return {};
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>

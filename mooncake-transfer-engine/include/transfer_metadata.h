@@ -57,7 +57,7 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
-        int32_t device_id = -1;  // CUDA device for NCCL buffers
+        int32_t device_id = -1;  // CUDA device (NCCL) or Ascend engine index
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
@@ -173,6 +173,12 @@ class TransferMetadata {
         // Capability marker. Encoded only by transports that opt into
         // ready_ack; decoded from field presence to detect peer support.
         bool ready_ack_supported = false;
+        // Per-peer RDMA CtrlChannel (notify QP). 0 = not supported / unused.
+        // When ctrl_channel is true, this handshake only sets up the control
+        // path (qp_num may be empty).
+        uint32_t notify_qp_num = 0;
+        uint16_t notify_rq_depth = 0;
+        bool ctrl_channel = false;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
@@ -231,6 +237,8 @@ class TransferMetadata {
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
     int getNotifies(std::vector<NotifyDesc> &notifies);
+    // Push a notify received from an alternate path (e.g. RDMA CtrlChannel).
+    void pushNotify(const NotifyDesc &notify);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
 

@@ -87,6 +87,18 @@ class Topology {
 
     Status parse(const std::string& json_content);
 
+    // Parse classic TE NIC priority matrix:
+    // {"cpu:0": [["mlx5_0"], ["mlx5_1"]], ...}
+    // preferred → device_list[rank0], avail → device_list[rank1].
+    Status parsePriorityMatrix(const std::string& json_content);
+
+    // Auto-detect native {"nics","mems"} JSON vs classic priority matrix.
+    Status parseCustomTopology(const std::string& json_content);
+
+    // Load topology from Config (inline matrix / file path) or discover.
+    Status loadFromConfig(const Config& conf,
+                          const std::vector<Platform*>& platforms);
+
     std::string toString() const;
 
     void print() const;

@@ -1,5 +1,6 @@
 #include "segment.h"
 
+#include "ha/snapshot/local_ssd_codec.h"
 #include "master_metric_manager.h"
 #include "utils/zstd_util.h"
 
@@ -20,11 +21,6 @@ bool HasAllocator(const AllocatorManager& allocator_manager,
     }
     return std::find(allocators->begin(), allocators->end(), allocator) !=
            allocators->end();
-}
-
-bool IsMsgpackInteger(const msgpack::object& object) {
-    return object.type == msgpack::type::POSITIVE_INTEGER ||
-           object.type == msgpack::type::NEGATIVE_INTEGER;
 }
 
 void AddHostSegment(HostSegmentIndex& index, const Segment& segment) {
@@ -107,6 +103,18 @@ std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
         return {};
     }
     return BuildHostOrderedSegments(*segments_by_host_, writer_host_id, key);
+}
+
+std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
+    const std::string& segment_name) const {
+    if (client_by_name_ == nullptr) {
+        return std::nullopt;
+    }
+    auto it = client_by_name_->find(segment_name);
+    if (it == client_by_name_->end()) {
+        return std::nullopt;
+    }
+    return it->second;
 }
 
 ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
@@ -216,21 +224,6 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     AddHostSegment(segment_manager_->segments_by_host_, segment);
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
 
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
-                                                     bool enable_offloading) {
-    auto exist_segment_it =
-        segment_manager_->client_local_disk_segment_.find(client_id);
-    if (exist_segment_it !=
-        segment_manager_->client_local_disk_segment_.end()) {
-        LOG(WARNING) << "client_id=" << client_id
-                     << ", warn=local_disk_segment_already_exists";
-        return ErrorCode::SEGMENT_ALREADY_EXISTS;
-    }
-    segment_manager_->client_local_disk_segment_.emplace(
-        client_id, std::make_shared<LocalDiskSegment>(enable_offloading));
     return ErrorCode::OK;
 }
 
@@ -463,6 +456,10 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     if (!is_cxl) {
         MasterMetricManager::instance().dec_total_mem_capacity(
             segment_name, metrics_dec_capacity);
+        // Remove per-segment metric labels entirely to avoid stale 0-value
+        // entries persisting in Prometheus output (e.g. after snapshot
+        // restore followed by client expiry / reaper cleanup).
+        MasterMetricManager::instance().remove_segment_metrics(segment_name);
     }
 
     return ErrorCode::OK;
@@ -482,29 +479,6 @@ ErrorCode ScopedSegmentAccess::GetClientSegments(
         }
     }
     return ErrorCode::OK;
-}
-
-void ScopedSegmentAccess::UnmountLocalDiskSegment(const UUID& client_id) {
-    auto it = segment_manager_->client_local_disk_segment_.find(client_id);
-    if (it != segment_manager_->client_local_disk_segment_.end()) {
-        // Hold offloading_mutex_ while reading ssd_total_capacity_bytes to
-        // avoid a data race with OffloadObjectHeartbeat, which writes the
-        // field under the same lock.  Release the lock before erase() so we
-        // don't unlock an already-destroyed mutex (erase destroys the
-        // LocalDiskSegment, including its mutex).
-        int64_t reported_capacity = 0;
-        {
-            MutexLocker locker(&it->second->offloading_mutex_);
-            reported_capacity = it->second->ssd_total_capacity_bytes;
-        }
-        if (reported_capacity > 0) {
-            MasterMetricManager::instance().dec_total_file_capacity(
-                reported_capacity);
-        }
-        segment_manager_->client_local_disk_segment_.erase(it);
-        LOG(INFO) << "client_id=" << client_id
-                  << ", action=unmount_local_disk_segment";
-    }
 }
 
 ErrorCode ScopedSegmentAccess::GetAllSegments(
@@ -637,11 +611,11 @@ ErrorCode SegmentView::GetMountedSegment(const UUID& segment_id,
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>
-SegmentSerializer::Serialize() {
+SegmentSerializer::Serialize(const LocalSsdPersistedState& local_ssd_state) {
     if (!segment_manager_) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::SERIALIZE_FAIL,
-            "serialize SegmentManager segment_manager_ is null"));
+        return tl::unexpected(
+            SerializationError(ErrorCode::SERIALIZE_FAIL,
+                               "serialize SegmentManager dependency is null"));
     }
 
     if (segment_manager_->memory_allocator_ != BufferAllocatorType::OFFSET) {
@@ -725,48 +699,10 @@ SegmentSerializer::Serialize() {
         }
     }
 
-    // Serialize client_local_disk_segment_
-    // Sort client UUIDs first to ensure deterministic serialization results
     packer.pack("ld");  // local_disk_segments
-    packer.pack_map(segment_manager_->client_local_disk_segment_.size());
-
-    // Collect all client UUIDs and sort
-    std::vector<UUID> sorted_ld_uuids;
-    sorted_ld_uuids.reserve(
-        segment_manager_->client_local_disk_segment_.size());
-    for (const auto& pair : segment_manager_->client_local_disk_segment_) {
-        sorted_ld_uuids.push_back(pair.first);
-    }
-    std::sort(sorted_ld_uuids.begin(), sorted_ld_uuids.end());
-
-    for (const auto& client_uuid : sorted_ld_uuids) {
-        const auto& segment =
-            segment_manager_->client_local_disk_segment_.at(client_uuid);
-        packer.pack(UuidToString(client_uuid));
-
-        // Serialize LocalDiskSegment: [enable_offloading, count, storage_key1,
-        // task1, storage_key2, task2, ...] Sort keys to ensure determinism.
-        std::vector<std::string> sorted_keys;
-        for (const auto& [key, _] : segment->offloading_objects) {
-            sorted_keys.push_back(key);
-        }
-        std::sort(sorted_keys.begin(), sorted_keys.end());
-
-        // Trailing ssd_total_capacity_bytes so a restored master keeps the
-        // client-reported SSD capacity across a snapshot restore (#2783).
-        packer.pack_array(2 + sorted_keys.size() * 2 + 1);
-        packer.pack(segment->enable_offloading);
-        packer.pack(static_cast<uint64_t>(sorted_keys.size()));
-
-        for (const auto& key : sorted_keys) {
-            packer.pack(key);
-            const auto& task = segment->offloading_objects.at(key);
-            packer.pack_array(3);
-            packer.pack(task.tenant_id);
-            packer.pack(task.key);
-            packer.pack(task.size);
-        }
-        packer.pack(segment->ssd_total_capacity_bytes);
+    auto local_ssd_result = ha::LocalSsdCodec::Encode(local_ssd_state, packer);
+    if (!local_ssd_result) {
+        return tl::unexpected(local_ssd_result.error());
     }
 
     // Compress entire data
@@ -779,8 +715,8 @@ SegmentSerializer::Serialize() {
         std::make_move_iterator(compressed_data.end()));
 }
 
-tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
-    const std::vector<uint8_t>& data) {
+tl::expected<LocalSsdPersistedState, SerializationError>
+SegmentSerializer::Deserialize(const std::vector<uint8_t>& data) {
     // Decompress data
     std::vector<uint8_t> decompressed_data;
     try {
@@ -820,13 +756,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
     if (!segment_manager_) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            "deserialize SegmentManager segment_manager is null"));
+            "deserialize SegmentManager dependency is null"));
     }
-
-    // Clear existing data
-    segment_manager_->mounted_segments_.clear();
-    segment_manager_->client_segments_.clear();
-    segment_manager_->segments_by_host_.clear();
 
     // Convert MessagePack map to regular map, use pointers for values to avoid
     // copying
@@ -841,6 +772,19 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
             fields_map.emplace(std::move(key), &value_obj);
         }
     }
+
+    auto ld_it = fields_map.find("ld");
+    auto local_ssd_state = ha::LocalSsdCodec::Decode(
+        ld_it == fields_map.end() ? nullptr : ld_it->second);
+    if (!local_ssd_state) {
+        return tl::unexpected(local_ssd_state.error());
+    }
+
+    // Do not mutate SegmentManager until the independent LocalSSD payload has
+    // been fully validated.
+    segment_manager_->mounted_segments_.clear();
+    segment_manager_->client_segments_.clear();
+    segment_manager_->segments_by_host_.clear();
 
     // Process fields in order
     // 1. First process memory_allocator_
@@ -1053,133 +997,7 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
         }
     }
 
-    // 4. Process client_local_disk_segment_
-    segment_manager_->client_local_disk_segment_.clear();
-    auto ld_it = fields_map.find("ld");
-    if (ld_it != fields_map.end()) {
-        const msgpack::object* ld_obj = ld_it->second;
-        if (ld_obj->type != msgpack::type::MAP) {
-            return tl::unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "deserialize SegmentManager local_disk_segments is not map"));
-        }
-
-        for (uint32_t j = 0; j < ld_obj->via.map.size; ++j) {
-            const msgpack::object& client_key = ld_obj->via.map.ptr[j].key;
-            const msgpack::object& client_value = ld_obj->via.map.ptr[j].val;
-
-            // Parse client_id
-            if (client_key.type != msgpack::type::STR) {
-                return tl::unexpected(
-                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                       "deserialize local_disk_segments "
-                                       "client key is not string"));
-            }
-
-            std::string client_uuid_str(client_key.via.str.ptr,
-                                        client_key.via.str.size);
-            UUID client_id;
-            if (!StringToUuid(client_uuid_str, client_id)) {
-                return tl::unexpected(SerializationError(
-                    ErrorCode::DESERIALIZE_FAIL,
-                    fmt::format("deserialize local_disk_segments "
-                                "client uuid {} is invalid",
-                                client_uuid_str)));
-            }
-
-            // Parse LocalDiskSegment array: [enable_offloading, count,
-            // storage_key1, task1, ...]
-            if (client_value.type != msgpack::type::ARRAY ||
-                client_value.via.array.size < 2) {
-                return tl::unexpected(
-                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                       "deserialize local_disk_segments "
-                                       "value is not valid array"));
-            }
-
-            bool enable_offloading = client_value.via.array.ptr[0].as<bool>();
-            uint64_t count = client_value.via.array.ptr[1].as<uint64_t>();
-
-            auto segment =
-                std::make_shared<LocalDiskSegment>(enable_offloading);
-
-            // Parse offloading_objects
-            for (uint64_t k = 0; k < count; ++k) {
-                size_t key_idx = 2 + k * 2;
-                size_t task_idx = 2 + k * 2 + 1;
-                if (task_idx >= client_value.via.array.size) {
-                    return tl::unexpected(
-                        SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                           "deserialize local_disk_segments "
-                                           "offloading_objects out of bounds"));
-                }
-
-                if (client_value.via.array.ptr[key_idx].type !=
-                    msgpack::type::STR) {
-                    return tl::unexpected(SerializationError(
-                        ErrorCode::DESERIALIZE_FAIL,
-                        "deserialize local_disk_segments offloading key is "
-                        "not string"));
-                }
-                std::string key(
-                    client_value.via.array.ptr[key_idx].via.str.ptr,
-                    client_value.via.array.ptr[key_idx].via.str.size);
-                const auto& task_obj = client_value.via.array.ptr[task_idx];
-                if (task_obj.type == msgpack::type::ARRAY &&
-                    task_obj.via.array.size == 3) {
-                    if (task_obj.via.array.ptr[0].type != msgpack::type::STR ||
-                        task_obj.via.array.ptr[1].type != msgpack::type::STR) {
-                        return tl::unexpected(SerializationError(
-                            ErrorCode::DESERIALIZE_FAIL,
-                            "deserialize local_disk_segments offloading task "
-                            "fields are not strings"));
-                    }
-                    if (!IsMsgpackInteger(task_obj.via.array.ptr[2])) {
-                        return tl::unexpected(SerializationError(
-                            ErrorCode::DESERIALIZE_FAIL,
-                            "deserialize local_disk_segments offloading task "
-                            "size is not integer"));
-                    }
-                    OffloadTaskItem task;
-                    task.tenant_id =
-                        task_obj.via.array.ptr[0].as<std::string>();
-                    task.key = task_obj.via.array.ptr[1].as<std::string>();
-                    task.size = task_obj.via.array.ptr[2].as<int64_t>();
-                    segment->offloading_objects[key] = std::move(task);
-                } else {
-                    // Backward compatibility for snapshots whose
-                    // offloading_objects value was key -> size.
-                    if (!IsMsgpackInteger(task_obj)) {
-                        return tl::unexpected(SerializationError(
-                            ErrorCode::DESERIALIZE_FAIL,
-                            "deserialize local_disk_segments legacy "
-                            "offloading size is not integer"));
-                    }
-                    auto [tenant_id, user_key] = TenantId::ParseScopedKey(key);
-                    segment->offloading_objects[key] =
-                        OffloadTaskItem{.tenant_id = tenant_id.value(),
-                                        .key = std::move(user_key),
-                                        .size = task_obj.as<int64_t>()};
-                }
-            }
-
-            // ssd_total_capacity_bytes is appended after the offloading
-            // objects. Pre-#2783 snapshots omit it, so read it only when
-            // present; otherwise it keeps the default 0 until the client
-            // re-reports capacity.
-            size_t capacity_idx = 2 + count * 2;
-            if (client_value.via.array.size > capacity_idx &&
-                IsMsgpackInteger(client_value.via.array.ptr[capacity_idx])) {
-                segment->ssd_total_capacity_bytes =
-                    client_value.via.array.ptr[capacity_idx].as<int64_t>();
-            }
-
-            segment_manager_->client_local_disk_segment_[client_id] =
-                std::move(segment);
-        }
-    }
-
-    return {};
+    return std::move(*local_ssd_state);
 }
 
 void SegmentSerializer::Reset() {
@@ -1188,7 +1006,6 @@ void SegmentSerializer::Reset() {
     segment_manager_->client_by_name_.clear();
     segment_manager_->segment_id_by_name_.clear();
     segment_manager_->segments_by_host_.clear();
-    segment_manager_->client_local_disk_segment_.clear();
     segment_manager_->allocator_manager_ = AllocatorManager();
 }
 
@@ -1474,6 +1291,7 @@ ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
     nof_segment_manager_->mounted_segments_.erase(segment_id);
     MasterMetricManager::instance().dec_total_nof_capacity(
         segment_name, metrics_dec_capacity);
+    MasterMetricManager::instance().remove_nof_segment_metrics(segment_name);
 
     return ErrorCode::OK;
 }
@@ -1572,6 +1390,7 @@ void SegmentManager::releaseCapacityMetrics() {
         }
         MasterMetricManager::instance().dec_total_mem_capacity(segment.name,
                                                                segment.size);
+        MasterMetricManager::instance().remove_segment_metrics(segment.name);
     }
 }
 
@@ -1587,32 +1406,6 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
     cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
-}
-
-int64_t ScopedLocalDiskSegmentAccess::getSsdTotalCapacity(
-    const std::string& segment_name) const {
-    auto client_it = client_by_name_.find(segment_name);
-    if (client_it == client_by_name_.end()) {
-        return 0;
-    }
-    auto disk_it = client_local_disk_segment_.find(client_it->second);
-    if (disk_it == client_local_disk_segment_.end()) {
-        return 0;
-    }
-    return disk_it->second->ssd_total_capacity_bytes;
-}
-
-int64_t ScopedLocalDiskSegmentAccess::getSsdUsedBytes(
-    const std::string& segment_name) const {
-    auto client_it = client_by_name_.find(segment_name);
-    if (client_it == client_by_name_.end()) {
-        return 0;
-    }
-    auto disk_it = client_local_disk_segment_.find(client_it->second);
-    if (disk_it == client_local_disk_segment_.end()) {
-        return 0;
-    }
-    return disk_it->second->ssd_used_bytes.load(std::memory_order_relaxed);
 }
 
 bool SegmentManager::HasSegmentByEndpoint(const std::string& endpoint) const {

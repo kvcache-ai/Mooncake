@@ -87,25 +87,28 @@ CoroRpcAgent::CoroRpcAgent() = default;
 
 CoroRpcAgent::~CoroRpcAgent() { stop(); }
 
-Status CoroRpcAgent::registerFunction(int func_id, const Function& func) {
+Status CoroRpcAgent::registerFunction(int func_id, const Function& func,
+                                      bool offload) {
     func_map_mutex_.lock();
-    func_map_[func_id] = func;
+    func_map_[func_id] = Handler{func, offload};
     func_map_mutex_.unlock();
     return Status::OK();
 }
 
-Status CoroRpcAgent::start(uint16_t& port, bool ipv6) {
+Status CoroRpcAgent::start(uint16_t& port, bool ipv6, size_t threads) {
     const static uint16_t kStartPort = 15000;
     const static uint16_t kPortRange = 2000;
     const static int kMaxRetry = 10;
     if (running_)
         return Status::InvalidArgument("RPC server already started" LOC_MARK);
     easylog::set_min_severity(easylog::Severity::FATAL);
+    if (threads > 1)
+        LOG(INFO) << "CoroRpcAgent: RPC server threads set to " << threads;
     for (int retry = 0; retry < kMaxRetry; ++retry) {
         try {
             if (port == 0)
                 port = kStartPort + SimpleRandom::Get().next(kPortRange);
-            server_ = new coro_rpc::coro_rpc_server(kRpcThreads, port,
+            server_ = new coro_rpc::coro_rpc_server(threads, port,
                                                     ipv6 ? "::" : "0.0.0.0");
             server_->register_handler<&CoroRpcAgent::process>(this);
             server_->async_start();
@@ -145,16 +148,33 @@ Status CoroRpcAgent::stop() {
     return Status::OK();
 }
 
-void CoroRpcAgent::process(int func_id) {
-    RpcHandlerScope handler_scope(tl_inside_rpc_handler);
-    auto ctx = coro_rpc::get_context();
-    if (func_map_.count(func_id)) {
-        auto request = ctx->get_request_attachment();
-        std::string response;
-        auto func = func_map_.at(func_id);
-        func(request, response);
-        ctx->set_response_attachment(response);
+Lazy<void> CoroRpcAgent::process(int func_id) {
+    auto* ctx = co_await coro_rpc::get_context_in_coro();
+    auto it = func_map_.find(func_id);
+    if (it == func_map_.end()) co_return;
+    const auto handler = it->second;
+
+    auto request = ctx->get_request_attachment();
+    std::string response;
+    if (handler.offload) {
+        // Suspends this coroutine, freeing the io_context thread. The request
+        // buffer belongs to the context_info this coroutine keeps alive, so
+        // the view survives the hop. tl_inside_rpc_handler is deliberately
+        // not set: it guards against deadlocking the RPC thread, which an
+        // offloaded handler no longer occupies.
+        //
+        // post() reports a throwing handler through the Try instead of
+        // unwinding, so rethrow here: the router turns that into the same
+        // rpc_throw_exception an inline handler would produce. Dropping it
+        // would answer a malformed request with an empty success.
+        auto result =
+            co_await coro_io::post([&] { handler.func(request, response); });
+        result.value();
+    } else {
+        RpcHandlerScope handler_scope(tl_inside_rpc_handler);
+        handler.func(request, response);
     }
+    ctx->set_response_attachment(std::move(response));
 }
 
 std::shared_ptr<ClientPool> CoroRpcAgent::getOrCreatePool(
@@ -205,8 +225,11 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK), "");
     }
 
-    std::string response{lease->get_resp_attachment()};
-    lease->release_resp_attachment();
+    // The internal buffer is padded for small attachments; trim the moved
+    // string to the real attachment length from the view.
+    const size_t len = lease->get_resp_attachment().size();
+    std::string response = lease->release_resp_attachment();
+    response.resize(len);
 
     co_return std::make_pair(Status::OK(), std::move(response));
 }
@@ -216,6 +239,17 @@ Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
                           std::string& response) {
     auto [status, resp] = async_simple::coro::syncAwait(
         callCoroutine(server_addr, func_id, std::string(request)));
+
+    if (status.ok()) {
+        response = std::move(resp);
+    }
+    return status;
+}
+
+Status CoroRpcAgent::callOwned(const std::string& server_addr, int func_id,
+                               std::string request, std::string& response) {
+    auto [status, resp] = async_simple::coro::syncAwait(
+        callCoroutine(server_addr, func_id, std::move(request)));
 
     if (status.ok()) {
         response = std::move(resp);

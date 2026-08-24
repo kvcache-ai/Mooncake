@@ -81,6 +81,11 @@ struct TransferHandshakeUtil {
         root["qp_num"] = qpNums;
         if (desc.ready_ack_supported || desc.ready_ack)
             root["ready_ack"] = desc.ready_ack;
+        if (desc.notify_qp_num != 0 || desc.ctrl_channel) {
+            root["notify_qp_num"] = Json::UInt(desc.notify_qp_num);
+            root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
+            root["ctrl_channel"] = desc.ctrl_channel;
+        }
         root["reply_msg"] = desc.reply_msg;
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
@@ -124,6 +129,21 @@ struct TransferHandshakeUtil {
             desc.ready_ack = root["ready_ack"].asBool();
         } else {
             desc.ready_ack = false;
+        }
+        desc.notify_qp_num = 0;
+        desc.notify_rq_depth = 0;
+        desc.ctrl_channel = false;
+        if (root.isMember("notify_qp_num") && root["notify_qp_num"].isUInt()) {
+            desc.notify_qp_num = root["notify_qp_num"].asUInt();
+        }
+        if (root.isMember("notify_rq_depth") &&
+            root["notify_rq_depth"].isUInt()) {
+            unsigned int depth = root["notify_rq_depth"].asUInt();
+            if (depth > 0xFFFFu) return ERR_INVALID_ARGUMENT;
+            desc.notify_rq_depth = static_cast<uint16_t>(depth);
+        }
+        if (root.isMember("ctrl_channel") && root["ctrl_channel"].isBool()) {
+            desc.ctrl_channel = root["ctrl_channel"].asBool();
         }
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
@@ -292,6 +312,11 @@ int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
     return 0;
 }
 
+void TransferMetadata::pushNotify(const NotifyDesc &notify) {
+    RWSpinlock::WriteGuard guard(notify_lock_);
+    notifys.push_back(notify);
+}
+
 #ifdef ENABLE_MULTI_PROTOCOL
 static int encodeMultiProtocolSegmentDesc(
     const std::vector<std::string> &protocols,
@@ -341,7 +366,8 @@ static int encodeMultiProtocolSegmentDesc(
             bufferJSON["lkey"] = lkeyJSON;
         } else if (buffer.protocol == "tcp") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-        } else if (buffer.protocol == "hip" || buffer.protocol == "maca") {
+        } else if (buffer.protocol == "hip" || buffer.protocol == "maca" ||
+                   buffer.protocol == "musa") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
         }
@@ -370,7 +396,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         is_multi_protocol = true;
         for (const auto &proto : protocols) {
             if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                proto != "hip" && proto != "maca") {
+                proto != "hip" && proto != "maca" && proto != "musa") {
                 is_multi_protocol = false;
                 break;
             }
@@ -378,7 +404,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only cxl, tcp, rdma, hip and maca may be "
+                       << ". Only cxl, tcp, rdma, hip, maca and musa may be "
                           "combined.";
             return ERR_INVALID_ARGUMENT;
         }
@@ -487,6 +513,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            bufferJSON["device_id"] = buffer.device_id;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -518,6 +545,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                segmentJSON["protocol"] == "nvlink_intra" ||
                segmentJSON["protocol"] == "hip" ||
                segmentJSON["protocol"] == "maca" ||
+               segmentJSON["protocol"] == "musa" ||
                segmentJSON["protocol"] == "ubshmem" ||
                segmentJSON["protocol"] == "sunrise_link") {
         Json::Value buffersJSON(Json::arrayValue);
@@ -702,7 +730,8 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
-        } else if (buffer_protocol == "hip" || buffer_protocol == "maca") {
+        } else if (buffer_protocol == "hip" || buffer_protocol == "maca" ||
+                   buffer_protocol == "musa") {
             TransferMetadata::BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
@@ -739,17 +768,17 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &protocolStr : segmentJSON["protocol"]) {
                 std::string proto = protocolStr.asString();
                 if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                    proto != "hip" && proto != "maca") {
+                    proto != "hip" && proto != "maca" && proto != "musa") {
                     is_multi_protocol = false;
                     break;
                 }
             }
             if (!is_multi_protocol) {
-                LOG(ERROR) << "Unsupported multi-protocol combination in "
-                              "segment: "
-                           << segment_name
-                           << ". Only cxl, tcp, rdma, hip and maca may be "
-                              "combined.";
+                LOG(ERROR)
+                    << "Unsupported multi-protocol combination in segment: "
+                    << segment_name
+                    << ". Only cxl, tcp, rdma, hip, maca and musa may be "
+                       "combined.";
                 return nullptr;
             }
         }
@@ -904,7 +933,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         }
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
                desc->protocol == "hip" || desc->protocol == "maca" ||
-               desc->protocol == "ubshmem" ||
+               desc->protocol == "musa" || desc->protocol == "ubshmem" ||
                desc->protocol == "sunrise_link") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
@@ -959,6 +988,9 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
+            buffer.device_id = bufferJSON.isMember("device_id")
+                                   ? bufferJSON["device_id"].asInt()
+                                   : -1;
             if (buffer.name.empty() || !buffer.addr || !buffer.length) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol;
@@ -1460,7 +1492,11 @@ int TransferMetadata::startHandshakeDaemon(
         [on_receive_handshake](const Json::Value &peer,
                                Json::Value &local) -> int {
             HandShakeDesc local_desc, peer_desc;
-            TransferHandshakeUtil::decode(peer, peer_desc);
+            if (TransferHandshakeUtil::decode(peer, peer_desc)) {
+                local_desc.reply_msg = "Invalid handshake notify_rq_depth";
+                local = TransferHandshakeUtil::encode(local_desc);
+                return 0;
+            }
             if (on_receive_handshake) {
                 int ret = on_receive_handshake(peer_desc, local_desc);
                 if (ret) {
@@ -1507,7 +1543,11 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
                                       peer_location.rpc_port, local, peer);
     if (ret) return ret;
-    TransferHandshakeUtil::decode(peer, peer_desc);
+    if (TransferHandshakeUtil::decode(peer, peer_desc)) {
+        LOG(ERROR) << "Handshake from " << peer_server_name
+                   << " has invalid notify_rq_depth";
+        return ERR_INVALID_ARGUMENT;
+    }
     if (!peer_desc.reply_msg.empty()) {
         LOG(ERROR) << "Handshake rejected by " << peer_server_name << ": "
                    << peer_desc.reply_msg;

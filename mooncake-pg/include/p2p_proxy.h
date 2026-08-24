@@ -335,15 +335,6 @@ class P2PProxy {
      */
     void abandonResources();
 
-    // Epoch for fault recovery.  All control slots carry this
-    // value so that stale messages from before a Reset can be detected.
-    uint32_t getEpoch(int peer_rank) const {
-        return peer_epoch_[peer_rank].load(std::memory_order_acquire);
-    }
-    void setEpoch(int peer_rank, uint32_t epoch) {
-        peer_epoch_[peer_rank].store(epoch, std::memory_order_release);
-    }
-
    private:
     // Sender-side per-chunk state machine.
     enum class SendTaskState {
@@ -375,7 +366,7 @@ class P2PProxy {
         SendTransferTask() = default;
         SendTransferTask(uint64_t buffer_offset_in, uint32_t chunk_len_in,
                          void* staging_addr_in, uint64_t remote_addr_in,
-                         uint32_t sequence_in, uint32_t epoch_in);
+                         uint32_t sequence_in);
 
         SendTaskState state_ = SendTaskState::kCopyIn;
         uint64_t buffer_offset_ = 0;  // Offset inside the user buffer.
@@ -383,7 +374,6 @@ class P2PProxy {
         void* staging_addr_ = nullptr;  // Address inside SendPool.
         uint64_t remote_addr_ = 0;      // Address inside REMOTE RecvPool.
         uint32_t sequence_ = 0;         // Sequence number in the control ring.
-        uint32_t epoch_ = 0;            // Epoch for Reset detection.
         std::optional<BatchID> transfer_batch_id_;  // RDMA Write batch id.
         std::optional<BatchID> ack_batch_id_;       // AckSlot write batch id.
         cudaEvent_t copy_ready_event_ = nullptr;  // Signals Copy-In done (GPU).
@@ -420,15 +410,13 @@ class P2PProxy {
     struct RecvTransferTask {
         RecvTransferTask() = default;
         RecvTransferTask(uint64_t buffer_offset_in, uint32_t chunk_len_in,
-                         void* local_addr_in, uint32_t sequence_in,
-                         uint32_t epoch_in);
+                         void* local_addr_in, uint32_t sequence_in);
 
         RecvTaskState state_ = RecvTaskState::kIssueCredit;
         uint64_t buffer_offset_ = 0;  // Offset inside the user buffer.
         uint32_t chunk_len_ = 0;      // Bytes in this chunk.
         void* local_addr_ = nullptr;  // Address inside local RecvPool.
         uint32_t sequence_ = 0;       // Sequence number in the control ring.
-        uint32_t epoch_ = 0;          // Epoch for Reset detection.
         std::optional<BatchID>
             credit_batch_id_;  // CreditSlot RDMA Write batch id.
         cudaEvent_t copy_ready_event_ =
@@ -590,11 +578,6 @@ class P2PProxy {
 
     std::atomic<int> active_send_tasks_{0};
     std::atomic<int> active_recv_tasks_{0};
-
-    // Per-peer epoch for fault recovery.  Incremented in resetPeerState
-    // and performSend/RecvReset so that stale messages from a previous epoch
-    // can be detected on a per-peer basis.
-    std::array<std::atomic<uint32_t>, kMaxNumRanks> peer_epoch_;
 
     std::array<SendPeerLane, kMaxNumRanks> send_peer_lanes_;
     std::array<RecvPeerLane, kMaxNumRanks> recv_peer_lanes_;

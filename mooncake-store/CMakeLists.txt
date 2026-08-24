@@ -1,7 +1,6 @@
 project(MooncakeStore VERSION 2.0.0)
 
-option(ENABLE_KV_EVENTS
-       "Build master KV events ZMQ publisher (requires libzmq when ON)" OFF)
+set(MOONCAKE_STORE_INCLUDE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 # Extract version components for C++ usage
 set(MOONCAKE_STORE_VERSION ${PROJECT_VERSION})
@@ -46,27 +45,19 @@ if (STORE_USE_K8S_LEASE)
     set(K8S_LEASE_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/k8s-lease/libk8s_lease_wrapper.so)
 endif()
 
-if (STORE_USE_REDIS)
-    find_path(MOONCAKE_STORE_HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
-    find_library(MOONCAKE_STORE_HIREDIS_LIBRARY hiredis REQUIRED)
-    message(STATUS "Redis HA backend: Enabled")
+if(TARGET Mooncake::liburing)
+  message(STATUS "io_uring: Enabled for mooncake_store")
+else()
+  message(STATUS "io_uring: Disabled (liburing not found)")
+endif()
+
+if(STORE_USE_REDIS)
+  message(STATUS "Redis HA backend: Enabled")
 endif()
 
 if (NOT STORE_USE_ETCD AND NOT STORE_USE_REDIS AND NOT STORE_USE_K8S_LEASE)
     message(STATUS "Store HA backends are disabled")
 endif()
-
-# Add include directories
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/fake_include
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/mooncake-store/proto/
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/
-    ${CMAKE_CURRENT_BINARY_DIR}/include/
-    ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/include
-    ${ETCD_WRAPPER_INCLUDE}
-)
 
 # Add subdirectories
 add_subdirectory(src)

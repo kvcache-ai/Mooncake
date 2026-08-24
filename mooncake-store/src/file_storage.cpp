@@ -1,17 +1,13 @@
 #include "file_storage.h"
 
-#include <cmath>
-#include <locale>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <utility>
 #include <vector>
 
 #include "aligned_client_buffer.h"
-#include "bool_parser.h"
-#include "environ.h"
 #include "storage_backend.h"
+#include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
 #include "device/accelerator_registry.h"
@@ -22,47 +18,6 @@
 namespace mooncake {
 
 namespace {
-
-double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
-    if (raw_value.empty()) {
-        return default_value;
-    }
-
-    std::istringstream stream(raw_value);
-    stream.imbue(std::locale::classic());
-
-    double value = 0.0;
-    stream >> value;
-    if (stream.fail()) {
-        return default_value;
-    }
-    if (!stream.eof() || !std::isfinite(value) || value <= 0.0 || value > 1.0) {
-        return default_value;
-    }
-    return value;
-}
-
-double GetEnvRatioOr(const char* name, double default_value) {
-    const auto raw_value = Environ::GetString(name, "");
-    return ParseEnvRatioOr(raw_value, default_value);
-}
-
-double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
-                     double default_value) {
-    const auto preferred_value = Environ::GetString(preferred_name, "");
-    if (!preferred_value.empty()) {
-        return ParseEnvRatioOr(preferred_value, default_value);
-    }
-    return GetEnvRatioOr(fallback_name, default_value);
-}
-
-bool GetEnvBoolStringOr(const char* name, bool default_value) {
-    const auto raw_value =
-        Environ::GetString(name, default_value ? "true" : "false");
-    return TryParseBool(raw_value, {.token_set = BoolTokenSet::kTrueFalse,
-                                    .trim_ascii_whitespace = false})
-        .value_or(default_value);
-}
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
@@ -82,176 +37,6 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 
 }  // namespace
 
-FileStorageConfig FileStorageConfig::FromEnvironment() {
-    FileStorageConfig config;
-
-    auto storage_backend_descriptor =
-        Environ::GetString("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                           "bucket_storage_backend");
-
-    if (storage_backend_descriptor == "bucket_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kBucket;
-    } else if (storage_backend_descriptor == "file_per_key_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kFilePerKey;
-    } else if (storage_backend_descriptor ==
-               "offset_allocator_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    } else if (storage_backend_descriptor == "distributed_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kDistributed;
-    } else {
-        LOG(ERROR) << "Unknown storage backend.";
-    }
-
-    config.storage_filepath = Environ::GetString(
-        "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
-
-    config.local_buffer_size = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
-
-    config.scanmeta_iterator_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
-        Environ::GetInt64("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
-                          config.scanmeta_iterator_keys_limit));
-
-    config.total_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
-
-    config.total_size_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
-
-    config.heartbeat_interval_seconds =
-        Environ::GetUInt32("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
-                           config.heartbeat_interval_seconds);
-    config.client_buffer_gc_interval_seconds =
-        Environ::GetUInt32("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
-                           config.client_buffer_gc_interval_seconds);
-
-    config.client_buffer_gc_ttl_ms =
-        Environ::GetUInt64("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
-                           config.client_buffer_gc_ttl_ms);
-
-    config.enable_disk_watermark_eviction =
-        GetEnvBoolStringOr("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION",
-                           config.enable_disk_watermark_eviction);
-    config.disk_eviction_high_watermark_ratio =
-        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO",
-                      "MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO",
-                      config.disk_eviction_high_watermark_ratio);
-    config.disk_eviction_low_watermark_ratio =
-        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO",
-                      "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
-                      config.disk_eviction_low_watermark_ratio);
-
-    const auto use_uring_str =
-        Environ::GetString("MOONCAKE_OFFLOAD_USE_URING",
-                           Environ::GetString("MOONCAKE_USE_URING", "false"));
-    config.use_uring =
-        TryParseBool(use_uring_str, {.token_set = BoolTokenSet::kTrueFalse,
-                                     .trim_ascii_whitespace = false})
-            .value_or(false);
-
-    return config;
-}
-
-bool FileStorageConfig::ValidatePath(std::string path) const {
-    if (path.empty()) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is invalid";
-        return false;
-    }
-    namespace fs = std::filesystem;
-    // 1. Must be an absolute path
-    if (!fs::path(path).is_absolute()) {
-        LOG(ERROR)
-            << "FileStorageConfig: storage_filepath must be an absolute path: "
-            << path;
-        return false;
-    }
-
-    // 2. Check if the path contains ".." components that could lead to path
-    // traversal (static check)
-    fs::path p(path);
-    for (const auto& component : p) {
-        if (component == "..") {
-            LOG(ERROR) << "FileStorageConfig: path traversal is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    struct stat stat_buf;
-
-    // 3. Use stat() to check if the path exists
-    if (::stat(path.c_str(), &stat_buf) != 0) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath does not exist: "
-                   << path;
-        return false;
-    }
-    // Path exists — check if it is a directory
-    if (!S_ISDIR(stat_buf.st_mode)) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is not a directory: "
-                   << path;
-        return false;
-    }
-
-    // (Optional) Check write permission
-    if (::access(path.c_str(), W_OK) != 0) {
-        LOG(ERROR) << "FileStorageConfig: no write permission on directory: "
-                   << path;
-        return false;
-    }
-
-    // 4. Additional security: prevent symlink bypass (optional)
-    // Use lstat to avoid automatic dereferencing of symbolic links
-    struct stat lstat_buf;
-    if (::lstat(path.c_str(), &lstat_buf) == 0) {
-        if (S_ISLNK(lstat_buf.st_mode)) {
-            LOG(ERROR) << "FileStorageConfig: symbolic link is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
-        return false;
-    }
-    if (total_keys_limit <= 0) {
-        LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
-        return false;
-    }
-    if (total_size_limit == 0) {
-        LOG(ERROR) << "FileStorageConfig: total_size_limit should not be zero";
-        return false;
-    }
-    if (heartbeat_interval_seconds <= 0) {
-        LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
-        return false;
-    }
-    if (disk_eviction_low_watermark_ratio <= 0.0 ||
-        disk_eviction_low_watermark_ratio > 1.0) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_low_watermark_ratio must be in (0, 1]";
-        return false;
-    }
-    if (disk_eviction_high_watermark_ratio <= 0.0 ||
-        disk_eviction_high_watermark_ratio > 1.0) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_high_watermark_ratio must be in (0, 1]";
-        return false;
-    }
-    if (disk_eviction_low_watermark_ratio >=
-        disk_eviction_high_watermark_ratio) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_low_watermark_ratio must be lower than "
-                   << "disk_eviction_high_watermark_ratio";
-        return false;
-    }
-    return true;
-}
-
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
                          const std::string& local_rpc_addr,
@@ -263,8 +48,34 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
+    if (config_.storage_backend_type == StorageBackendType::kDistributed) {
+        config_.enable_dfs = true;
+    }
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
+    }
+
+    if (config.pinned_restore_arena_size > 0) {
+        if (config.use_uring) {
+            LOG(WARNING) << "Pinned SSD restore is disabled with io_uring";
+        } else if (!client ||
+                   !client->CanUseLocalMemcpy(client->GetSegmentEndpoint())) {
+            LOG(WARNING)
+                << "Pinned SSD restore is disabled: local memcpy unavailable";
+        } else {
+            auto buffer = PinnedBufferPool::AllocatePinned(
+                static_cast<size_t>(config.pinned_restore_arena_size));
+            if (buffer.pinned_host.addr) {
+                pinned_restore_arena_ = std::move(buffer);
+                pinned_restore_arena_allocator_ = ClientBufferAllocator::create(
+                    pinned_restore_arena_.data, pinned_restore_arena_.capacity,
+                    client->GetProtocol());
+                LOG(INFO) << "Initialized pinned SSD restore arena, size="
+                          << pinned_restore_arena_.capacity;
+            } else {
+                LOG(WARNING) << "Failed to allocate pinned SSD restore arena";
+            }
+        }
     }
 
     auto create_storage_backend_result = CreateStorageBackend(config_);
@@ -274,6 +85,13 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     }
 
     storage_backend_ = create_storage_backend_result.value();
+    if (auto distributed_backend =
+            std::dynamic_pointer_cast<DistributedStorageBackend>(
+                storage_backend_)) {
+        if (client_) {
+            client_->SetDfsStorageBackend(distributed_backend);
+        }
+    }
 
     // Register the client buffer with the process-wide io_uring fixed-buffer
     // mechanism. This must happen before any I/O threads start so that they
@@ -321,6 +139,12 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         LOG(ERROR) << "Failed to init storage backend: "
                    << init_storage_backend_result.error();
         return init_storage_backend_result;
+    }
+    if (config_.enable_dfs) {
+        client_buffer_gc_running_.store(true);
+        client_buffer_gc_thread_ =
+            std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
+        return {};
     }
     auto enable_offloading_result = IsEnableOffloading();
     if (enable_offloading_result.has_value()) {
@@ -376,9 +200,15 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         });
 
     if (!scan_meta_result) {
-        LOG(ERROR) << "Failed to scan meta and send to master: "
-                   << scan_meta_result.error();
-        return scan_meta_result;
+        if (config_.enable_dfs &&
+            scan_meta_result.error() == ErrorCode::NOT_SUPPORTED) {
+            LOG(INFO) << "Currently, DFS backend does not support ScanMeta; "
+                         "skip re-registering offloaded objects";
+        } else {
+            LOG(ERROR) << "Failed to scan meta and send to master: "
+                       << scan_meta_result.error();
+            return scan_meta_result;
+        }
     }
 
     heartbeat_running_.store(true);
@@ -398,15 +228,23 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     return {};
 }
 
-tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
-    auto start_time = std::chrono::steady_clock::now();
-    auto allocate_res = AllocateBatch(keys, sizes);
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::LoadBatch(const std::vector<std::string>& keys,
+                       const std::vector<int64_t>& sizes, bool prefer_pinned) {
+    const bool use_pinned = prefer_pinned && pinned_restore_arena_allocator_;
+    auto& allocator = use_pinned ? *pinned_restore_arena_allocator_
+                                 : *client_buffer_allocator_;
+    auto allocate_res = AllocateBatch(keys, sizes, allocator);
+    if (!allocate_res && use_pinned &&
+        allocate_res.error() == ErrorCode::BUFFER_OVERFLOW) {
+        VLOG(1) << "Pinned SSD restore arena exhausted; using default arena";
+        allocate_res = AllocateBatch(keys, sizes, *client_buffer_allocator_);
+    }
     if (!allocate_res) {
         LOG(ERROR) << "Failed to allocate batch objects";
         return tl::make_unexpected(allocate_res.error());
     }
-    auto allocated_batch = allocate_res.value();
+    auto allocated_batch = std::move(allocate_res.value());
     auto result = BatchLoad(allocated_batch->slices);
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
@@ -424,6 +262,16 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
         }
     }
 
+    return allocated_batch;
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    auto start_time = std::chrono::steady_clock::now();
+    auto load_result = LoadBatch(keys, sizes, false);
+    if (!load_result) return tl::make_unexpected(load_result.error());
+
+    auto allocated_batch = std::move(load_result.value());
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
 
@@ -437,6 +285,19 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
             << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
     return batch_result;
+}
+
+tl::expected<FileStorage::LocalBatchResult, ErrorCode>
+FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
+                           const std::vector<int64_t>& sizes) {
+    auto load_result = LoadBatch(keys, sizes, true);
+    if (!load_result) return tl::make_unexpected(load_result.error());
+
+    auto batch = std::move(load_result.value());
+    LocalBatchResult result;
+    result.pointers = std::move(batch->pointers);
+    result.owner = std::move(batch);
+    return result;
 }
 
 bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
@@ -790,6 +651,16 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // A drain deregistered the disk tier on purpose. Skipping the whole tick
+    // matters for the SEGMENT_NOT_FOUND branch below, which would re-mount the
+    // segment and re-register every object; there is also no point taking new
+    // offload work for a store that is leaving. The client TTL is renewed by
+    // Ping on the storage heartbeat thread, not here, so the client stays
+    // alive for its memory segments.
+    if (draining_.load()) {
+        return {};
+    }
+
     // Join previous rescan if completed
     if (rescan_future_.valid() && rescan_future_.wait_for(std::chrono::seconds(
                                       0)) == std::future_status::ready) {
@@ -816,8 +687,19 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // === STEP 1: Send heartbeat and get offloading decisions ===
     {
         MutexLocker locker(&offloading_mutex_);
-        auto heartbeat_result = client_->OffloadObjectHeartbeat(
-            enable_offloading_, offloading_objects);
+        // Re-checked under the lock: the entry check above is only a fast
+        // path. A drain (which latches and deregisters under this same
+        // mutex) may have completed while this tick was parked on it; going
+        // on would hit SEGMENT_NOT_FOUND below and re-mount the segment the
+        // drain just deregistered.
+        if (draining_.load()) {
+            return {};
+        }
+        auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
+            return client_->OffloadObjectHeartbeat(enable_offloading_,
+                                                   offloading_objects);
+        };
+        auto heartbeat_result = fetch_offload_tasks();
         if (!heartbeat_result) {
             ErrorCode err = heartbeat_result.error();
             if (err == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -844,8 +726,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                                 << "heartbeat recovery: " << cap_result.error();
                         }
                     }
-                    heartbeat_result = client_->OffloadObjectHeartbeat(
-                        enable_offloading_, offloading_objects);
+                    heartbeat_result = fetch_offload_tasks();
                     if (!heartbeat_result) {
                         LOG(ERROR) << "Heartbeat failed after re-registration: "
                                    << heartbeat_result.error();
@@ -929,6 +810,45 @@ void FileStorage::RemoveAll() {
         storage_backend_->RemoveAll();
     }
     LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
+}
+
+tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
+    uint64_t grace_period_ms) {
+    if (client_ == nullptr) {
+        LOG(ERROR) << "client is nullptr";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Latch and deregister under offloading_mutex_, the lock Heartbeat holds
+    // across its master RPCs and the SEGMENT_NOT_FOUND re-mount. The latch
+    // alone is not enough: a heartbeat that read draining_ == false before
+    // this store() and was then scheduled out would, on resume, see
+    // SEGMENT_NOT_FOUND from the deregistration below and re-mount the
+    // segment. Under the mutex, such a tick is either still parked on the
+    // lock (it re-checks draining_ once it gets it and skips) or it already
+    // finished its RPCs before we latched (anything it mounted or registered
+    // is deregistered again right here, and the master refuses registrations
+    // that arrive after this call returns -- see
+    // MasterService::NotifyOffloadSuccess).
+    {
+        MutexLocker locker(&offloading_mutex_);
+        draining_.store(true);
+
+        auto result = client_->UnmountLocalDiskSegment();
+        if (!result) {
+            LOG(ERROR) << "action=drain_local_disk_segment, error="
+                       << result.error();
+            draining_.store(false);
+            return result;
+        }
+    }
+
+    LOG(INFO) << "action=drain_local_disk_segment, grace_period_ms="
+              << grace_period_ms;
+    if (grace_period_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(grace_period_ms));
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
@@ -1023,7 +943,8 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         // staging space when the local goes out of scope.
         std::vector<std::string> single_key{storage_key};
         std::vector<int64_t> single_size{size};
-        auto allocate_res = AllocateBatch(single_key, single_size);
+        auto allocate_res =
+            AllocateBatch(single_key, single_size, *client_buffer_allocator_);
         if (!allocate_res) {
             LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
                          << ", error=" << allocate_res.error();
@@ -1156,7 +1077,8 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
 
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::AllocateBatch(const std::vector<std::string>& keys,
-                           const std::vector<int64_t>& sizes) {
+                           const std::vector<int64_t>& sizes,
+                           ClientBufferAllocator& allocator) {
     if (keys.size() != sizes.size()) {
         LOG(ERROR) << "Mismatched keys and sizes count: keys=" << keys.size()
                    << ", sizes=" << sizes.size();
@@ -1187,8 +1109,9 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
         size_t alloc_size =
             align_up(data_size, kDirectIOAlignment) + 2 * kDirectIOAlignment;
 
-        auto alloc_result = client_buffer_allocator_->allocate(alloc_size);
-        if (!alloc_result && !gc_triggered) {
+        auto alloc_result = allocator.allocate(alloc_size);
+        if (!alloc_result && !gc_triggered &&
+            &allocator == client_buffer_allocator_.get()) {
             gc_triggered = true;
             {
                 MutexLocker locker(&client_buffer_mutex_);
@@ -1202,12 +1125,9 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                     }
                 }
             }
-            alloc_result = client_buffer_allocator_->allocate(alloc_size);
+            alloc_result = allocator.allocate(alloc_size);
         }
         if (!alloc_result) {
-            LOG(ERROR) << "Failed to allocate slice buffer, size = "
-                       << alloc_size << " (data_size=" << data_size
-                       << "), key = " << keys[i];
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
 
@@ -1288,6 +1208,17 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
             [this, &total_keys, &total_batches, &total_failures](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) {
+                // A rescan can be mid-flight when a drain deregisters the
+                // disk tier; every batch it would register from here on
+                // re-advertises the departing store. The master refuses such
+                // registrations anyway (the segment entry is gone), so this
+                // stops the scan on the first batch instead of on a refused
+                // RPC.
+                if (draining_.load()) {
+                    LOG(INFO) << "ReRegisterOffloadedObjects: aborting scan, "
+                              << "the disk tier is draining";
+                    return ErrorCode::SEGMENT_NOT_FOUND;
+                }
                 total_batches++;
                 total_keys += keys.size();
                 for (auto& metadata : metadatas) {
@@ -1314,6 +1245,12 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     LOG(INFO) << "ReRegisterOffloadedObjects: ScanMeta returned. success="
               << scan_meta_result.has_value();
     if (!scan_meta_result) {
+        if (config_.enable_dfs &&
+            scan_meta_result.error() == ErrorCode::NOT_SUPPORTED) {
+            LOG(INFO) << "ReRegisterOffloadedObjects: Currently, DFS ScanMeta "
+                         "is not supported; skip";
+            return {};
+        }
         LOG(ERROR) << "ReRegisterOffloadedObjects: ScanMeta failed: "
                    << scan_meta_result.error();
         return scan_meta_result;

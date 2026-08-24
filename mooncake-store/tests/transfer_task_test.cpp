@@ -5,14 +5,16 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
-#include <cstring>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <thread>
 #include <vector>
 
 #include "types.h"
-#ifdef USE_CUDA
+#include "pinned_buffer_pool.h"
+#if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
 #endif
 
@@ -21,43 +23,49 @@ namespace mooncake {
 // Test fixture for TransferTask tests
 // TODO: Currently, this test does not cover TransferSubmitter and
 // TransferEngine integration. Will add more tests in the future.
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        if (const char* old_value = std::getenv(name)) {
+            had_old_value_ = true;
+            old_value_ = old_value;
+        }
+        if (value) {
+            setenv(name_.c_str(), value, 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (had_old_value_) {
+            setenv(name_.c_str(), old_value_.c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    bool had_old_value_ = false;
+    std::string old_value_;
+};
+
 class TransferTaskTest : public ::testing::Test {
    protected:
     void SetUp() override {
         // Initialize glog for logging
         google::InitGoogleLogging("TransferTaskTest");
         FLAGS_logtostderr = 1;  // Output logs to stderr
+        unsetenv("MC_STORE_MEMCPY");
     }
 
     void TearDown() override {
+        unsetenv("MC_STORE_MEMCPY");
         // Cleanup glog
         google::ShutdownGoogleLogging();
     }
 };
-
-// Test basic MemcpyOperation functionality
-TEST_F(TransferTaskTest, MemcpyOperationBasic) {
-    const size_t data_size = 1024;
-    std::vector<char> src_data(data_size, 'A');
-    std::vector<char> dest_data(data_size, 'B');
-
-    // Create memcpy operation
-    MemcpyOperation op(dest_data.data(), src_data.data(), data_size);
-
-    // Verify operation parameters
-    EXPECT_EQ(op.dest, dest_data.data());
-    EXPECT_EQ(op.src, src_data.data());
-    EXPECT_EQ(op.size, data_size);
-
-    // Perform memcpy manually to test
-    std::memcpy(op.dest, op.src, op.size);
-
-    // Verify data was copied correctly
-    EXPECT_EQ(dest_data, src_data);
-    for (size_t i = 0; i < data_size; ++i) {
-        EXPECT_EQ(dest_data[i], 'A');
-    }
-}
 
 // Test MemcpyOperationState functionality
 TEST_F(TransferTaskTest, MemcpyOperationState) {
@@ -153,6 +161,7 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
     constexpr size_t kFragmentCount = 128;
     std::vector<char> source(kBufferSize), destination(kBufferSize, 0);
     std::iota(source.begin(), source.end(), 0);
+    std::vector<size_t> completions(kFragmentCount, 0);
     std::vector<size_t> destination_offsets, source_offsets,
         lengths(kFragmentCount, 1);
     for (size_t i = 0; i < kFragmentCount; ++i) {
@@ -183,12 +192,17 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
                         .local_offsets = destination_offsets,
                         .remote_offsets = source_offsets,
                         .lengths = lengths,
-                        .on_fragment_complete = {},
+                        .on_fragment_complete =
+                            [&](size_t i, const Status& status) {
+                                EXPECT_TRUE(status.ok());
+                                ++completions[i];
+                            },
                     }})
                     .ok());
     for (size_t i = 0; i < kFragmentCount; ++i) {
         EXPECT_EQ(destination[destination_offsets[i]],
                   source[source_offsets[i]]);
+        EXPECT_EQ(completions[i], 1u);
     }
 }
 
@@ -281,11 +295,7 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedGpuBuffers) {
 }
 #endif
 
-// Test the locality decision used by TransferSubmitter::isLocalTransfer.
-// Same-host different-process pairs share an IP but have distinct ports;
-// they must NOT be treated as locally addressable, otherwise memcpy in the
-// caller process would dereference a virtual address belonging to a peer
-// process and segfault.
+// Same-host endpoints from different processes are not locally addressable.
 TEST_F(TransferTaskTest, IsSameProcessEndpoint) {
     // Empty inputs -> not same-process (cannot prove locality).
     EXPECT_FALSE(TransferSubmitter::isSameProcessEndpoint("", ""));
@@ -310,6 +320,156 @@ TEST_F(TransferTaskTest, IsSameProcessEndpoint) {
     // Hostname endpoints (non-P2P metadata mode) compare as full strings.
     EXPECT_TRUE(TransferSubmitter::isSameProcessEndpoint("host-a", "host-a"));
     EXPECT_FALSE(TransferSubmitter::isSameProcessEndpoint("host-a", "host-b"));
+}
+
+TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
+    setenv("MC_STORE_MEMCPY", "1", 1);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17933"), 0);
+    const std::string endpoint = engine.getLocalIpAndPort();
+
+    std::vector<char> source(512, 'A');
+    std::vector<char> destination(512, 0);
+    const std::vector<std::string> keys{"key"};
+    const std::vector<uint64_t> pointers{
+        reinterpret_cast<uintptr_t>(source.data())};
+    const std::unordered_map<std::string, std::vector<Slice>> slices{
+        {"key", {{nullptr, 0}, {destination.data(), destination.size()}}}};
+
+    {
+        std::shared_ptr<StorageBackend> backend;
+        TransferSubmitter submitter(engine, backend, endpoint);
+        auto future = submitter.submit_batch_get_offload_object(
+            endpoint, keys, pointers, slices,
+            OffloadBufferAccess::kLocalAddress);
+        ASSERT_TRUE(future);
+        EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);
+        EXPECT_EQ(future->get(), ErrorCode::OK);
+        EXPECT_FALSE(submitter.submit_batch_get_offload_object(
+            endpoint, keys, {std::numeric_limits<uint64_t>::max() - 7},
+            {{"key", {{destination.data(), 16}}}},
+            OffloadBufferAccess::kLocalAddress));
+    }
+    EXPECT_EQ(destination, source);
+
+    setenv("MC_STORE_MEMCPY", "0", 1);
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, endpoint);
+    EXPECT_FALSE(submitter.submit_batch_get_offload_object(
+        endpoint, keys, pointers, slices, OffloadBufferAccess::kLocalAddress));
+    EXPECT_EQ(engine.freeEngine(), 0);
+}
+
+#ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(TransferTaskTest, BatchGetOffloadObjectCopiesPinnedHostToGpu) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    setenv("MC_STORE_MEMCPY", "1", 1);
+    constexpr size_t kSourceOffset = 128;
+    constexpr size_t kSize = 4096;
+    auto pinned_buffer =
+        PinnedBufferPool::AllocatePinned(kSourceOffset + kSize);
+    ASSERT_NE(pinned_buffer.pinned_host.addr, nullptr);
+    void* pinned_source = pinned_buffer.data;
+    void* gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kSize), cudaSuccess);
+    std::memset(static_cast<char*>(pinned_source) + kSourceOffset, 0x5a, kSize);
+
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17934"), 0);
+    const std::string endpoint = engine.getLocalIpAndPort();
+    {
+        std::shared_ptr<StorageBackend> backend;
+        TransferSubmitter submitter(engine, backend, endpoint);
+        auto future = submitter.submit_batch_get_offload_object(
+            endpoint, {"gpu"},
+            {reinterpret_cast<uintptr_t>(static_cast<char*>(pinned_source) +
+                                         kSourceOffset)},
+            {{"gpu", {{gpu_destination, kSize}}}},
+            OffloadBufferAccess::kLocalAddress);
+        ASSERT_TRUE(future);
+        EXPECT_EQ(future->get(), ErrorCode::OK);
+    }
+
+    std::vector<unsigned char> actual(kSize);
+    EXPECT_EQ(cudaMemcpy(actual.data(), gpu_destination, kSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, std::vector<unsigned char>(kSize, 0x5a));
+    EXPECT_EQ(engine.freeEngine(), 0);
+    EXPECT_EQ(cudaFree(gpu_destination), cudaSuccess);
+}
+#endif
+TEST_F(TransferTaskTest, CanUseLocalMemcpyRequiresSameProcessEndpoint) {
+    ScopedEnvVar memcpy_enabled("MC_STORE_MEMCPY", "1");
+
+    TransferEngine engine(false);
+    ASSERT_EQ(
+        engine.init("P2PHANDSHAKE", "127.0.0.1:30991", "127.0.0.1", 30991), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+
+    std::shared_ptr<StorageBackend> storage_backend;
+    TransferSubmitter submitter(engine, storage_backend, "127.0.0.1:30991");
+
+    const auto local_endpoint = engine.getLocalIpAndPort();
+    ASSERT_FALSE(local_endpoint.empty());
+    EXPECT_TRUE(submitter.canUseLocalMemcpy(local_endpoint));
+
+    EXPECT_FALSE(submitter.canUseLocalMemcpy("127.0.0.1:30992"));
+    EXPECT_FALSE(submitter.canUseLocalMemcpy(""));
+}
+
+TEST_F(TransferTaskTest, CanUseLocalMemcpyHonorsMemcpyEnv) {
+    ScopedEnvVar memcpy_disabled("MC_STORE_MEMCPY", "0");
+
+    TransferEngine engine(false);
+    ASSERT_EQ(
+        engine.init("P2PHANDSHAKE", "127.0.0.1:30993", "127.0.0.1", 30993), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+
+    std::shared_ptr<StorageBackend> storage_backend;
+    TransferSubmitter submitter(engine, storage_backend, "127.0.0.1:30993");
+
+    EXPECT_FALSE(submitter.canUseLocalMemcpy(engine.getLocalIpAndPort()));
+}
+
+TEST_F(TransferTaskTest, BatchWriteHonorsLocalMemcpySetting) {
+    ScopedEnvVar memcpy_enabled("MC_STORE_MEMCPY", "1");
+
+    TransferEngine engine(false);
+    ASSERT_EQ(
+        engine.init("P2PHANDSHAKE", "127.0.0.1:30995", "127.0.0.1", 30995), 0);
+
+    std::vector<char> source(512, 'A');
+    std::vector<char> destination(source.size(), 0);
+    MemoryDescriptor memory;
+    memory.buffer_descriptor.buffer_address_ =
+        reinterpret_cast<uintptr_t>(destination.data());
+    memory.buffer_descriptor.size_ = destination.size();
+    memory.buffer_descriptor.transport_endpoint_ = engine.getLocalIpAndPort();
+    memory.buffer_descriptor.protocol_ = "tcp";
+    Replica::Descriptor replica;
+    replica.descriptor_variant = memory;
+    replica.status = ReplicaStatus::PROCESSING;
+
+    std::shared_ptr<StorageBackend> storage_backend;
+    {
+        TransferSubmitter submitter(engine, storage_backend,
+                                    engine.getLocalIpAndPort());
+        std::vector<std::vector<Slice>> slices{
+            {{source.data(), source.size()}}};
+        auto future =
+            submitter.submit_batch({replica}, slices, TransferRequest::WRITE);
+
+        ASSERT_TRUE(future);
+        EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);
+        EXPECT_EQ(future->get(), ErrorCode::OK);
+    }
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(engine.freeEngine(), 0);
 }
 
 // Test TransferStrategy enum and stream operator

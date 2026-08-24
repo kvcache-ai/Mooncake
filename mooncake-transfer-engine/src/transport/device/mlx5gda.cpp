@@ -1,4 +1,6 @@
 #include <cmath>
+#include <cstdint>
+#include <unistd.h>
 
 #include "cuda_alike.h"
 
@@ -31,11 +33,7 @@ constexpr T round_up_pow2(T n) {
 #define IBGDA_ROUND_UP_POW2_OR_0(_n) (((_n) == 0) ? 0 : round_up_pow2(_n))
 
 static void print_cuda_error(const char* msg) {
-#ifdef USE_MUSA
-    const char* err_str = musaGetErrorString(musaGetLastError());
-#else
     const char* err_str = cudaGetErrorString(cudaGetLastError());
-#endif
     fprintf(stderr, "%s: %s\n", msg, err_str);
 }
 
@@ -81,14 +79,6 @@ static void print_devx_create_qp_failure(const uint8_t* cmd_out,
             dbr_offset);
 }
 
-// Create UAR for BF (Blue Flame) doorbell ringing.
-// On CUDA: registers the BF MMIO region into GPU address space so the
-//          GPU kernel can directly write the doorbell (lowest latency).
-// On MUSA: musaHostRegisterIoMemory is not supported for MMIO addresses,
-//          so we skip BF registration and return a UAR with reg_addr=NULL.
-//          The GPU kernel will use DBR-only mode (write to memory-mapped
-//          doorbell record, NIC polls it) — slightly higher latency but
-//          functionally correct.
 static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
     struct mlx5dv_devx_uar* uar =
         mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
@@ -96,25 +86,35 @@ static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
         errno = EIO;
         return NULL;
     }
-#ifdef USE_MUSA
-    // MUSA cannot map MMIO addresses into GPU VA.  Skip the
-    // musaHostRegister(IoMemory) call entirely — attempting it
-    // corrupts the MUSA runtime, causing all subsequent device-side
-    // fill operations to fail with "illegal memory access".
-    // Use DBR-only mode: the kernel writes to the doorbell record
-    // in GPU memory instead of the BF MMIO register.
-    uar->reg_addr = NULL;
-#else
-    if (cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
-                         cudaHostRegisterPortable | cudaHostRegisterMapped |
-                             cudaHostRegisterIoMemory) != cudaSuccess) {
-        print_cuda_error("Failed to register MMIO memory");
-        errno = EIO;
-        mlx5dv_devx_free_uar(uar);
-        return NULL;
-    }
-#endif
     return uar;
+}
+
+static int map_uar_for_device(struct mlx5dv_devx_uar* uar,
+                              struct mlx5gda_qp* qp) {
+    const cudaError_t register_result =
+        cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
+                         cudaHostRegisterMapped | cudaHostRegisterIoMemory);
+    void* device_base = nullptr;
+    if (cudaHostGetDevicePointer(&device_base, uar->reg_addr, 0) !=
+        cudaSuccess) {
+        if (register_result == cudaSuccess) cudaHostUnregister(uar->reg_addr);
+        print_cuda_error("Failed to map BF MMIO page");
+        errno = EIO;
+        return -1;
+    }
+    qp->bf_host_base = uar->reg_addr;
+    qp->bf_device_addr = static_cast<char*>(device_base);
+    qp->bf_host_registration_owner = register_result == cudaSuccess;
+    return 0;
+}
+
+static void unmap_uar_for_device(struct mlx5gda_qp* qp) {
+    if (qp->bf_host_registration_owner) {
+        cudaHostUnregister(qp->bf_host_base);
+        qp->bf_host_registration_owner = false;
+    }
+    qp->bf_host_base = nullptr;
+    qp->bf_device_addr = nullptr;
 }
 
 static bool uses_control_regions(
@@ -133,19 +133,15 @@ static void release_control_region(
 
 static void destroy_uar(struct mlx5dv_devx_uar* uar) {
     if (!uar) return;
-    if (uar->reg_addr) {
-        if (cudaHostUnregister(uar->reg_addr) != cudaSuccess) {
-            print_cuda_error("Failed to unregister MMIO memory");
-        }
-    }
     mlx5dv_devx_free_uar(uar);
 }
 
 struct mlx5gda_cq* mlx5gda_create_cq(
     void* ctrl_buf, struct mlx5dv_devx_umem* ctrl_buf_umem,
     struct memheap* ctrl_buf_heap, struct ibv_pd* pd, int cqe,
-    cudaStream_t stream,
-    const struct mlx5gda_control_region_allocator* region_allocator) {
+    cudaStream_t stream, void* cq_buf_arg, void* cq_buf_dev,
+    struct mlx5dv_devx_umem* cq_buf_umem, struct memheap* cq_buf_heap,
+    const struct mlx5gda_control_region_allocator* cq_region_allocator) {
     struct mlx5gda_cq* cq = NULL;
     struct mlx5dv_devx_uar* uar = NULL;
     uint32_t eqn = 0;
@@ -153,15 +149,17 @@ struct mlx5gda_cq* mlx5gda_create_cq(
     size_t dbr_offset = -1;
     struct mlx5dv_devx_obj* mlx5_cq = NULL;
     uint32_t cqn = 0;
-    void* cq_buf = ctrl_buf;
-    void* dbr = ctrl_buf;
-    struct mlx5dv_devx_umem* cq_umem = ctrl_buf_umem;
-    struct mlx5dv_devx_umem* dbr_umem = ctrl_buf_umem;
-    const bool split_regions = uses_control_regions(region_allocator);
+    void* cq_buf = cq_buf_arg ? cq_buf_arg : ctrl_buf;
+    void* dbr = cq_buf;
+    struct mlx5dv_devx_umem* cq_umem =
+        cq_buf_umem ? cq_buf_umem : ctrl_buf_umem;
+    struct mlx5dv_devx_umem* dbr_umem = cq_umem;
+    struct memheap* cq_heap = cq_buf_heap ? cq_buf_heap : ctrl_buf_heap;
+    const bool split_regions = uses_control_regions(cq_region_allocator);
 
     struct ibv_context* ctx = pd->context;
     void* cq_context = NULL;
-    bool ctrl_host = !split_regions && is_host_control_buffer(ctrl_buf);
+    bool ctrl_host = !split_regions && is_host_control_buffer(cq_buf);
 
     if (cqe <= 0) {
         errno = EINVAL;
@@ -176,16 +174,16 @@ struct mlx5gda_cq* mlx5gda_create_cq(
     if (!cq) goto fail;
 
     if (split_regions) {
-        cq->region_allocator = *region_allocator;
-        if (region_allocator->allocate(region_allocator->context,
-                                       num_cqe * sizeof(struct mlx5_cqe64),
-                                       &cq->cq_region) != 0) {
+        cq->region_allocator = *cq_region_allocator;
+        if (cq_region_allocator->allocate(cq_region_allocator->context,
+                                          num_cqe * sizeof(struct mlx5_cqe64),
+                                          &cq->cq_region) != 0) {
             perror("Failed to allocate CQ control region");
             goto fail;
         }
-        if (region_allocator->allocate(region_allocator->context,
-                                       sizeof(struct mlx5gda_cq_dbr),
-                                       &cq->dbr_region) != 0) {
+        if (cq_region_allocator->allocate(cq_region_allocator->context,
+                                          sizeof(struct mlx5gda_cq_dbr),
+                                          &cq->dbr_region) != 0) {
             perror("Failed to allocate CQ DBR control region");
             goto fail;
         }
@@ -196,16 +194,15 @@ struct mlx5gda_cq* mlx5gda_create_cq(
         cq_offset = 0;
         dbr_offset = 0;
     } else {
-        cq_offset = memheap_aligned_alloc(ctrl_buf_heap,
-                                          num_cqe * sizeof(struct mlx5_cqe64),
-                                          (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
-        if (cq_offset == -1) {
+        cq_offset =
+            memheap_aligned_alloc(cq_heap, num_cqe * sizeof(struct mlx5_cqe64),
+                                  (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
+        if (cq_offset == (size_t)-1) {
             perror("Failed to allocate CQ memory");
             goto fail;
         }
-        dbr_offset =
-            memheap_alloc(ctrl_buf_heap, sizeof(struct mlx5gda_cq_dbr));
-        if (dbr_offset == -1) {
+        dbr_offset = memheap_alloc(cq_heap, sizeof(struct mlx5gda_cq_dbr));
+        if (dbr_offset == (size_t)-1) {
             perror("Failed to allocate CQ DBR memory");
             goto fail;
         }
@@ -271,7 +268,12 @@ struct mlx5gda_cq* mlx5gda_create_cq(
 
     cq->cq_offset = cq_offset;
     cq->dbr_offset = dbr_offset;
+    cq->dev_base = cq_buf_dev ? cq_buf_dev : ctrl_buf;
+    cq->heap = cq_heap;
     cq->cq_buf = static_cast<char*>(cq_buf) + cq_offset;
+    cq->dev_cq_buf = split_regions
+                         ? cq->cq_buf
+                         : static_cast<char*>(cq->dev_base) + cq_offset;
     cq->dbr = static_cast<char*>(dbr) + dbr_offset;
     cq->cqe = num_cqe;
     cq->cqn = cqn;
@@ -287,14 +289,14 @@ fail:
         free(cq);
     }
     if (!split_regions) {
-        if (cq_offset != -1) memheap_free(ctrl_buf_heap, cq_offset);
-        if (dbr_offset != -1) memheap_free(ctrl_buf_heap, dbr_offset);
+        if (cq_offset != (size_t)-1) memheap_free(cq_heap, cq_offset);
+        if (dbr_offset != (size_t)-1) memheap_free(cq_heap, dbr_offset);
     }
     errno = saved_errno;
     return NULL;
 }
 
-void mlx5gda_destroy_cq(struct memheap* ctrl_buf_heap, struct mlx5gda_cq* cq) {
+void mlx5gda_destroy_cq(struct mlx5gda_cq* cq) {
     if (!cq) return;
     if (cq->mcq) {
         mlx5dv_devx_obj_destroy(cq->mcq);
@@ -306,17 +308,18 @@ void mlx5gda_destroy_cq(struct memheap* ctrl_buf_heap, struct mlx5gda_cq* cq) {
         release_control_region(&cq->region_allocator, &cq->dbr_region);
         release_control_region(&cq->region_allocator, &cq->cq_region);
     } else {
-        memheap_free(ctrl_buf_heap, cq->cq_offset);
-        memheap_free(ctrl_buf_heap, cq->dbr_offset);
+        memheap_free(cq->heap, cq->cq_offset);
+        memheap_free(cq->heap, cq->dbr_offset);
     }
     free(cq);
 }
 
 struct mlx5gda_qp* mlx5gda_create_rc_qp(
-    struct mlx5dv_pd mpd, void* ctrl_buf,
-    struct mlx5dv_devx_umem* ctrl_buf_umem, struct memheap* ctrl_buf_heap,
-    struct ibv_pd* pd, int wqe, uint8_t port_num, cudaStream_t stream,
-    const struct mlx5gda_control_region_allocator* region_allocator) {
+    struct mlx5dv_pd mpd, const struct mlx5gda_control_buffer* ctrl,
+    const struct mlx5gda_control_buffer* cq, struct ibv_pd* pd, int wqe,
+    uint8_t port_num, cudaStream_t stream,
+    const struct mlx5gda_control_region_allocator* cq_region_allocator,
+    const struct mlx5gda_control_region_allocator* qp_region_allocator) {
     mlx5gda_reset_create_qp_failure();
 
     struct mlx5gda_qp* qp = NULL;
@@ -325,17 +328,17 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     struct mlx5dv_devx_obj* mlx5_qp = NULL;
     size_t wq_offset = -1;
     size_t dbr_offset = -1;
-    void* wq = ctrl_buf;
-    void* dbr = ctrl_buf;
-    struct mlx5dv_devx_umem* wq_umem = ctrl_buf_umem;
-    struct mlx5dv_devx_umem* dbr_umem = ctrl_buf_umem;
-    const bool split_regions = uses_control_regions(region_allocator);
+    void* wq = ctrl->addr;
+    void* dbr = ctrl->addr;
+    struct mlx5dv_devx_umem* wq_umem = ctrl->umem;
+    struct mlx5dv_devx_umem* dbr_umem = ctrl->umem;
+    const bool split_regions = uses_control_regions(qp_region_allocator);
 
     struct ibv_context* ctx = pd->context;
     void* qp_context = NULL;
     void* cap = NULL;
     uint32_t cqe_version = 0;
-    bool ctrl_host = !split_regions && is_host_control_buffer(ctrl_buf);
+    bool ctrl_host = !split_regions && is_host_control_buffer(ctrl->addr);
 
     if (wqe <= 0) {
         errno = EINVAL;
@@ -354,7 +357,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
         perror("Failed to allocate QP memory");
         goto fail;
     }
-    if (split_regions) qp->region_allocator = *region_allocator;
+    if (split_regions) qp->region_allocator = *qp_region_allocator;
 
     qp->port_num = port_num;
     if (ibv_query_port(ctx, port_num, &qp->port_attr) != 0) {
@@ -382,8 +385,9 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     }
 
     // Create send_cq on GPU memory.
-    send_cq = mlx5gda_create_cq(ctrl_buf, ctrl_buf_umem, ctrl_buf_heap, pd, wqe,
-                                stream, region_allocator);
+    send_cq = mlx5gda_create_cq(ctrl->addr, ctrl->umem, ctrl->heap, pd, wqe,
+                                stream, cq->addr, cq->dev_addr, cq->umem,
+                                cq->heap, cq_region_allocator);
     if (send_cq == NULL) {
         perror("mlx5gda_create_cq failed");
         goto fail;
@@ -394,17 +398,19 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
         perror("Failed to create UAR");
         goto fail;
     }
+    if (map_uar_for_device(uar, qp) != 0) goto fail;
 
     if (split_regions) {
-        if (region_allocator->allocate(region_allocator->context,
-                                       num_wqebb * sizeof(struct mlx5gda_wqebb),
-                                       &qp->wq_region) != 0) {
+        if (qp_region_allocator->allocate(
+                qp_region_allocator->context,
+                num_wqebb * sizeof(struct mlx5gda_wqebb),
+                &qp->wq_region) != 0) {
             perror("Failed to allocate WQ control region");
             goto fail;
         }
-        if (region_allocator->allocate(region_allocator->context,
-                                       sizeof(struct mlx5gda_wq_dbr),
-                                       &qp->dbr_region) != 0) {
+        if (qp_region_allocator->allocate(qp_region_allocator->context,
+                                          sizeof(struct mlx5gda_wq_dbr),
+                                          &qp->dbr_region) != 0) {
             perror("Failed to allocate QP DBR control region");
             goto fail;
         }
@@ -416,16 +422,15 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
         dbr_offset = 0;
     } else {
         wq_offset = memheap_aligned_alloc(
-            ctrl_buf_heap, num_wqebb * sizeof(struct mlx5gda_wqebb),
+            ctrl->heap, num_wqebb * sizeof(struct mlx5gda_wqebb),
             (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
-        if (wq_offset == -1) {
+        if (wq_offset == (size_t)-1) {
             perror("Failed to allocate WQ memory");
             goto fail;
         }
 
-        dbr_offset =
-            memheap_alloc(ctrl_buf_heap, sizeof(struct mlx5gda_wq_dbr));
-        if (dbr_offset == -1) {
+        dbr_offset = memheap_alloc(ctrl->heap, sizeof(struct mlx5gda_wq_dbr));
+        if (dbr_offset == (size_t)-1) {
             perror("Failed to allocate DBR memory");
             goto fail;
         }
@@ -496,8 +501,14 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     qp->num_wqebb = num_wqebb;
     qp->wq_offset = wq_offset;
     qp->dbr_offset = dbr_offset;
+    qp->wq_heap = ctrl->heap;
     qp->wq = static_cast<char*>(wq) + wq_offset;
     qp->dbr = static_cast<char*>(dbr) + dbr_offset;
+    qp->dev_wq =
+        split_regions ? qp->wq : static_cast<char*>(ctrl->dev_addr) + wq_offset;
+    qp->dev_dbr = split_regions
+                      ? qp->dbr
+                      : static_cast<char*>(ctrl->dev_addr) + dbr_offset;
     return qp;
 
 fail:
@@ -506,10 +517,11 @@ fail:
         mlx5dv_devx_obj_destroy(mlx5_qp);
     }
     if (uar) {
+        if (qp) unmap_uar_for_device(qp);
         destroy_uar(uar);
     }
     if (send_cq) {
-        mlx5gda_destroy_cq(ctrl_buf_heap, send_cq);
+        mlx5gda_destroy_cq(send_cq);
     }
     if (qp) {
         release_control_region(&qp->region_allocator, &qp->dbr_region);
@@ -518,35 +530,36 @@ fail:
     if (qp) {
         free(qp);
     }
-    if (!split_regions && wq_offset != -1) {
-        memheap_free(ctrl_buf_heap, wq_offset);
+    if (!split_regions && wq_offset != (size_t)-1) {
+        memheap_free(ctrl->heap, wq_offset);
     }
-    if (!split_regions && dbr_offset != -1) {
-        memheap_free(ctrl_buf_heap, dbr_offset);
+    if (!split_regions && dbr_offset != (size_t)-1) {
+        memheap_free(ctrl->heap, dbr_offset);
     }
     errno = saved_errno;
     return NULL;
 }
 
-void mlx5gda_destroy_qp(struct memheap* ctrl_buf_heap, struct mlx5gda_qp* qp) {
+void mlx5gda_destroy_qp(struct mlx5gda_qp* qp) {
     if (qp->mqp) {
         mlx5dv_devx_obj_destroy(qp->mqp);
     }
     if (qp->uar) {
+        unmap_uar_for_device(qp);
         destroy_uar(qp->uar);
     }
     if (qp->send_cq) {
-        mlx5gda_destroy_cq(ctrl_buf_heap, qp->send_cq);
+        mlx5gda_destroy_cq(qp->send_cq);
     }
     if (uses_control_regions(&qp->region_allocator)) {
         release_control_region(&qp->region_allocator, &qp->dbr_region);
         release_control_region(&qp->region_allocator, &qp->wq_region);
     } else {
-        if (qp->wq_offset != -1) {
-            memheap_free(ctrl_buf_heap, qp->wq_offset);
+        if (qp->wq_offset != (size_t)-1) {
+            memheap_free(qp->wq_heap, qp->wq_offset);
         }
-        if (qp->dbr_offset != -1) {
-            memheap_free(ctrl_buf_heap, qp->dbr_offset);
+        if (qp->dbr_offset != (size_t)-1) {
+            memheap_free(qp->wq_heap, qp->dbr_offset);
         }
     }
     if (qp) {

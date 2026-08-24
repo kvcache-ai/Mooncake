@@ -1216,7 +1216,15 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentRemoveAllOperations) {
 }
 
 TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
-    service_.reset(new MasterService());
+    // Snapshot mode keeps the invalid-handle sweep synchronous inside
+    // UnmountSegment. A default-configured MasterService would instead defer
+    // it to the replica cleanup worker, making the key-count assertion below
+    // race with that worker.
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
 
     // Mount two segments for testing
     constexpr size_t buffer1 = 0x300000000;
@@ -1272,7 +1280,11 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
 }
 
 TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
-    service_.reset(new MasterService());
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
 
     // Mount two large segments
     constexpr size_t buffer1 = 0x300000000;
@@ -1328,7 +1340,11 @@ TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
 }
 
 TEST_F(MasterServiceSnapshotTest, UnmountSegmentPerformance) {
-    service_.reset(new MasterService());
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 256;  // 256MB
     std::string segment_name = "perf_test_segment";
@@ -1642,7 +1658,7 @@ TEST_F(MasterServiceSnapshotTest, RemoveSoftPinObject) {
     uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
-    config.with_soft_pin = true;
+    config.soft_pin_action = SoftPinAction::ENABLE;
 
     // Verify soft pin does not block remove
     ASSERT_TRUE(service_
@@ -1698,7 +1714,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
             uint64_t slice_length = value_size;
             ReplicateConfig soft_pin_config;
             soft_pin_config.replica_num = 1;
-            soft_pin_config.with_soft_pin = true;
+            soft_pin_config.soft_pin_action = SoftPinAction::ENABLE;
 
             ASSERT_TRUE(service_
                             ->PutStart(client_id, pin_key, TenantId::Default(),
@@ -1779,7 +1795,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsCanBeEvicted) {
         uint64_t slice_length = value_size;
         ReplicateConfig config;
         config.replica_num = 1;
-        config.with_soft_pin = true;
+        config.soft_pin_action = SoftPinAction::ENABLE;
         if (service_
                 ->PutStart(client_id, key, TenantId::Default(), slice_length,
                            config)
@@ -1807,101 +1823,53 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsCanBeEvicted) {
     // service_->RemoveAll();
 }
 
-TEST_F(MasterServiceSnapshotTest, SoftPinExtendedOnGet) {
+TEST_F(MasterServiceSnapshotTest, SoftPinExpiresAndGetDoesNotReactivate) {
     const uint64_t kv_lease_ttl = 200;
-    // The soft pin ttl shall not be too large, otherwise the test will take too
-    // long
-    const uint64_t kv_soft_pin_ttl = 1000;
-    static_assert(
-        kv_soft_pin_ttl > kv_lease_ttl,
-        "kv_soft_pin_ttl must be larger than kv_lease_ttl in this test");
-    const double eviction_ratio = 0.5;
-    const bool allow_evict_soft_pinned_objects = true;
+    const uint64_t kv_soft_pin_ttl = 20;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(
-                                  allow_evict_soft_pinned_objects)
-                              .set_eviction_ratio(eviction_ratio)
                               .build();
     service_.reset(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
-    // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
     constexpr size_t segment_size = 1024 * 1024 * 16;
-    constexpr size_t value_size = 1024 * 1024;
+    constexpr size_t value_size = 1024;
     [[maybe_unused]] const auto context =
         PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
 
-    // The eviction has random factors, so test 3 times
-    for (int test_i = 0; test_i < 3; test_i++) {
-        // Put pin_key first
-        for (int i = 0; i < 2; i++) {
-            std::string pin_key = "pin_key" + std::to_string(i);
-            uint64_t slice_length = value_size;
-            ReplicateConfig soft_pin_config;
-            soft_pin_config.replica_num = 1;
-            soft_pin_config.with_soft_pin = true;
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    ReplicateConfig config;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, "pin_key", TenantId::Default(),
+                               value_size, config)
+                    .has_value());
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, "pin_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
 
-            ASSERT_TRUE(service_->PutStart(client_id, pin_key,
-                                           TenantId::Default(), slice_length,
-                                           soft_pin_config));
-            ASSERT_TRUE(service_
-                            ->PutEnd(client_id, pin_key, TenantId::Default(),
-                                     ReplicaType::MEMORY)
-                            .has_value());
-        }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(kv_soft_pin_ttl + 10));
+    ASSERT_TRUE(
+        service_->GetReplicaList("pin_key", TenantId::Default()).has_value());
 
-        // Wait for the soft pin to expire
-        std::this_thread::sleep_for(std::chrono::milliseconds(kv_soft_pin_ttl));
-
-        // Get the pin_key to extend the soft pin
-        for (int i = 0; i < 2; i++) {
-            std::string pin_key = "pin_key" + std::to_string(i);
-            ASSERT_TRUE(service_->GetReplicaList(pin_key, TenantId::Default())
-                            .has_value());
-        }
-
-        // Fill the segment to trigger eviction
-        int failed_puts = 0;
-        for (int i = 0; i < 16; i++) {
-            std::string key = "key" + std::to_string(i);
-            uint64_t slice_length = value_size;
-            ReplicateConfig config;
-            config.replica_num = 1;
-            if (service_
-                    ->PutStart(client_id, key, TenantId::Default(),
-                               slice_length, config)
-                    .has_value()) {
-                ASSERT_TRUE(service_
-                                ->PutEnd(client_id, key, TenantId::Default(),
-                                         ReplicaType::MEMORY)
-                                .has_value());
-            } else {
-                failed_puts++;
-            }
-        }
-        ASSERT_GT(failed_puts, 0);
-
-        // wait for eviction
-        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-
-        // pin_key should still be accessible
-        for (int i = 0; i < 2; i++) {
-            std::string pin_key = "pin_key" + std::to_string(i);
-            ASSERT_TRUE(service_->GetReplicaList(pin_key, TenantId::Default())
-                            .has_value());
-        }
-        // [Commented for snapshot test] The following RemoveAll would clear
-        // data before TearDown snapshot verification Only remove all objects
-        // before the next turn (skip last round)
-        if (test_i < 2) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kv_lease_ttl));
-            service_->RemoveAll();
-        }
-    }
+    ReplicateConfig preserve;
+    ASSERT_TRUE(service_
+                    ->UpsertStart(client_id, "pin_key", TenantId::Default(),
+                                  value_size, preserve)
+                    .has_value());
+    ASSERT_TRUE(service_
+                    ->UpsertEnd(client_id, "pin_key", TenantId::Default(),
+                                ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
 }
 
 TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotAllowEvict) {
@@ -1934,7 +1902,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotAllowEvict) {
         uint64_t slice_length = value_size;
         ReplicateConfig config;
         config.replica_num = 1;
-        config.with_soft_pin = true;
+        config.soft_pin_action = SoftPinAction::ENABLE;
         if (service_
                 ->PutStart(client_id, key, TenantId::Default(), slice_length,
                            config)
@@ -2454,19 +2422,30 @@ TEST_F(MasterServiceSnapshotTest, PutStartExpiringTest) {
 
     // Put key_2 again, should fail because eviction has not been triggered. And
     // this PutStart should trigger the eviction.
+    const int64_t eviction_attempts_before =
+        MasterMetricManager::instance().get_mem_eviction_attempts();
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
-    EXPECT_FALSE(put_start_result.has_value());
+    ASSERT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    // Wait a moment for the eviction to complete.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (MasterMetricManager::instance().get_mem_eviction_attempts() <=
+               eviction_attempts_before &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_GT(MasterMetricManager::instance().get_mem_eviction_attempts(),
+              eviction_attempts_before)
+        << "Timed out waiting for asynchronous eviction";
 
     // Put key_2 again, should success because the previous one has been
     // discarded and released.
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
-    EXPECT_TRUE(put_start_result.has_value());
+    ASSERT_TRUE(put_start_result.has_value())
+        << toString(put_start_result.error());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
     for (size_t i = 0; i < kReplicaCnt; i++) {
@@ -2656,7 +2635,7 @@ TEST_F(MasterServiceSnapshotTest, BatchReplicaClearSpecificSegment) {
     ASSERT_TRUE(put_end_result.has_value());
 
     // 4. Wait for lease to expire and verify it's actually expired
-    // PutEnd calls GrantLease(0, ...) which sets lease_timeout to now.
+    // PutEnd grants a zero-duration read lease, setting lease_timeout to now.
     // Due to clock precision and timing, we need to ensure the lease is
     // actually expired before calling BatchReplicaClear.
     // Use a small delay and then poll to ensure lease is expired.
