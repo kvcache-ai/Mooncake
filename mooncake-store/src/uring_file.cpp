@@ -788,13 +788,95 @@ tl::expected<void, ErrorCode> UringFile::batch_read(ReadDesc* descs, int cnt) {
 // vector_write / vector_read
 // ---------------------------------------------------------------------------
 
+namespace {
+
+size_t IovecTotalLen(const iovec* iov, int iovcnt) {
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
+    return total;
+}
+
+bool IovecRegionDirectReady(const iovec* iov, int iovcnt, off_t offset,
+                            size_t alignment) {
+    if (offset % static_cast<off_t>(alignment) != 0) return false;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (reinterpret_cast<uintptr_t>(iov[i].iov_base) % alignment != 0) {
+            return false;
+        }
+        if (iov[i].iov_len % alignment != 0) return false;
+    }
+    return true;
+}
+
+void CopyFromIovec(char* dst, const iovec* iov, int iovcnt) {
+    for (int i = 0; i < iovcnt; ++i) {
+        std::memcpy(dst, iov[i].iov_base, iov[i].iov_len);
+        dst += iov[i].iov_len;
+    }
+}
+
+void CopyToIovec(char* src, iovec* iov, int iovcnt) {
+    for (int i = 0; i < iovcnt; ++i) {
+        std::memcpy(iov[i].iov_base, src, iov[i].iov_len);
+        src += iov[i].iov_len;
+    }
+}
+
+}  // namespace
+
 tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
                                                         int iovcnt,
                                                         off_t offset) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
+    if (!iov || iovcnt <= 0)
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
+
+    const size_t total = IovecTotalLen(iov, iovcnt);
+    if (total == 0) return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
+
     auto start = std::chrono::steady_clock::now();
-    auto res =
-        SharedUringRing::instance().vector_write(fd_, iov, iovcnt, offset);
+    tl::expected<size_t, ErrorCode> res;
+
+    if (!use_direct_io_ ||
+        IovecRegionDirectReady(iov, iovcnt, offset, ALIGNMENT_)) {
+        res = SharedUringRing::instance().vector_write(fd_, iov, iovcnt,
+                                                       offset);
+    } else {
+        const off_t aligned_off = offset & ~static_cast<off_t>(ALIGNMENT_ - 1);
+        const size_t head = static_cast<size_t>(offset - aligned_off);
+        const size_t span = head + total;
+        const size_t aligned_len =
+            ((span + ALIGNMENT_ - 1) / ALIGNMENT_) * ALIGNMENT_;
+
+        void* bounce = alloc_aligned_buffer(aligned_len);
+        if (!bounce) return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+
+        // Preserve bytes outside [offset, offset+total) within the aligned
+        // region; otherwise padding would clobber neighboring data.
+        const bool needs_rmw = (head != 0) || (aligned_len != total);
+        if (needs_rmw) {
+            auto read_res = SharedUringRing::instance().read(
+                fd_, bounce, aligned_len, aligned_off);
+            if (!read_res) {
+                std::memset(bounce, 0, aligned_len);
+            } else if (read_res.value() < aligned_len) {
+                std::memset(static_cast<char*>(bounce) + read_res.value(), 0,
+                            aligned_len - read_res.value());
+            }
+        }
+        CopyFromIovec(static_cast<char*>(bounce) + head, iov, iovcnt);
+
+        res = SharedUringRing::instance().write(fd_, bounce, aligned_len,
+                                                aligned_off);
+        free_aligned_buffer(bounce);
+
+        if (res && res.value() >= span) {
+            res = total;
+        } else if (res) {
+            res = make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+        }
+    }
+
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)
                   .count();
@@ -808,13 +890,41 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
                                                        int iovcnt,
                                                        off_t offset) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
+    if (!iov || iovcnt <= 0)
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
 
-    size_t expected_bytes = 0;
-    for (int i = 0; i < iovcnt; ++i) expected_bytes += iov[i].iov_len;
+    const size_t expected_bytes = IovecTotalLen(iov, iovcnt);
+    if (expected_bytes == 0)
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
+
     auto start = std::chrono::steady_clock::now();
+    tl::expected<size_t, ErrorCode> res;
 
-    auto res =
-        SharedUringRing::instance().vector_read(fd_, iov, iovcnt, offset);
+    if (!use_direct_io_ ||
+        IovecRegionDirectReady(iov, iovcnt, offset, ALIGNMENT_)) {
+        res =
+            SharedUringRing::instance().vector_read(fd_, iov, iovcnt, offset);
+    } else {
+        const off_t aligned_off = offset & ~static_cast<off_t>(ALIGNMENT_ - 1);
+        const size_t head = static_cast<size_t>(offset - aligned_off);
+        const size_t span = head + expected_bytes;
+        const size_t aligned_len =
+            ((span + ALIGNMENT_ - 1) / ALIGNMENT_) * ALIGNMENT_;
+
+        void* bounce = alloc_aligned_buffer(aligned_len);
+        if (!bounce) return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+
+        res = SharedUringRing::instance().read(fd_, bounce, aligned_len,
+                                               aligned_off);
+        if (res && res.value() >= span) {
+            CopyToIovec(static_cast<char*>(bounce) + head,
+                        const_cast<iovec*>(iov), iovcnt);
+            res = expected_bytes;
+        } else if (res) {
+            res = make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+        }
+        free_aligned_buffer(bounce);
+    }
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)
