@@ -12,31 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod memory_pool;
-mod transfer_engine;
+//! Transfer Engine throughput benchmark (initiator / target), analogous to
+//! `transfer_engine_bench.cpp`.
+//!
+//! ```bash
+//! cargo run --example transfer_engine_bench --release -- \
+//!   --metadata-server http://127.0.0.1:8080/metadata \
+//!   --mode target
+//! cargo run --example transfer_engine_bench --release -- \
+//!   --metadata-server http://127.0.0.1:8080/metadata \
+//!   --mode initiator --segment-id <target-ip>
+//! ```
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use dns_lookup::{get_hostname, getaddrinfo, AddrInfoHints, SockType};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
-use std::{net::IpAddr, time::Instant};
+use std::time::{Duration, Instant};
 use tracing::{error, info};
-use transfer_engine::{OpcodeEnum, TransferEngine, TransferRequest, TransferStatusEnum};
+use transfer_engine_rust::{
+    MemoryPool, Opcode, TransferEngine, TransferRequest, TransferStatusCode,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    #[clap(long, default_value_t = String::from("localhost:2379"), help = "etcd server host address")]
+    #[clap(long, default_value_t = String::from("localhost:2379"), help = "etcd / metadata server address")]
     pub metadata_server: String,
 
-    #[clap(long, default_value_t = String::from("initiator"), value_parser = ["initiator", "target"], 
+    #[clap(long, default_value_t = String::from("initiator"), value_parser = ["initiator", "target"],
     help = "Running mode: initiator or target. Initiator node read/write data blocks from target node")]
     pub mode: String,
 
-    #[clap(long, default_value_t = String::from("read"), value_parser = ["read", "write"], 
+    #[clap(long, default_value_t = String::from("read"), value_parser = ["read", "write"],
     help = "Operation type: read or write")]
     pub operation: String,
 
@@ -61,6 +72,9 @@ pub struct Args {
 
     #[clap(long, default_value_t = 4, help = "Task submission threads")]
     pub threads: i32,
+
+    #[clap(long, default_value_t = String::from("tcp"), help = "Transport protocol (tcp, rdma, efa)")]
+    pub protocol: String,
 }
 
 fn get_host_ip() -> Result<String> {
@@ -88,7 +102,6 @@ fn get_host_ip() -> Result<String> {
     bail!("No non-loopback IP address found")
 }
 
-/// Allocate memory pool of the given size.
 fn allocate_memory_pool(size: usize) -> *mut u8 {
     let mut buffer = vec![0u8; size].into_boxed_slice();
     let ptr = buffer.as_mut_ptr();
@@ -96,7 +109,6 @@ fn allocate_memory_pool(size: usize) -> *mut u8 {
     ptr
 }
 
-/// Free the allocated memory pool.
 unsafe fn free_memory_pool(ptr: *mut u8, size: usize) {
     if !ptr.is_null() {
         let _buffer = Vec::from_raw_parts(ptr, size, size);
@@ -110,12 +122,12 @@ fn initiator_worker(
     engine: Arc<TransferEngine>,
     segment_id: i32,
     thread_id: i32,
-    pool: Arc<memory_pool::MemoryPool>,
+    pool: Arc<MemoryPool>,
     total_batch_count: Arc<AtomicUsize>,
 ) -> Result<()> {
     let opcode = match args.operation.as_str() {
-        "read" => OpcodeEnum::Read,
-        "write" => OpcodeEnum::Write,
+        "read" => Opcode::Read,
+        "write" => Opcode::Write,
         _ => bail!("Unsupported operation: must be 'read' or 'write'"),
     };
     while RUNNING.load(Ordering::SeqCst) {
@@ -125,23 +137,22 @@ fn initiator_worker(
             let source_offset = args.block_size * (i * args.threads + thread_id);
             requests.push(TransferRequest {
                 opcode,
-                source: pool.offset(source_offset as isize) as *mut _,
+                source: pool.offset(source_offset as usize) as *mut _,
                 target_id: segment_id,
                 target_offset: args.target_base + source_offset as u64,
                 length: args.block_size as u64,
             });
         }
 
-        engine.submit_transfer(batch_id, &mut requests)?;
+        unsafe { engine.submit_transfer(batch_id, &requests)? };
 
-        for task_id in 0..args.batch_size {
-            let mut completed = false;
-            while !completed {
-                let (status, _) = engine.get_transfer_status(batch_id, task_id as u64)?;
-                if status == TransferStatusEnum::Completed as i32
-                    || status == TransferStatusEnum::Failed as i32
+        for task_id in 0..args.batch_size as usize {
+            loop {
+                let status = engine.get_transfer_status(batch_id, task_id)?;
+                if status.status == TransferStatusCode::Completed
+                    || status.status == TransferStatusCode::Failed
                 {
-                    completed = true;
+                    break;
                 }
             }
         }
@@ -155,17 +166,21 @@ fn initiator_worker(
 
 fn initiator(args: Args) -> Result<()> {
     let args = Arc::new(args);
-    let engine = Arc::new(TransferEngine::new(
+    let local = get_host_ip()?;
+    let engine = Arc::new(TransferEngine::initialize(
+        &format!("{local}:12345"),
         &args.metadata_server,
-        &get_host_ip()?,
-        12345,
+        &args.protocol,
+        "",
     )?);
 
     let dram_buffer_size = 1 << 30;
-    let pool = Arc::new(memory_pool::MemoryPool::new(dram_buffer_size));
-    engine.register_local_memory(pool.offset(0) as *mut _, dram_buffer_size, "cpu:0")?;
+    let pool = Arc::new(MemoryPool::new(dram_buffer_size));
+    unsafe {
+        engine.register_local_memory(pool.as_void_ptr(), dram_buffer_size, "cpu:0")?;
+    }
 
-    let segment_id = engine.open_segment(args.segment_id.clone())?;
+    let segment_id = engine.open_segment(&args.segment_id)?;
     let total_batch_count = Arc::new(AtomicUsize::new(0));
     let start_time = Instant::now();
     let mut workers = vec![];
@@ -187,7 +202,7 @@ fn initiator(args: Args) -> Result<()> {
     }
 
     thread::sleep(Duration::from_secs(args.duration as u64));
-    RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    RUNNING.store(false, Ordering::SeqCst);
 
     for worker in workers {
         worker.join().unwrap()?;
@@ -203,22 +218,28 @@ fn initiator(args: Args) -> Result<()> {
         (batch_count * args.batch_size as usize * args.block_size as usize) as f64 / duration / 1e9
     );
 
-    engine.unregister_local_memory(pool.offset(0) as *mut _)?;
+    unsafe {
+        engine.unregister_local_memory(pool.as_void_ptr())?;
+    }
 
     Ok(())
 }
 
 fn target(args: Args) -> Result<()> {
-    let engine = TransferEngine::new(
+    let local = get_host_ip()?;
+    let engine = TransferEngine::initialize(
+        &format!("{local}:12345"),
         &args.metadata_server,
-        &get_host_ip()?,
-        12345,
+        &args.protocol,
+        "",
     )?;
 
     let dram_buffer_size = 1 << 30;
     let addr = allocate_memory_pool(dram_buffer_size);
 
-    engine.register_local_memory(addr as *mut _, dram_buffer_size, "cpu:0")?;
+    unsafe {
+        engine.register_local_memory(addr as *mut _, dram_buffer_size, "cpu:0")?;
+    }
 
     loop {
         thread::sleep(Duration::from_secs(1));
@@ -226,8 +247,8 @@ fn target(args: Args) -> Result<()> {
 
     #[allow(unreachable_code)]
     {
-        engine.unregister_local_memory(addr as *mut _)?;
         unsafe {
+            engine.unregister_local_memory(addr as *mut _)?;
             free_memory_pool(addr, dram_buffer_size);
         }
         Ok(())
@@ -235,6 +256,7 @@ fn target(args: Args) -> Result<()> {
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
     info!("args: {:?}", args);
 

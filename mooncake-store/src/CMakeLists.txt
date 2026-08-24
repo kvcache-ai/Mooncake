@@ -63,6 +63,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
+    client_buffer_allocation.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp
@@ -84,6 +85,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    config/file_storage_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp

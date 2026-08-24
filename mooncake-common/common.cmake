@@ -165,7 +165,7 @@ option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE
-       "build the Rust interface and sample code for the transfer engine" OFF)
+       "build the Transfer Engine Rust library and sample code" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
 option(USE_EVENT_DRIVEN_COMPLETION
@@ -666,5 +666,13 @@ if(NOT TARGET gflags::gflags)
     endif()
   endforeach()
 endif()
-find_package(yalantinglibs CONFIG REQUIRED)
+if(SKBUILD AND EXISTS "${CMAKE_SOURCE_DIR}/extern/yalantinglibs/CMakeLists.txt")
+  set(YLT_ENABLE_IBV
+      ON
+      CACHE BOOL "Enable yalantinglibs ibverbs support" FORCE)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/extern/yalantinglibs"
+                   "${CMAKE_BINARY_DIR}/_deps/yalantinglibs" EXCLUDE_FROM_ALL)
+else()
+  find_package(yalantinglibs CONFIG REQUIRED)
+endif()
 add_compile_definitions(YLT_ENABLE_IBV)

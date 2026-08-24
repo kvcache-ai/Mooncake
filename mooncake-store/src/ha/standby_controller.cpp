@@ -83,7 +83,7 @@ class NoopStandbyController final : public StandbyController {
 
     tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport()
         override {
-        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        return PromotionContext{};
     }
 
     void UpdateObservedLeader(const std::optional<MasterView>&) override {}
