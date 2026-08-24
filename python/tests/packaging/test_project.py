@@ -57,6 +57,30 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
 
 
+def test_async_store_has_one_authoritative_source() -> None:
+    canonical_module = REPOSITORY_ROOT / "python" / "mooncake" / "async_store.py"
+    legacy_module = (
+        REPOSITORY_ROOT / "mooncake-integration" / "store" / "async_store.py"
+    )
+
+    assert canonical_module.is_file()
+    assert not legacy_module.exists()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "test_async_store.py"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "async_store_integration.py"
+    ).is_file()
+    assert not (REPOSITORY_ROOT / "scripts" / "test_async_store.py").exists()
+
+    cmake = (REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt").read_text()
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert '../python/mooncake/async_store.py"' in cmake
+    assert 'CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py"' not in cmake
+    assert "cp python/mooncake/async_store.py " in legacy_builder
+    assert "cp mooncake-integration/store/async_store.py " not in legacy_builder
+
+
 def test_pg_extension_build_stages_outside_the_source_tree(
     tmp_path: Path,
 ) -> None:
