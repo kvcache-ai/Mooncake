@@ -256,13 +256,25 @@ void MooncakeWorker::putTaskCuda(
     const auto issue_stream =
         GpuStream::borrow(issueStream, cuda_device_index_);
     const auto& enq_stream = enqueue_stream_.value();
-
-    GpuEvent event_start(issue_stream.deviceIndex());
-    event_start.record(issue_stream);
-    enq_stream.waitEvent(event_start);
-
+    cudaStreamCaptureStatus issue_capture = cudaStreamCaptureStatusNone;
+    cudaStreamCaptureStatus enq_capture = cudaStreamCaptureStatusNone;
+    PG_ASSERT_CUDA(cudaStreamIsCapturing(issue_stream.get(), &issue_capture));
+    PG_ASSERT_CUDA(cudaStreamIsCapturing(enq_stream.get(), &enq_capture));
+    const bool is_capturing =
+        issue_capture != cudaStreamCaptureStatusNone ||
+        enq_capture != cudaStreamCaptureStatusNone;
+    if (is_capturing) {
+        GpuEvent event_start(issue_stream.deviceIndex());
+        event_start.record(issue_stream);
+        enq_stream.waitEvent(event_start);
+    } else {
+        // Do not create an eager cross-stream cycle with the completion wait
+        // installed by the preceding collective on issue_stream.
+        PG_ASSERT_CUDA(cudaStreamSynchronize(issue_stream.get()));
+    }
     std::vector<CudaTaskSubmissionToken> submitted_tasks;
     submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
+
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
         size_t realSize = std::min(tensorSize, pos + chunkSize) - pos;
         int taskId = cudaTaskCount % 2 + 2;
@@ -290,15 +302,19 @@ void MooncakeWorker::putTaskCuda(
         ++meta->taskCount;
     }
 
-    // During CUDA graph capture the kernels are recorded but not executed, so
-    // waiting for the worker thread to observe them would hang.
-    if (!issue_stream.isCapturing()) {
+    // With one enqueue stream per task slot, the worker can observe the
+    // enqueue kernel without waiting on an issue-stream event from another
+    // slot.  Retain this gate so the caller never advances while task
+    // metadata is still only queued on the GPU.
+    if (!is_capturing) {
         waitUntilTasksSubmitted(submitted_tasks);
+        PG_ASSERT_CUDA(cudaStreamSynchronize(enq_stream.get()));
     }
 
     GpuEvent event_end(enq_stream.deviceIndex());
     event_end.record(enq_stream);
     issue_stream.waitEvent(event_end);
+    PG_ASSERT_CUDA(cudaStreamSynchronize(issue_stream.get()));
 }
 
 }  // namespace mooncake

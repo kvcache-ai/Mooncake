@@ -98,14 +98,8 @@ void MooncakeWorkTracker::notifyCapture(bool capturing) noexcept {
 }
 
 void MooncakeWorkTracker::evictCompleted() noexcept {
-    // Skip eviction while any captured Work objects are still live.  Each
-    // MooncakeWorkCuda created during capture calls notifyCapture(true) and
-    // its destructor calls notifyCapture(false), so capture_depth_ > 0 means
-    // at least one captured work is still referenced.  cudaEventQuery on any
-    // event is illegal while a capture is in progress in the context, so we
-    // must not call ready_to_release() until after all captures end.
+    // cudaEventQuery is illegal while any captured work is still live.
     if (capture_depth_.load(std::memory_order_relaxed) > 0) return;
-
     std::vector<RetiredResources> candidates;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -116,14 +110,8 @@ void MooncakeWorkTracker::evictCompleted() noexcept {
     std::vector<RetiredResources> pending;
     pending.reserve(candidates.size());
     for (auto& candidate : candidates) {
-        // Clear any sticky CUDA error before querying the event.  A prior
-        // operation on this thread (or a cross-thread capture that shares the
-        // CUDA context) may have left cudaErrorIllegalAddress set.  Calling
-        // cudaEventQuery while the context has a sticky error always fails.
-        cudaGetLastError();
-        bool released = false;
         try {
-            released = candidate.ready_to_release();
+            if (candidate.ready_to_release()) continue;
         } catch (const std::exception& error) {
             TORCH_WARN(
                 "MooncakeWorkTracker: failed to process retired work; "
@@ -134,13 +122,8 @@ void MooncakeWorkTracker::evictCompleted() noexcept {
                 "MooncakeWorkTracker: failed to process retired work; "
                 "resources remain retained: unknown exception");
         }
-        // Clear any sticky error set by the query itself.
-        cudaGetLastError();
-        if (released) continue;
         pending.push_back(std::move(candidate));
     }
-    // Final clear: ensure no sticky error escapes this function.
-    cudaGetLastError();
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (is_shutdown_) return;
@@ -246,10 +229,8 @@ MooncakeWorkCuda::MooncakeWorkCuda(c10d::OpType opType,
 MooncakeWorkCuda::~MooncakeWorkCuda() {
     if (!tracker_) return;
     if (is_captured_) {
-        // Decrement the capture depth counter that was incremented when this
-        // work was created.  This allows evictCompleted() to resume once all
-        // captured work objects have been destroyed (i.e. after graph replay
-        // has released its references).
+        // Captured graph resources remain valid until the graph has released
+        // its references; the tracker owns them through shutdown.
         tracker_->notifyCapture(false);
         tracker_->retainUntilShutdown(makeTrackedResources(
             std::move(event_), std::move(failed_ranks_hint_),

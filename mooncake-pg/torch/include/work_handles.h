@@ -47,12 +47,8 @@ class MooncakeWorkTracker final {
     void evictCompleted() noexcept;
     void shutdown() noexcept;
 
-    // Called by launchCollective/launchP2P/barrier to inform the tracker that
-    // a CUDA graph capture is in progress.  evictCompleted() skips event
-    // queries while capture_depth_ > 0 because cudaEventQuery is illegal
-    // during any active capture on the CUDA context.
-    // notifyCapture(true)  — enter capture (increment depth)
-    // notifyCapture(false) — leave capture  (decrement depth)
+    // Captured CUDA work stays retained while graph capture is active because
+    // querying its event is illegal on a capturing CUDA context.
     void notifyCapture(bool capturing) noexcept;
 
    private:
@@ -74,8 +70,6 @@ class MooncakeWorkTracker final {
     std::vector<RetiredResources> retired_;
     std::vector<std::any> retained_until_shutdown_;
     bool is_shutdown_ = false;
-    // Incremented by notifyCapture(true), decremented by notifyCapture(false).
-    // evictCompleted() skips when > 0.
     std::atomic<int> capture_depth_{0};
 };
 
@@ -106,12 +100,7 @@ class MooncakeWorkCpu : public ::c10d::Work {
 
 class MooncakeWorkCuda : public ::c10d::Work {
    public:
-    // is_captured: true when the collective's stream is in CUDA graph capture
-    // mode.  When true, the work is retained until shutdown rather than being
-    // queried via cudaEventQuery (which is illegal during capture).  Callers
-    // should pass the result of cudaStreamIsCapturing on the collective's own
-    // stream, NOT at::cuda::currentStreamCaptureStatus(), because in TBO the
-    // EP stream may be capturing while the thread-default stream is not.
+    // The capture state is supplied by the collective's actual CUDA stream.
     MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<c10::Event> event,
                      FailedRanksHint failedRanksHint,
                      std::shared_ptr<MooncakeWorkTracker> tracker,

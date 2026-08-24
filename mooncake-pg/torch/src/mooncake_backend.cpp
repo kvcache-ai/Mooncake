@@ -435,20 +435,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::launchCollective(
     checkResult(GpuFn(args..., comm_, convertStream(stream),
                       failed_ranks_hint.data(), failed_ranks_hint_count),
                 operation);
-    // The EP GPU kernel (dispatch/combine) may leave a sticky CUDA error on
-    // the device even when it returns success.  Clear it now so that
-    // subsequent CUDA API calls (event->record, cudaStreamIsCapturing) and
-    // Flash Attention kernels on the same context are not poisoned.
+    // Clear a sticky error before recording the completion event and checking
+    // capture state on the collective's stream.
     cudaGetLastError();
     if (postCompletion) postCompletion();
     auto event = std::make_shared<c10::Event>(kGpuDeviceType);
     event->record(stream);
-    // Guard on the collective's own stream rather than the thread-default
-    // stream.  In TBO, EP and TP may use different streams; if the TP stream
-    // is being captured while the EP stream is not (or vice-versa),
-    // currentStreamCaptureStatus() misses the capture and evictCompleted()
-    // would call cudaEventQuery on events belonging to a stream that is in
-    // capture mode, triggering cudaErrorIllegalAddress.
     cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
     cudaStreamIsCapturing(stream.stream(), &captureStatus);
     const bool is_captured = captureStatus != cudaStreamCaptureStatusNone ||
