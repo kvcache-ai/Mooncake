@@ -197,8 +197,6 @@ TEST_F(NVMeofTransportTest, MultipleRead) {
                      kDataLength);
         ASSERT_EQ(ret, 0);
     }
-    engine->unregisterLocalMemory(addr);
-    freeMemoryPool(addr, ram_buffer_size);
 }
 
 }  // namespace mooncake
