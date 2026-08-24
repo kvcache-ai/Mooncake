@@ -135,7 +135,9 @@ int MsgChannel::createResources() {
         destroyResources();
         return ERR_ENDPOINT;
     }
-    context_.registerMsgChannel(this);
+    // construct() only runs from connectActive() / acceptPassive(), i.e. after
+    // make_shared has published the owner.
+    context_.registerMsgChannel(shared_from_this());
     registered_with_context_ = true;
     return 0;
 }
@@ -508,9 +510,16 @@ void MsgChannel::dispatchRecv(size_t idx, size_t byte_len) {
 }
 
 int MsgChannel::pollCompletions(int max_entries) {
-    if (!cq_) return 0;
     std::vector<ibv_wc> wc(static_cast<size_t>(max_entries));
-    int n = ibv_poll_cq(cq_, max_entries, wc.data());
+    int n = 0;
+    {
+        // disconnect() destroys cq_ under this lock, so the null check and the
+        // poll must be atomic with respect to it. The WC loop below stays out:
+        // it re-takes the lock and dispatchRecv() re-enters the transport.
+        std::lock_guard<std::mutex> lock(resource_mutex_);
+        if (!cq_) return 0;
+        n = ibv_poll_cq(cq_, max_entries, wc.data());
+    }
     if (n < 0) return n;
     for (int i = 0; i < n; ++i) {
         if (wc[i].status != IBV_WC_SUCCESS) {
