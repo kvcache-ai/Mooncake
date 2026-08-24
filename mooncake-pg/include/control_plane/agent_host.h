@@ -23,6 +23,7 @@ class RpcServer;
 class RpcClient;
 class MooncakeCommunicator;
 class DeviceTransferService;
+class DeviceCollectiveWorkspace;
 
 // =========================================================================
 // Control Plane Architecture (Agent side)
@@ -128,6 +129,7 @@ class AgentHost : public AgentInterface {
     AgentHost(std::string coordinator_addr, const std::string& host_ip,
               GlobalRank rank, int max_world_size,
               DeviceTransferService* device_transfer_service,
+              DeviceCollectiveWorkspace* device_collective_workspace,
               LinkManager& link_manager,
               int64_t fault_reconciliation_window_us);
 
@@ -178,6 +180,7 @@ class AgentHost : public AgentInterface {
     SerializedExecutor executor_;
 
     DeviceTransferService* device_transfer_service_ = nullptr;
+    DeviceCollectiveWorkspace* device_collective_workspace_ = nullptr;
     LinkManager& link_manager_;
 
     std::string host_ip_;

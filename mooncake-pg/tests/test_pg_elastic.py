@@ -705,15 +705,14 @@ def _replacement_recovery_worker(
         # Round 1: all healthy
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        # CUDA Work completion orders the current stream without blocking the
+        # host. Finish Round 1 before the broken rank exits so this round is
+        # actually observed as a healthy collective by every participant.
+        ctx.synchronize()
 
         if logical_rank == BROKEN_RANK:
             if graceful_group_destroy:
                 backend = ctx.get_backend()
-                # CUDA Work::wait() orders the current stream but does not
-                # block the host until the collective finishes. Complete
-                # Round 1 before deactivate_ranks changes the active-rank
-                # view used by that collective.
-                ctx.synchronize()
                 resp = pg.deactivate_ranks(backend, [logical_rank])
                 assert resp.status == pg.ProposalStatus.Applied, \
                     "graceful self-deactivation should apply, " \
@@ -737,6 +736,10 @@ def _replacement_recovery_worker(
         # Round 2: run collective without the departed rank.
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        # Control-plane calls are not ordered behind work on the CUDA stream.
+        # Wait until the failed collective's automatic synchronization has
+        # applied the reduced view before starting the replacement workflow.
+        ctx.synchronize()
 
         # Signal that we're ready for replacement
         if logical_rank == 0:

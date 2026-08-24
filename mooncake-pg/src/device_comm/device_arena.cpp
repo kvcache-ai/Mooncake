@@ -95,31 +95,36 @@ PGResult<DeviceArenaSlice> DeviceArena::allocate(size_t size,
     PG_VALIDATE_ARG(size != 0, "DeviceArena slice is empty");
     PG_VALIDATE_ARG(alignment != 0, "DeviceArena alignment is zero");
 
-    // Align relative offsets independently of the process-local base so peers
-    // with identical allocation histories have identical layouts. The base
-    // must therefore satisfy the requested alignment itself.
-    PG_VALIDATE_ARG(reinterpret_cast<uintptr_t>(base_) % alignment == 0,
-                    "DeviceArena base does not satisfy slice alignment");
+    const uint64_t base_address = reinterpret_cast<uintptr_t>(base_);
 
     for (auto current = free_ranges_.begin(); current != free_ranges_.end();
          ++current) {
-        const uint64_t range_begin = current->first;
+        const uint64_t range_begin_offset = current->first;
         const uint64_t range_size = current->second;
-        const auto allocation_begin = alignUp(range_begin, alignment);
-        if (!allocation_begin) continue;
-        const uint64_t prefix = *allocation_begin - range_begin;
+
+        // Align the actual device address. Relative offsets may consequently
+        // differ between ranks with different base addresses.
+        const auto allocation_address =
+            alignUp(base_address + range_begin_offset, alignment);
+        if (!allocation_address) continue;
+        const uint64_t allocation_begin_offset =
+            *allocation_address - base_address;
+        const uint64_t prefix = allocation_begin_offset - range_begin_offset;
         if (prefix > range_size || size > range_size - prefix) continue;
 
-        const uint64_t allocation_end =
-            *allocation_begin + static_cast<uint64_t>(size);
-        const uint64_t range_end = range_begin + range_size;
+        const uint64_t allocation_end_offset =
+            allocation_begin_offset + static_cast<uint64_t>(size);
+        const uint64_t range_end_offset = range_begin_offset + range_size;
         free_ranges_.erase(current);
-        if (prefix != 0) free_ranges_.emplace(range_begin, prefix);
-        if (allocation_end != range_end) {
-            free_ranges_.emplace(allocation_end, range_end - allocation_end);
+        if (prefix != 0) {
+            free_ranges_.emplace(range_begin_offset, prefix);
         }
-        allocations_.emplace(*allocation_begin, size);
-        return DeviceArenaSlice(*this, *allocation_begin, size);
+        if (allocation_end_offset != range_end_offset) {
+            free_ranges_.emplace(allocation_end_offset,
+                                 range_end_offset - allocation_end_offset);
+        }
+        allocations_.emplace(allocation_begin_offset, size);
+        return DeviceArenaSlice(*this, allocation_begin_offset, size);
     }
     return makePGError(PGErrorCode::ResourceBusy,
                        "DeviceArena has no sufficiently large free range");

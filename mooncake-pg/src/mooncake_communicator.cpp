@@ -17,6 +17,7 @@
 #include "memory_location.h"
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 #include "device_comm/device_collective/device_collective.h"
+#include "device_comm/device_collective/device_collective_workspace.h"
 #include "device_comm/device_collective/strong_stream.h"
 #endif
 
@@ -196,9 +197,11 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
     auto arena =
         DeviceArena::create(device_index, transfer_service->regionAddr(),
                             transfer_service->regionSize());
-    PG_TRY(auto workspace,
-           arena->allocate(kDeviceCollectiveWorkspaceSize,
-                           kDeviceCollectiveWorkspaceAlignment));
+    PG_TRY(auto workspace, DeviceCollectiveWorkspace::create(
+                               *arena, static_cast<GlobalRank>(rank),
+                               static_cast<uint32_t>(world_size),
+                               kDeviceCollectiveBufferCapacity,
+                               kDeviceCollectiveWorkspaceAlignment));
 
     PG_TRY(auto strong_stream, StrongStream::create(device_index));
 
@@ -207,7 +210,7 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
 
     device_transfer_service = std::move(transfer_service);
     device_arena = std::move(arena);
-    device_collective_workspace.emplace(std::move(workspace));
+    device_collective_workspace = std::move(workspace);
     device_collective_strong_stream = std::move(strong_stream);
     device_collective_recovery_worker = std::move(recovery_worker);
 #endif
@@ -253,12 +256,15 @@ PGResult<void> MooncakePGContext::connectCoordinator(
                     "coordinator address must not be empty");
     if (!agent_host) {
         DeviceTransferService* transfer_service = nullptr;
+        DeviceCollectiveWorkspace* collective_workspace = nullptr;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
         transfer_service = device_transfer_service.get();
+        collective_workspace = device_collective_workspace.get();
 #endif
         auto candidate = std::make_unique<AgentHost>(
             coordinator_address, host_ip, global_rank, max_world_size,
-            transfer_service, link_manager, fault_reconciliation_window_us);
+            transfer_service, collective_workspace, link_manager,
+            fault_reconciliation_window_us);
         PG_TRY(candidate->start());
         agent_host = std::move(candidate);
     }
@@ -598,10 +604,10 @@ PGResult<void> MooncakeCommunicator::initialize(
     }
 
     // Initial local endpoint info.
-    std::optional<DeviceCollectiveEndpoint> device_collective_endpoint;
+    DeviceCollectiveProtocolEndpoints device_collective_endpoints;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     if (device_collective_) {
-        device_collective_endpoint = device_collective_->localEndpoint();
+        device_collective_endpoints = device_collective_->localEndpoints();
     }
 #endif
     meta_->segmentInfos[rank_] = GroupEndpointInfo{
@@ -616,7 +622,7 @@ PGResult<void> MooncakeCommunicator::initialize(
         .p2p_credit_region =
             reinterpret_cast<uint64_t>(p2p_proxy_->credit_region()),
         .p2p_ack_region = reinterpret_cast<uint64_t>(p2p_proxy_->ack_region()),
-        .collective_v2 = std::move(device_collective_endpoint),
+        .device_collective = std::move(device_collective_endpoints),
     };
 
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2

@@ -9,7 +9,7 @@ if(USE_CUDA)
   enable_language(CUDA)
   set(_pg_device_input
       "${_pg_device_source}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/device_collective.cu")
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/protocols/ring/ring_all_reduce.cu")
 elseif(USE_MUSA OR USE_MACA)
   set(_pg_device_object
       "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.o")
@@ -144,12 +144,15 @@ if(USE_CUDA)
     mooncake_pg
     PRIVATE
       device_comm/device_arena.cpp
+      device_comm/device_primitives/payload_writer.cpp
       device_comm/device_transfer/transfer_service.cpp
       device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cpp
       device_comm/device_transfer/routes/host_proxy_route/host_transfer_proxy.cpp
       device_comm/device_transfer/routes/p2p_route/p2p_route.cpp
       device_comm/device_collective/device_collective.cpp
+      device_comm/device_collective/device_collective_workspace.cpp
       device_comm/device_collective/device_collective_recovery.cpp
+      device_comm/device_collective/protocols/ring/ring_all_reduce.cpp
       device_comm/device_collective/strong_stream.cpp)
 endif()
 

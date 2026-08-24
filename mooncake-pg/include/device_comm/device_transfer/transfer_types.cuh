@@ -5,13 +5,15 @@
 
 #include <cuda_alike.h>
 
+#include "common_types.h"
+
 namespace mooncake {
 
 class TransferLane;
 
 // Each lane owns one fixed submission slot.
 // The caller decides how lanes map to its work.
-inline constexpr uint32_t kTransferLaneCount = 4;
+inline constexpr uint32_t kTransferLaneCount = 32;
 
 enum class DeviceRouteKind : uint32_t {
     Unreachable = 0,
@@ -61,6 +63,32 @@ struct DeviceTransferHandle {
 
     uint32_t max_world_size = 0;
 
+    // Return a byte address relative to the local registered service region.
+    // The caller remains responsible for validating the complete accessed
+    // range against local_region_size.
+    [[nodiscard]] __device__ __forceinline__ char* localPtr(
+        uint64_t local_offset) const {
+        return static_cast<char*>(local_region) + local_offset;
+    }
+
+    // Return a directly addressable pointer into a peer's registered region.
+    // A null result means the selected route is not directly addressable. This
+    // capability query never allocates or falls back to staging.
+    [[nodiscard]] __device__ __forceinline__ void* remotePtr(
+        GlobalRank rank, uint64_t remote_offset) const {
+        const auto& route = routes[rank];
+        if (route.kind != DeviceRouteKind::P2p) return nullptr;
+        return reinterpret_cast<char*>(
+                   static_cast<uintptr_t>(route.p2p.mapped_region_address)) +
+               remote_offset;
+    }
+
+    // Return the route currently selected for a peer.
+    [[nodiscard]] __device__ __forceinline__ DeviceRouteKind
+    routeKind(GlobalRank rank) const {
+        return routes[rank].kind;
+    }
+
     // Return a lightweight view of one fixed service lane.
     __device__ __forceinline__ TransferLane lane(uint32_t lane_index) const;
 };
@@ -73,21 +101,33 @@ struct SignalAdd {
     uint64_t delta = 1;
 };
 
-// One standalone remote notification operation. It does not order unrelated
-// payload operations.
+struct SignalAction {
+    enum class Kind : uint32_t {
+        None = 0,
+        Add = 1,
+    };
+
+    Kind kind = Kind::None;
+    // Meaningful only when kind is Add.
+    SignalAdd add;
+};
+
+// One CTA-collective remote notification operation. Before updating the
+// counter, signal() releases the calling CTA's preceding direct memory
+// accesses. It does not order independently submitted transfer operations.
 struct SignalRequest {
-    SignalAdd signal;
+    SignalAction signal;
     uint64_t timeout_ticks = 0;
 };
 
-// Transfer one payload and then add to the attached remote notification
-// counter. Observing the counter update implies that this attached payload is
-// visible, but says nothing about unrelated operations.
-struct PutAndSignalRequest {
+// Transfer one payload between registered-region offsets.
+// When signal is not None, observing the attached notification implies this
+// payload is visible, but says nothing about unrelated transfer operations.
+struct PutRequest {
     uint64_t local_offset = 0;
     uint64_t remote_offset = 0;
     uint64_t size = 0;
-    SignalAdd signal;
+    SignalAction signal;
     uint64_t timeout_ticks = 0;
 };
 
