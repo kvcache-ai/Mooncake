@@ -72,7 +72,7 @@
         case 3072:                                         \
             case_macro(3072); /* for gpt-oss */            \
         case 3584:                                         \
-            case_macro(3584); /* for Kimi K3 */             \
+            case_macro(3584); /* for Kimi K3 */            \
         case 4096:                                         \
             case_macro(4096);                              \
         case 5120:                                         \
