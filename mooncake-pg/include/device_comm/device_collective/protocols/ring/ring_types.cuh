@@ -131,12 +131,10 @@ struct RingPeerTarget {
 
 // Complete published resource and topology binding read by a Ring AllReduce
 // kernel. Rolling sequence state lives next to it in RingAllReduceDeviceState.
-// publish() replaces the Plan while protocol execution is quiescent, so a
-// kernel needs only the state pointer and its per-invocation request.
+// A control update replaces the Plan while protocol execution is quiescent, so
+// a kernel needs only the state pointer and its per-invocation request.
 struct RingAllReducePlan {
     const DeviceTransferHandle* transfer_handle = nullptr;
-    DeviceCollectiveInvocationState* invocation_state = nullptr;
-    DeviceCollectiveRecoveryMailbox* recovery_mailbox = nullptr;
     uint64_t timeout_ticks = 0;
 
     // Local bindings are concrete addresses. Peer bindings remain offsets in
@@ -164,6 +162,8 @@ using RingAllReducePlanSlot = DevicePlanSlot<RingAllReducePlan>;
 // of this state is registered or published to peers.
 struct alignas(256) RingAllReduceDeviceState {
     RingAllReducePlanSlot plan;
+    DeviceCollectiveInvocationState* invocation_state = nullptr;
+    DeviceCollectiveRecoveryMailbox* recovery_mailbox = nullptr;
     uint64_t next_step_sequences[kMaxDeviceCollectiveChannels *
                                  kRingPipelineSlots] = {};
     uint64_t next_recv_buffer_ready_sequences[kMaxDeviceCollectiveChannels] =
@@ -181,7 +181,6 @@ struct RingAllReduceKernelArgs {
 
 cudaError_t launchRingAllReduceKernel(const RingAllReduceKernelArgs& request,
                                       RingAllReduceDeviceState* state,
-                                      uint32_t channel_count,
                                       cudaStream_t stream);
 
 }  // namespace mooncake

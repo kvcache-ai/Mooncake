@@ -317,6 +317,7 @@ class MooncakeCommunicator {
     bool active_ranks_mirror_is_device_ = false;
     int active_ranks_mirror_device_index_ = -1;
     std::optional<GpuStream> active_ranks_mirror_stream_;
+    int32_t* active_ranks_mirror_staging_ = nullptr;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     std::unique_ptr<DeviceCollectiveRuntime> device_collective_;
 #endif

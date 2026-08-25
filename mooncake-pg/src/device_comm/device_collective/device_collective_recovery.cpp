@@ -13,9 +13,10 @@
 #include <glog/logging.h>
 
 namespace mooncake {
+
 struct DeviceCollectiveRecoveryWorker::MailboxState {
     DeviceCollectiveRecoveryMailbox* mailbox = nullptr;
-    Handler handler;
+    PrepareResumeCallback prepare_resume;
 };
 
 void DeviceCollectiveRecoveryWorker::runLoop() {
@@ -44,11 +45,11 @@ void DeviceCollectiveRecoveryWorker::runLoop() {
             }
         }
 
-        auto recovered = pending->handler();
-        if (!recovered.has_value()) {
+        auto prepared_resume = pending->prepare_resume();
+        if (!prepared_resume.has_value()) {
             LOG(ERROR) << "Device collective recovery failed; the kernel "
                           "remains parked: "
-                       << recovered.error().message;
+                       << prepared_resume.error().message;
             std::lock_guard<std::mutex> lock(mutex_);
             active_mailbox_ = nullptr;
             terminated_with_error_ = true;
@@ -56,8 +57,9 @@ void DeviceCollectiveRecoveryWorker::runLoop() {
             return;
         }
 
-        // A successful handler means the runtime has published a Plan,
-        // so release the kernel waiting on this exact failure generation.
+        // The callback pinned the update before this acknowledgement. The
+        // acquire load in the parked CTA therefore observes the complete
+        // update before applying it and leaving the failed collective.
         std::atomic_ref(pending->mailbox->ready_generation)
             .store(generation, std::memory_order_release);
 
@@ -115,10 +117,11 @@ PGResult<void> DeviceCollectiveRecoveryWorker::start() {
 }
 
 PGResult<void> DeviceCollectiveRecoveryWorker::addMailbox(
-    DeviceCollectiveRecoveryMailbox* mailbox, Handler handler) {
+    DeviceCollectiveRecoveryMailbox* mailbox,
+    PrepareResumeCallback prepare_resume) {
     auto state = std::make_unique<MailboxState>();
     state->mailbox = mailbox;
-    state->handler = std::move(handler);
+    state->prepare_resume = std::move(prepare_resume);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -139,7 +142,7 @@ void DeviceCollectiveRecoveryWorker::removeMailbox(
         mailboxes_.begin(), mailboxes_.end(),
         [mailbox](const auto& current) { return current->mailbox == mailbox; });
     if (selected == mailboxes_.end()) return;
-    // Stop future scans immediately, but keep the state alive until a handler
+    // Stop future scans immediately, but keep the state alive until a callback
     // selected before the erase has finished using it.
     auto removed_state = std::move(*selected);
     auto* const removed_mailbox = removed_state->mailbox;
