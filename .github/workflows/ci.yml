@@ -183,6 +183,8 @@ jobs:
     - name: Test Mooncake PyTorch Backend (CPU Only)
       env:
         MC_FORCE_TCP: "true"
+        # The runner has CUDA headers/nvcc but no usable GPU for arch detection.
+        TORCH_CUDA_ARCH_LIST: "8.0"
       run: |
         source test_env/bin/activate
         python mooncake-pg/tests/test_pg_collectives.py
@@ -191,6 +193,7 @@ jobs:
     - name: Test PyTorch >= 2.13 Single-Buffer Collectives (CPU Only)
       env:
         MC_FORCE_TCP: "true"
+        TORCH_CUDA_ARCH_LIST: "8.0"
       run: |
         source test_env/bin/activate
         python mooncake-pg/tests/test_pg_collectives.py \
