@@ -1,4 +1,4 @@
-# Kunpeng UB Transport 
+# Kunpeng UB Transport
 Kunpeng UbTransport源代码路径为Mooncake/mooncake-transfer-engine/src/transport/kunpneg_transport，该路径下有UB协议的Transport对接代码和实现逻辑。
 
 ## 概述
@@ -33,17 +33,17 @@ Kunpeng UbTransport在Mooncake本身依赖的基础上，新增了一部分URMA�
 
 ```bash
 # 克隆 Mooncake 仓库
-git clone https://github.com/kvcache-ai/Mooncake.git 
+git clone https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
 
 # 启用 UB 传输层进行配置
-mkdir build && cd build
-cmake .. -DUSE_UB=ON \
-         -DURMA_INCLUDE_DIR=/usr/include \
-         -DURMA_LIBRARY=/usr/lib64/liburma.so
+cmake -B build -G Ninja \
+    -DUSE_UB=ON \
+    -DURMA_INCLUDE_DIR=/usr/include \
+    -DURMA_LIBRARY=/usr/lib64/liburma.so
 
 # 编译
-make -j$(nproc)
+cmake --build build
 ```
 
 **验证**

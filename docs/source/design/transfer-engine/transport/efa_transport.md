@@ -61,14 +61,11 @@ This installs all system packages, git submodules (pybind11), and Go.
 **GPU memory transfers (e.g., KV cache in vLLM):**
 
 ```bash
-mkdir build && cd build
-
-cmake .. \
+cmake -B build -G Ninja \
     -DUSE_EFA=ON \
     -DUSE_CUDA=ON \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo
-
-make -j$(nproc)
+cmake --build build
 ```
 
 > **Note:** `-DUSE_CUDA=ON` is required to transfer GPU memory (e.g., KV cache in vLLM). Without it, GPU buffers are treated as host memory, and transfers on them fail (for example with "Bad address" (EFAULT) on the TCP fallback).
@@ -76,14 +73,11 @@ make -j$(nproc)
 **No NVIDIA GPU (CPU memory, or Neuron devices):**
 
 ```bash
-mkdir build && cd build
-
-cmake .. \
+cmake -B build -G Ninja \
     -DUSE_EFA=ON \
     -DUSE_CUDA=OFF \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo
-
-make -j$(nproc)
+cmake --build build
 ```
 
 > **Note:** With `-DUSE_CUDA=OFF`, the benchmark tool uses DRAM buffers allocated via `numa_alloc_onnode`. This is useful for measuring EFA transport throughput independently of GPU hardware.
@@ -1033,9 +1027,8 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib:$LD_LIBRARY_PATH
 export LIBRARY_PATH=$CUDA_HOME/lib:$LIBRARY_PATH
 
 # Build with CUDA support
-mkdir -p build && cd build
-cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
-make -j$(nproc)
+cmake -B build -G Ninja -DUSE_EFA=ON -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build
 ```
 
 `dependencies.sh` and the venv do not interact: it requires root, installs apt packages / git submodules / Go, and runs no `pip`, so it can go either side of the `activate` — `sudo` discards the venv environment regardless. Everything that *does* depend on which Python is active happens at `cmake` time, which is why the activation has to come before it.
