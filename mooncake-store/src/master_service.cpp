@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <algorithm>
+#include <bitset>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -764,6 +765,13 @@ std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
         return std::nullopt;
     }
     return it->second.consecutive_failures;
+}
+
+TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
+    return {
+        .memory = segment_manager_.GetMemoryUsageSnapshot(),
+        .nof = nof_segment_manager_.GetUsageSnapshot(),
+    };
 }
 
 bool MasterService::IsTenantQuotaEnabled() const {
@@ -8556,8 +8564,7 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     // Watermark gate: don't promote if DRAM is already under eviction
     // pressure. The check is best-effort (state can change between this
     // sample and the actual allocation in PromotionAllocStart).
-    const double used_ratio =
-        MasterMetricManager::instance().get_global_mem_used_ratio();
+    const double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
     if (used_ratio >= eviction_high_watermark_ratio_) {
         MasterMetricManager::instance().inc_promotion_rejected_watermark();
         if (record_candidate) {
@@ -9049,8 +9056,7 @@ void MasterService::EvictionThreadFunc() {
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
-        double used_ratio =
-            MasterMetricManager::instance().get_global_mem_used_ratio();
+        double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
@@ -9082,8 +9088,7 @@ void MasterService::EvictionThreadFunc() {
         }
 
 #ifdef USE_NOF
-        double nof_used_ratio =
-            MasterMetricManager::instance().get_global_nof_used_ratio();
+        double nof_used_ratio = nof_segment_manager_.GetUsage().used_ratio();
         if (nof_used_ratio > nof_eviction_high_watermark_ratio_ ||
             (need_nof_eviction_ && nof_eviction_ratio_ > 0.0)) {
             double nof_evict_ratio_target =
@@ -9654,7 +9659,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         }
 
         LOG(INFO) << "[Restore] Total allocated size after restore: "
-                  << MasterMetricManager::instance().get_allocated_mem_size();
+                  << segment_manager_.GetMemoryUsage().used_bytes;
     }
 
     // Soft pin is runtime-only and is never restored from a snapshot.
@@ -10486,6 +10491,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
     uint64_t total_freed_size = 0;
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
+    // Shards that actually evicted this cycle; their metadata maps are
+    // shrink candidates once eviction finishes.
+    std::bitset<kNumShards> evicted_shards;
 
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
@@ -10549,6 +10557,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
                     evicted_count += evict_result.evicted_objects;
                     evicted_this_pass += evict_result.evicted_objects;
+                    if (evict_result.evicted_objects > 0) {
+                        evicted_shards.set(c.shard_idx);
+                    }
                 }
                 deferred_replicas.clear();
             }
@@ -10595,9 +10606,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
             // Evict via key lookup — avoid full metadata traversal
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+                const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
-                    MetadataShardAccessorRW shard(this,
-                                                  (start_idx + i) % kNumShards);
+                    MetadataShardAccessorRW shard(this, shard_idx);
                     for (auto tenant_it = shard->tenants.begin();
                          tenant_it != shard->tenants.end() &&
                          target_evict_num > 0;) {
@@ -10630,6 +10641,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 evicted_count += evict_result.evicted_objects;
                                 target_evict_num -=
                                     evict_result.evicted_objects;
+                                if (evict_result.evicted_objects > 0) {
+                                    evicted_shards.set(shard_idx);
+                                }
                             } else {
                                 ++it;
                             }
@@ -10655,9 +10669,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+                const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
-                    MetadataShardAccessorRW shard(this,
-                                                  (start_idx + i) % kNumShards);
+                    MetadataShardAccessorRW shard(this, shard_idx);
 
                     for (auto tenant_it = shard->tenants.begin();
                          tenant_it != shard->tenants.end() &&
@@ -10695,6 +10709,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 evicted_count += evict_result.evicted_objects;
                                 target_evict_num -=
                                     evict_result.evicted_objects;
+                                if (evict_result.evicted_objects > 0) {
+                                    evicted_shards.set(shard_idx);
+                                }
                             } else {
                                 ++it;
                             }
@@ -10718,6 +10735,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
                        << ", eviction_base=" << total_eviction_base
                        << ", evict_ratio_target=" << evict_ratio_target
                        << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
+        }
+    }
+
+    // erase() never returns bucket memory, so a shard that once held far
+    // more keys than it does now would keep its high-water bucket array
+    // forever. Shrink the metadata maps of the shards that evicted this
+    // cycle. The shard lock is held, and the loop iterates `tenants`, not
+    // the map being rehashed, so no live iterator is invalidated.
+    for (size_t i = 0; i < kNumShards; i++) {
+        if (!evicted_shards.test(i)) continue;
+        MetadataShardAccessorRW shard(this, i);
+        for (auto& tenant : shard->tenants) {
+            ShrinkBucketsIfSparse(tenant.second.metadata);
         }
     }
 
