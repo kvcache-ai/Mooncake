@@ -924,7 +924,8 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     auto& worker = worker_context_[tl_wid];
     if (slice->source_dev_id < 0) {
         CHECK_STATUS(device_selector_->allocate(
-            slice->length, source.buffer->location, slice->source_dev_id));
+            slice->length, source.buffer->location, slice->source_dev_id,
+            slice->priority, slice->task->device_mask));
         slice->quota_charged = true;
     }
 
@@ -1080,12 +1081,15 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
             : &getOrCreateRail(worker.rails, target.segment->machine_id);
     size_t start =
         static_cast<size_t>(slice->last_fallback_idx + 1) % total_combos;
+    const uint64_t device_mask = slice->task->device_mask;
     for (size_t k = 0; k < total_combos; ++k) {
         size_t idx = (start + k) % total_combos;
         size_t src_idx = idx / dst_total;
         size_t dst_idx = idx % dst_total;
         int sdev = getDeviceByFlatIndex(source, src_idx);
         int tdev = getDeviceByFlatIndex(target, dst_idx);
+        if (sdev < 0 || sdev >= 64 || (device_mask & (1ULL << sdev)) == 0)
+            continue;
         bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
                                       : rail_mon->available(sdev, tdev);
 

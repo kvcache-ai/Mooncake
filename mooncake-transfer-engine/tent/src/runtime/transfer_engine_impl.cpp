@@ -25,6 +25,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
@@ -1275,6 +1276,15 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         if (last.req.transport_hint != curr.req.transport_hint) {
             return false;
         }
+        // These fields affect transport selection or scheduling. Merging
+        // requests with different values would silently apply the first
+        // request's policy to the whole combined transfer.
+        if (last.req.priority != curr.req.priority ||
+            last.req.policy_name != curr.req.policy_name ||
+            last.req.intent_type != curr.req.intent_type ||
+            last.req.deadline_ns != curr.req.deadline_ns) {
+            return false;
+        }
         if (!last.boundary.source_key || !curr.boundary.source_key ||
             !last.boundary.target_key || !curr.boundary.target_key) {
             return false;
@@ -1558,14 +1568,19 @@ Status TransferEngineImpl::commitPreparedSubmit(
             "batch public task capacity exceeded" LOC_MARK);
     }
 
-    std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];
+    // task_id_list also contains derived public tasks created by request
+    // merging. Keep a parallel list of physical owners so requests can be
+    // grouped with the policy that will be copied into their transport task.
+    std::vector<size_t> physical_task_id_list[kSupportedTransportTypes];
     std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
     batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
                             TaskInfo{});
 
-    std::unordered_map<TransportType, size_t> next_sub_task_id;
+    std::unordered_map<size_t, size_t> owner_task_id_by_merged_task;
+    std::unordered_map<size_t, std::vector<size_t>>
+        public_tasks_by_physical_owner;
     for (const auto& task_plan : prepared.tasks) {
         size_t task_id = task_plan.task_id;
         size_t merged_task_id = task_plan.merged_task_index;
@@ -1575,7 +1590,15 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
-            if (task.type != UNSPEC) task_id_list[task.type].push_back(task_id);
+            if (task.type != UNSPEC) {
+                task_id_list[task.type].push_back(task_id);
+                auto owner_it =
+                    owner_task_id_by_merged_task.find(merged_task_id);
+                if (owner_it != owner_task_id_by_merged_task.end()) {
+                    public_tasks_by_physical_owner[owner_it->second].push_back(
+                        task_id);
+                }
+            }
             continue;
         }
 
@@ -1628,47 +1651,89 @@ Status TransferEngineImpl::commitPreparedSubmit(
             attachProgressNotifier(batch, batch->sub_batch[task.type]);
         }
 
-        if (!next_sub_task_id.count(task.type))
-            next_sub_task_id[task.type] = batch->sub_batch[task.type]->size();
-        size_t sub_task_id = next_sub_task_id[task.type];
-        next_sub_task_id[task.type]++;
-
-        classified_request_list[task.type].push_back(merged_request);
-        task.sub_task_id = sub_task_id;
+        task.sub_task_id = -1;
         task.derived = false;
         task_id_list[task.type].push_back(task_id);
+        physical_task_id_list[task.type].push_back(task_id);
+        owner_task_id_by_merged_task[merged_task_id] = task_id;
+        public_tasks_by_physical_owner[task_id].push_back(task_id);
         merged_task_id_map[merged_task_id] = task;
     }
 
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-        if (classified_request_list[type].empty()) continue;
+        if (physical_task_id_list[type].empty()) continue;
         auto& transport = transport_list_[type];
         auto& sub_batch = batch->sub_batch[type];
 
-        // Set device_mask on SubBatch for RDMA transport
-        if (type == RDMA && !task_id_list[type].empty()) {
-            // Use the device_mask from the first task (we assume all tasks in
-            // this batch should have the same policy)
-            sub_batch->device_mask =
-                batch->task_list[task_id_list[type][0]].device_mask;
-            sub_batch->qp_pool =
-                batch->task_list[task_id_list[type][0]].qp_pool;
+        // SubBatch carries one policy per submit call. Requests using the
+        // same transport may still resolve to different device masks or QP
+        // pools, so RDMA owners must be submitted in homogeneous groups.
+        // RdmaTransport copies these scalar fields into each RdmaTask before
+        // returning, so groups can safely share one SubBatch.
+        std::vector<std::vector<size_t>> submit_groups;
+        if (type == RDMA) {
+            std::map<std::pair<uint64_t, std::string>, size_t>
+                group_by_policy;
+            for (const auto task_id : physical_task_id_list[type]) {
+                const auto& task = batch->task_list[task_id];
+                auto key = std::make_pair(task.device_mask, task.qp_pool);
+                auto [it, inserted] =
+                    group_by_policy.emplace(std::move(key),
+                                            submit_groups.size());
+                if (inserted) submit_groups.emplace_back();
+                submit_groups[it->second].push_back(task_id);
+            }
+        } else {
+            submit_groups.push_back(physical_task_id_list[type]);
         }
 
-        auto attempt_start = std::chrono::steady_clock::now();
-        for (auto& task_id : task_id_list[type]) {
-            startTransportAttempt(batch->task_list[task_id],
-                                  static_cast<TransportType>(type),
-                                  attempt_start);
-        }
-        auto status = transport->submitTransferTasks(
-            sub_batch, classified_request_list[type]);
-        if (!status.ok()) {
-            auto attempt_end = std::chrono::steady_clock::now();
-            for (auto& task_id : task_id_list[type]) {
-                finishTransportAttempt(batch->task_list[task_id], FAILED,
-                                       attempt_end);
-                batch->task_list[task_id].type = UNSPEC;
+        for (const auto& group : submit_groups) {
+            if (group.empty()) continue;
+
+            // A synchronous failure is allowed to return without appending
+            // anything to the SubBatch. Resolve IDs from the actual current
+            // size for each group so a failed earlier group cannot leave a gap
+            // in the IDs assigned to a later successful group. Propagate the
+            // physical ID to every merged public alias before submission so
+            // synchronous failure handling still sees a consistent mapping.
+            int next_sub_task_id = static_cast<int>(sub_batch->size());
+            for (const auto physical_task_id : group) {
+                for (const auto public_task_id :
+                     public_tasks_by_physical_owner.at(physical_task_id)) {
+                    batch->task_list[public_task_id].sub_task_id =
+                        next_sub_task_id;
+                }
+                ++next_sub_task_id;
+            }
+
+            if (type == RDMA) {
+                const auto& first_task = batch->task_list[group.front()];
+                sub_batch->device_mask = first_task.device_mask;
+                sub_batch->qp_pool = first_task.qp_pool;
+            }
+
+            std::vector<Request> requests;
+            requests.reserve(group.size());
+            for (const auto task_id : group)
+                requests.push_back(batch->task_list[task_id].request);
+
+            auto attempt_start = std::chrono::steady_clock::now();
+            for (const auto task_id : group) {
+                startTransportAttempt(batch->task_list[task_id],
+                                      static_cast<TransportType>(type),
+                                      attempt_start);
+            }
+            auto status = transport->submitTransferTasks(sub_batch, requests);
+            if (!status.ok()) {
+                auto attempt_end = std::chrono::steady_clock::now();
+                for (const auto physical_task_id : group) {
+                    for (const auto public_task_id :
+                         public_tasks_by_physical_owner.at(physical_task_id)) {
+                        auto& task = batch->task_list[public_task_id];
+                        finishTransportAttempt(task, FAILED, attempt_end);
+                        task.type = UNSPEC;
+                    }
+                }
             }
         }
     }
@@ -1824,7 +1889,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto route = resolveTransport(task.request, 0);
     task.type = route.transport;
     task.device_mask = route.device_mask;
-    if (route.qp_pool) task.qp_pool = *route.qp_pool;
+    task.qp_pool = route.qp_pool.value_or("");
     if (task.type == UNSPEC) {
         return finishQueuedOwner(owner_id, FAILED);
     }
@@ -2152,6 +2217,12 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         attachProgressNotifier(batch, batch->sub_batch[type]);
     }
     auto& sub_batch = batch->sub_batch[type];
+    task.device_mask = result.device_mask;
+    task.qp_pool = result.qp_pool.value_or("");
+    if (type == RDMA) {
+        sub_batch->device_mask = task.device_mask;
+        sub_batch->qp_pool = task.qp_pool;
+    }
     task.sub_task_id = sub_batch->size();
     task.type = type;
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
