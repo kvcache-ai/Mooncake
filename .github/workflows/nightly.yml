@@ -96,23 +96,28 @@ jobs:
 
       - name: Configure project
         run: |
-          apt update -y
-          apt install -y ninja-build
           bash -x dependencies.sh -y
-          mkdir build
-          cd build
-          cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
+          cmake -B build -G Ninja \
+            -DUSE_MUSA=ON \
+            -DUSE_MNNVL=ON \
+            -DUSE_ETCD=ON \
+            -DSTORE_USE_ETCD=ON \
+            -DUSE_CXL=ON \
+            -DUSE_TCP=ON \
+            -DWITH_EP=ON \
+            -DBUILD_UNIT_TESTS=OFF \
+            -DBUILD_EXAMPLES=OFF \
+            -DENABLE_DEBUG_SYMBOLS=OFF
         shell: bash
 
       - name: Build project
         run: |
-          cd build
           source ~/.bashrc
           # Limit concurrency of Mooncake PG's setup.py build to avoid OOM
           export MAX_JOBS=2
           # Does not affect the Ninja system
-          cmake --build .
-          cmake --install .
+          cmake --build build
+          cmake --install build
         shell: bash
 
   build-docker:
@@ -225,11 +230,6 @@ jobs:
           method: 'network'
           sub-packages: '["nvcc"]'
 
-      - name: Install build utilities
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build
-
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -244,9 +244,8 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
-          mkdir build && cd build
-          cmake -G Ninja .. \
+          echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
+          cmake -B build -G Ninja \
             -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
             -DWITH_P2P_STORE=ON \
             -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
@@ -271,9 +270,8 @@ jobs:
 
       - name: Build project
         run: |
-          cd build
-          cmake --build . -j$(nproc)
-          sudo -E cmake --install .
+          cmake --build build
+          sudo -E cmake --install build
 
       - name: Build nvlink_allocator.so
         run: |
@@ -407,7 +405,7 @@ jobs:
       - name: Install coverage tools and build utilities
         run: |
           sudo apt-get update
-          sudo apt-get install -y lcov gcovr ninja-build
+          sudo apt-get install -y lcov gcovr
 
       - name: Test HugeTLB sizing helper
         run: python3 scripts/test_hicache_hugepage_requirements.py
@@ -426,15 +424,21 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
-          mkdir build
-          cd build
-          cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
+          cmake -B build -G Ninja \
+            -DUSE_HTTP=ON \
+            -DUSE_CXL=ON \
+            -DUSE_UB=ON \
+            -DUSE_ETCD=ON \
+            -DSTORE_USE_ETCD=ON \
+            -DENABLE_ASAN=ON \
+            -DENABLE_SCCACHE=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_DEBUG_SYMBOLS=OFF
 
       - name: Build project
         run: |
-          cd build
-          cmake --build . --parallel "$(nproc)"
-          sudo cmake --install .
+          cmake --build build
+          sudo cmake --install build
 
       - name: Start Metadata Server
         run: |

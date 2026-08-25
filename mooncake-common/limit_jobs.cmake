@@ -82,5 +82,5 @@ else()
     message(STATUS "[limit_jobs] Hint: use -G Ninja for automatic "
         "compile/link parallelism separation")
     message(STATUS "[limit_jobs] With Make, recommend: "
-        "cmake --build . -j${PARALLEL_LINK_JOBS}")
+        "cmake --build ${CMAKE_BINARY_DIR} -j${PARALLEL_LINK_JOBS}")
 endif()

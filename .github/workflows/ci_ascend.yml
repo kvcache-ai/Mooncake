@@ -157,10 +157,8 @@ jobs:
         bash scripts/ascend/dependencies_ascend_installation.sh
         echo "Configuring CMake..."
         rm -rf build
-        mkdir -p build
-        cd build
 
-        cmake .. \
+        cmake -B build -G Ninja \
           -DUSE_ASCEND_DIRECT=ON \
           -DBUILD_EXAMPLES=OFF \
           -DBUILD_UNIT_TESTS=OFF \
@@ -172,9 +170,8 @@ jobs:
       run: |
         source /usr/local/Ascend/cann-9.0.0/set_env.sh
         echo "Building..."
-        cd build
-        cmake --build . -j48
-        cmake --install .
+        cmake --build build
+        cmake --install build
         echo "Mooncake installed successfully."
 
     - name: Run Hixl Mooncake Store Test

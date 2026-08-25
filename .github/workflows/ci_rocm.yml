@@ -54,7 +54,7 @@ jobs:
         apt-get update -y
         apt-get install -y --no-install-recommends \
           curl build-essential sudo pkg-config \
-          ninja-build software-properties-common
+          software-properties-common
         PYV="${{ matrix.python-version }}"
         if ! command -v "python${PYV}" >/dev/null 2>&1; then
           add-apt-repository -y ppa:deadsnakes/ppa
@@ -86,15 +86,15 @@ jobs:
       run: |
         set -eo pipefail
         bash -x dependencies.sh -y
-        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+        echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
 
     - name: Configure project
       shell: bash
       run: |
         set -eo pipefail
         export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
-        rm -rf build && mkdir build && cd build
-        cmake -G Ninja .. \
+        rm -rf build
+        cmake -B build -G Ninja \
           -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
           -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
           -DBUILD_UNIT_TESTS=OFF -DENABLE_SCCACHE=ON \
@@ -106,16 +106,15 @@ jobs:
       run: |
         set -eo pipefail
         export PATH="/opt/rocm/bin:$PATH"
-        cd build
         # Retry to ride out transient Go module (proxy.golang.org) fetch errors
         # during the etcd-wrapper build; Go caches modules, so retries resume.
         n=0
-        until cmake --build . -j"$(nproc)"; do
+        until cmake --build build; do
           n=$((n+1))
           if [ "$n" -ge 3 ]; then echo "Build failed after $n attempts"; exit 1; fi
           echo "Build attempt $n failed; retrying in 15s..."; sleep 15
         done
-        cmake --install .
+        cmake --install build
 
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}
