@@ -355,16 +355,6 @@ else
     exit 1
 fi
 
-if [ "$HIP_BUILD" = "1" ]; then
-    # Ubuntu 22.04 ships patchelf 0.14.3, which can make auditwheel's RPATH
-    # update share a dynamic-string entry with DT_NEEDED. The resulting ROCm
-    # wheel has its RPATH set to a vendored library name and cannot load in a
-    # clean environment. Use a current patchelf for auditwheel's ELF rewrites.
-    python${PYTHON_VERSION} -m pip install --upgrade patchelf==0.19.1.0
-    export PATH="$(python${PYTHON_VERSION} -c 'import sysconfig; print(sysconfig.get_path("scripts"))'):$PATH"
-    patchelf --version
-fi
-
 # Create directory for repaired wheels
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}

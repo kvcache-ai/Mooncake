@@ -19,13 +19,10 @@
 #include <sys/time.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
-#include <functional>
-#include <limits>
 #include <set>
 #include <thread>
 #include <utility>
@@ -37,6 +34,7 @@
 #include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "transport/batch_registration.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
@@ -44,38 +42,6 @@ namespace mooncake {
 
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
-
-static size_t maxConcurrentRegMr() {
-    size_t configured = globalConfig().max_concurrent_reg_mr;
-    return configured > 0 ? configured : std::numeric_limits<size_t>::max();
-}
-
-static int runBoundedParallel(size_t count,
-                              const std::function<int(size_t)> &fn) {
-    if (count == 0) return 0;
-
-    size_t workers = std::min(count, maxConcurrentRegMr());
-    std::atomic<size_t> next{0};
-    std::atomic<int> first_error{0};
-
-    auto worker = [&]() {
-        for (size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
-            int ret = fn(i);
-            if (ret) {
-                int expected = 0;
-                first_error.compare_exchange_strong(expected, ret);
-            }
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(workers - 1);
-    for (size_t w = 1; w < workers; ++w) threads.emplace_back(worker);
-    worker();
-    for (auto &thread : threads) thread.join();
-
-    return first_error.load();
-}
 
 static std::string resolveBufferLocation(
     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
@@ -772,18 +738,19 @@ int RdmaTransport::registerLocalMemoryBatch(
     } else {
 #endif
         auto start = std::chrono::steady_clock::now();
-        int first_error = runBoundedParallel(buffer_list.size(), [&](size_t i) {
-            int ret = registerLocalMemoryInternal(buffer_list[i].addr,
-                                                  buffer_list[i].length,
-                                                  location, true, false, true);
-            if (ret) {
-                LOG(WARNING)
-                    << "RdmaTransport: Failed to register memory: addr "
-                    << buffer_list[i].addr << " length "
-                    << buffer_list[i].length;
-            }
-            return ret;
-        });
+        int first_error =
+            runBoundedRegMrBatch(buffer_list.size(), [&](size_t i) {
+                int ret = registerLocalMemoryInternal(
+                    buffer_list[i].addr, buffer_list[i].length, location, true,
+                    false, true);
+                if (ret) {
+                    LOG(WARNING)
+                        << "RdmaTransport: Failed to register memory: addr "
+                        << buffer_list[i].addr << " length "
+                        << buffer_list[i].length;
+                }
+                return ret;
+            });
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - start)
@@ -803,7 +770,7 @@ int RdmaTransport::registerLocalMemoryBatch(
 
 int RdmaTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    int first_error = runBoundedParallel(addr_list.size(), [&](size_t i) {
+    int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
         int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         if (ret) {
             LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "

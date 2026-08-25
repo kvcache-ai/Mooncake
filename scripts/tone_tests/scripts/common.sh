@@ -45,8 +45,8 @@ docker_launch(){
             run --init --name "${CONTAINER_NAME}" -d
             --network=host
             --device=/dev/kfd
-            --cpuset-cpus="${MOONCAKE_CPUSET_CPUS:-0-95}"
-            --cpuset-mems="${MOONCAKE_CPUSET_MEMS:-0}"
+            --cpuset-cpus="${MOONCAKE_CPUSET_CPUS}"
+            --cpuset-mems="${MOONCAKE_CPUSET_MEMS}"
             --cap-drop=ALL
             # apt/dpkg drops privileges to _apt while installing the standard
             # verbs userspace. Retain only the filesystem/identity capabilities
@@ -76,10 +76,10 @@ docker_launch(){
             -e PYTHONUNBUFFERED=1
             -e "PYTEST_ADDOPTS=-p no:cacheprovider"
             -e NCCL_GIN_TYPE=0
-            -e "NCCL_IB_HCA=${MOONCAKE_RDMA_DEVICES:-ionic_0,ionic_1,ionic_2,ionic_3}"
-            -e "NCCL_SOCKET_IFNAME=${MOONCAKE_RDMA_NETDEVS:-eth2,eth3,eth4,eth5}"
-            -e "MOONCAKE_DEVICE=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
-            -e "MC_GID_INDEX=${MOONCAKE_GID_INDEX:-1}"
+            -e "NCCL_IB_HCA=${MOONCAKE_RDMA_DEVICES}"
+            -e "NCCL_SOCKET_IFNAME=${MOONCAKE_RDMA_NETDEVS}"
+            -e "MOONCAKE_DEVICE=${MOONCAKE_TRANSFER_DEVICE}"
+            -e "MC_GID_INDEX=${MOONCAKE_GID_INDEX}"
             -e MC_FORCE_HCA=1
             # The MI35x image enables a host-wide SGLang affinity heuristic.
             # It ignores Docker's cpuset and assigns TP rank 1 to CPU96+, which
@@ -116,8 +116,8 @@ docker_launch(){
         fi
         local -a render_nodes
         read -r -a render_nodes <<<"${MOONCAKE_RENDER_DEVICES:-}"
-        if [ "${#render_nodes[@]}" -ne 4 ]; then
-            echo "ERROR: ROCm profile must expose exactly four render nodes" >&2
+        if [ "${#render_nodes[@]}" -eq 0 ]; then
+            echo "ERROR: ROCm profile must expose at least one render node" >&2
             return 1
         fi
         local device
@@ -128,11 +128,36 @@ docker_launch(){
             fi
             docker_args+=(--device="$device")
         done
-        local uverbs
-        for uverbs in 0 1 2 3; do
-            device="/dev/infiniband/uverbs${uverbs}"
-            [ -c "$device" ] || { echo "ERROR: Missing RDMA device $device" >&2; return 1; }
-            docker_args+=(--device="$device")
+        if [ -z "${MOONCAKE_RDMA_DEVICES:-}" ]; then
+            echo "ERROR: MOONCAKE_RDMA_DEVICES is required for ROCm" >&2
+            return 1
+        fi
+        local rdma_device verbs_path uverbs_node uverbs_found
+        local -A mounted_uverbs=()
+        for rdma_device in ${MOONCAKE_RDMA_DEVICES//,/ }; do
+            verbs_path="/sys/class/infiniband/${rdma_device}/device/infiniband_verbs"
+            [ -d "$verbs_path" ] || {
+                echo "ERROR: Missing verbs mapping for RDMA device $rdma_device" >&2
+                return 1
+            }
+            uverbs_found=0
+            for uverbs_node in "$verbs_path"/uverbs*; do
+                [ -e "$uverbs_node" ] || continue
+                uverbs_found=1
+                device="/dev/infiniband/$(basename "$uverbs_node")"
+                [ -c "$device" ] || {
+                    echo "ERROR: Missing RDMA character device $device" >&2
+                    return 1
+                }
+                if [ -z "${mounted_uverbs[$device]:-}" ]; then
+                    docker_args+=(--device="$device")
+                    mounted_uverbs[$device]=1
+                fi
+            done
+            if [ "$uverbs_found" -eq 0 ]; then
+                echo "ERROR: No userspace verbs device found for RDMA device $rdma_device" >&2
+                return 1
+            fi
         done
         if [ -c /dev/infiniband/rdma_cm ]; then
             docker_args+=(--device=/dev/infiniband/rdma_cm)
@@ -300,13 +325,18 @@ fi"
         fi
     fi
 
-    echo "Checking RDMA device ${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
-    local rdma_device=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}
-    if ! [[ "$rdma_device" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
-        echo "ERROR: Invalid MOONCAKE_TRANSFER_DEVICE: $rdma_device" >&2
-        return 1
-    fi
-    local rdma_preflight_cmd="set -e
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        local rdma_device=${MOONCAKE_TRANSFER_DEVICE:-}
+        if [ -z "$rdma_device" ]; then
+            echo "ERROR: MOONCAKE_TRANSFER_DEVICE is required for ROCm" >&2
+            return 1
+        fi
+        if ! [[ "$rdma_device" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+            echo "ERROR: Invalid MOONCAKE_TRANSFER_DEVICE: $rdma_device" >&2
+            return 1
+        fi
+        echo "Checking ROCm RDMA device ${rdma_device}"
+        local rdma_preflight_cmd="set -e
 echo '=== ibv_devinfo ==='
 ibv_devinfo -d '${rdma_device}'
 echo '=== RDMA link state ==='
@@ -314,14 +344,21 @@ if command -v rdma >/dev/null 2>&1; then rdma link show; fi
 state=\$(cat '/sys/class/infiniband/${rdma_device}/ports/1/state')
 echo '${rdma_device} port 1 state:' \"\$state\"
 case \"\$state\" in *ACTIVE*) ;; *) echo 'RDMA port is not active' >&2; exit 1;; esac
-gid=\$(cat '/sys/class/infiniband/${rdma_device}/ports/1/gids/${MOONCAKE_GID_INDEX:-1}')
-echo '${rdma_device} GID index ${MOONCAKE_GID_INDEX:-1}:' \"\$gid\"
+	gid=\$(cat '/sys/class/infiniband/${rdma_device}/ports/1/gids/${MOONCAKE_GID_INDEX}')
+	echo '${rdma_device} GID index ${MOONCAKE_GID_INDEX}:' \"\$gid\"
 case \"\$gid\" in ''|'::'|'0:0:0:0:0:0:0:0') echo 'RDMA GID is empty' >&2; exit 1;; esac"
-    if ! ${docker_exec} "${rdma_preflight_cmd}"; then
-        echo "RDMA preflight failed for $rdma_device" >&2
-        return 1
-    else
+        if ! ${docker_exec} "${rdma_preflight_cmd}"; then
+            echo "RDMA preflight failed for $rdma_device" >&2
+            return 1
+        fi
         echo "RDMA preflight successful"
+    else
+        echo "Checking RDMA devices"
+        if ! ${docker_exec} "ibv_devinfo" >/dev/null 2>&1; then
+            echo "ibv_devinfo execution failed" >&2
+            return 1
+        fi
+        echo "ibv_devinfo execution successful"
     fi
 
     # install mooncake and upgrade sglang
@@ -773,6 +810,13 @@ drain_gpu_local() {
 # state on both the local and (for double-machine runs) remote nodes via a
 # lightweight container restart (no wheel / ERDMA driver reinstall).
 drain_gpu_between_tests() {
+    # The reset protocol is currently defined only for the dedicated ROCm
+    # allocation. Preserve the existing CUDA/T-one lifecycle until an
+    # accelerator-neutral reset contract is introduced and validated there.
+    if [ "${CI_ACCELERATOR:-cuda}" != "rocm" ]; then
+        return 0
+    fi
+
     echo "===== Resetting environment between test cases ====="
     local reset_failed=false
     if ! drain_gpu_local; then

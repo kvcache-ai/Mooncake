@@ -477,9 +477,20 @@ jobs:
     secrets: inherit
 
   integration-test:
-    needs: [build-wheel-cu13, build-wheel-rocm, check-paths]
+    needs: [build-wheel-cu13, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
+    secrets: inherit
+
+  rocm-integration-test:
+    needs: [build-wheel-rocm, check-paths]
+    if: >-
+      needs.build-wheel-rocm.result == 'success' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/integration-test-rocm.yml
+    with:
+      checkout_ref: ${{ github.sha }}
     secrets: inherit
 
   tent-ci:

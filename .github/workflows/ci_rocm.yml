@@ -4,7 +4,7 @@ name: 'Build Wheel (ROCm)'
 # on PRs so packaging regressions are caught. Runs inside the ROCm dev image so
 # hipcc / HIP headers / hsa-runtime are available; no GPU is needed to compile.
 # On-device external-PD tests consume these artifacts later on the trusted
-# self-hosted ROCm runner in integration-test.yml.
+# self-hosted ROCm runner in integration-test-rocm.yml.
 
 on:
   workflow_call:

@@ -84,9 +84,14 @@ run_proxy()
     local use_health_check=0
     if python3 -c "from packaging import version; import sys; sys.exit(0 if version.parse('$vllm_version') >= version.parse('0.16.0') else 1)" 2>/dev/null; then
         echo "Using Mooncake Connector Proxy (vLLM >= 0.16.0)"
-        local proxy_path="/app/vllm/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py"
-        if ! ${docker_exec} "test -f '$proxy_path'"; then
-            echo "ERROR: vLLM Mooncake connector proxy not found: $proxy_path" >&2
+        local proxy_path
+        proxy_path=$(${docker_exec} "for path in \
+            /app/vllm/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py \
+            /vllm-workspace/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py; do \
+                if [ -f \"\$path\" ]; then printf '%s' \"\$path\"; break; fi; \
+            done")
+        if [ -z "$proxy_path" ]; then
+            echo "ERROR: vLLM Mooncake connector proxy not found in a supported image layout" >&2
             return 1
         fi
         proxy_script="python3 -u $proxy_path --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
