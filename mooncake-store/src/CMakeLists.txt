@@ -27,6 +27,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_admin_service.cpp
     offset_allocator.cpp
     http_metadata_server.cpp
+    embedded_master.cpp
     serialize/serializer.cpp
     storage/distributed/dfs_global_allocator.cpp
     ha/leadership/leader_coordinator_factory.cpp

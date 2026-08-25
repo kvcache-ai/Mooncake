@@ -117,10 +117,10 @@ _KNOWN_PROTOCOLS = frozenset(
 )
 
 # Required fields that must be present AND non-empty.
+# master_server_address is optional when enable_standalone is true.
 _REQUIRED_NON_EMPTY_FIELDS = (
     "local_hostname",
     "metadata_server",
-    "master_server_address",
 )
 
 
@@ -189,6 +189,9 @@ class MooncakeConfig:
             (e.g., "mlx5_0", "erdma_0", or "auto-discovery").
             Required when protocol is "rdma", optional for other protocols.
         master_server_address (str): The address of the master server.
+            Optional when enable_standalone is true.
+        enable_standalone (bool): Start an in-process master so this process
+            does not require an external mooncake_master. Default is False.
         enable_ssd_offload (bool): Enable SSD offload. Default is False.
         ssd_offload_path (str): The path to the SSD directory for offloading.
         tenant_id (str): Tenant identifier. Default is "default".
@@ -206,6 +209,7 @@ class MooncakeConfig:
             "protocol": "tcp",
             "device_name": "",
             "master_server_address": "localhost:8081",
+            "enable_standalone": false,
             "enable_ssd_offload": true,
             "ssd_offload_path": "/nvme/mooncake_offload",
             "tenant_id": "default",
@@ -222,6 +226,7 @@ class MooncakeConfig:
             "protocol": "rdma",
             "device_name": "mlx5_0",
             "master_server_address": "master:8081",
+            "enable_standalone": false,
             "enable_ssd_offload": true,
             "ssd_offload_path": "/nvme/mooncake_offload",
             "tenant_id": "default",
@@ -242,6 +247,7 @@ class MooncakeConfig:
     tenant_id: str = "default"
     enable_client_http_server: bool = False
     client_http_port: int = 9300
+    enable_standalone: bool = False
 
     def __post_init__(self):
         """Validate and normalise configuration invariants.
@@ -285,6 +291,15 @@ class MooncakeConfig:
                     f"Invalid {field_name}: {value}. Size must be non-negative."
                 )
 
+        if self.enable_standalone:
+            if self.metadata_server is None or (
+                isinstance(self.metadata_server, str)
+                and not self.metadata_server.strip()
+            ):
+                self.metadata_server = "P2PHANDSHAKE"
+            if self.master_server_address is None:
+                self.master_server_address = ""
+
         for field_name in _REQUIRED_NON_EMPTY_FIELDS:
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
@@ -293,24 +308,43 @@ class MooncakeConfig:
                     f"got {value!r}."
                 )
 
+        if self.enable_standalone:
+            if not isinstance(self.master_server_address, str):
+                raise ValueError(
+                    "Config field 'master_server_address' must be a string, "
+                    f"got {self.master_server_address!r}."
+                )
+        else:
+            value = self.master_server_address
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    "Config field 'master_server_address' must be a "
+                    f"non-empty string, got {value!r}."
+                )
+
     @staticmethod
     def from_file(file_path: str) -> "MooncakeConfig":
         """Load the config from a JSON file."""
         with open(file_path) as fin:
             config = json.load(fin)
-        required_fields = [
-            "local_hostname",
-            "metadata_server",
-            "master_server_address",
-        ]
+        enable_standalone = _parse_bool(config.get("enable_standalone", False))
+        required_fields = ["local_hostname"]
+        if not enable_standalone:
+            required_fields.extend(["metadata_server", "master_server_address"])
         for field in required_fields:
             if field not in config:
                 raise ValueError(f"Missing required config field: {field}")
         ssd_offload_path = config.get("ssd_offload_path")
         tenant_id = config.get("tenant_id")
+        master_server_address = config.get("master_server_address")
+        if master_server_address is None:
+            master_server_address = ""
+        metadata_server = config.get("metadata_server")
+        if metadata_server is None:
+            metadata_server = "P2PHANDSHAKE" if enable_standalone else ""
         return MooncakeConfig(
             local_hostname=config.get("local_hostname"),
-            metadata_server=config.get("metadata_server"),
+            metadata_server=metadata_server,
             global_segment_size=_parse_segment_size(
                 config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
@@ -319,7 +353,8 @@ class MooncakeConfig:
             ),
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
-            master_server_address=config.get("master_server_address"),
+            master_server_address=master_server_address,
+            enable_standalone=enable_standalone,
             enable_ssd_offload=_parse_bool(config.get("enable_ssd_offload", False)),
             ssd_offload_path=str(ssd_offload_path)
             if ssd_offload_path is not None
@@ -341,10 +376,17 @@ class MooncakeConfig:
         """
         config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
         if config_file_path is None:
-            if not os.getenv("MOONCAKE_MASTER"):
+            enable_standalone = _parse_bool(
+                os.getenv("MOONCAKE_ENABLE_STANDALONE", "false")
+            )
+            if not os.getenv("MOONCAKE_MASTER") and not enable_standalone:
                 raise ValueError(
-                    "Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set."
+                    "Neither the environment variable 'MOONCAKE_CONFIG_PATH' "
+                    "nor 'MOONCAKE_MASTER' is set. Set "
+                    "MOONCAKE_ENABLE_STANDALONE=true for a single-process "
+                    "deployment that does not require mooncake_master."
                 )
+            master_server_address = os.getenv("MOONCAKE_MASTER") or ""
             return MooncakeConfig(
                 local_hostname=os.getenv("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
                 metadata_server=os.getenv(
@@ -360,7 +402,8 @@ class MooncakeConfig:
                 ),
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),
-                master_server_address=os.getenv("MOONCAKE_MASTER"),
+                master_server_address=master_server_address,
+                enable_standalone=enable_standalone,
                 enable_ssd_offload=_parse_bool(
                     os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")
                 ),

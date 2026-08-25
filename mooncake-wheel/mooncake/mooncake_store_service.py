@@ -41,9 +41,7 @@ def _shm_name_to_path(name):
 
 def _unblock_shutdown_signals():
     try:
-        signal.pthread_sigmask(
-            signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM}
-        )
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
     except AttributeError:
         pass
 
@@ -77,7 +75,8 @@ class MooncakeStoreService:
         "local_buffer_size": 1073741824,
         "protocol": "tcp",
         "device_name": "",
-        "master_server_address": "localhost:8081"
+        "master_server_address": "localhost:8081",
+        "enable_standalone": false
     }
 
     Explanation of Key Fields:
@@ -88,6 +87,7 @@ class MooncakeStoreService:
     - protocol: Communication protocol (tcp or rdma).
     - device_name: The name of the device to use.
     - master_server_address: The address of the master server.
+    - enable_standalone: When true, embed mooncake_master in this process.
     """
 
     def __init__(self, config_path: str = None, cli_config: dict = None):
@@ -126,9 +126,7 @@ class MooncakeStoreService:
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
 
-    async def start_store_service(
-        self, max_wait_time: float = 60, shutdown_event=None
-    ):
+    async def start_store_service(self, max_wait_time: float = 60, shutdown_event=None):
         """
         Start the store service with retry mechanism.
 
@@ -183,6 +181,7 @@ class MooncakeStoreService:
                             self.config.enable_client_http_server
                         ),
                         "client_http_port": self.config.client_http_port,
+                        "enable_standalone": self.config.enable_standalone,
                     }
                 )
 
@@ -191,9 +190,7 @@ class MooncakeStoreService:
                     # chance to publish a shutdown requested while it ran.
                     await asyncio.sleep(0)
                     if shutdown_event.is_set():
-                        logging.info(
-                            "Store startup cancelled by shutdown request"
-                        )
+                        logging.info("Store startup cancelled by shutdown request")
                         await self.stop()
                         return False
 
@@ -228,9 +225,7 @@ class MooncakeStoreService:
                                 shutdown_event.wait(),
                                 timeout=actual_sleep_time,
                             )
-                            logging.info(
-                                "Store startup cancelled by shutdown request"
-                            )
+                            logging.info("Store startup cancelled by shutdown request")
                             return False
                         except asyncio.TimeoutError:
                             pass
@@ -889,6 +884,11 @@ def parse_arguments():
         default=60,
         required=False,
     )
+    parser.add_argument(
+        "--enable-standalone",
+        action="store_true",
+        help="Embed mooncake_master in this process so no external master is required",
+    )
     return parser.parse_args()
 
 
@@ -903,6 +903,9 @@ async def main():
             cli_config[key] = value
         else:
             logging.warning(f"Ignoring invalid CLI config: {item}")
+
+    if args.enable_standalone:
+        cli_config["enable_standalone"] = True
 
     service = MooncakeStoreService(args.config, cli_config)
     shutdown_event = asyncio.Event()

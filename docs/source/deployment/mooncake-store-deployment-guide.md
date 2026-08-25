@@ -133,6 +133,48 @@ Limitation: the master is a single point of failure. If it crashes, cluster oper
 
 ---
 
+(standalone-no-external-master)=
+### Standalone (no external master) — Single Process
+
+For a single-machine evaluation or embedding Mooncake Store in one process, enable **standalone mode**. The store client starts an in-process master, so you do **not** run `mooncake_master`. Transfer Engine metadata defaults to `P2PHANDSHAKE`.
+
+Python:
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup(
+    local_hostname="localhost",
+    metadata_server="P2PHANDSHAKE",
+    global_segment_size=512 * 1024 * 1024,
+    local_buffer_size=128 * 1024 * 1024,
+    protocol="tcp",
+    rdma_devices="",
+    master_server_addr="",
+    enable_standalone=True,
+)
+store.put("hello_key", b"Hello, standalone Mooncake Store!")
+print(store.get("hello_key").decode())
+store.close()
+```
+
+Or with a config dict / env:
+
+```bash
+export MOONCAKE_ENABLE_STANDALONE=true
+export MOONCAKE_PROTOCOL=tcp
+python -m mooncake.mooncake_store_service --enable-standalone
+```
+
+```bash
+mooncake_client --enable_standalone=true --global_segment_size="1GB"
+```
+
+Standalone mode is for a single process that both owns memory and serves KV operations. It is not a substitute for HA or multi-node clusters — those still need an external `mooncake_master`.
+
+---
+
 ### High-Availability (etcd) — Production HA
 
 Runs a cluster of master instances coordinated through etcd. If the leader fails, the remaining instances elect a new leader automatically.
@@ -1046,6 +1088,7 @@ mooncake_client \
 | `--threads` | `1` | Client worker thread count |
 | `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
+| `--enable_standalone` | `false` | Start an in-process master; no external `mooncake_master` is required. When true, the default metadata server is `P2PHANDSHAKE` |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 | `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |

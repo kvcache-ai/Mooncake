@@ -22,6 +22,9 @@ DEFINE_string(local_buffer_size, "0", "Size of local buffer (e.g., 16MB, 1GB)");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_string(tenant_id, "default", "Tenant identifier");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
+DEFINE_bool(enable_standalone, false,
+            "Start an in-process master so this process does not require an "
+            "external mooncake_master");
 DEFINE_bool(start_offload_rpc_server, true,
             "Expose TCP RPC for disk-tier reads "
             "(batch_get_offload_object / release_offload_buffer). "
@@ -123,13 +126,20 @@ int main(int argc, char *argv[]) {
 #endif
 
     auto client_inst = RealClient::create();
+    std::string metadata_server = FLAGS_metadata_server;
+    if (FLAGS_enable_standalone &&
+        metadata_server == "http://127.0.0.1:8080/metadata") {
+        metadata_server = "P2PHANDSHAKE";
+        LOG(INFO) << "Standalone mode: defaulting metadata_server to "
+                     "P2PHANDSHAKE";
+    }
     auto res = client_inst->setup_internal(
-        FLAGS_host, FLAGS_metadata_server, global_segment_size,
-        local_buffer_size, FLAGS_protocol, FLAGS_device_names,
-        FLAGS_master_server_address, nullptr,
-        "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
-        FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
-        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port);
+        FLAGS_host, metadata_server, global_segment_size, local_buffer_size,
+        FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
+        nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
+        FLAGS_port, FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
+        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port,
+        FLAGS_enable_standalone);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;

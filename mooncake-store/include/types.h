@@ -215,6 +215,7 @@ constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
     "enable_client_http_server";
 constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+constexpr const char* CONFIG_KEY_ENABLE_STANDALONE = "enable_standalone";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB

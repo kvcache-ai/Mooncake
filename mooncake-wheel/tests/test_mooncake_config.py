@@ -178,6 +178,40 @@ class TestMooncakeConfig(unittest.TestCase):
                     f"Missing required config field: {field}", str(cm.exception)
                 )
 
+    def test_standalone_from_file_without_master(self):
+        self.write_config(
+            {
+                "local_hostname": "localhost",
+                "enable_standalone": True,
+                "protocol": "tcp",
+            }
+        )
+        config = MooncakeConfig.from_file(self.config_file)
+        self.assertTrue(config.enable_standalone)
+        self.assertEqual(config.metadata_server, "P2PHANDSHAKE")
+        self.assertEqual(config.master_server_address, "")
+        self.assertEqual(config.protocol, "tcp")
+
+    def test_load_from_env_standalone_without_master(self):
+        previous_config_path = os.environ.pop("MOONCAKE_CONFIG_PATH", None)
+        previous_master = os.environ.pop("MOONCAKE_MASTER", None)
+        previous_standalone = os.environ.pop("MOONCAKE_ENABLE_STANDALONE", None)
+        os.environ["MOONCAKE_ENABLE_STANDALONE"] = "true"
+        try:
+            config = MooncakeConfig.load_from_env()
+            self.assertTrue(config.enable_standalone)
+            self.assertEqual(config.local_hostname, "localhost")
+            self.assertEqual(config.metadata_server, "P2PHANDSHAKE")
+            self.assertEqual(config.master_server_address, "")
+        finally:
+            del os.environ["MOONCAKE_ENABLE_STANDALONE"]
+            if previous_config_path is not None:
+                os.environ["MOONCAKE_CONFIG_PATH"] = previous_config_path
+            if previous_master is not None:
+                os.environ["MOONCAKE_MASTER"] = previous_master
+            if previous_standalone is not None:
+                os.environ["MOONCAKE_ENABLE_STANDALONE"] = previous_standalone
+
     def test_load_from_config_path_env(self):
         """Test loading configuration from environment variable MOONCAKE_CONFIG_PATH"""
         self.write_config(self.valid_config)
@@ -469,6 +503,15 @@ class TestMooncakeConfigValidation(unittest.TestCase):
                     with self.assertRaises(ValueError) as cm:
                         self.make(**{field: bad})
                     self.assertIn(field, str(cm.exception))
+
+    def test_standalone_allows_empty_master_address(self):
+        config = self.make(enable_standalone=True, master_server_address="")
+        self.assertTrue(config.enable_standalone)
+        self.assertEqual(config.master_server_address, "")
+
+    def test_standalone_defaults_empty_metadata_to_p2p(self):
+        config = self.make(enable_standalone=True, metadata_server="")
+        self.assertEqual(config.metadata_server, "P2PHANDSHAKE")
 
     def test_from_file_warns_on_unknown_protocol(self):
         with open(self.config_path, "w") as f:

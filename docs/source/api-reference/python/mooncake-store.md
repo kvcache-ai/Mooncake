@@ -95,6 +95,30 @@ print(store.get("hello_key").decode())
 store.close()
 ```
 
+### Standalone Hello World (no `mooncake_master`)
+
+Set `enable_standalone=True` to start an in-process master in the same process:
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup(
+    "localhost",
+    "P2PHANDSHAKE",
+    512*1024*1024,
+    128*1024*1024,
+    "tcp",
+    "",
+    "",
+    enable_standalone=True,
+)
+
+store.put("hello_key", b"Hello, standalone Mooncake Store!")
+print(store.get("hello_key").decode())
+store.close()
+```
+
 ## Basic API Usage
 
 ### Simple Get/Put Operations
