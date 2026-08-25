@@ -34,15 +34,13 @@
 
 2. 在项目根目录下运行以下命令：
    ```bash
-   mkdir build
-   cd build
-   cmake ..
-   make -j
+   cmake -B build -G Ninja
+   cmake --build build
    ```
 
 3. 安装 Mooncake python 包和 mooncake_master 可执行文件：
    ```bash
-   make install
+   sudo cmake --install install
    ```
 
 ## 手动安装
@@ -63,7 +61,6 @@
     ```bash
     # For debian/ubuntu
     apt-get install -y build-essential \
-                   cmake \
                    libibverbs-dev \
                    libgoogle-glog-dev \
                    libgtest-dev \
@@ -73,8 +70,7 @@
                    libhiredis-dev
 
     # For centos/alibaba linux os
-    yum install cmake \
-                gflags-devel \
+    yum install gflags-devel \
                 glog-devel \
                 libibverbs-devel \
                 numactl-devel \
@@ -121,15 +117,14 @@
 
     若 Neuware 安装路径与默认头文件/库布局不一致，还可显式指定：
     ```bash
-    cmake .. -DUSE_MLU=ON \
+    cmake -B build -G Ninja -DUSE_MLU=ON \
       -DMLU_INCLUDE_DIR=/path/to/neuware/include \
       -DMLU_LIB_DIR=/path/to/neuware/lib64
     ```
 
     启用 MLU 后端示例：
     ```bash
-    cmake .. -DUSE_MLU=ON -DNEUWARE_ROOT=${NEUWARE_HOME:-/usr/local/neuware}
-    make -j
+    cmake -B build -G Ninja  -DUSE_MLU=ON -DNEUWARE_ROOT=${NEUWARE_HOME:-/usr/local/neuware}
     ```
 
 5. 若需编译沐曦 MetaX MACA 支持（如 C500），请安装 MACA SDK，使头文件与库位于 `MACA_ROOT`（优先取 `MACA_HOME` 环境变量，未设置时默认 `/opt/maca`）。不同安装包可能把库放在 `lib` 或 `lib64`，建议在环境变量中同时加入两者，避免链接或运行时找不到共享库：
@@ -153,25 +148,21 @@
     启用 Ascend NPU 编译示例：
     ```bash
     source /usr/local/Ascend/cann/set_env.sh
-    cmake .. -DUSE_ASCEND_DIRECT=ON
-    make -j
+    cmake -B build -DUSE_ASCEND_DIRECT=ON
     ```
 
 7. 进入项目根目录，运行下列命令进行编译
    ```bash
-   mkdir build
-   cd build
-   cmake ..
-   make -j
+   cmake --build build
    ```
 
 8. 安装 Mooncake python 包和 mooncake_master 可执行文件
    ```bash
-   make install
+   sudo cmake --install install
    ```
 
 ## 高级编译选项
-在执行 `cmake ..` 期间可以使用下列选项指定是否编译 Mooncake 的某些组件。
+在执行 `cmake` 期间可以使用下列选项指定是否编译 Mooncake 的某些组件。
 - `-DUSE_CUDA=[ON|OFF]`: 启用 GPU Direct RDMA 及 NVMe-of 支持
 - `-DUSE_MUSA=[ON|OFF]`: 通过 MUSA 启用对摩尔线程 GPU 的支持
 - `-DUSE_MACA=[ON|OFF]`: 通过 MACA 启用对沐曦 MetaX GPU 的支持。

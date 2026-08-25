@@ -41,17 +41,16 @@ git clone https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
 
 # 启用 TENT + Sunrise Link
-mkdir build && cd build
-cmake .. -DUSE_TENT=ON -DUSE_SUNRISE=ON
+cmake -B build -G Ninja -DUSE_TENT=ON -DUSE_SUNRISE=ON
 
 # 编译
-make -j$(nproc)
+cmake --build build
 ```
 
 如果 Tang Runtime 安装在非默认路径：
 
 ```bash
-cmake .. -DUSE_TENT=ON -DUSE_SUNRISE=ON -DMC_TANGRT_ROOT=/opt/tangrt
+cmake -B build -G Ninja -DUSE_TENT=ON -DUSE_SUNRISE=ON -DMC_TANGRT_ROOT=/opt/tangrt
 ```
 
 ---
