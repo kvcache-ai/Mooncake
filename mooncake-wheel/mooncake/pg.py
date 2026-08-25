@@ -55,7 +55,7 @@ def _source_path(source_dir: Path, name: str) -> Path:
     if candidate.is_file():
         return candidate
     subdir = "src" if name.endswith(".cpp") else "include"
-    if name == "mooncake_pg.h":
+    if name in {"mooncake_pg.h", "pg_utils.h"}:
         return source_dir.parent.parent / "include" / name
     return source_dir / subdir / name
 
