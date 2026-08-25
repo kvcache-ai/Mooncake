@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <set>
 #include <string>
@@ -556,6 +557,19 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
 
 class SizeClassAwareAllocationStrategy final : public RankedAllocationStrategy {
    public:
+    explicit SizeClassAwareAllocationStrategy(
+        double free_ratio_weight = DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT,
+        double matching_share_weight =
+            DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT)
+        : free_ratio_weight_(free_ratio_weight),
+          matching_share_weight_(matching_share_weight) {
+        if (!std::isfinite(free_ratio_weight_) || free_ratio_weight_ <= 0.0 ||
+            !std::isfinite(matching_share_weight_) ||
+            matching_share_weight_ < 0.0) {
+            throw std::invalid_argument("invalid size-class strategy weights");
+        }
+    }
+
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num = 1,
@@ -572,7 +586,7 @@ class SizeClassAwareAllocationStrategy final : public RankedAllocationStrategy {
     }
 
    private:
-    static double GetSegmentScore(const AllocatorManager& allocator_manager,
+    double GetSegmentScore(const AllocatorManager& allocator_manager,
                                   const std::string& name,
                                   const size_t slice_length) {
         const auto* allocators = allocator_manager.getAllocators(name);
@@ -613,15 +627,17 @@ class SizeClassAwareAllocationStrategy final : public RankedAllocationStrategy {
                                   static_cast<double>(total_capacity);
         if (!profile_supported || total_live_bytes == 0 ||
             matching_live_bytes == 0) {
-            return free_ratio;
+            return free_ratio_weight_ * free_ratio;
         }
 
         const double matching_share = static_cast<double>(matching_live_bytes) /
                                       static_cast<double>(total_live_bytes);
-        return free_ratio + matching_share * kMaxSizeClassAffinityBonus;
+        return free_ratio_weight_ * free_ratio +
+               matching_share_weight_ * matching_share;
     }
 
-    static constexpr double kMaxSizeClassAffinityBonus = 0.1;
+    const double free_ratio_weight_;
+    const double matching_share_weight_;
 };
 
 class SsdFreeRatioFirstAllocationStrategy final
@@ -711,14 +727,20 @@ class CxlAllocationStrategy : public AllocationStrategy {
  * @brief Factory function to create allocation strategy based on type
  */
 inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
-    AllocationStrategyType type, const LocalSsdManager& local_ssd) {
+    AllocationStrategyType type, const LocalSsdManager& local_ssd,
+    double size_class_free_ratio_weight =
+        DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT,
+    double size_class_matching_share_weight =
+        DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT) {
     switch (type) {
         case AllocationStrategyType::RANDOM:
             return std::make_shared<RandomAllocationStrategy>();
         case AllocationStrategyType::FREE_RATIO_FIRST:
             return std::make_shared<FreeRatioFirstAllocationStrategy>();
         case AllocationStrategyType::SIZE_CLASS_AWARE:
-            return std::make_shared<SizeClassAwareAllocationStrategy>();
+            return std::make_shared<SizeClassAwareAllocationStrategy>(
+                size_class_free_ratio_weight,
+                size_class_matching_share_weight);
         case AllocationStrategyType::CXL:
             return std::make_shared<CxlAllocationStrategy>();
         case AllocationStrategyType::SSD_FREE_RATIO_FIRST:

@@ -3,6 +3,7 @@
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
+#include <cmath>
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
@@ -321,8 +322,23 @@ DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
 DEFINE_string(
     allocation_strategy, "random",
-    "Allocation strategy for segments, random | free_ratio_first | cxl | "
-    "ssd_free_ratio_first | local_first");
+    "Allocation strategy for segments, random | free_ratio_first | "
+    "size_class_aware | cxl | ssd_free_ratio_first | local_first");
+DEFINE_double(size_class_free_ratio_weight,
+              mooncake::DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT,
+              "Free-ratio score weight for size_class_aware placement");
+DEFINE_double(size_class_matching_share_weight,
+              mooncake::DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT,
+              "Matching-size-class score weight for size_class_aware "
+              "placement");
+DEFINE_validator(size_class_free_ratio_weight,
+                 [](const char*, double value) {
+                     return std::isfinite(value) && value > 0.0;
+                 });
+DEFINE_validator(size_class_matching_share_weight,
+                 [](const char*, double value) {
+                     return std::isfinite(value) && value >= 0.0;
+                 });
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -631,6 +647,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("allocation_strategy",
                              &master_config.allocation_strategy,
                              FLAGS_allocation_strategy);
+    default_config.GetDouble("size_class_free_ratio_weight",
+                             &master_config.size_class_free_ratio_weight,
+                             FLAGS_size_class_free_ratio_weight);
+    default_config.GetDouble("size_class_matching_share_weight",
+                             &master_config.size_class_matching_share_weight,
+                             FLAGS_size_class_matching_share_weight);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -1143,6 +1165,20 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "size_class_free_ratio_weight", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.size_class_free_ratio_weight =
+            FLAGS_size_class_free_ratio_weight;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "size_class_matching_share_weight", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.size_class_matching_share_weight =
+            FLAGS_size_class_matching_share_weight;
     }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||

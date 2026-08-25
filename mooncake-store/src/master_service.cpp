@@ -217,8 +217,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allocation_strategy_type_(config.enable_cxl
                                     ? AllocationStrategyType::CXL
                                     : config.allocation_strategy_type),
-      allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_,
-                                                    local_ssd_manager_)),
+      allocation_strategy_(CreateAllocationStrategy(
+          allocation_strategy_type_, local_ssd_manager_,
+          config.size_class_free_ratio_weight,
+          config.size_class_matching_share_weight)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       offloading_queue_limit_(config.offloading_queue_limit),

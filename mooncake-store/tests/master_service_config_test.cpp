@@ -1,5 +1,7 @@
 #include "master_config.h"
 
+#include <limits>
+
 #include <gtest/gtest.h>
 
 namespace mooncake::test {
@@ -42,14 +44,50 @@ TEST(MasterServiceConfigTest, OplogEnablementPropagatesToServingConfig) {
 TEST(MasterServiceConfigTest, SizeClassAwareStrategyIsParsed) {
     MasterConfig master_config{};
     master_config.allocation_strategy = "size_class_aware";
+    master_config.size_class_free_ratio_weight = 0.75;
+    master_config.size_class_matching_share_weight = 0.25;
 
     MasterServiceSupervisorConfig supervisor_config(master_config);
     WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
 
     EXPECT_EQ(supervisor_config.allocation_strategy_type,
               AllocationStrategyType::SIZE_CLASS_AWARE);
     EXPECT_EQ(wrapped_config.allocation_strategy_type,
               AllocationStrategyType::SIZE_CLASS_AWARE);
+    EXPECT_DOUBLE_EQ(supervisor_config.size_class_free_ratio_weight, 0.75);
+    EXPECT_DOUBLE_EQ(supervisor_config.size_class_matching_share_weight, 0.25);
+    EXPECT_DOUBLE_EQ(wrapped_config.size_class_free_ratio_weight, 0.75);
+    EXPECT_DOUBLE_EQ(wrapped_config.size_class_matching_share_weight, 0.25);
+    EXPECT_DOUBLE_EQ(service_config.size_class_free_ratio_weight, 0.75);
+    EXPECT_DOUBLE_EQ(service_config.size_class_matching_share_weight, 0.25);
+}
+
+TEST(MasterServiceConfigTest, SizeClassWeightsBuilderOverrideRespected) {
+    auto config = MasterServiceConfig::builder()
+                      .set_size_class_weights(0.6, 0.4)
+                      .build();
+
+    EXPECT_DOUBLE_EQ(config.size_class_free_ratio_weight, 0.6);
+    EXPECT_DOUBLE_EQ(config.size_class_matching_share_weight, 0.4);
+}
+
+TEST(MasterServiceConfigTest, RejectsInvalidSizeClassWeights) {
+    MasterConfig master_config{};
+
+    master_config.size_class_free_ratio_weight = 0.0;
+    EXPECT_THROW((void)MasterServiceSupervisorConfig{master_config},
+                 std::runtime_error);
+
+    master_config.size_class_free_ratio_weight = 1.0;
+    master_config.size_class_matching_share_weight = -0.1;
+    EXPECT_THROW((void)MasterServiceSupervisorConfig{master_config},
+                 std::runtime_error);
+
+    master_config.size_class_matching_share_weight =
+        std::numeric_limits<double>::infinity();
+    EXPECT_THROW((void)MasterServiceSupervisorConfig{master_config},
+                 std::runtime_error);
 }
 
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {

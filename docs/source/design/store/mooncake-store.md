@@ -601,7 +601,7 @@ The key insight behind Best-of-N is that if a new/empty segment is sampled, it w
 
 **`size_class_aware` — SizeClassAwareAllocationStrategy**
 
-For every live allocation, `OffsetBufferAllocator` records the requested byte count in a logarithmic size class (`ceil(log2(size))`). Candidate ranking starts with each segment's free ratio and adds at most `0.1` according to the share of live bytes in the requested class. This bounded bonus avoids letting affinity override a materially emptier segment while still grouping compatible sizes when capacity is similar. The state remains dynamic: deleting allocations updates the profile immediately, while snapshot replay reconstructs it from live descriptors.
+For every live allocation, `OffsetBufferAllocator` records the requested byte count in a logarithmic size class (`ceil(log2(size))`). Candidate ranking combines the segment free ratio and the share of live bytes in the requested class using the configurable `size_class_free_ratio_weight` and `size_class_matching_share_weight` values. This bounded bonus avoids letting affinity override a materially emptier segment while still grouping compatible sizes when capacity is similar. The state remains dynamic: deleting allocations updates the profile immediately, while snapshot replay reconstructs it from live descriptors.
 
 The strategy applies affinity to `MEMORY` and NoF SSD replicas managed by `OffsetBufferAllocator`. Allocators without size-profile support, including CacheLib, retain free-ratio ranking; CXL, local-disk, and DFS paths retain their existing placement behavior.
 

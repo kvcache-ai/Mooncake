@@ -564,6 +564,8 @@ mooncake_master \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--allocation_strategy` | `random` | Allocation strategy: `random` (pure random, fastest), `free_ratio_first` (best memory load balance), `size_class_aware` (size-class affinity for memory and NoF SSD `OffsetAllocator` segments), `ssd_free_ratio_first` (SSD-aware free-ratio-first), `cxl` (prefer CXL memory), or `local_first` (prefer local host memory segments before ordered remote fallback) |
+| `--size_class_free_ratio_weight` | `1.0` | Free-ratio score weight used by `size_class_aware`; must be greater than zero |
+| `--size_class_matching_share_weight` | `0.15` | Matching-size-class score weight used by `size_class_aware`; must be non-negative |
 
 ### PutStart Timeouts
 

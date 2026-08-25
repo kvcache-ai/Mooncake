@@ -24,6 +24,14 @@
 DEFINE_int64(segment_capacity, 1024,
              "Per-segment capacity in MB (base capacity for skewed mode)");
 DEFINE_int32(num_allocations, 10000, "Number of allocations to benchmark");
+DEFINE_double(size_class_free_ratio_weight,
+              mooncake::DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT,
+              "Free-ratio weight for size-class-aware placement");
+DEFINE_double(size_class_matching_share_weight,
+              mooncake::DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT,
+              "Matching-share weight for size-class-aware placement");
+DEFINE_uint64(size_class_strategy_seed, 42,
+              "Random seed for size-class churn strategy sampling");
 DEFINE_int32(convergence_sample_interval, 100,
              "Sample utilization stddev or fragmentation every N allocations");
 DEFINE_bool(run_all, false,
@@ -673,7 +681,9 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
     LocalSsdManager local_ssd;
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd,
+                                  FLAGS_size_class_free_ratio_weight,
+                                  FLAGS_size_class_matching_share_weight);
 
     std::vector<double> latencies;
     latencies.reserve(cfg.num_allocations);
@@ -793,7 +803,9 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
     LocalSsdManager local_ssd;
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd,
+                                  FLAGS_size_class_free_ratio_weight,
+                                  FLAGS_size_class_matching_share_weight);
 
     const double convergence_threshold = FLAGS_convergence_threshold;
 
@@ -1119,7 +1131,9 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
     LocalSsdManager local_ssd;
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd,
+                                  FLAGS_size_class_free_ratio_weight,
+                                  FLAGS_size_class_matching_share_weight);
 
     const size_t total_capacity = computeTotalCapacity(manager);
     const size_t avg_obj_size =
@@ -1240,10 +1254,13 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
 }
 
 static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
+    threadLocalRandomEngine().seed(FLAGS_size_class_strategy_seed);
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
     LocalSsdManager local_ssd;
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd,
+                                  FLAGS_size_class_free_ratio_weight,
+                                  FLAGS_size_class_matching_share_weight);
     auto specs = getSizeClassSpecs(cfg.size_class_pattern);
 
     std::vector<SizeClassStat> per_class_stats;

@@ -750,6 +750,57 @@ TEST_F(AllocationStrategyTest, SizeClassAwareBoundsAffinityByFreeRatio) {
               "emptier-mismatch");
 }
 
+TEST_F(AllocationStrategyTest, SizeClassAwareWeightsControlTradeoff) {
+    constexpr size_t kSegmentSize = 64 * MiB;
+    constexpr size_t kRequestSize = 4 * MiB;
+    auto matching = std::make_shared<OffsetBufferAllocator>(
+        "matching", 0x3d0000000ULL, kSegmentSize, "matching");
+    auto emptier_mismatch = std::make_shared<OffsetBufferAllocator>(
+        "emptier-mismatch", 0x3e0000000ULL, kSegmentSize,
+        "emptier-mismatch");
+
+    std::vector<std::unique_ptr<AllocatedBuffer>> matching_seeds;
+    for (int i = 0; i < 4; ++i) {
+        matching_seeds.push_back(matching->allocate(kRequestSize));
+        ASSERT_NE(matching_seeds.back(), nullptr);
+    }
+    auto mismatched_seed = emptier_mismatch->allocate(4 * 1024);
+    ASSERT_NE(mismatched_seed, nullptr);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("matching", matching);
+    allocator_manager.addAllocator("emptier-mismatch", emptier_mismatch);
+
+    {
+        SizeClassAwareAllocationStrategy capacity_first(1.0, 0.0);
+        auto capacity_result = capacity_first.Allocate(allocator_manager,
+                                                       kRequestSize);
+        ASSERT_TRUE(capacity_result.has_value());
+        EXPECT_EQ(capacity_result->front()
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "emptier-mismatch");
+    }
+
+    SizeClassAwareAllocationStrategy affinity_first(0.75, 0.25);
+    auto affinity_result = affinity_first.Allocate(allocator_manager,
+                                                   kRequestSize);
+    ASSERT_TRUE(affinity_result.has_value());
+    EXPECT_EQ(affinity_result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "matching");
+}
+
+TEST_F(AllocationStrategyTest, SizeClassAwareRejectsInvalidWeights) {
+    EXPECT_THROW(SizeClassAwareAllocationStrategy(0.0, 0.1),
+                 std::invalid_argument);
+    EXPECT_THROW(SizeClassAwareAllocationStrategy(1.0, -0.1),
+                 std::invalid_argument);
+}
+
 TEST_F(AllocationStrategyTest, SizeClassAwarePrefersEmptyOverMismatch) {
     constexpr size_t kSegmentSize = 64 * MiB;
     auto mismatched = std::make_shared<OffsetBufferAllocator>(
