@@ -21,6 +21,27 @@ _HEADER_NAMES = (
 )
 
 
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").upper() in {"1", "ON", "TRUE", "YES"}
+
+
+def _using_musa() -> bool:
+    return _env_enabled("MOONCAKE_EP_USE_MUSA")
+
+
+def _load_torchada() -> None:
+    """Install torchada's MUSA mappings before loading cpp_extension."""
+    if not _using_musa():
+        return
+    try:
+        import torchada  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Mooncake PG MUSA JIT requires torchada. "
+            "Install it with `python -m pip install torchada`."
+        ) from exc
+
+
 def _source_dir() -> Path:
     installed = Path(__file__).with_name("_pg_jit")
     if installed.is_dir():
@@ -50,6 +71,7 @@ def _cache_key(source_dir: Path, core_path: Path, build_path: str) -> str:
     digest = hashlib.sha256()
     digest.update(torch.__version__.encode())
     digest.update(str(torch.version.cuda).encode())
+    digest.update(str(getattr(torch.version, "musa", None)).encode())
     digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
     digest.update(str(torch.version.git_version).encode())
     digest.update(build_path.encode())
@@ -72,30 +94,40 @@ def _build_lock(lock_path: Path):
 
 
 def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
+    _load_torchada()
     from torch.utils.cpp_extension import library_paths, load
 
     verbose = os.environ.get("MOONCAKE_PG_JIT_VERBOSE", "0") == "1"
+    is_musa = _using_musa()
+    extra_cflags = [
+        "-std=c++20",
+        "-O3",
+        "-g0",
+        f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
+    ]
+    extra_ldflags = [
+        f"-Wl,-rpath,{core_path.parent}",
+        *[f"-Wl,-rpath,{path}" for path in library_paths()],
+        str(core_path),
+    ]
+    if is_musa:
+        # torchada redirects PyTorch's CUDA extension machinery to mcc/MUSA.
+        # The adapter sources select the MUSA backend through these defines.
+        extra_cflags += ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
+    else:
+        # Retain the CUDA link contract validated by the fresh-wheel smoke.
+        extra_ldflags += ["-lc10_cuda", "-ltorch_cuda"]
+
     return load(
-        name="_mooncake_pg_jit_cuda",
+        name="_mooncake_pg_jit_musa" if is_musa else "_mooncake_pg_jit_cuda",
         sources=[str(_source_path(source_dir, name)) for name in _SOURCE_NAMES],
-        extra_cflags=[
-            "-std=c++20",
-            "-O3",
-            "-g0",
-            f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
-        ],
+        extra_cflags=extra_cflags,
         extra_include_paths=[
             str(source_dir),
             str(source_dir / "include"),
             str(source_dir.parent.parent / "include"),
         ],
-        extra_ldflags=[
-            f"-Wl,-rpath,{core_path.parent}",
-            *[f"-Wl,-rpath,{path}" for path in library_paths()],
-            str(core_path),
-            "-lc10_cuda",
-            "-ltorch_cuda",
-        ],
+        extra_ldflags=extra_ldflags,
         build_directory=str(build_dir),
         verbose=verbose,
         with_cuda=True,
@@ -143,14 +175,29 @@ def _load_jit_adapter():
             "Install it with `python -m pip install ninja`."
         )
 
-    from torch.utils.cpp_extension import CUDA_HOME
-
-    if not CUDA_HOME or not (Path(CUDA_HOME) / "bin" / "nvcc").is_file():
-        raise ImportError(
-            "Mooncake PG Torch adapter JIT requires a CUDA toolkit with nvcc; "
-            "install a CUDA toolkit or use a compatible runtime environment"
+    if _using_musa():
+        _load_torchada()
+        musa_home = os.environ.get("MUSA_HOME")
+        mcc = (
+            Path(musa_home) / "bin" / "mcc"
+            if musa_home
+            else shutil.which("mcc")
         )
-    toolkit_identity = f"cuda:{CUDA_HOME}:{Path(CUDA_HOME) / 'bin' / 'nvcc'}"
+        if not mcc or not Path(mcc).is_file():
+            raise ImportError(
+                "Mooncake PG MUSA JIT requires the MUSA compiler (mcc). "
+                "Set MUSA_HOME or add mcc to PATH."
+            )
+        toolkit_identity = f"musa:{musa_home or 'PATH'}:{Path(mcc).resolve()}"
+    else:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if not CUDA_HOME or not (Path(CUDA_HOME) / "bin" / "nvcc").is_file():
+            raise ImportError(
+                "Mooncake PG Torch adapter JIT requires a CUDA toolkit with nvcc; "
+                "install a CUDA toolkit or use a compatible runtime environment"
+            )
+        toolkit_identity = f"cuda:{CUDA_HOME}:{Path(CUDA_HOME) / 'bin' / 'nvcc'}"
     key = _cache_key(source_dir, core_path, toolkit_identity)
     build_dir = _cache_root() / key
     build_dir.mkdir(parents=True, exist_ok=True)
