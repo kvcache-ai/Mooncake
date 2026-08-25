@@ -8,8 +8,14 @@
 #include <cstdint>
 #include <thread>
 
-// For PAUSE macro
-#include <transfer_engine.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define MOONCAKE_PG_PAUSE() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define MOONCAKE_PG_PAUSE() __asm__ __volatile__("yield")
+#else
+#define MOONCAKE_PG_PAUSE()
+#endif
 
 namespace mooncake {
 
@@ -118,7 +124,7 @@ class BackoffWaiter {
      */
     void step() {
         if (spin_count_ < config_.spin_limit) {
-            PAUSE();
+            MOONCAKE_PG_PAUSE();
             ++spin_count_;
         } else if (yield_count_ < config_.yield_limit) {
             std::this_thread::yield();

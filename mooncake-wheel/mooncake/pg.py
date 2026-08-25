@@ -15,7 +15,7 @@ _HEADER_NAMES = (
     "mooncake_backend.h",
     "work_handles.h",
     "torch_utils.h",
-    "adapter_backoff.h",
+    "pg_utils.h",
     "mooncake_pg.h",
 )
 
@@ -83,7 +83,11 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
             "-g0",
             f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
         ],
-        extra_include_paths=[str(source_dir), str(source_dir / "include")],
+        extra_include_paths=[
+            str(source_dir),
+            str(source_dir / "include"),
+            str(source_dir.parent.parent / "include"),
+        ],
         extra_ldflags=[
             f"-Wl,-rpath,{core_path.parent}",
             *[f"-Wl,-rpath,{path}" for path in library_paths()],

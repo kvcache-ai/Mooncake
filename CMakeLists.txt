@@ -221,6 +221,39 @@ if(WITH_EP)
     file(REMOVE_RECURSE "${EP_PG_STAGING_DIR}" "${EP_PG_BUILD_DIR}")
     file(MAKE_DIRECTORY "${EP_PG_STAGING_DIR}" "${EP_PG_BUILD_DIR}")
 
+    # Stage the runtime JIT source bundle for the legacy wheel script as well
+    # as the scikit-build install path.  The authoritative files stay under
+    # mooncake-pg/torch; no package-tree mirror is maintained.
+    add_custom_target(
+      mooncake_pg_jit_sources_stage ALL
+      COMMAND ${CMAKE_COMMAND} -E make_directory
+              "${EP_PG_STAGING_DIR}/_pg_jit"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/pg_py.cpp"
+              "${EP_PG_STAGING_DIR}/_pg_jit/pg_py.cpp"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/mooncake_backend.cpp"
+              "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.cpp"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/work_handles.cpp"
+              "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.cpp"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/mooncake_backend.h"
+              "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.h"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/work_handles.h"
+              "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.h"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/torch_utils.h"
+              "${EP_PG_STAGING_DIR}/_pg_jit/torch_utils.h"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/pg_utils.h"
+              "${EP_PG_STAGING_DIR}/_pg_jit/pg_utils.h"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/mooncake_pg.h"
+              "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_pg.h"
+      COMMENT "Staging Mooncake PG Torch JIT sources")
+
     # Convert semicolon-separated lists to pipe-separated strings so they
     # survive CMake's COMMAND list-splitting (semicolons are CMake list
     # separators).

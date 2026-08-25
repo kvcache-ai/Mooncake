@@ -35,7 +35,7 @@ if(WITH_EP)
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/mooncake_backend.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/work_handles.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/torch_utils.h"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/adapter_backoff.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/include/pg_utils.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/include/mooncake_pg.h"
     DESTINATION mooncake/_pg_jit
     COMPONENT python)
