@@ -238,10 +238,8 @@ TEST(RequestMergeTest, MergesMatchingSelectionAndSchedulingAttributes) {
         request.deadline_ns = 12345;
     }
     std::vector<RequestBoundaryInfo> boundaries = {
-        {makeBufferKey(source_addr, source.size()),
-         makeBufferKey(4096, 2048)},
-        {makeBufferKey(source_addr, source.size()),
-         makeBufferKey(4096, 2048)},
+        {makeBufferKey(source_addr, source.size()), makeBufferKey(4096, 2048)},
+        {makeBufferKey(source_addr, source.size()), makeBufferKey(4096, 2048)},
     };
 
     auto merged = mergeRequests(requests, boundaries, true);

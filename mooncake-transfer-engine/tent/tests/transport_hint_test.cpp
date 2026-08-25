@@ -87,8 +87,7 @@ class FakeTransport : public Transport {
         submitted_device_masks.push_back(fb->device_mask);
         submitted_qp_pools.push_back(fb->qp_pool);
         submitted_request_counts.push_back(reqs.size());
-        if (!fail_qp_pool_once.empty() &&
-            fb->qp_pool == fail_qp_pool_once) {
+        if (!fail_qp_pool_once.empty() && fb->qp_pool == fail_qp_pool_once) {
             fail_qp_pool_once.clear();
             return Status::InternalError("injected submit failure" LOC_MARK);
         }
@@ -395,21 +394,19 @@ TEST(TransportPolicy, SplitsRdmaSubBatchesByResolvedPolicy) {
     std::vector<uint8_t> buf(kBufLen, 0xCC);
     ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
 
-    Request request_a0 = makeLocalWriteRequest(
-        buf.data(), kRequestLength);
+    Request request_a0 = makeLocalWriteRequest(buf.data(), kRequestLength);
     request_a0.policy_name = "rdma-a";
-    Request request_b = makeLocalWriteRequest(
-        buf.data() + kRequestLength, kRequestLength);
+    Request request_b =
+        makeLocalWriteRequest(buf.data() + kRequestLength, kRequestLength);
     request_b.policy_name = "rdma-b";
-    Request request_a1 = makeLocalWriteRequest(
-        buf.data() + 2 * kRequestLength, kRequestLength);
+    Request request_a1 =
+        makeLocalWriteRequest(buf.data() + 2 * kRequestLength, kRequestLength);
     request_a1.policy_name = "rdma-a";
 
     BatchID batch_id = engine.allocateBatch(4);
-    ASSERT_TRUE(engine
-                    .submitTransfer(batch_id,
-                                    {request_a0, request_b, request_a1})
-                    .ok());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch_id, {request_a0, request_b, request_a1})
+            .ok());
 
     ASSERT_EQ(fake_rdma->submit_calls.load(), 2);
     ASSERT_EQ(fake_rdma->submitted_request_counts.size(), 2u);
@@ -468,8 +465,8 @@ TEST(TransportPolicy, SyncFailureDoesNotShiftLaterGroupTaskIds) {
 
     Request failing = makeLocalWriteRequest(buf.data(), kRequestLength);
     failing.policy_name = "rdma-fail";
-    Request succeeding = makeLocalWriteRequest(
-        buf.data() + kRequestLength, kRequestLength);
+    Request succeeding =
+        makeLocalWriteRequest(buf.data() + kRequestLength, kRequestLength);
     succeeding.policy_name = "rdma-ok";
 
     BatchID batch_id = engine.allocateBatch(2);

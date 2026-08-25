@@ -181,9 +181,10 @@ TEST(DeviceSelectorTest, PerSliceAllocationHonorsPolicy) {
         DeviceSelector selector;
         ASSERT_TRUE(selector.loadTopology(topology).ok());
         int chosen_device = -1;
-        ASSERT_TRUE(selector.allocate(4096, "cpu:0", chosen_device,
-                                       PRIO_HIGH, 1ULL << 1)
-                        .ok());
+        ASSERT_TRUE(
+            selector
+                .allocate(4096, "cpu:0", chosen_device, PRIO_HIGH, 1ULL << 1)
+                .ok());
         EXPECT_EQ(chosen_device, 1);
     }
 
@@ -200,8 +201,9 @@ TEST(DeviceSelectorTest, PerSliceAllocationHonorsPolicy) {
         selector.setSchedulingParams(params);
 
         int chosen_device = -1;
-        ASSERT_TRUE(selector.allocate(4096, "cpu:0", chosen_device,
-                                       PRIO_LOW, (1ULL << 1) | (1ULL << 2))
+        ASSERT_TRUE(selector
+                        .allocate(4096, "cpu:0", chosen_device, PRIO_LOW,
+                                  (1ULL << 1) | (1ULL << 2))
                         .ok());
         EXPECT_EQ(chosen_device, 2);
     }

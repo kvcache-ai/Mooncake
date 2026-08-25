@@ -1672,14 +1672,12 @@ Status TransferEngineImpl::commitPreparedSubmit(
         // returning, so groups can safely share one SubBatch.
         std::vector<std::vector<size_t>> submit_groups;
         if (type == RDMA) {
-            std::map<std::pair<uint64_t, std::string>, size_t>
-                group_by_policy;
+            std::map<std::pair<uint64_t, std::string>, size_t> group_by_policy;
             for (const auto task_id : physical_task_id_list[type]) {
                 const auto& task = batch->task_list[task_id];
                 auto key = std::make_pair(task.device_mask, task.qp_pool);
-                auto [it, inserted] =
-                    group_by_policy.emplace(std::move(key),
-                                            submit_groups.size());
+                auto [it, inserted] = group_by_policy.emplace(
+                    std::move(key), submit_groups.size());
                 if (inserted) submit_groups.emplace_back();
                 submit_groups[it->second].push_back(task_id);
             }
