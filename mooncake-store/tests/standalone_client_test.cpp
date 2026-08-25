@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <memory>
 #include <span>
 #include <string>
@@ -25,6 +26,7 @@ class StandaloneClientTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        unsetenv("MOONCAKE_ENABLE_STANDALONE");
         if (client_) {
             client_->tearDownAll();
             client_.reset();
@@ -97,6 +99,7 @@ TEST_F(StandaloneClientTest, ConfigDictOmitsMasterAddress) {
 }
 
 TEST_F(StandaloneClientTest, RejectsEmptyMetadataWithoutStandalone) {
+    unsetenv("MOONCAKE_ENABLE_STANDALONE");
     ConfigDict config;
     config[CONFIG_KEY_LOCAL_HOSTNAME] = "localhost";
     config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = "16MB";
@@ -105,6 +108,28 @@ TEST_F(StandaloneClientTest, RejectsEmptyMetadataWithoutStandalone) {
     auto result = client_->setup_internal(config);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(StandaloneClientTest, EnvVarEnablesStandaloneWithoutKwarg) {
+    ASSERT_EQ(setenv("MOONCAKE_ENABLE_STANDALONE", "true", 1), 0);
+    ASSERT_EQ(
+        client_->setup_real("localhost", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                            16 * 1024 * 1024, FLAGS_protocol, rdma_devices(),
+                            /*master_server_addr=*/"127.0.0.1:50051"),
+        0)
+        << "MOONCAKE_ENABLE_STANDALONE should embed master for HiCache-style "
+           "setup() calls that omit enable_standalone";
+
+    const std::string key = "standalone_env_key";
+    const std::string test_data = "hello-env-standalone";
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ASSERT_EQ(client_->put(key, data_span), 0);
+    auto buffer_handle = client_->get_buffer(key);
+    ASSERT_NE(buffer_handle, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buffer_handle->ptr()),
+                          buffer_handle->size()),
+              test_data);
+    unsetenv("MOONCAKE_ENABLE_STANDALONE");
 }
 
 }  // namespace testing

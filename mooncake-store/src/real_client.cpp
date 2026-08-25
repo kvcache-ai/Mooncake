@@ -793,6 +793,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_standalone) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
+    if (!enable_standalone &&
+        Environ::GetBool("MOONCAKE_ENABLE_STANDALONE", false)) {
+        LOG(INFO)
+            << "enable_standalone inferred from MOONCAKE_ENABLE_STANDALONE";
+        enable_standalone = true;
+    }
     const bool should_use_hugepage =
         use_hugepage_ && this->protocol != "ubshmem";
 #ifdef USE_ASCEND_DIRECT
@@ -1297,6 +1303,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         get_config(config, CONFIG_KEY_METADATA_SERVER);
     bool enable_standalone =
         get_config_bool(config, CONFIG_KEY_ENABLE_STANDALONE, false);
+    if (!enable_standalone) {
+        enable_standalone =
+            Environ::GetBool("MOONCAKE_ENABLE_STANDALONE", false);
+    }
 
     // Validate required parameters
     if (local_hostname.empty()) {
