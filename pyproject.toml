@@ -3,9 +3,9 @@ requires = [
     "scikit-build-core>=1.0",
     "pybind11>=2.13",
     "numpy>=1.24",
-    # Mooncake PG still builds its Torch ABI extensions through setup.py.
+    # Retained for the legacy wheel helper and packaging test environment.
     "setuptools>=61",
-    # Multi-ABI PG builds install the requested Torch wheels at build time.
+    # Retained for the legacy wheel helper; PG Torch compilation is runtime JIT.
     "pip>=23",
 ]
 build-backend = "scikit_build_core.build"
