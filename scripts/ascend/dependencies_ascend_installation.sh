@@ -55,12 +55,28 @@ check_success() {
 
 set +e
 
+if command -v apt-get &> /dev/null; then
+    echo "Detected apt-get. Using Debian-based package manager."
+    apt-get update
+    apt-get install -y python3-venv
+elif command -v yum &> /dev/null; then
+    echo "Detected yum. Using Red Hat-based package manager."
+    yum makecache
+    yum install -y python3
+fi
+
+MOONCAKE_TOOLCHAIN=/opt/mooncake-toolchain
+python3 -m venv ${MOONCAKE_TOOLCHAIN}
+${MOONCAKE_TOOLCHAIN}/bin/python3 -m pip config --user set \
+  global.index-url https://mirrors.huaweicloud.com/repository/pypi/simple
+${MOONCAKE_TOOLCHAIN}/bin/python3 -m pip install --upgrade pip cmake ninja
+export PATH=${MOONCAKE_TOOLCHAIN}/bin:$PATH
+
 # System detection and dependency installation
 if command -v apt-get &> /dev/null; then
     echo "Detected apt-get. Using Debian-based package manager."
     apt-get update
     apt-get install -y build-essential \
-            cmake \
             git \
             wget \
             libibverbs-dev \
@@ -89,7 +105,7 @@ if command -v apt-get &> /dev/null; then
 elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
     yum makecache
-    yum install -y cmake \
+    yum install -y \
             gflags-devel \
             glog-devel \
             libibverbs-devel \
@@ -108,22 +124,20 @@ elif command -v yum &> /dev/null; then
     clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
     cd yaml-cpp || exit
     rm -rf build
-    mkdir -p build && cd build
-    cmake ..
-    make -j$(nproc)
-    make install
-    cd ../..
+    cmake -B build -G Ninja
+    cmake --build build
+    cmake --install build
+    cd -
 
     # Install msgpack-c
     clone_repo_if_not_exists "msgpack-c" "https://github.com/msgpack/msgpack-c.git"
     cd msgpack-c || exit
     git checkout cpp-7.0.0
     rm -rf build
-    mkdir -p build && cd build
-    cmake ..
-    make -j
-    make install
-    cd ../..
+    cmake -B build -G Ninja
+    cmake --build build
+    cmake --install build
+    cd -
 else
     echo "Unsupported package manager. Please install the dependencies manually."
     exit 1

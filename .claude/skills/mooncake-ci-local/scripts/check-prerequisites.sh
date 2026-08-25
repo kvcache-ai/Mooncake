@@ -15,7 +15,7 @@ echo "🔍 Checking Mooncake CI test prerequisites..."
 # 1. Check build directory
 if [ ! -f build/CMakeCache.txt ]; then
   echo -e "${RED}✗ Build directory not found or not built${NC}"
-  echo "  → Run: mkdir build && cd build && cmake .. && cmake --build ."
+  echo "  → Run: cmake -B build -G Ninja && cmake --build build"
   exit 1
 fi
 echo -e "${GREEN}✓ Build exists${NC}"
@@ -24,7 +24,7 @@ echo -e "${GREEN}✓ Build exists${NC}"
 if ! python -c "import mooncake" 2>/dev/null; then
   echo -e "${RED}✗ mooncake package not installed${NC}"
   echo "  → Fixing: Installing mooncake package..."
-  cd build && sudo cmake --install . && cd - >/dev/null
+  sudo cmake --install build
   if ! python -c "import mooncake" 2>/dev/null; then
     echo "  → Alternative: pip install mooncake-wheel/dist/*.whl"
     exit 1

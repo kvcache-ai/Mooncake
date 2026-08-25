@@ -34,9 +34,8 @@
 //! Then build and run via CMake (which sets the right library paths):
 //!
 //! ```bash
-//! cd build
-//! cmake -G Ninja .. -DWITH_STORE_RUST=ON
-//! cmake --build . --target build_mooncake_store_rust
+//! cmake -B build -G Ninja -DWITH_STORE_RUST=ON
+//! cmake --build build --target build_mooncake_store_rust
 //! ```
 //!
 //! Or directly with cargo (after a CMake install):
