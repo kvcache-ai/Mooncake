@@ -8,6 +8,7 @@ add_custom_target(build_mooncake_store_rust DEPENDS mooncake_store)
 
 add_custom_command(
   TARGET build_mooncake_store_rust
+  POST_BUILD
   COMMAND
     ${CMAKE_COMMAND} -E env
     # Where cargo should place its build artefacts.
@@ -26,6 +27,7 @@ add_custom_target(build_mooncake_store_rust_example DEPENDS mooncake_store)
 
 add_custom_command(
   TARGET build_mooncake_store_rust_example
+  POST_BUILD
   COMMAND
     ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
     MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}
@@ -40,6 +42,7 @@ add_custom_target(build_mooncake_store_rust_tests DEPENDS mooncake_store)
 
 add_custom_command(
   TARGET build_mooncake_store_rust_tests
+  POST_BUILD
   COMMAND
     ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
     MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}
@@ -55,6 +58,7 @@ add_custom_command(
 add_custom_target(generate_store_rust_dlopen_bindings)
 add_custom_command(
   TARGET generate_store_rust_dlopen_bindings
+  POST_BUILD
   COMMAND
     ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
     MOONCAKE_STORE_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../include cargo run
