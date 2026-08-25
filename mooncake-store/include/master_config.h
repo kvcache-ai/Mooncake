@@ -359,6 +359,8 @@ class MasterServiceSupervisorConfig {
         // Convert string allocation_strategy to AllocationStrategyType enum
         if (config.allocation_strategy == "free_ratio_first") {
             allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "size_class_aware") {
+            allocation_strategy_type = AllocationStrategyType::SIZE_CLASS_AWARE;
         } else if (config.allocation_strategy == "cxl") {
             allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
@@ -372,9 +374,9 @@ class MasterServiceSupervisorConfig {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
-                         << "Valid options are: random, free_ratio_first, cxl, "
-                            "ssd_free_ratio_first, local_first "
-                            "(case-sensitive)";
+                         << "Valid options are: random, free_ratio_first, "
+                            "size_class_aware, cxl, ssd_free_ratio_first, "
+                            "local_first (case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
@@ -644,6 +646,8 @@ class WrappedMasterServiceConfig {
         // Convert string allocation_strategy to AllocationStrategyType enum
         if (config.allocation_strategy == "free_ratio_first") {
             allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "size_class_aware") {
+            allocation_strategy_type = AllocationStrategyType::SIZE_CLASS_AWARE;
         } else if (config.allocation_strategy == "cxl") {
             allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
@@ -657,9 +661,9 @@ class WrappedMasterServiceConfig {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
-                         << "Valid options are: random, free_ratio_first, cxl, "
-                            "ssd_free_ratio_first, local_first "
-                            "(case-sensitive)";
+                         << "Valid options are: random, free_ratio_first, "
+                            "size_class_aware, cxl, ssd_free_ratio_first, "
+                            "local_first (case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 

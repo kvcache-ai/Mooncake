@@ -27,7 +27,8 @@ static constexpr size_t MiB = 1024 * 1024;
 
 // Strategy types for parameterized tests
 const auto kStrategyTypes = ::testing::Values(
-    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST);
+    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST,
+    AllocationStrategyType::SIZE_CLASS_AWARE);
 
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
@@ -91,6 +92,9 @@ INSTANTIATE_TEST_SUITE_P(
                 break;
             case AllocationStrategyType::FREE_RATIO_FIRST:
                 strategy_str = "FreeRatioFirst";
+                break;
+            case AllocationStrategyType::SIZE_CLASS_AWARE:
+                strategy_str = "SizeClassAware";
                 break;
             case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
                 strategy_str = "SsdFreeRatioFirst";
@@ -650,6 +654,106 @@ TEST_P(AllocationStrategyParameterizedTest,
     // Verify that utilization ratios are balanced (within 15%)
     EXPECT_LT(util_diff, 15.0)
         << "FreeRatioFirst should balance utilization ratios";
+}
+
+TEST_F(AllocationStrategyTest, SizeClassAwarePrefersMatchingSegment) {
+    constexpr size_t kSegmentSize = 64 * MiB;
+    auto small_segment = std::make_shared<OffsetBufferAllocator>(
+        "small", 0x300000000ULL, kSegmentSize, "small");
+    auto large_segment = std::make_shared<OffsetBufferAllocator>(
+        "large", 0x310000000ULL, kSegmentSize, "large");
+    auto empty_segment = std::make_shared<OffsetBufferAllocator>(
+        "empty", 0x320000000ULL, kSegmentSize, "empty");
+    auto small_seed = small_segment->allocate(4 * 1024);
+    auto large_seed = large_segment->allocate(2 * MiB);
+    ASSERT_NE(small_seed, nullptr);
+    ASSERT_NE(large_seed, nullptr);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("small", small_segment);
+    allocator_manager.addAllocator("large", large_segment);
+    allocator_manager.addAllocator("empty", empty_segment);
+
+    SizeClassAwareAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, 4 * 1024);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "small");
+}
+
+TEST_F(AllocationStrategyTest, SizeClassAwarePrefersEmptyOverMismatch) {
+    constexpr size_t kSegmentSize = 64 * MiB;
+    auto mismatched = std::make_shared<OffsetBufferAllocator>(
+        "mismatched", 0x330000000ULL, kSegmentSize, "mismatched");
+    auto empty = std::make_shared<OffsetBufferAllocator>(
+        "empty", 0x340000000ULL, kSegmentSize, "empty");
+    auto seed = mismatched->allocate(2 * MiB);
+    ASSERT_NE(seed, nullptr);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("mismatched", mismatched);
+    allocator_manager.addAllocator("empty", empty);
+
+    SizeClassAwareAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, 4 * 1024);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "empty");
+}
+
+TEST_F(AllocationStrategyTest, SizeClassAwareSpillsFromFullMatch) {
+    constexpr size_t kRequestSize = 4 * MiB;
+    auto full_match = std::make_shared<OffsetBufferAllocator>(
+        "full-match", 0x350000000ULL, kRequestSize, "full-match");
+    auto fallback = std::make_shared<OffsetBufferAllocator>(
+        "fallback", 0x360000000ULL, 16 * MiB, "fallback");
+    auto matching_seed = full_match->allocate(kRequestSize);
+    auto mismatched_seed = fallback->allocate(4 * 1024);
+    ASSERT_NE(matching_seed, nullptr);
+    ASSERT_NE(mismatched_seed, nullptr);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("full-match", full_match);
+    allocator_manager.addAllocator("fallback", fallback);
+
+    SizeClassAwareAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "fallback");
+}
+
+TEST_F(AllocationStrategyTest, SizeClassAwareFallsBackForCachelib) {
+    constexpr size_t kSegmentSize = 64 * MiB;
+    auto fuller = std::make_shared<CachelibBufferAllocator>(
+        "fuller", 0x370000000ULL, kSegmentSize, "fuller");
+    auto emptier = std::make_shared<CachelibBufferAllocator>(
+        "emptier", 0x380000000ULL, kSegmentSize, "emptier");
+    auto seed = fuller->allocate(16 * MiB);
+    ASSERT_NE(seed, nullptr);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("fuller", fuller);
+    allocator_manager.addAllocator("emptier", emptier);
+
+    SizeClassAwareAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, 4 * 1024);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "emptier");
 }
 
 // Test the performance comparison between strategies

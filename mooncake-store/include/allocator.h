@@ -1,9 +1,12 @@
 #ifndef BUFFER_ALLOCATOR_H
 #define BUFFER_ALLOCATOR_H
 
+#include <array>
 #include <atomic>
+#include <bit>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +35,20 @@ enum class ReplicaType {
 // Constant for unknown free space in allocators that don't track it precisely
 static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
+
+// One class per power-of-two ceiling, including zero and SIZE_MAX.
+static constexpr size_t kAllocationSizeClassCount =
+    std::numeric_limits<size_t>::digits + 1;
+
+inline size_t AllocationSizeClass(size_t size) {
+    return size == 0 ? 0 : std::bit_width(size - 1);
+}
+
+// A request-specific snapshot used by segment placement.
+struct AllocationSizeProfile {
+    uint64_t total_live_bytes{0};
+    uint64_t matching_live_bytes{0};
+};
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -306,6 +323,9 @@ class OffsetBufferAllocator
      */
     size_t getLargestFreeRegion() const override;
 
+    std::optional<AllocationSizeProfile> getAllocationSizeProfile(
+        size_t allocation_size) const;
+
     // Public method to get offset_allocator
     std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()
         const {
@@ -321,6 +341,8 @@ class OffsetBufferAllocator
     const std::string segment_name_;
     const size_t base_;
     const size_t total_size_;
+    std::array<std::atomic<uint64_t>, kAllocationSizeClassCount>
+        live_bytes_by_size_class_{};
     const std::string transport_endpoint_;
     const ReplicaType replica_type_;
 

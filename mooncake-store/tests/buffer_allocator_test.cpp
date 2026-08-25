@@ -111,6 +111,51 @@ TEST_F(BufferAllocatorTest, AllocateMultiple) {
     }
 }
 
+TEST_F(BufferAllocatorTest, OffsetAllocationSizeProfileTracksLiveBytes) {
+    constexpr size_t kCapacity = 16 * 1024 * 1024;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "profile-segment", 0x130000000ULL, kCapacity, "profile-segment");
+
+    auto profile = allocator->getAllocationSizeProfile(4096);
+    ASSERT_TRUE(profile.has_value());
+    EXPECT_EQ(profile->total_live_bytes, 0);
+
+    auto small = allocator->allocate(4096);
+    auto large = allocator->allocate(4097);
+    ASSERT_NE(small, nullptr);
+    ASSERT_NE(large, nullptr);
+
+    profile = allocator->getAllocationSizeProfile(4096);
+    ASSERT_TRUE(profile.has_value());
+    EXPECT_EQ(profile->total_live_bytes, 8193);
+    EXPECT_EQ(profile->matching_live_bytes, 4096);
+    const auto large_profile = allocator->getAllocationSizeProfile(4097);
+    ASSERT_TRUE(large_profile.has_value());
+    EXPECT_EQ(large_profile->matching_live_bytes, 4097);
+
+    small.reset();
+    profile = allocator->getAllocationSizeProfile(4096);
+    ASSERT_TRUE(profile.has_value());
+    EXPECT_EQ(profile->total_live_bytes, 4097);
+    EXPECT_EQ(profile->matching_live_bytes, 0);
+    const auto remaining_profile = allocator->getAllocationSizeProfile(4097);
+    ASSERT_TRUE(remaining_profile.has_value());
+    EXPECT_EQ(remaining_profile->matching_live_bytes, 4097);
+
+    large.reset();
+    profile = allocator->getAllocationSizeProfile(4096);
+    ASSERT_TRUE(profile.has_value());
+    EXPECT_EQ(profile->total_live_bytes, 0);
+}
+
+TEST_F(BufferAllocatorTest, NonMemoryOffsetAllocatorHasNoSizeProfile) {
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "nof-profile", 0x138000000ULL, 16 * 1024 * 1024, "nof-profile",
+        ReplicaType::NOF_SSD);
+
+    EXPECT_FALSE(allocator->getAllocationSizeProfile(4096).has_value());
+}
+
 TEST_F(BufferAllocatorTest, OffsetLargestFreeRegionRemainsExact) {
     constexpr size_t CAPACITY = 16 * 1024 * 1024;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
@@ -160,6 +205,16 @@ TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
     ASSERT_EQ(restored->buffers.size(), descriptors.size());
     EXPECT_EQ(restored->allocator->size(),
               descriptors[0].size_ + descriptors[1].size_);
+    const auto first_profile =
+        restored->allocator->getAllocationSizeProfile(descriptors[0].size_);
+    ASSERT_TRUE(first_profile.has_value());
+    EXPECT_EQ(first_profile->total_live_bytes,
+              descriptors[0].size_ + descriptors[1].size_);
+    EXPECT_EQ(first_profile->matching_live_bytes, descriptors[0].size_);
+    const auto last_profile =
+        restored->allocator->getAllocationSizeProfile(descriptors[1].size_);
+    ASSERT_TRUE(last_profile.has_value());
+    EXPECT_EQ(last_profile->matching_live_bytes, descriptors[1].size_);
     EXPECT_EQ(restored->buffers[0]->get_descriptor().buffer_address_,
               descriptors[0].buffer_address_);
     EXPECT_EQ(restored->buffers[1]->get_descriptor().buffer_address_,

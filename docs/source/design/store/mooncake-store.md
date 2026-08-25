@@ -543,7 +543,7 @@ Mooncake Store provides multiple built-in allocation strategies to control how s
 ./build/mooncake-store/src/mooncake_master --allocation_strategy=free_ratio_first
 ```
 
-Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`, `cxl`, `local_first` (case-sensitive).
+Valid values are: `random` (default), `free_ratio_first`, `size_class_aware`, `ssd_free_ratio_first`, `cxl`, `local_first` (case-sensitive).
 
 #### How to Choose
 
@@ -551,6 +551,7 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 |---|---|---|
 | `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
 | `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
+| `size_class_aware` | Mixed-size workloads using multiple memory segments with `OffsetAllocator` | Trades some utilization balance for lower cross-size fragmentation |
 | `ssd_free_ratio_first` | SSD-aware memory allocation when SSD offloading is enabled | Depends on SSD usage metrics; falls back to random allocation when needed |
 | `cxl` | CXL memory hardware | CXL-specific; single-replica only |
 | `local_first` | Colocated inference workers and memory store segments | Requires stable host identity in `local_hostname`; single memory replica only |
@@ -560,6 +561,8 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 **Use `free_ratio_first`** when you need better load balancing across segments, especially in scenarios where:
 - Segments have different capacities and you want even utilization ratios.
 - New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
+
+**Use `size_class_aware`** for mixed-size in-memory workloads backed by `OffsetAllocator`. It learns each segment's live allocation-size distribution and prefers an established matching segment, then an empty segment, then a mismatched or unsupported segment. Free ratio breaks ties, and failed allocations continue through the existing fallback path. The profile is rebuilt from live descriptors during snapshot recovery and is not persisted separately. Other replica and allocator types fall back to free-ratio ranking.
 
 **Use `ssd_free_ratio_first`** when SSD offloading is enabled and you want memory allocation to prefer segments whose backing SSD still has more free capacity.
 
@@ -595,6 +598,12 @@ An improved strategy built on top of `RandomAllocationStrategy`. Instead of pick
 The overhead is minimal: sampling is `O(K)` and sorting is `O(K log K)`, where K is the candidate count (at most `6*N`) — both small since `replica_num` is typically 1–3. The strategy is thread-safe, using `thread_local` random state with no shared mutable data.
 
 The key insight behind Best-of-N is that if a new/empty segment is sampled, it will almost certainly be ranked first due to having the highest free ratio, which naturally accelerates convergence when new segments join the cluster.
+
+**`size_class_aware` — SizeClassAwareAllocationStrategy**
+
+For every live allocation, `OffsetBufferAllocator` records the requested byte count in a logarithmic size class (`ceil(log2(size))`). Candidate segments are ranked in three cohorts: segments already containing the requested class, empty segments, and mismatched or unsupported segments. Matching-class share is used within the first cohort and free ratio is the final tie-breaker. This keeps the state dynamic: deleting all allocations resets a segment to empty, while snapshot replay reconstructs the same profile from live descriptors.
+
+The first implementation applies affinity only to `MEMORY` replicas managed by `OffsetBufferAllocator`. CacheLib, NoF SSD, CXL, local-disk, and DFS paths retain their existing placement behavior.
 
 **`ssd_free_ratio_first` — SsdFreeRatioFirstAllocationStrategy**
 

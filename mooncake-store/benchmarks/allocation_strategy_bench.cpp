@@ -628,6 +628,8 @@ static std::string strategyName(AllocationStrategyType type) {
             return "Random";
         case AllocationStrategyType::FREE_RATIO_FIRST:
             return "FreeRatioFirst";
+        case AllocationStrategyType::SIZE_CLASS_AWARE:
+            return "SizeClassAware";
         default:
             return "Unknown";
     }
@@ -1809,6 +1811,7 @@ static void runSizeClassChurnMatrix() {
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
         AllocationStrategyType::FREE_RATIO_FIRST,
+        AllocationStrategyType::SIZE_CLASS_AWARE,
     };
 
     std::vector<std::string> patterns;

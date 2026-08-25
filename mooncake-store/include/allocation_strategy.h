@@ -506,29 +506,7 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
         return replicas;
     }
 
-   private:
-    static constexpr size_t kMaxRetryLimit = 100;
-    static constexpr size_t kCandidateMultiplier = 6;
-};
-
-class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
-   public:
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        const AllocatorManager& allocator_manager, const size_t slice_length,
-        const size_t replica_num = 1,
-        const std::vector<std::string>& preferred_segments =
-            std::vector<std::string>(),
-        const std::set<std::string>& excluded_segments =
-            std::set<std::string>(),
-        const ReplicaType replica_type = ReplicaType::MEMORY) override {
-        return AllocateRanked(
-            allocator_manager, slice_length, replica_num, preferred_segments,
-            excluded_segments, replica_type, [&](const std::string& name) {
-                return GetSegmentFreeRatio(allocator_manager, name);
-            });
-    }
-
-   private:
+   protected:
     static double GetSegmentFreeRatio(const AllocatorManager& allocator_manager,
                                       const std::string& name) {
         const auto* allocators = allocator_manager.getAllocators(name);
@@ -552,6 +530,104 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
         return static_cast<double>(total_free) /
                static_cast<double>(total_capacity);
     }
+
+   private:
+    static constexpr size_t kMaxRetryLimit = 100;
+    static constexpr size_t kCandidateMultiplier = 6;
+};
+
+class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
+   public:
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        return AllocateRanked(
+            allocator_manager, slice_length, replica_num, preferred_segments,
+            excluded_segments, replica_type, [&](const std::string& name) {
+                return GetSegmentFreeRatio(allocator_manager, name);
+            });
+    }
+};
+
+class SizeClassAwareAllocationStrategy final : public RankedAllocationStrategy {
+   public:
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        return AllocateRanked(
+            allocator_manager, slice_length, replica_num, preferred_segments,
+            excluded_segments, replica_type, [&](const std::string& name) {
+                return GetSegmentScore(allocator_manager, name, slice_length,
+                                       replica_type);
+            });
+    }
+
+   private:
+    static double GetSegmentScore(const AllocatorManager& allocator_manager,
+                                  const std::string& name,
+                                  const size_t slice_length,
+                                  const ReplicaType replica_type) {
+        const double free_ratio = GetSegmentFreeRatio(allocator_manager, name);
+        if (replica_type != ReplicaType::MEMORY) {
+            return free_ratio;
+        }
+
+        const auto* allocators = allocator_manager.getAllocators(name);
+        if (!allocators || allocators->empty()) {
+            return free_ratio;
+        }
+
+        uint64_t total_live_bytes = 0;
+        uint64_t matching_live_bytes = 0;
+        bool found_allocator = false;
+        for (const auto& allocator : *allocators) {
+            if (!allocator) {
+                continue;
+            }
+            found_allocator = true;
+            const auto offset_allocator =
+                std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
+            if (!offset_allocator) {
+                return free_ratio;
+            }
+            const auto profile =
+                offset_allocator->getAllocationSizeProfile(slice_length);
+            if (!profile) {
+                return free_ratio;
+            }
+            total_live_bytes += profile->total_live_bytes;
+            matching_live_bytes += profile->matching_live_bytes;
+        }
+
+        if (!found_allocator) {
+            return free_ratio;
+        }
+        if (total_live_bytes == 0) {
+            return kEmptySegmentScore + free_ratio;
+        }
+        if (matching_live_bytes == 0) {
+            return free_ratio;
+        }
+
+        const double matching_share = static_cast<double>(matching_live_bytes) /
+                                      static_cast<double>(total_live_bytes);
+        return kMatchingSegmentScore + matching_share +
+               free_ratio * kFreeRatioTieBreakerWeight;
+    }
+
+    static constexpr double kEmptySegmentScore = 2.0;
+    static constexpr double kMatchingSegmentScore = 4.0;
+    static constexpr double kFreeRatioTieBreakerWeight = 0.001;
 };
 
 class SsdFreeRatioFirstAllocationStrategy final
@@ -647,6 +723,8 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
             return std::make_shared<RandomAllocationStrategy>();
         case AllocationStrategyType::FREE_RATIO_FIRST:
             return std::make_shared<FreeRatioFirstAllocationStrategy>();
+        case AllocationStrategyType::SIZE_CLASS_AWARE:
+            return std::make_shared<SizeClassAwareAllocationStrategy>();
         case AllocationStrategyType::CXL:
             return std::make_shared<CxlAllocationStrategy>();
         case AllocationStrategyType::SSD_FREE_RATIO_FIRST:

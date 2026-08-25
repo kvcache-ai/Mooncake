@@ -361,6 +361,8 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
     }
 
     RecordAllocation(size);
+    live_bytes_by_size_class_[AllocationSizeClass(size)].fetch_add(
+        size, std::memory_order_relaxed);
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
                                                                size);
@@ -378,6 +380,8 @@ void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
         size_t freed_size = handle->size();
         handle->offset_handle_.reset();
         RecordDeallocation(freed_size);
+        live_bytes_by_size_class_[AllocationSizeClass(freed_size)].fetch_sub(
+            freed_size, std::memory_order_relaxed);
         if (replica_type_ == ReplicaType::MEMORY) {
             MasterMetricManager::instance().dec_allocated_mem_size(
                 segment_name_, freed_size);
@@ -411,6 +415,20 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
                    << " segment=" << segment_name_;
         return 0;
     }
+}
+
+std::optional<AllocationSizeProfile>
+OffsetBufferAllocator::getAllocationSizeProfile(size_t allocation_size) const {
+    if (replica_type_ != ReplicaType::MEMORY) {
+        return std::nullopt;
+    }
+
+    const uint64_t total_live_bytes = GetUsageBytes();
+    const uint64_t matching_live_bytes =
+        live_bytes_by_size_class_[AllocationSizeClass(allocation_size)].load(
+            std::memory_order_relaxed);
+    return AllocationSizeProfile{
+        total_live_bytes, std::min(matching_live_bytes, total_live_bytes)};
 }
 
 std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(

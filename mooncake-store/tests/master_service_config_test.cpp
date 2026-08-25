@@ -39,6 +39,19 @@ TEST(MasterServiceConfigTest, OplogEnablementPropagatesToServingConfig) {
     EXPECT_TRUE(service_config.enable_oplog);
 }
 
+TEST(MasterServiceConfigTest, SizeClassAwareStrategyIsParsed) {
+    MasterConfig master_config{};
+    master_config.allocation_strategy = "size_class_aware";
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+
+    EXPECT_EQ(supervisor_config.allocation_strategy_type,
+              AllocationStrategyType::SIZE_CLASS_AWARE);
+    EXPECT_EQ(wrapped_config.allocation_strategy_type,
+              AllocationStrategyType::SIZE_CLASS_AWARE);
+}
+
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
     auto config =
         MasterServiceConfig::builder().set_oplog_batch_max_entries(17).build();
