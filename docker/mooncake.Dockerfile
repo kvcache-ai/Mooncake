@@ -15,12 +15,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
-ARG TORCH_CUDA_ARCH_LIST=""
 # CI can opt in to removing /workspace/build from the builder layer.
 ARG CLEAN_BUILD_ARTIFACTS=0
 
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
-    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     PATH="/usr/local/go/bin:${PATH}"
 
 # Install base build utilities and the requested Python version via deadsnakes PPA
