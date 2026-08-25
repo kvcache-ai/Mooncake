@@ -160,7 +160,7 @@ if(WITH_EP)
   else()
     message(
       STATUS
-        "WITH_EP enabled: building Mooncake EP natively and PG via setup.py")
+        "WITH_EP enabled: building Mooncake EP natively and staging PG native libraries; Torch adapter is JIT-built at runtime")
     if(USE_CUDA)
       find_package(CUDAToolkit REQUIRED)
       message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
