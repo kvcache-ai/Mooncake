@@ -1502,6 +1502,32 @@ std::string publishAndRefreshTcpEndpoint(EngineHandle& handle, uint16_t port) {
     return publishAndRefreshTcpEndpoint(handle, handle.segment_id, port);
 }
 
+std::string publishAndRefreshTcpIncarnation(EngineHandle& handle,
+                                            Transport::SegmentID segment_id,
+                                            uint16_t port,
+                                            const std::string& instance_id) {
+    auto metadata = handle.engine->getMetadata();
+    auto current = metadata->getSegmentDescByID(segment_id);
+    EXPECT_NE(current, nullptr);
+    if (!current) return {};
+
+    auto authoritative = *current;
+    authoritative.tcp_data_port = port;
+    authoritative.tcp_proto_version = 2;
+    authoritative.tcp_instance_id = instance_id;
+
+    EXPECT_EQ(metadata->updateSegmentDesc(current->name, authoritative), 0);
+    EXPECT_EQ(handle.engine->syncSegmentCache(current->name), 0);
+
+    auto refreshed = metadata->getSegmentDescByID(segment_id);
+    EXPECT_NE(refreshed, nullptr);
+    if (refreshed) {
+        EXPECT_EQ(refreshed->tcp_data_port, port);
+        EXPECT_EQ(refreshed->tcp_instance_id, instance_id);
+    }
+    return current->name;
+}
+
 TransferRequest makeWriteRequest(const EngineHandle& handle, size_t length,
                                  uint64_t target_offset = 0) {
     TransferRequest request;
@@ -3737,6 +3763,115 @@ TEST(TcpWriteVisibilityTest, ShutdownWithArmedProgressDeadlineCompletesOnce) {
     fake_peer.release();
 }
 
+TEST(TcpWriteVisibilityTest, SameEndpointNewTcpInstanceRetiresOldGroup) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint;
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint.ok());
+
+    const std::string logical_peer = "127.0.0.2:18051";
+
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18151", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+
+    // G1 uses endpoint A.
+    ASSERT_EQ(publishAndRefreshTcpIncarnation(h, h.segment_id, endpoint.port(),
+                                              "tcp-instance-g1"),
+              logical_peer);
+
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(endpoint.waitForRequests(1, std::chrono::seconds(5)));
+    ASSERT_EQ(endpoint.acceptedCount(), 1);
+    ASSERT_EQ(endpoint.activeAcceptedCount(), 1);
+
+    // Simulate a process restart. The TCP endpoint is deliberately unchanged;
+    // only the incarnation identity changes from G1 to G2.
+    ASSERT_EQ(publishAndRefreshTcpIncarnation(h, h.segment_id, endpoint.port(),
+                                              "tcp-instance-g2"),
+              logical_peer);
+
+    auto refreshed = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(refreshed, nullptr);
+    ASSERT_EQ(refreshed->tcp_data_port, endpoint.port());
+    ASSERT_EQ(refreshed->tcp_instance_id, "tcp-instance-g2");
+
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(endpoint.waitForRequests(2, std::chrono::seconds(5)));
+
+    // A new incarnation must not reuse the idle connection established for
+    // G1. The instance ID is part of ConnectionKey, so this starts a fresh
+    // G2 connection even though host and port are unchanged.
+    ASSERT_TRUE(waitForPredicate([&] { return endpoint.acceptedCount() >= 2; },
+                                 std::chrono::milliseconds(500)))
+        << "RED: tcp_instance_id changed at the same host:port, but the "
+           "existing G1 connection group was still reused";
+
+    EXPECT_EQ(endpoint.acceptedCount(), 2);
+
+    // Once G2 owns the current connection, G1's old group must eventually
+    // drain and close rather than remaining pinned alongside it.
+    EXPECT_TRUE(
+        waitForPredicate([&] { return endpoint.activeAcceptedCount() == 1; },
+                         std::chrono::seconds(5)))
+        << "old G1 connection remained active after the G2 incarnation "
+           "became current";
+}
+
+TEST(TcpWriteVisibilityTest, LocalTcpInstanceIdIsNonEmptyAndStable) {
+    LocalHttpMetadataServer metadata_server;
+    ASSERT_TRUE(metadata_server.ok());
+
+    EngineHandle handle;
+    handle.init(metadata_server.uri(), "127.0.0.2:18171", 64 * 1024);
+    ASSERT_TRUE(handle.ok);
+
+    auto metadata = handle.engine->getMetadata();
+    auto before = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(before, nullptr);
+    ASSERT_FALSE(before->tcp_instance_id.empty());
+    EXPECT_EQ(before->tcp_instance_id.size(), 32U);
+    const std::string instance_id = before->tcp_instance_id;
+
+    // Re-publish through the normal local descriptor update path. The
+    // incarnation belongs to the TcpTransport, so memory publication must not
+    // replace it with a new value.
+    ASSERT_EQ(metadata->updateLocalSegmentDesc(), 0);
+    auto after = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->tcp_instance_id, instance_id);
+}
+
+TEST(TcpWriteVisibilityTest,
+     DistinctTcpTransportInstancesHaveDistinctInstanceIds) {
+    LocalHttpMetadataServer metadata_server;
+    ASSERT_TRUE(metadata_server.ok());
+
+    EngineHandle first;
+    first.init(metadata_server.uri(), "127.0.0.2:18181", 64 * 1024);
+    ASSERT_TRUE(first.ok);
+    EngineHandle second;
+    second.init(metadata_server.uri(), "127.0.0.2:18182", 64 * 1024);
+    ASSERT_TRUE(second.ok);
+
+    auto first_desc =
+        first.engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto second_desc =
+        second.engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(first_desc, nullptr);
+    ASSERT_NE(second_desc, nullptr);
+    ASSERT_FALSE(first_desc->tcp_instance_id.empty());
+    ASSERT_FALSE(second_desc->tcp_instance_id.empty());
+    EXPECT_NE(first_desc->tcp_instance_id, second_desc->tcp_instance_id);
+}
+
 TEST(TcpWriteVisibilityTest, EndpointRefreshRoutesNewWorkToNewTcpEndpoint) {
     ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
     LocalHttpMetadataServer metadata_server;
@@ -3892,9 +4027,20 @@ TEST(TcpWriteVisibilityTest, SharedEndpointOnePeerMovesDoesNotRetireOtherPeer) {
     const auto segment_y = h.engine->openSegment(logical_peer_y);
     ASSERT_NE(h.engine->getMetadata()->getSegmentDescByID(segment_y), nullptr);
 
-    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, h.segment_id, endpoint_a.port()),
-              logical_peer_x);
-    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, segment_y, endpoint_a.port()),
+    // Both logical peers represent the same TCP server process. Keep their
+    // incarnation identity equal so they intentionally share one endpoint-A
+    // connection group.
+    auto target_x_local =
+        target_x.engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(target_x_local, nullptr);
+    ASSERT_FALSE(target_x_local->tcp_instance_id.empty());
+
+    ASSERT_EQ(
+        publishAndRefreshTcpIncarnation(h, h.segment_id, endpoint_a.port(),
+                                        target_x_local->tcp_instance_id),
+        logical_peer_x);
+    ASSERT_EQ(publishAndRefreshTcpIncarnation(h, segment_y, endpoint_a.port(),
+                                              target_x_local->tcp_instance_id),
               logical_peer_y);
     ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
               TransferStatusEnum::COMPLETED);

@@ -132,6 +132,12 @@ class TransferMetadata {
         // READ responses (#2086); absent/1 = legacy unacknowledged framing.
         int tcp_proto_version{1};
 
+        // Opaque identity for one TCP server incarnation. It stays stable
+        // for the lifetime of a TCP transport instance and changes after a
+        // restart. Missing/empty means a legacy peer with no incarnation
+        // identity support.
+        std::string tcp_instance_id;
+
         // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
         // address may differ from the TCP-routable segment name.  When
         // non-empty, NIC paths are constructed using this value instead
