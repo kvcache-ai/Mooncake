@@ -202,6 +202,11 @@ endif()
 if(USE_NOF)
   add_subdirectory(spdk)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES ${SPDK_WRAPPER_SOURCES})
+  # master_service.cpp references SpdkWrapper::GetInstance() under #ifdef
+  # USE_NOF (ProbeNofSegment trampoline + SetNoFProbeFnForTesting); without
+  # this, linking mooncake_store_master fails with "undefined reference to
+  # SpdkWrapper::GetInstance()" whenever USE_NOF=ON.
+  list(APPEND MOONCAKE_STORE_MASTER_SOURCES ${SPDK_WRAPPER_SOURCES})
 
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
@@ -370,6 +375,14 @@ endif()
 if(STORE_USE_K8S_LEASE)
   add_dependencies(mooncake_store_master_objects build_k8s_lease_wrapper)
 endif()
+if(USE_NOF)
+  # master_service.cpp includes spdk/spdk_wrapper.h, which transitively pulls in
+  # <spdk/env.h> / <spdk/nvme.h>; with the SPDK wrapper sources now in
+  # mooncake_store_master_objects, the master_objects translation unit needs to
+  # find SPDK/DPDK headers at compile time.
+  target_include_directories(mooncake_store_master_objects
+                             PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+endif()
 
 # Sources used only by Store clients and the complete mooncake_store library.
 add_library(mooncake_store_client_objects OBJECT
@@ -468,6 +481,12 @@ endif()
 if(USE_UB)
   target_link_libraries(mooncake_store_master PRIVATE ub_allocator)
 endif()
+if(USE_NOF)
+  # The master OBJECT lib now contains SPDK wrapper sources (master_service.cpp
+  # calls SpdkWrapper::GetInstance() under #ifdef USE_NOF); the master static
+  # archive therefore needs to resolve SPDK symbols at link time.
+  target_link_libraries(mooncake_store_master PRIVATE ${SPDK_STATIC_LIBS})
+endif()
 
 # Complete public Store library.
 add_library(
@@ -539,6 +558,16 @@ target_link_libraries(
           asio_shared)
 if(USE_SUNRISE)
   target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
+endif()
+if(USE_NOF)
+  # The SPDK wrapper symbols that mooncake_store_master references (e.g.
+  # spdk_nvme_ns_cmd_read/write, spdk_nvme_transport_id_parse) are NOT pulled in
+  # transitively through mooncake_store_master because the static archive only
+  # carries the object files.  The master executable must add the SPDK static
+  # libs explicitly so the final link resolves the undefined references.
+  target_include_directories(mooncake_master PRIVATE ${SPDK_INCLUDE_DIR}
+                                                     ${DPDK_INCLUDE_DIR})
+  target_link_libraries(mooncake_master PRIVATE ${SPDK_STATIC_LIBS})
 endif()
 
 if(STORE_USE_ETCD)
