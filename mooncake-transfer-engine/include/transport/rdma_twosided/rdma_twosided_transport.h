@@ -15,6 +15,8 @@
 #ifndef RDMA_TWOSIDED_TRANSPORT_H_
 #define RDMA_TWOSIDED_TRANSPORT_H_
 
+#include <glog/logging.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -23,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "config.h"
@@ -124,6 +127,25 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     std::shared_ptr<RdmaContext> selectMsgContext(
         const HandShakeDesc &peer_desc, size_t existing_rail_count);
 
+    // Releases an already-held lock for the duration of a blocking call and
+    // reacquires it on scope exit, including when that call throws. Keeps the
+    // lock state uniform for an enclosing connect scope, whose destructor may
+    // then assume the lock is held.
+    class UnlockGuard {
+       public:
+        explicit UnlockGuard(std::unique_lock<std::mutex> &lock) : lock_(lock) {
+            DCHECK(lock_.owns_lock());
+            lock_.unlock();
+        }
+        ~UnlockGuard() { lock_.lock(); }
+
+        UnlockGuard(const UnlockGuard &) = delete;
+        UnlockGuard &operator=(const UnlockGuard &) = delete;
+
+       private:
+        std::unique_lock<std::mutex> &lock_;
+    };
+
     // RAII publisher for one connect attempt. On construction it installs the
     // placeholder entry and marks the peer as having a connect in flight; on
     // destruction it always retracts the marker and wakes waiters, and drops
@@ -147,6 +169,27 @@ class RdmaTwoSidedTransport : public RdmaTransport {
         std::string peer_;
         std::shared_ptr<CtrlChannel> channel_;
         bool success_ = false;
+    };
+
+    // Data-plane counterpart of ConnectScope, for one rail handshake. Nothing
+    // is published speculatively because rail waiters key off msg_connecting_
+    // rather than off a placeholder rail, so the destructor only has to clear
+    // the key and wake waiters -- but it has to do so on every path, or a
+    // handshake that throws strands the key and every later builder waits out
+    // the full deadline. Hold the scope open until the new rail is installed:
+    // a waiter woken earlier would find neither key nor rail and start the
+    // duplicate handshake this serialisation exists to prevent.
+    class RailConnectScope {
+       public:
+        RailConnectScope(RdmaTwoSidedTransport &transport, std::string key);
+        ~RailConnectScope();
+
+        RailConnectScope(const RailConnectScope &) = delete;
+        RailConnectScope &operator=(const RailConnectScope &) = delete;
+
+       private:
+        RdmaTwoSidedTransport &transport_;
+        std::string key_;
     };
 
     void startCtrlWorker();
@@ -227,6 +270,8 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     void stopBounceManager();
     void bounceManagerLoop();
     void manageBouncePoolsTick();
+    // Drops receiver-side ACK bookkeeping for task_ids that went idle.
+    void pruneRecvAckLedger();
     size_t waitingTaskCount();
     int sendCreditRequest(const std::string &peer_server_name);
 
@@ -244,6 +289,10 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     // waiting for a wakeup that never comes. Refcounted because an active and
     // a passive connect to the same peer can overlap.
     std::unordered_map<std::string, int> ctrl_connecting_;
+    // "peer|nicPath" keys whose MsgChannel handshake is in flight. A second
+    // builder would make the peer replace the first rail, stranding the SENDs
+    // already posted on it, so builders wait on ctrl_cv_ instead.
+    std::unordered_set<std::string> msg_connecting_;
     // Set once by stopCtrlWorker() to release waiters during shutdown.
     // Guarded by ctrl_mutex_.
     bool ctrl_stopping_ = false;
@@ -260,6 +309,9 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     std::mutex twosided_mutex_;
     std::unordered_map<uint64_t, TwoSidedTaskState> twosided_tasks_;
     std::deque<TransferTask *> waiting_tasks_;
+    // Readable without twosided_mutex_ so the ctrl worker's idle retry costs
+    // one load while nothing is queued.
+    std::atomic<uint64_t> waiting_count_{0};
     std::atomic<uint64_t> next_task_id_{1};
     std::atomic<uint64_t> twosided_resume_count_{0};
     // Tasks dispatched on MsgChannel awaiting DATA_ACK. Non-zero keeps the
@@ -271,8 +323,15 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     std::mutex ctrl_idle_mutex_;
     std::condition_variable ctrl_idle_cv_;
     // Receiver-side cumulative bytes per remote task_id (per-transport).
+    // Retired as soon as MsgHeader::total_chunks chunks have arrived; the idle
+    // sweep in pruneRecvAckLedger() only has to cover tasks that never do.
+    struct RecvAckState {
+        uint64_t bytes = 0;
+        uint64_t chunks = 0;
+        uint64_t last_ms = 0;
+    };
     std::mutex recv_ack_mutex_;
-    std::unordered_map<uint64_t, uint64_t> recv_acked_bytes_;
+    std::unordered_map<uint64_t, RecvAckState> recv_acked_bytes_;
 };
 
 }  // namespace mooncake

@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -30,6 +31,21 @@
 #include "transport/rdma_transport/rdma_context.h"
 
 namespace mooncake {
+namespace {
+// Backstop for receiver-side ACK bookkeeping. A completed task retires itself
+// once all its chunks arrive; this only reclaims tasks that never complete.
+// Keep it well above any transfer lifetime, because pruning an entry that is
+// still receiving would restart its cumulative count from zero and the sender
+// would never see the task complete.
+constexpr uint64_t kRecvAckIdleMs = 60000;
+
+uint64_t nowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+}  // namespace
 
 void *RdmaTwoSidedTransport::allocateManagedBuffer(size_t length) {
     if (length == 0 || !globalConfig().rdma_msg_enabled) return nullptr;
@@ -191,66 +207,92 @@ std::vector<std::shared_ptr<MsgChannel>> RdmaTwoSidedTransport::ensureMsgRails(
         return connected;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(ctrl_mutex_);
-        auto it = msg_channels_.find(peer_server_name);
-        if (it != msg_channels_.end()) {
-            for (auto &rail : it->second) {
-                if (rail && rail->connected()) connected.push_back(rail);
-            }
-            if (connected.size() == getContextList().size()) return connected;
-        }
-    }
+    // Absolute deadline for the whole call so repeated waits cannot extend it.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(
+                              globalConfig().rdma_notify_connect_timeout_ms);
 
-    // Build / reconnect missing rails outside the lock (handshake may block).
-    std::vector<std::shared_ptr<MsgChannel>> created;
-    created.reserve(getContextList().size());
+    auto find_rail = [&](const std::string &nic_path) {
+        std::shared_ptr<MsgChannel> found;
+        auto it = msg_channels_.find(peer_server_name);
+        if (it == msg_channels_.end()) return found;
+        for (auto &rail : it->second) {
+            if (rail && rail->nicPath() == nic_path && rail->connected()) {
+                found = rail;
+                break;
+            }
+        }
+        return found;
+    };
+
+    std::unique_lock<std::mutex> lock(ctrl_mutex_);
     for (auto &ctx : getContextList()) {
         if (!ctx) continue;
-        bool have = false;
-        {
-            std::lock_guard<std::mutex> lock(ctrl_mutex_);
-            auto it = msg_channels_.find(peer_server_name);
-            if (it != msg_channels_.end()) {
-                for (auto &rail : it->second) {
-                    if (rail && rail->nicPath() == ctx->nicPath() &&
-                        rail->connected()) {
-                        have = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if (have) continue;
-        auto channel =
-            std::make_shared<MsgChannel>(*this, *ctx, peer_server_name);
-        if (channel->connectActive()) {
-            LOG(WARNING) << "MsgChannel: rail connect failed peer="
-                         << peer_server_name << " nic=" << ctx->nicPath();
-            continue;
-        }
-        created.push_back(channel);
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(ctrl_mutex_);
-        auto &rails = msg_channels_[peer_server_name];
-        for (auto &channel : created) {
-            bool replaced = false;
-            for (auto &existing : rails) {
-                if (existing && existing->nicPath() == channel->nicPath()) {
-                    if (existing.get() != channel.get()) {
-                        existing->disconnect();
-                        existing = channel;
-                    }
-                    replaced = true;
+        const std::string nic_path = ctx->nicPath();
+        const std::string key = peer_server_name + "|" + nic_path;
+        while (!ctrl_stopping_) {
+            if (find_rail(nic_path)) break;
+            if (msg_connecting_.count(key)) {
+                // Another thread is handshaking this rail. A second handshake
+                // would make the peer replace its rail, and the SENDs already
+                // posted on the replaced one never land: their QP is gone on
+                // the peer, and rnr_retry=7 means they never complete either.
+                if (ctrl_cv_.wait_until(lock, deadline) ==
+                    std::cv_status::timeout) {
+                    LOG(WARNING) << "MsgChannel: timed out waiting for "
+                                    "in-flight rail connect to "
+                                 << peer_server_name << " nic=" << nic_path;
                     break;
                 }
+                continue;
             }
-            if (!replaced) rails.push_back(channel);
+
+            {
+                // Publishes the in-flight key and, on every exit path
+                // including a throwing handshake, clears it and wakes the
+                // waiters above.
+                RailConnectScope scope(*this, key);
+                auto channel =
+                    std::make_shared<MsgChannel>(*this, *ctx, peer_server_name);
+                int ret = 0;
+                {
+                    // The handshake blocks and re-enters this transport on the
+                    // passive side, so it cannot run under ctrl_mutex_.
+                    UnlockGuard unlocked(lock);
+                    ret = channel->connectActive();
+                }
+                if (ret == 0) {
+                    auto existing_rail = find_rail(nic_path);
+                    if (existing_rail) {
+                        // A passive accept published a rail for this NIC while
+                        // the lock was released; keep it and drop ours rather
+                        // than stranding whatever is already in flight on it.
+                        UnlockGuard unlocked(lock);
+                        channel->disconnect();
+                    } else {
+                        auto &rails = msg_channels_[peer_server_name];
+                        bool replaced = false;
+                        for (auto &rail : rails) {
+                            if (rail && rail->nicPath() == nic_path) {
+                                rail = channel;
+                                replaced = true;
+                                break;
+                            }
+                        }
+                        if (!replaced) rails.push_back(channel);
+                    }
+                } else {
+                    LOG(WARNING) << "MsgChannel: rail connect failed peer="
+                                 << peer_server_name << " nic=" << nic_path;
+                }
+            }
+            break;
         }
-        connected.clear();
-        for (auto &rail : rails) {
+    }
+
+    auto it = msg_channels_.find(peer_server_name);
+    if (it != msg_channels_.end()) {
+        for (auto &rail : it->second) {
             if (rail && rail->connected()) connected.push_back(rail);
         }
     }
@@ -303,6 +345,8 @@ Status RdmaTwoSidedTransport::submitTwoSidedTasks(
         if (rc == ERR_TOO_MANY_REQUESTS) {
             std::lock_guard<std::mutex> lock(twosided_mutex_);
             waiting_tasks_.push_back(task);
+            waiting_count_.store(waiting_tasks_.size(),
+                                 std::memory_order_relaxed);
             // dispatchTwoSidedTask already inserted TwoSidedTaskState; just
             // mark waiting (do not allocate a second task_id for the same
             // task).
@@ -493,6 +537,10 @@ int RdmaTwoSidedTransport::dispatchTwoSidedTask(TransferTask *task) {
         if (it != twosided_tasks_.end()) it->second.credit_reserved = false;
     };
 
+    // Chunk count for the whole task, not just this dispatch: the receiver
+    // counts across resumes, so a resumed dispatch must report the same total.
+    const uint32_t total_chunks =
+        static_cast<uint32_t>((length + max_payload - 1) / max_payload);
     if (resume_off)
         twosided_resume_count_.fetch_add(1, std::memory_order_relaxed);
     for (size_t off = resume_off; off < length; off += max_payload) {
@@ -503,7 +551,8 @@ int RdmaTwoSidedTransport::dispatchTwoSidedTask(TransferTask *task) {
             if (opcode == TransferRequest::WRITE) {
                 return msg->sendDataWrite(
                     task_id, seq, target_offset + off,
-                    static_cast<const char *>(source) + off, chunk);
+                    static_cast<const char *>(source) + off, chunk,
+                    total_chunks);
             }
             return msg->sendReadReq(task_id, seq, target_offset + off, chunk);
         });
@@ -531,19 +580,36 @@ int RdmaTwoSidedTransport::dispatchTwoSidedTask(TransferTask *task) {
 }
 
 void RdmaTwoSidedTransport::redispatchWaitingTasks() {
+    if (waiting_count_.load(std::memory_order_relaxed) == 0) return;
+    // One recycled slot cannot admit the whole queue, so retrying every waiter
+    // on every ACK costs O(queue) per event and collapses throughput once the
+    // queue is deep. Retry a bounded prefix instead and leave the rest to the
+    // next event.
+    constexpr size_t kMaxRetryPerEvent = 8;
     std::deque<TransferTask *> pending;
     {
         std::lock_guard<std::mutex> lock(twosided_mutex_);
-        pending.swap(waiting_tasks_);
+        while (!waiting_tasks_.empty() && pending.size() < kMaxRetryPerEvent) {
+            pending.push_back(waiting_tasks_.front());
+            waiting_tasks_.pop_front();
+        }
+        waiting_count_.store(waiting_tasks_.size(), std::memory_order_relaxed);
     }
+    std::deque<TransferTask *> requeue;
     for (auto *task : pending) {
         int rc = dispatchTwoSidedTask(task);
         if (rc == ERR_TOO_MANY_REQUESTS) {
-            std::lock_guard<std::mutex> lock(twosided_mutex_);
-            waiting_tasks_.push_back(task);
+            requeue.push_back(task);
         } else if (rc) {
             if (!task->slice_list.empty()) task->slice_list[0]->markFailed();
         }
+    }
+    if (!requeue.empty()) {
+        std::lock_guard<std::mutex> lock(twosided_mutex_);
+        // At the front: a task that already waited keeps its place in line.
+        waiting_tasks_.insert(waiting_tasks_.begin(), requeue.begin(),
+                              requeue.end());
+        waiting_count_.store(waiting_tasks_.size(), std::memory_order_relaxed);
     }
 }
 
@@ -589,6 +655,17 @@ void RdmaTwoSidedTransport::completeTwoSidedAck(uint64_t task_id,
     }
 }
 
+void RdmaTwoSidedTransport::pruneRecvAckLedger() {
+    const uint64_t now = nowMs();
+    std::lock_guard<std::mutex> lock(recv_ack_mutex_);
+    for (auto it = recv_acked_bytes_.begin(); it != recv_acked_bytes_.end();) {
+        if (it->second.last_ms + kRecvAckIdleMs < now)
+            it = recv_acked_bytes_.erase(it);
+        else
+            ++it;
+    }
+}
+
 int RdmaTwoSidedTransport::sendDataAck(const std::string &peer,
                                        uint64_t task_id, uint64_t acked_bytes) {
     std::shared_ptr<CtrlChannel> channel;
@@ -626,8 +703,18 @@ void RdmaTwoSidedTransport::onMsgReceived(const std::string &peer_server_name,
         uint64_t cumulative = 0;
         {
             std::lock_guard<std::mutex> lock(recv_ack_mutex_);
-            recv_acked_bytes_[hdr.task_id] += hdr.length;
-            cumulative = recv_acked_bytes_[hdr.task_id];
+            auto &state = recv_acked_bytes_[hdr.task_id];
+            state.bytes += hdr.length;
+            state.chunks++;
+            state.last_ms = nowMs();
+            cumulative = state.bytes;
+            // Retire the entry as soon as the task is whole. Counting chunks
+            // works regardless of the order they arrive in across rails, which
+            // a last-chunk flag would not. A duplicate landing afterwards just
+            // re-creates the entry and its ACK is dropped by the sender, whose
+            // task is already gone.
+            if (hdr.total_chunks && state.chunks >= hdr.total_chunks)
+                recv_acked_bytes_.erase(hdr.task_id);
         }
         (void)sendDataAck(peer_server_name, hdr.task_id, cumulative);
         return;
