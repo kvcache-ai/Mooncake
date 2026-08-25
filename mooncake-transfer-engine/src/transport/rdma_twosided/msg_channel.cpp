@@ -426,6 +426,15 @@ int MsgChannel::postSend(const MsgHeader &hdr, const void *payload,
     ibv_send_wr *bad = nullptr;
     int ret = ibv_post_send(qp_, &wr, &bad);
     if (ret) {
+        // It is undefined whether the WR entered the queue on failure, so
+        // clear the table entry as well as releasing the slot: a SEND
+        // completion that does arrive must find -1 and skip the release
+        // instead of double-freeing the slot.
+        {
+            std::lock_guard<std::mutex> inflight(inflight_mutex_);
+            size_t idx = wr_id % inflight_slots_.size();
+            if (inflight_slots_[idx] == slot) inflight_slots_[idx] = -1;
+        }
         pool_.releaseSendSlot(slot);
         LOG(ERROR) << "MsgChannel: ibv_post_send failed: "
                    << strerror(std::abs(ret));
@@ -528,6 +537,23 @@ int MsgChannel::pollCompletions(int max_entries) {
                        << " opcode=" << wc[i].opcode
                        << " peer=" << peer_server_name_;
             connected_.store(false, std::memory_order_release);
+            // The channel is dead, so every outstanding SEND is now void.
+            // Error WCs may not carry a reliable opcode/wr_id, so instead of
+            // routing them through handleSendComplete(), return every
+            // in-flight slot to the pool and settle the count here. Entries
+            // are cleared under the lock before release, so a later success
+            // WC for the same wr_id finds -1 and cannot double-release.
+            std::vector<int> slots;
+            {
+                std::lock_guard<std::mutex> inflight(inflight_mutex_);
+                for (int &slot : inflight_slots_) {
+                    if (slot >= 0) slots.push_back(slot);
+                }
+                std::fill(inflight_slots_.begin(), inflight_slots_.end(), -1);
+            }
+            for (int slot : slots) pool_.releaseSendSlot(slot);
+            std::lock_guard<std::mutex> lock(send_mutex_);
+            pending_sends_ = 0;
             continue;
         }
         if (wc[i].opcode == IBV_WC_RECV) {
