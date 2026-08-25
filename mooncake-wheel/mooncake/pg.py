@@ -57,7 +57,7 @@ def _build_lock(lock_path: Path):
 
 def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path,
                    with_cuda: bool):
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import library_paths, load
 
     verbose = os.environ.get("MOONCAKE_PG_JIT_VERBOSE", "0") == "1"
     return load(
@@ -72,6 +72,7 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path,
         extra_include_paths=[str(source_dir)],
         extra_ldflags=[
             f"-Wl,-rpath,{core_path.parent}",
+            *[f"-Wl,-rpath,{path}" for path in library_paths()],
             str(core_path),
             "-lc10_cuda",
             "-ltorch_cuda",

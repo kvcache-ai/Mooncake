@@ -5,6 +5,8 @@ requires = [
     "numpy>=1.24",
     # Mooncake PG still builds its Torch ABI extensions through setup.py.
     "setuptools>=61",
+    # Runtime PG adapter JIT uses torch.utils.cpp_extension's Ninja backend.
+    "ninja>=1.10",
     # Multi-ABI PG builds install the requested Torch wheels at build time.
     "pip>=23",
 ]
@@ -24,6 +26,7 @@ dependencies = [
     "aiohttp",
     "msgpack",
     "requests",
+    "ninja>=1.10",
 ]
 keywords = ["mooncake", "transfer engine", "kv cache", "llm inference", "rdma"]
 classifiers = [
