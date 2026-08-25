@@ -14,7 +14,7 @@
 #include "allocator.h"
 #include "client_service.h"
 #include "types.h"
-#include "client_buffer_allocation.h"
+#include "common/client_buffer_allocation.h"
 
 // Configuration flags
 DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");

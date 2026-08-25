@@ -10,7 +10,7 @@
 
 #include <ylt/coro_http/coro_http_client.hpp>
 
-#include "network.h"
+#include "common/network.h"
 #include "master_admin_service.h"
 #include "master_service.h"
 #include "segment.h"

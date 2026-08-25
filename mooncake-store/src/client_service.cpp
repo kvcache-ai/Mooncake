@@ -38,7 +38,7 @@
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.h"
-#include "network.h"
+#include "common/network.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "device/accelerator_registry.h"

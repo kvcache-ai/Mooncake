@@ -2,7 +2,7 @@
 // Simple arena allocator implementation
 
 #include "mmap_arena.h"
-#include "client_buffer_allocation.h"
+#include "common/client_buffer_allocation.h"
 #include <sys/mman.h>
 #include <glog/logging.h>
 #include <cerrno>

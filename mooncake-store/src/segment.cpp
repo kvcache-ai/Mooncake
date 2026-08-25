@@ -2,7 +2,7 @@
 
 #include "ha/snapshot/local_ssd_codec.h"
 #include "master_metric_manager.h"
-#include "utils/zstd_util.h"
+#include "common/zstd_util.h"
 
 #include <functional>
 #include <unordered_set>

@@ -10,7 +10,7 @@
 #include <Slab.h>
 #include <glog/logging.h>
 
-#include "byte_size.h"
+#include "common/byte_size.h"
 
 namespace mooncake {
 

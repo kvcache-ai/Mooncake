@@ -10,7 +10,7 @@
 #include <utility>
 
 #include "types.h"
-#include "result.h"
+#include "common/result.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 #include "ylt/util/tl/expected.hpp"

@@ -1,4 +1,4 @@
-#include "byte_size.h"
+#include "common/byte_size.h"
 
 #include <gtest/gtest.h>
 

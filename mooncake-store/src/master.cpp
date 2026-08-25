@@ -21,7 +21,7 @@
 #include "master_admin_service.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "network.h"
+#include "common/network.h"
 
 #include "master_config.h"
 #include "version.h"

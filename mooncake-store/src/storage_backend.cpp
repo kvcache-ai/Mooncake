@@ -25,8 +25,8 @@
 
 #include "mutex.h"
 #include "nvme_kv_backend.h"
-#include "timestamp.h"
-#include "utils/file_util.h"
+#include "common/timestamp.h"
+#include "common/file_util.h"
 #include "crc32c.h"
 #include "ascii_string.h"
 #include "environ.h"
