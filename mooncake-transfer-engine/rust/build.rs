@@ -55,6 +55,14 @@ fn has_library(search_dirs: &[PathBuf], name: &str) -> bool {
             })
 }
 
+fn has_static_library(search_dirs: &[PathBuf], name: &str) -> bool {
+    let file_name = format!("lib{name}.a");
+    search_dirs.iter().any(|dir| dir.join(&file_name).exists())
+        || ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/local/lib"]
+            .into_iter()
+            .any(|dir| Path::new(dir).join(&file_name).exists())
+}
+
 fn is_tent_archive(lib: &str) -> bool {
     lib == "tent"
         || lib.starts_with("tent_")
@@ -343,13 +351,16 @@ fn main() {
     }
 
     // Coverage-instrumented C++ archives reference __gcov_* symbols. Cargo
-    // links the Rust test binary directly, so add the compiler's gcov runtime
-    // when it is available.
-    if emit_compiler_runtime_search("libgcov.a")
-        || emit_compiler_runtime_search("libgcov.so")
-        || has_library(&search_dirs, "gcov")
-    {
-        println!("cargo:rustc-link-lib=gcov");
+    // links the Rust test binary directly, so add GCC's static gcov runtime
+    // when it is available. Keep this last: libgcov.a must follow the
+    // instrumented archives on the link line. Non-coverage builds have no
+    // __gcov_* references, so the static archive contributes no objects.
+    if emit_compiler_runtime_search("libgcov.a") || has_static_library(&search_dirs, "gcov") {
+        if link_tent {
+            println!("cargo:rustc-link-arg=-lgcov");
+        } else {
+            println!("cargo:rustc-link-lib=gcov");
+        }
     }
 
     let include_dir = env::var("MOONCAKE_TE_INCLUDE_DIR").unwrap_or_else(|_| {
