@@ -307,6 +307,15 @@ class TransferEngineImpl {
         return alive_batches_.size();
     }
 
+    // Test-only hook: how many undrained staging batches the ProxyManager
+    // handed over for deferred teardown. Lets a regression test assert the
+    // ownership-transfer path ran instead of freeing memory the transport
+    // workers could still touch.
+    size_t deferredStageTeardownBatchCountForTest() {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        return deferred_stage_teardown_.batches.size();
+    }
+
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
     // enable_progress_worker is false. Transport completion paths use this as
     // an idempotent "maybe ready" signal.
@@ -334,6 +343,16 @@ class TransferEngineImpl {
     Status retainBatch(BatchID batch_id, Batch*& batch);
 
     Status releaseBatch(Batch* batch);
+
+    // Called by ProxyManager when its shutdown drain deadline expires: takes
+    // ownership of the batches (and the local stage buffers they target) that
+    // never reached a terminal state, detaching them from batch_set_ /
+    // alive_batches_ so deconstruct() does not hand their SubBatch/Slice
+    // objects back to the Slab while transport workers may still complete
+    // them. Released only after the transports quiesce.
+    struct DeferredStageTeardown;
+
+    void adoptDeferredStageTeardown(DeferredStageTeardown&& deferred);
 
     class BatchRef;
 
@@ -431,6 +450,21 @@ class TransferEngineImpl {
         std::vector<Batch*> freelist;
     };
 
+    // Staging resources that ProxyManager could not drain before its shutdown
+    // deadline. Their slices may still be written by transport workers, so
+    // nothing here may be freed before transport_list_ is reset (which joins
+    // the workers and drains the completion queues).
+    struct DeferredStageTeardown {
+        struct StageBuffers {
+            std::string location;
+            void* chunks{nullptr};
+            std::atomic_flag* bitmap{nullptr};
+        };
+        std::vector<BatchID> batches;
+        std::vector<StageBuffers> stage_buffers;
+        bool empty() const { return batches.empty() && stage_buffers.empty(); }
+    };
+
     struct RuntimeQueueConfig {
         bool enabled{false};
         QueueLimits limits{};
@@ -486,6 +520,9 @@ class TransferEngineImpl {
     // getTransferStatus can re-enter on the same thread. See issue #2116.
     std::recursive_mutex progress_mutex_;
     std::unordered_set<BatchID> alive_batches_;
+    // Guarded by progress_mutex_. Emptied (abandoned on purpose) at the end of
+    // deconstruct(), after the transports have been destroyed.
+    DeferredStageTeardown deferred_stage_teardown_;
     std::unique_ptr<ProgressWorker> progress_worker_;
 };
 }  // namespace tent

@@ -562,6 +562,40 @@ Status TransferEngineImpl::deconstruct() {
 
     // Now safe to destroy transports (workers join here)
     for (auto& transport : transport_list_) transport.reset();
+
+    // Staging resources adopted from a timed-out ProxyManager drain may only
+    // be touched now that the workers above have joined and their completion
+    // queues are drained. Reclaiming them cleanly is not possible here:
+    // freeSubBatch() is a virtual on the transports just destroyed, and
+    // freeLocalMemory()/unregisterLocalMemory() route through raw Transport
+    // pointers captured in allocated_memory_. Following the
+    // resource_abandoned_ precedent in mooncake-pg, leak them on purpose
+    // until process exit instead of risking a use-after-free. The abandoned
+    // holder is kept reachable from a static registry (and the Batch shells
+    // stay inside the Slab arenas) so LeakSanitizer stays quiet.
+    {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        if (!deferred_stage_teardown_.empty()) {
+            LOG(WARNING) << "Abandoning "
+                         << deferred_stage_teardown_.batches.size()
+                         << " undrained staging batches and "
+                         << deferred_stage_teardown_.stage_buffers.size()
+                         << " local stage buffer arenas until process exit";
+            for (auto& entry : deferred_stage_teardown_.stage_buffers) {
+                // The bitmap is plain host memory only the (already joined)
+                // staging workers touched; the chunks are what the transport
+                // slices pointed at, so only they must be kept.
+                delete[] entry.bitmap;
+                entry.bitmap = nullptr;
+            }
+            static std::mutex abandoned_mu;
+            static auto* abandoned = new std::vector<DeferredStageTeardown>();
+            std::lock_guard<std::mutex> alk(abandoned_mu);
+            abandoned->push_back(std::move(deferred_stage_teardown_));
+            deferred_stage_teardown_ = DeferredStageTeardown();
+        }
+    }
+
     progress_worker_.reset();
     local_segment_tracker_.reset();
     if (metadata_) {
@@ -975,6 +1009,30 @@ Status TransferEngineImpl::releaseBatch(Batch* batch) {
         CHECK_STATUS(lazyFreeBatch());
     }
     return Status::OK();
+}
+
+void TransferEngineImpl::adoptDeferredStageTeardown(
+    DeferredStageTeardown&& deferred) {
+    if (deferred.empty()) return;
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    for (auto batch_id : deferred.batches) {
+        Batch* batch = (Batch*)batch_id;
+        // Detach from the normal lifecycle: an undrained batch sits in
+        // batch_set_.active, batch_set_.freelist (free_requested, still
+        // referenced) and alive_batches_, so the sweep in deconstruct() would
+        // hand its SubBatch/Slice objects back to the Slab while a transport
+        // worker can still write their status.
+        batch_set_.active.erase(batch);
+        auto it = std::find(batch_set_.freelist.begin(),
+                            batch_set_.freelist.end(), batch);
+        if (it != batch_set_.freelist.end()) batch_set_.freelist.erase(it);
+        alive_batches_.erase(batch_id);
+        deferred_stage_teardown_.batches.push_back(batch_id);
+    }
+    deferred_stage_teardown_.stage_buffers.insert(
+        deferred_stage_teardown_.stage_buffers.end(),
+        std::make_move_iterator(deferred.stage_buffers.begin()),
+        std::make_move_iterator(deferred.stage_buffers.end()));
 }
 
 class TransferEngineImpl::BatchRef {
