@@ -159,6 +159,17 @@ target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
 
+add_executable(tent_high_performance_tcp_workers_test
+               high_performance_tcp_workers_test.cpp)
+target_link_libraries(tent_high_performance_tcp_workers_test PRIVATE gtest
+                                                                    gtest_main
+                                                                    tent_xport_tcp)
+target_include_directories(
+  tent_high_performance_tcp_workers_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_high_performance_tcp_workers_test
+         COMMAND tent_high_performance_tcp_workers_test)
+
 add_executable(tent_tcp_datapath_roundtrip_test
                tcp_datapath_roundtrip_test.cpp)
 target_link_libraries(tent_tcp_datapath_roundtrip_test PRIVATE gtest gtest_main
