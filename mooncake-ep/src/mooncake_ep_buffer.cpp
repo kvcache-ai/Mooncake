@@ -342,21 +342,20 @@ MooncakeEpBuffer::dispatch(
             num_ranks, use_fp8, workspace, launch_stream, timeout_ticks, phases,
             active_qps_per_rank);
     };
-    if (graph_capture) {
+    if (return_recv_hook &&
+        (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
+        launcher(LOW_LATENCY_SEND_PHASE);
+        mark_send_done();
+    } else if (graph_capture) {
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
     } else {
-        if (return_recv_hook) {
-            launcher(LOW_LATENCY_SEND_PHASE);
-            mark_send_done();
-        } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-            launcher(LOW_LATENCY_SEND_PHASE);
-            mark_and_wait_peer_send_done();
-            launcher(LOW_LATENCY_RECV_PHASE);
+        launcher(LOW_LATENCY_SEND_PHASE);
+        mark_and_wait_peer_send_done();
+        launcher(LOW_LATENCY_RECV_PHASE);
 #else
-            launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
+        launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
 #endif
-        }
     }
 
     // Wait streams
@@ -376,7 +375,7 @@ MooncakeEpBuffer::dispatch(
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() {
-            if (graph_capture) return;
+            if (graph_capture && macaHostPhaseFenceCoversPeers()) return;
             if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
@@ -497,21 +496,20 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
             zero_copy, active_qps_per_rank);
     };
-    if (graph_capture) {
+    if (return_recv_hook &&
+        (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
+        launcher(LOW_LATENCY_SEND_PHASE);
+        mark_send_done();
+    } else if (graph_capture) {
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
     } else {
-        if (return_recv_hook) {
-            launcher(LOW_LATENCY_SEND_PHASE);
-            mark_send_done();
-        } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-            launcher(LOW_LATENCY_SEND_PHASE);
-            mark_and_wait_peer_send_done();
-            launcher(LOW_LATENCY_RECV_PHASE);
+        launcher(LOW_LATENCY_SEND_PHASE);
+        mark_and_wait_peer_send_done();
+        launcher(LOW_LATENCY_RECV_PHASE);
 #else
-            launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
+        launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
 #endif
-        }
     }
 
     // Wait streams
@@ -531,7 +529,7 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() {
-            if (graph_capture) return;
+            if (graph_capture && macaHostPhaseFenceCoversPeers()) return;
             if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
