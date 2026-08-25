@@ -14,10 +14,21 @@ from ...contracts import (
     RevisionId,
     RuntimeFragmentId,
     RuntimeInstanceId,
+    StoredFragmentSnapshotId,
     TensorId,
 )
-from ..manifest import ParallelRank, WeightPlacementManifest
-from ..storage_manifest import StoredFragment, StoredManifestIdentity
+from ..manifest import (
+    ParallelRank,
+    PlacementFragment,
+    RuntimeBindingFragment,
+    WeightPlacementManifest,
+)
+from ..storage_manifest import (
+    StoredFragmentSnapshot,
+    StoredManifestIdentity,
+    WeightManifest,
+    validate_weight_manifest_snapshot,
+)
 from . import contracts as _contracts
 from .attestation import RuntimeBindingAttestation
 from .contracts import (
@@ -31,7 +42,7 @@ from .fragments import BoundWeightFragment
 
 
 @dataclass(frozen=True)
-class RuntimeLeaseSnapshot:
+class RuntimeFragmentSnapshot:
     fragment_id: RuntimeFragmentId
     tensor_id: TensorId
     global_offset: tuple[int, ...]
@@ -41,10 +52,14 @@ class RuntimeLeaseSnapshot:
     worker_id: str
     endpoint: str
     device: str
+    strides_bytes: tuple[int, ...]
+    storage_address: int
+    storage_nbytes: int
+    storage_offset_bytes: int
     lease_generation: int
 
     @classmethod
-    def from_fragment(cls, fragment: BoundWeightFragment) -> RuntimeLeaseSnapshot:
+    def from_fragment(cls, fragment: BoundWeightFragment) -> RuntimeFragmentSnapshot:
         return cls(
             fragment_id=fragment.fragment_id,
             tensor_id=fragment.tensor_id,
@@ -55,7 +70,36 @@ class RuntimeLeaseSnapshot:
             worker_id=fragment.worker_id,
             endpoint=fragment.endpoint,
             device=fragment.device,
+            strides_bytes=fragment.binding.strides_bytes,
+            storage_address=fragment.storage_address,
+            storage_nbytes=fragment.storage_nbytes,
+            storage_offset_bytes=fragment.storage_offset_bytes,
             lease_generation=fragment.lease_generation,
+        )
+
+    @classmethod
+    def from_attested_pair(
+        cls,
+        placement_fragment: PlacementFragment,
+        runtime_fragment: RuntimeBindingFragment,
+        *,
+        lease_generation: int,
+    ) -> RuntimeFragmentSnapshot:
+        return cls(
+            fragment_id=runtime_fragment.fragment_id,
+            tensor_id=placement_fragment.tensor_id,
+            global_offset=placement_fragment.global_offset,
+            local_shape=placement_fragment.local_shape,
+            address=runtime_fragment.address,
+            nbytes=runtime_fragment.nbytes,
+            worker_id=runtime_fragment.worker_id,
+            endpoint=runtime_fragment.endpoint,
+            device=runtime_fragment.device,
+            strides_bytes=runtime_fragment.strides_bytes,
+            storage_address=runtime_fragment.storage_address,
+            storage_nbytes=runtime_fragment.storage_nbytes,
+            storage_offset_bytes=runtime_fragment.storage_offset_bytes,
+            lease_generation=lease_generation,
         )
 
 
@@ -69,7 +113,7 @@ class ExecutorTransferPlan:
     worker_id: str
     rank: ParallelRank
     fragment_ids: tuple[RuntimeFragmentId, ...]
-    fragment_leases: tuple[RuntimeLeaseSnapshot, ...]
+    fragment_snapshots: tuple[RuntimeFragmentSnapshot, ...]
     attestation: Optional[RuntimeBindingAttestation] = field(
         default=None,
         compare=False,
@@ -78,7 +122,7 @@ class ExecutorTransferPlan:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "fragment_ids", tuple(self.fragment_ids))
-        object.__setattr__(self, "fragment_leases", tuple(self.fragment_leases))
+        object.__setattr__(self, "fragment_snapshots", tuple(self.fragment_snapshots))
         if (
             not self.instance_id
             or not self.placement_id
@@ -98,14 +142,15 @@ class ExecutorTransferPlan:
         if len(self.fragment_ids) != len(set(self.fragment_ids)):
             raise ValueError("executor plan has duplicate fragment IDs")
         if not all(
-            isinstance(lease, RuntimeLeaseSnapshot) for lease in self.fragment_leases
+            isinstance(snapshot, RuntimeFragmentSnapshot)
+            for snapshot in self.fragment_snapshots
         ):
-            raise ValueError("executor plan has invalid runtime lease metadata")
+            raise ValueError("executor plan has invalid runtime fragment snapshots")
         if (
-            tuple(lease.fragment_id for lease in self.fragment_leases)
+            tuple(snapshot.fragment_id for snapshot in self.fragment_snapshots)
             != self.fragment_ids
         ):
-            raise ValueError("executor plan fragment lease IDs do not match")
+            raise ValueError("executor plan fragment snapshot IDs do not match")
         if self.attestation is not None and not isinstance(
             self.attestation, RuntimeBindingAttestation
         ):
@@ -129,7 +174,7 @@ def _validate_executable_operation(value: object) -> None:
     operation = cast(ExecutableTransferOperation, value)
     if not isinstance(operation.target, BoundWeightFragment):
         raise ValueError("executable transfer plan target must be runtime-bound")
-    if not isinstance(operation.source, (BoundWeightFragment, StoredFragment)):
+    if not isinstance(operation.source, (BoundWeightFragment, StoredFragmentSnapshot)):
         raise ValueError("executable transfer plan source must be runtime-bound")
     operation.validate_bounds()
 
@@ -210,6 +255,10 @@ def _validate_execution_provenance(
         if isinstance(operation.source, BoundWeightFragment):
             fragments = (("source", operation.source), *fragments)
         for side, fragment in fragments:
+            if fragment.owner is not None or fragment.binding.owner is not None:
+                raise ValueError(
+                    f"transfer plan {side} fragment retains runtime allocation owner"
+                )
             attestation = fragment.attestation
             if not isinstance(attestation, RuntimeBindingAttestation):
                 raise ValueError(
@@ -246,12 +295,14 @@ def _validate_executor_provenance(
         operation.source if side == "source" else operation.target
         for operation in operations
     )
+    if not fragments:
+        return
     has_stored_source = any(
-        isinstance(fragment, StoredFragment) for fragment in fragments
+        isinstance(fragment, StoredFragmentSnapshot) for fragment in fragments
     )
     if has_stored_source:
         if side != "source" or not all(
-            isinstance(fragment, StoredFragment) for fragment in fragments
+            isinstance(fragment, StoredFragmentSnapshot) for fragment in fragments
         ):
             raise ValueError("transfer plan mixes stored and live source fragments")
         if executors:
@@ -263,14 +314,14 @@ def _validate_executor_provenance(
     if len(live_fragments) != len(fragments):
         raise ValueError(f"transfer plan {side} fragment is not runtime-bound")
     if not executors:
-        return
+        raise ValueError(f"live {side} requires executor provenance")
 
     expected_indices: dict[ExecutorKey, list[int]] = {}
     for index, fragment in enumerate(live_fragments):
         attestation = fragment.attestation
         if not isinstance(attestation, RuntimeBindingAttestation):
             raise ValueError(f"transfer plan {side} fragment lacks runtime attestation")
-        binding = attestation.binding
+        binding = attestation.evidence
         placement = attestation.placement
         key: ExecutorKey = (
             binding.instance_id,
@@ -289,6 +340,9 @@ def _validate_executor_provenance(
         if isinstance(fragment.attestation, RuntimeBindingAttestation)
     }
     actual_indices: dict[ExecutorKey, list[int]] = {}
+    executor_snapshots_by_fragment_id: dict[
+        RuntimeFragmentId, RuntimeFragmentSnapshot
+    ] = {}
     for executor in executors:
         if executor.runtime_lease_id is None:
             raise ValueError(f"{side} executor is missing runtime lease provenance")
@@ -307,7 +361,7 @@ def _validate_executor_provenance(
         if not isinstance(attestation, RuntimeBindingAttestation):
             raise ValueError(f"{side} executor lacks runtime attestation")
         placement = attestation.placement
-        binding = attestation.binding
+        binding = attestation.evidence
         if (
             placement.resource_id != resource_id
             or placement.revision != revision
@@ -329,30 +383,28 @@ def _validate_executor_provenance(
         actual_indices[key] = list(
             operation_views.operation_indices_for(executor, side)
         )
-        expected_fragment_leases = tuple(
+        expected_fragment_snapshots = tuple(
             sorted(
                 (
-                    RuntimeLeaseSnapshot(
-                        fragment_id=runtime.fragment_id,
-                        tensor_id=placement_fragment.tensor_id,
-                        global_offset=placement_fragment.global_offset,
-                        local_shape=placement_fragment.local_shape,
-                        address=runtime.address,
-                        nbytes=runtime.nbytes,
-                        worker_id=runtime.worker_id,
-                        endpoint=runtime.endpoint,
-                        device=runtime.device,
+                    RuntimeFragmentSnapshot.from_attested_pair(
+                        placement_fragment,
+                        runtime,
                         lease_generation=binding.generation,
                     )
                     for placement_fragment, runtime in attestation.worker_fragment_pairs(
                         executor.worker_id
                     )
+                    if runtime.fragment_id in executor.fragment_ids
                 ),
                 key=lambda item: item.fragment_id,
             )
         )
-        if executor.fragment_leases != expected_fragment_leases:
+        if executor.fragment_snapshots != expected_fragment_snapshots:
             raise ValueError(f"{side} executor fragment provenance differs")
+        for snapshot in executor.fragment_snapshots:
+            if snapshot.fragment_id in executor_snapshots_by_fragment_id:
+                raise ValueError(f"{side} executor has duplicate fragment provenance")
+            executor_snapshots_by_fragment_id[snapshot.fragment_id] = snapshot
 
     for key, actual in actual_indices.items():
         expected = expected_indices.get(key)
@@ -364,6 +416,37 @@ def _validate_executor_provenance(
             raise ValueError(f"{side} executor provenance differs from operations")
     if set(expected_indices) - set(actual_indices):
         raise ValueError(f"{side} executor provenance differs from operations")
+    operation_fragment_ids = {fragment.fragment_id for fragment in live_fragments}
+    if set(executor_snapshots_by_fragment_id) != operation_fragment_ids:
+        raise ValueError(f"{side} executor fragment provenance differs from operations")
+    for fragment in live_fragments:
+        if executor_snapshots_by_fragment_id.get(fragment.fragment_id) != (
+            RuntimeFragmentSnapshot.from_fragment(fragment)
+        ):
+            raise ValueError(f"{side} executor fragment provenance differs")
+
+
+def _validated_stored_source_fragment_snapshots(
+    operations: tuple[ExecutableTransferOperation, ...],
+    source_manifest: WeightManifest,
+) -> tuple[StoredFragmentSnapshot, ...]:
+    """Derive selected Store ranges from the committed manifest snapshot."""
+
+    snapshots_by_id: dict[StoredFragmentSnapshotId, StoredFragmentSnapshot] = {}
+    for fragment in source_manifest.fragments:
+        snapshots_by_id[fragment.fragment_id] = fragment
+
+    operation_ids: set[StoredFragmentSnapshotId] = set()
+    for operation in operations:
+        source = operation.source
+        if not isinstance(source, StoredFragmentSnapshot):
+            raise ValueError("transfer plan mixes stored and live source fragments")
+        if snapshots_by_id.get(source.fragment_id) != source:
+            raise ValueError(
+                "transfer plan stored source fragment differs from committed manifest"
+            )
+        operation_ids.add(source.fragment_id)
+    return tuple(snapshots_by_id[fragment_id] for fragment_id in sorted(operation_ids))
 
 
 @dataclass(frozen=True)
@@ -378,7 +461,11 @@ class TransferPlan:
     planning_limits: PlanningLimits = field(default_factory=PlanningLimits)
     source_executors: tuple[ExecutorTransferPlan, ...] = ()
     target_executors: tuple[ExecutorTransferPlan, ...] = ()
+    source_manifest: Optional[WeightManifest] = None
     source_manifest_identity: Optional[StoredManifestIdentity] = None
+    source_stored_fragment_snapshots: tuple[StoredFragmentSnapshot, ...] = field(
+        init=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "operations", tuple(self.operations))
@@ -395,6 +482,11 @@ class TransferPlan:
             StoredManifestIdentity,
         ):
             raise ValueError("transfer plan source manifest identity is invalid")
+        if self.source_manifest is not None and not isinstance(
+            self.source_manifest,
+            WeightManifest,
+        ):
+            raise ValueError("transfer plan source manifest is invalid")
         if len(self.operations) > self.planning_limits.max_transfer_regions:
             raise ValueError("transfer plan exceeds max_transfer_regions")
         total_lowered_segments = 0
@@ -406,10 +498,14 @@ class TransferPlan:
             if total_lowered_segments > self.planning_limits.max_total_lowered_segments:
                 raise ValueError("transfer plan exceeds max_total_lowered_segments")
         has_stored_source = any(
-            isinstance(operation.source, StoredFragment)
+            isinstance(operation.source, StoredFragmentSnapshot)
             for operation in self.operations
         )
         if has_stored_source:
+            if self.source_manifest is None:
+                raise ValueError("stored transfer plan requires a source manifest")
+            source_manifest = validate_weight_manifest_snapshot(self.source_manifest)
+            object.__setattr__(self, "source_manifest", source_manifest)
             if self.source_manifest_identity is None:
                 raise ValueError(
                     "stored transfer plan requires a source manifest identity"
@@ -421,10 +517,24 @@ class TransferPlan:
                 != self.weight_generation
             ):
                 raise ValueError("transfer plan source manifest identity differs")
+            if source_manifest.manifest_identity != self.source_manifest_identity:
+                raise ValueError("transfer plan source manifest commitment differs")
+            object.__setattr__(
+                self,
+                "source_stored_fragment_snapshots",
+                _validated_stored_source_fragment_snapshots(
+                    self.operations,
+                    source_manifest,
+                ),
+            )
+        elif self.source_manifest is not None:
+            raise ValueError("runtime transfer plan must not have a source manifest")
         elif self.source_manifest_identity is not None:
             raise ValueError(
                 "runtime transfer plan must not have a source manifest identity"
             )
+        else:
+            object.__setattr__(self, "source_stored_fragment_snapshots", ())
         if not all(
             isinstance(executor, ExecutorTransferPlan)
             for executor in (*self.source_executors, *self.target_executors)
@@ -483,7 +593,10 @@ class TransferPlan:
             _validate_target_physical_ranges,
         )
 
-        _validate_target_physical_ranges(self.operations)
+        _validate_target_physical_ranges(
+            self.operations,
+            max_segment_checks=self.planning_limits.max_total_lowered_segments,
+        )
         _validate_bound_target_coverage(self)
 
     @property
@@ -525,6 +638,6 @@ class TransferPlan:
 
 __all__ = [
     "ExecutorTransferPlan",
-    "RuntimeLeaseSnapshot",
+    "RuntimeFragmentSnapshot",
     "TransferPlan",
 ]

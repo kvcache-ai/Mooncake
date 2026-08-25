@@ -27,8 +27,9 @@ from .planner import (
     PipelineRouteGroup,
     PlacementExecutorPlan,
     PlanningLimits,
-    RuntimeLeaseSnapshot,
+    RuntimeFragmentSnapshot,
     RuntimeBindingAttestation,
+    RuntimeBindingEvidence,
     RuntimeTensorOwner,
     StoredLoadOperation,
     TransferPlan,
@@ -40,7 +41,7 @@ from .planner import (
     resolve_executor_plan,
     resolve_executor_plans,
 )
-from .storage_manifest import StoredFragment, WeightManifest
+from .storage_manifest import StoredFragmentSnapshot, WeightManifest
 
 __all__ = [
     "ParallelRank",
@@ -59,7 +60,7 @@ __all__ = [
     "validate_runtime_bindings",
     "weight_placement_from_json",
     "weight_placement_to_json",
-    "StoredFragment",
+    "StoredFragmentSnapshot",
     "WeightManifest",
     "BoundWeightFragment",
     "ExecutableTransferOperation",
@@ -70,8 +71,9 @@ __all__ = [
     "PipelineRouteGroup",
     "PlacementExecutorPlan",
     "PlanningLimits",
-    "RuntimeLeaseSnapshot",
+    "RuntimeFragmentSnapshot",
     "RuntimeBindingAttestation",
+    "RuntimeBindingEvidence",
     "RuntimeTensorOwner",
     "StoredLoadOperation",
     "TransferPlan",

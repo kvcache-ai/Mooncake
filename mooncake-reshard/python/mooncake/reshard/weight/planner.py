@@ -12,7 +12,7 @@ from ._planner.binding import (
 )
 from ._planner.bound_contracts import (
     ExecutorTransferPlan,
-    RuntimeLeaseSnapshot,
+    RuntimeFragmentSnapshot,
     TransferPlan,
 )
 from ._planner.contracts import (
@@ -28,7 +28,7 @@ from ._planner.contracts import (
     StoredLoadOperation,
     TransferRegion,
 )
-from ._planner.attestation import RuntimeBindingAttestation
+from ._planner.attestation import RuntimeBindingAttestation, RuntimeBindingEvidence
 
 
 __all__ = [
@@ -41,8 +41,9 @@ __all__ = [
     "LogicalTransferOperation",
     "PipelineRouteGroup",
     "PlacementExecutorPlan",
-    "RuntimeLeaseSnapshot",
+    "RuntimeFragmentSnapshot",
     "RuntimeBindingAttestation",
+    "RuntimeBindingEvidence",
     "RuntimeTensorOwner",
     "StoredLoadOperation",
     "TransferPlan",

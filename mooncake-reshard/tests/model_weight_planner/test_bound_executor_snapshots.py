@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from copy import copy
 from dataclasses import replace
+import gc
 import inspect
 import pickle
 from types import SimpleNamespace
+import weakref
 
 import pytest
 
@@ -14,6 +16,7 @@ from mooncake.reshard.weight import (
     bind_logical_transfer_plan,
     plan_placement_transfer,
     plan_placement_transfer_to_local_target,
+    plan_stored_transfer_to_target_placement,
 )
 from mooncake.reshard.weight._planner.binding import resolve_executor_plans
 from mooncake.reshard.weight._planner.bound_contracts import (
@@ -22,8 +25,13 @@ from mooncake.reshard.weight._planner.bound_contracts import (
 )
 from mooncake.reshard.weight._planner.contracts import (
     LogicalTransferPlan,
+    PlanningLimits,
     PlacementExecutorPlan,
     TransferRegion,
+)
+from mooncake.reshard.weight.storage_manifest import (
+    StoredFragmentSnapshot,
+    WeightManifest,
 )
 
 from .helpers import RuntimeInputs, plan_transfer, rebuild_placement, tp_manifests
@@ -31,6 +39,60 @@ from .helpers import RuntimeInputs, plan_transfer, rebuild_placement, tp_manifes
 
 def _replace_bindings(inputs: RuntimeInputs, bindings) -> RuntimeInputs:
     return RuntimeInputs(inputs.placement, tuple(bindings))
+
+
+_RUNTIME_ATTESTED_FIELDS = (
+    "fragment_id",
+    "address",
+    "nbytes",
+    "worker_id",
+    "endpoint",
+    "device",
+    "strides_bytes",
+    "storage_address",
+    "storage_nbytes",
+    "storage_offset_bytes",
+    "lease_generation",
+)
+
+
+def _tampered_value(value: object) -> object:
+    if type(value) is str:
+        return f"forged-{value}"
+    if type(value) is int:
+        return value + 1
+    if type(value) is tuple and value and all(type(item) is int for item in value):
+        return (value[0] + 1, *value[1:])
+    raise AssertionError(f"unsupported attested value: {value!r}")
+
+
+def _forge_operation_fragment(fragment, field: str):
+    forged = copy(fragment)
+    if field == "lease_generation":
+        object.__setattr__(
+            forged,
+            field,
+            _tampered_value(getattr(fragment, field)),
+        )
+        return forged
+    forged_binding = copy(fragment.binding)
+    object.__setattr__(
+        forged_binding,
+        field,
+        _tampered_value(getattr(forged_binding, field)),
+    )
+    object.__setattr__(forged, "binding", forged_binding)
+    return forged
+
+
+def _forge_executor_snapshot(snapshot, field: str):
+    forged = copy(snapshot)
+    object.__setattr__(
+        forged,
+        field,
+        _tampered_value(getattr(snapshot, field)),
+    )
+    return forged
 
 
 def test_execution_views_derive_operation_indices_and_pipeline_routes() -> None:
@@ -159,6 +221,292 @@ def test_bound_plan_snapshots_only_the_selected_source_dp_replica() -> None:
     assert {executor.rank.dp for executor in plan.source_executors} == {0}
 
 
+def test_public_transfer_plan_rejects_live_source_without_executor() -> None:
+    source = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    target = tp_manifests(
+        tp=1,
+        pp_rank=1,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+    )
+    plan = plan_transfer(source, target)
+
+    with pytest.raises(ValueError, match="live source requires executor provenance"):
+        replace(plan, source_executors=())
+
+
+def test_transfer_plan_does_not_retain_runtime_allocation_owner() -> None:
+    class AllocationOwner:
+        pass
+
+    source = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    target = tp_manifests(
+        tp=1,
+        pp_rank=1,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+    )
+    owner = AllocationOwner()
+    owner_ref = weakref.ref(owner)
+    source = _replace_bindings(
+        source,
+        (
+            replace(
+                source.bindings[0],
+                fragments=(replace(source.bindings[0].fragments[0], owner=owner),),
+            ),
+        ),
+    )
+
+    plan = plan_transfer(source, target)
+
+    live_fragments = (
+        *(operation.source for operation in plan.operations),
+        *(operation.target for operation in plan.operations),
+    )
+    assert all(fragment.owner is None for fragment in live_fragments)
+    assert all(fragment.binding.owner is None for fragment in live_fragments)
+    assert all(
+        fragment.owner is None
+        for executor in (*plan.source_executors, *plan.target_executors)
+        for fragment in executor.attestation.evidence.fragments
+    )
+    del owner
+    del source
+    gc.collect()
+    assert owner_ref() is None
+
+
+def test_transfer_plan_rejects_owner_forged_into_attestation_during_restore() -> None:
+    source = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    target = tp_manifests(
+        tp=1,
+        pp_rank=1,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+    )
+    plan = plan_transfer(source, target)
+    fragment = plan.operations[0].source
+    assert fragment.attestation is not None
+    forged_evidence = copy(fragment.attestation.evidence)
+    object.__setattr__(
+        forged_evidence,
+        "fragments",
+        (
+            replace(
+                fragment.attestation.evidence.fragments[0],
+                owner=SimpleNamespace(name="forged-owner"),
+            ),
+        ),
+    )
+    restored_attestation = object.__new__(type(fragment.attestation))
+
+    with pytest.raises(
+        ValueError, match="runtime binding evidence must not retain allocation owners"
+    ):
+        restored_attestation.__setstate__(
+            (fragment.attestation.placement, forged_evidence)
+        )
+
+
+@pytest.mark.parametrize("side", ["source", "target"])
+@pytest.mark.parametrize("field", _RUNTIME_ATTESTED_FIELDS)
+def test_transfer_plan_rejects_every_operation_attested_field(
+    side: str,
+    field: str,
+) -> None:
+    source = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    target = tp_manifests(
+        tp=1,
+        pp_rank=1,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+    )
+    plan = plan_transfer(source, target)
+    fragment = (
+        plan.operations[0].source if side == "source" else plan.operations[0].target
+    )
+    with pytest.raises(ValueError):
+        forged_operation = replace(
+            plan.operations[0],
+            **{side: _forge_operation_fragment(fragment, field)},
+        )
+        forged = copy(plan)
+        object.__setattr__(forged, "operations", (forged_operation,))
+        pickle.loads(pickle.dumps(forged))
+
+
+@pytest.mark.parametrize("side", ["source", "target"])
+@pytest.mark.parametrize("field", _RUNTIME_ATTESTED_FIELDS)
+def test_transfer_plan_rejects_every_executor_attested_field(
+    side: str,
+    field: str,
+) -> None:
+    source = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    target = tp_manifests(
+        tp=1,
+        pp_rank=1,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+    )
+    plan = plan_transfer(source, target)
+    executor = (
+        plan.source_executors[0] if side == "source" else plan.target_executors[0]
+    )
+    forged_executor = copy(executor)
+    object.__setattr__(
+        forged_executor,
+        "fragment_snapshots",
+        (_forge_executor_snapshot(executor.fragment_snapshots[0], field),),
+    )
+    forged = copy(plan)
+    object.__setattr__(forged, f"{side}_executors", (forged_executor,))
+
+    with pytest.raises(ValueError):
+        pickle.loads(pickle.dumps(forged))
+
+
+def test_runtime_binding_uses_the_plan_segment_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    target = tp_manifests(
+        tp=1,
+        pp_rank=1,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+    )
+    logical = replace(
+        plan_placement_transfer(source.placement, target.placement),
+        planning_limits=PlanningLimits(
+            max_transfer_regions=7,
+            max_segments_per_region=7,
+            max_total_lowered_segments=7,
+        ),
+    )
+
+    import mooncake.reshard.weight._planner.binding as binding_module
+
+    observed: list[int] = []
+    original = binding_module._validate_target_physical_ranges
+
+    def capture(operations, *, max_segment_checks: int) -> None:
+        observed.append(max_segment_checks)
+        original(operations, max_segment_checks=max_segment_checks)
+
+    monkeypatch.setattr(binding_module, "_validate_target_physical_ranges", capture)
+    plan = bind_logical_transfer_plan(
+        logical,
+        target.bindings,
+        source_bindings=source.bindings,
+    )
+
+    assert observed == [logical.planning_limits.max_total_lowered_segments]
+    assert plan.planning_limits == logical.planning_limits
+
+
+def test_bound_stored_plan_rejects_coordinated_fragment_forgery_after_pickle() -> None:
+    target = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+    )
+    group_id = "weights/default/qwen3.5-0.8b/step-42/1"
+    source_manifest = WeightManifest(
+        namespace="default",
+        resource_id=target.placement.resource_id,
+        revision=target.placement.revision,
+        weight_generation=target.placement.weight_generation,
+        group_id=group_id,
+        manifest_key=f"{group_id}/manifest",
+        tensors=target.placement.tensors,
+        fragments=(
+            StoredFragmentSnapshot(
+                fragment_id="stored-source",
+                tensor_id=target.placement.tensors[0].tensor_id,
+                global_offset=(0, 0),
+                local_shape=target.placement.tensors[0].global_shape,
+                object_key=f"{group_id}/payload/0",
+                object_offset=0,
+                nbytes=target.placement.tensors[0].itemsize * 32,
+            ),
+        ),
+        created_at="2026-08-26T00:00:00Z",
+    )
+    logical = plan_stored_transfer_to_target_placement(
+        source_manifest,
+        target.placement,
+    )
+    plan = bind_logical_transfer_plan(
+        logical,
+        target.bindings,
+        source_manifest=source_manifest,
+    )
+    forged_source = replace(
+        plan.operations[0].source,
+        object_key=f"{group_id}/payload/forged",
+    )
+
+    forged = copy(plan)
+    object.__setattr__(
+        forged,
+        "operations",
+        (replace(plan.operations[0], source=forged_source),),
+    )
+    object.__setattr__(
+        forged,
+        "source_stored_fragment_snapshots",
+        (forged_source,),
+    )
+
+    with pytest.raises(ValueError, match="differs from committed manifest"):
+        pickle.loads(pickle.dumps(forged))
+
+
 def test_bind_accepts_participant_local_source_generations() -> None:
     sources = tp_manifests(
         tp=2,
@@ -187,7 +535,7 @@ def test_bind_accepts_participant_local_source_generations() -> None:
     )
 
     assert {
-        executor.participant_id: executor.fragment_leases[0].lease_generation
+        executor.participant_id: executor.fragment_snapshots[0].lease_generation
         for executor in plan.source_executors
     } == {
         mixed_sources[0].participant_id: mixed_sources[0].generation,
@@ -308,10 +656,18 @@ def test_public_transfer_plan_rejects_bound_target_coverage_gap() -> None:
         for index, operation in enumerate(plan.operations)
         if operation.source.rank.tp == 1
     )
+    kept_source_fragment_ids = {
+        plan.operations[index].source.fragment_id for index in kept_indices
+    }
     with pytest.raises(ValueError, match="bound target fragment is not fully covered"):
         replace(
             plan,
             operations=tuple(plan.operations[index] for index in kept_indices),
+            source_executors=tuple(
+                executor
+                for executor in plan.source_executors
+                if set(executor.fragment_ids) <= kept_source_fragment_ids
+            ),
         )
 
 

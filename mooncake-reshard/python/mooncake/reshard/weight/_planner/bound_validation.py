@@ -12,7 +12,7 @@ from ..._compat import _strict_zip
 from ...contracts import ParticipantId, PlacementFragmentId
 from ...geometry import regions_exactly_cover
 from ..manifest import PlacementFragment
-from ..storage_manifest import StoredFragment
+from ..storage_manifest import StoredFragmentSnapshot
 from .attestation import RuntimeBindingAttestation
 from .bound_contracts import TransferPlan
 from .contracts import ExecutableTransferOperation
@@ -77,16 +77,20 @@ def _validate_bound_target_coverage(plan: TransferPlan) -> None:
             or executor.placement_digest != target_placement.digest
             or not isinstance(attestation, RuntimeBindingAttestation)
             or attestation.placement != target_placement
-            or attestation.binding.participant_id != executor.participant_id
-            or attestation.binding.instance_id != executor.instance_id
-            or attestation.binding.lease_id != executor.runtime_lease_id
+            or attestation.evidence.participant_id != executor.participant_id
+            or attestation.evidence.instance_id != executor.instance_id
+            or attestation.evidence.lease_id != executor.runtime_lease_id
         ):
             raise ValueError("bound target executor differs from target placement")
-        expected_fragment_ids = tuple(
-            sorted(
-                runtime.fragment_id
-                for _, runtime in attestation.worker_fragment_pairs(executor.worker_id)
+        selected_pairs = tuple(
+            (fragment, runtime)
+            for fragment, runtime in attestation.worker_fragment_pairs(
+                executor.worker_id
             )
+            if runtime.fragment_id in executor.fragment_ids
+        )
+        expected_fragment_ids = tuple(
+            sorted(runtime.fragment_id for _, runtime in selected_pairs)
         )
         if executor.fragment_ids != expected_fragment_ids:
             raise ValueError(
@@ -98,7 +102,7 @@ def _validate_bound_target_coverage(plan: TransferPlan) -> None:
             )
         selected_participants.add(executor.participant_id)
         selected_fragments.update(
-            {fragment.placement_fragment_id: fragment for fragment in part.fragments}
+            {fragment.placement_fragment_id: fragment for fragment, _ in selected_pairs}
         )
 
     if selected_participants != operation_participants:
@@ -113,7 +117,7 @@ def _validate_bound_target_coverage(plan: TransferPlan) -> None:
 
 
 def _is_complete_alias_group(
-    fragment: Union[BoundWeightFragment, StoredFragment],
+    fragment: Union[BoundWeightFragment, StoredFragmentSnapshot],
 ) -> bool:
     return len(fragment.aliases) > 1 and fragment.tensor_id in fragment.aliases
 
@@ -156,7 +160,7 @@ def _is_safe_declared_alias_overlap(
         or not isinstance(left_attestation, RuntimeBindingAttestation)
         or not isinstance(right_attestation, RuntimeBindingAttestation)
         or left_attestation.placement != right_attestation.placement
-        or left_attestation.binding != right_attestation.binding
+        or left_attestation.evidence != right_attestation.evidence
         or left.overlap_offset != right.overlap_offset
         or left.overlap_shape != right.overlap_shape
     ):

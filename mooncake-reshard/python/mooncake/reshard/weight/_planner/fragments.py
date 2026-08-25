@@ -15,7 +15,7 @@ from ...contracts import (
     TensorId,
 )
 from ..manifest import ParallelRank, PlacementFragment, RuntimeBindingFragment
-from ..storage_manifest import StoredFragment
+from ..storage_manifest import StoredFragmentSnapshot
 from .attestation import RuntimeBindingAttestation
 
 
@@ -69,9 +69,9 @@ class BoundWeightFragment:
                     "bound fragment does not match its runtime binding attestation"
                 )
             if (
-                self.instance_id != self.attestation.binding.instance_id
-                or self.runtime_lease_id != self.attestation.binding.lease_id
-                or self.lease_generation != self.attestation.binding.generation
+                self.instance_id != self.attestation.evidence.instance_id
+                or self.runtime_lease_id != self.attestation.evidence.lease_id
+                or self.lease_generation != self.attestation.evidence.generation
             ):
                 raise ValueError(
                     "bound fragment runtime fence differs from attestation"
@@ -161,17 +161,17 @@ class BoundWeightFragment:
 # These aliases are intentionally stage-specific. A placement is immutable and
 # address-free; a bound fragment carries runtime lease/address state; a stored
 # fragment is a Store object range. Executors may only see the last two kinds.
-LogicalSourceFragment: TypeAlias = Union[PlacementFragment, StoredFragment]
+LogicalSourceFragment: TypeAlias = Union[PlacementFragment, StoredFragmentSnapshot]
 LogicalTargetFragment: TypeAlias = PlacementFragment
-ExecutableSourceFragment: TypeAlias = Union[BoundWeightFragment, StoredFragment]
+ExecutableSourceFragment: TypeAlias = Union[BoundWeightFragment, StoredFragmentSnapshot]
 ExecutableTargetFragment: TypeAlias = BoundWeightFragment
 LiveSourceFragment: TypeAlias = BoundWeightFragment
 LiveTargetFragment: TypeAlias = BoundWeightFragment
-StoredLoadSourceFragment: TypeAlias = StoredFragment
+StoredLoadSourceFragment: TypeAlias = StoredFragmentSnapshot
 StoredLoadTargetFragment: TypeAlias = BoundWeightFragment
 GeometryFragment: TypeAlias = Union[
     PlacementFragment,
-    StoredFragment,
+    StoredFragmentSnapshot,
     BoundWeightFragment,
 ]
 

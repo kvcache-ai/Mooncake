@@ -196,7 +196,7 @@ class PlacementPlannerTest(unittest.TestCase):
                 executor.instance_id: executor.fragment_leases[0].lease_generation
                 for executor in plan.source_executors
             },
-            {"source-dp0-instance": 3, "source-dp1-instance": 4},
+            {"source-dp0-instance": 3},
         )
 
     def test_partial_source_bindings_reject_cross_participant_overlap(self) -> None:

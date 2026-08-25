@@ -19,11 +19,11 @@ from ..manifest import (
     WeightRuntimeBindingManifest,
 )
 from ..storage_manifest import (
-    StoredFragment,
+    StoredFragmentSnapshot,
     WeightManifest,
     validate_weight_manifest_snapshot,
 )
-from .bound_contracts import ExecutorTransferPlan, RuntimeLeaseSnapshot, TransferPlan
+from .bound_contracts import ExecutorTransferPlan, RuntimeFragmentSnapshot, TransferPlan
 from .bound_validation import _validate_target_physical_ranges
 from .contracts import (
     BoundWeightFragment,
@@ -110,13 +110,14 @@ def _bound_fragment(
     binding: RuntimeBindingFragment,
     attestation: RuntimeBindingAttestation,
 ) -> BoundWeightFragment:
+    evidence = attestation.binding_fragment(placement.placement_fragment_id)
     return BoundWeightFragment(
         placement=placement,
-        binding=binding,
-        instance_id=attestation.binding.instance_id,
-        runtime_lease_id=attestation.binding.lease_id,
-        lease_generation=attestation.binding.generation,
-        owner=binding.owner,
+        binding=evidence,
+        instance_id=attestation.evidence.instance_id,
+        runtime_lease_id=attestation.evidence.lease_id,
+        lease_generation=attestation.evidence.generation,
+        owner=None,
         attestation=attestation,
     )
 
@@ -265,7 +266,7 @@ def _validate_logical_fragment_snapshots(
                 "logical plan and source placement fragment snapshots differ"
             )
         if logical_plan.source_manifest is not None and (
-            not isinstance(source, StoredFragment)
+            not isinstance(source, StoredFragmentSnapshot)
             or stored_source_by_id.get(source.fragment_id) != source
         ):
             raise ValueError(
@@ -288,7 +289,7 @@ def _required_participants(
 
 def _bind_operation(
     operation: LogicalTransferOperation,
-    source: Union[BoundWeightFragment, StoredFragment],
+    source: Union[BoundWeightFragment, StoredFragmentSnapshot],
     target: BoundWeightFragment,
 ) -> ExecutableTransferOperation:
     """Rebuild a logical value object with the bound execution fragments."""
@@ -314,6 +315,8 @@ def _build_executor_plans(
     placements: Sequence[WeightPlacementManifest],
     bindings: Sequence[WeightRuntimeBindingManifest],
     side: str,
+    *,
+    selected_fragment_ids: frozenset[RuntimeFragmentId] | None = None,
 ) -> tuple[ExecutorTransferPlan, ...]:
     if side not in ("source", "target"):
         raise ValueError(f"invalid executor side: {side}")
@@ -325,6 +328,7 @@ def _build_executor_plans(
 
     result: list[ExecutorTransferPlan] = []
     executor_keys: set[tuple[ParallelRank, str]] = set()
+    observed_selected_fragment_ids: set[RuntimeFragmentId] = set()
     for placement in placements:
         for part in placement.parts:
             binding = binding_by_participant.get(
@@ -355,6 +359,11 @@ def _build_executor_plans(
                     attestation=attestation,
                 )
                 for placement_fragment in part.fragments
+                if selected_fragment_ids is None
+                or runtime_by_placement_fragment_id[
+                    placement_fragment.placement_fragment_id
+                ].fragment_id
+                in selected_fragment_ids
             ]
             fragments_by_worker: dict[str, list[BoundWeightFragment]] = {}
             for fragment in fragments:
@@ -373,6 +382,7 @@ def _build_executor_plans(
                 fragment_ids = tuple(
                     fragment.fragment_id for fragment in ordered_fragments
                 )
+                observed_selected_fragment_ids.update(fragment_ids)
                 result.append(
                     ExecutorTransferPlan(
                         instance_id=binding.instance_id,
@@ -383,8 +393,8 @@ def _build_executor_plans(
                         worker_id=worker_id,
                         rank=part.rank,
                         fragment_ids=fragment_ids,
-                        fragment_leases=tuple(
-                            RuntimeLeaseSnapshot.from_fragment(fragment)
+                        fragment_snapshots=tuple(
+                            RuntimeFragmentSnapshot.from_fragment(fragment)
                             for fragment in ordered_fragments
                         ),
                         attestation=attestation,
@@ -393,7 +403,25 @@ def _build_executor_plans(
     result.sort(
         key=lambda item: (item.rank.dp, item.rank.pp, item.rank.ep, item.rank.tp)
     )
+    if selected_fragment_ids is not None and observed_selected_fragment_ids != set(
+        selected_fragment_ids
+    ):
+        raise ValueError(f"missing selected {side} runtime fragment")
     return tuple(result)
+
+
+def _selected_runtime_fragment_ids(
+    operations: Sequence[ExecutableTransferOperation],
+    side: str,
+) -> frozenset[RuntimeFragmentId]:
+    if side not in ("source", "target"):
+        raise ValueError(f"invalid executor side: {side}")
+    selected: set[RuntimeFragmentId] = set()
+    for operation in operations:
+        fragment = operation.source if side == "source" else operation.target
+        if isinstance(fragment, BoundWeightFragment):
+            selected.add(fragment.fragment_id)
+    return frozenset(selected)
 
 
 def bind_logical_transfer_plan(
@@ -433,7 +461,6 @@ def bind_logical_transfer_plan(
         source_bindings,
         "source",
         source_required,
-        retain_unselected=True,
     )
     runtime_targets = _bound_fragments_by_placement_fragment_id(
         (logical_plan.target_placement,),
@@ -473,7 +500,7 @@ def bind_logical_transfer_plan(
                     "missing source runtime binding for placement fragment: "
                     f"{placement_source.placement_fragment_id}"
                 )
-        elif isinstance(placement_source, StoredFragment):
+        elif isinstance(placement_source, StoredFragmentSnapshot):
             runtime_source = placement_source
         else:
             raise ValueError("logical transfer operation source is runtime-bound")
@@ -483,7 +510,10 @@ def bind_logical_transfer_plan(
     # share an allocation only after the target-range validator proves the same
     # complete alias group and attested lease scope.
     bound_operations = tuple(operations)
-    _validate_target_physical_ranges(bound_operations)
+    _validate_target_physical_ranges(
+        bound_operations,
+        max_segment_checks=logical_plan.planning_limits.max_total_lowered_segments,
+    )
     target_binding_values = tuple(target_binding_by_id.values())
     source_binding_values = tuple(source_binding_by_id.values())
     source_placements: tuple[WeightPlacementManifest, ...] = ()
@@ -500,12 +530,17 @@ def bind_logical_transfer_plan(
         target_placement=logical_plan.target_placement,
         operations=bound_operations,
         planning_limits=logical_plan.planning_limits,
+        source_manifest=authoritative_source_manifest,
         source_manifest_identity=logical_plan.source_manifest_identity,
         source_executors=(
             _build_executor_plans(
                 source_placements,
                 source_binding_values,
                 "source",
+                selected_fragment_ids=_selected_runtime_fragment_ids(
+                    bound_operations,
+                    "source",
+                ),
             )
             if source_binding_values
             else ()
@@ -514,6 +549,10 @@ def bind_logical_transfer_plan(
             (logical_plan.target_placement,),
             target_binding_values,
             "target",
+            selected_fragment_ids=_selected_runtime_fragment_ids(
+                bound_operations,
+                "target",
+            ),
         ),
     )
 
@@ -551,6 +590,11 @@ def resolve_executor_plans(
         (placement,),
         (binding,),
         side,
+        selected_fragment_ids=frozenset(
+            fragment_id
+            for executor in expected_executors
+            for fragment_id in executor.fragment_ids
+        ),
     )
     executor_keys = [
         (executor.rank, executor.worker_id) for executor in expected_executors

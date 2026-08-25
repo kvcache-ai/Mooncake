@@ -8,7 +8,7 @@ from .binding import (
     resolve_executor_plan,
     resolve_executor_plans,
 )
-from .bound_contracts import ExecutorTransferPlan, RuntimeLeaseSnapshot, TransferPlan
+from .bound_contracts import ExecutorTransferPlan, RuntimeFragmentSnapshot, TransferPlan
 from .contracts import (
     BoundWeightFragment,
     ExecutableTransferOperation,
@@ -21,7 +21,7 @@ from .contracts import (
     StoredLoadOperation,
     TransferRegion,
 )
-from .attestation import RuntimeBindingAttestation
+from .attestation import RuntimeBindingAttestation, RuntimeBindingEvidence
 from .ownership import (
     complete_parallel_source_replicas,
     parallel_tensor_owner,
@@ -38,8 +38,9 @@ __all__ = [
     "LogicalTransferOperation",
     "PipelineRouteGroup",
     "PlacementExecutorPlan",
-    "RuntimeLeaseSnapshot",
+    "RuntimeFragmentSnapshot",
     "RuntimeBindingAttestation",
+    "RuntimeBindingEvidence",
     "StoredLoadOperation",
     "TransferPlan",
     "TransferRegion",
