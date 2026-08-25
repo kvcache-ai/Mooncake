@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <unordered_set>
+#include <random>
 
 #include <ylt/struct_pb.hpp>
 
@@ -1689,7 +1690,8 @@ void StorageBackendAdaptor::RemoveAll() {
 BucketIdGenerator::BucketIdGenerator(int64_t start) {
     if (start <= 0) {
         auto cur_time_stamp = time_gen();
-        current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) | SEQUENCE_ID_SHIFT;
+        current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) |
+                      GenerateBucketIdEntropySeed();
     } else {
         current_id_ = start;
     }
@@ -1701,6 +1703,47 @@ int64_t BucketIdGenerator::NextId() {
 
 int64_t BucketIdGenerator::CurrentId() {
     return current_id_.load(std::memory_order_relaxed);
+}
+
+// Generate a per-client entropy seed for the fresh-start bucket id.
+//
+// A fresh seed is (time_gen() << TIMESTAMP_SHIFT) | SEQUENCE_ID_SHIFT, which
+// carries NO client entropy: the low sequence bits are 0 and the timestamp
+// has whole-second granularity. Multiple clients that construct their
+// BucketIdGenerator within the same second therefore seed the IDENTICAL value
+// and produce the IDENTICAL id sequence, so their bucket files
+// (<storage_path>/<bucket_id>.bucket) collide. The write path opens the file
+// with O_CREAT|O_TRUNC (no O_EXCL), so a later client silently truncates an
+// earlier client's bucket: keys stay registered (visible via get_all_keys /
+// IsExist) but reads return empty. See kvcache-ai/Mooncake#3528.
+//
+// Fold a per-process unique nonce into the low sequence bits so two clients
+// starting in the same second get different sequences and their files never
+// overlap. The high timestamp bits are preserved, so monotonicity and the
+// "last used bucket id" recovery order are unchanged.
+int64_t GenerateBucketIdEntropySeed() {
+    // Per-process unique nonce: random_device + pid + ASLR address.
+    // random_device can be deterministic on some hosts (containers without
+    // /dev/urandom); getpid() is only unique at process start; the stack
+    // address reliably differs across processes even if both are weak.
+    static const uint64_t process_nonce = [] {
+        uint64_t r = 0;
+        try {
+            std::random_device rd;
+            r = static_cast<uint64_t>(rd()) << 32 | rd();
+        } catch (...) {}
+        r ^= static_cast<uint64_t>(getpid());
+        volatile char stack_marker;
+        r ^= reinterpret_cast<uint64_t>(&stack_marker);
+        return r | 1;  // force non-zero
+    }();
+    // Monotonic counter ensures two calls within the same process also diverge.
+    // Use addition (not XOR) so process_nonce==1 + counter==1 gives 2, not 0.
+    static std::atomic<uint64_t> counter{0};
+    uint64_t seq = process_nonce +
+                   (counter.fetch_add(1, std::memory_order_relaxed) + 1);
+    // Fold into the sequence field only; high timestamp bits are unaffected.
+    return static_cast<int64_t>(seq & SEQUENCE_MASK);
 }
 
 BucketStorageBackend::BucketStorageBackend(

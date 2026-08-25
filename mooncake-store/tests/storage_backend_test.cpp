@@ -572,12 +572,41 @@ TEST_F(StorageBackendTest, InitializeWithValidStart) {
 }
 
 TEST_F(StorageBackendTest, InitializeWithInvalidStart_UseTimestampFallback) {
+    // A fresh seed keeps the high timestamp bits (so ids stay monotonic and
+    // "last used bucket id" recovery order is unchanged) but folds in
+    // per-client entropy instead of forcing the low sequence bits to 0.
+    // Previously every client starting in the same second seeded the identical
+    // value, producing identical id sequences and colliding bucket files
+    // (silent truncation via O_CREAT|O_TRUNC). See #3528.
     auto time = time_gen();
-    int64_t expected = (time << 12) | 0;
     BucketIdGenerator gen(
         BucketIdGenerator::INIT_NEW_START_ID);  // invalid start
-    LOG(INFO) << "expected is: " << expected << " gen is: " << gen.CurrentId();
-    EXPECT_TRUE(expected <= gen.CurrentId());
+    int64_t id = gen.CurrentId();
+    LOG(INFO) << "time_gen is: " << time << " gen is: " << id;
+    // High bits carry the (whole-second) timestamp.
+    EXPECT_GE(id, time << 12);
+    // Low 12 bits are no longer forced to 0: entropy was folded in.
+    EXPECT_NE(id & 0xFFF, 0);
+}
+
+TEST_F(StorageBackendTest, FreshStartSeedsDivergeAcrossClients) {
+    // Regression for #3528: two clients that construct their BucketIdGenerator
+    // in the same second must NOT seed the same value, otherwise they emit the
+    // same id sequence and silently overwrite each other's bucket files. The
+    // old seed was (time_gen() << 12) | 0, identical for every client in the
+    // same second; the entropy-augmented seed must diverge.
+    BucketIdGenerator client_a(BucketIdGenerator::INIT_NEW_START_ID);
+    BucketIdGenerator client_b(BucketIdGenerator::INIT_NEW_START_ID);
+
+    // The seeded ids differ...
+    EXPECT_NE(client_a.CurrentId(), client_b.CurrentId());
+    // ...and the full id sequences diverge, not just the first value.
+    EXPECT_NE(client_a.NextId(), client_b.NextId());
+
+    // Both still carry the high timestamp bits (monotonicity / recovery order).
+    const auto time = time_gen();
+    EXPECT_GE(client_a.CurrentId(), time << 12);
+    EXPECT_GE(client_b.CurrentId(), time << 12);
 }
 
 TEST_F(StorageBackendTest, NextIdReturnsNewValue) {
