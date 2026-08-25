@@ -104,8 +104,8 @@ static int GetSpdkNofMaxQueueDepth() {
         errno = 0;
         char* end = nullptr;
         long parsed = std::strtol(raw, &end, 10);
-        if (errno != 0 || end == raw || (end && *end != '\0') ||
-            parsed < 0 || parsed > 4096)
+        if (errno != 0 || end == raw || (end && *end != '\0') || parsed < 0 ||
+            parsed > 4096)
             return 256;
         return static_cast<int>(parsed);
     }();

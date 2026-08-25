@@ -831,19 +831,19 @@ TEST_F(RDMAEndpointReestablishTest,
 namespace mooncake {
 class RdmaEndPointTestPeer {
    public:
-    static void addDummyQp(RdmaEndPoint &endpoint, ibv_qp *qp) {
+    static void addDummyQp(RdmaEndPoint& endpoint, ibv_qp* qp) {
         endpoint.qp_list_.push_back(qp);
     }
 
-    static void clearDummyQp(RdmaEndPoint &endpoint) {
+    static void clearDummyQp(RdmaEndPoint& endpoint) {
         endpoint.qp_list_.clear();
     }
 
-    static int doSetupConnection(RdmaEndPoint &endpoint, int qp_index,
-                                 const ibv_gid &peer_gid, uint16_t peer_lid,
+    static int doSetupConnection(RdmaEndPoint& endpoint, int qp_index,
+                                 const ibv_gid& peer_gid, uint16_t peer_lid,
                                  uint32_t peer_qp_num, int local_gid_index,
-                                 std::string *reply_msg,
-                                 int &out_stage, int &out_sys_errno) {
+                                 std::string* reply_msg, int& out_stage,
+                                 int& out_sys_errno) {
         RdmaEndPoint::SetupConnectionFailureInfo failure_info = {};
         int rc = endpoint.doSetupConnection(qp_index, peer_gid, peer_lid,
                                             peer_qp_num, local_gid_index,
@@ -854,10 +854,11 @@ class RdmaEndPointTestPeer {
     }
 
     static int getResetStageValue() {
-        return static_cast<int>(RdmaEndPoint::SetupConnectionFailureStage::kReset);
+        return static_cast<int>(
+            RdmaEndPoint::SetupConnectionFailureStage::kReset);
     }
 };
-}
+}  // namespace mooncake
 
 extern std::atomic<int> g_inject_modify_qp_error;
 
@@ -893,7 +894,9 @@ TEST(RDMAEndpointSetupErrorTest, VerifyVerbsErrorCorrectlyCaptured) {
     EXPECT_EQ(rc, ERR_ENDPOINT);
     EXPECT_EQ(stage, mooncake::RdmaEndPointTestPeer::getResetStageValue());
     EXPECT_EQ(sys_errno, EINVAL);
-    EXPECT_TRUE(reply_msg.find("EINVAL") != std::string::npos || reply_msg.find("Invalid argument") != std::string::npos || reply_msg.find("22") != std::string::npos);
+    EXPECT_TRUE(reply_msg.find("EINVAL") != std::string::npos ||
+                reply_msg.find("Invalid argument") != std::string::npos ||
+                reply_msg.find("22") != std::string::npos);
 }
 
 }  // namespace

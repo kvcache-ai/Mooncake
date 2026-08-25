@@ -56,20 +56,23 @@ struct NofConfig {
     // Minimum acceptable I/O qpair count.  Even when the target QID pool is
     // nearly exhausted, the connection will succeed as long as at least this
     // many qpairs can be allocated.
-    // Default 1 = extreme degradation mode (1 qpair still works, lower throughput).
-    // Env var: MC_NVME_MIN_IO_QUEUES, valid range [1, num_io_queues].
+    // Default 1 = extreme degradation mode (1 qpair still works, lower
+    // throughput). Env var: MC_NVME_MIN_IO_QUEUES, valid range [1,
+    // num_io_queues].
     uint32_t min_io_queues = 1;
 
     // Maximum retries on allocation failure.  Retry interval grows
     // exponentially (retry_backoff_ms * 2^attempt).
     // Default 5 = max ~3100 ms total backoff (100+200+400+800+1600 ms).
-    // Covers a typical keep-alive reclamation window (MC_NVME_KEEP_ALIVE_TIMEOUT_MS=2000).
-    // Env var: MC_NVME_RETRY_MAX_ATTEMPTS, valid range [0, 10].
+    // Covers a typical keep-alive reclamation window
+    // (MC_NVME_KEEP_ALIVE_TIMEOUT_MS=2000). Env var:
+    // MC_NVME_RETRY_MAX_ATTEMPTS, valid range [0, 10].
     uint32_t retry_max_attempts = 5;
 
-    // Base retry backoff interval in ms.  Actual = retry_backoff_ms * (1 << attempt).
-    // Default 100 ms → total backoff ~3.1 s, ample opportunity after keep-alive 2 s window.
-    // Env var: MC_NVME_RETRY_BACKOFF_MS, valid range [10, 5000].
+    // Base retry backoff interval in ms.  Actual = retry_backoff_ms * (1 <<
+    // attempt). Default 100 ms → total backoff ~3.1 s, ample opportunity after
+    // keep-alive 2 s window. Env var: MC_NVME_RETRY_BACKOFF_MS, valid range
+    // [10, 5000].
     uint32_t retry_backoff_ms = 100;
 
     // Enable adaptive degradation.  When disabled, Connect() falls back to

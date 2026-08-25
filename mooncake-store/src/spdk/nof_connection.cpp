@@ -267,9 +267,8 @@ NofConnection::~NofConnection() {
 // static
 std::unique_ptr<NofConnection> NofConnection::Connect(
     const std::string &traddr, const std::string &trsvcid,
-    const std::string &subnqn, uint32_t ns_id,
-    spdk_nvme_transport_type trtype, const NofConfig &config,
-    std::string *error_msg) {
+    const std::string &subnqn, uint32_t ns_id, spdk_nvme_transport_type trtype,
+    const NofConfig &config, std::string *error_msg) {
     // Build transport ID
     struct spdk_nvme_transport_id trid;
     std::memset(&trid, 0, sizeof(trid));
@@ -394,8 +393,8 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
             }
         }
         LOG(ERROR) << "[NofConnection] QID exhaustion: " << partial_count
-                   << " qpairs for " << subnqn
-                   << " (target=" << requested << ", min=" << min_required
+                   << " qpairs for " << subnqn << " (target=" << requested
+                   << ", min=" << min_required
                    << ") — target QID pool likely exhausted";
         spdk_nvme_detach(ctx.ctrlr);
         return nullptr;
@@ -443,8 +442,7 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
         spdk_trtype = SPDK_NVME_TRANSPORT_RDMA;
     }
 
-    return Connect(traddr, trsvcid, subnqn, ns, spdk_trtype, config,
-                   error_msg);
+    return Connect(traddr, trsvcid, subnqn, ns, spdk_trtype, config, error_msg);
 }
 
 }  // namespace mooncake

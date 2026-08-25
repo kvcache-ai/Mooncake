@@ -105,9 +105,8 @@ void SpdkWrapper::Cleanup() {
             std::lock_guard<std::mutex> lock(segments_mutex_);
             for (auto &[handle, conn] : open_segments_) {
                 if (handle) {
-                    delete handle
-                        ->segment;  // Allocated by OpenNofSegment
-                    delete handle;  // Allocated by OpenNofSegment
+                    delete handle->segment;  // Allocated by OpenNofSegment
+                    delete handle;           // Allocated by OpenNofSegment
                 }
                 // conn (unique_ptr<NofConnection>) auto-destructs,
                 // freeing the qpair pool and detaching the ctrlr.
@@ -377,8 +376,8 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         // Exponential backoff capped at 30 s to prevent unbounded
         // blocking under extreme config values (retry_max_attempts=10,
         // retry_backoff_ms=5000 → uncapped total ~85 min).
-        auto wait_ms = std::min(
-            config_.retry_backoff_ms * (1u << attempt), 30000u);
+        auto wait_ms =
+            std::min(config_.retry_backoff_ms * (1u << attempt), 30000u);
         LOG(WARNING) << "SpdkWrapper::OpenNofSegment: QID exhausted"
                      << " (target=" << current_target << "), waiting "
                      << wait_ms << "ms"
@@ -403,8 +402,8 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
     // failure) does not leak the segment.
     auto segment = std::unique_ptr<NofSegment>(
         new NofSegment(conn.get(), 0, conn->GetNumBlocks()));
-    auto handle = std::unique_ptr<nof_seg_handle>(
-        new nof_seg_handle{segment.get()});
+    auto handle =
+        std::unique_ptr<nof_seg_handle>(new nof_seg_handle{segment.get()});
 
     {
         std::lock_guard<std::mutex> lock(segments_mutex_);
