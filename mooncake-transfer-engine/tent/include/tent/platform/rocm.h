@@ -115,7 +115,7 @@ class RocmPlatform : public Platform {
     virtual const std::vector<RangeLocation> getLocation(
         void* start, size_t len, bool skip_prefault = false);
 
-    virtual const std::string type() const { return "rocm"; }
+    virtual const std::string type() const { return kAmdGpuLocationType; }
 
     Status getStreamFromPool(HIPStreamHandle& outHandle,
                              int deviceId = HIPStreamPool::kCurrentDevice);
