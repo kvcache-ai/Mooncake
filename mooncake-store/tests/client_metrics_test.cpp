@@ -14,6 +14,7 @@
 #include "real_client.h"
 #include "test_server_helpers.h"
 #include "utils.h"
+#include "version.h"
 
 namespace mooncake::test {
 namespace {
@@ -262,6 +263,20 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
                 summary.find("No data") != std::string::npos);
 }
 
+TEST_F(ClientMetricsTest, MetricsIncludeVersionInfo) {
+    ClientMetric metrics;
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_NE(serialized.find("mooncake_client_version_info{version=\"" +
+                              std::string(MOONCAKE_DISPLAY_VERSION) + "\"} 1"),
+              std::string::npos);
+
+    std::string summary = metrics.summary_metrics();
+    EXPECT_NE(summary.find(std::string("Version: ") + MOONCAKE_DISPLAY_VERSION),
+              std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, HybridHistogramSerializesEachLabelOnce) {
     ylt::metric::hybrid_histogram_1t histogram(
         "request_latency", "Request latency", {10.0, 20.0}, {}, {"route"});
@@ -437,11 +452,28 @@ TEST_F(ClientMetricsTest, HttpMetricsEndpointsReturnData) {
         FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/metrics");
     EXPECT_EQ(metrics.status, 200);
     EXPECT_EQ(metrics.body.find("metrics not available"), std::string::npos);
+    // The client attaches extra static labels (e.g. client_mode), so only
+    // check for the metric name and the version label.
+    EXPECT_NE(metrics.body.find("mooncake_client_version_info{"),
+              std::string::npos);
+    EXPECT_NE(metrics.body.find("version=\"" +
+                                std::string(MOONCAKE_DISPLAY_VERSION) + "\""),
+              std::string::npos);
 
     auto summary = FetchUrl("http://127.0.0.1:" + std::to_string(http_port) +
                             "/metrics/summary");
     EXPECT_EQ(summary.status, 200);
     EXPECT_NE(summary.body.find("Client Metrics Summary"), std::string::npos);
+    EXPECT_NE(
+        summary.body.find(std::string("Version: ") + MOONCAKE_DISPLAY_VERSION),
+        std::string::npos);
+
+    auto version =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/version");
+    EXPECT_EQ(version.status, 200);
+    EXPECT_NE(version.body.find("{\"version\":\"" +
+                                std::string(MOONCAKE_DISPLAY_VERSION) + "\"}"),
+              std::string::npos);
 
     EXPECT_EQ(client->tearDownAll(), 0);
 }

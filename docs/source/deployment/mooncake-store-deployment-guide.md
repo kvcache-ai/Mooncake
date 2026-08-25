@@ -947,7 +947,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `enable_ssd_offload` | bool | `false` | *(advanced)* Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
 | `ssd_offload_path` | str | empty | *(advanced)* FileStorage path; with the distributed backend, DFS data uses `MOONCAKE_DFS_ROOT_DIR` |
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
-| `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
 
 ```{note}
@@ -978,7 +978,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; DFS shard data uses `MOONCAKE_DFS_ROOT_DIR` with the distributed backend |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
-| `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
 
@@ -1047,7 +1047,7 @@ mooncake_client \
 | `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
-| `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |
 
 ### Client HTTP Health and Metrics Endpoint
@@ -1075,6 +1075,7 @@ For `mooncake_store_service`, use `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER=true` and 
 | `GET /health` | Client health check |
 | `GET /metrics` | Prometheus-format client metrics |
 | `GET /metrics/summary` | Human-readable client metrics summary |
+| `GET /version` | Client version, JSON `{"version":"..."}` |
 
 ```{note}
 `MC_STORE_CLIENT_METRIC` controls whether client metrics are collected. If the client HTTP server is enabled but `MC_STORE_CLIENT_METRIC=0`, `/metrics` and `/metrics/summary` return HTTP 503 with `metrics not available`.

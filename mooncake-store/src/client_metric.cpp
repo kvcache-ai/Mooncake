@@ -7,10 +7,17 @@
 
 #include "bool_parser.h"
 #include "integer_parser.h"
+#include "version.h"
 
 namespace mooncake {
 
 namespace {
+
+std::map<std::string, std::string> withVersionLabel(
+    std::map<std::string, std::string> labels) {
+    labels.emplace("version", MOONCAKE_DISPLAY_VERSION);
+    return labels;
+}
 
 bool parseMetricsEnabled() {
     const char* metric_env = std::getenv("MC_STORE_CLIENT_METRIC");
@@ -71,6 +78,9 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       master_client_metric(labels),
       transfer_operation_metric(labels),
       ssd_metric(labels),
+      version_info("mooncake_client_version_info",
+                   "Mooncake store client version information",
+                   withVersionLabel(labels)),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds),
       bandwidth_reporting_enabled_(bandwidth_reporting_enabled),
@@ -79,6 +89,8 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
         static_cast<uint64_t>(transfer_metric.total_read_bytes.value()),
         static_cast<uint64_t>(transfer_metric.total_write_bytes.value()),
         std::chrono::steady_clock::now()};
+    // Constant value 1; the payload is the "version" label.
+    version_info.update(1);
     if (metrics_interval_seconds_ > 0) {
         StartMetricsReportingThread();
     }
@@ -110,6 +122,7 @@ std::unique_ptr<ClientMetric> ClientMetric::Create(
 }
 
 void ClientMetric::serialize(std::string& str) {
+    version_info.serialize(str);
     transfer_metric.serialize(str);
     if (master_rpc_metrics_enabled_) {
         master_client_metric.serialize(str);
@@ -121,6 +134,7 @@ void ClientMetric::serialize(std::string& str) {
 std::string ClientMetric::summary_metrics() {
     std::stringstream ss;
     ss << "Client Metrics Summary\n";
+    ss << "Version: " << MOONCAKE_DISPLAY_VERSION << "\n";
     ss << transfer_metric.summary_metrics(bandwidth_reporting_enabled_);
     ss << "\n";
     if (master_rpc_metrics_enabled_) {

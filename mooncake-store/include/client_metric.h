@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 #include <ylt/metric/counter.hpp>
+#include <ylt/metric/gauge.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
 #include "environ.h"
@@ -658,6 +659,10 @@ struct ClientMetric {
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
+    // Constant gauge carrying the client version as a label, following the
+    // Prometheus "info metric" convention:
+    //   mooncake_client_version_info{version="..."} 1
+    ylt::metric::gauge_t version_info;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables

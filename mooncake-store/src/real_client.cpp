@@ -29,6 +29,7 @@
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
+#include "version.h"
 #include "rpc_types.h"
 #include "file_storage.h"
 #include "device/accelerator_registry.h"
@@ -1924,6 +1925,14 @@ int RealClient::start_http_server(int port) {
             }
             resp.add_header("Content-Type", "text/plain");
             resp.set_status_and_content(status_type::ok, std::move(*result));
+        });
+
+    http_server_->set_http_handler<GET>(
+        "/version", [](coro_http_request &req, coro_http_response &resp) {
+            std::string body = std::string("{\"version\":\"") +
+                               MOONCAKE_DISPLAY_VERSION + "\"}";
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(status_type::ok, std::move(body));
         });
 
     auto ec = http_server_->async_start();

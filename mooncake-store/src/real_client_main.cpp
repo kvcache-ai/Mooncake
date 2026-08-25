@@ -6,6 +6,7 @@
 #include "common.h"
 #include "config.h"
 #include "real_client.h"
+#include "version.h"
 
 using namespace mooncake;
 
@@ -110,6 +111,7 @@ int main(int argc, char *argv[]) {
     // spawning threads, leading to missing signal processing.
     mooncake::ResourceTracker::getInstance();
 
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);
