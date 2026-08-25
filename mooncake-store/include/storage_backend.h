@@ -1174,7 +1174,15 @@ class BucketStorageBackend : public StorageBackendInterface {
         return lru_index_.size();
     }
 
+    // Test-only: inject datasync failure in WriteBucket to verify orphan
+    // cleanup. SetDatasyncFailureForTest(true) makes WriteBucket fail its
+    // datasync call and immediately call CleanupOrphanedBucket.
+    void SetDatasyncFailureForTest(bool enabled) {
+        test_datasync_failure_.store(enabled, std::memory_order_relaxed);
+    }
+
    private:
+    std::atomic<bool> test_datasync_failure_{false};
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
@@ -1693,10 +1701,6 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     std::atomic<int> test_metadata_write_failure_step_{0};
     // Skip the destructor's final checkpoint (simulates an abrupt crash).
     std::atomic<bool> test_skip_final_checkpoint_{false};
-    // When true, BucketStorageBackend::WriteBucket will inject a datasync
-    // failure on the newly written .bucket file, then call
-    // CleanupOrphanedBucket to verify the orphan file is removed.
-    std::atomic<bool> test_datasync_failure_{false};
 
    public:
     // ---- Test accessors ----
@@ -1705,9 +1709,6 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     }
     void SetSkipFinalCheckpointForTest() {
         test_skip_final_checkpoint_.store(true, std::memory_order_relaxed);
-    }
-    void SetDatasyncFailureForTest(bool enabled) {
-        test_datasync_failure_.store(enabled, std::memory_order_relaxed);
     }
     size_t GetAllEvictedThisBatchSizeForTest() const {
         return all_evicted_this_batch_.size();
