@@ -11,10 +11,8 @@ repository directly from GitHub or from checked-out source tree.
 
 ```
 cd /workspaces/Mooncake
-mkdir build
-cd build
-cmake .. -DUSE_ETCD=OFF -DUSE_HTTP=ON
-make -j`nproc` VERBOSE=1
+cmake -B build -G Ninja -DUSE_ETCD=OFF -DUSE_HTTP=ON
+cmake --build build
 ```
 
 ### Test
@@ -29,6 +27,6 @@ go run . --addr=:8090
 2. run tests
 
 ```
-cd /workspaces/Mooncake/build
-MC_METADATA_SERVER=http://127.0.0.1:8090/metadata make test -j ARGS="-V"
+cd /workspaces/Mooncake/
+MC_METADATA_SERVER=http://127.0.0.1:8090/metadata cmake --build build --target test
 ```
