@@ -567,8 +567,8 @@ Status RdmaTransport::submitTransferTasks(
                              << ", canceling task " << rejected_task;
                 workers_->cancel(rejected_task);
                 return Status::TooManyRequests(
-                    "Initial slice submit rejected (worker queue full)"
-                    LOC_MARK);
+                    "Initial slice submit rejected (worker queue "
+                    "full)" LOC_MARK);
             }
         }
     }
