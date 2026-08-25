@@ -138,7 +138,7 @@ jobs:
           PYV_NODOT=$(echo "${{ matrix.python-version }}" | tr -d '.')
           PYBIN="/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin"
           echo "$PYBIN" >> "$GITHUB_PATH"
-          "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
+          "$PYBIN/pip" install --quiet cmake ninja setuptools wheel
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -170,12 +170,10 @@ jobs:
             $SUDO apt-get update -y || true
           fi
           $SUDO bash -x dependencies.sh -y
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
-          mkdir -p build && cd build
-          # Ninja is required: limit_jobs.cmake caps parallelism through Ninja
-          # job pools, which Make ignores (exit 137 on GitHub-hosted runners).
+          echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
+          ep=(); [ -n "$EP_TORCH_VERSIONS_INPUT" ] && ep=(-DEP_TORCH_VERSIONS="$EP_TORCH_VERSIONS_INPUT")
           # shellcheck disable=SC2086
-          cmake -G Ninja .. $CMAKE_ARGS -DPython3_EXECUTABLE="$(which python3)"
+          cmake -B build -G Ninja $CMAKE_ARGS "${ep[@]}" -DPython3_EXECUTABLE="$(which python3)"
 
       - name: Build project
         env:
@@ -187,9 +185,8 @@ jobs:
           done
           [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
           SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -E"
-          cd build
-          cmake --build . -j"$(nproc)"
-          $SUDO cmake --install .
+          cmake --build build
+          $SUDO cmake --install build
 
       - name: Build nvlink_allocator.so
         if: ${{ env.BUILD_NVLINK_ALLOCATOR == 'true' }}
