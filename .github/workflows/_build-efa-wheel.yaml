@@ -114,9 +114,8 @@ jobs:
           packages=(libfabric-dev libfabric1)
           sudo apt install -y "${packages[@]}"
           sudo bash -x dependencies.sh -y
-          if [ "$BUILD_PROFILE" = ci ]; then
-            df -h
-          fi
+          echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
+          df -h
         shell: bash
 
       - name: Configure project
