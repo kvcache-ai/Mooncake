@@ -5479,9 +5479,9 @@ std::vector<int> RealClient::batch_get_session_start(
         }
 
         const auto *replica =
-            SelectCompleteMemoryReplica(query_result.replicas, local_endpoints);
+            SelectBestReplica(query_result.replicas, local_endpoints);
         if (!replica) {
-            LOG(ERROR) << "No complete memory replica for key: " << keys[i];
+            LOG(ERROR) << "No complete replica for key: " << keys[i];
             results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             get_sessions_.erase(keys[i]);
             continue;
