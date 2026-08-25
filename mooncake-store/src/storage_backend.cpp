@@ -2665,9 +2665,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         // Flush bucket data to stable storage before writing metadata.
         // This prevents a crash from leaving valid metadata pointing at
         // incomplete data (write-ordering durability guarantee).
+        // Test-only: inject datasync failure to exercise the orphan-cleanup
+        // path (SetDatasyncFailureForTest(true) must have been called).
+        if (test_datasync_failure_.load(std::memory_order_relaxed)) {
+            LOG(ERROR) << "datasync failed for bucket: " << bucket_id
+                       << " (injected for regression test)";
+            CleanupOrphanedBucket(bucket_id);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
         auto sync_result = uring_file->datasync();
         if (!sync_result) {
             LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+            CleanupOrphanedBucket(bucket_id);
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
@@ -2705,9 +2714,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         // incomplete data (write-ordering durability guarantee).
         // OpenFile returns PosixFile for writes (UringFile is read-only),
         // so this datasync is the effective flush for the fallback path.
+        // Test-only: inject datasync failure to exercise the orphan-cleanup
+        // path (SetDatasyncFailureForTest(true) must have been called).
+        if (test_datasync_failure_.load(std::memory_order_relaxed)) {
+            LOG(ERROR) << "datasync failed for bucket: " << bucket_id
+                       << " (injected for regression test)";
+            CleanupOrphanedBucket(bucket_id);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
         auto sync_result = file->datasync();
         if (!sync_result) {
             LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+            CleanupOrphanedBucket(bucket_id);
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
     }
