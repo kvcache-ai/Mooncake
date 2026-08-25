@@ -419,7 +419,8 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
 
 std::optional<AllocationSizeProfile>
 OffsetBufferAllocator::getAllocationSizeProfile(size_t allocation_size) const {
-    if (replica_type_ != ReplicaType::MEMORY) {
+    if (replica_type_ != ReplicaType::MEMORY &&
+        replica_type_ != ReplicaType::NOF_SSD) {
         return std::nullopt;
     }
 

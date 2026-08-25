@@ -551,7 +551,7 @@ Valid values are: `random` (default), `free_ratio_first`, `size_class_aware`, `s
 |---|---|---|
 | `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
 | `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
-| `size_class_aware` | Mixed-size workloads using multiple memory segments with `OffsetAllocator` | Trades some utilization balance for lower cross-size fragmentation |
+| `size_class_aware` | Mixed-size workloads using multiple memory or NoF SSD segments with `OffsetAllocator` | Trades some utilization balance for lower cross-size fragmentation |
 | `ssd_free_ratio_first` | SSD-aware memory allocation when SSD offloading is enabled | Depends on SSD usage metrics; falls back to random allocation when needed |
 | `cxl` | CXL memory hardware | CXL-specific; single-replica only |
 | `local_first` | Colocated inference workers and memory store segments | Requires stable host identity in `local_hostname`; single memory replica only |
@@ -562,7 +562,7 @@ Valid values are: `random` (default), `free_ratio_first`, `size_class_aware`, `s
 - Segments have different capacities and you want even utilization ratios.
 - New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
 
-**Use `size_class_aware`** for mixed-size in-memory workloads backed by `OffsetAllocator`. It starts from free-ratio ranking and adds a bounded affinity bonus for segments already containing the requested logarithmic size class. Capacity therefore remains the primary signal, while the affinity nudges similarly utilized segments toward compatible allocation sizes. Failed allocations continue through the existing fallback path. The profile is rebuilt from live descriptors during snapshot recovery and is not persisted separately. Other replica and allocator types fall back to free-ratio ranking.
+**Use `size_class_aware`** for mixed-size memory or NoF SSD workloads backed by `OffsetAllocator`. It starts from free-ratio ranking and adds a bounded affinity bonus for segments already containing the requested logarithmic size class. Capacity therefore remains the primary signal, while the affinity nudges similarly utilized segments toward compatible allocation sizes. Failed allocations continue through the existing fallback path. The profile is rebuilt from live descriptors during snapshot recovery and is not persisted separately. Other replica and allocator types fall back to free-ratio ranking.
 
 **Use `ssd_free_ratio_first`** when SSD offloading is enabled and you want memory allocation to prefer segments whose backing SSD still has more free capacity.
 
@@ -603,7 +603,7 @@ The key insight behind Best-of-N is that if a new/empty segment is sampled, it w
 
 For every live allocation, `OffsetBufferAllocator` records the requested byte count in a logarithmic size class (`ceil(log2(size))`). Candidate ranking starts with each segment's free ratio and adds at most `0.1` according to the share of live bytes in the requested class. This bounded bonus avoids letting affinity override a materially emptier segment while still grouping compatible sizes when capacity is similar. The state remains dynamic: deleting allocations updates the profile immediately, while snapshot replay reconstructs it from live descriptors.
 
-The first implementation applies affinity only to `MEMORY` replicas managed by `OffsetBufferAllocator`. CacheLib, NoF SSD, CXL, local-disk, and DFS paths retain their existing placement behavior.
+The strategy applies affinity to `MEMORY` and NoF SSD replicas managed by `OffsetBufferAllocator`. Allocators without size-profile support, including CacheLib, retain free-ratio ranking; CXL, local-disk, and DFS paths retain their existing placement behavior.
 
 **`ssd_free_ratio_first` — SsdFreeRatioFirstAllocationStrategy**
 

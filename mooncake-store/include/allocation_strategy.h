@@ -567,16 +567,14 @@ class SizeClassAwareAllocationStrategy final : public RankedAllocationStrategy {
         return AllocateRanked(
             allocator_manager, slice_length, replica_num, preferred_segments,
             excluded_segments, replica_type, [&](const std::string& name) {
-                return GetSegmentScore(allocator_manager, name, slice_length,
-                                       replica_type);
+                return GetSegmentScore(allocator_manager, name, slice_length);
             });
     }
 
    private:
     static double GetSegmentScore(const AllocatorManager& allocator_manager,
                                   const std::string& name,
-                                  const size_t slice_length,
-                                  const ReplicaType replica_type) {
+                                  const size_t slice_length) {
         const auto* allocators = allocator_manager.getAllocators(name);
         if (!allocators || allocators->empty()) {
             return 0.0;
@@ -586,7 +584,7 @@ class SizeClassAwareAllocationStrategy final : public RankedAllocationStrategy {
         uint64_t total_free = 0;
         uint64_t total_live_bytes = 0;
         uint64_t matching_live_bytes = 0;
-        bool profile_supported = replica_type == ReplicaType::MEMORY;
+        bool profile_supported = true;
         for (const auto& allocator : *allocators) {
             if (!allocator) {
                 continue;

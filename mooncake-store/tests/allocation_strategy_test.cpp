@@ -798,6 +798,36 @@ TEST_F(AllocationStrategyTest, SizeClassAwareSpillsFromFullMatch) {
               "fallback");
 }
 
+TEST_F(AllocationStrategyTest, SizeClassAwareSupportsNofOffsetAllocator) {
+    constexpr size_t kSegmentSize = 64 * MiB;
+    constexpr size_t kRequestSize = 4 * MiB;
+    auto matching = std::make_shared<OffsetBufferAllocator>(
+        "nof-matching", 0x3b0000000ULL, kSegmentSize, "nof-matching",
+        ReplicaType::NOF_SSD);
+    auto mismatched = std::make_shared<OffsetBufferAllocator>(
+        "nof-mismatched", 0x3c0000000ULL, kSegmentSize, "nof-mismatched",
+        ReplicaType::NOF_SSD);
+    auto matching_seed = matching->allocate(kRequestSize);
+    auto mismatched_seed = mismatched->allocate(4 * 1024);
+    ASSERT_NE(matching_seed, nullptr);
+    ASSERT_NE(mismatched_seed, nullptr);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("nof-matching", matching);
+    allocator_manager.addAllocator("nof-mismatched", mismatched);
+
+    SizeClassAwareAllocationStrategy strategy;
+    auto result = strategy.Allocate(
+        allocator_manager, kRequestSize, 1, {}, {}, ReplicaType::NOF_SSD);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_nof_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "nof-matching");
+}
+
 TEST_F(AllocationStrategyTest, SizeClassAwareFallsBackForCachelib) {
     constexpr size_t kSegmentSize = 64 * MiB;
     auto fuller = std::make_shared<CachelibBufferAllocator>(
