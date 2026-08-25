@@ -43,7 +43,9 @@ def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
     smoke_script = f"""
 from importlib import metadata
 from pathlib import Path
+import sys
 import mooncake
+import mooncake.dataproto_catalog
 import mooncake.engine
 import mooncake.reshard
 import mooncake.store
@@ -53,7 +55,9 @@ repository_path = Path({str(REPOSITORY_ROOT)!r}).resolve()
 assert not package_path.is_relative_to(repository_path), (package_path, repository_path)
 assert metadata.version("mooncake-transfer-engine") == {_project_version()!r}
 assert mooncake.BufferPool is mooncake.store.BufferPool
+assert mooncake.dataproto_catalog.DataProtoCatalog is not None
 assert mooncake.engine.TransferEngine is not None
+assert "mooncake.structured_object_store" not in sys.modules
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],

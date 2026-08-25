@@ -22,7 +22,10 @@ install(
   COMPONENT python
   FILES_MATCHING
   PATTERN "*.py"
-  PATTERN "__init__.py" EXCLUDE)
+  PATTERN "__init__.py" EXCLUDE
+  # Migrated modules come from tool.scikit-build.wheel.packages. Exclude any
+  # stale file left by the transitional legacy wheel staging script.
+  PATTERN "dataproto_catalog.py" EXCLUDE)
 install(
   DIRECTORY
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-reshard/python/mooncake/reshard/"

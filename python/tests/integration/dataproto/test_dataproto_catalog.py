@@ -1,8 +1,40 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 import pytest
 
 from mooncake.dataproto_catalog import DataProtoCatalog
+
+
+def test_catalog_source_import_keeps_structured_object_import_lazy() -> None:
+    repository_root = Path(__file__).resolve().parents[4]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (
+            str(repository_root / "mooncake-wheel"),
+            str(repository_root / "python"),
+        )
+    )
+    environment["PYTHONNOUSERSITE"] = "1"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import mooncake.dataproto_catalog as catalog; "
+                "assert catalog.DataProtoCatalog is not None; "
+                "assert 'mooncake.structured_object_store' not in sys.modules"
+            ),
+        ],
+        cwd=repository_root,
+        env=environment,
+        check=True,
+    )
 
 
 def handle(name: str, fields: list[str], batch_size: int = 2) -> dict:
