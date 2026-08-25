@@ -24,6 +24,9 @@ install(
   PATTERN "*.py"
   PATTERN "__init__.py" EXCLUDE)
 if(WITH_EP)
+  # The JIT adapter sources remain authoritative under mooncake-pg/torch.
+  # Install them into the wheel only; do not mirror them under
+  # mooncake-wheel/mooncake in the source tree.
   install(
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/src/pg_py.cpp"

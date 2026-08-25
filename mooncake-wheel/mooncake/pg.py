@@ -21,7 +21,21 @@ _HEADER_NAMES = (
 
 
 def _source_dir() -> Path:
-    return Path(__file__).with_name("_pg_jit")
+    installed = Path(__file__).with_name("_pg_jit")
+    if installed.is_dir():
+        return installed
+    # In a source checkout, consume the authoritative adapter sources directly.
+    return Path(__file__).parents[2] / "mooncake-pg" / "torch"
+
+
+def _source_path(source_dir: Path, name: str) -> Path:
+    candidate = source_dir / name
+    if candidate.is_file():
+        return candidate
+    subdir = "src" if name.endswith(".cpp") else "include"
+    if name == "mooncake_pg.h":
+        return source_dir.parent.parent / "include" / name
+    return source_dir / subdir / name
 
 
 def _cache_root() -> Path:
@@ -41,7 +55,7 @@ def _cache_key(source_dir: Path, core_path: Path, build_path: str) -> str:
     digest.update(core_path.read_bytes())
     for name in (*_SOURCE_NAMES, *_HEADER_NAMES):
         digest.update(name.encode())
-        digest.update((source_dir / name).read_bytes())
+        digest.update(_source_path(source_dir, name).read_bytes())
     return digest.hexdigest()[:20]
 
 
@@ -62,14 +76,14 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
     verbose = os.environ.get("MOONCAKE_PG_JIT_VERBOSE", "0") == "1"
     return load(
         name="_mooncake_pg_jit_cuda",
-        sources=[str(source_dir / name) for name in _SOURCE_NAMES],
+        sources=[str(_source_path(source_dir, name)) for name in _SOURCE_NAMES],
         extra_cflags=[
             "-std=c++20",
             "-O3",
             "-g0",
             f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
         ],
-        extra_include_paths=[str(source_dir)],
+        extra_include_paths=[str(source_dir), str(source_dir / "include")],
         extra_ldflags=[
             f"-Wl,-rpath,{core_path.parent}",
             *[f"-Wl,-rpath,{path}" for path in library_paths()],
@@ -111,7 +125,7 @@ def _load_jit_adapter():
     missing = [
         str(source_dir / name)
         for name in (*_SOURCE_NAMES, *_HEADER_NAMES)
-        if not (source_dir / name).is_file()
+        if not _source_path(source_dir, name).is_file()
     ]
     if missing:
         raise ImportError(
