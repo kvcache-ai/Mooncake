@@ -504,6 +504,10 @@ PGResult<void> MooncakeCommunicator::initialize(
     if (active_ranks_mirror_ && active_ranks_mirror_is_device_) {
         PG_TRY(active_ranks_mirror_stream_,
                GpuStream::createNonBlocking(active_ranks_mirror_device_index_));
+        PG_TRY_CUDA(cudaHostAlloc(
+            reinterpret_cast<void**>(&active_ranks_mirror_staging_),
+            max_group_size_ * sizeof(*active_ranks_mirror_staging_),
+            cudaHostAllocPortable));
     }
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     if (!is_cpu_) {
@@ -512,12 +516,18 @@ PGResult<void> MooncakeCommunicator::initialize(
         PG_VALIDATE_STATE(context_.device_collective_workspace &&
                               context_.device_collective_strong_stream,
                           "device collective device resources are unavailable");
+        int32_t* control_update_active_ranks_mirror = nullptr;
+        if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
+            active_ranks_mirror_device_index_ == device_index_) {
+            control_update_active_ranks_mirror = active_ranks_mirror_;
+        }
         PG_TRY(device_collective_,
                DeviceCollectiveRuntime::create(
                    *context_.device_transfer_service,
                    *context_.device_collective_workspace,
                    *context_.device_collective_strong_stream, device_index_,
-                   rank_, max_group_size_, context_.collective_timeout_us));
+                   rank_, max_group_size_, control_update_active_ranks_mirror,
+                   context_.collective_timeout_us));
     }
 #endif
 
@@ -652,10 +662,13 @@ PGResult<void> MooncakeCommunicator::initialize(
                     meta_->rankEpochs[failed_global_rank];
                 agent_.pushLinkEvent(event);
 
-                PG_TRY(auto response, syncAfterFailure());
-                PG_ASSERT(response.status != SyncAfterFailureStatus::Rejected,
-                          "device collective recovery was rejected: " +
-                              response.reject_reason);
+                if (meta_->autoSyncOnFailure) {
+                    PG_TRY(auto response, syncAfterFailure());
+                    PG_ASSERT(
+                        response.status != SyncAfterFailureStatus::Rejected,
+                        "device collective recovery was rejected: " +
+                            response.reject_reason);
+                }
                 return {};
             }));
     }
@@ -1482,6 +1495,10 @@ PGResult<void> MooncakeCommunicator::shutdown() {
         meta_->activeRanksDevice = nullptr;
         meta_->maybeActivatable = nullptr;
     }
+    if (!has_hung_operation && active_ranks_mirror_staging_) {
+        cudaFreeHost(active_ranks_mirror_staging_);
+        active_ranks_mirror_staging_ = nullptr;
+    }
     // Prevent zombie P2PProxy workers from dereferencing this communicator
     // after destruction. Must happen after drainTasks so in-flight failures can
     // still be reported during shutdown.
@@ -1508,15 +1525,26 @@ PGResult<void> MooncakeCommunicator::syncActiveRanksMirror() const {
     if (!active_ranks_mirror_) return {};
     // The mirror is InGroupRank-indexed, in the same order as the caller-owned
     // storage.
-    auto active_ranks = getActiveRanks();
     const size_t bytes = max_group_size_ * sizeof(int32_t);
     if (active_ranks_mirror_is_device_) {
+        PG_VALIDATE_STATE(active_ranks_mirror_staging_ &&
+                              active_ranks_mirror_stream_.has_value(),
+                          "device active-ranks mirror staging is unavailable");
+        for (int index = 0; index < max_group_size_; ++index) {
+            active_ranks_mirror_staging_[index] =
+                meta_ && meta_->activeRanks && meta_->activeRanks[index] ? 1
+                                                                         : 0;
+        }
         PG_TRY(auto device_guard,
                GpuDeviceGuard::create(active_ranks_mirror_device_index_));
-        PG_TRY_CUDA(cudaMemcpyAsync(active_ranks_mirror_, active_ranks.data(),
-                                    bytes, cudaMemcpyHostToDevice,
-                                    active_ranks_mirror_stream_.value().get()));
+        PG_TRY_CUDA(cudaMemcpyAsync(
+            active_ranks_mirror_, active_ranks_mirror_staging_, bytes,
+            cudaMemcpyHostToDevice, active_ranks_mirror_stream_.value().get()));
+        // Outside same-device kernel recovery, complete this independent
+        // mirror stream before publishing the new GroupView epoch.
+        PG_TRY(active_ranks_mirror_stream_.value().synchronize());
     } else {
+        auto active_ranks = getActiveRanks();
         std::memcpy(active_ranks_mirror_, active_ranks.data(), bytes);
     }
     return {};
@@ -1682,10 +1710,13 @@ void MooncakeCommunicator::applyGroupState(
         next_mode = CollectiveExtensionState::Normal;
     }
 
-    // Only active GPU ranks execute the group decision. Initialization, CPU,
-    // inactive, and unresolved Bootstrapping views use Legacy.
+    // An isolated joiner uses the resolved group backend with a local-only
+    // Plan. This lets a CUDA Graph captured before activation keep the same
+    // kernel after activation; a later GroupView changes only the
+    // device-resident Plan.
     auto effective_gpu_collective_backend = GpuCollectiveBackend::Legacy;
-    if (!is_cpu_ && self_active && view.gpu_collective_backend.has_value()) {
+    if (!is_cpu_ && view.gpu_collective_backend.has_value() &&
+        (self_active || next_mode != CollectiveExtensionState::Normal)) {
         effective_gpu_collective_backend = *view.gpu_collective_backend;
     }
 
@@ -1786,19 +1817,35 @@ void MooncakeCommunicator::applyGroupState(
         meta_->maybeActivatable[i] = activatable[i];
     }
 
-    // Keep the caller-visible active-ranks mirror in sync with the view.
-    // FIXME: potential deadlock?
-    PG_ASSERT_OK(syncActiveRanksMirror());
-
     // Publish the rank-space extent after the corresponding data-plane state.
     // getSize() reads this from the application thread.
     meta_->activeSize.store(active_size, std::memory_order_release);
 
+    bool active_ranks_in_control_update = false;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     if (effective_gpu_collective_backend == GpuCollectiveBackend::New) {
-        PG_ASSERT_OK(device_collective_->applyGroupView(view));
+        if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
+            active_ranks_mirror_device_index_ == device_index_) {
+            active_ranks_in_control_update = true;
+        }
+        switch (next_mode) {
+            case CollectiveExtensionState::Isolated:
+            case CollectiveExtensionState::Quiescing:
+                PG_ASSERT_OK(device_collective_->useLocalOnly());
+                break;
+            case CollectiveExtensionState::Normal:
+                PG_ASSERT_OK(device_collective_->applyGroupView(view));
+                break;
+        }
     }
 #endif
+
+    // A same-device mirror must be copied by the control update. During
+    // recovery, even synchronizing an independent CUDA stream may lead to a
+    // deadlock. Host and cross-device mirrors retain their existing path.
+    if (!active_ranks_in_control_update) {
+        PG_ASSERT_OK(syncActiveRanksMirror());
+    }
 
     gpu_collective_backend_ = effective_gpu_collective_backend;
 

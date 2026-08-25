@@ -152,6 +152,7 @@ if(USE_CUDA)
       device_comm/device_collective/device_collective.cpp
       device_comm/device_collective/device_collective_workspace.cpp
       device_comm/device_collective/device_collective_recovery.cpp
+      device_comm/device_collective/device_control_update.cpp
       device_comm/device_collective/protocols/ring/ring_all_reduce.cpp
       device_comm/device_collective/strong_stream.cpp)
 endif()

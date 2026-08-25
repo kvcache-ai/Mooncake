@@ -1071,19 +1071,15 @@ def _manual_deactivate_recovery_worker(
         broken_exited.wait()
 
         # Round 2: rank died, auto_deactivate=False ==> activeRanks unchanged.
-        # local_success=False because the dead rank is still in the group.
-        expected_reduced = expected_all - (BROKEN_RANK + 1)
+        # local_success=False because the dead rank is still in the group. A
+        # failed collective does not promise valid output contents.
         tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
         work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
         work.wait()
-        assert int(tensor.cpu().item()) == expected_reduced
+        # Ring failure hints reflect each rank's local progress observation,
+        # so failed_ranks_hint is not required to agree across survivors.
         assert not pg.get_local_success(work), \
             f"rank {ctx.rank}: round 2 should detect broken rank"
-
-        failed_ranks_hint = pg.get_failed_ranks_hint(work)
-        expected_failed_ranks_hint = [0] * ctx.world_size
-        expected_failed_ranks_hint[BROKEN_RANK] = 1
-        assert failed_ranks_hint.tolist() == expected_failed_ranks_hint
 
         active_ranks = pg.get_active_ranks(backend)
         assert active_ranks.cpu().tolist() == [1] * ctx.world_size

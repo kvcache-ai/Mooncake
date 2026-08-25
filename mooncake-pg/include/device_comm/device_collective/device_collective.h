@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_H
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_H
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -23,17 +24,18 @@ class RingAllReduceProtocol;
 class StrongStream;
 
 // Protocol-independent lifecycle facade. It owns communicator invocation and
-// recovery state, stream ordering and graph references; the selected protocol
-// owns topology, publication, resource interpretation and kernel launch policy.
+// recovery state, stream ordering, control-update publication and graph
+// references; the selected protocol owns topology, resource interpretation
+// and kernel launch policy.
 class DeviceCollectiveRuntime {
    public:
-    using RecoveryHandler = std::function<PGResult<void>(InGroupRank)>;
+    using FailureRecoveryCallback = std::function<PGResult<void>(InGroupRank)>;
 
     static PGResult<std::unique_ptr<DeviceCollectiveRuntime>> create(
         DeviceTransferService& transfer_service,
         DeviceCollectiveWorkspace& workspace, StrongStream& strong_stream,
         int device_index, InGroupRank self_rank, uint32_t max_group_size,
-        size_t collective_timeout_us);
+        int32_t* active_ranks_mirror, size_t collective_timeout_us);
 
     ~DeviceCollectiveRuntime() noexcept;
 
@@ -46,7 +48,7 @@ class DeviceCollectiveRuntime {
     PGResult<void> applyGroupView(const GroupView& view);
 
     PGResult<void> enableRecovery(DeviceCollectiveRecoveryWorker& worker,
-                                  RecoveryHandler handler);
+                                  FailureRecoveryCallback callback);
 
     PGResult<void> enqueueAllReduce(const void* send_buffer, void* recv_buffer,
                                     size_t count, DataType datatype,
@@ -60,23 +62,30 @@ class DeviceCollectiveRuntime {
     friend class MooncakeCommunicator;
 
     DeviceCollectiveRuntime(DeviceTransferService& transfer_service,
-                            int device_index, StrongStream& strong_stream,
-                            GpuStream control_stream, GpuEvent handoff_event);
+                            int device_index, InGroupRank self_rank,
+                            uint32_t max_group_size,
+                            int32_t* active_ranks_mirror,
+                            StrongStream& strong_stream,
+                            GpuEvent handoff_event);
 
     PGResult<void> attachGraphUse(const GpuCaptureInfo& capture);
-    PGResult<void> recoverFailure();
+    PGResult<void> publishControlState(bool pinned = false);
+    PGResult<void> prepareFailureResume();
     void releaseState() noexcept;
 
     DeviceTransferService& transfer_service_;
     int device_index_ = -1;
+    InGroupRank self_rank_ = kInvalidInGroupRank;
     DeviceCollectiveInvocationState* invocation_state_ = nullptr;
     std::unique_ptr<RingAllReduceProtocol> all_reduce_;
     StrongStream& strong_stream_;
     DeviceCollectiveRecoveryMailbox* recovery_mailbox_ = nullptr;
-    RecoveryHandler recovery_handler_;
+    int32_t* active_ranks_mirror_ = nullptr;
+    size_t active_ranks_count_ = 0;
+    std::array<int32_t, kMaxNumRanks> host_active_ranks_{};
+    FailureRecoveryCallback failure_recovery_callback_;
     DeviceCollectiveRecoveryWorker* recovery_worker_ = nullptr;
 
-    GpuStream control_stream_;
     GpuEvent handoff_event_;
     mutable std::mutex mutex_;
     std::atomic<size_t> live_graph_uses_{0};

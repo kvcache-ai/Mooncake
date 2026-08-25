@@ -38,10 +38,12 @@ class DeviceCollectiveRecoveryWorker {
     friend class DeviceCollectiveRuntime;
 
     struct MailboxState;
-    using Handler = std::function<PGResult<void>()>;
+    // Called after the worker observes a new device failure. The callback must
+    // prepare and pin the control update that releases the parked CTA.
+    using PrepareResumeCallback = std::function<PGResult<void>()>;
 
     PGResult<void> addMailbox(DeviceCollectiveRecoveryMailbox* mailbox,
-                              Handler handler);
+                              PrepareResumeCallback prepare_resume);
     void removeMailbox(DeviceCollectiveRecoveryMailbox* mailbox) noexcept;
     void runLoop();
     void run() noexcept;
