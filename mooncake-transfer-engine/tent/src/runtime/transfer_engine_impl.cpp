@@ -1276,13 +1276,12 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         if (last.req.transport_hint != curr.req.transport_hint) {
             return false;
         }
-        // These fields affect transport selection or scheduling. Merging
+        // These fields affect transport selection. Merging
         // requests with different values would silently apply the first
         // request's policy to the whole combined transfer.
         if (last.req.priority != curr.req.priority ||
             last.req.policy_name != curr.req.policy_name ||
-            last.req.intent_type != curr.req.intent_type ||
-            last.req.deadline_ns != curr.req.deadline_ns) {
+            last.req.intent_type != curr.req.intent_type) {
             return false;
         }
         if (!last.boundary.source_key || !curr.boundary.source_key ||
@@ -1568,10 +1567,6 @@ Status TransferEngineImpl::commitPreparedSubmit(
             "batch public task capacity exceeded" LOC_MARK);
     }
 
-    std::vector<size_t> task_id_list[kSupportedTransportTypes];
-    // task_id_list also contains derived public tasks created by request
-    // merging. Keep a parallel list of physical owners so requests can be
-    // grouped with the policy that will be copied into their transport task.
     std::vector<size_t> physical_task_id_list[kSupportedTransportTypes];
     std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
@@ -1591,7 +1586,6 @@ Status TransferEngineImpl::commitPreparedSubmit(
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
             if (task.type != UNSPEC) {
-                task_id_list[task.type].push_back(task_id);
                 auto owner_it =
                     owner_task_id_by_merged_task.find(merged_task_id);
                 if (owner_it != owner_task_id_by_merged_task.end()) {
@@ -1653,7 +1647,6 @@ Status TransferEngineImpl::commitPreparedSubmit(
 
         task.sub_task_id = -1;
         task.derived = false;
-        task_id_list[task.type].push_back(task_id);
         physical_task_id_list[task.type].push_back(task_id);
         owner_task_id_by_merged_task[merged_task_id] = task_id;
         public_tasks_by_physical_owner[task_id].push_back(task_id);

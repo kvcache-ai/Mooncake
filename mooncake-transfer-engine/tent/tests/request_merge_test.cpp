@@ -170,7 +170,7 @@ TEST(RequestMergeTest, MergesAdjacentRequestsWithSameTransportHint) {
     EXPECT_EQ(merged.task_lookup.at(1), 0u);
 }
 
-TEST(RequestMergeTest, KeepsDifferentSelectionAndSchedulingAttributesSplit) {
+TEST(RequestMergeTest, KeepsDifferentSelectionAttributesSplit) {
     std::array<char, 8192> source{};
     const auto source_addr =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
@@ -179,7 +179,7 @@ TEST(RequestMergeTest, KeepsDifferentSelectionAndSchedulingAttributesSplit) {
         const char* name;
         void (*set_different)(Request&, Request&);
     };
-    const std::array<AttributeCase, 4> cases = {{
+    const std::array<AttributeCase, 3> cases = {{
         {"priority",
          [](Request& first, Request& second) {
              first.priority = PRIO_HIGH;
@@ -194,11 +194,6 @@ TEST(RequestMergeTest, KeepsDifferentSelectionAndSchedulingAttributesSplit) {
          [](Request& first, Request& second) {
              first.intent_type = IntentType::FOREGROUND_GET;
              second.intent_type = IntentType::MIGRATION;
-         }},
-        {"deadline_ns",
-         [](Request& first, Request& second) {
-             first.deadline_ns = 100;
-             second.deadline_ns = 200;
          }},
     }};
 
@@ -223,7 +218,7 @@ TEST(RequestMergeTest, KeepsDifferentSelectionAndSchedulingAttributesSplit) {
     }
 }
 
-TEST(RequestMergeTest, MergesMatchingSelectionAndSchedulingAttributes) {
+TEST(RequestMergeTest, MergesMatchingSelectionAttributes) {
     std::array<char, 2048> source{};
     const auto source_addr =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
@@ -235,7 +230,6 @@ TEST(RequestMergeTest, MergesMatchingSelectionAndSchedulingAttributes) {
         request.priority = PRIO_LOW;
         request.policy_name = "background";
         request.intent_type = IntentType::MIGRATION;
-        request.deadline_ns = 12345;
     }
     std::vector<RequestBoundaryInfo> boundaries = {
         {makeBufferKey(source_addr, source.size()), makeBufferKey(4096, 2048)},

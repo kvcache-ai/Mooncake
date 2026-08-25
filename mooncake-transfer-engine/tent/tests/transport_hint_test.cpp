@@ -389,18 +389,20 @@ TEST(TransportPolicy, SplitsRdmaSubBatchesByResolvedPolicy) {
     std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
     installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
 
-    constexpr size_t kRequestLength = 4096;
-    constexpr size_t kBufLen = 3 * kRequestLength;
+    constexpr size_t kRequestLengths[] = {1024, 2048, 3072};
+    constexpr size_t kBufLen =
+        kRequestLengths[0] + kRequestLengths[1] + kRequestLengths[2];
     std::vector<uint8_t> buf(kBufLen, 0xCC);
     ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
 
-    Request request_a0 = makeLocalWriteRequest(buf.data(), kRequestLength);
+    Request request_a0 = makeLocalWriteRequest(buf.data(), kRequestLengths[0]);
     request_a0.policy_name = "rdma-a";
-    Request request_b =
-        makeLocalWriteRequest(buf.data() + kRequestLength, kRequestLength);
+    Request request_b = makeLocalWriteRequest(buf.data() + kRequestLengths[0],
+                                              kRequestLengths[1]);
     request_b.policy_name = "rdma-b";
-    Request request_a1 =
-        makeLocalWriteRequest(buf.data() + 2 * kRequestLength, kRequestLength);
+    Request request_a1 = makeLocalWriteRequest(
+        buf.data() + kRequestLengths[0] + kRequestLengths[1],
+        kRequestLengths[2]);
     request_a1.policy_name = "rdma-a";
 
     BatchID batch_id = engine.allocateBatch(4);
@@ -423,6 +425,7 @@ TEST(TransportPolicy, SplitsRdmaSubBatchesByResolvedPolicy) {
         TransferStatus status;
         ASSERT_TRUE(engine.getTransferStatus(batch_id, task_id, status).ok());
         EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kRequestLengths[task_id]);
     }
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
