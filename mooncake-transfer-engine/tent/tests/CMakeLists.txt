@@ -380,6 +380,21 @@ target_include_directories(tent_stage_buffer_concurrency_test
 add_test(NAME tent_stage_buffer_concurrency_test
          COMMAND tent_stage_buffer_concurrency_test)
 
+# Regression test for PR #3526: a timed-out ProxyManager shutdown drain must
+# hand undrained batches and their stage buffers to the engine for deferred
+# teardown instead of freeing them. Pure CPU; no RDMA device required.
+add_executable(tent_proxy_shutdown_timeout_test
+               proxy_shutdown_timeout_test.cpp)
+target_link_libraries(tent_proxy_shutdown_timeout_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_proxy_shutdown_timeout_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_proxy_shutdown_timeout_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_proxy_shutdown_timeout_test
+         COMMAND tent_proxy_shutdown_timeout_test)
+
 # Backoff policy for the synchronous wait loops. Pure function, no engine
 # required.
 add_executable(tent_poll_backoff_test poll_backoff_test.cpp)
