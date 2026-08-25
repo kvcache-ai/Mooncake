@@ -36,7 +36,14 @@ start_server()
         kv_role="kv_producer"
     fi
 
-    local kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\"}"
+    local kv_config_json
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        # Diagnose vLLM#44238 by serializing Mooncake sender work. Keep every
+        # other serving and transfer parameter identical to the baseline run.
+        kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\",\"kv_connector_extra_config\":{\"num_workers\":1}}"
+    else
+        kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\"}"
+    fi
 
     local env_vars
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
