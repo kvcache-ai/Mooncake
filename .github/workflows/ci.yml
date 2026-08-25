@@ -96,6 +96,13 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
+    - name: Run standalone Mooncake Store e2e tests (no master)
+      run: |
+        source test_env/bin/activate
+        bash scripts/run_standalone_store_e2e.sh
+        deactivate
+      shell: bash
+
     - name: Run tests with ssd
       run: |
         # Reserve port 50052 (mooncake_client RPC port) so the kernel never
@@ -107,7 +114,7 @@ jobs:
         # TIME_WAIT+bind conflict for same-IP or loopback).
         sudo sysctl -w net.ipv4.ip_local_reserved_ports=50052
         source test_env/bin/activate
-        MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
+        MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true SKIP_STANDALONE_STORE_E2E=1 ./scripts/run_tests.sh
         rm -rf /tmp/mooncake_test_ssd
         deactivate
       shell: bash

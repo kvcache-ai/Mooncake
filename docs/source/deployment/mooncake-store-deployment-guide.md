@@ -134,7 +134,7 @@ Limitation: the master is a single point of failure. If it crashes, cluster oper
 ---
 
 (standalone-no-external-master)=
-### Standalone (no external master) — Single Process
+### Standalone (no external master) — Single Process {#standalone-no-external-master}
 
 For a single-machine evaluation or embedding Mooncake Store in one process, enable **standalone mode**. The store client starts an in-process master, so you do **not** run `mooncake_master`. Transfer Engine metadata defaults to `P2PHANDSHAKE`.
 

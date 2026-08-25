@@ -13,6 +13,8 @@ The E2E test suite includes several executable programs designed to test differe
 - **chaos_rand_test**: Long-term randomized chaos testing with configurable parameters.
 - **store_client_e2e.py**: Python `MooncakeDistributedStore` client that continuously issues `put/get` operations.
 - **run_nof_heartbeat_tcp_e2e.sh**: Scripted NoF heartbeat end-to-end test using a TCP SPDK target.
+- **session_ranges_tcp_e2e.py**: TCP e2e for put/get session ranged multi-buffer APIs. Set `MOONCAKE_ENABLE_STANDALONE=true` to skip `mooncake_master`.
+- **scripts/run_standalone_store_e2e.sh**: CI entry point that runs standalone (no `mooncake_master`) Python unittest, session-range, and put/get workload e2e tests.
 
 ## Parameters
 
@@ -149,3 +151,21 @@ python3 store_client_e2e.py \
 - `--payload-size 4096`: keep NoF writes 4K aligned
 - `--duration-sec`: total workload duration
 - `--sleep-ms`: interval between operations
+- `--enable-standalone`: embed master in-process; no `mooncake_master` is required
+
+### Standalone e2e (no `mooncake_master`)
+
+**Brief**: Python e2e coverage that embeds master in-process. Linux CI (`test-wheel-ubuntu`) runs `scripts/run_standalone_store_e2e.sh` before any `mooncake_master` process is started.
+
+```bash
+# After installing the wheel into the active Python environment:
+bash scripts/run_standalone_store_e2e.sh
+```
+
+The script runs:
+
+1. `mooncake-wheel/tests/test_standalone_store_e2e.py` — put/get, batch, session ranges, tensor, config-dict, and `MOONCAKE_ENABLE_STANDALONE` env-var setup
+2. `session_ranges_tcp_e2e.py` with `MOONCAKE_ENABLE_STANDALONE=true`
+3. `store_client_e2e.py --enable-standalone` for a short put/get workload
+
+It fails if a `mooncake_master` process is running before or after the tests.

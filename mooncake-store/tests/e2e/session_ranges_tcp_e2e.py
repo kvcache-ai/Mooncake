@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """TCP e2e for put/get session ranged multi-buffer APIs.
 
-Requires a running mooncake_master and built store Python module.
+Default mode requires a running mooncake_master. Set
+MOONCAKE_ENABLE_STANDALONE=true to embed master in-process instead.
 
-Example:
+Example (external master):
   PYTHONPATH=build/mooncake-integration \\
   MOONCAKE_PROTOCOL=tcp \\
   MOONCAKE_MASTER=127.0.0.1:50051 \\
+  MOONCAKE_TE_META_DATA_SERVER=P2PHANDSHAKE \\
+  python3 mooncake-store/tests/e2e/session_ranges_tcp_e2e.py
+
+Example (standalone, no mooncake_master):
+  MOONCAKE_ENABLE_STANDALONE=true \\
+  MOONCAKE_PROTOCOL=tcp \\
   MOONCAKE_TE_META_DATA_SERVER=P2PHANDSHAKE \\
   python3 mooncake-store/tests/e2e/session_ranges_tcp_e2e.py
 """
@@ -19,13 +26,24 @@ import sys
 import time
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _require_store():
     try:
-        import store  # type: ignore
+        from mooncake import store as store_mod  # type: ignore
+
+        return store_mod
+    except Exception:
+        pass
+    try:
+        import store as store_mod  # type: ignore
+
+        return store_mod
     except Exception as exc:  # pragma: no cover
         print(f"import_fail {exc}", flush=True)
         raise SystemExit(10)
-    return store
 
 
 def _ptr(buf: ctypes.Array) -> int:
@@ -48,15 +66,25 @@ def run() -> int:
     num_keys = int(os.getenv("E2E_NUM_KEYS", "3"))
     object_size = page_size * num_layers
 
+    enable_standalone = _env_flag("MOONCAKE_ENABLE_STANDALONE")
+    master_addr = "" if enable_standalone else master
     print(
-        f"e2e_session_ranges protocol={protocol} master={master} "
-        f"keys={num_keys} layers={num_layers} page={page_size}",
+        f"e2e_session_ranges protocol={protocol} master={master_addr or master} "
+        f"standalone={enable_standalone} keys={num_keys} layers={num_layers} "
+        f"page={page_size}",
         flush=True,
     )
 
     mc = store.MooncakeDistributedStore()
     setup_ret = mc.setup(
-        hostname, metadata, segment, local_buf, protocol, device, master
+        hostname,
+        metadata,
+        segment,
+        local_buf,
+        protocol,
+        device,
+        master_addr,
+        enable_standalone=enable_standalone,
     )
     print(f"setup_ret {setup_ret}", flush=True)
     if setup_ret != 0:

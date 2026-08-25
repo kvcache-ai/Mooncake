@@ -9,6 +9,22 @@ def make_payload(seq: int, size: int) -> bytes:
     return (seed * repeat)[:size]
 
 
+def _require_store():
+    try:
+        from mooncake import store as store_mod  # type: ignore
+
+        return store_mod
+    except Exception:
+        pass
+    try:
+        import store as store_mod  # type: ignore
+
+        return store_mod
+    except Exception as exc:
+        print(f"import_fail {exc}", flush=True)
+        raise SystemExit(10)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Continuous MooncakeDistributedStore put/get workload"
@@ -26,23 +42,27 @@ def main() -> int:
     parser.add_argument("--key-prefix", default="nof-e2e")
     parser.add_argument("--memory-replica-num", type=int, default=1)
     parser.add_argument("--nof-replica-num", type=int, default=1)
+    parser.add_argument(
+        "--enable-standalone",
+        action="store_true",
+        help="Embed mooncake_master in-process; no external master is required",
+    )
     args = parser.parse_args()
 
-    try:
-        import store  # type: ignore
-    except Exception as exc:
-        print(f"import_fail {exc}", flush=True)
-        return 10
+    store = _require_store()
 
     mc = store.MooncakeDistributedStore()
+    master_addr = "" if args.enable_standalone else args.master_server
+    metadata = "P2PHANDSHAKE" if args.enable_standalone else args.metadata_server
     setup_ret = mc.setup(
         args.local_hostname,
-        args.metadata_server,
+        metadata,
         args.global_segment_size,
         args.local_buffer_size,
         args.protocol,
         args.device_name,
-        args.master_server,
+        master_addr,
+        enable_standalone=args.enable_standalone,
     )
     print(f"setup_ret {setup_ret}", flush=True)
     if setup_ret != 0:
@@ -60,38 +80,41 @@ def main() -> int:
     get_fail = 0
     mismatch = 0
 
-    while deadline is None or time.time() < deadline:
-        seq += 1
-        key = f"{args.key_prefix}-{seq}"
-        expected = make_payload(seq, args.payload_size)
+    try:
+        while deadline is None or time.time() < deadline:
+            seq += 1
+            key = f"{args.key_prefix}-{seq}"
+            expected = make_payload(seq, args.payload_size)
 
-        put_ret = mc.put(key, expected, replicate_config)
-        if put_ret == 0:
-            put_ok += 1
-            print(f"put_ok seq={seq} key={key} len={len(expected)}", flush=True)
-        else:
-            put_fail += 1
-            print(f"put_fail seq={seq} key={key} ret={put_ret}", flush=True)
+            put_ret = mc.put(key, expected, replicate_config)
+            if put_ret == 0:
+                put_ok += 1
+                print(f"put_ok seq={seq} key={key} len={len(expected)}", flush=True)
+            else:
+                put_fail += 1
+                print(f"put_fail seq={seq} key={key} ret={put_ret}", flush=True)
+                time.sleep(args.sleep_ms / 1000.0)
+                continue
+
+            actual = mc.get(key)
+            if actual == expected:
+                get_ok += 1
+                print(f"get_ok seq={seq} key={key} len={len(actual)}", flush=True)
+            elif actual in (b"", None):
+                get_fail += 1
+                actual_len = 0 if actual in (b"", None) else len(actual)
+                print(f"get_fail seq={seq} key={key} len={actual_len}", flush=True)
+            else:
+                mismatch += 1
+                print(
+                    f"data_mismatch seq={seq} key={key} expected_len={len(expected)} actual_len={len(actual)}",
+                    flush=True,
+                )
+                return 20
+
             time.sleep(args.sleep_ms / 1000.0)
-            continue
-
-        actual = mc.get(key)
-        if actual == expected:
-            get_ok += 1
-            print(f"get_ok seq={seq} key={key} len={len(actual)}", flush=True)
-        elif actual in (b"", None):
-            get_fail += 1
-            actual_len = 0 if actual in (b"", None) else len(actual)
-            print(f"get_fail seq={seq} key={key} len={actual_len}", flush=True)
-        else:
-            mismatch += 1
-            print(
-                f"data_mismatch seq={seq} key={key} expected_len={len(expected)} actual_len={len(actual)}",
-                flush=True,
-            )
-            return 20
-
-        time.sleep(args.sleep_ms / 1000.0)
+    finally:
+        mc.close()
 
     print(
         "summary "
@@ -99,7 +122,9 @@ def main() -> int:
         f"get_ok={get_ok} get_fail={get_fail} mismatch={mismatch}",
         flush=True,
     )
-    return 0 if mismatch == 0 else 20
+    if mismatch != 0 or put_ok == 0 or get_ok == 0:
+        return 20
+    return 0
 
 
 if __name__ == "__main__":
