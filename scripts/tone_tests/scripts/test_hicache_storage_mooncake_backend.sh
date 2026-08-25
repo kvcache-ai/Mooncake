@@ -13,10 +13,12 @@ run_test()
 
     echo "Running tests in container and saving output to: $log_file"
     ${docker_exec} "\
+        export SGLANG_IS_IN_CI=1 && \
         export PYTHONPATH=/sgl-workspace/sglang/test/registered/hicache:\$PYTHONPATH && \
         cd /test_run/python && \
-        python3 -m pytest test_hicache_storage_mooncake_backend.py -v -s --tb=long" | tee "$log_file"
-    
+        python3 -m pytest test_hicache_storage_mooncake_backend.py -v -s --tb=long" \
+        2>&1 | tee "$log_file"
+
     return ${PIPESTATUS[0]}
 }
 
@@ -41,7 +43,7 @@ if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
     if ! run_test; then
         exit_code=1
     fi
-    
+
     parse $exit_code
     exit $?
 fi

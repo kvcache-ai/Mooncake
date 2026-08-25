@@ -131,6 +131,7 @@ jobs:
           rm -rf build && mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+            -DENABLE_MULTI_PROTOCOL=ON \
             -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
             -DBUILD_UNIT_TESTS=OFF -DENABLE_DEBUG_SYMBOLS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
@@ -187,13 +188,15 @@ jobs:
           # Install the actual per-matrix release artifact (cp310-cp313) into a
           # fresh venv and exercise the packaged binary, so packaging/ELF-layout
           # failures in any version are caught before this wheel reaches PyPI.
-          # No GPU is needed for `mooncake_master --version`.
+          # Import both native bindings as well as exercising the packaged
+          # binary. No GPU is needed for these load-time checks.
           smoke_venv=$(mktemp -d)
           "${PYTHON_BIN}" -m venv "$smoke_venv"
           "$smoke_venv/bin/python" -m pip install --no-deps \
             mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
           export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
-          site="$("$smoke_venv/bin/python" -c 'import mooncake,os;print(os.path.dirname(mooncake.__file__))')"
+          "$smoke_venv/bin/python" scripts/tone_tests/python/verify_rocm_wheel.py
+          site="$("$smoke_venv/bin/python" -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')"
           "$site/mooncake_master" --version
 
       - name: Upload Python wheel artifact
