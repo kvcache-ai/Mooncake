@@ -18,8 +18,6 @@
 
 namespace mooncake {
 
-EmbeddedMaster::~EmbeddedMaster() { Stop(); }
-
 bool EmbeddedMaster::Start(InProcMasterConfig config) {
     if (server_) {
         LOG(ERROR) << "Embedded master is already running on port "

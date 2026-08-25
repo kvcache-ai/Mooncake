@@ -3,17 +3,14 @@
 #include <memory>
 #include <string>
 
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
+
+#include "http_metadata_server.h"
+#include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
 
-namespace coro_rpc {
-class coro_rpc_server;
-}  // namespace coro_rpc
-
 namespace mooncake {
-
-class HttpMetadataServer;
-class MasterAdminServer;
 
 // In-process master used for standalone single-node deployments and tests.
 // When enabled, a store client starts this master in the same process so no
@@ -21,7 +18,7 @@ class MasterAdminServer;
 class EmbeddedMaster {
    public:
     EmbeddedMaster() = default;
-    ~EmbeddedMaster();
+    ~EmbeddedMaster() { Stop(); }
 
     EmbeddedMaster(const EmbeddedMaster&) = delete;
     EmbeddedMaster& operator=(const EmbeddedMaster&) = delete;
