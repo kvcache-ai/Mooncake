@@ -38,9 +38,11 @@ echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
 cp -r mooncake-reshard/tests test_env/reshard_tests
+cp python/tests/store/test_fast_copy.py test_env/tests/
 cd test_env
 pip install torch numpy
 python -c "import mooncake._fast_copy"
+python -c "import mooncake.structured_object_store"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
 

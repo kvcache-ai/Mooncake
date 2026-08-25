@@ -5,13 +5,16 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_PACKAGE = ROOT / "mooncake"
+SOURCE_ROOT = ROOT.parent / "python"
+SOURCE_PACKAGE = SOURCE_ROOT / "mooncake"
 
 try:
     import mooncake
 except ModuleNotFoundError:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
+    if str(SOURCE_ROOT) not in sys.path:
+        sys.path.append(str(SOURCE_ROOT))
 else:
     if importlib.util.find_spec("mooncake.structured_object_store") is None:
         mooncake_path = getattr(mooncake, "__path__", None)

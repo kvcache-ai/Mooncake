@@ -5,7 +5,12 @@ run-ci:
 
 store:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-store/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-store/**/*'
+      - 'python/mooncake/_fast_copy.c'
+      - 'python/mooncake/structured_object_store.py'
+      - 'python/tests/store/test_fast_copy.py'
+      - 'python/tests/store/test_structured_object_store.py'
 
 Transfer Engine:
   - changed-files:
@@ -21,7 +26,12 @@ Mooncake EP:
 
 Installation:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-wheel/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-wheel/**/*'
+      - 'python/mooncake/_fast_copy.c'
+      - 'python/mooncake/structured_object_store.py'
+      - 'python/tests/store/test_fast_copy.py'
+      - 'python/tests/store/test_structured_object_store.py'
 
 P2P Store:
   - changed-files:
@@ -57,6 +67,8 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/store/test_fast_copy.py'
+      - 'python/tests/store/test_structured_object_store.py'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:
