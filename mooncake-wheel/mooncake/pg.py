@@ -4,6 +4,7 @@ import contextlib
 import fcntl
 import hashlib
 import os
+import traceback
 from pathlib import Path
 
 import torch
@@ -83,6 +84,24 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path,
     )
 
 
+def _failure_marker(build_dir: Path) -> Path:
+    return build_dir / ".failed"
+
+
+def _read_failure(build_dir: Path):
+    marker = _failure_marker(build_dir)
+    if marker.is_file():
+        return marker.read_text(errors="replace")
+    return None
+
+
+def _write_failure(build_dir: Path, exc: BaseException):
+    _failure_marker(build_dir).write_text(
+        "The previous Mooncake PG JIT attempt failed.\n"
+        + "".join(traceback.format_exception(exc)),
+    )
+
+
 def _load_jit_adapter():
     source_dir = _source_dir()
     core_path = Path(__file__).with_name("libmooncake_pg.so")
@@ -122,14 +141,24 @@ def _load_jit_adapter():
             failures.append("Path B unavailable: CUDA_HOME/nvcc not found")
             continue
         path_name = "cuda" if with_cuda else "cpp"
-        key = _cache_key(source_dir, core_path, path_name)
+        toolkit_identity = str(CUDA_HOME or "")
+        if cuda_toolkit_available:
+            toolkit_identity += ":" + str(Path(CUDA_HOME) / "bin" / "nvcc")
+        key = _cache_key(source_dir, core_path,
+                         f"{path_name}:{toolkit_identity}")
         build_dir = _cache_root() / key
         build_dir.mkdir(parents=True, exist_ok=True)
         lock_path = build_dir.with_suffix(".lock")
         try:
             with _build_lock(lock_path):
+                previous_failure = _read_failure(build_dir)
+                if previous_failure:
+                    raise RuntimeError(previous_failure)
                 return _build_adapter(source_dir, core_path, build_dir, with_cuda)
         except Exception as exc:
+            with _build_lock(lock_path):
+                if not _failure_marker(build_dir).exists():
+                    _write_failure(build_dir, exc)
             failures.append(f"Path {path_name.upper()} failed: {exc}")
             if force_cpp or force_cuda:
                 break
