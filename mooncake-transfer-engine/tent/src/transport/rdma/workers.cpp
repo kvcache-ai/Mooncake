@@ -258,7 +258,16 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
         priority = slice_list.first->priority;
     }
 
-    worker.queues[priority].push(slice_list);
+    // Use try_push to avoid blocking when queue is full. If the queue is full,
+    // return an error so the caller can fail the slice immediately instead of
+    // spinning indefinitely. This prevents livelock when the worker thread
+    // itself tries to re-enqueue retried slices into a full queue.
+    if (!worker.queues[priority].try_push(slice_list)) {
+        LOG(WARNING) << "Worker " << worker_id << " queue full (capacity "
+                     << Workers::kCapacity << "), rejecting slice";
+        return Status(Status::Code::kTooManyRequests,
+                      "Worker submit queue is full, cannot accept more slices");
+    }
     if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
@@ -461,7 +470,18 @@ void Workers::asyncPostSend() {
                     updateSliceStatus(slice, FAILED);
                 } else {
                     releaseSliceQuota(slice);
-                    submit(slice);
+                    // The worker must never block on enqueue: if the queue is
+                    // full, fail the slice immediately rather than spinning.
+                    // Spinning here wedges the worker (it stops popping its own
+                    // queue) and livelocks the whole engine. See #3636/#3637.
+                    Status st = submit(slice);
+                    if (!st.ok()) {
+                        LOG(WARNING)
+                            << "Slice " << slice
+                            << " failed: re-enqueue rejected ("
+                            << st.message() << ")";
+                        updateSliceStatus(slice, FAILED);
+                    }
                 }
                 worker.inflight_slices.fetch_sub(1);
             }
@@ -529,7 +549,16 @@ void Workers::asyncPostSend() {
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
                 } else {
-                    submit(slice);
+                    // Non-blocking re-enqueue: never wedge the worker on a
+                    // full queue. Fail the slice instead. See #3636/#3637.
+                    Status st = submit(slice);
+                    if (!st.ok()) {
+                        LOG(WARNING)
+                            << "Slice " << slice
+                            << " failed: re-enqueue rejected ("
+                            << st.message() << ")";
+                        updateSliceStatus(slice, FAILED);
+                    }
                 }
                 worker.inflight_slices.fetch_sub(1);
             } else {
@@ -706,7 +735,16 @@ void Workers::asyncPollCq() {
                             std::memory_order_acquire)) {
                         updateSliceStatus(slice, CANCELED);
                     } else {
-                        submit(slice);
+                        // Non-blocking re-enqueue: never wedge the worker on a
+                        // full queue. Fail the slice instead. See #3636/#3637.
+                        Status st = submit(slice);
+                        if (!st.ok()) {
+                            LOG(WARNING)
+                                << "Slice " << slice
+                                << " failed: re-enqueue rejected ("
+                                << st.message() << ")";
+                            updateSliceStatus(slice, FAILED);
+                        }
                     }
                 }
             } else {
