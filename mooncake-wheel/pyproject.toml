@@ -18,7 +18,7 @@
 # source of truth for the long description.
 
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel>=0.37.0", "numpy", "ninja>=1.10"]
+requires = ["setuptools>=61.0.0", "wheel>=0.37.0", "numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -30,7 +30,7 @@ authors = [
 ]
 requires-python = ">=3.10"
 readme = "README.md"   # local copy of ../README.md, materialized at build time by scripts/build_wheel.sh
-dependencies = ["aiohttp", "requests", "msgpack", "ninja>=1.10", "typing_extensions>=4.0; python_version < '3.10'"]
+dependencies = ["aiohttp", "requests", "msgpack", "typing_extensions>=4.0; python_version < '3.10'"]
 # Single-line arrays: sed-substituted by scripts/build_wheel.sh for each variant.
 keywords = ["mooncake", "transfer engine", "kv cache", "llm inference", "rdma"]
 classifiers = ["Development Status :: 5 - Production/Stable", "Environment :: GPU :: NVIDIA CUDA", "Intended Audience :: Developers", "Intended Audience :: Science/Research", "License :: OSI Approved :: Apache Software License", "Operating System :: POSIX :: Linux", "Programming Language :: C++", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only", "Programming Language :: Python :: 3.10", "Programming Language :: Python :: 3.11", "Programming Language :: Python :: 3.12", "Programming Language :: Python :: 3.13", "Programming Language :: Python :: Implementation :: CPython", "Topic :: Scientific/Engineering :: Artificial Intelligence", "Topic :: System :: Distributed Computing"]

@@ -4,6 +4,7 @@ import contextlib
 import fcntl
 import hashlib
 import os
+import shutil
 import traceback
 from pathlib import Path
 
@@ -134,6 +135,12 @@ def _load_jit_adapter():
     if missing:
         raise ImportError(
             "Mooncake PG JIT source bundle is incomplete: " + ", ".join(missing)
+        )
+
+    if shutil.which("ninja") is None:
+        raise ImportError(
+            "Mooncake PG JIT requires Ninja to compile the Torch adapter. "
+            "Install it with `python -m pip install ninja`."
         )
 
     from torch.utils.cpp_extension import CUDA_HOME

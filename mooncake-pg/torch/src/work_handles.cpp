@@ -296,8 +296,9 @@ bool MooncakeBarrierWorkCuda::wait(std::chrono::milliseconds timeout) {
         return true;
     }
 
-    BackoffWaiter waiter(BackoffWaiterConfig{
-        200, 0, std::chrono::microseconds(10), std::chrono::milliseconds(100)});
+    BackoffWaiter waiter(
+        BackoffWaiterConfig{200, 0, std::chrono::microseconds(10),
+                            std::chrono::milliseconds(100)});
     return waiter.wait_for(timeout, [this] { return event_->query(); });
 }
 
