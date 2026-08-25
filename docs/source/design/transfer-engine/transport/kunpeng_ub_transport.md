@@ -32,7 +32,7 @@ git clone https://atomgit.com/openeuler/umdk.git
 cd umdk
 cmake -B build -G Ninja
 cmake --build build
-sudo cmake --install install
+sudo cmake --install build
 ```
 
 ### 3. Build Dependencies

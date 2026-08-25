@@ -40,7 +40,7 @@
 
 3. 安装 Mooncake python 包和 mooncake_master 可执行文件：
    ```bash
-   sudo cmake --install install
+   sudo cmake --install build
    ```
 
 ## 手动安装
@@ -158,7 +158,7 @@
 
 8. 安装 Mooncake python 包和 mooncake_master 可执行文件
    ```bash
-   sudo cmake --install install
+   sudo cmake --install build
    ```
 
 ## 高级编译选项
