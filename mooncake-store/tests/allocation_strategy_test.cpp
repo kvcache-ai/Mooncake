@@ -685,6 +685,71 @@ TEST_F(AllocationStrategyTest, SizeClassAwarePrefersMatchingSegment) {
               "small");
 }
 
+TEST_F(AllocationStrategyTest, SizeClassAwareUsesFreeRatioBetweenMatchingSegments) {
+    constexpr size_t kSegmentSize = 64 * MiB;
+    constexpr size_t kRequestSize = 4 * MiB;
+    auto fuller_match = std::make_shared<OffsetBufferAllocator>(
+        "fuller-match", 0x330000000ULL, kSegmentSize, "fuller-match");
+    auto emptier_match = std::make_shared<OffsetBufferAllocator>(
+        "emptier-match", 0x340000000ULL, kSegmentSize, "emptier-match");
+
+    std::vector<std::unique_ptr<AllocatedBuffer>> fuller_seeds;
+    for (int i = 0; i < 8; ++i) {
+        fuller_seeds.push_back(fuller_match->allocate(kRequestSize));
+        ASSERT_NE(fuller_seeds.back(), nullptr);
+    }
+    auto matching_seed = emptier_match->allocate(kRequestSize);
+    auto mismatched_seed = emptier_match->allocate(16 * MiB);
+    ASSERT_NE(matching_seed, nullptr);
+    ASSERT_NE(mismatched_seed, nullptr);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("fuller-match", fuller_match);
+    allocator_manager.addAllocator("emptier-match", emptier_match);
+
+    SizeClassAwareAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "emptier-match");
+}
+
+TEST_F(AllocationStrategyTest, SizeClassAwareBoundsAffinityByFreeRatio) {
+    constexpr size_t kSegmentSize = 64 * MiB;
+    constexpr size_t kRequestSize = 4 * MiB;
+    auto fuller_match = std::make_shared<OffsetBufferAllocator>(
+        "fuller-match", 0x390000000ULL, kSegmentSize, "fuller-match");
+    auto emptier_mismatch = std::make_shared<OffsetBufferAllocator>(
+        "emptier-mismatch", 0x3a0000000ULL, kSegmentSize,
+        "emptier-mismatch");
+
+    std::vector<std::unique_ptr<AllocatedBuffer>> matching_seeds;
+    for (int i = 0; i < 8; ++i) {
+        matching_seeds.push_back(fuller_match->allocate(kRequestSize));
+        ASSERT_NE(matching_seeds.back(), nullptr);
+    }
+    auto mismatched_seed = emptier_mismatch->allocate(4 * 1024);
+    ASSERT_NE(mismatched_seed, nullptr);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("fuller-match", fuller_match);
+    allocator_manager.addAllocator("emptier-mismatch", emptier_mismatch);
+
+    SizeClassAwareAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "emptier-mismatch");
+}
+
 TEST_F(AllocationStrategyTest, SizeClassAwarePrefersEmptyOverMismatch) {
     constexpr size_t kSegmentSize = 64 * MiB;
     auto mismatched = std::make_shared<OffsetBufferAllocator>(

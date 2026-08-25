@@ -148,6 +148,11 @@ class BufferAllocatorBase {
      */
     virtual size_t getLargestFreeRegion() const = 0;
 
+    virtual std::optional<AllocationSizeProfile> getAllocationSizeProfile(
+        size_t allocation_size) const {
+        return std::nullopt;
+    }
+
     /**
      * Attach this allocator to a domain usage tracker exactly once, before it
      * is published. Registration is immutable afterward and is released by
@@ -324,7 +329,7 @@ class OffsetBufferAllocator
     size_t getLargestFreeRegion() const override;
 
     std::optional<AllocationSizeProfile> getAllocationSizeProfile(
-        size_t allocation_size) const;
+        size_t allocation_size) const override;
 
     // Public method to get offset_allocator
     std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()

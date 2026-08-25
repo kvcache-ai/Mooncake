@@ -562,7 +562,7 @@ Valid values are: `random` (default), `free_ratio_first`, `size_class_aware`, `s
 - Segments have different capacities and you want even utilization ratios.
 - New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
 
-**Use `size_class_aware`** for mixed-size in-memory workloads backed by `OffsetAllocator`. It learns each segment's live allocation-size distribution and prefers an established matching segment, then an empty segment, then a mismatched or unsupported segment. Free ratio breaks ties, and failed allocations continue through the existing fallback path. The profile is rebuilt from live descriptors during snapshot recovery and is not persisted separately. Other replica and allocator types fall back to free-ratio ranking.
+**Use `size_class_aware`** for mixed-size in-memory workloads backed by `OffsetAllocator`. It starts from free-ratio ranking and adds a bounded affinity bonus for segments already containing the requested logarithmic size class. Capacity therefore remains the primary signal, while the affinity nudges similarly utilized segments toward compatible allocation sizes. Failed allocations continue through the existing fallback path. The profile is rebuilt from live descriptors during snapshot recovery and is not persisted separately. Other replica and allocator types fall back to free-ratio ranking.
 
 **Use `ssd_free_ratio_first`** when SSD offloading is enabled and you want memory allocation to prefer segments whose backing SSD still has more free capacity.
 
@@ -601,7 +601,7 @@ The key insight behind Best-of-N is that if a new/empty segment is sampled, it w
 
 **`size_class_aware` — SizeClassAwareAllocationStrategy**
 
-For every live allocation, `OffsetBufferAllocator` records the requested byte count in a logarithmic size class (`ceil(log2(size))`). Candidate segments are ranked in three cohorts: segments already containing the requested class, empty segments, and mismatched or unsupported segments. Matching-class share is used within the first cohort and free ratio is the final tie-breaker. This keeps the state dynamic: deleting all allocations resets a segment to empty, while snapshot replay reconstructs the same profile from live descriptors.
+For every live allocation, `OffsetBufferAllocator` records the requested byte count in a logarithmic size class (`ceil(log2(size))`). Candidate ranking starts with each segment's free ratio and adds at most `0.1` according to the share of live bytes in the requested class. This bounded bonus avoids letting affinity override a materially emptier segment while still grouping compatible sizes when capacity is similar. The state remains dynamic: deleting allocations updates the profile immediately, while snapshot replay reconstructs it from live descriptors.
 
 The first implementation applies affinity only to `MEMORY` replicas managed by `OffsetBufferAllocator`. CacheLib, NoF SSD, CXL, local-disk, and DFS paths retain their existing placement behavior.
 

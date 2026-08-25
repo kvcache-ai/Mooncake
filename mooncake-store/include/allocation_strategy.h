@@ -577,57 +577,53 @@ class SizeClassAwareAllocationStrategy final : public RankedAllocationStrategy {
                                   const std::string& name,
                                   const size_t slice_length,
                                   const ReplicaType replica_type) {
-        const double free_ratio = GetSegmentFreeRatio(allocator_manager, name);
-        if (replica_type != ReplicaType::MEMORY) {
-            return free_ratio;
-        }
-
         const auto* allocators = allocator_manager.getAllocators(name);
         if (!allocators || allocators->empty()) {
-            return free_ratio;
+            return 0.0;
         }
 
+        uint64_t total_capacity = 0;
+        uint64_t total_free = 0;
         uint64_t total_live_bytes = 0;
         uint64_t matching_live_bytes = 0;
-        bool found_allocator = false;
+        bool profile_supported = replica_type == ReplicaType::MEMORY;
         for (const auto& allocator : *allocators) {
             if (!allocator) {
                 continue;
             }
-            found_allocator = true;
-            const auto offset_allocator =
-                std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
-            if (!offset_allocator) {
-                return free_ratio;
+            const auto capacity = static_cast<uint64_t>(allocator->capacity());
+            total_capacity += capacity;
+            total_free += capacity - static_cast<uint64_t>(allocator->size());
+
+            if (!profile_supported) {
+                continue;
             }
             const auto profile =
-                offset_allocator->getAllocationSizeProfile(slice_length);
+                allocator->getAllocationSizeProfile(slice_length);
             if (!profile) {
-                return free_ratio;
+                profile_supported = false;
+                continue;
             }
             total_live_bytes += profile->total_live_bytes;
             matching_live_bytes += profile->matching_live_bytes;
         }
 
-        if (!found_allocator) {
-            return free_ratio;
+        if (total_capacity == 0) {
+            return 0.0;
         }
-        if (total_live_bytes == 0) {
-            return kEmptySegmentScore + free_ratio;
-        }
-        if (matching_live_bytes == 0) {
+        const double free_ratio = static_cast<double>(total_free) /
+                                  static_cast<double>(total_capacity);
+        if (!profile_supported || total_live_bytes == 0 ||
+            matching_live_bytes == 0) {
             return free_ratio;
         }
 
         const double matching_share = static_cast<double>(matching_live_bytes) /
                                       static_cast<double>(total_live_bytes);
-        return kMatchingSegmentScore + matching_share +
-               free_ratio * kFreeRatioTieBreakerWeight;
+        return free_ratio + matching_share * kMaxSizeClassAffinityBonus;
     }
 
-    static constexpr double kEmptySegmentScore = 2.0;
-    static constexpr double kMatchingSegmentScore = 4.0;
-    static constexpr double kFreeRatioTieBreakerWeight = 0.001;
+    static constexpr double kMaxSizeClassAffinityBonus = 0.1;
 };
 
 class SsdFreeRatioFirstAllocationStrategy final
