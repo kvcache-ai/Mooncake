@@ -56,13 +56,12 @@ def _build_lock(lock_path: Path):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path,
-                   with_cuda: bool):
+def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
     from torch.utils.cpp_extension import library_paths, load
 
     verbose = os.environ.get("MOONCAKE_PG_JIT_VERBOSE", "0") == "1"
     return load(
-        name="_mooncake_pg_jit_cuda" if with_cuda else "_mooncake_pg_jit_cpp",
+        name="_mooncake_pg_jit_cuda",
         sources=[str(source_dir / name) for name in _SOURCE_NAMES],
         extra_cflags=[
             "-std=c++20",
@@ -80,7 +79,7 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path,
         ],
         build_directory=str(build_dir),
         verbose=verbose,
-        with_cuda=with_cuda,
+        with_cuda=True,
     )
 
 
@@ -119,54 +118,31 @@ def _load_jit_adapter():
             "Mooncake PG JIT source bundle is incomplete: " + ", ".join(missing)
         )
 
-    force_cpp = os.environ.get("MOONCAKE_PG_JIT_FORCE_CPP") == "1"
-    force_cuda = os.environ.get("MOONCAKE_PG_JIT_FORCE_NVCC") == "1"
-    if force_cpp and force_cuda:
-        raise ImportError(
-            "MOONCAKE_PG_JIT_FORCE_CPP and MOONCAKE_PG_JIT_FORCE_NVCC "
-            "cannot both be set"
-        )
-
     from torch.utils.cpp_extension import CUDA_HOME
 
-    cuda_toolkit_available = bool(CUDA_HOME and (Path(CUDA_HOME) / "bin" / "nvcc").is_file())
-    if force_cuda and not cuda_toolkit_available:
+    if not CUDA_HOME or not (Path(CUDA_HOME) / "bin" / "nvcc").is_file():
         raise ImportError(
-            "MOONCAKE_PG_JIT_FORCE_NVCC=1 requires CUDA_HOME and nvcc"
+            "Mooncake PG Torch adapter JIT requires a CUDA toolkit with nvcc; "
+            "install a CUDA toolkit or use a compatible runtime environment"
         )
-    paths = (True,) if force_cuda else (False,) if force_cpp else (False, True)
-    failures = []
-    for with_cuda in paths:
-        if with_cuda and not cuda_toolkit_available:
-            failures.append("Path B unavailable: CUDA_HOME/nvcc not found")
-            continue
-        path_name = "cuda" if with_cuda else "cpp"
-        toolkit_identity = str(CUDA_HOME or "")
-        if cuda_toolkit_available:
-            toolkit_identity += ":" + str(Path(CUDA_HOME) / "bin" / "nvcc")
-        key = _cache_key(source_dir, core_path,
-                         f"{path_name}:{toolkit_identity}")
-        build_dir = _cache_root() / key
-        build_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = build_dir.with_suffix(".lock")
-        try:
-            with _build_lock(lock_path):
-                previous_failure = _read_failure(build_dir)
-                if previous_failure:
-                    raise RuntimeError(previous_failure)
-                return _build_adapter(source_dir, core_path, build_dir, with_cuda)
-        except Exception as exc:
-            with _build_lock(lock_path):
-                if not _failure_marker(build_dir).exists():
-                    _write_failure(build_dir, exc)
-            failures.append(f"Path {path_name.upper()} failed: {exc}")
-            if force_cpp or force_cuda:
-                break
-
-    details = "; ".join(failures)
-    raise ImportError(
-        "Mooncake PG Torch adapter JIT compilation failed: " + details
-    )
+    toolkit_identity = f"cuda:{CUDA_HOME}:{Path(CUDA_HOME) / 'bin' / 'nvcc'}"
+    key = _cache_key(source_dir, core_path, toolkit_identity)
+    build_dir = _cache_root() / key
+    build_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = build_dir.with_suffix(".lock")
+    try:
+        with _build_lock(lock_path):
+            previous_failure = _read_failure(build_dir)
+            if previous_failure:
+                raise RuntimeError(previous_failure)
+            return _build_adapter(source_dir, core_path, build_dir)
+    except Exception as exc:
+        with _build_lock(lock_path):
+            if not _failure_marker(build_dir).exists():
+                _write_failure(build_dir, exc)
+        raise ImportError(
+            "Mooncake PG Torch adapter JIT compilation failed: " + str(exc)
+        ) from exc
 
 
 backend_module = _load_jit_adapter()

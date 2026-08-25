@@ -21,13 +21,13 @@ run_timed_import() {
   echo "elapsed_s=$((end - start))"
 }
 
-echo "[cold-auto]"
+echo "[cold]"
 {
   run_timed_import python3 -c \
     'import mooncake.pg; print("PG_JIT_COLD_AUTO_OK")'
 } >"$log_dir/cold-auto.log" 2>&1
 
-echo "[warm-auto]"
+echo "[warm]"
 {
   run_timed_import python3 -c \
     'import mooncake.pg; print("PG_JIT_WARM_AUTO_OK")'
@@ -43,21 +43,6 @@ pid2=$!
 wait "$pid1"
 wait "$pid2"
 
-echo "[path-a-no-toolkit]"
-set +e
-env PATH=/usr/local/bin:/usr/bin:/bin CUDA_HOME= PYTHONPATH="$overlay" \
-  MOONCAKE_PG_JIT_DIR="$cache/path-a" MOONCAKE_PG_JIT_FORCE_CPP=1 \
-  MOONCAKE_PG_JIT_VERBOSE=1 python3 -c \
-  'import mooncake.pg' >"$log_dir/path-a-no-toolkit.log" 2>&1
-path_a_rc=$?
-set -e
-echo "path_a_rc=$path_a_rc" >"$log_dir/path-a-no-toolkit.rc"
-if [[ "$path_a_rc" -eq 0 ]]; then
-  echo "Path A unexpectedly succeeded" >&2
-  exit 1
-fi
-
-grep -q 'cuda_runtime_api.h' "$log_dir/path-a-no-toolkit.log"
 grep -q 'PG_JIT_COLD_AUTO_OK' "$log_dir/cold-auto.log"
 grep -q 'PG_JIT_WARM_AUTO_OK' "$log_dir/warm-auto.log"
 grep -q 'PG_JIT_CONCURRENT_1_OK' "$log_dir/concurrent-1.log"
