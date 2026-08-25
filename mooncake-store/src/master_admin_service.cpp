@@ -694,14 +694,15 @@ struct HttpSegmentDetailItem {
     std::string size_human;
     std::string te_endpoint;
     std::string protocol;
+    int32_t numa_node{-1};
     std::string status;
     uint64_t allocator_used_bytes{0};
     uint64_t allocator_capacity_bytes{0};
     double allocator_usage_percent{0.0};
 };
 YLT_REFL(HttpSegmentDetailItem, segment_name, segment_id, client_id,
-         base_address, size_bytes, size_human, te_endpoint, protocol, status,
-         allocator_used_bytes, allocator_capacity_bytes,
+         base_address, size_bytes, size_human, te_endpoint, protocol, numa_node,
+         status, allocator_used_bytes, allocator_capacity_bytes,
          allocator_usage_percent);
 
 struct HttpSegmentsDetailResponse {
@@ -740,6 +741,7 @@ void MasterAdminServer::HandleGetSegmentsDetail(
 
             item.te_endpoint = info.te_endpoint;
             item.protocol = info.protocol;
+            item.numa_node = info.numa_node;
             item.status = EnumToString(info.status);
             item.allocator_used_bytes = info.allocator_used_bytes;
             item.allocator_capacity_bytes = info.allocator_capacity_bytes;

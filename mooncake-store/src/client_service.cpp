@@ -3532,6 +3532,20 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.size = size;
         segment.protocol = protocol;
         segment.host_id = host_id_;
+        constexpr std::string_view kCpuLocationPrefix = "cpu:";
+        if (location.starts_with(kCpuLocationPrefix)) {
+            try {
+                size_t parsed = 0;
+                const auto node = std::stoi(
+                    location.substr(kCpuLocationPrefix.size()), &parsed);
+                if (node >= 0 &&
+                    parsed == location.size() - kCpuLocationPrefix.size()) {
+                    segment.numa_node = node;
+                }
+            } catch (const std::exception&) {
+                VLOG(1) << "Ignore invalid CPU memory location: " << location;
+            }
+        }
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {

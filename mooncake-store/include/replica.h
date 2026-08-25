@@ -117,6 +117,7 @@ struct ReplicateConfig {
     std::vector<std::string>
         preferred_nof_segments{};  // Preferred NoF segments for allocation
     bool prefer_alloc_in_same_node{false};
+    struct_pack::compatible<int32_t, 1> preferred_numa_node;
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
     // Optional per-key routing group IDs. Empty string keeps that key
@@ -146,6 +147,8 @@ struct ReplicateConfig {
             os << "default";
         }
         os << ", with_hard_pin: " << config.with_hard_pin
+           << ", preferred_numa_node: "
+           << config.preferred_numa_node.value_or(-1)
            << ", preferred_segments: [";
         for (size_t i = 0; i < config.preferred_segments.size(); ++i) {
             os << config.preferred_segments[i];

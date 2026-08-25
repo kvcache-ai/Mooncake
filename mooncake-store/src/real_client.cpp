@@ -955,7 +955,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         std::vector<int> seg_numa_nodes;
         if (protocol == "rdma") {
             seg_numa_nodes = client_->GetNicNumaNodes();
-            if (seg_numa_nodes.size() > 1) {
+            if (!seg_numa_nodes.empty()) {
                 std::string nodes_str;
                 for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
                     if (i) nodes_str += ",";
@@ -963,10 +963,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 }
                 LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=["
                           << nodes_str << "]";
-            } else {
-                seg_numa_nodes.clear();
             }
         }
+        if (!seg_numa_nodes.empty()) {
+            const size_t per_node_limit =
+                align_up((global_segment_size + seg_numa_nodes.size() - 1) /
+                             seg_numa_nodes.size(),
+                         alignment);
+            if (!split_limit.has_value() || per_node_limit < *split_limit) {
+                split_limit = per_node_limit;
+            }
+        }
+        size_t next_numa_node = 0;
 
         const bool parallel_hugetlb_population =
             protocol == "rdma" && should_use_hugepage;
@@ -986,15 +994,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             std::string seg_location = kWildcardLocation;
 
             if (!seg_numa_nodes.empty()) {
-                // NUMA-segmented allocation: contiguous VMA, per-region binding
-                size_t page_sz = should_use_hugepage
-                                     ? get_hugepage_size_from_env()
-                                     : static_cast<size_t>(getpagesize());
-                mapped_size =
-                    align_up(segment_size, page_sz * seg_numa_nodes.size());
-                ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
+                const int numa_node =
+                    seg_numa_nodes[next_numa_node++ % seg_numa_nodes.size()];
+                const size_t page_sz = should_use_hugepage
+                                           ? get_hugepage_size_from_env()
+                                           : static_cast<size_t>(getpagesize());
+                mapped_size = align_up(segment_size, page_sz);
+                ptr = allocate_buffer_numa_segments(mapped_size, {numa_node},
                                                     page_sz);
-                seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
+                seg_location = "cpu:" + std::to_string(numa_node);
             } else if (should_use_hugepage) {
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
