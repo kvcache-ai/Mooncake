@@ -623,7 +623,7 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     auto entry = (ibv_mr*)id;
     // Cache addr/length before ibv_dereg_mr: entry is freed by dereg_mr, so
     // reading entry->addr/entry->length afterwards is a use-after-free.
-    void *region_addr = entry->addr;
+    void* region_addr = entry->addr;
     size_t region_length = entry->length;
     mr_set_mutex_.lock();
     mr_set_.erase(entry);
