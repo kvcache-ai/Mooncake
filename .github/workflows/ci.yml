@@ -15,6 +15,9 @@ on:
 permissions:
   contents: read
 
+env:
+  MOONCAKE_TEST_TORCH_VERSION: '2.13.0'
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
@@ -29,8 +32,9 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       (github.event_name == 'pull_request' &&
+        (github.event.action != 'labeled' ||
+         contains(github.event.pull_request.labels.*.name, 'run-ci'))))
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       python-versions: '["3.10", "3.12"]'
@@ -38,13 +42,14 @@ jobs:
       version-override: 0.0.0.dev0
 
   test-wheel-ubuntu:
-    needs: [spell-check, clang-format, build-wheel]
+    needs: [build-wheel]
     if: >-
       needs.build-wheel.result == 'success' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       (github.event_name == 'pull_request' &&
+        (github.event.action != 'labeled' ||
+         contains(github.event.pull_request.labels.*.name, 'run-ci'))))
     strategy:
       matrix:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
@@ -96,108 +101,6 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
-    - name: Run tests with ssd
-      run: |
-        # Reserve port 50052 (mooncake_client RPC port) so the kernel never
-        # auto-allocates it as ephemeral source port for other outbound
-        # connections in the test suite. Without this, a random Python test
-        # connection can pick src_port=50052, leave a TIME_WAIT on
-        # <eth0_ip>:50052 for 60s, and block mooncake_client's bind to
-        # 0.0.0.0:50052 even with SO_REUSEADDR (Linux only relaxes
-        # TIME_WAIT+bind conflict for same-IP or loopback).
-        sudo sysctl -w net.ipv4.ip_local_reserved_ports=50052
-        source test_env/bin/activate
-        MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
-        rm -rf /tmp/mooncake_test_ssd
-        deactivate
-      shell: bash
-
-    - name: Start Mooncake Master
-      run: |
-        source test_env/bin/activate
-        mkdir -p /tmp/mooncake_storage
-        mooncake_master \
-          --default_kv_lease_ttl=500 \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_test_cluster \
-          --port 50051 \
-          --enable_http_metadata_server=true &
-        sleep 3
-      shell: bash
-
-    - name: Run Python Tensor API Performance Test (CI check)
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        python scripts/test_tensor_api.py -n 1
-      shell: bash
-
-    - name: Run Python Async API Test (CI check)
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        python scripts/test_async_store.py
-      shell: bash
-
-    - name: Test Mooncake Copy/Move API
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        python scripts/test_copy_move_api.py
-      shell: bash
-
-    - name: Run Python Drain HTTP E2E Test (CI check)
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        python scripts/test_drain_http_api.py --timeout-sec 90
-      shell: bash
-
-    - name: Run RPC Communicator Bandwidth Test
-      run: |
-        source test_env/bin/activate
-        python mooncake-transfer-engine/tests/rpc_communicator_test.py server --url 127.0.0.1:9004 --data-size 1 &
-        SERVER_PID=$!
-        sleep 5
-        timeout 10 python mooncake-transfer-engine/tests/rpc_communicator_test.py client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
-        kill $SERVER_PID 2>/dev/null || true
-        wait $SERVER_PID 2>/dev/null || true
-
-    - name: Test Mooncake PyTorch Backend (CPU Only)
-      env:
-        MC_FORCE_TCP: "true"
-      run: |
-        source test_env/bin/activate
-        python mooncake-pg/tests/test_pg_collectives.py
-      shell: bash
-
-    - name: Test PyTorch >= 2.13 Single-Buffer Collectives (CPU Only)
-      env:
-        MC_FORCE_TCP: "true"
-      run: |
-        source test_env/bin/activate
-        python mooncake-pg/tests/test_pg_collectives.py \
-          TestMooncakePGCollectivesCPU.test_all_gather_into_tensor \
-          TestMooncakePGCollectivesCPU.test_reduce_scatter_sum
-      shell: bash
-
     - name: Test Safetensor Functions
       run: |
         source test_env/bin/activate
@@ -205,8 +108,203 @@ jobs:
         python -m unittest mooncake-wheel.tests.test_safetensor_functions
       shell: bash
 
+  test-pg-cpu:
+    name: Test PG CPU (Python 3.12, PyTorch 2.13)
+    needs: [build-wheel]
+    if: >-
+      needs.build-wheel.result == 'success' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        (github.event.action != 'labeled' ||
+         contains(github.event.pull_request.labels.*.name, 'run-ci'))))
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Download Python 3.12 wheel artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: mooncake-wheel-ci-py312
+        path: mooncake-wheel/dist
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+
+    - name: Install PG CPU test environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          libibverbs-dev \
+          libnuma-dev \
+          libssl-dev \
+          libcurl4-openssl-dev
+        python -m venv test_env
+        source test_env/bin/activate
+        python -m pip install --upgrade pip
+        python -m pip install \
+          mooncake-wheel/dist/*.whl \
+          "torch==${MOONCAKE_TEST_TORCH_VERSION}" \
+          numpy
+      shell: bash
+
+    - name: Run all PG CPU tests
+      env:
+        MC_FORCE_TCP: "true"
+      run: |
+        source test_env/bin/activate
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        python -c 'import os, torch; expected = os.environ["MOONCAKE_TEST_TORCH_VERSION"]; actual = torch.__version__.split("+", 1)[0]; assert actual == expected, f"expected PyTorch {expected}, got {actual}"'
+        python -m unittest discover -s mooncake-pg/tests -k CPU -v
+      shell: bash
+
+  unit-tests:
+    name: CTest unit tests (Python 3.12)
+    needs: [check-paths]
+    if: *run-ci-for-source-changes
+    runs-on: ubuntu-22.04
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install and start etcd
+      run: |
+        wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
+        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
+        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
+        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
+        sleep 3
+        ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+      shell: bash
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
+    - name: Install build utilities and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build
+        sudo bash -x dependencies.sh -y
+        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+      shell: bash
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Configure sccache
+      uses: actions/github-script@v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Configure project with unit tests
+      run: |
+        cmake -S . -B build -G Ninja \
+          -DUSE_HTTP=ON \
+          -DUSE_CXL=ON \
+          -DUSE_UB=ON \
+          -DUSE_ETCD=ON \
+          -DUSE_CUDA=ON \
+          -DWITH_P2P_STORE=ON \
+          -DSTORE_USE_ETCD=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_UNIT_TESTS=ON \
+          -DENABLE_SCCACHE=ON
+      shell: bash
+
+    - name: Configure CUDA driver runtime
+      run: |
+        cuda_driver_library=$(sed -n \
+          's/^CUDA_cuda_driver_LIBRARY:FILEPATH=//p' build/CMakeCache.txt)
+        if [ -z "$cuda_driver_library" ] || [ ! -f "$cuda_driver_library" ]; then
+          echo "::error::CMake did not resolve the CUDA driver library"
+          exit 1
+        fi
+
+        cuda_driver_dir=$(dirname "$cuda_driver_library")
+        if [ ! -e "$cuda_driver_dir/libcuda.so.1" ]; then
+          sudo ln -s "$(basename "$cuda_driver_library")" \
+            "$cuda_driver_dir/libcuda.so.1"
+        fi
+        echo "LIBRARY_PATH=$cuda_driver_dir:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$cuda_driver_dir:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+      shell: bash
+
+    - name: Build project and unit tests
+      run: |
+        cmake --build build --parallel 128
+        sudo -E cmake --install build
+      shell: bash
+
+    - name: Start Metadata Server
+      run: |
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
+        python ./bootstrap_server.py &
+        sleep 2
+      shell: bash
+
+    - name: Run all CTest unit tests
+      id: ctest
+      run: |
+        reserved_ports=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+        sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
+        mkdir -p build/test-results
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+        DEFAULT_KV_LEASE_TTL=500 \
+          ctest --test-dir build --parallel "$(nproc)" --output-on-failure \
+            --output-junit "$GITHUB_WORKSPACE/build/test-results/ctest.xml"
+      shell: bash
+
+    - name: Preserve CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: PR CTest failure
+        artifact-name: ctest-diagnostics-pr
+        junit-report: build/test-results/ctest.xml
+        failed-tests-log: build/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build/Testing/Temporary/LastTest.log
+
   build-flags:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [check-paths]
     if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     strategy:
@@ -294,8 +392,9 @@ jobs:
     if: &run-ci >-
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       (github.event_name == 'pull_request' &&
+        (github.event.action != 'labeled' ||
+         contains(github.event.pull_request.labels.*.name, 'run-ci'))))
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -464,8 +563,9 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       (github.event_name == 'pull_request' &&
+        (github.event.action != 'labeled' ||
+         contains(github.event.pull_request.labels.*.name, 'run-ci'))))
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -516,15 +616,10 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       (github.event_name == 'pull_request' &&
+        (github.event.action != 'labeled' ||
+         contains(github.event.pull_request.labels.*.name, 'run-ci'))))
     uses: ./.github/workflows/ci_rocm.yml
-    secrets: inherit
-
-  integration-test:
-    needs: [build-wheel-cu13, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
-    uses: ./.github/workflows/integration-test.yml
     secrets: inherit
 
   tent-ci:
@@ -534,8 +629,9 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       (github.event_name == 'pull_request' &&
+        (github.event.action != 'labeled' ||
+         contains(github.event.pull_request.labels.*.name, 'run-ci'))))
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -701,13 +797,14 @@ jobs:
       - reshard-type-check
       - reshard-test
       - build-wheel
+      - unit-tests
       - build-flags
       - test-wheel-ubuntu
+      - test-pg-cpu
       - build-wheel-cu13
       - build-wheel-efa
       - build-wheel-rocm
       - tent-ci
-      - integration-test
     runs-on: ubuntu-latest
     steps:
       - name: Check required job results

@@ -74,11 +74,13 @@ jobs:
           - variant: non-cuda
             architecture: x86_64
             artifact-prefix: nightly-non-cuda-x86
+          - variant: non-cuda
+            architecture: arm64
+            artifact-prefix: nightly-non-cuda-arm64
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       variant: ${{ matrix.variant }}
       architecture: ${{ matrix.architecture }}
-      python-versions: '["3.10", "3.12"]'
       artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
@@ -286,6 +288,7 @@ jobs:
           cd mooncake-transfer-engine/example/http-metadata-server-python
           pip install aiohttp
           python ./bootstrap_server.py &
+          echo "NIGHTLY_METADATA_SERVER_PID=$!" >> "$GITHUB_ENV"
           sleep 2
 
       - name: Run CTest unit tests
@@ -362,6 +365,50 @@ jobs:
         run: |
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           bash scripts/run_tests.sh
+
+      - name: Run Python API end-to-end tests
+        env:
+          MOONCAKE_MASTER: "127.0.0.1:50051"
+          MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+          MOONCAKE_PROTOCOL: "tcp"
+          LOCAL_HOSTNAME: "127.0.0.1"
+        run: |
+          export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+          kill "$NIGHTLY_METADATA_SERVER_PID" 2>/dev/null || true
+          for _ in {1..50}; do
+            if ! kill -0 "$NIGHTLY_METADATA_SERVER_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          if kill -0 "$NIGHTLY_METADATA_SERVER_PID" 2>/dev/null; then
+            kill -KILL "$NIGHTLY_METADATA_SERVER_PID"
+          fi
+          mkdir -p /tmp/mooncake_storage
+          mooncake_master \
+            --default_kv_lease_ttl=500 \
+            --eviction_high_watermark_ratio=0.95 \
+            --cluster_id=nightly_test_cluster \
+            --port 50051 \
+            --enable_http_metadata_server=true &
+          master_pid=$!
+          trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
+          sleep 3
+          python scripts/test_tensor_api.py -n 1
+          python scripts/test_async_store.py
+          python scripts/test_copy_move_api.py
+          python scripts/test_drain_http_api.py --timeout-sec 90
+
+      - name: Run RPC Communicator Bandwidth Test
+        run: |
+          python mooncake-transfer-engine/tests/rpc_communicator_test.py \
+            server --url 127.0.0.1:9004 --data-size 1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          sleep 5
+          timeout 10 python \
+            mooncake-transfer-engine/tests/rpc_communicator_test.py \
+            client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
 
   nightly-coverage:
     runs-on: ubuntu-22.04

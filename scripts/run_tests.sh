@@ -139,7 +139,14 @@ sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_replicated_distributed_object_store.py
 
-pip install torch numpy safetensors packaging
+TORCH_SPEC="torch"
+if [ -n "${MOONCAKE_TEST_TORCH_VERSION:-}" ]; then
+    TORCH_SPEC="torch==${MOONCAKE_TEST_TORCH_VERSION}"
+fi
+pip install "$TORCH_SPEC" numpy safetensors packaging
+if [ -n "${MOONCAKE_TEST_TORCH_VERSION:-}" ]; then
+    python -c 'import os, torch; expected = os.environ["MOONCAKE_TEST_TORCH_VERSION"]; actual = torch.__version__.split("+", 1)[0]; assert actual == expected, f"expected PyTorch {expected}, got {actual}"'
+fi
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_safetensor_functions.py
 sleep 1
