@@ -678,8 +678,8 @@ class Client {
     std::unordered_set<std::string> GetLocalEndpoints() const {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         std::unordered_set<std::string> endpoints;
-        for (const auto& [segment_id, segment] : mounted_segments_) {
-            endpoints.insert(segment.te_endpoint);
+        for (const auto& [segment_id, entry] : mounted_segments_) {
+            endpoints.insert(entry.segment.te_endpoint);
         }
         return endpoints;
     }
@@ -929,9 +929,27 @@ class Client {
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
+    enum class SegmentSyncState : uint8_t {
+        NEW_PENDING = 0,
+        REMOUNT_PENDING,
+        ALIGNED,
+    };
+
+    struct MountedSegmentEntry {
+        Segment segment;
+        SegmentSyncState sync_state{SegmentSyncState::NEW_PENDING};
+    };
+
+    using MountedSegmentMap =
+        std::unordered_map<UUID, MountedSegmentEntry, boost::hash<UUID>>;
+
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
-    std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+    MountedSegmentMap mounted_segments_;
+    // True after the latest full segment reconciliation succeeds. Guarded by
+    // mounted_segments_mutex_ so mounts and NEED_REMOUNT transitions have one
+    // ordering point.
+    bool segments_aligned_with_master_{false};
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.
@@ -946,7 +964,7 @@ class Client {
      *        Caller must hold mounted_segments_mutex_.
      */
     tl::expected<void, ErrorCode> UnmountSegmentImpl(
-        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+        MountedSegmentMap::iterator it);
 
     void StartGracefulUnmountTimer(const UUID& segment_id,
                                    uint64_t grace_period_ms);

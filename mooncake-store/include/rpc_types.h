@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 
 #include "types.h"
@@ -7,6 +8,32 @@
 #include "task_manager.h"
 
 namespace mooncake {
+
+/**
+ * @brief Describes how the master should reconcile a segment registration.
+ *
+ * This is request intent, not the master-side availability status of a
+ * segment. The same segment is NEW when first registered with a master and
+ * REMOUNT when it is registered again after master-side state is lost.
+ */
+enum class SegmentRegistrationIntent : uint8_t {
+    NEW = 0,
+    REMOUNT = 1,
+};
+
+/**
+ * @brief A segment descriptor paired with its reconciliation intent.
+ */
+struct SegmentUpdate {
+    Segment segment;
+    SegmentRegistrationIntent intent{SegmentRegistrationIntent::NEW};
+
+    SegmentUpdate() = default;
+    SegmentUpdate(const Segment& segment_param,
+                  SegmentRegistrationIntent intent_param)
+        : segment(segment_param), intent(intent_param) {}
+};
+YLT_REFL(SegmentUpdate, segment, intent);
 
 struct ObjectMeta {
     std::string key;
