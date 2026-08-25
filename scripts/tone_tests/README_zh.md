@@ -2,11 +2,22 @@
 
 ## 概述
 
-本目录包含 Mooncake 项目的端到端（E2E）测试用例，这些用例被用来做CI测试，会在 [T-One](https://tone.openanolis.cn) 平台上执行。
+本目录包含 Mooncake 项目共享的端到端（E2E）测试用例。之所以保留历史路径，
+是因为外部 [T-One](https://tone.openanolis.cn) 模板会直接调用
+`scripts/tone_tests/scripts/run_test.sh`。
+
+执行后端与共享用例已经分离：
+
+- `tone` 是默认后端，通过 T-One 运行 CUDA/SGLang 测试。
+- `rocm` 仅由 `integration-test-rocm.yml` 选择，在专用的双机 MI350X
+  self-hosted 资源上运行。
+
+后端独有的拓扑、镜像、wheel 来源和 SSH 配置位于 `scripts/backends/`；测试断言继续共享。
 
 ## 测试环境
 
-- **当前支持**：2 台 A10 GPU 服务器
+- **Tone**：2 台 A10 GPU 服务器
+- **ROCm**：专用 4+4 MI350X 资源
 - **未来扩展**：可能支持更多机器配置
 
 ## 当前支持的测试用例
@@ -185,7 +196,7 @@ run_test()
     ${docker_exec} "\
         cd /test_workspace && \
         python3 -m pytest test_demo.py -v -s --tb=long" | tee "$log_file"
-    
+
     return ${PIPESTATUS[0]}
 }
 
@@ -211,7 +222,7 @@ if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
     if ! run_test; then
         exit_code=1
     fi
-    
+
     parse $exit_code
     exit $?
 fi

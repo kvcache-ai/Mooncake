@@ -476,10 +476,10 @@ jobs:
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
-  integration-test:
+  tone-integration-test:
     needs: [build-wheel-cu13, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
-    uses: ./.github/workflows/integration-test.yml
+    uses: ./.github/workflows/integration-test-tone.yml
     secrets: inherit
 
   rocm-integration-test:
@@ -657,7 +657,7 @@ jobs:
       - build-wheel-efa
       - build-wheel-rocm
       - tent-ci
-      - integration-test
+      - tone-integration-test
     runs-on: ubuntu-latest
     steps:
       - name: Check required job results
