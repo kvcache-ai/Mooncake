@@ -932,8 +932,7 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
             TransferStatus overall_status;
             auto status = getTransferStatus(batch_id, overall_status);
             if (status.ok() && overall_status.s != PENDING) {
-                for (size_t type = 0; type < kSupportedTransportTypes;
-                     ++type) {
+                for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                     auto& transport = transport_list_[type];
                     auto& sub_batch = batch->sub_batch[type];
                     if (transport && sub_batch)
@@ -1054,8 +1053,7 @@ Status TransferEngineImpl::lazyFreeBatch() {
             }
             {
                 BatchShard& shard = batchShard(batch_id);
-                std::lock_guard<std::recursive_mutex> shard_reg_lk(
-                    shard.mtx);
+                std::lock_guard<std::recursive_mutex> shard_reg_lk(shard.mtx);
                 shard.active_batches.erase(batch);
                 shard.alive_batches.erase(batch_id);
             }
@@ -1089,7 +1087,8 @@ Status TransferEngineImpl::releaseBatch(Batch* batch) {
         std::lock_guard<std::recursive_mutex> shard_lk(
             progressLockFor((BatchID)batch));
         if (batch->runtime_refs == 0) {
-            return Status::InternalError("Batch runtime ref underflow" LOC_MARK);
+            return Status::InternalError(
+                "Batch runtime ref underflow" LOC_MARK);
         }
         --batch->runtime_refs;
         deferred_free = (batch->runtime_refs == 0 && batch->free_requested);

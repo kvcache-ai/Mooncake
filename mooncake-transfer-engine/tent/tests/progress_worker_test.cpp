@@ -1572,8 +1572,9 @@ TEST(ProgressLockShard, ConcurrentIndependentBatchPolls) {
                             ++failures;
                             return;
                         }
-                        if (!engine.submitTransfer(
-                                     batch_id, {makeLocalWriteReq(ptr, kBufLen)})
+                        if (!engine
+                                 .submitTransfer(batch_id, {makeLocalWriteReq(
+                                                               ptr, kBufLen)})
                                  .ok()) {
                             ++failures;
                             (void)engine.freeBatch(batch_id);
@@ -1614,7 +1615,8 @@ TEST(ProgressLockShard, PollRacesWithFreeSameBatch) {
     BatchID batch_id = engine.allocateBatch(1);
     ASSERT_NE(batch_id, (BatchID)0);
     ASSERT_TRUE(
-        engine.submitTransfer(batch_id, {makeLocalWriteReq(buf.data(), kBufLen)})
+        engine
+            .submitTransfer(batch_id, {makeLocalWriteReq(buf.data(), kBufLen)})
             .ok());
 
     std::atomic<bool> stop{false};
@@ -1679,9 +1681,10 @@ TEST(ProgressLockShard, RuntimeQueuePollAndFreeDoesNotDeadlock) {
     for (int i = 0; i < kBatches; ++i) {
         BatchID batch_id = engine.allocateBatch(1);
         ASSERT_NE(batch_id, (BatchID)0);
-        ASSERT_TRUE(engine.submitTransfer(
-                             batch_id, {makeLocalWriteReq(
-                                           buf.data() + i * kBufLen, kBufLen)})
+        ASSERT_TRUE(engine
+                        .submitTransfer(batch_id,
+                                        {makeLocalWriteReq(
+                                            buf.data() + i * kBufLen, kBufLen)})
                         .ok());
         batches.push_back(batch_id);
     }
@@ -1710,7 +1713,6 @@ TEST(ProgressLockShard, RuntimeQueuePollAndFreeDoesNotDeadlock) {
 
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
 }
-
 
 }  // namespace
 }  // namespace tent
