@@ -386,7 +386,7 @@ Status TransferEngineImpl::construct() {
         conf_->get("runtime_queue/max_dispatch_bytes", 64UL << 20);
     runtime_queue_config_.progress_fallback_interval =
         std::chrono::microseconds(
-            conf_->get("runtime_queue/progress_fallback_interval_us", 50000UL));
+            conf_->get("runtime_queue/progress_fallback_interval_us", 5000UL));
     if (runtime_queue_config_.enabled &&
         (runtime_queue_config_.max_dispatch_owners == 0 ||
          runtime_queue_config_.max_dispatch_bytes == 0)) {

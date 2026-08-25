@@ -503,7 +503,7 @@ class TransferEngineImpl {
         QueueLimits limits{};
         size_t max_dispatch_owners{0};
         size_t max_dispatch_bytes{0};
-        std::chrono::microseconds progress_fallback_interval{50000};
+        std::chrono::microseconds progress_fallback_interval{5000};
     };
 
     struct QueuedOwnerState {
