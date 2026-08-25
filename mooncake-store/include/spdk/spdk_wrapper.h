@@ -53,6 +53,25 @@ class SpdkWrapper {
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
 
+    /** @brief Register external memory with SPDK for NoF zero-copy transfers.
+     *
+     * Memory returned by Alloc() is already registered with SPDK; use this to
+     * register memory allocated outside of SPDK (e.g. mmap'd shared memory) so
+     * that NoF RDMA transfers can DMA to/from it directly
+     * (spdk_rdma_get_translation).
+     *
+     * @param addr Start of the region; must be page-aligned.
+     * @param size Region length; must be a multiple of the page size.
+     * @return 0 on success, non-zero on failure.
+     */
+    int RegisterMemory(void *addr, size_t size);
+
+    /** @brief Unregister memory previously registered via RegisterMemory().
+     *
+     * @return 0 on success, non-zero on failure.
+     */
+    int UnregisterMemory(void *addr, size_t size);
+
    private:
     struct ProbeBuffer {
         void *ptr{nullptr};

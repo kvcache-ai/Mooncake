@@ -184,6 +184,34 @@ void SpdkWrapper::Free(void *ptr) {
     }
 }
 
+int SpdkWrapper::RegisterMemory(void *addr, size_t size) {
+    if (!addr || size == 0) {
+        return -1;
+    }
+    if (!InitializeEnv()) {
+        LOG(ERROR) << "SPDK env init failed, cannot register memory";
+        return -1;
+    }
+    int rc = spdk_mem_register(addr, size);
+    if (rc != 0) {
+        LOG(ERROR) << "spdk_mem_register failed (addr=" << addr
+                   << ", size=" << size << "): " << strerror(-rc);
+    }
+    return rc;
+}
+
+int SpdkWrapper::UnregisterMemory(void *addr, size_t size) {
+    if (!addr || size == 0) {
+        return -1;
+    }
+    int rc = spdk_mem_unregister(addr, size);
+    if (rc != 0) {
+        LOG(ERROR) << "spdk_mem_unregister failed (addr=" << addr
+                   << ", size=" << size << "): " << strerror(-rc);
+    }
+    return rc;
+}
+
 void SpdkWrapper::ProbeReadComplete(void *ctx,
                                     const struct spdk_nvme_cpl *cpl) {
     auto *probe_ctx = reinterpret_cast<ProbeRequestContext *>(ctx);

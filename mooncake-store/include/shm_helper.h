@@ -26,6 +26,7 @@ class ShmHelper {
         size_t size = 0;
         std::string name;
         bool registered = false;
+        bool spdk_registered = false;
         bool is_local = false;
     };
 
@@ -55,6 +56,7 @@ class ShmHelper {
     std::vector<std::shared_ptr<ShmSegment>> shms_;
     static std::mutex shm_mutex_;
     bool use_hugepage_ = false;
+    bool register_spdk_ = false;
 };
 
 }  // namespace mooncake
