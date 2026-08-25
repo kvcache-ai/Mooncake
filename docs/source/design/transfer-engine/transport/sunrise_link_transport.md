@@ -44,7 +44,7 @@ cd Mooncake
 cmake -B build -G Ninja -DUSE_TENT=ON -DUSE_SUNRISE=ON
 
 # Build
-cmake --build
+cmake --build build
 ```
 
 If Tang Runtime is installed at a non-default location:
