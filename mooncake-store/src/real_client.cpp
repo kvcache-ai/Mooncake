@@ -5045,6 +5045,36 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
+                   << ", buffers=" << buffers.size()
+                   << ", sizes=" << sizes.size();
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (keys.empty()) {
+        return {};
+    }
+
+    const auto query_results = client_->BatchQuery(keys);
+    return batch_get_into_internal(
+        keys, buffers, sizes, query_results,
+        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
+            return batch_get_into_offload_object_internal(endpoint, objects);
+        });
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_internal(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+    const LocalDiskOffloadReader &local_disk_reader) {
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
@@ -5053,10 +5083,12 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+    if (keys.size() != buffers.size() || keys.size() != sizes.size() ||
+        keys.size() != query_results.size()) {
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
                    << ", buffers=" << buffers.size()
-                   << ", sizes=" << sizes.size();
+                   << ", sizes=" << sizes.size()
+                   << ", query_results=" << query_results.size();
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -5067,9 +5099,6 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     if (num_keys == 0) {
         return results;
     }
-
-    // Query metadata for all keys
-    const auto query_results = client_->BatchQuery(keys);
 
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
@@ -5310,7 +5339,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::chrono::steady_clock::now();
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        auto batch_get_offload_result = batch_get_into_offload_object_internal(
+        auto batch_get_offload_result = local_disk_reader(
             offload_objects_it.first, offload_objects_it.second);
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
