@@ -20,21 +20,19 @@ std::string HostFromRpc(const std::string& address) {
 bool HasTcp(const BufferDesc& buffer) { return std::find(buffer.transports.begin(), buffer.transports.end(), TransportType::TCP) != buffer.transports.end(); }
 }
 
-HighPerformanceTcpTransport::HighPerformanceTcpTransport() { caps.dram_to_dram = true; }
-HighPerformanceTcpTransport::~HighPerformanceTcpTransport() { uninstall(); }
+HighPerformanceTcpTransport::HighPerformanceTcpTransport()
+    : HighPerformanceTcpTransport(HighPerformanceTcpParams{}) {}
 
-Status HighPerformanceTcpTransport::parseParams(const std::shared_ptr<Config>& config) {
-    if (!config) return Status::InvalidArgument("High-performance TCP requires configuration" LOC_MARK);
-    params_.bind_address=config->get("transports/tcp/high_performance/bind_address",""); params_.advertise_address=config->get("transports/tcp/high_performance/advertise_address",""); params_.port=config->get("transports/tcp/high_performance/port",0);
-    params_.worker_count=config->get("transports/tcp/high_performance/worker_count",16UL); params_.queue_capacity_per_worker=config->get("transports/tcp/high_performance/queue_capacity_per_worker",256UL); params_.connections_per_peer=config->get("transports/tcp/high_performance/connections_per_peer",4UL);
-    params_.max_outstanding_tasks=config->get("transports/tcp/high_performance/max_outstanding_tasks",4096ULL); params_.max_outstanding_bytes=config->get("transports/tcp/high_performance/max_outstanding_bytes",1ULL<<32); params_.max_transfer_bytes=config->get("transports/tcp/high_performance/max_transfer_bytes",1ULL<<30); params_.chunk_size=config->get("transports/tcp/high_performance/chunk_size",1ULL<<20); params_.connect_timeout_ms=config->get("transports/tcp/high_performance/connect_timeout_ms",2000ULL); params_.progress_timeout_ms=config->get("transports/tcp/high_performance/progress_timeout_ms",30000ULL);
-    if (!params_.worker_count || !params_.queue_capacity_per_worker || !params_.connections_per_peer || !params_.max_outstanding_tasks || !params_.max_outstanding_bytes || !params_.max_transfer_bytes || !params_.chunk_size || params_.chunk_size > params_.max_transfer_bytes || !params_.connect_timeout_ms || !params_.progress_timeout_ms) return Status::InvalidArgument("Invalid high-performance TCP parameters" LOC_MARK);
-    return Status::OK();
+HighPerformanceTcpTransport::HighPerformanceTcpTransport(
+    HighPerformanceTcpParams params)
+    : params_(std::move(params)) {
+    caps.dram_to_dram = true;
 }
+HighPerformanceTcpTransport::~HighPerformanceTcpTransport() { uninstall(); }
 std::string HighPerformanceTcpTransport::makeIncarnation() const { std::random_device d; std::mt19937_64 r(d()); std::ostringstream o; for(int i=0;i<2;++i) o << std::hex << std::setw(16) << std::setfill('0') << r(); return o.str(); }
 
 Status HighPerformanceTcpTransport::install(std::string& name, std::shared_ptr<ControlService> metadata, std::shared_ptr<Topology>, std::shared_ptr<Config> config) {
-    if (installed_) return Status::InvalidArgument("HP TCP already installed" LOC_MARK); CHECK_STATUS(parseParams(config)); metadata_=std::move(metadata); local_segment_name_=name;
+    if (installed_) return Status::InvalidArgument("HP TCP already installed" LOC_MARK); metadata_=std::move(metadata); local_segment_name_=name;
     workers_=std::make_unique<HighPerformanceTcpWorkers>(HighPerformanceTcpWorkers::Config{params_.worker_count,params_.queue_capacity_per_worker}); CHECK_STATUS(workers_->start());
     server_=std::make_unique<HighPerformanceTcpServer>(HighPerformanceTcpServer::Config{params_.bind_address,params_.port,params_.max_transfer_bytes,params_.chunk_size},&registry_); uint16_t bound=0; auto status=server_->start(&bound); if(!status.ok()){workers_->stop();workers_.reset();server_.reset();return status;}
     auto local=metadata_->segmentManager().getLocal(); auto host=params_.advertise_address.empty()?HostFromRpc(local->rpc_server_addr):params_.advertise_address; if(host.empty()){server_->stop();workers_->stop();return Status::InvalidArgument("Unable to derive HP TCP advertise address" LOC_MARK);}

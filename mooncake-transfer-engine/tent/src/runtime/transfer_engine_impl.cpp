@@ -335,6 +335,7 @@ Status TransferEngineImpl::setupLocalSegment() {
 }
 
 Status TransferEngineImpl::construct() {
+    CHECK_STATUS(ParseTcpTransportConfig(*conf_, &tcp_transport_config_));
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
 
@@ -389,25 +390,8 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->loadFromConfig(*conf_, {loader}));
 
-    bool high_performance_tcp = false;
-    std::string tcp_config;
-    if (conf_->dumpSubtree("transports/tcp", &tcp_config)) {
-        try {
-            auto tcp = json::parse(tcp_config);
-            if (tcp.contains("implementation")) {
-                if (!tcp["implementation"].is_string()) {
-                    return Status::InvalidArgument("transports/tcp/implementation must be a string" LOC_MARK);
-                }
-                const auto implementation = tcp["implementation"].get<std::string>();
-                if (implementation == "high_performance") high_performance_tcp = true;
-                else if (implementation != "standard") return Status::InvalidArgument("Unsupported transports/tcp/implementation" LOC_MARK);
-            }
-        } catch (const std::exception& error) {
-            return Status::MalformedJson(std::string("Invalid transports/tcp configuration: ") + error.what() + LOC_MARK);
-        }
-    }
     metadata_ = std::make_shared<ControlService>(metadata_type, metadata_servers,
-                                                  this, !high_performance_tcp);
+                                                  this, !tcp_transport_config_.hpRequired());
 
     CHECK_STATUS(metadata_->start(port_, ipv6_, rpc_server_threads));
 
@@ -438,8 +422,8 @@ Status TransferEngineImpl::construct() {
             auto status = transport->install(local_segment_name_, metadata_,
                                              topology_, conf_);
             if (!status.ok()) {
-                if (high_performance_tcp && transport_index == static_cast<size_t>(TransportType::TCP)) {
-                    return Status::InternalError("High-performance TCP is required but failed to install: " + status.ToString() + LOC_MARK);
+                if (tcp_transport_config_.hpRequired() && transport_index == static_cast<size_t>(TransportType::TCP)) {
+                    return status;
                 }
                 LOG(WARNING) << "Transport " << transport->getName()
                              << " skipped: " << status.ToString();
@@ -876,8 +860,13 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
     auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             removed = true;
-            for (auto type : desc.transports) {
-                auto status = transport_list_[type]->removeMemoryBuffer(desc);
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                auto& transport = transport_list_[type];
+                if (!transport) continue;
+                const auto transport_type = static_cast<TransportType>(type);
+                const bool advertised = std::find(desc.transports.begin(), desc.transports.end(), transport_type) != desc.transports.end();
+                if (!advertised && !transport->tracksLocalBuffer(desc)) continue;
+                auto status = transport->removeMemoryBuffer(desc);
                 if (!status.ok()) LOG(WARNING) << status.ToString();
             }
             return Status::OK();
@@ -900,8 +889,13 @@ Status TransferEngineImpl::unregisterLocalMemory(
             (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
             [&](BufferDesc& desc) -> Status {
                 removed = true;
-                for (auto type : desc.transports) {
-                    auto s = transport_list_[type]->removeMemoryBuffer(desc);
+                for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                    auto& transport = transport_list_[type];
+                    if (!transport) continue;
+                    const auto transport_type = static_cast<TransportType>(type);
+                    const bool advertised = std::find(desc.transports.begin(), desc.transports.end(), transport_type) != desc.transports.end();
+                    if (!advertised && !transport->tracksLocalBuffer(desc)) continue;
+                    auto s = transport->removeMemoryBuffer(desc);
                     if (!s.ok()) LOG(WARNING) << s.ToString();
                 }
                 return Status::OK();

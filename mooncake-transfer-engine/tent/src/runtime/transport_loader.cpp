@@ -54,25 +54,13 @@ namespace mooncake {
 namespace tent {
 
 Status TransferEngineImpl::loadTransports() {
-    if (conf_->get("transports/tcp/enable", true)) {
-        std::string subtree;
-        std::string implementation = "standard";
-        if (conf_->dumpSubtree("transports/tcp", &subtree)) {
-            try {
-                auto tcp = json::parse(subtree);
-                if (tcp.contains("implementation")) {
-                    if (!tcp["implementation"].is_string()) {
-                        return Status::InvalidArgument("transports/tcp/implementation must be a string" LOC_MARK);
-                    }
-                    implementation = tcp["implementation"].get<std::string>();
-                }
-            } catch (const std::exception& error) {
-                return Status::MalformedJson(std::string("Invalid transports/tcp configuration: ") + error.what() + LOC_MARK);
-            }
+    if (tcp_transport_config_.enabled) {
+        if (tcp_transport_config_.implementation == TcpImplementation::kStandard) {
+            transport_list_[TCP] = std::make_shared<TcpTransport>();
+        } else {
+            transport_list_[TCP] = std::make_shared<HighPerformanceTcpTransport>(
+                tcp_transport_config_.high_performance);
         }
-        if (implementation == "standard") transport_list_[TCP] = std::make_shared<TcpTransport>();
-        else if (implementation == "high_performance") transport_list_[TCP] = std::make_shared<HighPerformanceTcpTransport>();
-        else return Status::InvalidArgument("Unsupported transports/tcp/implementation" LOC_MARK);
     }
 
     // SHM is opt-in: default false because the current path is not NUMA-aware
