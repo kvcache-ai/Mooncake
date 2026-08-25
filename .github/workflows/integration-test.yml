@@ -11,13 +11,66 @@ on:
         description: 'PR number (passed from parent workflow for workflow_dispatch)'
         required: false
         type: string
+      testpypi_version:
+        description: 'Exact TestPyPI CUDA 13 package version to test instead of a CI artifact'
+        required: false
+        default: ''
+        type: string
 
 jobs:
-  test-sglang-integration:
+  test-tone-integration:
     runs-on: ubuntu-latest
     env:
       tone_user_name: ${{ secrets.TONE_USER_NAME }}
     steps:
+      - name: Require T-one credentials for the pre-release gate
+        if: ${{ inputs.testpypi_version != '' }}
+        env:
+          TONE_USER_NAME: ${{ secrets.TONE_USER_NAME }}
+          TONE_USER_TOKEN: ${{ secrets.TONE_USER_TOKEN }}
+        run: |
+          if [ -z "$TONE_USER_NAME" ] || [ -z "$TONE_USER_TOKEN" ]; then
+            echo "TONE_USER_NAME and TONE_USER_TOKEN are required for pre-release validation"
+            exit 1
+          fi
+
+      - name: Set up Python for TestPyPI download
+        if: ${{ inputs.testpypi_version != '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download the exact indexed CUDA 13 wheel
+        if: ${{ inputs.testpypi_version != '' }}
+        env:
+          TESTPYPI_VERSION: ${{ inputs.testpypi_version }}
+        run: |
+          set -euo pipefail
+          python -m pip download \
+            --index-url https://test.pypi.org/simple \
+            --no-cache-dir \
+            --no-deps \
+            --only-binary=:all: \
+            --pre \
+            --dest integration-wheel \
+            "mooncake-transfer-engine-cuda13==${TESTPYPI_VERSION}"
+
+          mapfile -t wheels < <(find integration-wheel -maxdepth 1 -name "*.whl")
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "Expected one TestPyPI wheel, found ${#wheels[@]}"
+            exit 1
+          fi
+
+      - name: Stage the indexed wheel for T-one
+        if: ${{ inputs.testpypi_version != '' }}
+        id: testpypi-wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-testpypi-tone-${{ inputs.testpypi_version }}
+          path: integration-wheel/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
       - name: trigger T-one test
         if: ${{ env.tone_user_name != '' }}
         run: |
@@ -30,62 +83,69 @@ jobs:
             PR_ID=""
           fi
           echo "PR_ID=${PR_ID}"
-          max_attempts=120
-          attempt=1
-          while [ $attempt -le $max_attempts ]; do
-            echo "Attempt $attempt: Fetching artifact..."
-            echo "Target SHA=${SHA}"
-            artifact_id=""
-            run_id=""
-            if curl -L -fs -o runs.json -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/${{ github.repository }}/actions/runs?head_sha=${SHA}&per_page=100"; then
-              if jq empty runs.json >/dev/null 2>&1; then
-                run_id=$(jq -r '.workflow_runs[] | select((.path == ".github/workflows/ci.yml") or (.name == "Build & Test (Linux)")) | .id' runs.json | head -n 1)
-              else
-                echo "Failed to download workflow run list. Retrying..."
-              fi
-              if [ -n "$run_id" ]; then
-                echo "Matched workflow run id $run_id"
-                if curl -L -fs -o artifact.json -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${run_id}/artifacts?per_page=100"; then
-                  if jq empty artifact.json >/dev/null 2>&1; then
-                    artifact_id=$(jq -r '.artifacts[] | select(.name | contains("py312") ) | select(.name | contains("mooncake") ) | select(.name | contains("cu130") ) | .id' artifact.json | head -n 1)
-                    if [ -z "$artifact_id" ]; then
-                      echo "Available artifacts in workflow run $run_id:"
-                      jq -r '.artifacts[].name' artifact.json || true
+          artifact_id="${{ steps.testpypi-wheel.outputs.artifact-id }}"
+          if [ -n "$artifact_id" ]; then
+            echo "Using TestPyPI wheel artifact id $artifact_id"
+          else
+            max_attempts=120
+            attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt: Fetching artifact..."
+              echo "Target SHA=${SHA}"
+              run_id=""
+              if curl -L -fs -o runs.json -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/${{ github.repository }}/actions/runs?head_sha=${SHA}&per_page=100"; then
+                if jq empty runs.json >/dev/null 2>&1; then
+                  run_id=$(jq -r '.workflow_runs[] | select((.path == ".github/workflows/ci.yml") or (.name == "Build & Test (Linux)")) | .id' runs.json | head -n 1)
+                else
+                  echo "Failed to download workflow run list. Retrying..."
+                fi
+                if [ -n "$run_id" ]; then
+                  echo "Matched workflow run id $run_id"
+                  if curl -L -fs -o artifact.json -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${run_id}/artifacts?per_page=100"; then
+                    if jq empty artifact.json >/dev/null 2>&1; then
+                      artifact_id=$(jq -r '.artifacts[] | select(.name | contains("py312") ) | select(.name | contains("mooncake") ) | select(.name | contains("cu130") ) | .id' artifact.json | head -n 1)
+                      if [ -z "$artifact_id" ]; then
+                        echo "Available artifacts in workflow run $run_id:"
+                        jq -r '.artifacts[].name' artifact.json || true
+                      fi
+                    else
+                      echo "Failed to download artifact list. Retrying..."
                     fi
                   else
-                    echo "Failed to download artifact list. Retrying..."
+                    echo "Failed to fetch artifacts for workflow run $run_id. Retrying..."
                   fi
                 else
-                  echo "Failed to fetch artifacts for workflow run $run_id. Retrying..."
+                  echo "Failed to find Build & Test workflow run for SHA $SHA. Retrying..."
+                  echo "Available workflow runs for SHA:"
+                  jq -r '.workflow_runs[] | "\(.id) \(.name) \(.path) \(.status) \(.conclusion)"' runs.json || true
+                fi
+                if [ -n "$artifact_id" ]; then
+                  echo "Successfully fetched expected artifact id $artifact_id"
+                  break
+                else
+                  echo "Failed to fetch expected artifact. Retrying..."
+                  if [ $attempt -lt $max_attempts ]; then
+                    sleep $((attempt * 60 < 600 ? attempt * 60 : 600))
+                  fi
                 fi
               else
-                echo "Failed to find Build & Test workflow run for SHA $SHA. Retrying..."
-                echo "Available workflow runs for SHA:"
-                jq -r '.workflow_runs[] | "\(.id) \(.name) \(.path) \(.status) \(.conclusion)"' runs.json || true
-              fi
-              if [ -n "$artifact_id" ]; then
-                echo "Successfully fetched expected artifact id $artifact_id"
-                break
-              else
-                echo "Failed to fetch expected artifact. Retrying..."
+                echo "Failed to fetch workflow runs. Retrying..."
                 if [ $attempt -lt $max_attempts ]; then
-                  sleep $((attempt * 60 < 600 ? attempt * 60 : 600))
+                  sleep $((attempt * 60))
                 fi
               fi
-            else
-              echo "Failed to fetch workflow runs. Retrying..."
-              if [ $attempt -lt $max_attempts ]; then
-                sleep $((attempt * 60))
-              fi
+              attempt=$((attempt + 1))
+            done
+            if [ $attempt -gt $max_attempts ]; then
+              echo "Failed to fetch artifacts after $max_attempts attempts"
+              exit 1
             fi
-            attempt=$((attempt + 1))
-          done
-          if [ $attempt -gt $max_attempts ]; then
-            echo "Failed to fetch artifacts after $max_attempts attempts"
-            exit 1
           fi
 
           ENV_INFO="ARTIFACT_ID=${artifact_id} GIT_REPO=${{ github.repository }}"
+          if [ -n "${{ inputs.testpypi_version }}" ]; then
+            ENV_INFO="${ENV_INFO} BRANCH=${{ github.ref_name }}"
+          fi
           if [ -n "$PR_ID" ]; then
             ENV_INFO="${ENV_INFO} PR_ID=${PR_ID}"
           fi

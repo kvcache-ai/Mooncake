@@ -1,53 +1,24 @@
-"""Guard the glibc floor of CI and release wheels.
-
-Distributable wheels must take their manylinux platform tag from a pinned
-container image, never from the GitHub runner. ``scripts/build_wheel.sh`` derives
-``PLATFORM_TAG`` from the *build host's* glibc (``detect_glibc_version``), so a
-job running on a bare runner silently re-tags itself whenever GitHub bumps the
-runner image. That is not hypothetical: the published aarch64 floor moved from
-``manylinux_2_35`` (0.3.9) to ``manylinux_2_39`` (0.3.10) with no code change,
-which stops ARM Ubuntu 22.04 from resolving any wheel and contradicts the
-"OS: Ubuntu 22.04 LTS+" contract in docs/source/getting_started/build.md.
-
-Running CI and release builds through the same manylinux workflow makes the
-detected glibc a constant of the image instead of a property of the runner. See
-#2858.
-"""
+"""Regression guards for shared wheel builds and the pre-release gate."""
 
 from __future__ import annotations
 
-import re
+import json
 from pathlib import Path
 
 import pytest
 
 yaml = pytest.importorskip("yaml")
 
-# Jobs delegating to this reusable workflow produce the standard CUDA and
-# non-CUDA wheel artifacts. Hardware-specific release-{efa,efa-non-cuda,musa,
-# npu}.yaml workflows do not call it and are out of scope.
 SHARED_BUILD_WORKFLOW = "_build-wheel.yaml"
-
-# The floor must come from a named manylinux image, matched to the runner's
-# architecture: an aarch64 image on an x86 runner (or vice versa) is a
-# misconfiguration, not a pinned floor. Deliberately not a digest assertion;
-# pinning digests is worth doing for both arches at once, not here.
-ARCH_CONTAINER = {
-    "aarch64": re.compile(r"^pytorch/manylinuxaarch64-builder:cuda\d+\.\d+$"),
-    "x86_64": re.compile(r"^pytorch/manylinux2_28-builder:cuda\d+\.\d+$"),
+CORE_PACKAGES = {
+    "mooncake-transfer-engine",
+    "mooncake-transfer-engine-cuda13",
+    "mooncake-transfer-engine-non-cuda",
 }
 
 
-def _runner_arch(runner: str) -> str:
-    return "aarch64" if runner.endswith("-arm") else "x86_64"
-
-
 def _find_workflows_dir() -> Path | None:
-    """Locate .github/workflows, or None when the suite has been detached.
-
-    scripts/test_installation.sh copies this directory into a scratch tree, so
-    the workflow sources are not always reachable from __file__.
-    """
+    """Locate .github/workflows, or None when the suite has been detached."""
     for parent in Path(__file__).resolve().parents:
         candidate = parent / ".github" / "workflows"
         if candidate.is_dir():
@@ -61,57 +32,200 @@ if WORKFLOWS_DIR is None:
     pytest.skip("workflow sources not available", allow_module_level=True)
 
 
+def _load_workflow(name: str) -> dict:
+    return yaml.safe_load((WORKFLOWS_DIR / name).read_text()) or {}
+
+
+def _commands(job: dict) -> str:
+    return "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
+
+
+def _command_step(job: dict, fragment: str) -> tuple[int, dict]:
+    matches = [
+        (index, step)
+        for index, step in enumerate(job.get("steps", []))
+        if fragment in str(step.get("run", ""))
+    ]
+    assert len(matches) == 1, f"expected one step containing {fragment!r}"
+    return matches[0]
+
+
 def _collect_build_jobs() -> list:
     jobs = []
-    # Both extensions: the repo uses .yml for most workflows and .yaml for the
-    # release set, so globbing one silently ignores callers named in the other.
     for path in sorted(WORKFLOWS_DIR.glob("*.y*ml")):
         workflow = yaml.safe_load(path.read_text()) or {}
         for job_name, job in (workflow.get("jobs") or {}).items():
             if SHARED_BUILD_WORKFLOW in str(job.get("uses", "")):
-                jobs.append(
-                    pytest.param(job.get("with") or {}, id=f"{path.name}:{job_name}")
-                )
+                jobs.append(f"{path.name}:{job_name}")
     return jobs
 
 
-BUILD_JOBS = _collect_build_jobs()
-
-
 def test_shared_build_workflow_still_has_callers() -> None:
-    """Fail loudly rather than skip if the marker stops matching.
-
-    Without this, renaming _build-wheel.yaml would empty BUILD_JOBS and leave
-    every assertion below silently unenforced.
-    """
-    assert BUILD_JOBS, (
+    callers = _collect_build_jobs()
+    assert callers, (
         f"no job delegates to {SHARED_BUILD_WORKFLOW}; it was renamed or the "
-        "wheel workflows stopped using it, so this guard is disarmed"
+        "wheel workflows stopped using it, so the release guards are disarmed"
     )
 
 
-@pytest.mark.parametrize("with_block", BUILD_JOBS)
-def test_wheel_build_pins_glibc_floor_to_a_container(with_block: dict) -> None:
-    runner = str(with_block.get("runner", ""))
-    container = with_block.get("container", "")
-    arch = _runner_arch(runner)
-    expected = ARCH_CONTAINER[arch]
+def test_shared_wheel_build_pins_glibc_floor_to_arch_specific_containers() -> None:
+    """The reusable workflow, not each caller, owns the manylinux floor."""
+    workflow = _load_workflow(SHARED_BUILD_WORKFLOW)
+    trigger = workflow.get("on", workflow.get(True))
+    build = workflow["jobs"]["build"]
+    runner = str(build.get("runs-on", ""))
+    container = str(build.get("container", ""))
 
-    assert container, (
-        "job builds wheels on a bare runner, so its manylinux tag "
-        "follows the runner's glibc and drifts when GitHub bumps the image; "
-        f"set container to a {expected.pattern} image"
+    default_pythons = trigger["workflow_call"]["inputs"]["python-versions"]["default"]
+    assert json.loads(default_pythons) == ["3.10", "3.11", "3.12", "3.13"]
+    assert "ubuntu-22.04-arm" in runner
+    assert "ubuntu-22.04" in runner
+    for image in (
+        "pytorch/manylinux2_28-builder:cuda12.8",
+        "pytorch/manylinux2_28-builder:cuda13.0",
+        "pytorch/manylinuxaarch64-builder:cuda12.8",
+        "pytorch/manylinuxaarch64-builder:cuda13.0",
+    ):
+        assert image in container
+
+
+def test_pre_release_build_uses_normalized_version_for_the_24_wheel_matrix() -> None:
+    workflow = _load_workflow("pre-release.yaml")
+    jobs = workflow["jobs"]
+    trigger = workflow.get("on", workflow.get(True))
+    version_job = jobs["version-stamp"]
+    version_commands = _commands(version_job)
+    build = jobs["build"]
+
+    assert set(trigger["push"]["tags"]) == {
+        "v*-rc*",
+        "v*-alpha*",
+        "v*-beta*",
+        "v*-pre*",
+    }
+    assert "Version(tag[1:])" in version_commands
+    assert "version.is_prerelease" in version_commands
+    assert version_job["outputs"]["package_version"]
+    assert build["needs"] == "version-stamp"
+    assert build["with"]["version-override"] == (
+        "${{ needs.version-stamp.outputs.package_version }}"
     )
-    assert expected.match(container), (
-        f"container {container!r} is not the pinned manylinux builder image "
-        f"for {arch} (runner {runner!r}); expected one matching "
-        f"{expected.pattern}"
+
+    profiles = {
+        (entry["variant"], entry["architecture"])
+        for entry in build["strategy"]["matrix"]["include"]
+    }
+    assert profiles == {
+        (variant, architecture)
+        for variant in ("cuda", "cuda13", "non-cuda")
+        for architecture in ("x86_64", "arm64")
+    }
+    assert "python-versions" not in build["with"]
+
+
+def test_pre_release_publishes_only_validated_collision_free_testpypi_wheels() -> None:
+    publish = _load_workflow("pre-release.yaml")["jobs"]["publish-testpypi"]
+    commands = _commands(publish)
+    validate_index, _ = _command_step(publish, "validate-local")
+    collision_index, _ = _command_step(publish, "ensure-version-absent")
+    credentials_index, credentials = _command_step(
+        publish, "Missing required release gate credentials"
     )
-    # sbsa-* makes _build-wheel.yaml install the CUDA toolkit with apt, which
-    # the AlmaLinux-based manylinux image does not have. Any other value
-    # ('container', 'none') keeps the build inside the image.
-    cuda = str(with_block.get("cuda", ""))
-    assert not cuda.startswith("sbsa-"), (
-        f"cuda is {cuda!r}; a job pinned to a manylinux container cannot "
-        "install CUDA via the host package manager"
+    upload_index, upload = _command_step(publish, "twine upload")
+
+    assert set(publish["needs"]) == {"version-stamp", "build"}
+    assert publish["environment"] == "nightly"
+    assert '"${wheel_count}" -ne 24' in commands
+    assert "twine check" in commands
+    assert "twine upload --repository testpypi" in commands
+    assert "--skip-existing" not in commands
+    assert validate_index < upload_index
+    assert collision_index < upload_index
+    assert credentials_index < upload_index
+    assert credentials["env"]["TONE_USER_TOKEN"] == ("${{ secrets.TONE_USER_TOKEN }}")
+    assert upload["env"]["TWINE_USERNAME"] == "__token__"
+    assert upload["env"]["TWINE_PASSWORD"] == ("${{ secrets.TESTPYPI_API_TOKEN }}")
+
+
+def test_pre_release_waits_for_the_complete_testpypi_index() -> None:
+    verify = _load_workflow("pre-release.yaml")["jobs"]["verify-testpypi-index"]
+    commands = _commands(verify)
+
+    assert "publish-testpypi" in verify["needs"]
+    assert "testpypi_wheel_gate.py wait-index" in commands
+    assert "https://test.pypi.org/simple" in commands
+
+
+def test_pre_release_consumes_each_indexed_package_without_local_artifacts() -> None:
+    consume = _load_workflow("pre-release.yaml")["jobs"]["consume-testpypi"]
+    commands = _commands(consume)
+
+    assert "verify-testpypi-index" in consume["needs"]
+    assert set(consume["strategy"]["matrix"]["package"]) == CORE_PACKAGES
+    assert "pip download" in commands
+    assert "https://test.pypi.org/simple" in commands
+    assert "--no-deps" in commands
+    assert '"${TARGET_PACKAGE}==${PACKAGE_VERSION}"' in commands
+    assert "https://pypi.org/simple" in commands
+    assert '"${wheels[0]}"' in commands
+    assert "mooncake_http_metadata_server" in commands
+    assert "import mooncake.engine, mooncake.store" in commands
+    assert 'mooncake_master" --version' in commands
+    assert "dist-release" not in commands
+
+
+def test_pre_release_runs_tone_with_the_exact_indexed_cuda13_version() -> None:
+    workflows = _load_workflow("pre-release.yaml")["jobs"]
+    integration = workflows["tone-integration"]
+    reusable = _load_workflow("integration-test.yml")
+    trigger = reusable.get("on", reusable.get(True))
+    tone = reusable["jobs"]["test-tone-integration"]
+    commands = _commands(tone)
+
+    assert set(integration["needs"]) == {"version-stamp", "consume-testpypi"}
+    assert integration["uses"] == "./.github/workflows/integration-test.yml"
+    assert integration["with"]["testpypi_version"] == (
+        "${{ needs.version-stamp.outputs.package_version }}"
     )
+    assert integration["secrets"] == "inherit"
+
+    version_input = trigger["workflow_call"]["inputs"]["testpypi_version"]
+    assert version_input["required"] is False
+    assert version_input["default"] == ""
+    assert "mooncake-transfer-engine-cuda13==${TESTPYPI_VERSION}" in commands
+    assert "https://test.pypi.org/simple" in commands
+    assert "--no-deps" in commands
+    assert "--only-binary=:all:" in commands
+    assert "steps.testpypi-wheel.outputs.artifact-id" in commands
+    assert "BRANCH=${{ github.ref_name }}" in commands
+    assert "TONE_USER_NAME and TONE_USER_TOKEN are required" in commands
+    assert "tone_user_token" not in tone["env"]
+
+
+def test_pre_release_has_no_production_or_github_release_publisher() -> None:
+    workflow_text = (WORKFLOWS_DIR / "pre-release.yaml").read_text()
+
+    assert "_publish-wheel.yaml" not in workflow_text
+    assert "secrets.PYPI_API_TOKEN" not in workflow_text
+    assert "gh release" not in workflow_text
+    assert "softprops/action-gh-release" not in workflow_text
+
+
+def test_pre_release_summary_reports_publication_and_consumer_results() -> None:
+    summary = _load_workflow("pre-release.yaml")["jobs"]["summary"]
+    commands = _commands(summary)
+
+    assert set(summary["needs"]) == {
+        "version-stamp",
+        "publish-testpypi",
+        "verify-testpypi-index",
+        "consume-testpypi",
+        "tone-integration",
+    }
+    assert "always()" in summary["if"]
+    assert "TestPyPI publication" in commands
+    assert "TestPyPI index validation" in commands
+    assert "TestPyPI consumer validation" in commands
+    assert "T-one integration (TestPyPI CUDA 13 wheel)" in commands
+    for package in CORE_PACKAGES:
+        assert f"{package}==${{PACKAGE_VERSION:-unavailable}}" in commands
