@@ -17,6 +17,8 @@ class SnapshotObjectStore;
 struct BatchOpLogSnapshotRestoreResult {
     uint64_t last_included_seq{0};
     uint64_t last_included_batch_id{0};
+    uint64_t last_applied_seq{0};
+    uint64_t last_applied_batch_id{0};
     ViewVersionId producer_view_version{0};
     ReplicaID max_replica_id{0};
 };

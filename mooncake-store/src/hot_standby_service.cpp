@@ -273,8 +273,8 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
     oplog_applier_ = std::move(temporary_applier);
     baseline_seq_id = oplog_applier_->GetExpectedSequenceId() - 1;
     batch_snapshot_baseline_ =
-        DurablePrefix{.batch_id = restored->last_included_batch_id,
-                      .last_seq = restored->last_included_seq};
+        DurablePrefix{.batch_id = restored->last_applied_batch_id,
+                      .last_seq = restored->last_applied_seq};
     return ErrorCode::OK;
 }
 

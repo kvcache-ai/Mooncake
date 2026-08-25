@@ -311,6 +311,8 @@ AttemptResult RestorePointer(
             ErrorCode::OK,
             {.last_included_seq = descriptor.last_included_seq,
              .last_included_batch_id = descriptor.last_included_batch_id,
+             .last_applied_seq = suffix.value.last_included_seq,
+             .last_applied_batch_id = suffix.value.last_included_batch_id,
              .producer_view_version = descriptor.producer_view_version,
              .max_replica_id = *live_max_replica_id}};
 }
@@ -345,6 +347,8 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
     }
     CopyRegistry(applier->GetSegmentRegistry(), registry);
     replay.value.max_replica_id = *max_replica_id;
+    replay.value.last_applied_seq = replay.value.last_included_seq;
+    replay.value.last_applied_batch_id = replay.value.last_included_batch_id;
     return replay;
 }
 
