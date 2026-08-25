@@ -229,8 +229,10 @@ void ControlClient::unpinStageBufferAsync(const std::string& server_addr,
 
 ControlService::ControlService(const std::string& type,
                                const std::string& servers,
-                               TransferEngineImpl* impl)
-    : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
+                               TransferEngineImpl* impl,
+                               bool enable_bulk_data_rpc)
+    : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl),
+      enable_bulk_data_rpc_(enable_bulk_data_rpc) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
@@ -412,6 +414,10 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
 
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
+    if (!enable_bulk_data_rpc_) {
+        response = "SendData disabled: high-performance TCP data plane required";
+        return;
+    }
     if (request.size() < sizeof(XferDataDesc)) {
         response = "SendData failed: request too short";
         return;
@@ -436,6 +442,10 @@ void ControlService::onSendData(const std::string_view& request,
 
 void ControlService::onRecvData(const std::string_view& request,
                                 std::string& response) {
+    if (!enable_bulk_data_rpc_) {
+        response = "RecvData disabled: high-performance TCP data plane required";
+        return;
+    }
     if (request.size() < sizeof(XferDataDesc)) {
         response = "RecvData failed: request too short";
         return;

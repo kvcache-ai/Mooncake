@@ -79,6 +79,11 @@ class Transport {
 
     virtual Status uninstall() { return Status::OK(); }
 
+    // Called before registered ranges and sub-batches are reclaimed.  Most
+    // transports have no background work; transports with async I/O use this
+    // barrier to settle work while their buffer registry is still alive.
+    virtual Status quiesce() { return Status::OK(); }
+
     virtual const Capabilities capabilities() const { return caps; }
 
     virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size) {

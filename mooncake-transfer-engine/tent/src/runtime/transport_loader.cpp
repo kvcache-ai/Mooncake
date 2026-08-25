@@ -15,6 +15,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/shm/shm_transport.h"
 #include "tent/transport/tcp/tcp_transport.h"
+#include "tent/transport/tcp/high_performance_tcp_transport.h"
 
 #ifdef USE_RDMA
 #include "tent/transport/rdma/rdma_transport.h"
@@ -53,8 +54,26 @@ namespace mooncake {
 namespace tent {
 
 Status TransferEngineImpl::loadTransports() {
-    if (conf_->get("transports/tcp/enable", true))
-        transport_list_[TCP] = std::make_shared<TcpTransport>();
+    if (conf_->get("transports/tcp/enable", true)) {
+        std::string subtree;
+        std::string implementation = "standard";
+        if (conf_->dumpSubtree("transports/tcp", &subtree)) {
+            try {
+                auto tcp = json::parse(subtree);
+                if (tcp.contains("implementation")) {
+                    if (!tcp["implementation"].is_string()) {
+                        return Status::InvalidArgument("transports/tcp/implementation must be a string" LOC_MARK);
+                    }
+                    implementation = tcp["implementation"].get<std::string>();
+                }
+            } catch (const std::exception& error) {
+                return Status::MalformedJson(std::string("Invalid transports/tcp configuration: ") + error.what() + LOC_MARK);
+            }
+        }
+        if (implementation == "standard") transport_list_[TCP] = std::make_shared<TcpTransport>();
+        else if (implementation == "high_performance") transport_list_[TCP] = std::make_shared<HighPerformanceTcpTransport>();
+        else return Status::InvalidArgument("Unsupported transports/tcp/implementation" LOC_MARK);
+    }
 
     // SHM is opt-in: default false because the current path is not NUMA-aware
     // (see tent/config/transfer-engine.json for an example that enables it).

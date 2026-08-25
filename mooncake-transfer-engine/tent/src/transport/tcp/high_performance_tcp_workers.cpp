@@ -1,169 +1,19 @@
 // Copyright 2026 KVCache.AI
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #include "tent/transport/tcp/high_performance_tcp_workers.h"
-
 #include <exception>
-#include <utility>
-
+#include <functional>
 #include <glog/logging.h>
-
-namespace mooncake {
-namespace tent {
-
-HighPerformanceTcpWorkers::HighPerformanceTcpWorkers()
-    : HighPerformanceTcpWorkers(Config{}) {}
-
-HighPerformanceTcpWorkers::HighPerformanceTcpWorkers(Config config)
-    : config_(config) {}
-
-HighPerformanceTcpWorkers::~HighPerformanceTcpWorkers() { stop(); }
-
-Status HighPerformanceTcpWorkers::start() {
-    std::lock_guard<std::mutex> lifecycle_guard(lifecycle_mutex_);
-    if (running_.load(std::memory_order_acquire)) return Status::OK();
-    if (started_) {
-        return Status::InvalidArgument(
-            "High-performance TCP workers cannot be restarted" LOC_MARK);
-    }
-    if (config_.worker_count == 0 || config_.queue_capacity == 0) {
-        return Status::InvalidArgument(
-            "High-performance TCP worker_count and queue_capacity must be "
-            "positive" LOC_MARK);
-    }
-
-    workers_.reserve(config_.worker_count);
-    for (size_t worker_id = 0; worker_id < config_.worker_count; ++worker_id) {
-        workers_.push_back(std::make_unique<WorkerContext>());
-    }
-
-    running_.store(true, std::memory_order_release);
-    started_ = true;
-    for (size_t worker_id = 0; worker_id < config_.worker_count; ++worker_id) {
-        workers_[worker_id]->thread =
-            std::thread([this, worker_id] { workerLoop(worker_id); });
-    }
-    return Status::OK();
-}
-
-Status HighPerformanceTcpWorkers::stop() {
-    {
-        std::lock_guard<std::mutex> lifecycle_guard(lifecycle_mutex_);
-        if (!running_.exchange(false, std::memory_order_acq_rel)) {
-            return Status::OK();
-        }
-        for (const auto& worker : workers_) {
-            {
-                std::lock_guard<std::mutex> worker_guard(worker->mutex);
-                worker->stopping = true;
-            }
-            worker->cv.notify_one();
-        }
-    }
-
-    // Workers drain already-admitted tasks before exit. That is required for
-    // the future transport: a batch may be freed only after its terminal task
-    // notifications are produced.
-    for (const auto& worker : workers_) {
-        if (worker->thread.joinable()) worker->thread.join();
-    }
-    return Status::OK();
-}
-
-Status HighPerformanceTcpWorkers::submit(Task task) {
-    if (!task) {
-        return Status::InvalidArgument(
-            "Cannot submit an empty high-performance TCP task" LOC_MARK);
-    }
-    if (!running_.load(std::memory_order_acquire)) {
-        return Status::InternalError(
-            "High-performance TCP workers are not running" LOC_MARK);
-    }
-
-    const size_t first = next_worker_.fetch_add(1, std::memory_order_relaxed) %
-                         config_.worker_count;
-    for (size_t offset = 0; offset < config_.worker_count; ++offset) {
-        const size_t worker_id = (first + offset) % config_.worker_count;
-        auto status = enqueue(worker_id, task);
-        if (status.ok() || !status.IsTooManyRequests()) return status;
-    }
-    return Status::TooManyRequests(
-        "All high-performance TCP worker queues are full" LOC_MARK);
-}
-
-Status HighPerformanceTcpWorkers::submitToWorker(size_t worker_id, Task task) {
-    if (!task) {
-        return Status::InvalidArgument(
-            "Cannot submit an empty high-performance TCP task" LOC_MARK);
-    }
-    if (!running_.load(std::memory_order_acquire)) {
-        return Status::InternalError(
-            "High-performance TCP workers are not running" LOC_MARK);
-    }
-    if (worker_id >= workers_.size()) {
-        return Status::InvalidArgument(
-            "High-performance TCP worker id is out of range" LOC_MARK);
-    }
-    return enqueue(worker_id, std::move(task));
-}
-
-Status HighPerformanceTcpWorkers::enqueue(size_t worker_id, Task task) {
-    auto& worker = *workers_[worker_id];
-    {
-        std::lock_guard<std::mutex> worker_guard(worker.mutex);
-        if (worker.stopping) {
-            return Status::InternalError(
-                "High-performance TCP worker is stopping" LOC_MARK);
-        }
-        if (worker.queue.size() >= config_.queue_capacity) {
-            return Status::TooManyRequests(
-                "High-performance TCP worker queue is full" LOC_MARK);
-        }
-        worker.queue.push(std::move(task));
-    }
-    worker.cv.notify_one();
-    return Status::OK();
-}
-
-void HighPerformanceTcpWorkers::workerLoop(size_t worker_id) {
-    auto& worker = *workers_[worker_id];
-    while (true) {
-        Task task;
-        {
-            std::unique_lock<std::mutex> worker_guard(worker.mutex);
-            worker.cv.wait(worker_guard, [&] {
-                return worker.stopping || !worker.queue.empty();
-            });
-            if (worker.queue.empty()) {
-                if (worker.stopping) return;
-                continue;
-            }
-            task = std::move(worker.queue.front());
-            worker.queue.pop();
-        }
-
-        try {
-            task(worker_id);
-        } catch (const std::exception& error) {
-            LOG(ERROR) << "High-performance TCP worker " << worker_id
-                       << " task failed: " << error.what();
-        } catch (...) {
-            LOG(ERROR) << "High-performance TCP worker " << worker_id
-                       << " task failed with a non-standard exception";
-        }
-    }
-}
-
-}  // namespace tent
-}  // namespace mooncake
+namespace mooncake::tent {
+HighPerformanceTcpWorkers::HighPerformanceTcpWorkers():HighPerformanceTcpWorkers(Config{}){}
+HighPerformanceTcpWorkers::HighPerformanceTcpWorkers(Config c):config_(c){}
+HighPerformanceTcpWorkers::~HighPerformanceTcpWorkers(){ stop(); }
+Status HighPerformanceTcpWorkers::start(){std::unique_lock<std::mutex>g(lifecycle_mutex_);auto s=state_.load();if(s==State::kRunning)return Status::OK();if(s!=State::kCreated)return Status::InvalidArgument("High-performance TCP workers cannot be restarted" LOC_MARK);if(!config_.worker_count||!config_.queue_capacity)return Status::InvalidArgument("HP TCP worker_count and queue_capacity must be positive" LOC_MARK);state_.store(State::kStarting);try{workers_.reserve(config_.worker_count);for(size_t i=0;i<config_.worker_count;++i)workers_.push_back(std::make_unique<WorkerContext>());for(size_t i=0;i<workers_.size();++i)workers_[i]->thread=std::thread([this,i]{workers_[i]->io.run();});state_.store(State::kRunning,std::memory_order_release);return Status::OK();}catch(const std::exception&e){state_.store(State::kFailed);requestStopLocked();g.unlock();for(auto&w:workers_)if(w->thread.joinable())w->thread.join();return Status::InternalError(std::string("Unable to start HP TCP workers: ")+e.what()+LOC_MARK);}}
+void HighPerformanceTcpWorkers::requestStopLocked(){for(auto&w:workers_){w->guard.reset();w->io.stop();}}
+Status HighPerformanceTcpWorkers::stop(){std::unique_lock<std::mutex>g(lifecycle_mutex_);auto s=state_.load();if(s==State::kStopped||s==State::kCreated)return Status::OK();if(stop_joining_){lifecycle_cv_.wait(g,[&]{return !stop_joining_;});return Status::OK();}stop_joining_=true;state_.store(State::kStopping,std::memory_order_release);requestStopLocked();g.unlock();for(auto&w:workers_)if(w->thread.joinable()){if(w->thread.get_id()==std::this_thread::get_id())return Status::InvalidArgument("HP TCP worker may not stop itself" LOC_MARK);w->thread.join();}g.lock();state_.store(State::kStopped,std::memory_order_release);stop_joining_=false;g.unlock();lifecycle_cv_.notify_all();return Status::OK();}
+size_t HighPerformanceTcpWorkers::affinityOwner(const AffinityKey& k)const{size_t h=std::hash<uint64_t>{}(k.peer);h^=std::hash<uint32_t>{}(k.endpoint+0x9e3779b9+(h<<6)+(h>>2));h^=std::hash<uint32_t>{}(k.lane+0x9e3779b9+(h<<6)+(h>>2));h^=std::hash<std::string>{}(k.incarnation);return config_.worker_count?h%config_.worker_count:0;}
+Status HighPerformanceTcpWorkers::submit(Task t){if(!t)return Status::InvalidArgument("Cannot submit empty HP TCP task" LOC_MARK);if(!running())return Status::InternalError("HP TCP workers are not running" LOC_MARK);return enqueue(next_worker_.fetch_add(1)%config_.worker_count,std::move(t));}
+Status HighPerformanceTcpWorkers::submitToWorker(size_t id,Task t){if(!t)return Status::InvalidArgument("Cannot submit empty HP TCP task" LOC_MARK);if(!running())return Status::InternalError("HP TCP workers are not running" LOC_MARK);if(id>=workers_.size())return Status::InvalidArgument("HP TCP worker id is out of range" LOC_MARK);return enqueue(id,std::move(t));}
+Status HighPerformanceTcpWorkers::enqueue(size_t id,Task task){auto&w=*workers_[id];bool wake=false;{std::lock_guard<std::mutex>g(w.mailbox_mutex);if(!running())return Status::InternalError("HP TCP workers are stopping" LOC_MARK);if(w.mailbox.size()>=config_.queue_capacity)return Status::TooManyRequests("HP TCP worker mailbox is full" LOC_MARK);w.mailbox.push(std::move(task));if(!w.drain_posted){w.drain_posted=true;wake=true;}}if(wake){try{asio::post(w.io,[this,id]{drain(id);});}catch(const std::exception& e){return Status::InternalError(std::string("HP TCP mailbox wake failed: ")+e.what()+LOC_MARK);}}return Status::OK();}
+void HighPerformanceTcpWorkers::drain(size_t id){auto&w=*workers_[id];for(;;){Task t;{std::lock_guard<std::mutex>g(w.mailbox_mutex);if(w.mailbox.empty()){w.drain_posted=false;return;}t=std::move(w.mailbox.front());w.mailbox.pop();}try{t(id);}catch(const std::exception&e){LOG(ERROR)<<"HP TCP worker "<<id<<" task failed: "<<e.what();}catch(...){LOG(ERROR)<<"HP TCP worker "<<id<<" task failed";}}}
+asio::io_context& HighPerformanceTcpWorkers::ioContext(size_t id){return workers_.at(id)->io;}
+}  // namespace mooncake::tent

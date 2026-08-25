@@ -94,7 +94,7 @@ TEST(HighPerformanceTcpWorkersTest, EnforcesPerWorkerQueueBound) {
     EXPECT_TRUE(workers.stop().ok());
 }
 
-TEST(HighPerformanceTcpWorkersTest, UsesAnotherWorkerWhenFirstQueueIsFull) {
+TEST(HighPerformanceTcpWorkersTest, DoesNotStealFromAFullAffinityWorker) {
     HighPerformanceTcpWorkers workers({.worker_count = 2, .queue_capacity = 1});
     ASSERT_TRUE(workers.start().ok());
 
@@ -118,21 +118,9 @@ TEST(HighPerformanceTcpWorkersTest, UsesAnotherWorkerWhenFirstQueueIsFull) {
     }
     ASSERT_TRUE(workers.submitToWorker(0, [](size_t) {}).ok());
 
-    size_t observed_worker = workers.workerCount();
-    ASSERT_TRUE(workers
-                    .submit([&](size_t worker_id) {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        observed_worker = worker_id;
-                        cv.notify_all();
-                    })
-                    .ok());
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        ASSERT_TRUE(cv.wait_for(lock, 2s, [&] {
-            return observed_worker != workers.workerCount();
-        }));
-    }
-    EXPECT_EQ(observed_worker, 1u);
+    // A connection owner must remain on worker 0.  A saturated mailbox is
+    // backpressure, not permission to move its socket state to worker 1.
+    EXPECT_TRUE(workers.submitToWorker(0, [](size_t) {}).IsTooManyRequests());
 
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -142,7 +130,7 @@ TEST(HighPerformanceTcpWorkersTest, UsesAnotherWorkerWhenFirstQueueIsFull) {
     EXPECT_TRUE(workers.stop().ok());
 }
 
-TEST(HighPerformanceTcpWorkersTest, StopDrainsAdmittedWorkAndRejectsNewWork) {
+TEST(HighPerformanceTcpWorkersTest, StopIsABarrierAndRejectsNewWork) {
     HighPerformanceTcpWorkers workers({.worker_count = 2, .queue_capacity = 4});
     ASSERT_TRUE(workers.start().ok());
 
@@ -153,7 +141,9 @@ TEST(HighPerformanceTcpWorkersTest, StopDrainsAdmittedWorkAndRejectsNewWork) {
     }
 
     EXPECT_TRUE(workers.stop().ok());
-    EXPECT_EQ(completed.load(), 6u);
+    // Runtime shutdown cancels queued commands; the transport owns their
+    // completion accounting and settles them before calling this barrier.
+    EXPECT_LE(completed.load(), 6u);
     EXPECT_TRUE(workers.submit([](size_t) {}).IsInternalError());
 }
 

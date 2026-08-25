@@ -389,8 +389,25 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->loadFromConfig(*conf_, {loader}));
 
-    metadata_ =
-        std::make_shared<ControlService>(metadata_type, metadata_servers, this);
+    bool high_performance_tcp = false;
+    std::string tcp_config;
+    if (conf_->dumpSubtree("transports/tcp", &tcp_config)) {
+        try {
+            auto tcp = json::parse(tcp_config);
+            if (tcp.contains("implementation")) {
+                if (!tcp["implementation"].is_string()) {
+                    return Status::InvalidArgument("transports/tcp/implementation must be a string" LOC_MARK);
+                }
+                const auto implementation = tcp["implementation"].get<std::string>();
+                if (implementation == "high_performance") high_performance_tcp = true;
+                else if (implementation != "standard") return Status::InvalidArgument("Unsupported transports/tcp/implementation" LOC_MARK);
+            }
+        } catch (const std::exception& error) {
+            return Status::MalformedJson(std::string("Invalid transports/tcp configuration: ") + error.what() + LOC_MARK);
+        }
+    }
+    metadata_ = std::make_shared<ControlService>(metadata_type, metadata_servers,
+                                                  this, !high_performance_tcp);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_, rpc_server_threads));
 
@@ -415,11 +432,15 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(loadTransports());
 
     std::string transport_string;
-    for (auto& transport : transport_list_) {
+    for (size_t transport_index = 0; transport_index < transport_list_.size(); ++transport_index) {
+        auto& transport = transport_list_[transport_index];
         if (transport) {
             auto status = transport->install(local_segment_name_, metadata_,
                                              topology_, conf_);
             if (!status.ok()) {
+                if (high_performance_tcp && transport_index == static_cast<size_t>(TransportType::TCP)) {
+                    return Status::InternalError("High-performance TCP is required but failed to install: " + status.ToString() + LOC_MARK);
+                }
                 LOG(WARNING) << "Transport " << transport->getName()
                              << " skipped: " << status.ToString();
                 transport = nullptr;
@@ -512,6 +533,10 @@ Status TransferEngineImpl::deconstruct() {
     // issue a final no-op wake while their workers are joining.
     if (progress_worker_) {
         progress_worker_->stop();
+    }
+
+    for (auto& transport : transport_list_) {
+        if (transport) transport->quiesce();
     }
 
     // Destroy staging_proxy_ first: its destructor calls back into

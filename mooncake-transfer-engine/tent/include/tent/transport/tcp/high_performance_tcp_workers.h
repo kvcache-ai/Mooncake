@@ -1,20 +1,8 @@
 // Copyright 2026 KVCache.AI
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #ifndef TENT_HIGH_PERFORMANCE_TCP_WORKERS_H_
 #define TENT_HIGH_PERFORMANCE_TCP_WORKERS_H_
 
+#include <asio.hpp>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -22,74 +10,33 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
-
 #include "tent/common/status.h"
 
-namespace mooncake {
-namespace tent {
-
-// Worker substrate for the future datacenter-only TCP path.
-//
-// The existing TcpTransport intentionally remains RPC/ylt based.  This class
-// has no RPC dependency: a future high-performance transport can attach one
-// socket/connection cache and one I/O context to every WorkerContext, then
-// submit affinity-preserving work through submitToWorker().
+namespace mooncake::tent {
 class HighPerformanceTcpWorkers {
-   public:
-    struct Config {
-        size_t worker_count{16};
-        // Bound is per worker. The total admitted-but-not-running work is at
-        // most worker_count * queue_capacity.
-        size_t queue_capacity{256};
-    };
-
-    using Task = std::function<void(size_t worker_id)>;
-
-    HighPerformanceTcpWorkers();
-    explicit HighPerformanceTcpWorkers(Config config);
-    ~HighPerformanceTcpWorkers();
-
-    HighPerformanceTcpWorkers(const HighPerformanceTcpWorkers&) = delete;
-    HighPerformanceTcpWorkers& operator=(const HighPerformanceTcpWorkers&) =
-        delete;
-
-    // Starts a fixed set of workers. A stopped instance is deliberately not
-    // restartable: future workers will own sockets, and reopening them under
-    // the same object would make connection lifetime ambiguous.
-    Status start();
-    Status stop();
-
-    // Picks a worker round-robin, falling back to another worker if the first
-    // candidate queue is full. Use submitToWorker for connection affinity.
-    Status submit(Task task);
-    Status submitToWorker(size_t worker_id, Task task);
-
-    bool running() const { return running_.load(std::memory_order_acquire); }
-    size_t workerCount() const { return config_.worker_count; }
-
-   private:
-    struct WorkerContext {
-        std::mutex mutex;
-        std::condition_variable cv;
-        std::queue<Task> queue;
-        std::thread thread;
-        bool stopping{false};
-    };
-
-    Status enqueue(size_t worker_id, Task task);
-    void workerLoop(size_t worker_id);
-
-    Config config_;
-    std::vector<std::unique_ptr<WorkerContext>> workers_;
-    std::atomic<bool> running_{false};
-    std::atomic<size_t> next_worker_{0};
-    std::mutex lifecycle_mutex_;
-    bool started_{false};
+ public:
+  struct Config { size_t worker_count{16}; size_t queue_capacity{256}; };
+  struct AffinityKey { uint64_t peer{0}; uint32_t endpoint{0}; uint32_t lane{0}; std::string incarnation; };
+  enum class State { kCreated, kStarting, kRunning, kStopping, kStopped, kFailed };
+  using Task = std::function<void(size_t)>;
+  HighPerformanceTcpWorkers(); explicit HighPerformanceTcpWorkers(Config config); ~HighPerformanceTcpWorkers();
+  HighPerformanceTcpWorkers(const HighPerformanceTcpWorkers&) = delete;
+  HighPerformanceTcpWorkers& operator=(const HighPerformanceTcpWorkers&) = delete;
+  Status start(); Status stop();
+  Status submit(Task task); Status submitToWorker(size_t worker_id, Task task);
+  size_t affinityOwner(const AffinityKey& key) const;
+  bool running() const { return state_.load(std::memory_order_acquire) == State::kRunning; }
+  size_t workerCount() const { return config_.worker_count; }
+  asio::io_context& ioContext(size_t worker_id);
+  State state() const { return state_.load(std::memory_order_acquire); }
+ private:
+  struct WorkerContext { explicit WorkerContext():guard(asio::make_work_guard(io)){} asio::io_context io; asio::executor_work_guard<asio::io_context::executor_type> guard; std::mutex mailbox_mutex; std::queue<Task> mailbox; bool drain_posted{false}; std::thread thread; };
+  Status enqueue(size_t worker_id, Task task); void drain(size_t worker_id); void requestStopLocked();
+  Config config_; std::vector<std::unique_ptr<WorkerContext>> workers_; std::atomic<State> state_{State::kCreated}; std::atomic<size_t> next_worker_{0};
+  mutable std::mutex lifecycle_mutex_; std::condition_variable lifecycle_cv_; bool stop_joining_{false};
 };
-
-}  // namespace tent
-}  // namespace mooncake
-
-#endif  // TENT_HIGH_PERFORMANCE_TCP_WORKERS_H_
+}  // namespace mooncake::tent
+#endif
