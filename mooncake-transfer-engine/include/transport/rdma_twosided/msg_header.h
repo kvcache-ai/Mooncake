@@ -24,7 +24,7 @@ namespace mooncake {
 
 // Msg QP payload header (host endian). Fixed 32 bytes.
 // | magic:u32 | ver:u8 | type:u8 | flags:u8 | slice_seq:u8 |
-// | task_id:u64 | dest_addr:u64 | length:u32 | reserved:u32 |
+// | task_id:u64 | dest_addr:u64 | length:u32 | total_chunks:u32 |
 constexpr uint32_t kMsgMagic = 0x47534D4Du;  // 'MSGM' LE
 constexpr uint8_t kMsgVersion = 1;
 constexpr size_t kMsgHeaderSize = 32;
@@ -43,6 +43,10 @@ struct MsgHeader {
     uint64_t task_id = 0;
     uint64_t dest_addr = 0;
     uint32_t length = 0;
+    // Chunks the whole task is split into, so the receiver knows when it has
+    // seen all of them and can drop the task's ACK bookkeeping. Order-agnostic,
+    // unlike a last-chunk flag. Zero means the sender did not report it.
+    uint32_t total_chunks = 0;
 };
 
 inline int encodeMsgHeader(const MsgHeader &h, void *out, size_t out_len) {
@@ -57,6 +61,7 @@ inline int encodeMsgHeader(const MsgHeader &h, void *out, size_t out_len) {
     std::memcpy(p + 8, &h.task_id, 8);
     std::memcpy(p + 16, &h.dest_addr, 8);
     std::memcpy(p + 24, &h.length, 4);
+    std::memcpy(p + 28, &h.total_chunks, 4);
     return 0;
 }
 
@@ -73,6 +78,7 @@ inline int decodeMsgHeader(const void *in, size_t in_len, MsgHeader &h) {
     std::memcpy(&h.task_id, p + 8, 8);
     std::memcpy(&h.dest_addr, p + 16, 8);
     std::memcpy(&h.length, p + 24, 4);
+    std::memcpy(&h.total_chunks, p + 28, 4);
     return 0;
 }
 

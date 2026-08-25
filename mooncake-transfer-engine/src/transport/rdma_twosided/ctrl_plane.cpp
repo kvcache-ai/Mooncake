@@ -52,25 +52,6 @@ inline void cpuRelax() {
 #endif
 }
 
-// Releases an already-held lock for the duration of a blocking call and
-// reacquires it on scope exit, including when that call throws. Keeps the
-// lock state uniform for the enclosing ConnectScope, whose destructor may
-// then assume the lock is held.
-class UnlockGuard {
-   public:
-    explicit UnlockGuard(std::unique_lock<std::mutex> &lock) : lock_(lock) {
-        DCHECK(lock_.owns_lock());
-        lock_.unlock();
-    }
-    ~UnlockGuard() { lock_.lock(); }
-
-    UnlockGuard(const UnlockGuard &) = delete;
-    UnlockGuard &operator=(const UnlockGuard &) = delete;
-
-   private:
-    std::unique_lock<std::mutex> &lock_;
-};
-
 }  // namespace
 
 RdmaTwoSidedTransport::ConnectScope::ConnectScope(
@@ -95,6 +76,17 @@ RdmaTwoSidedTransport::ConnectScope::~ConnectScope() {
             transport_.ctrl_channels_.erase(it);
         }
     }
+    transport_.ctrl_cv_.notify_all();
+}
+
+RdmaTwoSidedTransport::RailConnectScope::RailConnectScope(
+    RdmaTwoSidedTransport &transport, std::string key)
+    : transport_(transport), key_(std::move(key)) {
+    transport_.msg_connecting_.insert(key_);
+}
+
+RdmaTwoSidedTransport::RailConnectScope::~RailConnectScope() {
+    transport_.msg_connecting_.erase(key_);
     transport_.ctrl_cv_.notify_all();
 }
 
@@ -569,6 +561,13 @@ size_t RdmaTwoSidedTransport::waitingTaskCount() {
 void RdmaTwoSidedTransport::bounceManagerLoop() {
     while (bounce_manager_running_.load(std::memory_order_acquire)) {
         manageBouncePoolsTick();
+        // Backstop for queued tasks. A queued task is normally woken by the
+        // event that frees the resource it waits for, but that event can land
+        // between its failed retry and its requeue, and then nothing wakes it
+        // once the traffic that would have is gone. Retried here rather than in
+        // the ctrl worker, which must stay free to drain DATA_ACKs.
+        redispatchWaitingTasks();
+        pruneRecvAckLedger();
         auto tick_ms = globalConfig().rdma_msg_bounce_manager_tick_ms;
         if (tick_ms == 0) tick_ms = 50;
         std::this_thread::sleep_for(std::chrono::milliseconds(tick_ms));

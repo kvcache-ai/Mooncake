@@ -80,9 +80,11 @@ class MsgChannel : public std::enable_shared_from_this<MsgChannel> {
 
     const std::string &peerServerName() const { return peer_server_name_; }
 
-    // Send DATA_WRITE with payload copied from src. Returns 0 on post success.
+    // Send DATA_WRITE with payload copied from src. total_chunks is how many
+    // chunks the whole task is split into, so the receiver can retire its ACK
+    // bookkeeping once it has seen them all. Returns 0 on post success.
     int sendDataWrite(uint64_t task_id, uint8_t slice_seq, uint64_t dest_addr,
-                      const void *src, uint32_t length);
+                      const void *src, uint32_t length, uint32_t total_chunks);
 
     // Send READ_REQ (header only).
     int sendReadReq(uint64_t task_id, uint8_t slice_seq, uint64_t src_addr,

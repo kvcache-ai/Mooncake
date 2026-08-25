@@ -437,13 +437,14 @@ int MsgChannel::postSend(const MsgHeader &hdr, const void *payload,
 
 int MsgChannel::sendDataWrite(uint64_t task_id, uint8_t slice_seq,
                               uint64_t dest_addr, const void *src,
-                              uint32_t length) {
+                              uint32_t length, uint32_t total_chunks) {
     MsgHeader hdr;
     hdr.type = MsgType::DATA_WRITE;
     hdr.task_id = task_id;
     hdr.slice_seq = slice_seq;
     hdr.dest_addr = dest_addr;
     hdr.length = length;
+    hdr.total_chunks = total_chunks;
     return postSend(hdr, src, length);
 }
 
