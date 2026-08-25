@@ -12,7 +12,7 @@ namespace mooncake {
 namespace detail {
 
 __device__ __forceinline__ void executeClaimedControlUpdate(
-    DeviceControlUpdateSlot* slot) {
+    ControlUpdateSlot* slot) {
     const auto& update = slot->update;
     const uint32_t operation_count = update.operation_count;
     const uint32_t payload_size = update.payload_size;
@@ -25,12 +25,12 @@ __device__ __forceinline__ void executeClaimedControlUpdate(
         switch (operation.kind) {
             case ControlUpdateOpKind::CopyBytes: {
                 const auto copy = operation.payload.copy_bytes;
-                PG_DEVICE_ASSERT(
-                    copy.destination != 0 &&
-                    copy.payload_offset <= payload_size &&
-                    copy.size <= payload_size - copy.payload_offset);
-                auto* const destination = reinterpret_cast<volatile uint8_t*>(
-                    copy.destination);
+                PG_DEVICE_ASSERT(copy.destination != 0 &&
+                                 copy.payload_offset <= payload_size &&
+                                 copy.size <=
+                                     payload_size - copy.payload_offset);
+                auto* const destination =
+                    reinterpret_cast<volatile uint8_t*>(copy.destination);
                 const auto* const source =
                     reinterpret_cast<const volatile uint8_t*>(
                         update.payload + copy.payload_offset);
@@ -42,8 +42,8 @@ __device__ __forceinline__ void executeClaimedControlUpdate(
             case ControlUpdateOpKind::FillBytes: {
                 const auto fill = operation.payload.fill_bytes;
                 PG_DEVICE_ASSERT(fill.destination != 0);
-                auto* const destination = reinterpret_cast<volatile uint8_t*>(
-                    fill.destination);
+                auto* const destination =
+                    reinterpret_cast<volatile uint8_t*>(fill.destination);
                 for (uint32_t index = 0; index < fill.count; ++index) {
                     destination[index] = fill.value;
                 }
@@ -82,7 +82,7 @@ __device__ __forceinline__ void executeClaimedControlUpdate(
 // loses the state CAS can safely wait for it and then claim the newly published
 // complete update.
 __device__ __forceinline__ void applyPendingControlUpdate(
-    DeviceControlUpdateSlot* slot) {
+    ControlUpdateSlot* slot) {
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> state(slot->state);
     while (true) {
         uint32_t observed = state.load(cuda::memory_order_acquire);
@@ -105,7 +105,8 @@ __device__ __forceinline__ void applyPendingControlUpdate(
             case ControlUpdateState::Pinned:
             case ControlUpdateState::Claimed:
                 // StrongStream excludes another collective invocation, and a
-                // failed invocation consumes Pinned before its successor starts.
+                // failed invocation consumes Pinned before its successor
+                // starts.
                 PG_DEVICE_UNREACHABLE();
                 return;
             default:
@@ -119,7 +120,7 @@ __device__ __forceinline__ void applyPendingControlUpdate(
 // pinned before that acknowledgement, so no ordinary collective may consume
 // or replace it.
 __device__ __forceinline__ void applyPinnedControlUpdate(
-    DeviceControlUpdateSlot* slot) {
+    ControlUpdateSlot* slot) {
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> state(slot->state);
     uint32_t observed = static_cast<uint32_t>(ControlUpdateState::Pinned);
     if (!state.compare_exchange_strong(

@@ -105,19 +105,30 @@ struct DeviceTransferHandle {
 // registered region. `delta` must be nonzero and less than half the uint64_t
 // rolling range. Multiple publishers require a separate atomic primitive.
 struct SignalAdd {
-    uint64_t remote_offset = 0;
     uint64_t delta = 1;
+};
+
+// A single-publisher absolute update. This is used for incarnation values
+// whose producer and consumer may not share a rolling-counter history.
+struct SignalSet {
+    uint64_t value = 0;
 };
 
 struct SignalAction {
     enum class Kind : uint32_t {
         None = 0,
         Add = 1,
+        Set = 2,
     };
 
     Kind kind = Kind::None;
-    // Meaningful only when kind is Add.
-    SignalAdd add;
+    uint64_t remote_offset = 0;
+    union {
+        SignalAdd add = {};
+        SignalSet set;
+    };
+
+    __host__ __device__ constexpr SignalAction() : add{} {}
 };
 
 // One CTA-collective remote notification operation. Before updating the

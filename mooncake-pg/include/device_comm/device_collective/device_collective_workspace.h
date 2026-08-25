@@ -16,9 +16,10 @@ namespace mooncake {
 class DeviceTransferService;
 
 // Context-wide payload storage shared by device collective protocols. The
-// buffer is published once as the rank-level DeviceCollectiveEndpoint during
-// registerAgent, alongside DeviceTransferEndpoint. Staging is local-only and
-// allocated lazily when a route first needs it.
+// buffer is published once as the rank-level
+// DeviceCollectiveWorkspaceEndpoint during registerAgent, alongside
+// DeviceTransferEndpoint. Staging is local-only and allocated lazily when a
+// route first needs it.
 //
 // StrongStream serializes protocol kernels that borrow these buffers, so one
 // published buffer and one optional staging slice can be shared by every
@@ -38,25 +39,25 @@ class DeviceCollectiveWorkspace {
     [[nodiscard]] const RegionSlice& buffer() const noexcept;
     PGResult<const RegionSlice*> staging();
 
-    [[nodiscard]] const DeviceCollectiveEndpoint& localEndpoint()
+    [[nodiscard]] const DeviceCollectiveWorkspaceEndpoint& localEndpoint()
         const noexcept;
 
     PGResult<void> installPeerEndpoint(
-        GlobalRank rank, const DeviceCollectiveEndpoint& endpoint);
-    PGResult<DeviceCollectiveEndpoint> endpoint(GlobalRank rank) const;
+        GlobalRank rank, const DeviceCollectiveWorkspaceEndpoint& endpoint);
+    PGResult<DeviceCollectiveWorkspaceEndpoint> endpoint(GlobalRank rank) const;
 
    private:
     DeviceCollectiveWorkspace(DeviceTransferService& transfer_service,
                               RegionSlice buffer, GlobalRank self_rank,
                               uint32_t max_world_size,
-                              DeviceCollectiveEndpoint local_endpoint);
+                              DeviceCollectiveWorkspaceEndpoint local_endpoint);
 
     DeviceTransferService& transfer_service_;
     RegionSlice buffer_;
     std::optional<RegionSlice> staging_;
     GlobalRank self_rank_ = kInvalidGlobalRank;
-    DeviceCollectiveEndpoint local_endpoint_;
-    std::vector<std::optional<DeviceCollectiveEndpoint>> endpoints_;
+    DeviceCollectiveWorkspaceEndpoint local_endpoint_;
+    std::vector<std::optional<DeviceCollectiveWorkspaceEndpoint>> endpoints_;
     mutable std::mutex mutex_;
 };
 

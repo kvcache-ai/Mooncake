@@ -36,6 +36,40 @@ chooseChannelCount(uint64_t element_count, const RingAllReducePlan& plan) {
     return channel_count;
 }
 
+struct PrepareRingCollective {
+    [[nodiscard]] __device__ __forceinline__ CollectivePreparationResult
+    operator()(const RingAllReducePlan& plan,
+               const uint64_t* view_epoch_signals, uint32_t lane_index,
+               cooperative_groups::thread_block block) const {
+        // Ring sends payloads to its successor and progress notifications to
+        // its predecessor. A two-rank Ring uses the same peer in both
+        // directions, so describe it only once.
+        ViewEpochPeer peers[2];
+        uint32_t peer_count = 0;
+        if (plan.participant_count > 1) {
+            peers[peer_count++] = ViewEpochPeer{
+                .global_rank = plan.predecessor.global_rank,
+                .in_group_rank = plan.predecessor.in_group_rank,
+                .signal_offset = plan.predecessor.view_epoch_signal_offset,
+            };
+            if (plan.successor.in_group_rank !=
+                plan.predecessor.in_group_rank) {
+                peers[peer_count++] = ViewEpochPeer{
+                    .global_rank = plan.successor.global_rank,
+                    .in_group_rank = plan.successor.in_group_rank,
+                    .signal_offset = plan.successor.view_epoch_signal_offset,
+                };
+            }
+        }
+
+        PG_DEVICE_ASSERT(plan.transfer_handle);
+        const auto lane = plan.transfer_handle->lane(lane_index);
+        return synchronizeCollectiveViewEpoch(
+            plan.view_epoch, plan.timeout_ticks, view_epoch_signals, peers,
+            peer_count, lane, block);
+    }
+};
+
 template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ RingStepResult runRingTile(
     const RingAllReducePlan& plan, const RingPrimitives<T, Op>& primitives,
@@ -113,18 +147,24 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
     const uint32_t channel = blockIdx.x;
     PG_DEVICE_ASSERT(state);
     auto* const invocation = state->invocation_state;
-    auto* const recovery_mailbox = state->recovery_mailbox;
+    auto* const control_mailbox = state->control_mailbox;
     PG_DEVICE_ASSERT(invocation);
-    PG_DEVICE_ASSERT(recovery_mailbox);
-    prepareCollectiveInvocation(invocation, recovery_mailbox, block);
-
+    PG_DEVICE_ASSERT(control_mailbox);
     const auto* const plan_slot = &state->plan;
+    const auto preparation = prepareCollectiveInvocation(
+        &state->plan, state->view_epoch_signals, invocation, control_mailbox,
+        channel, PrepareRingCollective{}, block);
+    if (!preparation.succeeded()) {
+        completeChannel(invocation, control_mailbox, block,
+                        preparation.failed_rank, request.failed_ranks_hint);
+        return;
+    }
 
     // Recovery may update this host-constructed Plan between Graph replays.
     PG_DEVICE_ASSERT(plan_slot->status == DevicePlanStatus::Ready);
     const auto plan = plan_slot->plan;
     if (request.count == 0) {
-        completeChannel(invocation, recovery_mailbox, block);
+        completeChannel(invocation, control_mailbox, block);
         return;
     }
 
@@ -132,7 +172,7 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
     if (channel >= channel_count) {
         // The fixed launch capacity keeps host submission independent of the
         // Plan image. Inactive CTAs still participate in invocation completion.
-        completeChannel(invocation, recovery_mailbox, block);
+        completeChannel(invocation, control_mailbox, block);
         return;
     }
     const uint64_t elements_per_channel = request.count / channel_count;
@@ -151,7 +191,7 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
         if (input != output) {
             copyValuesTo(input, channel_elements, block, output);
         }
-        completeChannel(invocation, recovery_mailbox, block);
+        completeChannel(invocation, control_mailbox, block);
         return;
     }
     block.sync();
@@ -215,7 +255,7 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
     const auto buffer_ready =
         primitives.waitRecvBufferReady(recv_buffer_ready_sequence, block);
     if (!buffer_ready.succeeded()) {
-        completeChannel(invocation, recovery_mailbox, block,
+        completeChannel(invocation, control_mailbox, block,
                         buffer_ready.failed_rank, request.failed_ranks_hint);
         return;
     }
@@ -231,7 +271,7 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
         const auto result = runRingTile(plan, primitives, tile_layout,
                                         tile_index, step_sequences, block);
         if (!result.succeeded()) {
-            completeChannel(invocation, recovery_mailbox, block,
+            completeChannel(invocation, control_mailbox, block,
                             result.failed_rank, request.failed_ranks_hint);
             return;
         }
@@ -246,7 +286,7 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
         device::mc_st_release_u64(next_recv_buffer_ready_sequence,
                                   recv_buffer_ready_sequence + 1);
     }
-    completeChannel(invocation, recovery_mailbox, block);
+    completeChannel(invocation, control_mailbox, block);
 }
 
 template <typename T>

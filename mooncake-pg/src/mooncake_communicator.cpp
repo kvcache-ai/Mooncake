@@ -616,10 +616,10 @@ PGResult<void> MooncakeCommunicator::initialize(
     }
 
     // Initial local endpoint info.
-    DeviceCollectiveProtocolEndpoints device_collective_endpoints;
+    DeviceGroupEndpoint device_group_endpoint;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     if (device_collective_) {
-        device_collective_endpoints = device_collective_->localEndpoints();
+        device_group_endpoint = device_collective_->localEndpoint();
     }
 #endif
     meta_->segmentInfos[rank_] = GroupEndpointInfo{
@@ -634,7 +634,7 @@ PGResult<void> MooncakeCommunicator::initialize(
         .p2p_credit_region =
             reinterpret_cast<uint64_t>(p2p_proxy_->credit_region()),
         .p2p_ack_region = reinterpret_cast<uint64_t>(p2p_proxy_->ack_region()),
-        .device_collective = std::move(device_collective_endpoints),
+        .device_collective = std::move(device_group_endpoint),
     };
 
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
@@ -1826,12 +1826,13 @@ void MooncakeCommunicator::applyGroupState(
     if (effective_gpu_collective_backend == GpuCollectiveBackend::New) {
         if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
             active_ranks_mirror_device_index_ == device_index_) {
-            active_ranks_in_control_update = true;
+            active_ranks_in_control_update =
+                device_collective_->hasPendingRecovery();
         }
         switch (next_mode) {
             case CollectiveExtensionState::Isolated:
             case CollectiveExtensionState::Quiescing:
-                PG_ASSERT_OK(device_collective_->useLocalOnly());
+                PG_ASSERT_OK(device_collective_->useLocalOnly(view.epoch));
                 break;
             case CollectiveExtensionState::Normal:
                 PG_ASSERT_OK(device_collective_->applyGroupView(view));
@@ -1842,7 +1843,8 @@ void MooncakeCommunicator::applyGroupState(
 
     // A same-device mirror must be copied by the control update. During
     // recovery, even synchronizing an independent CUDA stream may lead to a
-    // deadlock. Host and cross-device mirrors retain their existing path.
+    // deadlock. Non-recovery update, host and cross-device mirrors retain
+    // their cudaMemcpyAsync path.
     if (!active_ranks_in_control_update) {
         PG_ASSERT_OK(syncActiveRanksMirror());
     }

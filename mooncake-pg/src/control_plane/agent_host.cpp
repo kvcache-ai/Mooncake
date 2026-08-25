@@ -511,7 +511,8 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
             device_transfer_service_->localEndpoint();
     }
     if (device_collective_workspace_) {
-        req.collective_endpoint = device_collective_workspace_->localEndpoint();
+        req.collective_workspace_endpoint =
+            device_collective_workspace_->localEndpoint();
     }
 #endif
     req.agent_session_id = agent_session_id_;
@@ -652,7 +653,7 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     (void)e;
 #endif
                 },
-                [this](const InstallDeviceCollectiveEndpoint& e) {
+                [this](const InstallDeviceCollectiveWorkspaceEndpoint& e) {
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
                     PG_ASSERT_OK(
                         device_collective_workspace_->installPeerEndpoint(

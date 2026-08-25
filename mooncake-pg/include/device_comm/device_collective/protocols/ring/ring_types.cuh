@@ -127,6 +127,8 @@ struct RingPeerTarget {
     // Each offset is relative to this peer's independently published region.
     uint64_t buffer_offset = 0;
     uint64_t signal_offset = 0;
+    // Exact remote word used to publish this rank's view epoch to the peer.
+    uint64_t view_epoch_signal_offset = 0;
 };
 
 // Complete published resource and topology binding read by a Ring AllReduce
@@ -136,6 +138,7 @@ struct RingPeerTarget {
 struct RingAllReducePlan {
     const DeviceTransferHandle* transfer_handle = nullptr;
     uint64_t timeout_ticks = 0;
+    uint64_t view_epoch = kInvalidViewEpoch;
 
     // Local bindings are concrete addresses. Peer bindings remain offsets in
     // RingPeerTarget because each rank publishes an independent region base.
@@ -156,14 +159,16 @@ struct RingAllReducePlan {
     RingPeerTarget successor;
 };
 
-using RingAllReducePlanSlot = DevicePlanSlot<RingAllReducePlan>;
+using RingAllReducePlanSlot = PlanSlot<RingAllReducePlan>;
 
 // Ordinary device memory owned by one Ring AllReduce protocol instance. None
 // of this state is registered or published to peers.
 struct alignas(256) RingAllReduceDeviceState {
     RingAllReducePlanSlot plan;
-    DeviceCollectiveInvocationState* invocation_state = nullptr;
-    DeviceCollectiveRecoveryMailbox* recovery_mailbox = nullptr;
+    // Runtime-owned local slice; word i is written only by InGroupRank i.
+    const uint64_t* view_epoch_signals = nullptr;
+    InvocationState* invocation_state = nullptr;
+    ControlMailbox* control_mailbox = nullptr;
     uint64_t next_step_sequences[kMaxDeviceCollectiveChannels *
                                  kRingPipelineSlots] = {};
     uint64_t next_recv_buffer_ready_sequences[kMaxDeviceCollectiveChannels] =

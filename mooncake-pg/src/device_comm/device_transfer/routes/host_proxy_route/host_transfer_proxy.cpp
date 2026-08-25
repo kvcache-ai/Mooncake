@@ -27,7 +27,7 @@ struct HostTransferProxy::Lane {
     //   WaitingForCommand
     //        -> PayloadTransferInFlight (when the payload is nonempty)
     //        -> SignalReadInFlight       (when the action is Add)
-    //        -> SignalWriteInFlight      (when the action is Add)
+    //        -> SignalWriteInFlight      (when the action is Add or Set)
     //        -> WaitingForCommand
     //
     // Only finishCommand() returns the command slot to the GPU producer.
@@ -277,6 +277,10 @@ void HostTransferProxy::startSignalAction(Lane& lane) {
         case SignalAction::Kind::Add:
             startSignalRead(lane);
             return;
+        case SignalAction::Kind::Set:
+            *lane.signal_staging = lane.command.signal.set.value;
+            startSignalWrite(lane);
+            return;
     }
     finishCommand(lane, HostProxyCommandResult::Failed);
 }
@@ -292,7 +296,7 @@ void HostTransferProxy::startSignalRead(Lane& lane) {
                          .source = lane.signal_staging,
                          .target_id = lane.target_segment_id,
                          .target_offset = lane.command.remote_region_addr +
-                                          lane.command.signal.add.remote_offset,
+                                          lane.command.signal.remote_offset,
                          .length = sizeof(uint64_t),
                      })) {
         finishCommand(lane, HostProxyCommandResult::Failed);
@@ -300,7 +304,15 @@ void HostTransferProxy::startSignalRead(Lane& lane) {
 }
 
 void HostTransferProxy::startSignalWrite(Lane& lane) {
-    *lane.signal_staging += lane.command.signal.add.delta;
+    switch (lane.command.signal.kind) {
+        case SignalAction::Kind::Add:
+            *lane.signal_staging += lane.command.signal.add.delta;
+            break;
+        case SignalAction::Kind::Set:
+            break;
+        case SignalAction::Kind::None:
+            PG_ASSERT(false, "None signal action reached signal write");
+    }
     lane.state = Lane::State::SignalWriteInFlight;
     if (!submitBatch(lane,
                      TransferRequest{
@@ -308,7 +320,7 @@ void HostTransferProxy::startSignalWrite(Lane& lane) {
                          .source = lane.signal_staging,
                          .target_id = lane.target_segment_id,
                          .target_offset = lane.command.remote_region_addr +
-                                          lane.command.signal.add.remote_offset,
+                                          lane.command.signal.remote_offset,
                          .length = sizeof(uint64_t),
                      })) {
         finishCommand(lane, HostProxyCommandResult::Failed);

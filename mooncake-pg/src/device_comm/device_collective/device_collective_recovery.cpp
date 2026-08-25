@@ -15,7 +15,7 @@
 namespace mooncake {
 
 struct DeviceCollectiveRecoveryWorker::MailboxState {
-    DeviceCollectiveRecoveryMailbox* mailbox = nullptr;
+    ControlMailbox* mailbox = nullptr;
     PrepareResumeCallback prepare_resume;
 };
 
@@ -47,8 +47,8 @@ void DeviceCollectiveRecoveryWorker::runLoop() {
 
         auto prepared_resume = pending->prepare_resume();
         if (!prepared_resume.has_value()) {
-            LOG(ERROR) << "Device collective recovery failed; the kernel "
-                          "remains parked: "
+            LOG(ERROR) << "Device collective recovery failed; the last "
+                          "channel CTA remains waiting: "
                        << prepared_resume.error().message;
             std::lock_guard<std::mutex> lock(mutex_);
             active_mailbox_ = nullptr;
@@ -58,7 +58,7 @@ void DeviceCollectiveRecoveryWorker::runLoop() {
         }
 
         // The callback pinned the update before this acknowledgement. The
-        // acquire load in the parked CTA therefore observes the complete
+        // acquire load in the last channel CTA therefore observes the complete
         // update before applying it and leaving the failed collective.
         std::atomic_ref(pending->mailbox->ready_generation)
             .store(generation, std::memory_order_release);
@@ -117,8 +117,7 @@ PGResult<void> DeviceCollectiveRecoveryWorker::start() {
 }
 
 PGResult<void> DeviceCollectiveRecoveryWorker::addMailbox(
-    DeviceCollectiveRecoveryMailbox* mailbox,
-    PrepareResumeCallback prepare_resume) {
+    ControlMailbox* mailbox, PrepareResumeCallback prepare_resume) {
     auto state = std::make_unique<MailboxState>();
     state->mailbox = mailbox;
     state->prepare_resume = std::move(prepare_resume);
@@ -135,7 +134,7 @@ PGResult<void> DeviceCollectiveRecoveryWorker::addMailbox(
 }
 
 void DeviceCollectiveRecoveryWorker::removeMailbox(
-    DeviceCollectiveRecoveryMailbox* mailbox) noexcept {
+    ControlMailbox* mailbox) noexcept {
     if (!mailbox) return;
     std::unique_lock<std::mutex> lock(mutex_);
     const auto selected = std::find_if(
