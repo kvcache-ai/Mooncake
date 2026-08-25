@@ -124,9 +124,11 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
                     source_header = external_include / header
                     if source_header.is_file():
                         shutil.copy2(source_header, target_include / header)
-        ported_dir = Path(
-            object.__new__(BuildExtension)._port_directory(str(musa_input))
-        )
+        ported_dir = musa_input.with_name(musa_input.name + "_musa")
+        if not ported_dir.exists():
+            ported_dir = Path(
+                object.__new__(BuildExtension)._port_directory(str(musa_input))
+            )
         adapter_source_dir = ported_dir
         source_paths = []
         for name in _SOURCE_NAMES:
