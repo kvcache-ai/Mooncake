@@ -49,6 +49,7 @@ from mooncake.mooncake_store_service import (
     _install_shutdown_signal_handlers,
     _shm_name_to_path,
     main as store_service_main,
+    parse_arguments,
 )
 
 
@@ -196,6 +197,42 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(service.config.tenant_id, "tenant-from-cli")
+
+    async def test_start_store_service_passes_enable_standalone_to_setup(self):
+        fake_store = FakeStore()
+        self.service.config = SimpleNamespace(
+            local_hostname="localhost",
+            metadata_server="P2PHANDSHAKE",
+            global_segment_size=1024,
+            local_buffer_size=2048,
+            protocol="tcp",
+            device_name="",
+            master_server_address="",
+            enable_ssd_offload=False,
+            ssd_offload_path="",
+            tenant_id="tenant-a",
+            enable_client_http_server=False,
+            client_http_port=9300,
+            enable_standalone=True,
+        )
+
+        with patch(
+            "mooncake.mooncake_store_service.MooncakeDistributedStore",
+            return_value=fake_store,
+        ):
+            result = await self.service.start_store_service(max_wait_time=1)
+
+        self.assertTrue(result)
+        self.assertEqual(fake_store.setup_calls[0][0]["enable_standalone"], True)
+
+    def test_parse_arguments_enable_standalone_flag(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["mooncake_store_service", "--enable-standalone"],
+        ):
+            args = parse_arguments()
+        self.assertTrue(args.enable_standalone)
 
     async def test_mount_shm_then_unmount_shm_api(self):
         mount_resp = await self.service.handle_mount_shm(
@@ -1014,6 +1051,8 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             enable_ssd_offload=False,
             ssd_offload_path="",
             tenant_id="",
+            enable_client_http_server=False,
+            client_http_port=9300,
             enable_standalone=False,
         )
 
@@ -1108,6 +1147,7 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             define=[],
             max_wait_time=60,
             port=8080,
+            enable_standalone=False,
         )
         service = mock.Mock()
         service.start_store_service = mock.AsyncMock(return_value=False)

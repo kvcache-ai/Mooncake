@@ -904,7 +904,7 @@ async def main():
         else:
             logging.warning(f"Ignoring invalid CLI config: {item}")
 
-    if args.enable_standalone:
+    if getattr(args, "enable_standalone", False):
         cli_config["enable_standalone"] = True
 
     service = MooncakeStoreService(args.config, cli_config)
