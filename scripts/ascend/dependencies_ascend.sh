@@ -36,6 +36,11 @@ clone_repo_if_not_exists() {
     fi
 }
 
+print_error() {
+    echo -e "ERROR: $1"
+    exit 1
+}
+
 # Function to check command success
 check_success() {
     if [ $? -ne 0 ]; then
@@ -44,6 +49,11 @@ check_success() {
 }
 
 set +e
+
+sh $SCRIPT_DIR/../install_toolchain.sh
+check_success "Failed to install toolchain"
+echo "toolchain installed successfully."
+export PATH=/opt/mooncake-toolchain/bin:$PATH
 
 # System detection and dependency installation
 if command -v apt-get &> /dev/null; then
