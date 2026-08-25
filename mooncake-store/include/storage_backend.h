@@ -1694,8 +1694,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Skip the destructor's final checkpoint (simulates an abrupt crash).
     std::atomic<bool> test_skip_final_checkpoint_{false};
     // When true, BucketStorageBackend::WriteBucket will inject a datasync
-    // failure on the newly written .bucket file, then call CleanupOrphanedBucket
-    // to verify the orphan file is removed.
+    // failure on the newly written .bucket file, then call
+    // CleanupOrphanedBucket to verify the orphan file is removed.
     std::atomic<bool> test_datasync_failure_{false};
 
    public:
