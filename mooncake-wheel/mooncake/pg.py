@@ -107,6 +107,35 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
         # torchada exposes the MUSA-aware runtime loader; importing the
         # similarly named torch loader would fall back to CUDA arch detection.
         from torchada.utils.cpp_extension import library_paths, load
+
+        # torchada's MUSA JIT loader does not run SimplePorting for C++ source
+        # files. Port a private copy first so CUDA namespace/header references
+        # in the unchanged adapter sources are translated for MUSA.
+        from torchada.utils.cpp_extension import BuildExtension
+
+        musa_input = build_dir / "musa_input"
+        if not musa_input.exists():
+            shutil.copytree(source_dir, musa_input)
+            external_include = source_dir.parent / "include"
+            if external_include.is_dir():
+                target_include = musa_input / "include"
+                target_include.mkdir(parents=True, exist_ok=True)
+                for header in ("pg_utils.h", "mooncake_pg.h"):
+                    source_header = external_include / header
+                    if source_header.is_file():
+                        shutil.copy2(source_header, target_include / header)
+        ported_dir = Path(
+            object.__new__(BuildExtension)._port_directory(str(musa_input))
+        )
+        adapter_source_dir = ported_dir
+        source_paths = []
+        for name in _SOURCE_NAMES:
+            candidates = (
+                ported_dir / name,
+                ported_dir / "src_musa" / name,
+                ported_dir / "src" / name,
+            )
+            source_paths.append(next(path for path in candidates if path.is_file()))
     else:
         from torch.utils.cpp_extension import library_paths, load
 
@@ -137,17 +166,18 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
         # Retain the CUDA link contract validated by the fresh-wheel smoke.
         extra_ldflags += ["-lc10_cuda", "-ltorch_cuda"]
         extra_cuda_cflags = None
+        adapter_source_dir = source_dir
+        source_paths = [_source_path(source_dir, name) for name in _SOURCE_NAMES]
 
     return load(
         name="_mooncake_pg_jit_musa" if is_musa else "_mooncake_pg_jit_cuda",
-        sources=[str(_source_path(source_dir, name)) for name in _SOURCE_NAMES],
+        sources=[str(path) for path in source_paths],
         extra_cflags=extra_cflags,
         extra_cuda_cflags=extra_cuda_cflags,
         extra_include_paths=[
-            str(source_dir),
-            str(source_dir / "include"),
-            str(source_dir.parent / "include"),
-            str(source_dir.parent.parent / "include"),
+            str(adapter_source_dir),
+            str(adapter_source_dir / "include"),
+            str(adapter_source_dir.parent / "include"),
         ],
         extra_ldflags=extra_ldflags,
         build_directory=str(build_dir),
