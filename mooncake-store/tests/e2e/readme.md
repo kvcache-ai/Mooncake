@@ -151,7 +151,7 @@ python3 store_client_e2e.py \
 - `--payload-size 4096`: keep NoF writes 4K aligned
 - `--duration-sec`: total workload duration
 - `--sleep-ms`: interval between operations
-- `--enable-standalone`: embed master in-process; no `mooncake_master` is required
+- `--enable-standalone`: embed master in-process; no `mooncake_master` is required. Standalone mode defaults `--nof-replica-num` to `0` because there is no NoF pool.
 
 ### Standalone e2e (no `mooncake_master`)
 
@@ -166,6 +166,6 @@ The script runs:
 
 1. `mooncake-wheel/tests/test_standalone_store_e2e.py` — put/get, batch, session ranges, tensor, config-dict, and `MOONCAKE_ENABLE_STANDALONE` env-var setup
 2. `session_ranges_tcp_e2e.py` with `MOONCAKE_ENABLE_STANDALONE=true`
-3. `store_client_e2e.py --enable-standalone` for a short put/get workload
+3. `store_client_e2e.py --enable-standalone --nof-replica-num 0` for a short memory-replica put/get workload
 
 It fails if a `mooncake_master` process is running before or after the tests.
