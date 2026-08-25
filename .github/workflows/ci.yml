@@ -649,11 +649,25 @@ jobs:
     # unit tests rely on, causing false failures. cuda-on still validates
     # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
+      id: ctest
       if: '!matrix.need_cuda'
       run: |
         cd build-tent
-        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
+        mkdir -p test-results
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j \
+          --output-on-failure \
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
       shell: bash
+
+    - name: Preserve TENT CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: TENT CTest failure (${{ matrix.name }})
+        artifact-name: ctest-diagnostics-tent-${{ matrix.name }}
+        junit-report: build-tent/test-results/ctest.xml
+        failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
 
     - name: Start Metadata Server
       if: '!matrix.need_cuda'
