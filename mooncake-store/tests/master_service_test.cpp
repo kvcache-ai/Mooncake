@@ -1236,6 +1236,37 @@ TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
         tenant_keys->end());
 }
 
+TEST_F(MasterServiceTest, TenantScopedPutsAndRemovesUpdateGlobalKeyCount) {
+    const std::string key = "shared_user_key";
+    const TenantId tenant_a("tenant_key_count_a");
+    const TenantId tenant_b("tenant_key_count_b");
+    auto service_ = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    EXPECT_EQ(service_->GetKeyCount(), 0u);
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_b, 2048, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 2u);
+
+    ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 1u);
+
+    ASSERT_TRUE(service_->Remove(key, tenant_b, /*force=*/true).has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 0u);
+}
+
 TEST_F(MasterServiceTest,
        ConcurrentGroupedAndUngroupedFirstCreateDoesNotDuplicateMetadata) {
     std::unique_ptr<MasterService> service_(new MasterService());

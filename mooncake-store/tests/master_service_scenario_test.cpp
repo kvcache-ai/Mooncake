@@ -315,6 +315,9 @@ TEST(MasterServiceTest, RemoveLeasedObject) {
         .Then(KeyExists("test_key"))
         .When(Remove("test_key").ExpectError(ErrorCode::OBJECT_HAS_LEASE))
         .When(ExpireAt("test_key", expired))
+        .Then(KeyExists("test_key"))
+        .When(Remove("test_key").ExpectError(ErrorCode::OBJECT_HAS_LEASE))
+        .When(ExpireAt("test_key", expired))
         .When(Remove("test_key"))
         .When(PutStart("test_key", 1_KB))
         .When(PutEnd("test_key"))
@@ -467,6 +470,19 @@ TEST(MasterServiceTest, RemoveByRegexComplex) {
                        "config/user/settings.json"})
                   .DoNotExist())
         .Then(KeyExists("prod_key_alpha"));
+
+    MasterScenario("remove by regex combines path and trailing-digit matches")
+        .Given(MemoryNode("memory"))
+        .Given(keys())
+        .When(RemoveByRegex("/|\\d$").ExpectRemoved(5))
+        .Then(Objects({"test_key_01", "test_key_02", "test_key_10",
+                       "config/user/settings.json", "logs/app-2025-08-13.log"})
+                  .DoNotExist())
+        .Then(MatchingKeys(".*").HasCount(8).HasKeys(
+            {"prod_key_alpha", "prod_key_beta", "data_part_1_chunk_a",
+             "data_part_2_chunk_b", "short",
+             "a_very_very_very_long_key_that_tests_length_limits",
+             "test-key-extra", "another_key"}));
 }
 
 TEST(MasterServiceTest, BatchExistKey) {
