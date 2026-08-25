@@ -467,8 +467,8 @@ void ControlService::onRecvData(const std::string_view& request,
                             length);
         } else {
             response.resize(length);
-            auto status = loader.copy(response.data(), (void*)peer_mem_addr,
-                                      length);
+            auto status =
+                loader.copy(response.data(), (void*)peer_mem_addr, length);
             if (!status.ok()) {
                 // Clear the payload so the client sees a length mismatch (see
                 // ControlClient::recvData) rather than copying partial/garbage
