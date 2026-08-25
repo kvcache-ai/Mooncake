@@ -7,7 +7,7 @@
 
 #include "p2p/client/tiered_cache/event_driven_scheduler/scheduler_context.h"
 #include "p2p/client/tiered_cache/scheduler/stats_collector.h"  // AccessStats
-#include "types.h"                                   // UUID
+#include "types.h"                                              // UUID
 
 namespace mooncake {
 
