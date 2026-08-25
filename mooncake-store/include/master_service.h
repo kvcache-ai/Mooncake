@@ -105,6 +105,25 @@ namespace benchmarks {
 class BatchEvictBench;
 }  // namespace benchmarks
 
+// std::unordered_map/set never shrink their bucket array on erase, so a
+// container that once held millions of entries keeps its high-water bucket
+// memory (8 bytes per bucket) forever. ShrinkBucketsIfSparse rehashes a
+// container down to roughly twice its live size once the bucket array is
+// both large enough to matter and less than a quarter full. The bucket
+// floor avoids rehash churn on small containers; the 2x headroom keeps a
+// freshly shrunk container from growing again right away.
+// Rehashing invalidates iterators: callers must hold the lock guarding the
+// container and must not be iterating it.
+inline constexpr size_t kShrinkMinBucketCount = 1024;
+
+template <typename UnorderedContainer>
+void ShrinkBucketsIfSparse(UnorderedContainer& container) {
+    if (container.bucket_count() > kShrinkMinBucketCount &&
+        container.size() < container.bucket_count() / 4) {
+        container.rehash(container.size() * 2);
+    }
+}
+
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
