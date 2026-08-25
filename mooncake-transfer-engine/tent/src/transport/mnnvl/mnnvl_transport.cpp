@@ -678,9 +678,13 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 "Requested address is not in registered CUDA buffer" LOC_MARK);
         }
 
-        int cuda_dev = 0;
-        CHECK_CUDA(cudaGetDevice(&cuda_dev));
-        cudaSetDevice(location.index());
+        // Do NOT switch to buffer->location's device index: that ordinal is
+        // the PEER's device index, relative to the peer's
+        // CUDA_VISIBLE_DEVICES. In the local process it may be an invalid
+        // ordinal, and even when numerically valid it may denote a different
+        // physical GPU. The driver calls below are device-agnostic: the VA
+        // mapping is process-wide and cuMemSetAccess grants read/write
+        // access to ALL local devices.
         if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
             auto [pid, remote_fd] = parsePidFd(buffer->mnnvl_handle);
             int local_fd = importFdFromProcess(pid, remote_fd);
@@ -718,9 +722,10 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         OpenedMnnvlEntry mnnvl_entry;
         mnnvl_entry.mnnvl_addr = mnnvl_addr;
         mnnvl_entry.length = buffer->length;
-        mnnvl_entry.cuda_id = location.index();
+        int cuda_dev = 0;
+        CHECK_CUDA(cudaGetDevice(&cuda_dev));
+        mnnvl_entry.cuda_id = cuda_dev;
         relocate_map_[target_id][buffer->addr] = mnnvl_entry;
-        cudaSetDevice(cuda_dev);
     }
 
     auto mnnvl_addr = relocate_map_[target_id][buffer->addr].mnnvl_addr;
