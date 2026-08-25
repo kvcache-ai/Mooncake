@@ -191,7 +191,7 @@ class RingPrimitives {
         cooperative_groups::thread_block block) const {
         SignalRequest ready;
         ready.signal.kind = SignalAction::Kind::Add;
-        ready.signal.add.remote_offset = signal_layout_.recvBufferReadyOffset(
+        ready.signal.remote_offset = signal_layout_.recvBufferReadyOffset(
             predecessor_.signal_offset, channel_index_, self_rank_);
         ready.timeout_ticks = timeout_ticks_;
         (void)transfer_lane_.signal(predecessor_.global_rank, ready, block);
@@ -335,10 +335,9 @@ class RingPrimitives {
         PayloadPublishRequest publication;
         publication.size = count * sizeof(T);
         publication.signal.kind = SignalAction::Kind::Add;
-        publication.signal.add.remote_offset =
-            signal_layout_.payloadReadyOffset(successor_.signal_offset,
-                                              channel_index_, self_rank_,
-                                              send_slot.index);
+        publication.signal.remote_offset = signal_layout_.payloadReadyOffset(
+            successor_.signal_offset, channel_index_, self_rank_,
+            send_slot.index);
         publication.signal.add.delta = 1;
         publication.timeout_ticks = timeout_ticks_;
         (void)payload.publish(publication, block);
@@ -370,7 +369,7 @@ class RingPrimitives {
         cooperative_groups::thread_block block) const {
         SignalRequest ack;
         ack.signal.kind = SignalAction::Kind::Add;
-        ack.signal.add.remote_offset = signal_layout_.payloadConsumedOffset(
+        ack.signal.remote_offset = signal_layout_.payloadConsumedOffset(
             predecessor_.signal_offset, channel_index_, self_rank_,
             recv_slot.index);
         ack.timeout_ticks = timeout_ticks_;

@@ -51,21 +51,22 @@ __device__ __forceinline__ void applyP2pSignalAction(
     // Publish every calling thread's preceding direct memory accesses before
     // applying the peer-visible action.
     device::mc_fence_barrier_fence();
-    switch (signal.kind) {
-        case SignalAction::Kind::None:
-            return;
-        case SignalAction::Kind::Add: {
-            if (block.thread_rank() == 0) {
-                auto* const target = reinterpret_cast<uint64_t*>(
-                    remote_region + signal.add.remote_offset);
-                const uint64_t current = device::mc_ld_acquire_u64(target);
-                device::mc_st_release_u64(target, current + signal.add.delta);
-            }
-            block.sync();
-            return;
+    if (signal.kind == SignalAction::Kind::None) return;
+    PG_DEVICE_ASSERT(signal.kind == SignalAction::Kind::Add ||
+                     signal.kind == SignalAction::Kind::Set);
+
+    if (block.thread_rank() == 0) {
+        auto* const target =
+            reinterpret_cast<uint64_t*>(remote_region + signal.remote_offset);
+        uint64_t value;
+        if (signal.kind == SignalAction::Kind::Add) {
+            value = device::mc_ld_acquire_u64(target) + signal.add.delta;
+        } else {
+            value = signal.set.value;
         }
+        device::mc_st_release_u64(target, value);
     }
-    PG_DEVICE_UNREACHABLE();
+    block.sync();
 }
 
 __device__ __forceinline__ P2pTransferTicket

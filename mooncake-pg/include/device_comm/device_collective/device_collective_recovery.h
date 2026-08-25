@@ -39,19 +39,19 @@ class DeviceCollectiveRecoveryWorker {
 
     struct MailboxState;
     // Called after the worker observes a new device failure. The callback must
-    // prepare and pin the control update that releases the parked CTA.
+    // prepare and pin the control update that lets the last channel CTA exit.
     using PrepareResumeCallback = std::function<PGResult<void>()>;
 
-    PGResult<void> addMailbox(DeviceCollectiveRecoveryMailbox* mailbox,
+    PGResult<void> addMailbox(ControlMailbox* mailbox,
                               PrepareResumeCallback prepare_resume);
-    void removeMailbox(DeviceCollectiveRecoveryMailbox* mailbox) noexcept;
+    void removeMailbox(ControlMailbox* mailbox) noexcept;
     void runLoop();
     void run() noexcept;
 
     std::mutex mutex_;
     std::condition_variable state_changed_;
     std::vector<std::unique_ptr<MailboxState>> mailboxes_;
-    DeviceCollectiveRecoveryMailbox* active_mailbox_ = nullptr;
+    ControlMailbox* active_mailbox_ = nullptr;
     std::thread worker_;
     bool started_ = false;
     bool shutdown_requested_ = false;

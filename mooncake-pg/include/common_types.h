@@ -20,6 +20,8 @@ using InGroupRank = int32_t;
 
 inline constexpr GlobalRank kInvalidGlobalRank = -1;
 inline constexpr InGroupRank kInvalidInGroupRank = -1;
+inline constexpr uint64_t kInvalidViewEpoch = UINT64_MAX;
+inline constexpr uint32_t kMaxNumRanks = 64;
 
 enum class OpType : uint8_t {
     Unknown = 0,
