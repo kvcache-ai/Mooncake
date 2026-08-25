@@ -43,10 +43,8 @@ Mooncake 目前仅支持 Linux 操作系统，并且依赖以下软件：
 
 6. 编译 Mooncake 组件
    ```bash
-   mkdir build
-   cd build
-   cmake ..
-   make -j
+   cmake -B build -G Ninja
+   cmake --build build
    ```
 
 ### 高级编译选项
@@ -125,7 +123,7 @@ Mooncake 支持在执行 `cmake` 命令期间添加下列高级编译选项：
     ```
    各个参数的含义如下（其余同前）：
    - `--segment_id` 可以简单理解为目标节点的主机名，需要和启动目标节点时 `--local_server_name` 传入的值（如果有）保持一致。
-   
+
    正常情况下，发起节点将开始进行传输操作，等待 10s 后回显“Test completed”信息，表明测试完成。
 
    发起节点还可以配置下列测试参数：`--operation`（可为 `"read"` 或 `"write"`）、`batch_size`、`block_size`、`duration`、`threads`, `use_vram` 等。
@@ -136,7 +134,7 @@ Mooncake 支持在执行 `cmake` 命令期间添加下列高级编译选项：
 按照上面步骤编译 P2P Store 成功后，可在 `build/mooncake-p2p-store` 目录下产生测试程序 `p2p-store-example`。该工具演示了 P2P Store 的使用方法，模拟了训练节点完成训练任务后，将模型数据迁移到大量推理节点的过程。目前仅支持 RDMA 协议。
 
 1. **启动 `etcd` 服务。** 这与 Transfer Engine Bench 所述的方法是一致的。
-   
+
 2. **启动模拟训练节点。** 该节点将创建模拟模型文件，并向集群内公开。
    ```bash
    # This is 10.0.0.2

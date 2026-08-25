@@ -63,14 +63,11 @@ To build from source instead (for development, an unreleased revision, or a cust
 **GPU memory transfers (e.g., KV cache in vLLM):**
 
 ```bash
-mkdir build && cd build
-
-cmake .. \
+cmake -B build -G Ninja \
     -DUSE_EFA=ON \
     -DUSE_CUDA=ON \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo
-
-make -j$(nproc)
+cmake --build build
 ```
 
 > **Note:** `-DUSE_CUDA=ON` is required when transferring GPU memory (e.g., KV cache in vLLM). Without it, the TCP transport (used as fallback when `mooncake_protocol` is set to `"tcp"`) cannot detect GPU memory and will fail with "Bad address" (EFAULT) errors.
@@ -78,14 +75,11 @@ make -j$(nproc)
 **CPU memory transfers only (no GPU dependency):**
 
 ```bash
-mkdir build && cd build
-
-cmake .. \
+cmake -B build -G Ninja \
     -DUSE_EFA=ON \
     -DUSE_CUDA=OFF \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo
-
-make -j$(nproc)
+cmake --build build
 ```
 
 > **Note:** With `-DUSE_CUDA=OFF`, the benchmark tool uses DRAM buffers allocated via `numa_alloc_onnode`. This is useful for measuring EFA transport throughput independently of GPU hardware.
@@ -771,9 +765,8 @@ export LIBRARY_PATH=$CUDA_HOME/lib:$LIBRARY_PATH
 
 # Build with CUDA support
 cd ~/Mooncake
-mkdir -p build && cd build
-cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
-make -j$(nproc)
+cmake -B build -G Ninja -DUSE_EFA=ON -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build
 ```
 
 Without activating the environment, you may encounter:
