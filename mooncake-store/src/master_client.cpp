@@ -824,15 +824,25 @@ tl::expected<void, ErrorCode> MasterClient::MountNoFSegment(
 }
 
 tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
-    const std::vector<Segment>& segments) {
+    const std::vector<SegmentUpdate>& updates) {
     ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
-    timer.LogRequest("segments_num=", segments.size(),
+    timer.LogRequest("segments_num=", updates.size(),
                      ", client_id=", client_id_);
 
     auto result = invoke_rpc<&WrappedMasterService::ReMountSegment, void>(
-        segments, client_id_);
+        updates, client_id_);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
+    const std::vector<Segment>& segments) {
+    std::vector<SegmentUpdate> updates;
+    updates.reserve(segments.size());
+    for (const auto& segment : segments) {
+        updates.emplace_back(segment, SegmentRegistrationIntent::REMOUNT);
+    }
+    return ReMountSegment(updates);
 }
 
 tl::expected<void, ErrorCode> MasterClient::ReMountNoFSegment(

@@ -340,9 +340,13 @@ class MasterClient {
      * connect to the master or the client Ping TTL is expired and need
      * to remount. This function is idempotent. Client should retry if the
      * return code is not ErrorCode::OK.
-     * @param segments Segments to remount
+     * @param updates Segments to reconcile and their per-segment intent
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
+        const std::vector<SegmentUpdate>& updates);
+
+    // Compatibility helper for callers that only issue true remounts.
     [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
         const std::vector<Segment>& segments);
 

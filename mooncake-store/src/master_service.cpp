@@ -1015,6 +1015,23 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    std::vector<SegmentUpdate> updates;
+    updates.reserve(segments.size());
+    for (const auto& segment : segments) {
+        updates.emplace_back(segment, SegmentRegistrationIntent::REMOUNT);
+    }
+    return ReMountSegment(updates, client_id);
+}
+
+auto MasterService::ReMountSegment(const std::vector<SegmentUpdate>& updates,
+                                   const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    std::vector<Segment> segments;
+    segments.reserve(updates.size());
+    for (const auto& update : updates) {
+        segments.push_back(update.segment);
+    }
+
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
@@ -1026,14 +1043,23 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         }
         {
             auto segment_access = segment_manager_.getSegmentAccess();
-            for (const auto& segment : segments) {
-                auto standby_validation =
-                    ValidateStandbyRemountSegment(segment);
-                if (standby_validation != ErrorCode::OK) {
-                    return tl::make_unexpected(standby_validation);
+            for (const auto& update : updates) {
+                switch (update.intent) {
+                    case SegmentRegistrationIntent::NEW:
+                        break;
+                    case SegmentRegistrationIntent::REMOUNT: {
+                        auto standby_validation =
+                            ValidateStandbyRemountSegment(update.segment);
+                        if (standby_validation != ErrorCode::OK) {
+                            return tl::make_unexpected(standby_validation);
+                        }
+                        break;
+                    }
+                    default:
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                auto validation =
-                    segment_access.ValidateRemountSegment(segment, client_id);
+                auto validation = segment_access.ValidateRemountSegment(
+                    update.segment, client_id);
                 if (validation != ErrorCode::OK) {
                     return tl::make_unexpected(validation);
                 }
@@ -1056,7 +1082,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             uint64_t imported_size{0};
         };
         std::vector<SegmentRestore> restores;
-        restores.reserve(segments.size());
+        restores.reserve(updates.size());
         std::vector<bool> segment_existed(segments.size());
         auto rollback_new_segments = [&] {
             ScopedSegmentAccess segment_access =
@@ -1116,24 +1142,39 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
 
-            remount_error = segment_access.ReMountSegment(segments, client_id);
-            if (remount_error == ErrorCode::OK) {
-                for (const auto& segment : segments) {
-                    auto allocator = segment_access.GetAllocator(segment.id);
-                    Segment authoritative;
-                    if (!allocator ||
-                        !segment_access.GetSegment(segment.id, authoritative)) {
-                        remount_error = ErrorCode::INTERNAL_ERROR;
-                        break;
+            for (const auto& update : updates) {
+                const auto& segment = update.segment;
+                if (update.intent == SegmentRegistrationIntent::NEW) {
+                    remount_error =
+                        segment_access.MountSegment(segment, client_id);
+                    if (remount_error == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+                        remount_error = ErrorCode::OK;
                     }
-                    restores.push_back({std::move(authoritative),
-                                        std::move(allocator),
-                                        nullptr,
-                                        {},
-                                        {},
-                                        {},
-                                        0});
+                } else {
+                    remount_error = segment_access.ReMountSegment(
+                        std::vector<Segment>{segment}, client_id);
                 }
+                if (remount_error != ErrorCode::OK) {
+                    break;
+                }
+
+                auto allocator = segment_access.GetAllocator(segment.id);
+                Segment authoritative;
+                if (!allocator ||
+                    !segment_access.GetSegment(segment.id, authoritative)) {
+                    remount_error = ErrorCode::INTERNAL_ERROR;
+                    break;
+                }
+                if (update.intent != SegmentRegistrationIntent::REMOUNT) {
+                    continue;
+                }
+                restores.push_back({std::move(authoritative),
+                                    std::move(allocator),
+                                    nullptr,
+                                    {},
+                                    {},
+                                    {},
+                                    0});
             }
         }
         if (remount_error != ErrorCode::OK) {
@@ -1144,8 +1185,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         bool unsupported_cxl = false;
         std::unordered_set<ObjectMetadata*> affected_objects;
         bool any_standby_kept_alive = std::any_of(
-            segments.begin(), segments.end(), [this](const Segment& segment) {
-                return standby_accounted_memory_bytes_.contains(segment.name);
+            restores.begin(), restores.end(), [this](const auto& restore) {
+                return standby_accounted_memory_bytes_.contains(
+                    restore.segment.name);
             });
         for (size_t shard_index = 0;
              any_standby_kept_alive && shard_index < kNumShards;

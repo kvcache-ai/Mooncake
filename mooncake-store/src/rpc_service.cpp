@@ -956,12 +956,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountNoFSegment(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
-    const std::vector<Segment>& segments, const UUID& client_id) {
+    const std::vector<SegmentUpdate>& updates, const UUID& client_id) {
     return execute_rpc(
         "ReMountSegment",
-        [&] { return master_service_.ReMountSegment(segments, client_id); },
+        [&] { return master_service_.ReMountSegment(updates, client_id); },
         [&](auto& timer) {
-            timer.LogRequest("segments_count=", segments.size(),
+            timer.LogRequest("segments_count=", updates.size(),
                              ", client_id=", client_id);
         },
         [] { MasterMetricManager::instance().inc_remount_segment_requests(); },

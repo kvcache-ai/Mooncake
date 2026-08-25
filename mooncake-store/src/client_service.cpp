@@ -478,7 +478,7 @@ Client::~Client() {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_copy.reserve(mounted_segments_.size());
         for (auto& entry : mounted_segments_) {
-            mounted_segments_copy.emplace_back(entry.second);
+            mounted_segments_copy.emplace_back(entry.second.segment);
         }
         for (auto& entry : gracefully_unmounting_segments_) {
             gracefully_unmounting_segments_copy.emplace_back(entry.second);
@@ -693,6 +693,18 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
     std::lock_guard<std::mutex> lock(leader_switch_mutex_);
 
+    const bool leader_changed =
+        current_master_view_.has_value() &&
+        (target_view.view_version != current_master_view_->view_version ||
+         target_view.leader_address != current_master_view_->leader_address);
+    std::unique_lock<std::mutex> segment_lock(mounted_segments_mutex_,
+                                              std::defer_lock);
+    if (leader_changed) {
+        // Establish a barrier between mounts accepted by the old and new
+        // leaders. New mounts cannot be classified until the switch finishes.
+        segment_lock.lock();
+    }
+
     if (current_master_view_.has_value()) {
         const auto& current_view = current_master_view_.value();
         if (target_view.view_version < current_view.view_version) {
@@ -714,6 +726,17 @@ ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
 
     current_master_view_ = target_view;
     last_ping_success_.store(true);
+    if (leader_changed) {
+        segments_aligned_with_master_ = false;
+        for (auto& [segment_id, entry] : mounted_segments_) {
+            if (entry.sync_state != SegmentSyncState::REMOUNT_PENDING) {
+                // NEW is relative to the leader that accepted MountSegment.
+                // Any entry that predates this switch is a remount for the new
+                // leader, regardless of whether the previous full sync ran.
+                entry.sync_state = SegmentSyncState::REMOUNT_PENDING;
+            }
+        }
+    }
     return ErrorCode::OK;
 }
 
@@ -3616,8 +3639,9 @@ tl::expected<void, ErrorCode> Client::MountSegment(
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
-    std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
-    auto unmount_result = master_client_.UnmountSegment(it->second.id);
+    MountedSegmentMap::iterator it) {
+    auto& segment = it->second.segment;
+    auto unmount_result = master_client_.UnmountSegment(segment.id);
     if (!unmount_result) {
         ErrorCode err = unmount_result.error();
         LOG(ERROR) << "Failed to unmount segment from master: "
@@ -3626,7 +3650,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
     }
 
     int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(it->second.base));
+        reinterpret_cast<void*>(segment.base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
@@ -3649,8 +3673,9 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 
     for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
          ++it) {
-        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
-            it->second.size == size) {
+        const auto& mounted = it->second.segment;
+        if (mounted.base == reinterpret_cast<uintptr_t>(buffer) &&
+            mounted.size == size) {
             segment = it;
             break;
         }
@@ -3677,7 +3702,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
 
         // Check if the segment overlaps with any existing segment
         for (auto& it : mounted_segments_) {
-            auto& mtseg = it.second;
+            auto& mtseg = it.second.segment;
             uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
             uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
             uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
@@ -3720,7 +3745,12 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         }
 
         segment_id = segment.id;
-        mounted_segments_[segment_id] = segment;
+        // Keep a successful ordinary mount as NEW_PENDING until a subsequent
+        // Ping confirms that the same master still considers the client OK, or
+        // until it participates in an explicit reconciliation request. This
+        // preserves NEW across the race between MountSegment and NEED_REMOUNT.
+        mounted_segments_[segment_id] = {segment,
+                                         SegmentSyncState::NEW_PENDING};
     }
 
     EnsureStorageControlPlaneStarted();
@@ -3750,7 +3780,8 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentById(
         return tl::unexpected(err);
     }
 
-    gracefully_unmounting_segments_.emplace(segment->first, segment->second);
+    gracefully_unmounting_segments_.emplace(segment->first,
+                                            segment->second.segment);
     if (cleanup_callback) {
         graceful_unmount_cleanup_callbacks_[segment->first] =
             std::move(cleanup_callback);
@@ -4910,15 +4941,31 @@ void Client::StorageHeartbeatThreadMain() {
         // unmounted successfully first, and then remounted again in
         // this thread.
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        std::vector<Segment> segments;
-        for (auto it : mounted_segments_) {
-            auto& segment = it.second;
-            segments.emplace_back(segment);
+        std::vector<SegmentUpdate> updates;
+        updates.reserve(mounted_segments_.size());
+        for (const auto& [segment_id, entry] : mounted_segments_) {
+            switch (entry.sync_state) {
+                case SegmentSyncState::NEW_PENDING:
+                    updates.emplace_back(entry.segment,
+                                         SegmentRegistrationIntent::NEW);
+                    break;
+                case SegmentSyncState::REMOUNT_PENDING:
+                    updates.emplace_back(entry.segment,
+                                         SegmentRegistrationIntent::REMOUNT);
+                    break;
+                case SegmentSyncState::ALIGNED:
+                    break;
+            }
         }
-        auto remount_result = master_client_.ReMountSegment(segments);
+        auto remount_result = master_client_.ReMountSegment(updates);
         if (!remount_result) {
             ErrorCode err = remount_result.error();
             LOG(ERROR) << "Failed to remount segments: " << err;
+        } else {
+            for (auto& [segment_id, entry] : mounted_segments_) {
+                entry.sync_state = SegmentSyncState::ALIGNED;
+            }
+            segments_aligned_with_master_ = true;
         }
         // Re-publish Transfer Engine segment descriptors to the HTTP
         // metadata server.  When Master (which hosts the HTTP metadata
@@ -4977,8 +5024,30 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
             last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
+            if (ping_response.client_status == ClientStatus::OK) {
+                std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+                if (segments_aligned_with_master_) {
+                    for (auto& [segment_id, entry] : mounted_segments_) {
+                        if (entry.sync_state == SegmentSyncState::NEW_PENDING) {
+                            entry.sync_state = SegmentSyncState::ALIGNED;
+                        }
+                    }
+                }
+            }
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
+                {
+                    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+                    if (segments_aligned_with_master_) {
+                        for (auto& [segment_id, entry] : mounted_segments_) {
+                            if (entry.sync_state == SegmentSyncState::ALIGNED) {
+                                entry.sync_state =
+                                    SegmentSyncState::REMOUNT_PENDING;
+                            }
+                        }
+                        segments_aligned_with_master_ = false;
+                    }
+                }
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =
                     std::async(std::launch::async, remount_segment);
@@ -5116,8 +5185,8 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
     std::unordered_set<std::string> local_endpoints;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        for (const auto& [segment_id, segment] : mounted_segments_) {
-            local_endpoints.insert(segment.te_endpoint);
+        for (const auto& [segment_id, entry] : mounted_segments_) {
+            local_endpoints.insert(entry.segment.te_endpoint);
         }
     }
 

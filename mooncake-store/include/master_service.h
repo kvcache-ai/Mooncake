@@ -261,16 +261,21 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
-     * @brief Re-mount segments, invoked when the client is the first time to
-     * connect to the master or the client Ping TTL is expired and need
-     * to remount. This function is idempotent. Client should retry if the
-     * return code is not ErrorCode::OK.
+     * @brief Reconcile segment registrations after the master requests a
+     * client remount. NEW updates use ordinary idempotent registration;
+     * REMOUNT updates additionally run standby recovery. This function is
+     * idempotent. Client should retry if the return code is not ErrorCode::OK.
      * @return ErrorCode::OK means either all segments are remounted
      * successfully or the fail is not solvable by a new remount request.
      *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment cannot
      *         be mounted temporarily.
      *         ErrorCode::INTERNAL_ERROR if something temporary error happens.
      */
+    auto ReMountSegment(const std::vector<SegmentUpdate>& updates,
+                        const UUID& client_id) -> tl::expected<void, ErrorCode>;
+
+    // Compatibility helper for in-process callers that only issue true
+    // remounts. RPC callers should provide an explicit intent per segment.
     auto ReMountSegment(const std::vector<Segment>& segments,
                         const UUID& client_id) -> tl::expected<void, ErrorCode>;
 
