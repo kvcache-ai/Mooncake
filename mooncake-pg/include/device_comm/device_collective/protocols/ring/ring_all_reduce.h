@@ -18,16 +18,16 @@ class DeviceTransferService;
 class ControlUpdateBuilder;
 
 // Owns the host-side decisions specific to Ring AllReduce. The common runtime
-// supplies ordering and recovery lifecycle only.
+// supplies view-epoch signal storage, ordering, and recovery lifecycle; the
+// Ring Plan supplies the exact peers that preparation must check.
 class RingAllReduceProtocol {
    public:
     static PGResult<std::unique_ptr<RingAllReduceProtocol>> create(
         DeviceTransferService& transfer_service,
         DeviceCollectiveWorkspace& workspace,
-        DeviceCollectiveInvocationState* invocation_state,
-        DeviceCollectiveRecoveryMailbox* recovery_mailbox,
-        uint64_t timeout_ticks, int device_index, InGroupRank self_rank,
-        uint32_t max_group_size);
+        const uint64_t* view_epoch_signals, InvocationState* invocation_state,
+        ControlMailbox* control_mailbox, uint64_t timeout_ticks,
+        int device_index, InGroupRank self_rank, uint32_t max_group_size);
 
     ~RingAllReduceProtocol() noexcept;
 
@@ -36,7 +36,7 @@ class RingAllReduceProtocol {
 
     // These methods update only the host Plan. Runtime publication is a
     // separate step that encodes the complete collective state below.
-    void useLocalOnly();
+    void useLocalOnly(uint64_t view_epoch);
     PGResult<void> applyGroupView(const GroupView& view);
     void invalidateHostPlan() noexcept;
     PGResult<void> appendPlanUpdate(ControlUpdateBuilder& builder) const;
@@ -53,8 +53,9 @@ class RingAllReduceProtocol {
     RingAllReduceProtocol(DeviceTransferService& transfer_service,
                           DeviceCollectiveWorkspace& workspace,
                           const DeviceTransferHandle* transfer_handle,
-                          DeviceCollectiveInvocationState* invocation_state,
-                          DeviceCollectiveRecoveryMailbox* recovery_mailbox,
+                          const uint64_t* view_epoch_signals,
+                          InvocationState* invocation_state,
+                          ControlMailbox* control_mailbox,
                           uint64_t timeout_ticks, int device_index,
                           InGroupRank self_rank, uint32_t max_group_size,
                           RegionSlice signals,
@@ -62,7 +63,8 @@ class RingAllReduceProtocol {
 
     PGResult<void> initializeDeviceState();
     void releaseDeviceState() noexcept;
-    [[nodiscard]] RingAllReducePlan makePlan(int32_t self_active_index,
+    [[nodiscard]] RingAllReducePlan makePlan(uint64_t view_epoch,
+                                             int32_t self_active_index,
                                              uint32_t participant_count,
                                              uint64_t buffer_size,
                                              RingPeerTarget predecessor,
@@ -71,8 +73,9 @@ class RingAllReduceProtocol {
     DeviceTransferService& transfer_service_;
     DeviceCollectiveWorkspace& workspace_;
     const DeviceTransferHandle* transfer_handle_ = nullptr;
-    DeviceCollectiveInvocationState* invocation_state_ = nullptr;
-    DeviceCollectiveRecoveryMailbox* recovery_mailbox_ = nullptr;
+    const uint64_t* view_epoch_signals_ = nullptr;
+    InvocationState* invocation_state_ = nullptr;
+    ControlMailbox* control_mailbox_ = nullptr;
     uint64_t timeout_ticks_ = 0;
     int device_index_ = -1;
     InGroupRank self_rank_ = kInvalidInGroupRank;

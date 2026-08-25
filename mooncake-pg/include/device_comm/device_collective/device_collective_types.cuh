@@ -88,10 +88,10 @@ struct alignas(16) ControlUpdateOp {
 // Writing: the host publisher exclusively owns the slot while copying an
 // already constructed update; device code must not read or execute it.
 // Published: a complete update is visible. The next collective may claim it,
-// the host may replace it to coalesce another update, or recovery may pin it.
-// Pinned: recovery has reserved the published update for the currently parked
-// failed collective; ordinary collectives and host publishers must leave it
-// untouched.
+// or the host may replace it to coalesce another update.
+// Pinned: recovery has reserved the published update for the last channel CTA
+// of the current failed invocation; ordinary collectives and host publishers
+// must leave it untouched.
 // Claimed: a device CTA exclusively owns and executes the update, then returns
 // the slot to Idle.
 //
@@ -100,8 +100,6 @@ struct alignas(16) ControlUpdateOp {
 //   Published -> Writing -> Published (coalescing)
 // Direct recovery publication:
 //   Idle/Published -> Writing -> Pinned
-// Reserving an existing normal publication for recovery:
-//   Published -> Pinned
 // Normal collective startup:
 //   Published -> Claimed -> Idle
 // Failed collective resume:
@@ -126,26 +124,30 @@ struct alignas(16) ControlUpdate {
 
 // Mapped single-slot state for a ControlUpdate. The host owns the slot
 // only during the short Writing publication step, and a collective kernel
-// owns it while Claimed. Pinned protects a failure-resume update until its
-// parked CTA can apply it. A newer complete update may replace Published, which
-// coalesces existing GroupView updates.
-struct alignas(64) DeviceControlUpdateSlot {
+// owns it while Claimed. Pinned protects a failure-resume update until the last
+// channel CTA can apply it. A newer complete update may replace Published,
+// which coalesces existing GroupView updates.
+struct alignas(64) ControlUpdateSlot {
     uint32_t state = static_cast<uint32_t>(ControlUpdateState::Idle);
     ControlUpdate update;
 };
 
 template <typename Plan>
-struct DevicePlanSlot {
+struct PlanSlot {
     DevicePlanStatus status = DevicePlanStatus::Unavailable;
     Plan plan{};
 };
 
+// Host-mapped control state shared by the collective kernel and runtime. The
+// control-update slot carries ordinary Plan updates as well as the pinned
+// update used by failure recovery.
+//
 // The device publishes a new failure generation only after every active
 // channel CTA has stopped touching the old Plan and protocol buffers. Recovery
 // pins a control update and then acknowledges the matching failure generation.
-// The parked CTA applies the pinned update before it leaves the failed
+// The last channel CTA applies the pinned update before it leaves the failed
 // collective.
-struct alignas(64) DeviceCollectiveRecoveryMailbox {
+struct alignas(64) ControlMailbox {
     uint64_t failure_generation = 0;
     uint64_t ready_generation = 0;
 
@@ -153,17 +155,17 @@ struct alignas(64) DeviceCollectiveRecoveryMailbox {
     InGroupRank failed_rank = 0;
     uint64_t failed_hint_address = 0;
 
-    // Valid for the parked CTA only while its state is Pinned and
+    // Valid for the last channel CTA only while its state is Pinned and
     // ready_generation has caught up with failure_generation.
-    DeviceControlUpdateSlot control_update_slot;
+    ControlUpdateSlot control_update_slot;
 };
 
 // State shared by all channel CTAs in one collective launch. A CTA increments
 // completion_arrival_count after all of its threads have stopped using the Plan
 // and protocol buffers; a non-last CTA then returns. If a failure was reported,
-// the last CTA publishes the latched metadata to the host recovery mailbox and
+// the last CTA publishes the latched metadata to the host control mailbox and
 // remains in the kernel until recovery finishes.
-struct alignas(64) DeviceCollectiveInvocationState {
+struct alignas(64) InvocationState {
     uint32_t startup_arrival_count = 0;
     uint32_t startup_complete = 0;
     uint32_t completion_arrival_count = 0;

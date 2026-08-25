@@ -29,7 +29,8 @@ struct RegisterAgentRequest {
     uint64_t warmup_recv_addr = 0;
 
     std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
-    std::optional<DeviceCollectiveEndpoint> collective_endpoint;
+    std::optional<DeviceCollectiveWorkspaceEndpoint>
+        collective_workspace_endpoint;
 };
 
 struct RankConnectionMetadata {
@@ -39,7 +40,8 @@ struct RankConnectionMetadata {
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
     std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
-    std::optional<DeviceCollectiveEndpoint> collective_endpoint;
+    std::optional<DeviceCollectiveWorkspaceEndpoint>
+        collective_workspace_endpoint;
 };
 
 struct RegisterAgentResponse {
@@ -202,7 +204,8 @@ struct PeerJoinedPush {
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
     std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
-    std::optional<DeviceCollectiveEndpoint> collective_endpoint;
+    std::optional<DeviceCollectiveWorkspaceEndpoint>
+        collective_workspace_endpoint;
 };
 
 struct RankStatePush {
@@ -261,9 +264,9 @@ struct InstallDeviceTransferEndpoint {
     DeviceTransferEndpoint endpoint;
 };
 
-struct InstallDeviceCollectiveEndpoint {
+struct InstallDeviceCollectiveWorkspaceEndpoint {
     GlobalRank rank = kInvalidGlobalRank;
-    DeviceCollectiveEndpoint endpoint;
+    DeviceCollectiveWorkspaceEndpoint endpoint;
 };
 
 struct EnablePeerProbe {
@@ -334,12 +337,13 @@ struct NotifyRanksActivated {
 };
 
 using AgentEffect =
-    std::variant<InstallDeviceTransferEndpoint, InstallDeviceCollectiveEndpoint,
-                 EnablePeerProbe, DisconnectLink, RequestLinkHealthCheck,
-                 SendLinkEventReport, StopReconnect, DisconnectAllLinks,
-                 ClearAllPeerMetadata, ApplyGroupStateToCommunicator,
-                 ApplyRankStateToCommunicator, ResetPeerState, RefreshPeerLink,
-                 NotifyLinkRefreshed, NotifyGroupReady, NotifyRanksActivated>;
+    std::variant<InstallDeviceTransferEndpoint,
+                 InstallDeviceCollectiveWorkspaceEndpoint, EnablePeerProbe,
+                 DisconnectLink, RequestLinkHealthCheck, SendLinkEventReport,
+                 StopReconnect, DisconnectAllLinks, ClearAllPeerMetadata,
+                 ApplyGroupStateToCommunicator, ApplyRankStateToCommunicator,
+                 ResetPeerState, RefreshPeerLink, NotifyLinkRefreshed,
+                 NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

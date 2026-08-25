@@ -23,10 +23,10 @@ class DeviceCollectiveWorkspace;
 class RingAllReduceProtocol;
 class StrongStream;
 
-// Protocol-independent lifecycle facade. It owns communicator invocation and
-// recovery state, stream ordering, control-update publication and graph
-// references; the selected protocol owns topology, resource interpretation
-// and kernel launch policy.
+// Protocol-independent lifecycle facade. It owns communicator view epoch
+// synchronization, invocation and recovery state, stream ordering,
+// control-update publication, and graph references. The selected protocol owns
+// topology, protocol resources, and kernel launch policy.
 class DeviceCollectiveRuntime {
    public:
     using FailureRecoveryCallback = std::function<PGResult<void>(InGroupRank)>;
@@ -42,9 +42,9 @@ class DeviceCollectiveRuntime {
     DeviceCollectiveRuntime(const DeviceCollectiveRuntime&) = delete;
     DeviceCollectiveRuntime& operator=(const DeviceCollectiveRuntime&) = delete;
 
-    [[nodiscard]] DeviceCollectiveProtocolEndpoints localEndpoints() const;
+    [[nodiscard]] DeviceGroupEndpoint localEndpoint() const;
 
-    PGResult<void> useLocalOnly();
+    PGResult<void> useLocalOnly(uint64_t view_epoch);
     PGResult<void> applyGroupView(const GroupView& view);
 
     PGResult<void> enableRecovery(DeviceCollectiveRecoveryWorker& worker,
@@ -65,21 +65,25 @@ class DeviceCollectiveRuntime {
                             int device_index, InGroupRank self_rank,
                             uint32_t max_group_size,
                             int32_t* active_ranks_mirror,
+                            RegionSlice view_epoch_signals,
                             StrongStream& strong_stream,
                             GpuEvent handoff_event);
 
     PGResult<void> attachGraphUse(const GpuCaptureInfo& capture);
-    PGResult<void> publishControlState(bool pinned = false);
+    [[nodiscard]] bool hasPendingRecovery() const noexcept;
+    PGResult<void> publishControlState(bool pinned,
+                                       bool include_active_ranks_mirror);
     PGResult<void> prepareFailureResume();
     void releaseState() noexcept;
 
     DeviceTransferService& transfer_service_;
     int device_index_ = -1;
     InGroupRank self_rank_ = kInvalidInGroupRank;
-    DeviceCollectiveInvocationState* invocation_state_ = nullptr;
+    RegionSlice view_epoch_signals_;
+    InvocationState* invocation_state_ = nullptr;
     std::unique_ptr<RingAllReduceProtocol> all_reduce_;
     StrongStream& strong_stream_;
-    DeviceCollectiveRecoveryMailbox* recovery_mailbox_ = nullptr;
+    ControlMailbox* control_mailbox_ = nullptr;
     int32_t* active_ranks_mirror_ = nullptr;
     size_t active_ranks_count_ = 0;
     std::array<int32_t, kMaxNumRanks> host_active_ranks_{};
@@ -89,6 +93,7 @@ class DeviceCollectiveRuntime {
     GpuEvent handoff_event_;
     mutable std::mutex mutex_;
     std::atomic<size_t> live_graph_uses_{0};
+    uint64_t view_epoch_ = kInvalidViewEpoch;
     bool shutdown_requested_ = false;
     bool shutdown_complete_ = false;
 };
