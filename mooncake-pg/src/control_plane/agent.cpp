@@ -127,7 +127,7 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
         .transfer_service_endpoint = push.transfer_service_endpoint,
-        .collective_endpoint = push.collective_endpoint,
+        .collective_workspace_endpoint = push.collective_workspace_endpoint,
     };
     if (push.transfer_service_endpoint) {
         effects.push_back(InstallDeviceTransferEndpoint{
@@ -135,10 +135,10 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
             .endpoint = *push.transfer_service_endpoint,
         });
     }
-    if (push.collective_endpoint) {
-        effects.push_back(InstallDeviceCollectiveEndpoint{
+    if (push.collective_workspace_endpoint) {
+        effects.push_back(InstallDeviceCollectiveWorkspaceEndpoint{
             .rank = push.rank,
-            .endpoint = *push.collective_endpoint,
+            .endpoint = *push.collective_workspace_endpoint,
         });
     }
     effects.push_back(EnablePeerProbe{push.rank, push.rank_epoch,
@@ -340,10 +340,10 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
                 .endpoint = *connection.transfer_service_endpoint,
             });
         }
-        if (connection.collective_endpoint) {
-            effects.push_back(InstallDeviceCollectiveEndpoint{
+        if (connection.collective_workspace_endpoint) {
+            effects.push_back(InstallDeviceCollectiveWorkspaceEndpoint{
                 .rank = connection.rank,
-                .endpoint = *connection.collective_endpoint,
+                .endpoint = *connection.collective_workspace_endpoint,
             });
         }
         effects.push_back(EnablePeerProbe{

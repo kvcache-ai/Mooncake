@@ -26,8 +26,7 @@ PGResult<void> ControlUpdateBuilder::copyBytes(void* destination,
                                                const void* source,
                                                size_t size) {
     PG_VALIDATE_ARG(destination, "control update copy destination is null");
-    PG_VALIDATE_ARG(source || size == 0,
-                    "control update copy source is null");
+    PG_VALIDATE_ARG(source || size == 0, "control update copy source is null");
     PG_VALIDATE_STATE(
         size <= kDeviceControlUpdatePayloadBytes - update_.payload_size,
         "device control update payload is too large");
@@ -46,8 +45,8 @@ PGResult<void> ControlUpdateBuilder::copyBytes(void* destination,
     return append(operation);
 }
 
-PGResult<void> ControlUpdateBuilder::fillBytes(void* destination,
-                                               uint8_t value, size_t count) {
+PGResult<void> ControlUpdateBuilder::fillBytes(void* destination, uint8_t value,
+                                               size_t count) {
     PG_VALIDATE_ARG(destination, "control update fill destination is null");
     PG_VALIDATE_ARG(count <= std::numeric_limits<uint32_t>::max(),
                     "control update fill is too large");
@@ -76,10 +75,10 @@ PGResult<void> ControlUpdateBuilder::fillU64(uint64_t* destination,
     return append(operation);
 }
 
-void publishControlUpdate(DeviceControlUpdateSlot& slot,
-                          const ControlUpdate& update, bool pinned) {
-    const auto published_state = pinned ? ControlUpdateState::Pinned
-                                        : ControlUpdateState::Published;
+void publishControlUpdate(ControlUpdateSlot& slot, const ControlUpdate& update,
+                          bool pinned) {
+    const auto published_state =
+        pinned ? ControlUpdateState::Pinned : ControlUpdateState::Published;
     auto state = std::atomic_ref(slot.state);
     while (true) {
         const auto observed = static_cast<ControlUpdateState>(
@@ -90,8 +89,7 @@ void publishControlUpdate(DeviceControlUpdateSlot& slot,
                 uint32_t expected = stateValue(observed);
                 if (!state.compare_exchange_strong(
                         expected, stateValue(ControlUpdateState::Writing),
-                        std::memory_order_acq_rel,
-                        std::memory_order_acquire)) {
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
                     continue;
                 }
                 std::memcpy(&slot.update, &update, sizeof(update));
@@ -105,23 +103,13 @@ void publishControlUpdate(DeviceControlUpdateSlot& slot,
                 std::this_thread::yield();
                 continue;
             case ControlUpdateState::Writing:
-                PG_ASSERT(false,
-                          "another host publisher owns the control-update slot");
+                PG_ASSERT(
+                    false,
+                    "another host publisher owns the control-update slot");
             default:
                 PG_ASSERT(false, "invalid control-update state");
         }
     }
-}
-
-PGResult<void> pinPublishedControlUpdate(DeviceControlUpdateSlot& slot) {
-    auto state = std::atomic_ref(slot.state);
-    uint32_t expected = stateValue(ControlUpdateState::Published);
-    PG_VALIDATE_STATE(
-        state.compare_exchange_strong(
-            expected, stateValue(ControlUpdateState::Pinned),
-            std::memory_order_acq_rel, std::memory_order_acquire),
-        "device control update is not available to pin");
-    return {};
 }
 
 }  // namespace mooncake

@@ -10,7 +10,7 @@ namespace mooncake {
 DeviceCollectiveWorkspace::DeviceCollectiveWorkspace(
     DeviceTransferService& transfer_service, RegionSlice buffer,
     GlobalRank self_rank, uint32_t max_world_size,
-    DeviceCollectiveEndpoint local_endpoint)
+    DeviceCollectiveWorkspaceEndpoint local_endpoint)
     : transfer_service_(transfer_service),
       buffer_(std::move(buffer)),
       self_rank_(self_rank),
@@ -30,7 +30,7 @@ DeviceCollectiveWorkspace::create(DeviceTransferService& transfer_service,
         "device collective self rank is outside the world");
     PG_TRY(auto buffer,
            transfer_service.allocatePeerAccessible(buffer_size, 1));
-    const DeviceCollectiveEndpoint local_endpoint{
+    const DeviceCollectiveWorkspaceEndpoint local_endpoint{
         .buffer_offset = buffer.offset(),
         .buffer_size = buffer.size(),
     };
@@ -54,18 +54,19 @@ PGResult<const RegionSlice*> DeviceCollectiveWorkspace::staging() {
     return &*staging_;
 }
 
-const DeviceCollectiveEndpoint& DeviceCollectiveWorkspace::localEndpoint()
-    const noexcept {
+const DeviceCollectiveWorkspaceEndpoint&
+DeviceCollectiveWorkspace::localEndpoint() const noexcept {
     return local_endpoint_;
 }
 
 PGResult<void> DeviceCollectiveWorkspace::installPeerEndpoint(
-    GlobalRank rank, const DeviceCollectiveEndpoint& endpoint) {
+    GlobalRank rank, const DeviceCollectiveWorkspaceEndpoint& endpoint) {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_ARG(rank >= 0 && static_cast<size_t>(rank) < endpoints_.size(),
                     "device collective peer rank is out of range");
     PG_VALIDATE_ARG(rank != self_rank_,
-                    "cannot replace the local device collective endpoint");
+                    "cannot replace the local device collective workspace "
+                    "endpoint");
     PG_VALIDATE_ARG(
         endpoint.buffer_size != 0 &&
             !addOverflows(endpoint.buffer_offset, endpoint.buffer_size),
@@ -74,7 +75,7 @@ PGResult<void> DeviceCollectiveWorkspace::installPeerEndpoint(
     return {};
 }
 
-PGResult<DeviceCollectiveEndpoint> DeviceCollectiveWorkspace::endpoint(
+PGResult<DeviceCollectiveWorkspaceEndpoint> DeviceCollectiveWorkspace::endpoint(
     GlobalRank rank) const {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_ARG(rank >= 0 && static_cast<size_t>(rank) < endpoints_.size(),

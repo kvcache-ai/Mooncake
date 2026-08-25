@@ -15,8 +15,6 @@ using GroupBootstrapId = std::string;
 // Coordinator-assigned unique group id
 using GroupId = std::string;
 
-constexpr int kMaxNumRanks = 64;
-
 // Resolves a registration only against runtime groups stored under the same
 // GroupBootstrapId, i.e. the same device kind and PyTorch group id.
 // An exact match requires both rank_order and max_group_size to be equal.
@@ -59,11 +57,11 @@ struct RouteEndpoint {
 };
 
 // Process-level collective buffer in DTS's peer-accessible region.
-struct DeviceCollectiveEndpoint {
+struct DeviceCollectiveWorkspaceEndpoint {
     uint64_t buffer_offset = 0;
     uint64_t buffer_size = 0;
 
-    bool operator==(const DeviceCollectiveEndpoint&) const = default;
+    bool operator==(const DeviceCollectiveWorkspaceEndpoint&) const = default;
 };
 
 // Process-level bootstrap metadata for the device transfer service.
@@ -87,19 +85,24 @@ struct RingAllReduceEndpoint {
     bool operator==(const RingAllReduceEndpoint&) const = default;
 };
 
-// Group-level endpoints published by the device collective protocols owned by
-// one communicator.
-struct DeviceCollectiveProtocolEndpoints {
+// Group-level endpoints published by the device collective runtime and the
+// protocols owned by one communicator.
+struct DeviceGroupEndpoint {
+    // Runtime-owned signal slice for synchronizing one GroupView incarnation.
+    // Each slot is written only by the peer with the matching InGroupRank.
+    uint64_t view_epoch_signal = 0;
+    uint32_t view_epoch_signal_count = 0;
+
     std::optional<RingAllReduceEndpoint> ring_all_reduce;
 
     [[nodiscard]] bool empty() const noexcept {
-        return !ring_all_reduce.has_value();
+        return view_epoch_signal_count == 0 && !ring_all_reduce.has_value();
     }
 
-    // True when every protocol required by the New backend has published its
-    // group-level endpoint.
-    [[nodiscard]] bool hasAllProtocolEndpoints() const noexcept {
-        return ring_all_reduce.has_value();
+    // True when the runtime and every protocol required by the New backend
+    // have published their group-level endpoints.
+    [[nodiscard]] bool hasAllRequiredEndpoints() const noexcept {
+        return view_epoch_signal_count != 0 && ring_all_reduce.has_value();
     }
 
     [[nodiscard]] bool supportsBackend(
@@ -108,12 +111,12 @@ struct DeviceCollectiveProtocolEndpoints {
             case GpuCollectiveBackend::Legacy:
                 return true;
             case GpuCollectiveBackend::New:
-                return hasAllProtocolEndpoints();
+                return hasAllRequiredEndpoints();
         }
         return false;
     }
 
-    bool operator==(const DeviceCollectiveProtocolEndpoints&) const = default;
+    bool operator==(const DeviceGroupEndpoint&) const = default;
 };
 
 // Group-level, per-(group_id, rank) buffer/sync/P2P addresses.
@@ -134,7 +137,7 @@ struct GroupEndpointInfo {
     uint64_t p2p_ack_region = 0;
 
     // Empty for CPU communicators and ranks without device protocols.
-    DeviceCollectiveProtocolEndpoints device_collective;
+    DeviceGroupEndpoint device_collective;
 
     bool operator==(const GroupEndpointInfo&) const = default;
 };

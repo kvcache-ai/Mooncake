@@ -13,8 +13,8 @@
 namespace mooncake {
 namespace {
 
-bool validDeviceCollectiveEndpoint(
-    const DeviceCollectiveEndpoint& endpoint,
+bool validDeviceCollectiveWorkspaceEndpoint(
+    const DeviceCollectiveWorkspaceEndpoint& endpoint,
     const DeviceTransferEndpoint& transfer_endpoint) noexcept {
     return endpoint.buffer_size != 0 &&
            endpoint.buffer_offset <= transfer_endpoint.region_size &&
@@ -58,12 +58,14 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
         result.response.reject_reason = "rank out of valid range";
         return result;
     }
-    if (req.collective_endpoint &&
+    if (req.collective_workspace_endpoint &&
         (!req.transfer_service_endpoint ||
-         !validDeviceCollectiveEndpoint(*req.collective_endpoint,
-                                        *req.transfer_service_endpoint))) {
+         !validDeviceCollectiveWorkspaceEndpoint(
+             *req.collective_workspace_endpoint,
+             *req.transfer_service_endpoint))) {
         result.response.success = false;
-        result.response.reject_reason = "invalid device collective endpoint";
+        result.response.reject_reason =
+            "invalid device collective workspace endpoint";
         return result;
     }
     auto& info = ranks_[req.rank];
@@ -81,7 +83,8 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
             return result;
         }
         if (info.transfer_service_endpoint != req.transfer_service_endpoint ||
-            info.collective_endpoint != req.collective_endpoint) {
+            info.collective_workspace_endpoint !=
+                req.collective_workspace_endpoint) {
             result.response.success = false;
             result.response.reject_reason =
                 "rank endpoint changed within one agent session";
@@ -114,7 +117,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     info.agent_addr = req.agent_addr;
     info.te_server_name = req.te_server_name;
     info.transfer_service_endpoint = req.transfer_service_endpoint;
-    info.collective_endpoint = req.collective_endpoint;
+    info.collective_workspace_endpoint = req.collective_workspace_endpoint;
     info.agent_session_id = req.agent_session_id;
     info.warmup_recv_addr = req.warmup_recv_addr;
     info.last_heartbeat = std::chrono::steady_clock::now();
@@ -162,7 +165,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
         .te_server_name = info.te_server_name,
         .warmup_recv_addr = info.warmup_recv_addr,
         .transfer_service_endpoint = info.transfer_service_endpoint,
-        .collective_endpoint = info.collective_endpoint,
+        .collective_workspace_endpoint = info.collective_workspace_endpoint,
     }});
     result.effects.push_back(makeRankStateEffect(req.rank));
 
@@ -212,7 +215,8 @@ void CentralizedCoordinatorStateMachine::populateRegisterAgentResponse(
         connection.warmup_recv_addr = ranks_[i].warmup_recv_addr;
         connection.transfer_service_endpoint =
             ranks_[i].transfer_service_endpoint;
-        connection.collective_endpoint = ranks_[i].collective_endpoint;
+        connection.collective_workspace_endpoint =
+            ranks_[i].collective_workspace_endpoint;
         response.rank_connections.push_back(std::move(connection));
     }
 }
@@ -391,17 +395,18 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
 
         auto& view = it->second;
         auto& member = view.members[req.rank];
-        const auto& protocol_endpoints = ep.endpoint_info.device_collective;
-        if (!protocol_endpoints.empty() &&
-            !ranks_[req.rank].collective_endpoint.has_value()) {
+        const auto& device_group_endpoint = ep.endpoint_info.device_collective;
+        if (!device_group_endpoint.empty() &&
+            !ranks_[req.rank].collective_workspace_endpoint.has_value()) {
             result.response.success = false;
             result.response.reject_reason =
-                "device protocol uses a collective buffer, but the rank did "
-                "not publish one";
+                "device group endpoint requires a collective workspace, "
+                "but the rank did not publish one";
             return result;
         }
         if (view.gpu_collective_backend && member.isActive() &&
-            !protocol_endpoints.supportsBackend(*view.gpu_collective_backend)) {
+            !device_group_endpoint.supportsBackend(
+                *view.gpu_collective_backend)) {
             result.response.success = false;
             result.response.reject_reason =
                 "active member does not support the group's GPU collective "
@@ -731,18 +736,19 @@ void CentralizedCoordinatorStateMachine::handleTimedOutAgent(
             view_changed = true;
         }
 
-        // Endpoint validity is independent of collective membership. Once a
-        // rank is Offline, every group must discard its published endpoint and
-        // wait for AgentHost to publish it again after re-registration.
-        if (member.hasEndpoint()) {
-            member.endpoint = std::nullopt;
-            view_changed = true;
-        }
-
         if (view.auto_deactivate && member.isActive()) {
             member.status = GroupMemberState::Inactive;
             view_changed = true;
             membership_changed = true;
+        }
+
+        // This must run after auto-deactivation above: it checks the final
+        // membership state, dropping the endpoint of an automatically
+        // deactivated member while preserving it for a manually managed
+        // Active member.
+        if (!member.isActive() && member.hasEndpoint()) {
+            member.endpoint = std::nullopt;
+            view_changed = true;
         }
 
         if (view_changed) {
@@ -1083,6 +1089,7 @@ void CentralizedCoordinatorStateMachine::tryAdmitPendingProposals(
             for (GlobalRank rank : requested_global_ranks) {
                 if (!view.members[rank].isActive()) continue;
                 view.members[rank].status = GroupMemberState::Inactive;
+                view.members[rank].endpoint = std::nullopt;
             }
         }
 
