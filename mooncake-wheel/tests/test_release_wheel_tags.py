@@ -181,6 +181,7 @@ def test_pre_release_runs_tone_with_the_exact_indexed_cuda13_version() -> None:
     trigger = reusable.get("on", reusable.get(True))
     tone = reusable["jobs"]["test-tone-integration"]
     commands = _commands(tone)
+    _, tone_step = _command_step(tone, "tone_integration.py")
 
     assert set(integration["needs"]) == {"version-stamp", "consume-testpypi"}
     assert integration["uses"] == "./.github/workflows/integration-test.yml"
@@ -196,8 +197,17 @@ def test_pre_release_runs_tone_with_the_exact_indexed_cuda13_version() -> None:
     assert "https://test.pypi.org/simple" in commands
     assert "--no-deps" in commands
     assert "--only-binary=:all:" in commands
-    assert "steps.testpypi-wheel.outputs.artifact-id" in commands
-    assert "BRANCH=${{ github.ref_name }}" in commands
+    assert tone_step["env"]["TESTPYPI_ARTIFACT_ID"] == (
+        "${{ steps.testpypi-wheel.outputs.artifact-id }}"
+    )
+    assert tone_step["env"]["TESTPYPI_VERSION"] == ("${{ inputs.testpypi_version }}")
+    assert tone_step["env"]["TONE_USER_TOKEN"] == ("${{ secrets.TONE_USER_TOKEN }}")
+    checkouts = [
+        step for step in tone["steps"] if step.get("uses") == "actions/checkout@v4"
+    ]
+    assert len(checkouts) == 1
+    assert checkouts[0]["with"]["persist-credentials"] is False
+    assert checkouts[0]["with"]["sparse-checkout"] == ("scripts/ci/tone_integration.py")
     assert "TONE_USER_NAME and TONE_USER_TOKEN are required" in commands
     assert "tone_user_token" not in tone["env"]
 
