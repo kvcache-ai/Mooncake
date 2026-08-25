@@ -6,10 +6,10 @@ P2P Store 基于 [Transfer Engine](transfer-engine/index.md) 构建，支持在�
 P2P Store 提供的是类似 Register 和 GetReplica 的接口。Register 相当于 BT 中的做种将本地某个文件注册到全局元数据中去，此时并不会发生任何的数据传输，仅仅是登记一个元数据；GetReplica 接口会检索元数据，并从曾调用 Register 或 Get 的其他机器中克隆数据（除非显式调用 Unregister 或 DeleteReplica 停止从本地拉取文件），自身也可作为数据源提高其他节点传输数据的效率。这样做可以提高大规模数据分发效率，避免单机出口带宽饱和影响分发效率。
 
 ## P2P Store 演示程序
-按照编译指南的说明，执行 `cmake .. -DWITH_P2P_STORE=ON && make -j` 编译 P2P Store 成功后，可在 `build/mooncake-p2p-store` 目录下产生测试程序 `p2p-store-example`。该工具演示了 P2P Store 的使用方法，模拟了训练节点完成训练任务后，将模型数据迁移到大量推理节点的过程。目前仅支持 RDMA 协议。
+按照编译指南的说明，执行 `cmake -B build -DWITH_P2P_STORE=ON && cmake --build build` 编译 P2P Store 成功后，可在 `build/mooncake-p2p-store` 目录下产生测试程序 `p2p-store-example`。该工具演示了 P2P Store 的使用方法，模拟了训练节点完成训练任务后，将模型数据迁移到大量推理节点的过程。目前仅支持 RDMA 协议。
 
 1. **启动 `etcd` 服务。** 这与 Transfer Engine Bench 所述的方法是一致的。
-   
+
 2. **启动模拟训练节点。** 该节点将创建模拟模型文件，并向集群内公开。
    ```bash
    # This is 10.0.0.2
