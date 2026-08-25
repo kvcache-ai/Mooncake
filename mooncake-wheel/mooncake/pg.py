@@ -5,6 +5,8 @@ import fcntl
 import hashlib
 import os
 import shutil
+import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -200,6 +202,10 @@ def _read_failure(build_dir: Path):
     return None
 
 
+def _has_built_extension(build_dir: Path) -> bool:
+    return any(build_dir.glob("*.so"))
+
+
 def _write_failure(build_dir: Path, exc: BaseException):
     _failure_marker(build_dir).write_text(
         "The previous Mooncake PG JIT attempt failed.\n"
@@ -262,7 +268,24 @@ def _load_jit_adapter():
             previous_failure = _read_failure(build_dir)
             if previous_failure:
                 raise RuntimeError(previous_failure)
-            return _build_adapter(source_dir, core_path, build_dir)
+            cold_build = not _has_built_extension(build_dir)
+            started = time.monotonic()
+            if cold_build:
+                print(
+                    "[mooncake.pg] Building the Torch adapter with JIT; "
+                    "the first import may take a few minutes.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            module = _build_adapter(source_dir, core_path, build_dir)
+            if cold_build:
+                elapsed = time.monotonic() - started
+                print(
+                    f"[mooncake.pg] Torch adapter JIT build completed in {elapsed:.1f}s.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return module
     except Exception as exc:
         with _build_lock(lock_path):
             if not _failure_marker(build_dir).exists():
