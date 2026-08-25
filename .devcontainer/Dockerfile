@@ -11,7 +11,7 @@ RUN python3 -m venv ${MOONCAKE_TOOLCHAIN}
 RUN ${MOONCAKE_TOOLCHAIN}/bin/python3 -m pip install --upgrade pip cmake ninja
 RUN ${MOONCAKE_TOOLCHAIN}/bin/python3 -m pip install go-bin==1.27.0
 
-ENV PATH=MOONCAKE_TOOLCHAIN/bin:$PATH
+ENV PATH=${MOONCAKE_TOOLCHAIN}/bin:$PATH
 
 RUN apt-get install -y libibverbs-dev \
     libunwind-dev \
