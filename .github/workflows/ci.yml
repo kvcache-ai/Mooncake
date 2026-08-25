@@ -15,9 +15,6 @@ on:
 permissions:
   contents: read
 
-env:
-  MOONCAKE_TEST_TORCH_VERSION: '2.13.0'
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
@@ -109,7 +106,7 @@ jobs:
       shell: bash
 
   test-pg-cpu:
-    name: Test PG CPU (Python 3.12, PyTorch 2.13)
+    name: Test PG CPU (Python 3.12, latest PyTorch)
     needs: [build-wheel]
     if: >-
       needs.build-wheel.result == 'success' &&
@@ -159,7 +156,7 @@ jobs:
         python -m pip install --upgrade pip
         python -m pip install \
           mooncake-wheel/dist/*.whl \
-          "torch==${MOONCAKE_TEST_TORCH_VERSION}" \
+          torch \
           numpy
       shell: bash
 
@@ -169,7 +166,6 @@ jobs:
       run: |
         source test_env/bin/activate
         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
-        python -c 'import os, torch; expected = os.environ["MOONCAKE_TEST_TORCH_VERSION"]; actual = torch.__version__.split("+", 1)[0]; assert actual == expected, f"expected PyTorch {expected}, got {actual}"'
         python -m unittest discover -s mooncake-pg/tests -k CPU -v
       shell: bash
 

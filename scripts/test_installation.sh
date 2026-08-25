@@ -39,14 +39,7 @@ echo "Running import structure test..."
 cp -r mooncake-wheel/tests test_env/
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cd test_env
-TORCH_SPEC="torch"
-if [ -n "${MOONCAKE_TEST_TORCH_VERSION:-}" ]; then
-    TORCH_SPEC="torch==${MOONCAKE_TEST_TORCH_VERSION}"
-fi
-pip install "$TORCH_SPEC" numpy
-if [ -n "${MOONCAKE_TEST_TORCH_VERSION:-}" ]; then
-    python -c 'import os, torch; expected = os.environ["MOONCAKE_TEST_TORCH_VERSION"]; actual = torch.__version__.split("+", 1)[0]; assert actual == expected, f"expected PyTorch {expected}, got {actual}"'
-fi
+pip install torch numpy
 python -c "import mooncake._fast_copy"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
