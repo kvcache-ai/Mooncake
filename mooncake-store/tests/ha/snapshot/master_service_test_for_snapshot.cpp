@@ -132,6 +132,99 @@ TEST_F(MasterServiceSnapshotTest, MountUnmountSegmentWithOffsetAllocator) {
     EXPECT_TRUE(unmount_result4.has_value());
 }
 
+TEST_F(MasterServiceSnapshotTest, RestoresOffsetAllocatorSizeClassProfile) {
+    constexpr size_t kSmallSize = 4 * 1024;
+    constexpr size_t kLargeSize = 8 * 1024;
+    const std::string small_key = "size_class_profile_small";
+    const std::string large_key = "size_class_profile_large";
+
+    auto service_config = MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_ = std::make_unique<MasterService>(service_config);
+
+    auto segment = MakeSegment("size_class_profile_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    replicate_config.preferred_segment = segment.name;
+
+    auto put_object = [&](const std::string& key, size_t size) {
+        ASSERT_TRUE(service_
+                        ->PutStart(client_id, key, TenantId::Default(), size,
+                                   replicate_config)
+                        .has_value());
+        ASSERT_TRUE(service_
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value());
+    };
+    put_object(small_key, kSmallSize);
+    put_object(large_key, kLargeSize);
+
+    auto original_allocator =
+        GetOffsetBufferAllocator(service_.get(), segment.id);
+    ASSERT_NE(original_allocator, nullptr);
+    auto small_profile =
+        original_allocator->getAllocationSizeProfile(kSmallSize);
+    auto large_profile =
+        original_allocator->getAllocationSizeProfile(kLargeSize);
+    ASSERT_TRUE(small_profile.has_value());
+    ASSERT_TRUE(large_profile.has_value());
+    EXPECT_EQ(small_profile->total_live_bytes, kSmallSize + kLargeSize);
+    EXPECT_EQ(small_profile->matching_live_bytes, kSmallSize);
+    EXPECT_EQ(large_profile->matching_live_bytes, kLargeSize);
+
+    const std::string snapshot_id = GenerateSnapshotId();
+    auto persist_result = CallPersistState(service_.get(), snapshot_id);
+    ASSERT_TRUE(persist_result.has_value())
+        << "Failed to persist state: " << persist_result.error().message;
+
+    ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
+    auto restore_config =
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_object_store_type("local")
+            .build();
+    auto restored_service = std::make_unique<MasterService>(restore_config);
+    ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+
+    auto restored_allocator =
+        GetOffsetBufferAllocator(restored_service.get(), segment.id);
+    ASSERT_NE(restored_allocator, nullptr);
+    small_profile = restored_allocator->getAllocationSizeProfile(kSmallSize);
+    large_profile = restored_allocator->getAllocationSizeProfile(kLargeSize);
+    ASSERT_TRUE(small_profile.has_value());
+    ASSERT_TRUE(large_profile.has_value());
+    EXPECT_EQ(small_profile->total_live_bytes, kSmallSize + kLargeSize);
+    EXPECT_EQ(small_profile->matching_live_bytes, kSmallSize);
+    EXPECT_EQ(large_profile->matching_live_bytes, kLargeSize);
+
+    ASSERT_TRUE(
+        restored_service->Remove(small_key, TenantId::Default()).has_value());
+    small_profile = restored_allocator->getAllocationSizeProfile(kSmallSize);
+    large_profile = restored_allocator->getAllocationSizeProfile(kLargeSize);
+    ASSERT_TRUE(small_profile.has_value());
+    ASSERT_TRUE(large_profile.has_value());
+    EXPECT_EQ(small_profile->total_live_bytes, kLargeSize);
+    EXPECT_EQ(small_profile->matching_live_bytes, 0);
+    EXPECT_EQ(large_profile->matching_live_bytes, kLargeSize);
+
+    ASSERT_TRUE(
+        restored_service->Remove(large_key, TenantId::Default()).has_value());
+    small_profile = restored_allocator->getAllocationSizeProfile(kSmallSize);
+    large_profile = restored_allocator->getAllocationSizeProfile(kLargeSize);
+    ASSERT_TRUE(small_profile.has_value());
+    ASSERT_TRUE(large_profile.has_value());
+    EXPECT_EQ(small_profile->total_live_bytes, 0);
+    EXPECT_EQ(small_profile->matching_live_bytes, 0);
+    EXPECT_EQ(large_profile->matching_live_bytes, 0);
+}
+
 TEST_F(MasterServiceSnapshotTest, RandomMountUnmountSegment) {
     service_.reset(new MasterService());
     // Define a constant buffer address for the segment.

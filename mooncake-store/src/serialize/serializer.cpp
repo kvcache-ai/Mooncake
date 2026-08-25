@@ -621,18 +621,19 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // Deserialize offset_handle_ (if exists)
     std::optional<offset_allocator::OffsetAllocationHandle> offsetHandle =
         std::nullopt;
+    std::shared_ptr<OffsetBufferAllocator> offset_buffer_allocator;
 
     bool has_offset_handle = array_items[3].as<bool>();
     if (has_offset_handle) {
-        auto offset_allocator =
+        offset_buffer_allocator =
             std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
-        if (offset_allocator) {
+        if (offset_buffer_allocator) {
             // Use OffsetBufferAllocator's offset_allocator_ to create
             // OffsetAllocationHandle
             auto handle_result =
                 Serializer<offset_allocator::OffsetAllocationHandle>::
                     deserialize(array_items[4],
-                                offset_allocator->getOffsetAllocator());
+                                offset_buffer_allocator->getOffsetAllocator());
             if (!handle_result) {
                 return tl::unexpected(handle_result.error());
             }
@@ -643,6 +644,9 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // Create AllocatedBuffer object
     auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
                                                     std::move(offsetHandle));
+    if (offset_buffer_allocator) {
+        offset_buffer_allocator->RestoreAllocationProfile(size);
+    }
     // buffer->status = status;
 
     return buffer;

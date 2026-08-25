@@ -158,6 +158,17 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         return {.segment_id = segment.id, .client_id = client_id};
     }
 
+    static std::shared_ptr<OffsetBufferAllocator> GetOffsetBufferAllocator(
+        MasterService* service, const UUID& segment_id) {
+        MountedSegment mounted_segment;
+        if (service->segment_manager_.getView().GetMountedSegment(
+                segment_id, mounted_segment) != ErrorCode::OK) {
+            return nullptr;
+        }
+        return std::dynamic_pointer_cast<OffsetBufferAllocator>(
+            mounted_segment.buf_allocator);
+    }
+
     // ==================== Snapshot Helper Methods ====================
 
     // Wrapper method: Call MasterSnapshotManager's PersistState through

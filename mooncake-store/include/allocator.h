@@ -341,6 +341,10 @@ class OffsetBufferAllocator
     void RestoreUsageBytes(size_t bytes) noexcept {
         SetUsageBytesForRestore(bytes);
     }
+    void RestoreAllocationProfile(size_t bytes) noexcept {
+        live_bytes_by_size_class_[AllocationSizeClass(bytes)].fetch_add(
+            bytes, std::memory_order_relaxed);
+    }
 
     // metadata
     const std::string segment_name_;
@@ -355,6 +359,7 @@ class OffsetBufferAllocator
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
 
     friend class Serializer<OffsetBufferAllocator>;
+    friend class Serializer<AllocatedBuffer>;
 };
 
 struct RestoredOffsetBufferAllocator {
