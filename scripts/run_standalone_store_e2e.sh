@@ -54,6 +54,7 @@ unset MOONCAKE_ENABLE_STANDALONE
     --duration-sec "${STANDALONE_CLIENT_E2E_SEC:-3}" \
     --sleep-ms 100 \
     --payload-size 4096 \
+    --nof-replica-num 0 \
     --key-prefix "standalone-e2e-$$"
 
 assert_no_master "after"

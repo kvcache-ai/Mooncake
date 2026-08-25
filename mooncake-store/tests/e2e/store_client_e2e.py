@@ -41,13 +41,20 @@ def main() -> int:
     parser.add_argument("--sleep-ms", type=int, default=200)
     parser.add_argument("--key-prefix", default="nof-e2e")
     parser.add_argument("--memory-replica-num", type=int, default=1)
-    parser.add_argument("--nof-replica-num", type=int, default=1)
+    parser.add_argument(
+        "--nof-replica-num",
+        type=int,
+        default=None,
+        help="NoF replica count. Defaults to 1 for cluster/NoF e2e, 0 in standalone mode.",
+    )
     parser.add_argument(
         "--enable-standalone",
         action="store_true",
         help="Embed mooncake_master in-process; no external master is required",
     )
     args = parser.parse_args()
+    if args.nof_replica_num is None:
+        args.nof_replica_num = 0 if args.enable_standalone else 1
 
     store = _require_store()
 
@@ -71,6 +78,11 @@ def main() -> int:
     replicate_config = store.ReplicateConfig()
     replicate_config.replica_num = args.memory_replica_num
     replicate_config.nof_replica_num = args.nof_replica_num
+    print(
+        f"replicate memory={args.memory_replica_num} nof={args.nof_replica_num} "
+        f"standalone={args.enable_standalone}",
+        flush=True,
+    )
 
     deadline = time.time() + args.duration_sec if args.duration_sec > 0 else None
     seq = 0
