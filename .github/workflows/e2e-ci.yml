@@ -45,11 +45,11 @@ jobs:
     with:
       checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
 
-  integration-test:
+  tone-integration-test:
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'run-e2e-ci'
-    uses: ./.github/workflows/integration-test.yml
+    uses: ./.github/workflows/integration-test-tone.yml
     with:
       pr_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
       pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
@@ -75,7 +75,7 @@ jobs:
     needs:
       - ascend-test
       - build-wheel-rocm
-      - integration-test
+      - tone-integration-test
       - rocm-integration-test
     runs-on: ubuntu-latest
     steps:

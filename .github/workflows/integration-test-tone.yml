@@ -1,4 +1,4 @@
-name: 'Integration test (Linux)'
+name: 'Integration test (Tone / CUDA)'
 
 on:
   workflow_call:
@@ -13,7 +13,8 @@ on:
         type: string
 
 jobs:
-  test-sglang-integration:
+  test-tone-integration:
+    name: Tone CUDA / SGLang
     runs-on: ubuntu-latest
     env:
       tone_user_name: ${{ secrets.TONE_USER_NAME }}

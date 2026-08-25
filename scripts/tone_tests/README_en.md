@@ -2,11 +2,24 @@
 
 ## Overview
 
-This directory contains end-to-end (E2E) test cases for the Mooncake project. These test cases are used for CI testing and are executed on the [T-One](https://tone.openanolis.cn) platform.
+This directory contains the shared end-to-end (E2E) test cases for the
+Mooncake project. The historical path is retained because the external
+[T-One](https://tone.openanolis.cn) template invokes
+`scripts/tone_tests/scripts/run_test.sh` directly.
+
+Execution backends are separate from the shared cases:
+
+- `tone` is the default backend and runs the CUDA/SGLang suite through T-One.
+- `rocm` is selected only by `integration-test-rocm.yml` and runs on the
+  dedicated two-node MI350X self-hosted allocation.
+
+Backend-specific topology, image, wheel-source, and SSH configuration lives in
+`scripts/backends/`; test assertions remain shared.
 
 ## Test Environment
 
-- **Current Support**: 2 A10 GPU servers
+- **Tone**: 2 A10 GPU servers
+- **ROCm**: Dedicated 4+4 MI350X allocation
 - **Future Expansion**: May support more machine configurations
 
 ## Supported Test Cases
@@ -184,7 +197,7 @@ run_test()
     ${docker_exec} "\
         cd /test_workspace && \
         python3 -m pytest test_demo.py -v -s --tb=long" | tee "$log_file"
-    
+
     return ${PIPESTATUS[0]}
 }
 
@@ -210,7 +223,7 @@ if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
     if ! run_test; then
         exit_code=1
     fi
-    
+
     parse $exit_code
     exit $?
 fi
