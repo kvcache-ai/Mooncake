@@ -48,8 +48,7 @@ struct BoundedMPSCQueue {
         Cell *cell = &buffer[pos % Capacity];
 
         uint64_t seq = cell->sequence.load(std::memory_order_acquire);
-        intptr_t dif =
-            static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+        intptr_t dif = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
         if (dif == 0) {
             if (tail.compare_exchange_weak(pos, pos + 1,
                                            std::memory_order_acq_rel,

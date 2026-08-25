@@ -476,10 +476,9 @@ void Workers::asyncPostSend() {
                     // queue) and livelocks the whole engine. See #3636/#3637.
                     Status st = submit(slice);
                     if (!st.ok()) {
-                        LOG(WARNING)
-                            << "Slice " << slice
-                            << " failed: re-enqueue rejected ("
-                            << st.message() << ")";
+                        LOG(WARNING) << "Slice " << slice
+                                     << " failed: re-enqueue rejected ("
+                                     << st.message() << ")";
                         updateSliceStatus(slice, FAILED);
                     }
                 }
@@ -553,10 +552,9 @@ void Workers::asyncPostSend() {
                     // full queue. Fail the slice instead. See #3636/#3637.
                     Status st = submit(slice);
                     if (!st.ok()) {
-                        LOG(WARNING)
-                            << "Slice " << slice
-                            << " failed: re-enqueue rejected ("
-                            << st.message() << ")";
+                        LOG(WARNING) << "Slice " << slice
+                                     << " failed: re-enqueue rejected ("
+                                     << st.message() << ")";
                         updateSliceStatus(slice, FAILED);
                     }
                 }
@@ -739,10 +737,9 @@ void Workers::asyncPollCq() {
                         // full queue. Fail the slice instead. See #3636/#3637.
                         Status st = submit(slice);
                         if (!st.ok()) {
-                            LOG(WARNING)
-                                << "Slice " << slice
-                                << " failed: re-enqueue rejected ("
-                                << st.message() << ")";
+                            LOG(WARNING) << "Slice " << slice
+                                         << " failed: re-enqueue rejected ("
+                                         << st.message() << ")";
                             updateSliceStatus(slice, FAILED);
                         }
                     }
