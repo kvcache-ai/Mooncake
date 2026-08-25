@@ -18,6 +18,7 @@ python3 -m venv ${MOONCAKE_TOOLCHAIN}
 test -z "$GITHUB_MIRROR" || python3 -m pip config --user set \
   global.index-url https://mirrors.huaweicloud.com/repository/pypi/simple
 python3 -m pip install --upgrade pip cmake ninja
+python3 -m pip install go-bin==1.27.0
 
 test -z "$AUDIT_GO_WHEEL" && exit
 
