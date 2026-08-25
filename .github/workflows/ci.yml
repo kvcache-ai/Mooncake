@@ -348,6 +348,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo bash -x dependencies.sh -y
+        echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
         df -h
       shell: bash
 
@@ -828,6 +829,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo bash -x dependencies.sh -y
+        echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
         df -h
       shell: bash
 
