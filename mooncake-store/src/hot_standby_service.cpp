@@ -275,6 +275,8 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
     batch_snapshot_baseline_ =
         DurablePrefix{.batch_id = restored->last_applied_batch_id,
                       .last_seq = restored->last_applied_seq};
+    applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
     return ErrorCode::OK;
 }
 
