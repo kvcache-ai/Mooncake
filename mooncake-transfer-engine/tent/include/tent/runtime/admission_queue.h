@@ -86,6 +86,9 @@ struct QueueSubmit {
     uint64_t batch_token{0};
     // Caller-computed remaining public task slots for this submit.
     size_t batch_slots_left{0};
+    // Public task ids in one submit form a contiguous range in
+    // Batch::task_list, although owner/derived ids need not be presented in
+    // that order.
     std::vector<QueueOwnerInput> owners;
 };
 
@@ -175,17 +178,13 @@ class LocalTransferAdmissionQueue {
 
     using OwnerMap = std::unordered_map<QueueOwnerId, QueueOwner>;
 
-    struct PublicTaskOwner {
-        size_t task_id{0};
-        QueueOwnerId owner_id{0};
-    };
-
     struct BatchIndex {
         std::vector<QueueOwnerId> owner_ids;
-        std::vector<PublicTaskOwner> public_tasks;
+        // Indexed by the absolute task id in Batch::task_list. Zero means the
+        // task is not managed by this runtime queue (for example, a direct
+        // submission made earlier in the same batch).
+        std::vector<QueueOwnerId> public_task_owners;
     };
-
-    static bool hasPublicTask(const BatchIndex& batch_index, size_t task_id);
 
     class DispatchScheduler {
        public:

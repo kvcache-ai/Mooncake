@@ -26,10 +26,6 @@ namespace {
 struct PendingPublicTask {
     size_t task_id{0};
     size_t owner_index{0};
-
-    bool operator<(const PendingPublicTask& other) const {
-        return task_id < other.task_id;
-    }
 };
 
 // Sort key for EDF: owners without a deadline (0) sort after all deadlined
@@ -88,16 +84,6 @@ Status validateLimits(const QueueLimits& limits) {
 }
 
 }  // namespace
-
-bool LocalTransferAdmissionQueue::hasPublicTask(const BatchIndex& batch_index,
-                                                size_t task_id) {
-    auto it = std::lower_bound(batch_index.public_tasks.begin(),
-                               batch_index.public_tasks.end(), task_id,
-                               [](const auto& public_task, size_t key) {
-                                   return public_task.task_id < key;
-                               });
-    return it != batch_index.public_tasks.end() && it->task_id == task_id;
-}
 
 size_t LocalTransferAdmissionQueue::DispatchScheduler::laneForKind(
     QueueOwnerKind kind) {
@@ -251,14 +237,29 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         }
     }
 
-    std::sort(public_tasks.begin(), public_tasks.end());
-    const auto duplicate_public_task =
-        std::adjacent_find(public_tasks.begin(), public_tasks.end(),
-                           [](const auto& lhs, const auto& rhs) {
-                               return lhs.task_id == rhs.task_id;
-                           });
-    if (duplicate_public_task != public_tasks.end()) {
-        return Status::InvalidArgument("duplicate public task id" LOC_MARK);
+    size_t first_public_task_id = std::numeric_limits<size_t>::max();
+    size_t public_task_extent = 0;
+    for (const auto& public_task : public_tasks) {
+        size_t task_extent = 0;
+        CHECK_STATUS(checkedAdd(public_task.task_id, 1, task_extent));
+        first_public_task_id =
+            std::min(first_public_task_id, public_task.task_id);
+        public_task_extent = std::max(public_task_extent, task_extent);
+    }
+
+    if (public_task_extent - first_public_task_id != public_tasks.size()) {
+        return Status::InvalidArgument(
+            "public task ids must form a contiguous range" LOC_MARK);
+    }
+    std::vector<size_t> pending_owner_indices(public_tasks.size(),
+                                              submit.owners.size());
+    for (const auto& public_task : public_tasks) {
+        auto& owner_index =
+            pending_owner_indices[public_task.task_id - first_public_task_id];
+        if (owner_index != submit.owners.size()) {
+            return Status::InvalidArgument("duplicate public task id" LOC_MARK);
+        }
+        owner_index = public_task.owner_index;
     }
 
     if (public_tasks.size() > submit.batch_slots_left) {
@@ -269,7 +270,9 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     auto batch_it = batch_index_.find(submit.batch_token);
     if (batch_it != batch_index_.end()) {
         for (const auto& public_task : public_tasks) {
-            if (hasPublicTask(batch_it->second, public_task.task_id)) {
+            if (public_task.task_id <
+                    batch_it->second.public_task_owners.size() &&
+                batch_it->second.public_task_owners[public_task.task_id] != 0) {
                 return Status::InvalidEntry(
                     "public task id already admitted" LOC_MARK);
             }
@@ -310,13 +313,8 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     }
 
     admitted_owner_ids.reserve(submit.owners.size());
-    owners_.reserve(owners_.size() + submit.owners.size());
     auto& batch_index =
         batch_index_.try_emplace(submit.batch_token).first->second;
-    batch_index.owner_ids.reserve(batch_index.owner_ids.size() +
-                                  submit.owners.size());
-    batch_index.public_tasks.reserve(batch_index.public_tasks.size() +
-                                     public_tasks.size());
 
     std::vector<QueueOwnerId> owner_ids;
     owner_ids.reserve(submit.owners.size());
@@ -334,17 +332,14 @@ Status LocalTransferAdmissionQueue::tryAdmit(
                            owner_input.kind, limits_.deadline_aware, owners_);
         admitted_owner_ids.push_back(owner_id);
     }
-    const auto public_task_begin = batch_index.public_tasks.size();
-    for (const auto& public_task : public_tasks) {
-        batch_index.public_tasks.push_back(
-            {public_task.task_id, owner_ids[public_task.owner_index]});
+    if (batch_index.public_task_owners.size() < public_task_extent) {
+        batch_index.public_task_owners.resize(public_task_extent, 0);
     }
-    std::inplace_merge(batch_index.public_tasks.begin(),
-                       batch_index.public_tasks.begin() + public_task_begin,
-                       batch_index.public_tasks.end(),
-                       [](const auto& lhs, const auto& rhs) {
-                           return lhs.task_id < rhs.task_id;
-                       });
+    for (size_t offset = 0; offset < pending_owner_indices.size(); ++offset) {
+        const auto task_id = first_public_task_id + offset;
+        const auto owner_index = pending_owner_indices[offset];
+        batch_index.public_task_owners[task_id] = owner_ids[owner_index];
+    }
 
     outstanding_owners_ = next_outstanding_owners;
     outstanding_bytes_ = next_outstanding_bytes;
@@ -561,17 +556,11 @@ Status LocalTransferAdmissionQueue::resolveOwner(uint64_t batch_token,
     if (batch_it == batch_index_.end()) {
         return Status::InvalidEntry("public task id not found" LOC_MARK);
     }
-    auto public_it =
-        std::lower_bound(batch_it->second.public_tasks.begin(),
-                         batch_it->second.public_tasks.end(), public_task_id,
-                         [](const auto& public_task, size_t task_id) {
-                             return public_task.task_id < task_id;
-                         });
-    if (public_it == batch_it->second.public_tasks.end() ||
-        public_it->task_id != public_task_id) {
+    if (public_task_id >= batch_it->second.public_task_owners.size() ||
+        batch_it->second.public_task_owners[public_task_id] == 0) {
         return Status::InvalidEntry("public task id not found" LOC_MARK);
     }
-    owner_id = public_it->owner_id;
+    owner_id = batch_it->second.public_task_owners[public_task_id];
     return Status::OK();
 }
 
