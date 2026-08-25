@@ -3908,7 +3908,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // Get data file path
         data_file_path_ = GetDataFilePath();
 
-        // Open/truncate data file in read-write mode
+        // OffsetAllocatorStorageBackend uses buffered I/O (no O_DIRECT):
+        // the vector_read/vector_write hot path does not enforce 4096-byte
+        // alignment on buffers, lengths, or offsets, so enabling O_DIRECT
+        // would cause EINVAL on every I/O operation.  Pass use_direct_io=false
+        // to UringFile to avoid the misleading "O_DIRECT mode enabled" log.
         int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
@@ -3932,7 +3936,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 #ifdef USE_URING
         if (file_storage_config_.use_uring) {
             data_file_ = std::make_shared<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
+                data_file_path_, fd_guard.release(), 32, false);  // buffered I/O, not O_DIRECT
         } else
 #endif
         {
@@ -4719,7 +4723,7 @@ OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
 #ifdef USE_URING
         if (file_storage_config_.use_uring) {
             data_file_ = std::make_shared<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
+                data_file_path_, fd_guard.release(), 32, false);  // buffered I/O
         } else
 #endif
         {
@@ -5639,7 +5643,7 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
 #ifdef USE_URING
             if (file_storage_config_.use_uring) {
                 data_file_ =
-                    std::make_shared<UringFile>(data_file_path_, fd, 32, true);
+                    std::make_shared<UringFile>(data_file_path_, fd, 32, false);  // buffered I/O
             } else
 #endif
             {
