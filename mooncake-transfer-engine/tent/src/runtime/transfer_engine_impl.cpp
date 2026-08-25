@@ -690,7 +690,12 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
          ++it) {
         if (it->addr == addr) {
             auto status = it->transport->freeLocalMemory(addr, it->size);
-            if (!status.ok()) return status;
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Failed to free local memory, addr=" << addr
+                    << ", size=" << it->size << ": " << status.ToString();
+                return status;
+            }
             allocated_memory_.erase(it);
             return Status::OK();
         }
