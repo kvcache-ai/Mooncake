@@ -23,7 +23,6 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-MOONCAKE_TOOLCHAIN=/opt/mooncake-toolchain
 OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
@@ -256,27 +255,10 @@ fi
 
 print_section "Installing Toolchain: CMake, Ninja and Go"
 
-python3 -m venv ${MOONCAKE_TOOLCHAIN}
-${MOONCAKE_TOOLCHAIN}/bin/python3 -m pip install --upgrade pip cmake ninja
-${MOONCAKE_TOOLCHAIN}/bin/python3 -m pip install go-bin==1.27.0
-
-# To audit go-bin wheel contents, run:
-# !/bin/sh
-# cd ${MOONCAKE_TOOLCHAIN}/*/site-packages/go
-# find -type f -exec sha256sum {} \; | tee /tmp/wheel.sha256sum
-# wget -q -O - https://go.dev/dl/go1.27.0.linux-amd64.tar.gz | tar -C /tmp -xzvf -
-# cd /tmp/go
-# find -type f -exec sha256sum {} \; | tee /tmp/tar.sha256sum
-# diff -u /tmp/tar.sha256sum /tmp/wheel.sha256sum
+sh ${REPO_ROOT}/scripts/install_toolchain.sh
+check_success "Failed to install toolchain"
 
 print_success "Toolchain installed successfully"
-
-# Add toolchain to PATH if not already there
-if ! grep -q "export PATH=\$PATH:${MOONCAKE_TOOLCHAIN}/bin" ~/.bashrc; then
-    echo -e "${YELLOW}Adding toolchain to your PATH in ~/.bashrc${NC}"
-    echo 'export PATH=$PATH:${MOONCAKE_TOOLCHAIN}/bin' >> ~/.bashrc
-    echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use MOONCAKE_TOOLCHAIN${NC}"
-fi
 
 # Install SPDK if requested
 if [ "$INSTALL_SPDK" = true ]; then

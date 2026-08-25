@@ -154,6 +154,7 @@ jobs:
           fi
         fi
 
+        bash -x dependencies.sh -y
         bash scripts/ascend/dependencies_ascend_installation.sh
         echo "Configuring CMake..."
         rm -rf build
