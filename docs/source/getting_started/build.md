@@ -24,7 +24,7 @@ Then build and install Mooncake:
 ```bash
 cmake -B build -G Ninja
 cmake --build build
-sudo cmake --install install
+sudo cmake --install build
 ```
 
 ### Build with VRAM Segment
@@ -37,7 +37,7 @@ sudo bash dependencies.sh
 
 cmake -B build -G Ninja -DUSE_VRAM_SEGMENT=ON
 cmake --build build
-sudo cmake --install install
+sudo cmake --install build
 ```
 
 If NVLink is available in your environment, you can also enable it
@@ -48,7 +48,7 @@ sudo bash dependencies.sh
 
 cmake -B build -G Ninja -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
 cmake --build build
-sudo cmake --install install
+sudo cmake --install build
 ```
 
 ### Build with NVMe-oF SSD Pool
@@ -61,7 +61,7 @@ sudo bash dependencies.sh --with-spdk
 
 cmake -B build -G Ninja -DUSE_NOF=ON
 cmake --build build
-sudo cmake --install install
+sudo cmake --install build
 ```
 
 `-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
