@@ -162,6 +162,7 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
             "-DUSE_MUSA",
             "-DMOONCAKE_EP_USE_MUSA=1",
         ]
+        extra_cflags += ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
     else:
         # Retain the CUDA link contract validated by the fresh-wheel smoke.
         extra_ldflags += ["-lc10_cuda", "-ltorch_cuda"]
