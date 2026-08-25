@@ -16,10 +16,16 @@
 #define NCCL_TRANSPORT_H_
 
 #include <memory>
+#include <string>
 
 #include "transport/transport.h"
 
 namespace mooncake {
+
+// Checks the NCCL library visible to the current process. This may load
+// libnccl.so.2, so callers should invoke it only when selecting the NCCL host
+// transport or explicitly probing its runtime capability.
+bool isNcclHostRuntimeAvailable(std::string* error = nullptr);
 
 // Host-submitted NCCL RMA backend for the classic Transfer Engine API.
 // Native NCCL communicators and windows are intentionally private.

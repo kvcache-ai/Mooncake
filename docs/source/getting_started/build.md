@@ -118,6 +118,12 @@ NCCL, rebuild Mooncake and every AOT CUDA kernel that includes
 `transport/device/nccl_device.cuh`. Invalidate and regenerate any cached NCCL
 Device API JIT kernels before running. This is required for the current GIN
 device-code model, which is not cross-version compatible.
+
+Importing Mooncake does not load NCCL. Creating a DeviceTransport resolves the
+process `libnccl.so.2` at runtime and reports an unavailable transport when the
+library is missing, incomplete, or version-mismatched. When another package
+such as PyTorch loads an older NCCL first, set `LD_PRELOAD` before process
+startup to select the NCCL runtime that matches Mooncake's build headers.
 ```
 
 ```{admonition} GPU-Direct RDMA

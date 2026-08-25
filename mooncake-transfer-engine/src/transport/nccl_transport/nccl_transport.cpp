@@ -15,6 +15,7 @@
 #include "transport/nccl_transport/nccl_transport.h"
 
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 #include <glog/logging.h>
 #if __has_include(<jsoncpp/json/json.h>)
 #include <jsoncpp/json/json.h>
@@ -51,6 +52,99 @@ namespace {
 
 constexpr char kHandshakeProtocol[] = "nccl";
 constexpr int kSessionTimeoutSeconds = 60;
+constexpr int kMinimumNcclVersion = 23004;
+
+class NcclRuntime {
+   public:
+    struct Symbols {
+        decltype(&ncclGetErrorString) get_error_string = nullptr;
+        decltype(&ncclGetVersion) get_version = nullptr;
+        decltype(&ncclGetUniqueId) get_unique_id = nullptr;
+        decltype(&ncclCommInitRankConfig) comm_init_rank_config = nullptr;
+        decltype(&ncclCommWindowRegister) comm_window_register = nullptr;
+        decltype(&ncclCommWindowDeregister) comm_window_deregister = nullptr;
+        decltype(&ncclCommDestroy) comm_destroy = nullptr;
+        decltype(&ncclPutSignal) put_signal = nullptr;
+        decltype(&ncclSignal) signal = nullptr;
+    };
+
+    static NcclRuntime& instance() {
+        static NcclRuntime runtime;
+        return runtime;
+    }
+
+    bool available() const { return available_; }
+    const std::string& error() const { return error_; }
+    const Symbols& symbols() const { return symbols_; }
+
+   private:
+    NcclRuntime() {
+        handle_ = dlopen("libnccl.so.2", RTLD_NOW | RTLD_LOCAL);
+        if (!handle_) {
+            const char* error = dlerror();
+            error_ = "Unable to load libnccl.so.2: " +
+                     std::string(error ? error : "unknown error");
+            return;
+        }
+
+        bool loaded = true;
+        loaded &= loadSymbol("ncclGetErrorString", &symbols_.get_error_string);
+        loaded &= loadSymbol("ncclGetVersion", &symbols_.get_version);
+        loaded &= loadSymbol("ncclGetUniqueId", &symbols_.get_unique_id);
+        loaded &= loadSymbol("ncclCommInitRankConfig",
+                             &symbols_.comm_init_rank_config);
+        loaded &= loadSymbol("ncclCommWindowRegister",
+                             &symbols_.comm_window_register);
+        loaded &= loadSymbol("ncclCommWindowDeregister",
+                             &symbols_.comm_window_deregister);
+        loaded &= loadSymbol("ncclCommDestroy", &symbols_.comm_destroy);
+        loaded &= loadSymbol("ncclPutSignal", &symbols_.put_signal);
+        loaded &= loadSymbol("ncclSignal", &symbols_.signal);
+        if (!loaded) return;
+
+        int version = 0;
+        ncclResult_t result = symbols_.get_version(&version);
+        if (result != ncclSuccess) {
+            error_ = "ncclGetVersion failed: " +
+                     std::string(symbols_.get_error_string(result));
+            return;
+        }
+        if (version < kMinimumNcclVersion) {
+            std::ostringstream out;
+            out << "NCCL " << version
+                << " is too old; Mooncake NCCL host transport requires "
+                   "NCCL 2.30.4 or newer. Preload a compatible libnccl.so.2 "
+                   "before starting Python.";
+            error_ = out.str();
+            return;
+        }
+
+        available_ = true;
+        LOG(INFO) << "[Host NCCL] runtime loaded, version=" << version;
+    }
+
+    template <typename Fn>
+    bool loadSymbol(const char* name, Fn* target) {
+        dlerror();
+        void* symbol = dlsym(handle_, name);
+        const char* error = dlerror();
+        if (error) {
+            error_ = "libnccl.so.2 is missing required symbol '" +
+                     std::string(name) + "': " + error;
+            return false;
+        }
+        *target = reinterpret_cast<Fn>(symbol);
+        return true;
+    }
+
+    // Keep the runtime loaded for the lifetime of every NCCL communicator.
+    void* handle_ = nullptr;
+    Symbols symbols_;
+    bool available_ = false;
+    std::string error_;
+};
+
+NcclRuntime& ncclRuntime() { return NcclRuntime::instance(); }
 
 struct BufferInfo {
     uint64_t addr = 0;
@@ -67,7 +161,8 @@ bool containsRange(const BufferInfo& buffer, uint64_t addr, size_t length) {
 
 std::string ncclError(ncclResult_t result, const char* operation) {
     std::ostringstream out;
-    out << operation << " failed: " << ncclGetErrorString(result);
+    out << operation
+        << " failed: " << ncclRuntime().symbols().get_error_string(result);
     return out.str();
 }
 
@@ -326,7 +421,7 @@ class NcclSession {
         }
 
         const auto& destination = window->buffers[owner_rank];
-        ncclResult_t result = ncclPutSignal(
+        ncclResult_t result = ncclRuntime().symbols().put_signal(
             source, length, ncclUint8, owner_rank, window->handle,
             dest_addr - destination.addr, 0, 0, 0, comm_, stream_);
         cudaError_t sync_result = cudaSuccess;
@@ -397,8 +492,8 @@ class NcclSession {
 
         ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
         config.numRmaCtx = 1;
-        ncclResult_t result =
-            ncclCommInitRankConfig(&comm_, 2, unique_id_, rank_, &config);
+        ncclResult_t result = ncclRuntime().symbols().comm_init_rank_config(
+            &comm_, 2, unique_id_, rank_, &config);
         if (result != ncclSuccess) {
             setFailure(ncclError(result, "ncclCommInitRankConfig"));
             if (saved_device >= 0) cudaSetDevice(saved_device);
@@ -420,9 +515,9 @@ class NcclSession {
             const auto& local_buffer = window.buffers[rank_];
             window.local_ptr = reinterpret_cast<void*>(local_buffer.addr);
 
-            result = ncclCommWindowRegister(comm_, window.local_ptr,
-                                            local_buffer.length, &window.handle,
-                                            NCCL_WIN_COLL_SYMMETRIC);
+            result = ncclRuntime().symbols().comm_window_register(
+                comm_, window.local_ptr, local_buffer.length, &window.handle,
+                NCCL_WIN_COLL_SYMMETRIC);
             if (result != ncclSuccess || !window.handle) {
                 if (result == ncclSuccess) result = ncclInternalError;
                 setFailure(ncclError(result, "ncclCommWindowRegister"));
@@ -435,7 +530,8 @@ class NcclSession {
         // NCCL initializes the host-RMA copy-engine resources collectively on
         // the first host RMA submission. Warm them here while both session
         // ranks are already participating, so later TE puts are one-sided.
-        result = ncclSignal(1 - rank_, 0, 0, 0, comm_, stream_);
+        result =
+            ncclRuntime().symbols().signal(1 - rank_, 0, 0, 0, comm_, stream_);
         if (result != ncclSuccess) {
             setFailure(ncclError(result, "ncclSignal (RMA warm-up)"));
             if (saved_device >= 0) cudaSetDevice(saved_device);
@@ -479,14 +575,17 @@ class NcclSession {
         cudaSetDevice(local_device_);
         if (stream_) cudaStreamSynchronize(stream_);
         for (auto it = windows_.rbegin(); it != windows_.rend(); ++it) {
-            if (it->handle) ncclCommWindowDeregister(comm_, it->handle);
+            if (it->handle) {
+                ncclRuntime().symbols().comm_window_deregister(comm_,
+                                                               it->handle);
+            }
         }
         windows_.clear();
         if (stream_) {
             cudaStreamDestroy(stream_);
             stream_ = nullptr;
         }
-        ncclCommDestroy(comm_);
+        ncclRuntime().symbols().comm_destroy(comm_);
         comm_ = nullptr;
         if (saved_device >= 0) cudaSetDevice(saved_device);
     }
@@ -981,7 +1080,8 @@ class NcclHostTransport::Impl {
                 if (error) *error = "NCCL rank 1 cannot create a unique ID";
                 return false;
             }
-            ncclResult_t result = ncclGetUniqueId(unique_id);
+            ncclResult_t result =
+                ncclRuntime().symbols().get_unique_id(unique_id);
             if (result != ncclSuccess) {
                 if (error) *error = ncclError(result, "ncclGetUniqueId");
                 return false;
@@ -1226,10 +1326,21 @@ NcclHostTransport::~NcclHostTransport() = default;
 int NcclHostTransport::install(std::string& local_server_name,
                                std::shared_ptr<TransferMetadata> metadata,
                                std::shared_ptr<Topology> topology) {
+    if (!isNcclHostRuntimeAvailable()) {
+        LOG(ERROR) << "NCCL host transport is unavailable: "
+                   << ncclRuntime().error();
+        return -1;
+    }
     (void)topology;
     local_server_name_ = local_server_name;
     metadata_ = metadata;
     return impl_->install(local_server_name, std::move(metadata));
+}
+
+bool isNcclHostRuntimeAvailable(std::string* error) {
+    auto& runtime = ncclRuntime();
+    if (error) *error = runtime.error();
+    return runtime.available();
 }
 
 Status NcclHostTransport::submitTransfer(
