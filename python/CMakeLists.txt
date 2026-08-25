@@ -23,6 +23,20 @@ install(
   FILES_MATCHING
   PATTERN "*.py"
   PATTERN "__init__.py" EXCLUDE)
+if(WITH_EP)
+  install(
+    FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/src/pg_py.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/src/mooncake_backend.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/src/work_handles.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/mooncake_backend.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/work_handles.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/torch_utils.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/adapter_backoff.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/include/mooncake_pg.h"
+    DESTINATION mooncake/_pg_jit
+    COMPONENT python)
+endif()
 install(
   DIRECTORY
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-reshard/python/mooncake/reshard/"

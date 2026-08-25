@@ -25,6 +25,21 @@ rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
 
+# Keep the runtime PG JIT source bundle synchronized with the canonical adapter
+# sources.  The wheel contains only this small Torch-facing bundle; it does not
+# contain the native PG or Transfer Engine C++ header trees.
+rm -rf mooncake-wheel/mooncake/_pg_jit
+mkdir -p mooncake-wheel/mooncake/_pg_jit
+cp mooncake-pg/torch/src/pg_py.cpp \
+   mooncake-pg/torch/src/mooncake_backend.cpp \
+   mooncake-pg/torch/src/work_handles.cpp \
+   mooncake-pg/torch/include/mooncake_backend.h \
+   mooncake-pg/torch/include/work_handles.h \
+   mooncake-pg/torch/include/torch_utils.h \
+   mooncake-pg/torch/include/adapter_backoff.h \
+   mooncake-pg/include/mooncake_pg.h \
+   mooncake-wheel/mooncake/_pg_jit/
+
 echo "Creating directory structure..."
 
 # Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
