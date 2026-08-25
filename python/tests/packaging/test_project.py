@@ -1,11 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shutil
-import subprocess
-import sys
 
-import pytest
 
 try:
     import tomllib
@@ -55,56 +51,3 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
-
-
-def test_pg_extension_build_stages_outside_the_source_tree(
-    tmp_path: Path,
-) -> None:
-    cmake = shutil.which("cmake")
-    if cmake is None:
-        pytest.skip("CMake is required to exercise the PG staging script")
-
-    source = tmp_path / "source" / "mooncake-pg" / "torch"
-    common = tmp_path / "source" / "mooncake-common"
-    source.mkdir(parents=True)
-    common.mkdir(parents=True)
-    (common / "SetupPyTorchEnv.cmake").write_text("")
-    (source / "setup.py").write_text(
-        """\
-from pathlib import Path
-import sys
-
-build_lib = Path(sys.argv[sys.argv.index("--build-lib") + 1])
-package = build_lib / "mooncake"
-package.mkdir(parents=True, exist_ok=True)
-(package / "pg_fake.so").write_bytes(b"extension")
-"""
-    )
-
-    core = tmp_path / "libmooncake_pg.so"
-    device = tmp_path / "libmooncake_pg_device.so"
-    core.write_bytes(b"core")
-    device.write_bytes(b"device")
-    staging = tmp_path / "staging"
-    build = tmp_path / "build"
-
-    subprocess.run(
-        [
-            cmake,
-            f"-DSOURCE_DIR={source}",
-            "-DEP_TORCH_VERSIONS=",
-            f"-DSTAGING_DIR={staging}",
-            f"-DBUILD_DIR={build}",
-            f"-DPG_CORE_SO_PATH={core}",
-            f"-DPG_DEVICE_SO_PATH={device}",
-            f"-DPython3_EXECUTABLE={sys.executable}",
-            "-P",
-            str(REPOSITORY_ROOT / "mooncake-pg" / "torch" / "BuildPgExt.cmake"),
-        ],
-        check=True,
-    )
-
-    assert (staging / "pg_fake.so").read_bytes() == b"extension"
-    assert (staging / device.name).read_bytes() == b"device"
-    assert (build / "current" / "lib" / "mooncake" / "pg_fake.so").is_file()
-    assert not list(source.rglob("*.so"))

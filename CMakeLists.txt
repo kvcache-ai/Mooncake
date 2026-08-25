@@ -169,57 +169,13 @@ if(WITH_EP)
     add_subdirectory(mooncake-ep)
     include_directories(mooncake-ep/include)
 
-    # EP_TORCH_VERSIONS: semicolon-separated list of PyTorch versions to build
-    # for. Can be set via -DEP_TORCH_VERSIONS="2.9.1;2.8.0" or the
-    # EP_TORCH_VERSIONS env var. Empty means build with the currently-installed
-    # torch.
-    if(NOT EP_TORCH_VERSIONS)
-      set(EP_TORCH_VERSIONS "$ENV{EP_TORCH_VERSIONS}")
-    endif()
-    set(EP_TORCH_VERSIONS
-        "${EP_TORCH_VERSIONS}"
-        CACHE
-          STRING
-          "PyTorch versions for EP/PG extensions, semicolon-separated (empty = use currently-installed torch)"
-    )
-
-    if(SKBUILD AND NOT EP_TORCH_VERSIONS)
-      execute_process(
-        COMMAND ${Python3_EXECUTABLE} -c "import torch"
-        RESULT_VARIABLE _mooncake_python_has_torch
-        OUTPUT_QUIET ERROR_QUIET)
-      if(NOT _mooncake_python_has_torch EQUAL 0)
-        message(
-          FATAL_ERROR
-            "WITH_EP requires EP_TORCH_VERSIONS in an isolated scikit-build-core build because PyTorch is not installed in the build environment"
-        )
-      endif()
-    endif()
-
-    # TORCH_CUDA_ARCH_LIST forwarded to the torch CUDA extension build.
-    if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
-    endif()
-    if(NOT TORCH_CUDA_ARCH_LIST)
-      if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
-        set(TORCH_CUDA_ARCH_LIST "8.0;9.0;10.3")
-      else()
-        set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
-      endif()
-    endif()
-    set(TORCH_CUDA_ARCH_LIST
-        "${TORCH_CUDA_ARCH_LIST}"
-        CACHE STRING
-              "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
-
     # Keep generated Torch extensions and device libraries in backend-owned
     # build directories. The legacy release path injects the staged device
     # artifacts after auditwheel; scikit-build-core installs them directly into
     # its private wheel tree.
     set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
-    set(EP_PG_BUILD_DIR "${CMAKE_BINARY_DIR}/ep_pg_build")
-    file(REMOVE_RECURSE "${EP_PG_STAGING_DIR}" "${EP_PG_BUILD_DIR}")
-    file(MAKE_DIRECTORY "${EP_PG_STAGING_DIR}" "${EP_PG_BUILD_DIR}")
+    file(REMOVE_RECURSE "${EP_PG_STAGING_DIR}")
+    file(MAKE_DIRECTORY "${EP_PG_STAGING_DIR}")
 
     # Stage the runtime JIT source bundle for the legacy wheel script as well
     # as the scikit-build install path.  The authoritative files stay under
@@ -254,12 +210,6 @@ if(WITH_EP)
               "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_pg.h"
       COMMENT "Staging Mooncake PG Torch JIT sources")
 
-    # Convert semicolon-separated lists to pipe-separated strings so they
-    # survive CMake's COMMAND list-splitting (semicolons are CMake list
-    # separators).
-    string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
-    string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
-
     if(USE_CUDA)
       add_custom_target(
         mooncake_ep_device_stage ALL
@@ -272,23 +222,12 @@ if(WITH_EP)
     endif()
 
     add_custom_target(
-      mooncake_pg_ext ALL
+      mooncake_pg_device_stage ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-      COMMAND
-        ${CMAKE_COMMAND}
-        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch"
-        "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
-        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
-        "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
-        "-DSTAGING_DIR=${EP_PG_STAGING_DIR}" "-DBUILD_DIR=${EP_PG_BUILD_DIR}"
-        "-DPG_CORE_SO_PATH=$<TARGET_FILE:mooncake_pg>"
-        "-DPG_DEVICE_SO_PATH=$<TARGET_FILE:mooncake_pg_device>"
-        "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
-        "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
-        "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>" -P
-        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/BuildPgExt.cmake"
-      COMMENT "Building Mooncake PG Python extension(s)"
-      DEPENDS mooncake_pg mooncake_pg_device
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "$<TARGET_FILE:mooncake_pg_device>" "${EP_PG_STAGING_DIR}/"
+      COMMENT "Staging Mooncake PG device library"
+      DEPENDS mooncake_pg_device
       VERBATIM)
   endif()
 endif()

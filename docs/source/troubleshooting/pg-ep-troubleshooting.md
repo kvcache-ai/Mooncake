@@ -3,20 +3,19 @@
 This page covers common setup, import, runtime, and recovery issues for
 Mooncake PG and Mooncake EP.
 
-## Import fails with a PyTorch version error
+## PG JIT import fails
 
 Symptoms:
 
 ```text
-Mooncake PG was not built against torch==...
-Mooncake EP was not built against torch==...
+Mooncake PG JIT requires Ninja to compile the Torch adapter.
+Mooncake PG Torch adapter JIT requires a CUDA toolkit with nvcc.
 ```
 
 Cause:
 
-`mooncake.pg` and `mooncake.ep` load native extension modules whose names include
-the current PyTorch version. If the wheel or source build does not contain an
-extension for the active `torch.__version__`, import fails.
+`mooncake.pg` builds its Torch-facing adapter for the installed PyTorch at
+first import. That build requires Ninja and a CUDA toolkit with `nvcc`.
 
 Fixes:
 
@@ -30,16 +29,13 @@ Fixes:
    PY
    ```
 
-2. Install a Mooncake wheel built for that PyTorch/CUDA combination, or rebuild
-   from source with EP/PG enabled:
+2. Install Ninja and a CUDA toolkit compatible with the installed PyTorch:
 
    ```bash
-   cmake .. -DWITH_EP=ON
-   make -j
+   python -m pip install ninja
    ```
 
-3. Make sure the Python environment used at runtime is the same one used for the
-   build.
+3. Re-import `mooncake.pg`; it will rebuild into the local JIT cache.
 
 ## `dist.get_world_size()` differs from the number of active ranks
 
