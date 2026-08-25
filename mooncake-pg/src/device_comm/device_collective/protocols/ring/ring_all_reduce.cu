@@ -12,6 +12,30 @@
 namespace mooncake {
 namespace {
 
+inline constexpr uint64_t kMinBytesPerChannelStep = 256ull << 10;
+
+template <typename T>
+[[nodiscard]] __device__ __forceinline__ uint32_t
+chooseChannelCount(uint64_t element_count, const RingAllReducePlan& plan) {
+    PG_DEVICE_ASSERT(plan.participant_count != 0);
+    const uint64_t payload_size = element_count * sizeof(T);
+
+    // Launch is plan-independent. Each CTA derives the same active channel
+    // prefix after the startup leader has applied the latest Plan.
+    uint32_t channel_count = kMaxDeviceCollectiveChannels;
+    while (channel_count > 1) {
+        const bool shard_is_too_small =
+            payload_size / plan.participant_count / channel_count <
+            kMinBytesPerChannelStep;
+        const bool payload_slot_is_too_small =
+            plan.buffer_size / channel_count / kRingPipelineSlots <
+            kRingPayloadAlignment;
+        if (!shard_is_too_small && !payload_slot_is_too_small) break;
+        channel_count /= 2;
+    }
+    return channel_count;
+}
+
 template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ RingStepResult runRingTile(
     const RingAllReducePlan& plan, const RingPrimitives<T, Op>& primitives,
@@ -88,17 +112,29 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
     const auto block = cooperative_groups::this_thread_block();
     const uint32_t channel = blockIdx.x;
     PG_DEVICE_ASSERT(state);
+    auto* const invocation = state->invocation_state;
+    auto* const recovery_mailbox = state->recovery_mailbox;
+    PG_DEVICE_ASSERT(invocation);
+    PG_DEVICE_ASSERT(recovery_mailbox);
+    prepareCollectiveInvocation(invocation, recovery_mailbox, block);
+
     const auto* const plan_slot = &state->plan;
 
     // Recovery may update this host-constructed Plan between Graph replays.
     PG_DEVICE_ASSERT(plan_slot->status == DevicePlanStatus::Ready);
     const auto plan = plan_slot->plan;
     if (request.count == 0) {
-        completeChannel(plan.invocation_state, plan.recovery_mailbox, block);
+        completeChannel(invocation, recovery_mailbox, block);
         return;
     }
 
-    const uint32_t channel_count = gridDim.x;
+    const uint32_t channel_count = chooseChannelCount<T>(request.count, plan);
+    if (channel >= channel_count) {
+        // The fixed launch capacity keeps host submission independent of the
+        // Plan image. Inactive CTAs still participate in invocation completion.
+        completeChannel(invocation, recovery_mailbox, block);
+        return;
+    }
     const uint64_t elements_per_channel = request.count / channel_count;
     const uint64_t extra_elements = request.count % channel_count;
     const uint64_t channel_elements =
@@ -115,7 +151,7 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
         if (input != output) {
             copyValuesTo(input, channel_elements, block, output);
         }
-        completeChannel(plan.invocation_state, plan.recovery_mailbox, block);
+        completeChannel(invocation, recovery_mailbox, block);
         return;
     }
     block.sync();
@@ -179,7 +215,7 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
     const auto buffer_ready =
         primitives.waitRecvBufferReady(recv_buffer_ready_sequence, block);
     if (!buffer_ready.succeeded()) {
-        completeChannel(plan.invocation_state, plan.recovery_mailbox, block,
+        completeChannel(invocation, recovery_mailbox, block,
                         buffer_ready.failed_rank, request.failed_ranks_hint);
         return;
     }
@@ -195,7 +231,7 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
         const auto result = runRingTile(plan, primitives, tile_layout,
                                         tile_index, step_sequences, block);
         if (!result.succeeded()) {
-            completeChannel(plan.invocation_state, plan.recovery_mailbox, block,
+            completeChannel(invocation, recovery_mailbox, block,
                             result.failed_rank, request.failed_ranks_hint);
             return;
         }
@@ -210,7 +246,7 @@ __global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
         device::mc_st_release_u64(next_recv_buffer_ready_sequence,
                                   recv_buffer_ready_sequence + 1);
     }
-    completeChannel(plan.invocation_state, plan.recovery_mailbox, block);
+    completeChannel(invocation, recovery_mailbox, block);
 }
 
 template <typename T>
@@ -244,10 +280,9 @@ cudaError_t launchReduction(const RingAllReduceKernelArgs& request,
 
 cudaError_t launchRingAllReduceKernel(const RingAllReduceKernelArgs& request,
                                       RingAllReduceDeviceState* state,
-                                      uint32_t channel_count,
                                       cudaStream_t stream) {
     constexpr int kProtocolThreads = 256;
-    const dim3 grid(channel_count);
+    const dim3 grid(kMaxDeviceCollectiveChannels);
     switch (request.datatype) {
         case DataType::Float16:
             return launchReduction<__half>(request, state, grid,

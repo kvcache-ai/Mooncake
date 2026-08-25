@@ -15,6 +15,7 @@ namespace mooncake {
 
 class DeviceCollectiveWorkspace;
 class DeviceTransferService;
+class ControlUpdateBuilder;
 
 // Owns the host-side decisions specific to Ring AllReduce. The common runtime
 // supplies ordering and recovery lifecycle only.
@@ -25,17 +26,20 @@ class RingAllReduceProtocol {
         DeviceCollectiveWorkspace& workspace,
         DeviceCollectiveInvocationState* invocation_state,
         DeviceCollectiveRecoveryMailbox* recovery_mailbox,
-        uint64_t timeout_ticks, GpuStream& control_stream, int device_index,
-        InGroupRank self_rank, uint32_t max_group_size);
+        uint64_t timeout_ticks, int device_index, InGroupRank self_rank,
+        uint32_t max_group_size);
 
     ~RingAllReduceProtocol() noexcept;
 
     RingAllReduceProtocol(const RingAllReduceProtocol&) = delete;
     RingAllReduceProtocol& operator=(const RingAllReduceProtocol&) = delete;
 
-    PGResult<void> useLocalOnly();
+    // These methods update only the host Plan. Runtime publication is a
+    // separate step that encodes the complete collective state below.
+    void useLocalOnly();
     PGResult<void> applyGroupView(const GroupView& view);
-    PGResult<void> invalidate();
+    void invalidateHostPlan() noexcept;
+    PGResult<void> appendPlanUpdate(ControlUpdateBuilder& builder) const;
 
     [[nodiscard]] bool ready() const noexcept;
     [[nodiscard]] const RingAllReduceEndpoint& localEndpoint() const noexcept;
@@ -46,39 +50,30 @@ class RingAllReduceProtocol {
                            int32_t* failed_ranks_hint) const;
 
    private:
-    static constexpr size_t kMinBytesPerChannelStep = 256ull << 10;
-
-    struct HostState;
-
     RingAllReduceProtocol(DeviceTransferService& transfer_service,
                           DeviceCollectiveWorkspace& workspace,
                           const DeviceTransferHandle* transfer_handle,
                           DeviceCollectiveInvocationState* invocation_state,
                           DeviceCollectiveRecoveryMailbox* recovery_mailbox,
-                          uint64_t timeout_ticks, GpuStream& control_stream,
-                          int device_index, InGroupRank self_rank,
-                          uint32_t max_group_size, RegionSlice signals,
+                          uint64_t timeout_ticks, int device_index,
+                          InGroupRank self_rank, uint32_t max_group_size,
+                          RegionSlice signals,
                           RingSignalLayout signal_layout) noexcept;
 
     PGResult<void> initializeDeviceState();
     void releaseDeviceState() noexcept;
-    PGResult<void> initializeHostState();
-    void releaseHostState() noexcept;
-    PGResult<void> publish(int32_t self_active_index,
-                           uint32_t participant_count, uint64_t buffer_size,
-                           RingPeerTarget predecessor, RingPeerTarget successor,
-                           char* staging_ptr);
-    [[nodiscard]] static uint32_t chooseChannelCount(size_t payload_size,
-                                                     uint32_t participant_count,
-                                                     uint64_t buffer_size);
-
+    [[nodiscard]] RingAllReducePlan makePlan(int32_t self_active_index,
+                                             uint32_t participant_count,
+                                             uint64_t buffer_size,
+                                             RingPeerTarget predecessor,
+                                             RingPeerTarget successor,
+                                             char* staging_ptr) const;
     DeviceTransferService& transfer_service_;
     DeviceCollectiveWorkspace& workspace_;
     const DeviceTransferHandle* transfer_handle_ = nullptr;
     DeviceCollectiveInvocationState* invocation_state_ = nullptr;
     DeviceCollectiveRecoveryMailbox* recovery_mailbox_ = nullptr;
     uint64_t timeout_ticks_ = 0;
-    GpuStream& control_stream_;
     int device_index_ = -1;
     InGroupRank self_rank_ = kInvalidInGroupRank;
     uint32_t max_group_size_ = 0;
@@ -86,8 +81,7 @@ class RingAllReduceProtocol {
     RingSignalLayout signal_layout_;
     RingAllReduceDeviceState* state_ = nullptr;
     RingAllReduceEndpoint endpoint_;
-    HostState* host_state_ = nullptr;
-    bool ready_ = false;
+    RingAllReducePlanSlot host_plan_;
 };
 
 }  // namespace mooncake

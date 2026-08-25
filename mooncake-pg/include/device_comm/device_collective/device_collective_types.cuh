@@ -12,6 +12,8 @@ namespace mooncake {
 
 inline constexpr uint32_t kMaxDeviceCollectiveChannels = 32;
 static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
+inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 8;
+inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 1024;
 
 inline constexpr bool isDeviceAllReduceCombinationSupported(
     DataType datatype, ReduceOp op) noexcept {
@@ -47,6 +49,91 @@ enum class DevicePlanStatus : uint8_t {
     Ready = 1,
 };
 
+enum class ControlUpdateOpKind : uint32_t {
+    CopyBytes = 0,
+    FillBytes = 1,
+    FillU64 = 2,
+};
+
+struct alignas(16) ControlUpdateOp {
+    struct CopyBytes {
+        uint64_t destination;
+        uint32_t size;
+        uint32_t payload_offset;
+    };
+
+    struct FillBytes {
+        uint64_t destination;
+        uint8_t value;
+        uint32_t count;
+    };
+
+    struct FillU64 {
+        uint64_t destination;
+        uint64_t value;
+        uint32_t count;
+    };
+
+    union Payload {
+        CopyBytes copy_bytes;
+        FillBytes fill_bytes;
+        FillU64 fill_u64;
+    };
+
+    ControlUpdateOpKind kind = ControlUpdateOpKind::CopyBytes;
+    Payload payload = {};
+};
+
+// Idle: no update is pending; the host may acquire the slot for writing.
+// Writing: the host publisher exclusively owns the slot while copying an
+// already constructed update; device code must not read or execute it.
+// Published: a complete update is visible. The next collective may claim it,
+// the host may replace it to coalesce another update, or recovery may pin it.
+// Pinned: recovery has reserved the published update for the currently parked
+// failed collective; ordinary collectives and host publishers must leave it
+// untouched.
+// Claimed: a device CTA exclusively owns and executes the update, then returns
+// the slot to Idle.
+//
+// Replaceable host publication:
+//   Idle      -> Writing -> Published
+//   Published -> Writing -> Published (coalescing)
+// Direct recovery publication:
+//   Idle/Published -> Writing -> Pinned
+// Reserving an existing normal publication for recovery:
+//   Published -> Pinned
+// Normal collective startup:
+//   Published -> Claimed -> Idle
+// Failed collective resume:
+//   Pinned -> Claimed -> Idle
+enum class ControlUpdateState : uint32_t {
+    Idle = 0,
+    Writing = 1,
+    Published = 2,
+    Pinned = 3,
+    Claimed = 4,
+};
+
+// One complete, idempotent update for device-resident control-plane state.
+// The host constructs it locally before briefly acquiring the mapped slot for
+// publication.
+struct alignas(16) ControlUpdate {
+    uint32_t operation_count = 0;
+    uint32_t payload_size = 0;
+    ControlUpdateOp operations[kMaxDeviceControlUpdateOperations] = {};
+    alignas(16) uint8_t payload[kDeviceControlUpdatePayloadBytes] = {};
+};
+
+// Mapped single-slot state for a ControlUpdate. The host owns the slot
+// only during the short Writing publication step, and a collective kernel
+// owns it while Claimed. Pinned protects a failure-resume update until its
+// parked CTA can apply it. A newer complete update may replace Published, which
+// coalesces existing GroupView updates.
+struct alignas(64) DeviceControlUpdateSlot {
+    uint32_t state = static_cast<uint32_t>(ControlUpdateState::Idle);
+    ControlUpdate update;
+};
+
 template <typename Plan>
 struct DevicePlanSlot {
     DevicePlanStatus status = DevicePlanStatus::Unavailable;
@@ -54,9 +141,10 @@ struct DevicePlanSlot {
 };
 
 // The device publishes a new failure generation only after every active
-// channel CTA has stopped touching the old Plan and protocol buffers. The host
-// publishes the matching ready generation after recovery has installed the
-// replacement Plan.
+// channel CTA has stopped touching the old Plan and protocol buffers. Recovery
+// pins a control update and then acknowledges the matching failure generation.
+// The parked CTA applies the pinned update before it leaves the failed
+// collective.
 struct alignas(64) DeviceCollectiveRecoveryMailbox {
     uint64_t failure_generation = 0;
     uint64_t ready_generation = 0;
@@ -64,15 +152,21 @@ struct alignas(64) DeviceCollectiveRecoveryMailbox {
     // Valid only while failure_generation is newer than ready_generation.
     InGroupRank failed_rank = 0;
     uint64_t failed_hint_address = 0;
+
+    // Valid for the parked CTA only while its state is Pinned and
+    // ready_generation has caught up with failure_generation.
+    DeviceControlUpdateSlot control_update_slot;
 };
 
 // State shared by all channel CTAs in one collective launch. A CTA increments
-// arrived_channels after all of its threads have stopped using the Plan and
-// protocol buffers; a non-last CTA then returns. If a failure was reported,
+// completion_arrival_count after all of its threads have stopped using the Plan
+// and protocol buffers; a non-last CTA then returns. If a failure was reported,
 // the last CTA publishes the latched metadata to the host recovery mailbox and
 // remains in the kernel until recovery finishes.
 struct alignas(64) DeviceCollectiveInvocationState {
-    uint32_t arrived_channels = 0;
+    uint32_t startup_arrival_count = 0;
+    uint32_t startup_complete = 0;
+    uint32_t completion_arrival_count = 0;
     uint32_t failure_latched = 0;
     InGroupRank failed_rank = kInvalidInGroupRank;
     uint64_t failed_hint_address = 0;
