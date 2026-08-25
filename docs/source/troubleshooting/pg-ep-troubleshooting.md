@@ -35,7 +35,7 @@ Fixes:
 
    ```bash
    cmake .. -DWITH_EP=ON
-   make -j
+   cmake --build .
    ```
 
 3. Make sure the Python environment used at runtime is the same one used for the
