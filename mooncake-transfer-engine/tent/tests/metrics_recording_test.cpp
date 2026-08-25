@@ -623,6 +623,132 @@ TEST_F(MetricsRecordingTest, FailoverResubmitSyncFailureRecordsBothAttempts) {
 }
 
 // ---------------------------------------------------------------------------
+// Submit-stage failover: the primary transport fails synchronously inside
+// submitTransferTasks() and the engine recovers on the secondary. The
+// failover counter must advance and the logical completion must be attributed
+// to the transport that completed the request.
+// ---------------------------------------------------------------------------
+TEST_F(MetricsRecordingTest, SubmitStageFailoverRecordsFailoverAndCompletion) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, /*force_fail=*/false, /*force_submit_fail=*/true);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP, /*force_fail=*/false);
+    installFakeRdma(engine, fake_rdma);
+    installFakeTcp(engine, fake_tcp);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xB7);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0),
+              TransferStatusEnum::COMPLETED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    // Two attempts: RDMA failed synchronously, TCP completed.
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              2);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              1);
+    const std::string rdma_attempt_failures =
+        "tent_transport_attempt_failures_total{transport=\"rdma\",operation="
+        "\"write\"}";
+    EXPECT_EQ(after.series(rdma_attempt_failures) -
+                  before.series(rdma_attempt_failures),
+              1);
+
+    // Exactly one cross-transport failover event rdma -> tcp.
+    const std::string failover =
+        "tent_transport_failover_total{from=\"rdma\",to=\"tcp\"}";
+    EXPECT_EQ(after.series(failover) - before.series(failover), 1);
+
+    // The logical write completed on the fallback transport, attributed to
+    // TCP rather than the failed primary.
+    const std::string tcp_writes =
+        "tent_write_requests_total{transport=\"tcp\"}";
+    EXPECT_EQ(after.series(tcp_writes) - before.series(tcp_writes), 1);
+    EXPECT_EQ(after.counter("tent_write_failures_total") -
+                  before.counter("tent_write_failures_total"),
+              0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
+// Submit-stage failover exhaustion: every candidate transport rejects the
+// submit synchronously. The terminal failure must be attributed to a real
+// transport (the last one attempted), never to "unspec".
+// ---------------------------------------------------------------------------
+TEST_F(MetricsRecordingTest, SubmitStageExhaustionAttributesToRealTransport) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, /*force_fail=*/false, /*force_submit_fail=*/true);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP, /*force_fail=*/false,
+                                                    /*force_submit_fail=*/true);
+    installFakeRdma(engine, fake_rdma);
+    installFakeTcp(engine, fake_tcp);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0x6D);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              2);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              2);
+
+    // The terminal write failure is attributed to the last attempted
+    // transport (tcp), NOT to "unspec".
+    const std::string tcp_write_failures =
+        "tent_write_failures_total{transport=\"tcp\"}";
+    const std::string unspec_write_failures =
+        "tent_write_failures_total{transport=\"unspec\"}";
+    EXPECT_EQ(
+        after.series(tcp_write_failures) - before.series(tcp_write_failures),
+        1);
+    EXPECT_EQ(after.series(unspec_write_failures) -
+                  before.series(unspec_write_failures),
+              0);
+    EXPECT_EQ(after.counter("tent_write_requests_total") -
+                  before.counter("tent_write_requests_total"),
+              1);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
 // Failed transfer increments failures and requests but NOT bytes or size
 // histogram. Uses the direct API so the assertion is deterministic and does
 // not depend on engine failover behavior.
