@@ -56,7 +56,7 @@ def _source_path(source_dir: Path, name: str) -> Path:
         return candidate
     subdir = "src" if name.endswith(".cpp") else "include"
     if name in {"mooncake_pg.h", "pg_utils.h"}:
-        return source_dir.parent.parent / "include" / name
+        return source_dir.parent / "include" / name
     return source_dir / subdir / name
 
 
@@ -95,8 +95,6 @@ def _build_lock(lock_path: Path):
 
 def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
     _load_torchada()
-    from torch.utils.cpp_extension import library_paths, load
-
     verbose = os.environ.get("MOONCAKE_PG_JIT_VERBOSE", "0") == "1"
     is_musa = _using_musa()
     extra_cflags = [
@@ -105,26 +103,50 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
         "-g0",
         f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
     ]
+    if is_musa:
+        # torchada exposes the MUSA-aware runtime loader; importing the
+        # similarly named torch loader would fall back to CUDA arch detection.
+        from torchada.utils.cpp_extension import library_paths, load
+    else:
+        from torch.utils.cpp_extension import library_paths, load
+
     extra_ldflags = [
         f"-Wl,-rpath,{core_path.parent}",
         *[f"-Wl,-rpath,{path}" for path in library_paths()],
         str(core_path),
     ]
     if is_musa:
-        # torchada redirects PyTorch's CUDA extension machinery to mcc/MUSA.
-        # The adapter sources select the MUSA backend through these defines.
-        extra_cflags += ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
+        # MUSA Torch builds report no CUDA SM list. An explicit MUSA target
+        # prevents PyTorch's CUDA helper from calling max([]) before mcc runs.
+        musa_target = os.environ.get("MTGPU_TARGET", "mp_31")
+        if musa_target not in {"mp_22", "mp_31"}:
+            raise ImportError(
+                "Unsupported MUSA target {!r}; set MTGPU_TARGET to mp_22 or mp_31".format(
+                    musa_target
+                )
+            )
+        extra_cuda_cflags = [
+            f"--cuda-gpu-arch={musa_target}",
+            "-x",
+            "musa",
+            "-mtgpu",
+            "-DUSE_MUSA",
+            "-DMOONCAKE_EP_USE_MUSA=1",
+        ]
     else:
         # Retain the CUDA link contract validated by the fresh-wheel smoke.
         extra_ldflags += ["-lc10_cuda", "-ltorch_cuda"]
+        extra_cuda_cflags = None
 
     return load(
         name="_mooncake_pg_jit_musa" if is_musa else "_mooncake_pg_jit_cuda",
         sources=[str(_source_path(source_dir, name)) for name in _SOURCE_NAMES],
         extra_cflags=extra_cflags,
+        extra_cuda_cflags=extra_cuda_cflags,
         extra_include_paths=[
             str(source_dir),
             str(source_dir / "include"),
+            str(source_dir.parent / "include"),
             str(source_dir.parent.parent / "include"),
         ],
         extra_ldflags=extra_ldflags,
