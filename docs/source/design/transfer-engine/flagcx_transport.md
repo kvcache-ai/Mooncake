@@ -2,10 +2,11 @@
 
 ## Overview
 
-[FlagCX](https://github.com/flagos-ai/FlagCX) is the cross-chip communication library in the
-FlagOS ecosystem. Mooncake's FlagCX transport connects the classic Transfer Engine to the FlagCX
-P2P Engine. Mooncake keeps its existing segment, memory-registration, batch, and completion APIs;
-the transport maps those operations to FlagCX connections and P2P read/write requests.
+[FlagCX](https://github.com/flagos-ai/FlagCX) is the unified communication library in the FlagOS
+ecosystem for multi-vendor and cross-vendor deployments. Mooncake's FlagCX transport connects the
+classic Transfer Engine to the FlagCX P2P Engine. The integration keeps Mooncake's existing
+segment, memory-registration, batch, and completion APIs and maps them to FlagCX connections and
+P2P read/write requests.
 
 The protocol name used by Mooncake configuration and APIs is `flagcx`. `flagos` is not a protocol
 name.
@@ -42,18 +43,18 @@ name.
 
 ## Dependencies
 
-Build and run Mooncake with the same FlagCX installation. The prefix passed as `FLAGCX_HOME` must
-provide:
+Use compatible FlagCX revisions on all nodes. Each node may build the accelerator backend that
+matches its local platform. The prefix passed as `FLAGCX_HOME` must contain:
 
 - `include/flagcx_p2p.h`
 - `lib/libflagcx.so` or `lib64/libflagcx.so`
 - The accelerator runtime, communication library, and network dependencies required by the chosen
   FlagCX backend
 
-FlagCX supports multiple accelerator backends. Choose the backend that matches the local platform;
-for example, `USE_NVIDIA=1`, `USE_METAX=1`, or `USE_MUSA=1`. See the
+Choose the FlagCX backend that matches each node's local platform; for example, `USE_NVIDIA=1`,
+`USE_METAX=1`, or `USE_MUSA=1`. See the
 [FlagCX getting-started guide](https://github.com/flagos-ai/FlagCX/blob/main/docs/getting_started.md)
-for the complete current backend list and platform prerequisites.
+for the current backend list and platform prerequisites.
 
 ## Build and Compile
 
@@ -75,10 +76,11 @@ FlagCX/build/include/flagcx_p2p.h
 FlagCX/build/lib/libflagcx.so
 ```
 
-Alternatively, install FlagCX under a dedicated prefix:
+Alternatively, install FlagCX under a dedicated prefix. Installing under `/opt` normally requires
+root privileges:
 
 ```bash
-make PREFIX=/opt/flagcx install
+sudo make PREFIX=/opt/flagcx install
 ```
 
 ### 2. Build Mooncake
@@ -111,8 +113,9 @@ export FLAGCX_HOME=/path/to/FlagCX/build
 export LD_LIBRARY_PATH="$FLAGCX_HOME/lib:${LD_LIBRARY_PATH:-}"
 ```
 
-Add the relevant Mooncake accelerator option, such as `USE_CUDA`, `USE_MUSA`, or `USE_HIP`, when
-the application also needs Mooncake to allocate or identify that accelerator's memory.
+If Mooncake also needs to allocate or identify device memory, enable its matching hardware option,
+such as `USE_CUDA`, `USE_MACA`, `USE_MUSA`, `USE_HIP`, `USE_COREX`, `USE_HYGON`, or `USE_MLU`.
+See the [build guide](../../getting_started/build.md) for the options and SDK requirements.
 
 ---
 
@@ -120,8 +123,8 @@ the application also needs Mooncake to allocate or identify that accelerator's m
 
 ### Python API
 
-A Mooncake Python extension built with `USE_FLAGCX=ON` accepts `flagcx` through the existing
-initialization API:
+A Mooncake Python extension built from source with `USE_FLAGCX=ON` accepts `flagcx` through the
+existing initialization API:
 
 ```python
 engine.initialize(
@@ -138,12 +141,18 @@ FlagCX transport explicitly. No new Python API is required.
 ### C++ API
 
 Applications using the classic C++ Transfer Engine can install the transport by name after engine
-initialization:
+initialization. Keep automatic transport discovery disabled so that `flagcx` remains the standalone
+transport:
 
 ```cpp
+mooncake::TransferEngine engine(false);
+if (engine.init("P2PHANDSHAKE", "node1") != 0) {
+    return -1;
+}
+
 auto* transport = engine.installTransport("flagcx", nullptr);
 if (transport == nullptr) {
-    // Mooncake was not built with USE_FLAGCX=ON, or transport setup failed.
+    return -1;
 }
 ```
 
@@ -196,8 +205,10 @@ The target prints a command containing its segment name. Use that value on the i
   --max_num_threads=1
 ```
 
-Use `--op_type=write` to test the opposite direction. For accelerator memory, set
-`--seg_type=VRAM` and build both FlagCX and Mooncake for the accelerator platform.
+Use `--op_type=write` to test the opposite direction. The classic `tebench` VRAM allocator currently
+supports CUDA builds. For that path, add `-DUSE_CUDA=ON` when building Mooncake and run with
+`--seg_type=VRAM`. Other accelerator backends should validate device buffers through their
+application integration until `tebench` provides a matching allocator.
 
 Useful initialization messages include:
 
@@ -230,13 +241,13 @@ Mooncake integration are:
 
 | Variable | Purpose |
 |----------|---------|
-| `FLAGCX_SOCKET_IFNAME` | Selects the interface used for socket bootstrap and endpoint advertisement |
+| `FLAGCX_SOCKET_IFNAME` | Selects the interface used for socket bootstrap and endpoint advertisement; it does not select the RDMA HCA |
 | `FLAGCX_IB_HCA` | Selects the InfiniBand/RoCE HCA or HCA set used by FlagCX |
-| `FLAGCX_P2P_TRANSPORT=accl` | Selects the optional ACCL P2P implementation when the FlagCX build includes it |
+| `FLAGCX_P2P_TRANSPORT=accl` | Selects the optional ACCL P2P implementation when the FlagCX build includes it; both peers must set it |
 | `LD_LIBRARY_PATH` | Makes `libflagcx.so` and non-system backend libraries visible at run time |
 
-Set compatible values on both peers. For interface filtering syntax, GID selection, retry settings,
-and backend-specific tuning, see the
+Set `FLAGCX_SOCKET_IFNAME` and `FLAGCX_IB_HCA` for each node's local interfaces and devices. For
+interface filtering syntax, GID selection, retry settings, and backend-specific tuning, see the
 [FlagCX environment-variable reference](https://github.com/flagos-ai/FlagCX/blob/main/docs/environment_variables.md).
 
 ## Important Notes
@@ -260,7 +271,8 @@ connection's memory table. Reconnect both processes before using a changed regis
 - Use the literal protocol name `flagcx`; do not use `flagos`.
 - Use `flagcx` as a standalone protocol. Multi-protocol selection and routing are outside the
   current integration scope.
-- Both peers must use compatible FlagCX builds and P2P backends.
+- The peers may use different accelerator backends, but they must use compatible FlagCX revisions
+  and the same P2P network transport: default IBRC on both peers, or ACCL on both peers.
 - The transport relies on FlagCX's endpoint exchange and completion behavior; it does not add a
   separate Mooncake cancellation API.
 
@@ -268,8 +280,9 @@ connection's memory table. Reconnect both processes before using a changed regis
 
 Treat the FlagCX endpoint like other RDMA-capable transport endpoints. Only expose it to trusted
 peers, restrict the selected interface with network policy or host firewall rules, and register only
-the memory required by the application. P2P metadata contains information needed to access the
-registered regions and should not be published through an untrusted metadata service.
+the memory required by the application. Mooncake segment metadata exposes the endpoint and buffer
+addresses, while the FlagCX handshake exchanges the registered-region table. Do not expose either
+channel to untrusted peers.
 
 ## Troubleshooting
 
@@ -300,7 +313,7 @@ run-time linker issue, not a Mooncake protocol-selection issue.
 
 Set `FLAGCX_SOCKET_IFNAME` before starting each process. Use an interface whose advertised address
 is reachable from the peer. If InfiniBand/RoCE device selection is also ambiguous, set
-`FLAGCX_IB_HCA` consistently on both sides.
+`FLAGCX_IB_HCA` to the appropriate local HCA set on each side.
 
 ### `installTransport(flagcx)` Fails
 
@@ -309,10 +322,11 @@ Confirm all of the following:
 - Mooncake was configured with `USE_FLAGCX=ON`.
 - The FlagCX shared library and its platform dependencies load successfully.
 - `FLAGCX_SOCKET_IFNAME` resolves to a usable local address.
-- No other process or firewall rule prevents the FlagCX RPC server from starting.
+- The FlagCX log does not report a P2P Engine or RPC-server initialization error.
 
 ### Connection or Remote-Descriptor Creation Fails
 
 Verify that the target process is still running, the endpoint printed in the target log is reachable,
-and both peers selected compatible FlagCX P2P backends. If the target's registrations changed after
-the connection was first used, restart both processes and register all buffers before reconnecting.
+and both peers selected the same FlagCX P2P network transport. Check host firewall rules on the
+connection path. If the target's registrations changed after the connection was first used, restart
+both processes and register all buffers before reconnecting.
