@@ -18,6 +18,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 
 namespace mooncake {
 namespace tent {
