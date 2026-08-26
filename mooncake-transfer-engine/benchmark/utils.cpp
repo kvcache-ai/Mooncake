@@ -94,7 +94,8 @@ DEFINE_int32(
     rpc_server_port, 0,
     "RPC server port used for p2p metadata service (0 = auto-select).");
 DEFINE_string(xport_type, "",
-              "Transport type: rdma|shm|mnnvl|gds|iouring|sunrise_link|mpcomm");
+              "Transport type: "
+              "rdma|shm|mnnvl|gds|iouring|sunrise_link|mpcomm|flagcx");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");

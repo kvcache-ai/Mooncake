@@ -142,6 +142,21 @@ class MasterServiceTest : public ::testing::Test {
         service.CleanupExpiredSoftPins(now);
     }
 
+    size_t MetadataShardIndex(MasterService& service, const std::string& key,
+                              const TenantId& tenant_id = TenantId::Default()) {
+        return service.getShardIndex(tenant_id, key);
+    }
+
+    size_t MetadataBucketCount(
+        MasterService& service, size_t shard_idx,
+        const TenantId& tenant_id = TenantId::Default()) {
+        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
+        const auto tenant_it = shard->tenants.find(tenant_id);
+        return tenant_it == shard->tenants.end()
+                   ? 0
+                   : tenant_it->second.metadata.bucket_count();
+    }
+
     void SetSoftPinDeadlineForTest(
         MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,
@@ -5020,6 +5035,94 @@ TEST_F(MasterServiceTest, EvictObject) {
     ASSERT_GT(success_puts, 1024 * 16);
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, ShrinkBucketsIfSparseThresholds) {
+    // Small containers stay untouched regardless of sparsity: their bucket
+    // memory is negligible and rehash churn is not worth it.
+    std::unordered_map<std::string, int> small;
+    small.emplace("small_key", 0);
+    const size_t small_buckets = small.bucket_count();
+    ASSERT_LE(small_buckets, kShrinkMinBucketCount);
+    ShrinkBucketsIfSparse(small);
+    EXPECT_EQ(small.bucket_count(), small_buckets);
+
+    // Grow a map well past the bucket floor, then erase most entries: the
+    // bucket array keeps its high-water size until explicitly shrunk.
+    std::unordered_map<std::string, int> map;
+    for (size_t i = 0; i < 4 * kShrinkMinBucketCount; ++i) {
+        map.emplace("key" + std::to_string(i), 0);
+    }
+    const size_t high_water = map.bucket_count();
+    ASSERT_GT(high_water, kShrinkMinBucketCount);
+
+    // At exactly a quarter full there is nothing to shrink yet.
+    while (map.size() > high_water / 4) {
+        map.erase(map.begin());
+    }
+    ShrinkBucketsIfSparse(map);
+    EXPECT_EQ(map.bucket_count(), high_water);
+
+    // One more erase crosses the threshold and triggers the shrink.
+    map.erase(map.begin());
+    ShrinkBucketsIfSparse(map);
+    EXPECT_LT(map.bucket_count(), high_water);
+    EXPECT_GE(map.bucket_count(), map.size());
+}
+
+TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
+    // Zero lease TTL so every committed object is immediately evictable.
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t object_size = 1024;
+    constexpr size_t object_count = 2 * kShrinkMinBucketCount;
+    // Size the segment with ample headroom so the background eviction
+    // thread never fires; only the explicit call below evicts.
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(
+        *service_, "test_segment", buffer, object_size * object_count * 16);
+
+    // Pick keys that all hash to one shard so its metadata map grows past
+    // the shrink floor; random keys would spread these objects thinly
+    // across all 1024 shards.
+    const size_t target_shard = MetadataShardIndex(*service_, "shrink_key_0");
+    std::vector<std::string> keys;
+    for (size_t i = 0; keys.size() < object_count; ++i) {
+        std::string key = "shrink_key_" + std::to_string(i);
+        if (MetadataShardIndex(*service_, key) != target_shard) continue;
+        keys.push_back(std::move(key));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& key : keys) {
+        // Hard-pin the first object: it is excluded from eviction, so the
+        // tenant (and its metadata map) deterministically survives the
+        // full eviction below and the shrunk bucket count stays
+        // observable.
+        config.with_hard_pin = (&key == &keys.front());
+        ASSERT_TRUE(service_
+                        ->PutStart(client_id, key, TenantId::Default(),
+                                   object_size, config)
+                        .has_value());
+        ASSERT_TRUE(service_
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value());
+    }
+
+    const size_t buckets_before = MetadataBucketCount(*service_, target_shard);
+    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
+
+    service_->RunBatchEvictForTesting(1.0, 1.0);
+
+    const size_t buckets_after = MetadataBucketCount(*service_, target_shard);
+    ASSERT_GT(buckets_after, 0u);
+    // Without the post-eviction shrink the bucket array would still sit at
+    // its high-water mark and this assertion would fail.
+    EXPECT_LT(buckets_after, buckets_before / 2);
 }
 
 TEST_F(MasterServiceTest, TryEvictLeasedObject) {

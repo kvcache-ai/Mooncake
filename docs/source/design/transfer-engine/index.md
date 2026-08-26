@@ -446,7 +446,17 @@ To support the operational needs of P2P Store, Transfer Engine provides a Golang
 When compiling the project, enable the `-DWITH_P2P_STORE=ON` option to compile the P2P Store example program at the same time.
 
 ### Using Rust Interface
-Under `mooncake-transfer-engine/rust`, the Rust interface implementation of TransferEngine is provided, and a Rust version of the benchmark is implemented based on the interface, similar to [transfer_engine_bench.cpp](gh-file:mooncake-transfer-engine/example/transfer_engine_bench.cpp). To compile the rust example, you need to install the Rust SDK and add `-DWITH_RUST_EXAMPLE=ON` in the cmake command.
+`mooncake-transfer-engine/rust` ships `transfer_engine_rust`, a library crate
+that wraps the Transfer Engine C API (`transfer_engine_c.h`). Hot-path types
+(`TransferRequest`, `BufferEntry`, `TransferStatus`) match the C ABI so
+`submit_transfer` is a zero-copy FFI call. A throughput benchmark example
+(`examples/transfer_engine_bench.rs`) mirrors
+[transfer_engine_bench.cpp](gh-file:mooncake-transfer-engine/example/transfer_engine_bench.cpp).
+
+To build the library and example, install a Rust toolchain and libclang, then
+configure CMake with `-DWITH_RUST_EXAMPLE=ON`. See the
+[Transfer Engine Rust API](../../api-reference/rust/transfer-engine.md) for
+signatures and the crate `README.md` for Cargo-only builds.
 
 ## Advanced Runtime Options
 For advanced users, TransferEngine provides the following advanced runtime options, all of which can be passed in through **environment variables**.
@@ -545,6 +555,14 @@ heterogeneous_ascend
 
 kunpeng_ub_transport
 sunrise_link_transport
+:::
+
+## FlagOS FlagCX Transport Component
+
+:::{toctree}
+:maxdepth: 1
+
+flagcx_transport
 :::
 
 ## MPComm Transport Component

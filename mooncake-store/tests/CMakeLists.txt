@@ -1,6 +1,8 @@
+set(MOONCAKE_STORE_TESTS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+
 function(add_store_test name)
   add_executable(${name} ${ARGN})
-  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(${name} PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
@@ -17,7 +19,7 @@ endfunction()
 
 function(add_ha_test name)
   add_executable(${name} ${ARGN})
-  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(${name} PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
@@ -53,13 +55,16 @@ if(ENABLE_KV_EVENTS)
                              PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
   target_link_libraries(kv_event_publisher_test PRIVATE Mooncake::libzmq)
 endif()
+add_subdirectory(master_service)
+
 add_store_test(master_service_test master_service_test.cpp)
-add_ha_test(master_service_evict_scenario_test master_scenario.cpp
+add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
-add_store_test(master_scenario_test master_scenario.cpp
-               master_scenario_test.cpp)
-add_store_test(master_service_scenario_test master_scenario.cpp
-               master_service_scenario_test.cpp)
+target_link_libraries(master_service_evict_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_scenario_test master_service_scenario_test.cpp)
+target_link_libraries(master_service_scenario_test
+                      PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
@@ -179,6 +184,7 @@ add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
+add_store_test(file_storage_config_test file_storage_config_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)

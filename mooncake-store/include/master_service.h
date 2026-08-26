@@ -105,6 +105,25 @@ namespace benchmarks {
 class BatchEvictBench;
 }  // namespace benchmarks
 
+// std::unordered_map/set never shrink their bucket array on erase, so a
+// container that once held millions of entries keeps its high-water bucket
+// memory (8 bytes per bucket) forever. ShrinkBucketsIfSparse rehashes a
+// container down to roughly twice its live size once the bucket array is
+// both large enough to matter and less than a quarter full. The bucket
+// floor avoids rehash churn on small containers; the 2x headroom keeps a
+// freshly shrunk container from growing again right away.
+// Rehashing invalidates iterators: callers must hold the lock guarding the
+// container and must not be iterating it.
+inline constexpr size_t kShrinkMinBucketCount = 1024;
+
+template <typename UnorderedContainer>
+void ShrinkBucketsIfSparse(UnorderedContainer& container) {
+    if (container.bucket_count() > kShrinkMinBucketCount &&
+        container.size() < container.bucket_count() / 4) {
+        container.rehash(container.size() * 2);
+    }
+}
+
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
@@ -163,6 +182,7 @@ class MasterService {
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
+    [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
@@ -1570,6 +1590,7 @@ class MasterService {
         kWatermark,
         kQueueCap,
         kPushFailed,
+        kExecutionFailed,
     };
 
     struct PromotionCandidate {
@@ -1581,6 +1602,12 @@ class MasterService {
             PromotionCandidateReason::kQueueCap};
         ErrorCode last_error{ErrorCode::OK};
         uint32_t retry_count{0};
+        // Execution failures in this admission chain (AllocStart / TE-write /
+        // SSD failures reported via NotifyPromotionFailure). Propagated into
+        // PromotionTask at admission so the bound survives the candidate's
+        // consumption; reset only when a genuinely new chain starts (fresh
+        // insert with 0, e.g. after a give-up or a success).
+        uint32_t execution_failures{0};
     };
 
     // NotifyPromotionSuccess should commit, so a concurrent Put on the
@@ -1607,6 +1634,13 @@ class MasterService {
         uint64_t pending_quota_charge_bytes{0};
         std::chrono::system_clock::time_point start_time;
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
+        // Execution failures so far in this admission chain. Read by
+        // NotifyPromotionFailure before the task is erased and re-recorded as
+        // execution_failures+1 until kMaxPromotionExecutionFailures. Note the
+        // asymmetry with PromotionCandidate::execution_failures: admission
+        // copies candidate -> task verbatim, failure re-record writes
+        // task+1 -> candidate.
+        uint32_t execution_failures{0};
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -2093,7 +2127,8 @@ class MasterService {
     void RecordOrUpdateCandidate(TenantState& tenant_state,
                                  const std::string& key, uint8_t sketch_score,
                                  PromotionCandidateReason reason,
-                                 ErrorCode last_error);
+                                 ErrorCode last_error,
+                                 uint32_t execution_failures = 0);
     void EraseCandidate(TenantState& tenant_state, const std::string& key);
     void EraseCandidate(const ObjectIdentity& object_id);
     void DecrementCandidateCount();
@@ -2541,14 +2576,29 @@ class MasterService {
     std::atomic<uint64_t> promotion_candidate_count_{0};
     std::atomic<size_t> promotion_retry_cursor_{0};
     static constexpr size_t kPromotionCandidateLimit = 50000;
-    static constexpr uint32_t kPromotionCandidateMaxRetries = 8;
+    // Retry budget is sized to the condition it waits on: the watermark /
+    // queue-cap / push-failure gates clear on the client's offload heartbeat
+    // (10s-scale), not in milliseconds. The old budget (8 retries ≈ 2.3s)
+    // expired candidates long before their condition could clear, silently
+    // killing promotions whose only trigger was a one-off read. 64 retries
+    // with a 5s backoff cap spans ~5 minutes (≈ 30 heartbeat ticks); the TTL
+    // bounds how long an unread key can keep a slot.
+    static constexpr uint32_t kPromotionCandidateMaxRetries = 64;
     static constexpr size_t kPromotionRetryBatchSize = 128;
     static constexpr size_t kPromotionRetryShardBatch = 64;
-    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{60000};
+    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{300000};
     static constexpr std::chrono::milliseconds
         kPromotionCandidateInitialBackoff{10};
     static constexpr std::chrono::milliseconds kPromotionCandidateMaxBackoff{
-        1000};
+        5000};
+    // Bound on self-sustaining execution-failure cycles: a key whose
+    // promotion keeps failing at execution time (AllocStart under DRAM
+    // pressure, TE-write flake, SSD error) is re-recorded at most this many
+    // times. Bounds a persistently-failing ("poison") key to this many
+    // delivery slots (~this many heartbeat ticks, ~30s at the 10s default)
+    // before it stops re-queueing itself; genuine reads can still re-admit
+    // it afterwards with a fresh count.
+    static constexpr uint32_t kMaxPromotionExecutionFailures = 3;
 
     // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
     // true. CountMinSketch is mutex-protected internally so we can call into it

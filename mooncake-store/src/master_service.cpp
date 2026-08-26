@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <algorithm>
+#include <bitset>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -766,6 +767,13 @@ std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
         return std::nullopt;
     }
     return it->second.consecutive_failures;
+}
+
+TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
+    return {
+        .memory = segment_manager_.GetMemoryUsageSnapshot(),
+        .nof = nof_segment_manager_.GetUsageSnapshot(),
+    };
 }
 
 bool MasterService::IsTenantQuotaEnabled() const {
@@ -7546,12 +7554,16 @@ void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
                                             const std::string& key,
                                             uint8_t sketch_score,
                                             PromotionCandidateReason reason,
-                                            ErrorCode last_error) {
+                                            ErrorCode last_error,
+                                            uint32_t execution_failures) {
     const auto now = std::chrono::steady_clock::now();
     auto it = tenant_state.promotion_candidates.find(key);
     if (it != tenant_state.promotion_candidates.end()) {
         // Update existing entry: refresh last_seen, reset
-        // retry_after/retry_count.
+        // retry_after/retry_count. execution_failures is intentionally NOT
+        // updated here: a read refresh is new demand signal and may extend
+        // the budget, but it must not erase the failure history of this
+        // admission chain.
         it->second.last_seen = now;
         it->second.last_reason = reason;
         it->second.last_error = last_error;
@@ -7585,7 +7597,8 @@ void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
                                 .retry_after = now,
                                 .last_reason = reason,
                                 .last_error = last_error,
-                                .retry_count = 0});
+                                .retry_count = 0,
+                                .execution_failures = execution_failures});
     if (inserted) {
         MasterMetricManager::instance().inc_promotion_candidate_recorded();
         VLOG(1) << "promotion_candidate_recorded key=" << key;
@@ -8440,8 +8453,7 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     // Watermark gate: don't promote if DRAM is already under eviction
     // pressure. The check is best-effort (state can change between this
     // sample and the actual allocation in PromotionAllocStart).
-    const double used_ratio =
-        MasterMetricManager::instance().get_global_mem_used_ratio();
+    const double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
     if (used_ratio >= eviction_high_watermark_ratio_) {
         MasterMetricManager::instance().inc_promotion_rejected_watermark();
         if (record_candidate) {
@@ -8475,6 +8487,13 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     // Dedup: don't queue twice if a promotion is already in flight or if a
     // MEMORY replica has appeared since GetReplicaList observed only-disk.
     if (tenant_state.promotion_tasks.count(key) > 0) {
+        // A read hit an already in-flight promotion: re-mark the queued
+        // entry's recency so the next heartbeat delivers it ahead of stale
+        // admissions. No-op if the heartbeat already took the entry (the
+        // promotion is executing) or the holder's mailbox is gone.
+        local_ssd_manager_.TouchPromotion(
+            tenant_state.promotion_tasks.at(key).holder_id, object_id.tenant_id,
+            key);
         EraseCandidate(tenant_state, key);
         return PromotionQueueResult::kAlreadyInFlight;
     }
@@ -8547,13 +8566,22 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
 
     // Record the in-flight task. alloc_id is filled in by
     // PromotionAllocStart once the new MEMORY replica is staged.
+    // Propagate the execution-failure count across the candidate's
+    // consumption so NotifyPromotionFailure can bound self-sustaining
+    // execution-failure cycles; an absent candidate means a fresh chain (0).
+    uint32_t execution_failures = 0;
+    if (auto cit = tenant_state.promotion_candidates.find(key);
+        cit != tenant_state.promotion_candidates.end()) {
+        execution_failures = cit->second.execution_failures;
+    }
     EraseCandidate(tenant_state, key);
     tenant_state.promotion_tasks.emplace(
         key, PromotionTask{.source_id = source->id(),
                            .alloc_id = 0,
                            .object_size = object_size,
                            .start_time = std::chrono::system_clock::now(),
-                           .holder_id = holder_id});
+                           .holder_id = holder_id,
+                           .execution_failures = execution_failures});
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_admitted();
@@ -8858,10 +8886,48 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     ReleaseTenantQuota(
         GetBoundTenantQuotaHandle(tenant_state),
         std::exchange(task_it->second.pending_quota_charge_bytes, 0));
+    // Capture the chain's execution-failure count BEFORE erasing the task
+    // (the iterator is invalidated by the erase).
+    const uint32_t prior_failures = task_it->second.execution_failures;
     tenant_state.promotion_tasks.erase(task_it);
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     MasterMetricManager::instance().dec_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_failed();
+
+    // A transient execution failure (DRAM pressure at AllocStart, a TE write
+    // flake, SSD throttling) must not silently kill the promotion: re-record
+    // a retry candidate so the eviction-thread retry loop re-queues it with
+    // backoff. Bounded by kPromotionCandidateMaxRetries /
+    // kPromotionCandidateTtl, and the retry path erases the candidate on
+    // permanent conditions (not-found, memory-present, no-local-disk-source),
+    // so this cannot spin. Record the current estimate via count()
+    // (read-only), NOT increment(): an executor-side failure is not demand
+    // signal, and bumping the sketch here would pollute the frequency signal
+    // the admission gate relies on.
+    //
+    // The self-sustaining cycle is additionally bounded by
+    // kMaxPromotionExecutionFailures: without it, a persistently-failing key
+    // (e.g. a broken SSD file that still has a LOCAL_DISK replica) would
+    // re-record -> re-admit -> fail -> re-record forever, monopolizing
+    // delivery slots with no read demand. Once the bound is hit we stop
+    // re-recording — a genuine read can still re-admit the key (fresh chain).
+    if (!metadata.HasReplica(&Replica::fn_is_memory_replica) &&
+        metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        if (prior_failures >= kMaxPromotionExecutionFailures) {
+            LOG(WARNING) << "promotion_execution_gave_up key="
+                         << object_id.user_key
+                         << " failures=" << prior_failures;
+            MasterMetricManager::instance().inc_promotion_execution_gave_up();
+        } else {
+            const auto admission_key =
+                object_id.tenant_id.MakeScopedKey(object_id.user_key);
+            const uint8_t freq =
+                promotion_sketch_ ? promotion_sketch_->count(admission_key) : 0;
+            RecordOrUpdateCandidate(tenant_state, object_id.user_key, freq,
+                                    PromotionCandidateReason::kExecutionFailed,
+                                    ErrorCode::OK, prior_failures + 1);
+        }
+    }
 
     // Clear the holder's per-client promotion mailbox entry. Same
     // best-effort cleanup pattern as NotifyPromotionSuccess — the
@@ -8879,8 +8945,7 @@ void MasterService::EvictionThreadFunc() {
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
-        double used_ratio =
-            MasterMetricManager::instance().get_global_mem_used_ratio();
+        double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
@@ -8912,8 +8977,7 @@ void MasterService::EvictionThreadFunc() {
         }
 
 #ifdef USE_NOF
-        double nof_used_ratio =
-            MasterMetricManager::instance().get_global_nof_used_ratio();
+        double nof_used_ratio = nof_segment_manager_.GetUsage().used_ratio();
         if (nof_used_ratio > nof_eviction_high_watermark_ratio_ ||
             (need_nof_eviction_ && nof_eviction_ratio_ > 0.0)) {
             double nof_evict_ratio_target =
@@ -9484,7 +9548,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         }
 
         LOG(INFO) << "[Restore] Total allocated size after restore: "
-                  << MasterMetricManager::instance().get_allocated_mem_size();
+                  << segment_manager_.GetMemoryUsage().used_bytes;
     }
 
     // Soft pin is runtime-only and is never restored from a snapshot.
@@ -10365,6 +10429,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
     uint64_t total_freed_size = 0;
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
+    // Shards that actually evicted this cycle; their metadata maps are
+    // shrink candidates once eviction finishes.
+    std::bitset<kNumShards> evicted_shards;
 
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
@@ -10428,6 +10495,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
                     evicted_count += evict_result.evicted_objects;
                     evicted_this_pass += evict_result.evicted_objects;
+                    if (evict_result.evicted_objects > 0) {
+                        evicted_shards.set(c.shard_idx);
+                    }
                 }
                 deferred_replicas.clear();
             }
@@ -10474,9 +10544,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
             // Evict via key lookup — avoid full metadata traversal
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+                const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
-                    MetadataShardAccessorRW shard(this,
-                                                  (start_idx + i) % kNumShards);
+                    MetadataShardAccessorRW shard(this, shard_idx);
                     for (auto tenant_it = shard->tenants.begin();
                          tenant_it != shard->tenants.end() &&
                          target_evict_num > 0;) {
@@ -10509,6 +10579,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 evicted_count += evict_result.evicted_objects;
                                 target_evict_num -=
                                     evict_result.evicted_objects;
+                                if (evict_result.evicted_objects > 0) {
+                                    evicted_shards.set(shard_idx);
+                                }
                             } else {
                                 ++it;
                             }
@@ -10534,9 +10607,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+                const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
-                    MetadataShardAccessorRW shard(this,
-                                                  (start_idx + i) % kNumShards);
+                    MetadataShardAccessorRW shard(this, shard_idx);
 
                     for (auto tenant_it = shard->tenants.begin();
                          tenant_it != shard->tenants.end() &&
@@ -10574,6 +10647,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 evicted_count += evict_result.evicted_objects;
                                 target_evict_num -=
                                     evict_result.evicted_objects;
+                                if (evict_result.evicted_objects > 0) {
+                                    evicted_shards.set(shard_idx);
+                                }
                             } else {
                                 ++it;
                             }
@@ -10597,6 +10673,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
                        << ", eviction_base=" << total_eviction_base
                        << ", evict_ratio_target=" << evict_ratio_target
                        << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
+        }
+    }
+
+    // erase() never returns bucket memory, so a shard that once held far
+    // more keys than it does now would keep its high-water bucket array
+    // forever. Shrink the metadata maps of the shards that evicted this
+    // cycle. The shard lock is held, and the loop iterates `tenants`, not
+    // the map being rehashed, so no live iterator is invalidated.
+    for (size_t i = 0; i < kNumShards; i++) {
+        if (!evicted_shards.test(i)) continue;
+        MetadataShardAccessorRW shard(this, i);
+        for (auto& tenant : shard->tenants) {
+            ShrinkBucketsIfSparse(tenant.second.metadata);
         }
     }
 
