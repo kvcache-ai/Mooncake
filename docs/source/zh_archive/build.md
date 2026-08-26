@@ -23,7 +23,7 @@
 
 ### 建议版本
 - OS: Ubuntu 22.04 LTS+
-- cmake: 3.20.x
+- cmake: 4.x
 - gcc: 9.4+
 
 ### 步骤
