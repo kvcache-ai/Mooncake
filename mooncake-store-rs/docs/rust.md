@@ -122,9 +122,11 @@ Developer machines that only need Rust type analysis can skip that native CMake 
 MOONCAKE_SKIP_NATIVE_BUILD=1 cargo check
 ```
 
-This is intended for IDE analysis and for CI jobs that provide native artifacts through
+This is intended for IDE analysis and for build environments that provide native artifacts through
 `MOONCAKE_UPSTREAM_BUILD_DIR` and the explicit shim library path variables. Runtime builds that need
 fresh TE/TENT artifacts should leave `MOONCAKE_SKIP_NATIVE_BUILD` unset.
+In the monorepo layout, native dependency discovery also consumes FetchContent
+sources from `${MOONCAKE_UPSTREAM_BUILD_DIR}/_deps`, including yalantinglibs.
 
 ## Enable Routed Writes
 
