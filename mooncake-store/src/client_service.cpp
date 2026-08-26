@@ -2003,28 +2003,40 @@ bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
     if (!replicas) {
         return false;
     }
-    bool has_completed_local_disk = false;
+    const Replica::Descriptor* local_disk = nullptr;
     for (const auto& replica : replicas->replicas) {
         if (replica.status != ReplicaStatus::COMPLETE) {
             continue;
         }
         if (replica.is_local_disk_replica() &&
             replica.get_local_disk_descriptor().client_id == client_id_) {
-            has_completed_local_disk = true;
+            local_disk = &replica;
             continue;
         }
         // A completed replica owned elsewhere (memory, remote disk, DFS) can
         // still serve reads, so there is nothing for this client to heal.
         return false;
     }
-    if (!has_completed_local_disk || !storage_backend_) {
+    if (!local_disk || !transfer_submitter_) {
         return false;
     }
     // RemoveAll wipes client SSD files while master keeps the metadata
     // (issue #3709), leaving a completed entry whose backing file is gone.
-    // Reporting success for a Put on top of it would store nothing.
-    auto exists = storage_backend_->IsExist(key);
-    if (!exists || *exists) {
+    // Reporting success for a Put on top of it would store nothing. Probe the
+    // last byte through the normal read path: a file-gone error proves the
+    // replica is dangling. Anything else (readable, or a transport error)
+    // keeps the old idempotent path so we never evict a healthy replica.
+    const uint64_t object_size =
+        local_disk->get_local_disk_descriptor().object_size;
+    if (object_size == 0) {
+        return false;
+    }
+    char probe = 0;
+    std::vector<Slice> probe_slice{Slice{&probe, 1}};
+    const ErrorCode probe_err =
+        TransferReadRange(*local_disk, probe_slice, object_size - 1);
+    if (probe_err != ErrorCode::OBJECT_NOT_FOUND &&
+        probe_err != ErrorCode::FILE_OPEN_FAIL) {
         return false;
     }
     auto evicted =

@@ -776,10 +776,11 @@ class Client {
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
     // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
-    // completed replica is a LOCAL_DISK replica owned by this client and its
-    // backing file is gone (issue #3709). If so, evict the dangling replica
-    // so the Put can be retried. Returns true only when a replica was
-    // actually evicted.
+    // completed replica is a LOCAL_DISK replica owned by this client, and
+    // probe its last byte through the normal read path to prove the backing
+    // file is gone (issue #3709). Only then evict the dangling replica so the
+    // Put can be retried; any other outcome keeps the old idempotent path.
+    // Returns true only when a replica was actually evicted.
     bool healDanglingLocalDiskReplica(const ObjectKey& key);
     ErrorCode InitTransferEngine(
         const std::string& local_hostname,
