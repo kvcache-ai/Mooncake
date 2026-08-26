@@ -808,24 +808,6 @@ tl::expected<UpdateSegmentsResponse, ErrorCode> MasterClient::UpdateSegments(
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::MountSegment(
-    const Segment& segment) {
-    UpdateSegmentsRequest request;
-    request.request_intent = SegmentUpdateRequestIntent::REGISTER;
-    request.segments.emplace_back(segment, SegmentRegistrationIntent::NEW);
-    auto result = UpdateSegments(request);
-    if (!result) {
-        return tl::unexpected(result.error());
-    }
-    if (result->results.size() != 1) {
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    if (result->results.front().error_code != ErrorCode::OK) {
-        return tl::unexpected(result->results.front().error_code);
-    }
-    return {};
-}
-
 tl::expected<void, ErrorCode> MasterClient::MountNoFSegment(
     const NoFSegment& segment) {
     ScopedVLogTimer timer(1, "MasterClient::MountNofSegment");
@@ -837,37 +819,6 @@ tl::expected<void, ErrorCode> MasterClient::MountNoFSegment(
         segment, client_id_);
     timer.LogResponseExpected(result);
     return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
-    const std::vector<SegmentUpdate>& updates) {
-    UpdateSegmentsRequest request;
-    request.request_intent = SegmentUpdateRequestIntent::RECONCILE;
-    request.segments = updates;
-    auto result = UpdateSegments(request);
-    if (!result) {
-        return tl::unexpected(result.error());
-    }
-    if (result->client_status != ClientStatus::OK ||
-        result->results.size() != updates.size()) {
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    for (const auto& update_result : result->results) {
-        if (update_result.error_code != ErrorCode::OK) {
-            return tl::unexpected(update_result.error_code);
-        }
-    }
-    return {};
-}
-
-tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
-    const std::vector<Segment>& segments) {
-    std::vector<SegmentUpdate> updates;
-    updates.reserve(segments.size());
-    for (const auto& segment : segments) {
-        updates.emplace_back(segment, SegmentRegistrationIntent::REMOUNT);
-    }
-    return ReMountSegment(updates);
 }
 
 tl::expected<void, ErrorCode> MasterClient::ReMountNoFSegment(

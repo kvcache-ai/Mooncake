@@ -319,10 +319,6 @@ class MasterClient {
     [[nodiscard]] tl::expected<UpdateSegmentsResponse, ErrorCode>
     UpdateSegments(const UpdateSegmentsRequest& request);
 
-    // Compatibility helper implemented through UpdateSegments(REGISTER).
-    [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
-        const Segment& segment);
-
     [[nodiscard]] tl::expected<void, ErrorCode> MountSSDSegment(
         const Segment& segment);
 
@@ -333,14 +329,6 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MountNoFSegment(
         const NoFSegment& segment);
-
-    // Compatibility helper implemented through UpdateSegments(RECONCILE).
-    [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
-        const std::vector<SegmentUpdate>& updates);
-
-    // Compatibility helper for callers that only issue true remounts.
-    [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
-        const std::vector<Segment>& segments);
 
     /**
      * @brief Re-mount NoF ssd segments, invoked when the client is the first
