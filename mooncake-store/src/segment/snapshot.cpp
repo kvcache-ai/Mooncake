@@ -1,7 +1,6 @@
 #include "segment/snapshot.h"
 
 #include <algorithm>
-#include <map>
 #include <set>
 
 #include "segment/pool.h"
@@ -55,17 +54,13 @@ tl::expected<void, ErrorCode> SegmentPool::RestoreSnapshot(
         return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
     }
     std::set<UUID> ids;
-    std::map<std::string, UUID> owners;
     std::set<std::string> active_names;
     for (const auto& region : snapshot.regions) {
         const auto& mounted = region.mounted;
         if (!IsKnownSegmentStatus(mounted.status)) {
             return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
         }
-        auto [owner, inserted] =
-            owners.emplace(mounted.segment.name, mounted.client_id);
         if (!ids.insert(mounted.segment.id).second ||
-            (!inserted && owner->second != mounted.client_id) ||
             mounted.kind != RegionKind::HOST_MEMORY ||
             region.allocator.segment_name != mounted.segment.name ||
             region.allocator.base != mounted.segment.base ||

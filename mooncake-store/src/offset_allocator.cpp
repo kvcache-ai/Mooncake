@@ -1080,7 +1080,11 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::createHandleAtNode(
     if (!m_allocator || node_index >= m_allocator->m_current_capacity)
         return std::nullopt;
     const auto& node = m_allocator->m_nodes[node_index];
-    if (!node.used) return std::nullopt;
+    if (!node.used || requested_size == 0 ||
+        requested_size >
+            (static_cast<uint64_t>(node.dataSize) << m_multiplier_bits)) {
+        return std::nullopt;
+    }
 
     // Cross-validate: real_offset must match the node's stored offset.
     uint64_t expected_offset =

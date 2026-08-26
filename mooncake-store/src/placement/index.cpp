@@ -207,7 +207,7 @@ void PlacementIndex::VisitHostOrderedSegmentNames(
 
 std::optional<UUID> ScopedPlacementReadAccess::GetOwnerClientId(
     std::string_view segment_name) const {
-    return catalog_.FindOwnerClientId(segment_name);
+    return catalog_ ? catalog_->FindOwnerClientId(segment_name) : std::nullopt;
 }
 
 }  // namespace mooncake

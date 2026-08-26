@@ -21,6 +21,8 @@ class SegmentPool::ReadAccess final {
 
     std::shared_ptr<BufferAllocatorBase> GetAllocator(
         const UUID& region_id) const;
+    bool BindBufferToSegment(const UUID& region_id,
+                             AllocatedBuffer& buffer) const;
     // Usage of active placement candidates for this segment name and kind.
     ErrorCode QueryAllocationCandidates(std::string_view name,
                                         AllocationCandidateKind kind,

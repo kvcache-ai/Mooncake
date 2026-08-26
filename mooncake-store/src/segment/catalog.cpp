@@ -9,8 +9,6 @@ const MountedRegion* RegionCatalog::Find(const UUID& segment_id) const {
 
 ErrorCode RegionCatalog::Register(const MountedRegion& mounted) {
     if (Find(mounted.segment.id)) return ErrorCode::SEGMENT_ALREADY_EXISTS;
-    auto owner = FindOwnerClientId(mounted.segment.name);
-    if (owner && *owner != mounted.client_id) return ErrorCode::INVALID_PARAMS;
     auto record = mounted;
     record.generation = ++next_generation_;
     records_.insert(std::move(record));
@@ -35,10 +33,17 @@ void RegionCatalog::Clear() { records_.clear(); }
 
 std::optional<UUID> RegionCatalog::FindOwnerClientId(
     std::string_view name) const {
-    const auto& names = records_.get<1>();
-    auto it = names.find(name);
-    return it == names.end() ? std::nullopt
-                             : std::optional<UUID>(it->client_id);
+    const auto [first, last] = records_.get<1>().equal_range(name);
+    const MountedRegion* selected = nullptr;
+    for (auto it = first; it != last; ++it) {
+        const bool is_ok = it->status == SegmentStatus::OK;
+        if (!selected || (is_ok && selected->status != SegmentStatus::OK) ||
+            (is_ok == (selected->status == SegmentStatus::OK) &&
+             it->segment.id < selected->segment.id)) {
+            selected = &*it;
+        }
+    }
+    return selected ? std::optional<UUID>(selected->client_id) : std::nullopt;
 }
 
 }  // namespace mooncake

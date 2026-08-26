@@ -77,9 +77,11 @@ SegmentPool::WriteAccess::PrepareWithLiveAllocations(
         }
         previous_allocator = existing_resource->allocator();
     } else {
-        auto owner = catalog_.FindOwnerClientId(segment.name);
-        if (owner && *owner != client_id) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        for (const auto& id : catalog_.RegionIds(segment.name)) {
+            if (catalog_.Find(id)->status == SegmentStatus::UNMOUNTING) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
         }
     }
 
@@ -111,9 +113,11 @@ tl::expected<RegionMountTxn, ErrorCode> SegmentPool::WriteAccess::PrepareAdopt(
         if (catalog_.Find(mounted.segment.id)) {
             return tl::make_unexpected(ErrorCode::SEGMENT_ALREADY_EXISTS);
         }
-        auto owner = catalog_.FindOwnerClientId(mounted.segment.name);
-        if (owner && *owner != mounted.client_id) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        for (const auto& id : catalog_.RegionIds(mounted.segment.name)) {
+            if (catalog_.Find(id)->status == SegmentStatus::UNMOUNTING) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
         }
     }
     auto resource = driver->PrepareAdopt(MakeResourceSpec(mounted.segment),
@@ -155,16 +159,17 @@ ErrorCode SegmentPool::WriteAccess::PublishMount(
             current_resource->allocator() != previous_allocator.lock()) {
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
-    } else {
-        if (current) {
-            return ErrorCode::SEGMENT_ALREADY_EXISTS;
-        }
-        const auto owner = catalog_.FindOwnerClientId(mounted.segment.name);
-        if (owner && *owner != mounted.client_id) {
-            return ErrorCode::INVALID_PARAMS;
-        }
+    } else if (current) {
+        return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
     auto& new_resource = prepared.resource();
+    if (existed) {
+        new_resource.candidate->InheritBinding(
+            *segment_pool_.GetResource(*current)->candidate);
+    }
+    for (const auto& buffer : prepared.imported_buffers()) {
+        new_resource.candidate->BindBuffer(*buffer);
+    }
     if (existed && mounted.status == SegmentStatus::OK) {
         auto& old_resource = *segment_pool_.GetResource(mounted);
         prepared.Commit();
@@ -197,9 +202,12 @@ ErrorCode SegmentPool::WriteAccess::PublishMount(
 ErrorCode SegmentPool::WriteAccess::MountSegment(const Segment& segment,
                                                  const UUID& client_id) {
     if (const auto* mounted = catalog_.Find(segment.id)) {
-        return mounted->status == SegmentStatus::OK
+        if (mounted->status != SegmentStatus::OK) {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+        return mounted->client_id == client_id && mounted->segment == segment
                    ? ErrorCode::SEGMENT_ALREADY_EXISTS
-                   : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+                   : ErrorCode::INVALID_PARAMS;
     }
     auto prepared = PrepareMount(segment, client_id);
     if (!prepared) {

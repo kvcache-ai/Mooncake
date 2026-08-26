@@ -17,9 +17,10 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/store_resource_snapshot_codec.h"
 #include "master_config.h"
 #include "replica.h"
-#include "segment.h"
+#include "segment/snapshot.h"
 #include "serialize/serializer.h"
 #include "types.h"
 #include "common/zstd_util.h"
@@ -140,9 +141,8 @@ inline void PackDiskReplica(
 }
 
 inline std::vector<uint8_t> BuildSegmentsPayload() {
-    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
-    SegmentSerializer serializer(&segment_manager);
-    auto serialized = serializer.Serialize(LocalSsdPersistedState{});
+    auto serialized = ha::StoreResourceSnapshotCodec::Encode(
+        SegmentPoolSnapshot{}, LocalSsdPersistedState{});
     if (!serialized) {
         throw std::runtime_error(serialized.error().message);
     }

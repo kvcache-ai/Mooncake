@@ -6,11 +6,20 @@
 #include <vector>
 
 #include "master_service.h"
-#include "segment.h"
+#include "segment/pool.h"
 #include "serialize/serializer.h"
+#include "ha/snapshot/store_resource_snapshot_codec.h"
 #include "task_manager.h"
 
 namespace mooncake::ha {
+
+MasterSnapshotStateView::MasterSnapshotStateView(
+    MasterService& master_service, SegmentPool& segment_pool,
+    LocalSsdManager& local_ssd_manager, ClientTaskManager& task_manager)
+    : master_service(master_service),
+      segment_pool(segment_pool),
+      local_ssd_manager(local_ssd_manager),
+      task_manager(task_manager) {}
 
 std::vector<uint8_t> MasterSnapshotCodec::EncodeManifest(
     const std::string& type, const std::string& version,
@@ -30,10 +39,10 @@ MasterSnapshotCodec::Encode(MasterSnapshotStateView& state_view) const {
     }
     payloads.metadata = std::move(metadata_result.value());
 
-    // 2. Encode segments (memory segments + NoF segments)
+    // 2. Encode mounted memory regions and LocalSSD state. NoF is outside the
+    // current snapshot wire format.
     auto segments_result =
-        EncodeSegments(state_view.segment_manager, state_view.local_ssd_manager,
-                       state_view.nof_segment_manager);
+        EncodeSegments(state_view.segment_pool, state_view.local_ssd_manager);
     if (!segments_result) {
         return tl::make_unexpected(segments_result.error());
     }
@@ -119,23 +128,31 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeMetadata(
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>
-MasterSnapshotCodec::EncodeSegments(
-    SegmentManager& segment_manager, LocalSsdManager& local_ssd_manager,
-    NoFSegmentManager& nof_segment_manager) const {
-    // Note: NoFSegmentManager is not currently serialized in snapshots
-    SegmentSerializer serializer(&segment_manager);
-    return serializer.Serialize(local_ssd_manager.ExportPersistedState());
+MasterSnapshotCodec::EncodeSegments(const SegmentPool& segment_pool,
+                                    LocalSsdManager& local_ssd_manager) const {
+    auto snapshot = segment_pool.CaptureSnapshot();
+    if (!snapshot) {
+        return tl::unexpected(SerializationError(
+            snapshot.error(), "failed to capture segment pool snapshot"));
+    }
+    return StoreResourceSnapshotCodec::Encode(
+        *snapshot, local_ssd_manager.ExportPersistedState());
 }
 
 tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeSegments(
     MasterService* master_service, const std::vector<uint8_t>& data) const {
-    SegmentSerializer serializer(&master_service->segment_manager_);
-    auto local_ssd_state = serializer.Deserialize(data);
-    if (!local_ssd_state) {
-        return tl::unexpected(local_ssd_state.error());
+    auto snapshot = StoreResourceSnapshotCodec::Decode(data);
+    if (!snapshot) {
+        return tl::unexpected(snapshot.error());
+    }
+    auto restored = master_service->segment_pool_.RestoreSnapshot(
+        std::move(snapshot->segment_pool), true);
+    if (!restored) {
+        return tl::unexpected(SerializationError(
+            restored.error(), "failed to restore segment pool snapshot"));
     }
     master_service->local_ssd_manager_.RestorePersistedState(
-        std::move(*local_ssd_state));
+        std::move(snapshot->local_ssd));
     return {};
 }
 

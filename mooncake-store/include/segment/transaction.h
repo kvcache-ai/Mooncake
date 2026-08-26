@@ -74,6 +74,9 @@ class SegmentPool::WriteAccess::RegionUnmountTxn final {
     // after metadata cleanup. Each call consumes the transaction, including
     // on failure; the moved-from transaction cannot be used again.
     ErrorCode Commit(SegmentPool::WriteAccess& access) &&;
+    // Offboarding retains its token across retryable cleanup failures. A
+    // failed attempt preserves this token; success makes it unusable.
+    ErrorCode TryCommit(SegmentPool::WriteAccess& access) &;
     ErrorCode Rollback(SegmentPool::WriteAccess& access) &&;
 
     const Segment& segment() const noexcept { return segment_; }

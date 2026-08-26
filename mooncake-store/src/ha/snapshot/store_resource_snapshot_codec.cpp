@@ -338,16 +338,10 @@ StoreResourceSnapshotCodec::Decode(const std::vector<uint8_t>& data) {
                                "snapshot region is missing an owner"));
     }
 
-    std::unordered_map<std::string, UUID> owner_by_name;
+    // The legacy cs relation assigns one owner per region, not per name.
+    // Different clients may register independent regions under one hostname.
     std::set<std::string> expected_active_names;
     for (const auto& [_, region] : decoded) {
-        auto [owner, inserted] = owner_by_name.emplace(
-            region.mounted.segment.name, region.mounted.client_id);
-        if (!inserted && owner->second != region.mounted.client_id) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "snapshot logical region group has multiple owners"));
-        }
         if (region.mounted.status == SegmentStatus::OK) {
             expected_active_names.insert(region.mounted.segment.name);
         }

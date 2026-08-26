@@ -7,7 +7,8 @@
 #include "ha/snapshot/allocator_snapshot_codec.h"
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
-#include "master_service.h"
+#include "replica.h"
+#include "segment/pool_read_access.h"
 #include "common/zstd_util.h"
 
 namespace mooncake {
@@ -526,54 +527,71 @@ auto Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
 
     auto offset = allocation_array.via.array.ptr[0].as<uint32_t>();
     auto metadata = allocation_array.via.array.ptr[1].as<uint32_t>();
-    offset_allocator::OffsetAllocation allocation(offset, metadata);
-
-    // Create a new OffsetAllocationHandle object
-    auto handle = std::make_shared<offset_allocator::OffsetAllocationHandle>(
-        allocator, allocation, real_base, requested_size);
-
-    return handle;
+    if (!allocator || requested_size == 0) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL, "invalid offset allocation handle"));
+    }
+    // A raw constructor would let a corrupt node index reach the allocator's
+    // free path. Use the recovery API to validate ownership and bounds first.
+    auto restored =
+        allocator->createHandleAtNode(metadata, real_base, requested_size);
+    if (!restored || restored->m_allocation.getOffset() != offset) {
+        // This is only a borrowed reconstruction of an existing allocation;
+        // rejecting its redundant offset must not free that allocation.
+        if (restored) restored->m_allocator.reset();
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "offset allocation handle does not match restored allocator"));
+    }
+    return std::make_shared<offset_allocator::OffsetAllocationHandle>(
+        std::move(*restored));
 }
 
 tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
-    const AllocatedBuffer &buffer, const SegmentView &segment_view,
-    MsgpackPacker &packer) {
-    packer.pack_array(5);
+    const AllocatedBuffer& buffer, const SegmentPool& segment_pool,
+    MsgpackPacker& packer) {
+    const auto allocator = buffer.getAllocator();
+    // Snapshot encoding runs in a forked child. Never acquire the inherited
+    // pool mutex here: a vanished parent thread may have held its write lock.
+    const MountedRegion* region = nullptr;
+    for (const auto& mounted : segment_pool.catalog_.Regions()) {
+        const auto* resource = segment_pool.GetResource(mounted);
+        if (resource && resource->allocator() == allocator) {
+            region = &mounted;
+            break;
+        }
+    }
+    if (!region || region->kind != RegionKind::HOST_MEMORY) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::SERIALIZE_FAIL,
+            "serialize AllocatedBuffer has no snapshot-compatible region"));
+    }
+    return SerializeWithRegionId(buffer, region->segment.id, packer);
+}
 
-    // Serialize basic properties
-    // packer.pack(buffer.segment_name_);
+tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
+    const AllocatedBuffer& buffer, const SegmentPool::ReadAccess& segment_view,
+    MsgpackPacker& packer) {
+    const auto allocator = buffer.getAllocator();
+    for (const auto& mounted : segment_view.Catalog().Regions()) {
+        if (mounted.kind == RegionKind::HOST_MEMORY && allocator &&
+            segment_view.GetAllocator(mounted.segment.id) == allocator) {
+            return SerializeWithRegionId(buffer, mounted.segment.id, packer);
+        }
+    }
+    return tl::unexpected(SerializationError(
+        ErrorCode::SERIALIZE_FAIL,
+        "serialize AllocatedBuffer has no snapshot-compatible region"));
+}
+
+tl::expected<void, SerializationError>
+Serializer<AllocatedBuffer>::SerializeWithRegionId(
+    const AllocatedBuffer& buffer, const UUID& region_id,
+    MsgpackPacker& packer) {
+    packer.pack_array(5);
     packer.pack(static_cast<uint64_t>(buffer.size_));
     packer.pack(reinterpret_cast<uint64_t>(buffer.buffer_ptr_));
-    // packer.pack(static_cast<int32_t>(buffer.status));
-
-    if (buffer.allocator_.expired()) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::SERIALIZE_FAIL,
-            fmt::format("buffer.allocator_.expired,buffer_ptr:{}",
-                        buffer.buffer_ptr_)));
-    }
-
-    // Get segment info
-    const auto &allocator = buffer.allocator_.lock();
-    if (!allocator) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::SERIALIZE_FAIL,
-            fmt::format("serialize AllocatedBuffer "
-                        "buffer.allocator_.lock() fail,buffer_ptr:{}",
-                        buffer.buffer_ptr_)));
-    }
-
-    Segment segment;
-    ErrorCode ret = segment_view.GetSegment(allocator, segment);
-    if (ret != ErrorCode::OK) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::SERIALIZE_FAIL,
-            fmt::format("serialize AllocatedBuffer "
-                        "segment_view.GetSegment() fail ret={}",
-                        static_cast<int32_t>(ret))));
-    }
-
-    packer.pack(UuidToString(segment.id));
+    packer.pack(UuidToString(region_id));
 
     // Serialize offset_handle_ (if exists)
     if (buffer.offset_handle_.has_value()) {
@@ -594,8 +612,8 @@ tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
     return {};
 }
 
-auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
-                                              const SegmentView &segment_view)
+auto Serializer<AllocatedBuffer>::deserialize(
+    const msgpack::object& obj, const SegmentPool::ReadAccess& segment_view)
     -> tl::expected<PointerType, SerializationError> {
     // Check if object type is array (consistent with serialize_msgpack)
     if (obj.type != msgpack::type::ARRAY) {
@@ -635,29 +653,17 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
                         segment_id)));
     }
 
-    MountedSegment mountedSegment;
-    ErrorCode ret =
-        segment_view.GetMountedSegment(segment_uuid, mountedSegment);
-    if (ret != ErrorCode::OK) {
+    const auto* mounted_region = segment_view.Catalog().Find(segment_uuid);
+    if (!mounted_region) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            fmt::format(
-                "deserialize_msgpack AllocatedBuffer "
-                "segment_view.GetMountedSegment() fail ret={},segment_id={}",
-                static_cast<int32_t>(ret), segment_id)));
-    }
-
-    if (mountedSegment.status != SegmentStatus::OK) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize_msgpack AllocatedBuffer "
-                        "mountedSegment.status!=OK status={} segment_id={}",
-                        static_cast<int32_t>(mountedSegment.status),
+            fmt::format("deserialize AllocatedBuffer unknown segment {}",
                         segment_id)));
     }
-
+    // Draining/gracefully-unmounting regions retain readable allocations.
+    // Discarded replicas can also refer to an immediate unmount in progress.
     std::shared_ptr<BufferAllocatorBase> allocator =
-        mountedSegment.buf_allocator;
+        segment_view.GetAllocator(segment_uuid);
     // Check if allocator is valid
     if (!allocator) {
         return tl::unexpected(SerializationError(
@@ -667,42 +673,52 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
                         segment_id)));
     }
 
-    // Deserialize offset_handle_ (if exists)
-    std::optional<offset_allocator::OffsetAllocationHandle> offsetHandle =
-        std::nullopt;
-
-    bool has_offset_handle = array_items[3].as<bool>();
-    if (has_offset_handle) {
-        auto offset_allocator =
-            std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
-        if (offset_allocator) {
-            // Use OffsetBufferAllocator's offset_allocator_ to create
-            // OffsetAllocationHandle
-            auto handle_result =
-                Serializer<offset_allocator::OffsetAllocationHandle>::
-                    deserialize(array_items[4],
-                                offset_allocator->getOffsetAllocator());
-            if (!handle_result) {
-                return tl::unexpected(handle_result.error());
-            }
-            offsetHandle = std::move(*handle_result.value());
-        }
+    const auto address = reinterpret_cast<uintptr_t>(buffer_ptr);
+    const auto& segment = mounted_region->segment;
+    if (size == 0 || address < segment.base ||
+        address - segment.base >= segment.size ||
+        size > segment.size - (address - segment.base)) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "allocated buffer lies outside its mounted region"));
     }
+
+    auto offset_allocator =
+        std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
+    const auto& handle_object = array_items[4];
+    if (!offset_allocator || !array_items[3].as<bool>() ||
+        handle_object.type != msgpack::type::ARRAY ||
+        handle_object.via.array.size != 3 ||
+        handle_object.via.array.ptr[0].as<uint64_t>() != address ||
+        handle_object.via.array.ptr[1].as<uint64_t>() != size) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "allocated buffer has a missing or inconsistent offset handle"));
+    }
+    auto handle_result =
+        Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
+            handle_object, offset_allocator->getOffsetAllocator());
+    if (!handle_result) return tl::unexpected(handle_result.error());
+    std::optional<offset_allocator::OffsetAllocationHandle> offsetHandle(
+        std::move(**handle_result));
 
     // Create AllocatedBuffer object
     auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
                                                     std::move(offsetHandle));
-    if (mountedSegment.allocator_registration) {
-        mountedSegment.allocator_registration->BindBuffer(*buffer);
+    if (!segment_view.BindBufferToSegment(segment_uuid, *buffer)) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize AllocatedBuffer cannot bind to its region"));
     }
     // buffer->status = status;
 
     return buffer;
 }
 
-tl::expected<void, SerializationError> Serializer<Replica>::serialize(
-    const Replica &replica, const SegmentView &segment_view,
-    MsgpackPacker &packer) {
+template <typename SegmentAccess>
+tl::expected<void, SerializationError> Serializer<Replica>::SerializeImpl(
+    const Replica& replica, const SegmentAccess& segment_access,
+    MsgpackPacker& packer) {
     // Use unified array structure to pack Replica
     // Format: [id(uint64), status(int16), replica_type(int8), payload]
     packer.pack_array(4);
@@ -729,7 +745,7 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
                                 "is nullptr")));
             }
             auto result = Serializer<AllocatedBuffer>::serialize(
-                *mem_data->buffer, segment_view, packer);
+                *mem_data->buffer, segment_access, packer);
             if (!result) {
                 return tl::unexpected(result.error());
             }
@@ -783,17 +799,28 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             break;
         }
         default:
-            // Unsupported replica type
-            packer.pack(static_cast<int8_t>(255));
-            packer.pack_nil();
-            break;
+            return tl::unexpected(SerializationError(
+                ErrorCode::SERIALIZE_UNSUPPORTED,
+                "snapshot does not support this replica type"));
     }
 
     return {};
 }
 
-auto Serializer<Replica>::deserialize(const msgpack::object &obj,
-                                      const SegmentView &segment_view)
+tl::expected<void, SerializationError> Serializer<Replica>::serialize(
+    const Replica& replica, const SegmentPool& segment_pool,
+    MsgpackPacker& packer) {
+    return SerializeImpl(replica, segment_pool, packer);
+}
+
+tl::expected<void, SerializationError> Serializer<Replica>::serialize(
+    const Replica& replica, const SegmentPool::ReadAccess& segment_view,
+    MsgpackPacker& packer) {
+    return SerializeImpl(replica, segment_view, packer);
+}
+
+auto Serializer<Replica>::deserialize(
+    const msgpack::object& obj, const SegmentPool::ReadAccess& segment_view)
     -> tl::expected<PointerType, SerializationError> {
     // Check if object type is array (consistent with serialize)
     if (obj.type != msgpack::type::ARRAY) {
@@ -914,167 +941,6 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
     replica->id_ = id;
 
     return replica;
-}
-
-tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
-    const MountedSegment &mounted_segment, MsgpackPacker &packer) {
-    // Use array structure for packing, more efficient
-    // Format: [segment_id, segment_name, segment_base, segment_size,
-    // te_endpoint, status, has_buffer_allocator, buffer_allocator_data,
-    // host_id]
-
-    packer.pack_array(9);
-
-    // Serialize Segment info
-    packer.pack(UuidToString(mounted_segment.segment.id));
-    packer.pack(mounted_segment.segment.name);
-    packer.pack(static_cast<uint64_t>(mounted_segment.segment.base));
-    packer.pack(static_cast<uint64_t>(mounted_segment.segment.size));
-    packer.pack(mounted_segment.segment.te_endpoint);
-
-    // Serialize SegmentStatus
-    packer.pack(static_cast<int16_t>(mounted_segment.status));
-
-    // Serialize BufferAllocator
-    if (mounted_segment.buf_allocator) {
-        auto offsetAllocator = std::dynamic_pointer_cast<OffsetBufferAllocator>(
-            mounted_segment.buf_allocator);
-        if (offsetAllocator) {
-            packer.pack(true);  // Mark buffer allocator exists
-            auto result = Serializer<OffsetBufferAllocator>::serialize(
-                *offsetAllocator, packer);
-            if (!result) {
-                return tl::unexpected(result.error());
-            }
-            packer.pack(mounted_segment.segment.host_id);
-            return {};
-        }
-    }
-
-    packer.pack(false);  // Mark no valid buffer allocator exists
-    packer.pack_nil();
-    packer.pack(mounted_segment.segment.host_id);
-    return {};
-}
-
-tl::expected<MountedSegment, SerializationError>
-Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
-    if (obj.type != msgpack::type::ARRAY) {
-        return tl::unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "deserialize MountedSegment invalid serialized "
-                               "state: not a msgpack array"));
-    }
-
-    if (obj.via.array.size < 8) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize MountedSegment invalid array size"));
-    }
-
-    MountedSegment mounted_segment;
-    msgpack::object *array = obj.via.array.ptr;
-
-    try {
-        // Deserialize Segment info
-        std::string segment_id_str = array[0].as<std::string>();
-        UUID segment_uuid;
-        if (!StringToUuid(segment_id_str, segment_uuid)) {
-            return tl::unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                fmt::format("deserialize MountedSegment invalid UUID {}",
-                            segment_id_str)));
-        }
-
-        mounted_segment.segment.id = segment_uuid;
-        mounted_segment.segment.name = array[1].as<std::string>();
-        mounted_segment.segment.base =
-            static_cast<uintptr_t>(array[2].as<uint64_t>());
-        mounted_segment.segment.size =
-            static_cast<size_t>(array[3].as<uint64_t>());
-        mounted_segment.segment.te_endpoint = array[4].as<std::string>();
-
-        // Deserialize SegmentStatus
-        mounted_segment.status =
-            static_cast<SegmentStatus>(array[5].as<int16_t>());
-
-        // Deserialize BufferAllocator
-        bool has_buffer_allocator = array[6].as<bool>();
-        if (has_buffer_allocator) {
-            auto allocatorResult =
-                Serializer<OffsetBufferAllocator>::deserialize(array[7]);
-            if (allocatorResult) {
-                mounted_segment.buf_allocator =
-                    std::move(allocatorResult.value());
-            } else {
-                return tl::unexpected(allocatorResult.error());
-            }
-        }
-        if (obj.via.array.size >= 9) {
-            mounted_segment.segment.host_id = array[8].as<std::string>();
-        }
-    } catch (const std::exception &e) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize MountedSegment failed: {}", e.what())));
-    }
-
-    return mounted_segment;
-}
-
-tl::expected<void, SerializationError>
-Serializer<OffsetBufferAllocator>::serialize(
-    const OffsetBufferAllocator &allocator, MsgpackPacker &packer) {
-    // Use array structure to pack OffsetBufferAllocator
-    // Format: [segment_name, base, total_size, current_size,
-    // transport_endpoint, offset_allocator]
-
-    packer.pack_array(6);
-
-    // Serialize basic properties
-    packer.pack(allocator.getSegmentName());
-    packer.pack(static_cast<uint64_t>(allocator.base()));
-    packer.pack(static_cast<uint64_t>(allocator.capacity()));
-    packer.pack(static_cast<uint64_t>(allocator.size()));
-    packer.pack(allocator.getTransportEndpoint());
-
-    // Serialize offset_allocator
-    return Serializer<mooncake::offset_allocator::OffsetAllocator>::serialize(
-        *allocator.getOffsetAllocator(), packer);
-}
-
-auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
-    -> tl::expected<PointerType, SerializationError> {
-    // Validate input state
-    if (obj.type != msgpack::type::ARRAY) {
-        return tl::unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "deserialize OffsetBufferAllocator invalid "
-                               "serialized state: not a msgpack array"));
-    }
-
-    if (obj.via.array.size != 6) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize OffsetBufferAllocator invalid array size"));
-    }
-
-    try {
-        auto snapshot = ha::AllocatorSnapshotCodec::Decode(obj);
-        if (!snapshot) return tl::unexpected(snapshot.error());
-        auto allocator = OffsetBufferAllocator::Restore(std::move(*snapshot));
-        if (!allocator) {
-            return tl::unexpected(SerializationError(
-                allocator.error(),
-                "deserialize OffsetBufferAllocator rejected its state"));
-        }
-        return std::move(*allocator);
-    } catch (const std::exception &e) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize OffsetBufferAllocator failed: {}",
-                        e.what())));
-    }
 }
 
 }  // namespace mooncake

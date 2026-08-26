@@ -47,6 +47,7 @@ class EntryList final {
 };
 
 struct PlacementScratch final {
+    std::vector<const PlacementIndex::Entry*> serving_entries;
     EntryList preferred;
     std::unordered_set<const PlacementIndex::Entry*> excluded;
     std::vector<const PlacementIndex::Entry*> used;
@@ -57,6 +58,7 @@ struct PlacementScratch final {
     }
 
     void Clear() {
+        serving_entries.clear();
         preferred.Clear();
         excluded.clear();
         used.clear();
@@ -76,16 +78,31 @@ std::unique_ptr<AllocatedBuffer> TryAllocateFromEntry(
         return nullptr;
     }
     if (entry->candidates.size() == 1) {
-        return (*entry->candidates.begin())->Allocate(size);
+        const auto* candidate = *entry->candidates.begin();
+        return candidate->IsServing() ? candidate->Allocate(size) : nullptr;
     }
 
-    size_t index = randomIndex(entry->candidates.size());
-    for (size_t i = 0; i < entry->candidates.size(); ++i) {
-        if (auto buffer = (*entry->candidates.nth(index))->Allocate(size))
+    // Candidates remain indexed while their client is suspected. Sample only
+    // serving candidates so retained regions do not bias the starting point.
+    thread_local std::vector<const AllocationCandidate*> serving_candidates;
+    serving_candidates.clear();
+    serving_candidates.reserve(entry->candidates.size());
+    for (const auto* candidate : entry->candidates) {
+        if (candidate->IsServing()) {
+            serving_candidates.push_back(candidate);
+        }
+    }
+    if (serving_candidates.empty()) {
+        return nullptr;
+    }
+
+    size_t index = randomIndex(serving_candidates.size());
+    for (size_t i = 0; i < serving_candidates.size(); ++i) {
+        if (auto buffer = serving_candidates[index]->Allocate(size))
             [[likely]] {
             return buffer;
         }
-        if (++index == entry->candidates.size()) {
+        if (++index == serving_candidates.size()) {
             index = 0;
         }
     }
@@ -96,6 +113,7 @@ double GetFreeRatio(const PlacementIndex::Entry& entry) {
     uint64_t total_capacity = 0;
     uint64_t total_free = 0;
     for (const auto* target : entry.candidates) {
+        if (!target->IsServing()) continue;
         const uint64_t capacity = target->Capacity();
         const uint64_t used = target->Used();
         total_capacity += capacity;
@@ -142,6 +160,18 @@ void ResolveEntries(const PlacementIndex& index,
                     const PlacementConstraints& constraints,
                     AllocationCandidateKind target_kind,
                     PlacementScratch& scratch) {
+    // Client liveness can change without reindexing. Use one serving snapshot
+    // for both bounded sampling and replica-count diagnostics.
+    const auto active_entries = index.active_entries(target_kind);
+    scratch.serving_entries.reserve(active_entries.size());
+    for (const auto* entry : active_entries) {
+        if (std::any_of(
+                entry->candidates.begin(), entry->candidates.end(),
+                [](const auto* candidate) { return candidate->IsServing(); })) {
+            scratch.serving_entries.push_back(entry);
+        }
+    }
+
     for (const auto& excluded : constraints.excluded_segment_names) {
         if (const auto* entry = index.Find(excluded, target_kind)) {
             scratch.excluded.insert(entry);
@@ -159,8 +189,7 @@ void ResolveEntries(const PlacementIndex& index,
 }
 
 tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
-    const PlacementIndex& index, const ReplicaAllocationRequest& request,
-    AllocationCandidateKind required_kind, PlacementScratch& scratch) {
+    const ReplicaAllocationRequest& request, PlacementScratch& scratch) {
     const auto& replicas = request.replicas;
     if (replicas.size == 0 || replicas.count == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -168,7 +197,7 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
     if (!HasExplicitPreference(request.placement)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (index.active_entries(required_kind).empty()) {
+    if (scratch.serving_entries.empty()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
     if (scratch.preferred.empty()) {
@@ -277,7 +306,8 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateWithRanker(
     if (requirements.size == 0 || requirements.count == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const auto active_entries = index.active_entries(target_kind);
+    const std::span<const PlacementIndex::Entry* const> active_entries =
+        scratch.serving_entries;
     if (active_entries.empty()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
@@ -330,13 +360,14 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateWithRanker(
     return result;
 }
 
-void UpdateDiagnostics(const PlacementIndex& index,
-                       const ReplicaAllocationRequest& request,
-                       AllocationCandidateKind target_kind,
+void UpdateDiagnostics(const ReplicaAllocationRequest& request,
+                       const PlacementScratch& scratch,
                        PlacementDiagnostics* diagnostics) {
     if (diagnostics) {
+        // Use the same serving-entry count as sampling. Retained non-serving
+        // entries cannot satisfy strict replica count, even after eviction.
         diagnostics->has_sufficient_active_entry_count =
-            index.active_entries(target_kind).size() >= request.replicas.count;
+            scratch.serving_entries.size() >= request.replicas.count;
     }
 }
 
@@ -347,10 +378,9 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateUsingRanker(
     const Ranker& ranker, bool use_host_affinity) {
     constexpr auto kTargetKind = AllocationCandidateKind::NATIVE;
     const auto& index = placement.GetView();
-    UpdateDiagnostics(index, request, kTargetKind, diagnostics);
-
     auto& scratch = GetPlacementScratch();
     ResolveEntries(index, request.placement, kTargetKind, scratch);
+    UpdateDiagnostics(request, scratch, diagnostics);
     return AllocateWithRanker(placement, request, kTargetKind, scratch, ranker,
                               use_host_affinity);
 }
@@ -360,11 +390,10 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateUsingPreferences(
     const ReplicaAllocationRequest& request, PlacementDiagnostics* diagnostics,
     AllocationCandidateKind required_kind) {
     const auto& index = placement.GetView();
-    UpdateDiagnostics(index, request, required_kind, diagnostics);
-
     auto& scratch = GetPlacementScratch();
     ResolveEntries(index, request.placement, required_kind, scratch);
-    return AllocatePreferredOnly(index, request, required_kind, scratch);
+    UpdateDiagnostics(request, scratch, diagnostics);
+    return AllocatePreferredOnly(request, scratch);
 }
 
 tl::expected<Replica, ErrorCode> AllocateFromNamedEntry(

@@ -116,7 +116,12 @@ class ScopedPlacementReadAccess final {
     ScopedPlacementReadAccess(const PlacementIndex& placement,
                               const RegionCatalog& catalog,
                               std::shared_mutex& mutex)
-        : placement_(placement), catalog_(catalog), lock_(mutex) {}
+        : placement_(placement), catalog_(&catalog), lock_(mutex) {}
+
+    // NoF placement has no memory-region catalog or LocalSSD owner ranking.
+    ScopedPlacementReadAccess(const PlacementIndex& placement,
+                              std::shared_mutex& mutex)
+        : placement_(placement), lock_(mutex) {}
 
     // The view and entries borrowed from it must only be used while this
     // access object retains its lock.
@@ -126,7 +131,7 @@ class ScopedPlacementReadAccess final {
 
    private:
     const PlacementIndex& placement_;
-    const RegionCatalog& catalog_;
+    const RegionCatalog* catalog_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
