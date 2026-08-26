@@ -389,7 +389,18 @@ int TcpTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 int TcpTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    // Remove only the descs this transport published. Under multi-protocol
+    // the protocol field is authoritative; otherwise ours are the entries
+    // without a serialized IPC handle.
+    static const std::function<bool(const BufferDesc&)> own_desc =
+        [](const BufferDesc& desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+            return desc.protocol == "tcp";
+#else
+            return desc.shm_name.empty();
+#endif
+        };
+    return metadata_->removeLocalMemoryBuffer(addr, own_desc, update_metadata);
 }
 
 int TcpTransport::registerLocalMemoryBatch(

@@ -121,6 +121,34 @@ def _alias_lifecycle(result):
         result.put(("alias", str(e)))
 
 
+def _base_alias_lifecycle(result):
+    try:
+        torch.cuda.set_device(0)
+        # The first sub-range starts at the allocation base, so HIP's
+        # base-keyed entry and the caller-keyed entries published by the
+        # other transports share an address.
+        views = _sub_ranges_of_one_allocation()
+        engine = _engine()
+        addresses = [view.data_ptr() for view in views]
+
+        for address in addresses:
+            assert engine.register_memory(address, NBYTES) == 0
+
+        # A double unregister of the base-address view must fail without
+        # disturbing the entries the other aliases still hold (#3548 review:
+        # the transports used to delete each other's same-address entries).
+        assert engine.unregister_memory(addresses[0]) == 0
+        assert engine.unregister_memory(addresses[0]) != 0
+        for address in addresses[1:]:
+            assert engine.unregister_memory(address) == 0
+
+        # The registration is fully torn down; every alias now fails.
+        assert engine.unregister_memory(addresses[-1]) != 0
+        result.put(("base_alias", None))
+    except Exception as e:  # noqa: BLE001
+        result.put(("base_alias", str(e)))
+
+
 class TestTransferSubAllocationOnHip(unittest.TestCase):
     def setUp(self):
         if not torch.cuda.is_available():
@@ -179,6 +207,24 @@ class TestTransferSubAllocationOnHip(unittest.TestCase):
 
         if payload is not None:
             self.fail(f"alias failed: {payload}")
+
+    def test_base_address_view_double_unregister(self):
+        ctx = mp.get_context("spawn")
+        result = ctx.Queue()
+        child = ctx.Process(target=_base_alias_lifecycle, args=(result,))
+        child.start()
+        try:
+            _, payload = result.get(timeout=TIMEOUT)
+        except queue.Empty:
+            self.fail(f"no result: exitcode={child.exitcode}")
+        finally:
+            child.join(TIMEOUT)
+            if child.is_alive():
+                child.terminate()
+                child.join()
+
+        if payload is not None:
+            self.fail(f"base_alias failed: {payload}")
 
 
 if __name__ == "__main__":

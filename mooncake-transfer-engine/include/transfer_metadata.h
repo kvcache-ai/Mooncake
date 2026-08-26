@@ -217,6 +217,13 @@ class TransferMetadata {
 
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
 
+    // Removes the buffer at addr only when pred accepts the entry, so
+    // transports sharing an address in the local buffer list remove only
+    // their own entries.
+    int removeLocalMemoryBuffer(
+        void *addr, const std::function<bool(const BufferDesc &)> &pred,
+        bool update_metadata);
+
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
 
