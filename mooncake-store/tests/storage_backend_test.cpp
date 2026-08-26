@@ -5138,6 +5138,29 @@ TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
 // when datasync() fails inside WriteBucket, the freshly written .bucket file
 // must be removed by CleanupOrphanedBucket; otherwise repeated failures leave
 // orphan files that exhaust disk space until restart.
+    }
+    EXPECT_EQ(orphan_bucket_count, 0)
+        << "datasync failure must not leave an orphan .bucket file on disk";
+
+    // No .meta file should have been written either (metadata commit comes
+    // after datasync, so it was never reached).
+    int meta_count = 0;
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        if (entry.path().extension() == ".meta") {
+            ++meta_count;
+        }
+    }
+    EXPECT_EQ(meta_count, 0)
+        << "metadata must not be committed when datasync fails";
+
+    // The key must not be queryable.
+    auto exists = storage_backend.IsExist(key);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+}
+
+#endif
+
 TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
@@ -5145,8 +5168,9 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     BucketStorageBackend storage_backend(config, bucket_config);
     ASSERT_TRUE(storage_backend.Init());
 
-    // Enable datasync-failure injection: WriteBucket will skip the real
-    // fdatasync call and go straight to CleanupOrphanedBucket + error return.
+    // Enable datasync-failure injection: WriteBucket's datasync() call will
+    // return a failure, exercising the same !sync_result cleanup path as a
+    // real fdatasync() failure (CleanupOrphanedBucket + error return).
     storage_backend.SetDatasyncFailureForTest(true);
 
     std::string key = "datasync_fail_key";
@@ -5173,27 +5197,6 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
         if (entry.path().extension() == ".bucket") {
             ++orphan_bucket_count;
         }
-    }
-    EXPECT_EQ(orphan_bucket_count, 0)
-        << "datasync failure must not leave an orphan .bucket file on disk";
 
-    // No .meta file should have been written either (metadata commit comes
-    // after datasync, so it was never reached).
-    int meta_count = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.path().extension() == ".meta") {
-            ++meta_count;
-        }
-    }
-    EXPECT_EQ(meta_count, 0)
-        << "metadata must not be committed when datasync fails";
-
-    // The key must not be queryable.
-    auto exists = storage_backend.IsExist(key);
-    ASSERT_TRUE(exists.has_value());
-    EXPECT_FALSE(exists.value());
-}
-
-#endif
 
 }  // namespace mooncake::test
