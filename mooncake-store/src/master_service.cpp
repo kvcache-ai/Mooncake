@@ -1097,15 +1097,6 @@ auto MasterService::ReMountSegment(const std::vector<SegmentUpdate>& updates,
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-        if (ok_client_.erase(client_id) != 0) {
-            MasterMetricManager::instance().dec_active_clients();
-        }
-        for (const auto& segment : segments) {
-            if (!segment.host_id.empty()) {
-                client_host_id_[client_id] = segment.host_id;
-                break;
-            }
-        }
         {
             auto segment_access = segment_manager_.getSegmentAccess();
             for (const auto& update : updates) {
@@ -1409,9 +1400,20 @@ auto MasterService::ReMountSegment(const std::vector<SegmentUpdate>& updates,
                 std::chrono::milliseconds(default_kv_lease_ttl_));
         }
 
-        // Only a complete reconcile confirms the client snapshot.
-        ok_client_.insert(client_id);
-        MasterMetricManager::instance().inc_active_clients();
+        for (const auto& segment : segments) {
+            if (!segment.host_id.empty()) {
+                client_host_id_[client_id] = segment.host_id;
+                break;
+            }
+        }
+
+        // Only a complete reconcile confirms the client snapshot. Keep an
+        // already healthy client healthy if validation or reconciliation
+        // fails; client_mutex_ prevents observers from seeing an in-progress
+        // reconcile.
+        if (ok_client_.insert(client_id).second) {
+            MasterMetricManager::instance().inc_active_clients();
+        }
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {

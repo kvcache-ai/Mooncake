@@ -3676,6 +3676,8 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     }
 
     UUID segment_id;
+    Segment segment;
+    std::unique_lock<std::mutex> update_lock(segment_update_mutex_);
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
@@ -3702,7 +3704,6 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        Segment segment;
         segment.id = generate_uuid();
         segment.name = local_hostname_;
         segment.base = reinterpret_cast<uintptr_t>(buffer);
@@ -3716,17 +3717,58 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         }
 
         segment_id = segment.id;
-        // Local registration owns the buffer immediately. Master registration
-        // is performed by the single-flight control-plane flusher, so a Master
-        // outage does not lose this segment or require the caller to recreate
-        // it.
         mounted_segments_[segment_id] = {segment,
                                          SegmentSyncState::NEW_PENDING};
     }
 
+    UpdateSegmentsRequest request;
+    request.client_id = client_id_;
+    request.request_intent = SegmentUpdateRequestIntent::REGISTER;
+    request.segments.emplace_back(segment, SegmentRegistrationIntent::NEW);
+    auto mount_result = master_client_.UpdateSegments(request);
+
+    ErrorCode mount_error = ErrorCode::OK;
+    if (!mount_result) {
+        mount_error = mount_result.error();
+    } else if (mount_result->results.size() != 1 ||
+               mount_result->results.front().segment_id != segment_id) {
+        mount_error = ErrorCode::INTERNAL_ERROR;
+    } else {
+        mount_error = mount_result->results.front().error_code;
+    }
+
+    if (mount_error != ErrorCode::OK) {
+        LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
+                   << " size=" << size << ", error=" << mount_error;
+        {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            mounted_segments_.erase(segment_id);
+        }
+        int rc = transfer_engine_->unregisterLocalMemory((void*)buffer);
+        if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+            LOG(ERROR) << "rollback_register_local_memory_failed base="
+                       << buffer << " size=" << size << ", error=" << rc;
+        }
+        return tl::unexpected(mount_error);
+    }
+
+    const bool need_reconcile =
+        mount_result->client_status == ClientStatus::NEED_REMOUNT;
+    if (!need_reconcile) {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        auto entry = mounted_segments_.find(segment_id);
+        if (entry != mounted_segments_.end() &&
+            entry->second.sync_state == SegmentSyncState::NEW_PENDING) {
+            entry->second.sync_state = SegmentSyncState::ACTIVE;
+        }
+    }
+
+    update_lock.unlock();
     EnsureStorageControlPlaneStarted();
-    segment_flush_requested_.store(true);
-    storage_control_cv_.notify_one();
+    if (need_reconcile) {
+        segment_flush_requested_.store(true);
+        storage_control_cv_.notify_one();
+    }
     return segment_id;
 }
 
@@ -4916,6 +4958,7 @@ void Client::StorageHeartbeatThreadMain() {
     };
 
     auto mark_need_remount = [this]() {
+        std::lock_guard<std::mutex> update_lock(segment_update_mutex_);
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         for (auto& [segment_id, entry] : mounted_segments_) {
             if (entry.sync_state == SegmentSyncState::ACTIVE) {

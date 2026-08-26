@@ -947,9 +947,8 @@ class Client {
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
-    // Serializes segment update RPCs with unmount operations. Mount only needs
-    // mounted_segments_mutex_, so newly created segments can enter the next
-    // flusher snapshot while an RPC is in flight.
+    // Serializes synchronous registration, background reconciliation, and
+    // unmount operations so their snapshots cannot race with each other.
     std::mutex segment_update_mutex_;
     MountedSegmentMap mounted_segments_;
 
