@@ -66,6 +66,37 @@ def _write_wheel(
     return path
 
 
+def _write_complete_matrix(directory: Path, version: str) -> list[Path]:
+    return [
+        _write_wheel(directory, package, version, python_tag, architecture)
+        for package in gate.CORE_PACKAGES
+        for python_tag in gate.PYTHON_TAGS
+        for architecture in gate.ARCHITECTURES
+    ]
+
+
+def _artifacts(
+    wheels: list[Path],
+    hashes: dict[str, str | None] | None = None,
+) -> list[gate.IndexedArtifact]:
+    hashes = hashes or {}
+    return [
+        gate.IndexedArtifact(
+            wheel.name,
+            hashes[wheel.name] if wheel.name in hashes else gate._sha256(wheel),
+        )
+        for wheel in wheels
+    ]
+
+
+def test_prerelease_tag_normalization_rejects_non_public_versions() -> None:
+    assert str(gate.normalize_prerelease_tag("v1.2.0-rc1")) == "1.2.0rc1"
+
+    for tag in ("1.2.0-rc1", "v1.2.0", "v1.2.0rc1+local", "vnot-a-version"):
+        with pytest.raises(gate.GateError):
+            gate.normalize_prerelease_tag(tag)
+
+
 def test_complete_matrix_requires_exact_version_and_all_24_targets() -> None:
     filenames = _complete_matrix("1.2.0rc1")
 
@@ -84,89 +115,82 @@ def test_complete_matrix_requires_exact_version_and_all_24_targets() -> None:
 
 
 def test_local_validation_reads_each_wheel_metadata(tmp_path: Path) -> None:
-    wheels = [
-        _write_wheel(tmp_path, package, "1.2.0rc1", python_tag, architecture)
-        for package in gate.CORE_PACKAGES
-        for python_tag in gate.PYTHON_TAGS
-        for architecture in gate.ARCHITECTURES
-    ]
+    _write_complete_matrix(tmp_path, "1.2.0rc1")
     gate.validate_local(tmp_path, Version("1.2.0rc1"))
 
-    mismatched = wheels[-1]
     package = gate.CORE_PACKAGES[-1]
-    _write_wheel(
+    for bad_version in ("1.2.0rc2", "1.2rc1"):
+        _write_wheel(
+            tmp_path,
+            package,
+            "1.2.0rc1",
+            gate.PYTHON_TAGS[-1],
+            gate.ARCHITECTURES[-1],
+            metadata_version=bad_version,
+        )
+        with pytest.raises(gate.GateError, match=f"metadata version {bad_version}"):
+            gate.validate_local(tmp_path, Version("1.2.0rc1"))
+
+
+def test_upload_state_accepts_only_hash_matching_partial_uploads(
+    tmp_path: Path,
+) -> None:
+    wheels = _write_complete_matrix(tmp_path, "1.2.0rc1")
+    existing = wheels[:7]
+
+    gate.validate_upload_state(
         tmp_path,
-        package,
-        "1.2.0rc1",
-        gate.PYTHON_TAGS[-1],
-        gate.ARCHITECTURES[-1],
-        metadata_version="1.2.0rc2",
+        Version("1.2.0rc1"),
+        fetcher=lambda _index_url: _artifacts(existing),
     )
-    assert mismatched.exists()
-    with pytest.raises(gate.GateError, match="metadata version 1.2.0rc2"):
-        gate.validate_local(tmp_path, Version("1.2.0rc1"))
 
-    _write_wheel(
-        tmp_path,
-        package,
-        "1.2.0rc1",
-        gate.PYTHON_TAGS[-1],
-        gate.ARCHITECTURES[-1],
-        metadata_version="1.2rc1",
-    )
-    with pytest.raises(gate.GateError, match="metadata version 1.2rc1"):
-        gate.validate_local(tmp_path, Version("1.2.0rc1"))
-
-
-def test_existing_testpypi_equivalent_version_is_a_hard_collision() -> None:
-    existing = _complete_matrix("1.2rc1")
-
-    def fetcher(_index_url: str, package: str) -> list[str]:
-        prefix = package.replace("-", "_") + "-"
-        return [filename for filename in existing if filename.startswith(prefix)]
-
-    with pytest.raises(gate.GateError, match="refusing to mix"):
-        gate.ensure_version_absent(
-            gate.DEFAULT_INDEX_URL,
+    changed = existing[0]
+    with pytest.raises(gate.GateError, match="refusing to mix builds"):
+        gate.validate_upload_state(
+            tmp_path,
             Version("1.2.0rc1"),
-            fetcher=fetcher,
+            fetcher=lambda _index_url: _artifacts([changed], {changed.name: "0" * 64}),
         )
 
 
-def test_index_wait_retries_until_the_complete_matrix_is_visible() -> None:
-    complete = _complete_matrix("1.2.0rc1")
-    attempts = 0
+def test_upload_state_rejects_unverifiable_or_unexpected_artifacts(
+    tmp_path: Path,
+) -> None:
+    wheels = _write_complete_matrix(tmp_path, "1.2.0rc1")
+    existing = wheels[0]
+
+    with pytest.raises(gate.GateError, match="did not advertise a SHA-256"):
+        gate.validate_upload_state(
+            tmp_path,
+            Version("1.2.0rc1"),
+            fetcher=lambda _index_url: _artifacts([existing], {existing.name: None}),
+        )
+
+    unexpected = existing.name.replace("x86_64", "ppc64le")
+    with pytest.raises(gate.GateError, match="unexpected artifact"):
+        gate.validate_upload_state(
+            tmp_path,
+            Version("1.2.0rc1"),
+            fetcher=lambda _index_url: [gate.IndexedArtifact(unexpected, "0" * 64)],
+        )
+
+
+def test_upload_state_waits_for_the_complete_hash_matching_matrix(
+    tmp_path: Path,
+) -> None:
+    wheels = _write_complete_matrix(tmp_path, "1.2.0rc1")
+    responses = iter((_artifacts(wheels[:-1]), _artifacts(wheels)))
     sleeps = []
 
-    def fetcher(_index_url: str, package: str) -> list[str]:
-        nonlocal attempts
-        if package == gate.CORE_PACKAGES[0]:
-            attempts += 1
-        visible = complete[:-1] if attempts <= 1 else complete
-        prefix = package.replace("-", "_") + "-"
-        return [filename for filename in visible if filename.startswith(prefix)]
-
-    gate.wait_for_index(
+    gate.wait_for_upload_state(
+        tmp_path,
         gate.DEFAULT_INDEX_URL,
         Version("1.2.0rc1"),
         attempts=3,
         initial_delay=1,
         max_delay=4,
-        fetcher=fetcher,
+        fetcher=lambda _index_url: next(responses),
         sleeper=sleeps.append,
     )
 
     assert sleeps == [1]
-
-
-def test_index_wait_is_bounded() -> None:
-    with pytest.raises(gate.GateError, match="after 3 attempts"):
-        gate.wait_for_index(
-            gate.DEFAULT_INDEX_URL,
-            Version("1.2.0rc1"),
-            attempts=3,
-            initial_delay=1,
-            max_delay=2,
-            fetcher=lambda _index_url, _package: [],
-            sleeper=lambda _delay: None,
-        )

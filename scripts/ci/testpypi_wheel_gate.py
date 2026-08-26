@@ -4,18 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 import time
 from collections.abc import Callable, Iterable
-from email.parser import BytesParser
-from email.policy import default
-from html.parser import HTMLParser
 from pathlib import Path
+from typing import NamedTuple
 from urllib.error import HTTPError
-from urllib.parse import unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
+from packaging.metadata import InvalidMetadata, Metadata
 from packaging.utils import (
     InvalidSdistFilename,
     InvalidWheelFilename,
@@ -35,24 +35,20 @@ ARCHITECTURES = ("x86_64", "aarch64")
 DEFAULT_INDEX_URL = "https://test.pypi.org/simple"
 
 WheelTarget = tuple[str, str, str]
-IndexFetcher = Callable[[str, str], list[str]]
+
+
+class IndexedArtifact(NamedTuple):
+    """One artifact advertised by a package's Simple API page."""
+
+    filename: str
+    sha256: str | None
+
+
+ArtifactFetcher = Callable[[str], list[IndexedArtifact]]
 
 
 class GateError(RuntimeError):
     """A release gate invariant was not satisfied."""
-
-
-class _SimpleLinks(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.hrefs: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag != "a":
-            return
-        for name, value in attrs:
-            if name == "href" and value:
-                self.hrefs.append(value)
 
 
 def expected_targets() -> set[WheelTarget]:
@@ -63,6 +59,19 @@ def expected_targets() -> set[WheelTarget]:
         for python_tag in PYTHON_TAGS
         for architecture in ARCHITECTURES
     }
+
+
+def normalize_prerelease_tag(tag: str) -> Version:
+    """Normalize a public PEP 440 pre-release tag starting with ``v``."""
+    if not tag.startswith("v"):
+        raise GateError(f"pre-release tag must start with v: {tag!r}")
+    try:
+        version = Version(tag[1:])
+    except InvalidVersion as error:
+        raise GateError(f"invalid PEP 440 version in tag {tag!r}: {error}") from error
+    if not version.is_prerelease or version.local is not None:
+        raise GateError(f"tag {tag!r} must identify a public PEP 440 pre-release")
+    return version
 
 
 def _target_from_wheel(filename: str, expected_version: Version) -> WheelTarget:
@@ -94,19 +103,15 @@ def _target_from_wheel(filename: str, expected_version: Version) -> WheelTarget:
 
 def validate_wheel_set(filenames: Iterable[str], version: Version) -> None:
     """Require exactly one wheel for each target at ``version``."""
-    files_by_target: dict[WheelTarget, list[str]] = {}
+    files_by_target: dict[WheelTarget, str] = {}
     for filename in filenames:
         target = _target_from_wheel(filename, version)
-        files_by_target.setdefault(target, []).append(filename)
-
-    duplicate_targets = {
-        target: files for target, files in files_by_target.items() if len(files) > 1
-    }
-    if duplicate_targets:
-        details = "; ".join(
-            f"{target}: {files}" for target, files in sorted(duplicate_targets.items())
-        )
-        raise GateError(f"duplicate wheels for release targets: {details}")
+        if target in files_by_target:
+            raise GateError(
+                f"duplicate wheels for {target}: "
+                f"{files_by_target[target]!r} and {filename!r}"
+            )
+        files_by_target[target] = filename
 
     actual = set(files_by_target)
     expected = expected_targets()
@@ -135,32 +140,19 @@ def _validate_wheel_metadata(path: Path, expected_version: Version) -> None:
                     f"wheel {path.name!r} contains {len(metadata_files)} "
                     ".dist-info/METADATA files, expected exactly one"
                 )
-            metadata = BytesParser(policy=default).parsebytes(
-                wheel.read(metadata_files[0])
+            metadata = Metadata.from_email(
+                wheel.read(metadata_files[0]), validate=False
             )
-    except (BadZipFile, OSError) as error:
+            metadata_package = canonicalize_name(metadata.name)
+            metadata_version = metadata.version
+    except (BadZipFile, InvalidMetadata, OSError) as error:
         raise GateError(f"cannot read wheel {path.name!r}: {error}") from error
 
-    names = metadata.get_all("Name", [])
-    versions = metadata.get_all("Version", [])
-    if len(names) != 1 or len(versions) != 1:
-        raise GateError(
-            f"wheel {path.name!r} must contain exactly one Name and Version "
-            "metadata field"
-        )
-
-    metadata_package = canonicalize_name(names[0])
     if metadata_package != expected_package:
         raise GateError(
-            f"wheel {path.name!r} has metadata name {names[0]!r}, "
+            f"wheel {path.name!r} has metadata name {metadata.name!r}, "
             f"expected {expected_package!r}"
         )
-    try:
-        metadata_version = Version(versions[0])
-    except InvalidVersion as error:
-        raise GateError(
-            f"wheel {path.name!r} has invalid metadata version {versions[0]!r}"
-        ) from error
     if str(metadata_version) != str(expected_version):
         raise GateError(
             f"wheel {path.name!r} has metadata version {metadata_version}, "
@@ -179,29 +171,34 @@ def validate_local(directory: Path, version: Version) -> None:
     print(f"Validated {len(wheels)} local wheels for {version}")
 
 
-def fetch_simple_filenames(index_url: str, package: str) -> list[str]:
-    """Read artifact filenames from one PEP 503 Simple API project page."""
+def _fetch_package_artifacts(index_url: str, package: str) -> list[IndexedArtifact]:
+    """Read artifact filenames and hashes from a Simple API project page."""
     project_url = f"{index_url.rstrip('/')}/{canonicalize_name(package)}/"
     request = Request(
         project_url,
         headers={
-            "Accept": "text/html",
+            "Accept": "application/vnd.pypi.simple.v1+json",
             "User-Agent": "Mooncake-TestPyPI-release-gate/1",
         },
     )
     try:
         with urlopen(request, timeout=30) as response:
-            content = response.read().decode("utf-8")
+            payload = json.load(response)
     except HTTPError as error:
         if error.code == 404:
             return []
         raise
-
-    parser = _SimpleLinks()
-    parser.feed(content)
     return [
-        Path(unquote(urlparse(urljoin(project_url, href)).path)).name
-        for href in parser.hrefs
+        IndexedArtifact(item["filename"], item.get("hashes", {}).get("sha256"))
+        for item in payload.get("files", [])
+    ]
+
+
+def fetch_index_artifacts(index_url: str) -> list[IndexedArtifact]:
+    return [
+        artifact
+        for package in CORE_PACKAGES
+        for artifact in _fetch_package_artifacts(index_url, package)
     ]
 
 
@@ -214,79 +211,144 @@ def _artifact_version(filename: str) -> Version | None:
         return None
 
 
-def ensure_version_absent(
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as wheel:
+        for chunk in iter(lambda: wheel.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _local_wheel_hashes(directory: Path, version: Version) -> dict[str, str]:
+    validate_local(directory, version)
+    return {path.name: _sha256(path) for path in sorted(directory.glob("*.whl"))}
+
+
+def _indexed_version_artifacts(
     index_url: str,
     version: Version,
-    fetcher: IndexFetcher = fetch_simple_filenames,
+    fetcher: ArtifactFetcher,
+) -> dict[str, str | None]:
+    indexed: dict[str, str | None] = {}
+    for artifact in fetcher(index_url):
+        if _artifact_version(artifact.filename) != version:
+            continue
+        if artifact.filename in indexed:
+            raise GateError(f"TestPyPI lists {artifact.filename!r} more than once")
+        indexed[artifact.filename] = artifact.sha256
+    return indexed
+
+
+def _validate_indexed_hashes(
+    local_hashes: dict[str, str],
+    indexed: dict[str, str | None],
+    version: Version,
+    *,
+    require_complete: bool,
 ) -> None:
-    """Fail before upload if TestPyPI already has any artifact at ``version``."""
-    collisions = []
-    for package in CORE_PACKAGES:
-        collisions.extend(
-            f"{package}: {filename}"
-            for filename in fetcher(index_url, package)
-            if _artifact_version(filename) == version
-        )
-    if collisions:
-        raise GateError(
-            f"TestPyPI already contains artifacts for {version}; refusing to mix "
-            f"this build with an existing upload: {collisions}"
-        )
-    print(f"TestPyPI has no existing core artifacts for {version}")
+    """Require every visible artifact to match and optionally require all files."""
+    if require_complete:
+        missing = sorted(set(local_hashes) - set(indexed))
+        if missing:
+            raise GateError(
+                f"TestPyPI is missing {len(missing)} artifacts for {version}: {missing}"
+            )
+
+    for filename, indexed_hash in sorted(indexed.items()):
+        local_hash = local_hashes.get(filename)
+        if local_hash is None:
+            raise GateError(
+                f"TestPyPI contains unexpected artifact {filename!r} for {version}"
+            )
+        if not indexed_hash:
+            raise GateError(
+                f"TestPyPI did not advertise a SHA-256 hash for {filename!r}"
+            )
+        if indexed_hash.lower() != local_hash:
+            raise GateError(
+                f"TestPyPI artifact {filename!r} has SHA-256 {indexed_hash}, "
+                f"but the local wheel has {local_hash}; refusing to mix builds"
+            )
 
 
-def _indexed_wheels(
-    index_url: str,
+def validate_upload_state(
+    directory: Path,
     version: Version,
-    fetcher: IndexFetcher,
-) -> list[str]:
-    filenames = []
-    for package in CORE_PACKAGES:
-        filenames.extend(
-            filename
-            for filename in fetcher(index_url, package)
-            if filename.endswith(".whl") and _artifact_version(filename) == version
+    fetcher: ArtifactFetcher = fetch_index_artifacts,
+    *,
+    index_url: str = DEFAULT_INDEX_URL,
+) -> None:
+    """Allow an empty index or an exact, hash-matching partial upload.
+
+    TestPyPI filenames do not identify build contents. Comparing the hashes
+    advertised by the Simple API prevents a retry from combining wheels from
+    two different builds under one immutable version.
+    """
+    local_hashes = _local_wheel_hashes(directory, version)
+    indexed = _indexed_version_artifacts(index_url, version, fetcher)
+    _validate_indexed_hashes(
+        local_hashes,
+        indexed,
+        version,
+        require_complete=False,
+    )
+
+    if indexed:
+        print(
+            f"Validated {len(indexed)} matching existing TestPyPI artifacts; "
+            "the upload can safely resume"
         )
-    return filenames
+    else:
+        print(f"TestPyPI has no existing core artifacts for {version}")
 
 
-def wait_for_index(
+def wait_for_upload_state(
+    directory: Path,
     index_url: str,
     version: Version,
     attempts: int,
     initial_delay: float,
     max_delay: float,
-    fetcher: IndexFetcher = fetch_simple_filenames,
+    fetcher: ArtifactFetcher = fetch_index_artifacts,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Wait a bounded amount of time for the complete wheel set to propagate."""
+    """Wait until every published wheel is visible with its local SHA-256."""
     if attempts < 1:
         raise GateError("attempts must be at least 1")
 
+    local_hashes = _local_wheel_hashes(directory, version)
     delay = initial_delay
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            filenames = _indexed_wheels(index_url, version, fetcher)
-            validate_wheel_set(filenames, version)
+            indexed = _indexed_version_artifacts(index_url, version, fetcher)
+            _validate_indexed_hashes(
+                local_hashes,
+                indexed,
+                version,
+                require_complete=True,
+            )
         except (GateError, OSError) as error:
             last_error = error
             if attempt == attempts:
                 break
             print(
-                f"TestPyPI wheel set is not ready (attempt {attempt}/{attempts}): "
-                f"{error}; retrying in {delay:g}s",
+                "TestPyPI hashes are not ready "
+                f"(attempt {attempt}/{attempts}): {error}; "
+                f"retrying in {delay:g}s",
                 flush=True,
             )
             sleeper(delay)
             delay = min(delay * 2, max_delay)
         else:
-            print(f"Validated {len(filenames)} indexed TestPyPI wheels for {version}")
+            print(
+                f"Validated all {len(indexed)} published TestPyPI hashes for {version}"
+            )
             return
 
     raise GateError(
-        f"TestPyPI did not expose the complete wheel set for {version} after "
-        f"{attempts} attempts: {last_error}"
+        f"TestPyPI did not expose the complete, hash-matching wheel set for "
+        f"{version} after {attempts} attempts: {last_error}"
     )
 
 
@@ -301,32 +363,39 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    local = subparsers.add_parser("validate-local")
-    local.add_argument("--directory", type=Path, required=True)
-    local.add_argument("--version", type=_version, required=True)
+    normalize = subparsers.add_parser("normalize-version")
+    normalize.add_argument("--tag", required=True)
 
-    absent = subparsers.add_parser("ensure-version-absent")
-    absent.add_argument("--index-url", default=DEFAULT_INDEX_URL)
-    absent.add_argument("--version", type=_version, required=True)
+    upload = subparsers.add_parser("validate-upload-state")
+    upload.add_argument("--directory", type=Path, required=True)
+    upload.add_argument("--index-url", default=DEFAULT_INDEX_URL)
+    upload.add_argument("--version", type=_version, required=True)
 
-    wait = subparsers.add_parser("wait-index")
-    wait.add_argument("--index-url", default=DEFAULT_INDEX_URL)
-    wait.add_argument("--version", type=_version, required=True)
-    wait.add_argument("--attempts", type=int, default=8)
-    wait.add_argument("--initial-delay", type=float, default=5)
-    wait.add_argument("--max-delay", type=float, default=30)
+    wait_upload = subparsers.add_parser("wait-upload-state")
+    wait_upload.add_argument("--directory", type=Path, required=True)
+    wait_upload.add_argument("--index-url", default=DEFAULT_INDEX_URL)
+    wait_upload.add_argument("--version", type=_version, required=True)
+    wait_upload.add_argument("--attempts", type=int, default=8)
+    wait_upload.add_argument("--initial-delay", type=float, default=5)
+    wait_upload.add_argument("--max-delay", type=float, default=30)
+
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
     try:
-        if args.command == "validate-local":
-            validate_local(args.directory, args.version)
-        elif args.command == "ensure-version-absent":
-            ensure_version_absent(args.index_url, args.version)
-        else:
-            wait_for_index(
+        if args.command == "normalize-version":
+            print(normalize_prerelease_tag(args.tag))
+        elif args.command == "validate-upload-state":
+            validate_upload_state(
+                args.directory,
+                args.version,
+                index_url=args.index_url,
+            )
+        elif args.command == "wait-upload-state":
+            wait_for_upload_state(
+                args.directory,
                 args.index_url,
                 args.version,
                 args.attempts,

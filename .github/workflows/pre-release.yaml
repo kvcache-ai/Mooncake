@@ -14,12 +14,18 @@ on:
 jobs:
   version-stamp:
     name: Normalize pre-release version
+    if: github.repository == 'kvcache-ai/Mooncake'
     runs-on: ubuntu-22.04
     permissions:
       contents: read
     outputs:
       package_version: ${{ steps.version.outputs.package_version }}
     steps:
+      - name: Checkout release gate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -33,29 +39,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-
-          from packaging.version import InvalidVersion, Version
-
-          tag = os.environ["RELEASE_TAG"]
-          if not tag.startswith("v"):
-              raise SystemExit(f"pre-release tag must start with v: {tag!r}")
-          try:
-              version = Version(tag[1:])
-          except InvalidVersion as error:
-              raise SystemExit(f"invalid PEP 440 version in tag {tag!r}: {error}")
-          if not version.is_prerelease or version.local is not None:
-              raise SystemExit(
-                  f"tag {tag!r} must identify a public PEP 440 pre-release"
-              )
-
-          normalized = str(version)
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-              output.write(f"package_version={normalized}\n")
-          print(f"Normalized {tag} to {normalized}")
-          PY
+          normalized=$(python scripts/ci/testpypi_wheel_gate.py \
+            normalize-version --tag "$RELEASE_TAG")
+          echo "package_version=${normalized}" >> "$GITHUB_OUTPUT"
+          echo "Normalized ${RELEASE_TAG} to ${normalized}"
 
   build:
     needs: version-stamp
@@ -93,12 +80,13 @@ jobs:
     needs: [version-stamp, build]
     runs-on: ubuntu-22.04
     environment: nightly
+    concurrency:
+      group: pre-release-testpypi-${{ needs.version-stamp.outputs.package_version }}
+      cancel-in-progress: false
     permissions:
       contents: read
     env:
       PACKAGE_VERSION: ${{ needs.version-stamp.outputs.package_version }}
-    outputs:
-      wheel_count: ${{ steps.collect.outputs.wheel_count }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -110,7 +98,6 @@ jobs:
           pattern: mooncake-wheel*pre-release*
 
       - name: Collect wheels for publication
-        id: collect
         run: |
           mkdir -p mooncake-wheel/dist-release
           find mooncake-wheel/dist-all -name "*.whl" \
@@ -119,12 +106,6 @@ jobs:
           echo "Package version: ${PACKAGE_VERSION}"
           echo "Collected wheels:"
           ls -la mooncake-wheel/dist-release/
-          wheel_count=$(find mooncake-wheel/dist-release -name "*.whl" | wc -l)
-          echo "wheel_count=${wheel_count}" >> "$GITHUB_OUTPUT"
-          if [ "${wheel_count}" -ne 24 ]; then
-            echo "Expected exactly 24 wheels (4 Python versions x 3 variants x 2 architectures), found ${wheel_count}"
-            exit 1
-          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -132,87 +113,44 @@ jobs:
           python-version: '3.12'
 
       - name: Install publication tools
-        run: python -m pip install twine
+        run: python -m pip install packaging twine
 
-      - name: Require publication and integration credentials
+      - name: Require TestPyPI credentials
         env:
           TESTPYPI_API_TOKEN: ${{ secrets.TESTPYPI_API_TOKEN }}
-          TONE_USER_NAME: ${{ secrets.TONE_USER_NAME }}
-          TONE_USER_TOKEN: ${{ secrets.TONE_USER_TOKEN }}
         run: |
-          missing=()
-          for variable_name in \
-            TESTPYPI_API_TOKEN TONE_USER_NAME TONE_USER_TOKEN; do
-            if [ -z "${!variable_name}" ]; then
-              missing+=("$variable_name")
-            fi
-          done
-          if [ "${#missing[@]}" -ne 0 ]; then
-            echo "Missing required release gate credentials: ${missing[*]}"
+          if [ -z "$TESTPYPI_API_TOKEN" ]; then
+            echo "TESTPYPI_API_TOKEN is required"
             exit 1
           fi
-
-      - name: Validate exact wheel matrix and version
-        run: |
-          python scripts/ci/testpypi_wheel_gate.py validate-local \
-            --directory mooncake-wheel/dist-release \
-            --version "$PACKAGE_VERSION"
 
       - name: Validate wheels with twine
         run: twine check mooncake-wheel/dist-release/*.whl
 
-      - name: Reject an existing TestPyPI version
+      - name: Validate empty or resumable TestPyPI upload state
         run: |
-          python scripts/ci/testpypi_wheel_gate.py ensure-version-absent \
-            --index-url https://test.pypi.org/simple \
+          python scripts/ci/testpypi_wheel_gate.py validate-upload-state \
+            --directory mooncake-wheel/dist-release \
             --version "$PACKAGE_VERSION"
-
-      - name: Upload validated wheels as workflow artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: mooncake-wheels-pre-release-${{ github.ref_name }}
-          path: mooncake-wheel/dist-release/*.whl
-          retention-days: 14
 
       - name: Publish exact wheels to TestPyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.TESTPYPI_API_TOKEN }}
-        run: twine upload --repository testpypi mooncake-wheel/dist-release/*.whl
+        run: >-
+          twine upload --repository testpypi --skip-existing
+          mooncake-wheel/dist-release/*.whl
 
-  verify-testpypi-index:
-    name: Verify TestPyPI wheel matrix
-    needs: [version-stamp, publish-testpypi]
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-    env:
-      PACKAGE_VERSION: ${{ needs.version-stamp.outputs.package_version }}
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install index validation tools
-        run: python -m pip install packaging
-
-      - name: Wait for the exact wheel matrix in TestPyPI
+      - name: Verify every published wheel hash
         run: |
-          python scripts/ci/testpypi_wheel_gate.py wait-index \
-            --index-url https://test.pypi.org/simple \
-            --version "$PACKAGE_VERSION" \
-            --attempts 8 \
-            --initial-delay 5 \
-            --max-delay 30
+          python scripts/ci/testpypi_wheel_gate.py wait-upload-state \
+            --directory mooncake-wheel/dist-release \
+            --version "$PACKAGE_VERSION"
 
   consume-testpypi:
-    name: Consume ${{ matrix.package }} from TestPyPI
-    needs: [version-stamp, verify-testpypi-index]
-    runs-on: ubuntu-22.04
+    name: Consume ${{ matrix.package }} on ${{ matrix.architecture }}
+    needs: [version-stamp, publish-testpypi]
+    runs-on: ${{ matrix.architecture == 'aarch64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
     permissions:
       contents: read
     strategy:
@@ -222,10 +160,34 @@ jobs:
           - mooncake-transfer-engine
           - mooncake-transfer-engine-cuda13
           - mooncake-transfer-engine-non-cuda
+        architecture:
+          - x86_64
+          - aarch64
     env:
       PACKAGE_VERSION: ${{ needs.version-stamp.outputs.package_version }}
       TARGET_PACKAGE: ${{ matrix.package }}
     steps:
+      - name: Install CUDA runtime and driver stub
+        if: ${{ matrix.package != 'mooncake-transfer-engine-non-cuda' }}
+        env:
+          CUDA_PACKAGE_VERSION: ${{ matrix.package == 'mooncake-transfer-engine-cuda13' && '13-0' || '12-8' }}
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" = x86_64 ]; then
+            repository_architecture=x86_64
+          else
+            repository_architecture=sbsa
+          fi
+          keyring=$(mktemp --suffix=.deb)
+          curl --fail --location --retry 3 \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${repository_architecture}/cuda-keyring_1.1-1_all.deb" \
+            --output "$keyring"
+          sudo dpkg -i "$keyring"
+          sudo apt-get update
+          sudo apt-get install -y \
+            "cuda-cudart-${CUDA_PACKAGE_VERSION}" \
+            "cuda-driver-dev-${CUDA_PACKAGE_VERSION}"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -234,17 +196,13 @@ jobs:
       - name: Download, install, and smoke the indexed wheel
         run: |
           set -euo pipefail
-          if [ "$TARGET_PACKAGE" = mooncake-transfer-engine-non-cuda ]; then
-            sudo apt-get update
-            sudo apt-get install -y \
-              libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
-          fi
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
 
-          consumer_venv=$(mktemp -d)
           download_dir=$(mktemp -d)
-          python -m venv "$consumer_venv"
 
-          "$consumer_venv/bin/python" -m pip download \
+          python -m pip download \
             --index-url https://test.pypi.org/simple \
             --no-cache-dir \
             --no-deps \
@@ -253,19 +211,37 @@ jobs:
             --dest "$download_dir" \
             "${TARGET_PACKAGE}==${PACKAGE_VERSION}"
 
-          mapfile -t wheels < <(find "$download_dir" -maxdepth 1 -name "*.whl")
-          if [ "${#wheels[@]}" -ne 1 ]; then
-            echo "Expected one indexed wheel for ${TARGET_PACKAGE}==${PACKAGE_VERSION}, found ${#wheels[@]}"
-            exit 1
-          fi
-
           # Install the wheel downloaded above. Its ordinary dependencies are
           # resolved from production PyPI, never TestPyPI.
-          "$consumer_venv/bin/python" -m pip install \
+          python -m pip install \
             --index-url https://pypi.org/simple \
-            "${wheels[0]}"
+            "$download_dir"/*.whl
 
-          "$consumer_venv/bin/python" - "$TARGET_PACKAGE" "$PACKAGE_VERSION" <<'PY'
+          if [ "$TARGET_PACKAGE" != mooncake-transfer-engine-non-cuda ]; then
+            cuda_stub=
+            for candidate in /usr/local/cuda*/lib64/stubs/libcuda.so \
+                             /usr/local/cuda*/targets/*/lib/stubs/libcuda.so; do
+              if [ -f "$candidate" ]; then
+                cuda_stub="$candidate"
+                break
+              fi
+            done
+            if [ -z "$cuda_stub" ]; then
+              echo "CUDA driver stub libcuda.so was not found"
+              exit 1
+            fi
+            stub_dir=$(mktemp -d)
+            ln -s "$cuda_stub" "$stub_dir/libcuda.so.1"
+            export LD_LIBRARY_PATH="$stub_dir:${LD_LIBRARY_PATH:-}"
+            for directory in /usr/local/cuda*/lib64 \
+                             /usr/local/cuda*/targets/*/lib; do
+              if [ -d "$directory" ]; then
+                export LD_LIBRARY_PATH="$directory:$LD_LIBRARY_PATH"
+              fi
+            done
+          fi
+
+          python - "$TARGET_PACKAGE" "$PACKAGE_VERSION" <<'PY'
           import importlib.metadata
           import sys
 
@@ -277,15 +253,12 @@ jobs:
               )
 
           import mooncake
+          import mooncake.engine
           import mooncake.http_metadata_server
+          import mooncake.store
           PY
-          "$consumer_venv/bin/mooncake_http_metadata_server" --help >/dev/null
-
-          if [ "$TARGET_PACKAGE" = mooncake-transfer-engine-non-cuda ]; then
-            "$consumer_venv/bin/python" -c \
-              "import mooncake.engine, mooncake.store"
-            "$consumer_venv/bin/mooncake_master" --version
-          fi
+          mooncake_http_metadata_server --help >/dev/null
+          mooncake_master --version
 
   tone-integration:
     name: Validate T-one integration with TestPyPI wheel
@@ -294,53 +267,3 @@ jobs:
     with:
       testpypi_version: ${{ needs.version-stamp.outputs.package_version }}
     secrets: inherit
-
-  summary:
-    name: Pre-release gate summary
-    if: ${{ always() }}
-    needs:
-      - version-stamp
-      - publish-testpypi
-      - verify-testpypi-index
-      - consume-testpypi
-      - tone-integration
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-    env:
-      PUBLISH_RESULT: ${{ needs.publish-testpypi.result }}
-      INDEX_RESULT: ${{ needs.verify-testpypi-index.result }}
-      CONSUMER_RESULT: ${{ needs.consume-testpypi.result }}
-      TONE_RESULT: ${{ needs.tone-integration.result }}
-      PACKAGE_VERSION: ${{ needs.version-stamp.outputs.package_version }}
-      WHEEL_COUNT: ${{ needs.publish-testpypi.outputs.wheel_count }}
-    steps:
-      - name: Report pre-release gate result
-        run: |
-          # tone-integration can only succeed after the entire dependency chain
-          # has succeeded, so it is the single source of truth for the gate.
-          if [ "$TONE_RESULT" = success ]; then
-            gate_result=passed
-          else
-            gate_result=failed
-          fi
-
-          echo "## Pre-Release TestPyPI gate ${gate_result}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Tag: \`${GITHUB_REF_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Package version: \`${PACKAGE_VERSION:-unavailable}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Wheels built: ${WHEEL_COUNT:-unavailable}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- TestPyPI packages:" >> "$GITHUB_STEP_SUMMARY"
-          echo "  - \`mooncake-transfer-engine==${PACKAGE_VERSION:-unavailable}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "  - \`mooncake-transfer-engine-cuda13==${PACKAGE_VERSION:-unavailable}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "  - \`mooncake-transfer-engine-non-cuda==${PACKAGE_VERSION:-unavailable}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- TestPyPI publication: ${PUBLISH_RESULT}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- TestPyPI index validation: ${INDEX_RESULT}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- TestPyPI consumer validation: ${CONSUMER_RESULT}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- T-one integration (TestPyPI CUDA 13 wheel): ${TONE_RESULT}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Production PyPI publish: skipped" >> "$GITHUB_STEP_SUMMARY"
-          echo "- GitHub Release upload: skipped" >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$gate_result" != passed ]; then
-            exit 1
-          fi
