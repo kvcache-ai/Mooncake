@@ -20,6 +20,7 @@ _VENDORED_LIB_DIRS = ("mooncake_store_rs.libs", "mooncake.libs")
 _OWN_VENDORED_LIB_DIRS = ("mooncake_store_rs.libs",)
 _NATIVE_LIBRARIES = (
     "libasio.so",
+    "libmooncake_common.so",
     "libtransfer_engine.so",
     "libtent_shared.so",
     "libmooncake_classic_shim.so",
