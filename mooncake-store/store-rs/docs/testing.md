@@ -437,42 +437,6 @@ Override the default case count for a one-off deep-dive:
 PROPTEST_CASES=5000 cargo test -p mooncake-store-client --lib prop_align_up
 ```
 
-### Remote workflow
-
-Per `docs/skills/mooncake-store-rs-dev/SKILL.md`, the canonical remote
-build-and-test environment is on `sg`:
-
-```bash
-rsync -avz crates/ sg:/root/mooncake-store-rs/crates/
-ssh sg 'cd /root/mooncake-store-rs && source /root/.cargo/env \
-  && cargo test -p mooncake-store-client --lib'
-```
-
-## CI Integration
-
-`.aoneci/ci.yaml` keeps the broader merge-request checks such as `rust-lint`
-and the full CI build/test flow.
-
-`.aoneci/build-wheel.yaml` defines the wheel-only release flow as separate
-native, wheel, and test stages:
-
-- `build-native-artifacts` — builds the upstream Mooncake native shared
-  libraries plus `libmooncake_classic_shim.so` and
-  `libmooncake_tent_shim.so`, then uploads the static `native-artifacts`
-  artifact for the current pipeline. The artifact also carries the upstream
-  Mooncake Python wheel assets needed by `build-wheel`.
-- `build-wheel` — downloads the current pipeline's static `native-artifacts`
-  artifact, sets `MOONCAKE_REUSE_NATIVE_ARTIFACTS=1`, and builds the
-  Rust/Python wheels without rerunning the upstream CMake build.
-- `unit-test` — downloads the current pipeline's static `native-artifacts`
-  artifact and runs
-  `cargo test --lib -- --test-threads=4` with native builds disabled.
-- `build-release-package-and-image` in `.aoneci/build-wheel.yaml` — reuses
-  the `build-wheel` `build-artifacts` wheel output for OSS upload and
-  nightly image assembly instead of starting a separate ABS wheel build.
-  The runtime wheel is uploaded through the AoneCI `upload-oss` component to
-  the `mooncake-pro` bucket under `nightly/$build_id/`.
-
 Redis-backed lib tests inside `mooncake-metadata` and `mooncake-store-py`
 run only if the CI image has a `redis-server` binary. Etcd-backed tests run
 only if the image also includes a local `etcd` binary. Redis coverage runs on

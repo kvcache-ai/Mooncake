@@ -91,32 +91,6 @@ Main capabilities:
 - `batch_get_into_multi_buffers`
 - HiCache-compatible dummy and real paths for the Python layer
 
-### RL checkpoint updates
-
-The Python wheel includes `mooncake_rl.checkpoint_engine`, a Store-RS-maintained
-checkpoint-engine namespace derived from MoonshotAI checkpoint-engine v0.4.1.
-VeRL-style separated trainer/rollout deployments can use
-`mooncake_rl.checkpoint_engine.store_rs_checkpoint_engine.MooncakeStoreRSCheckpointEngine`
-and `mooncake_rl.checkpoint_engine.store_rs.MooncakeStoreClient` to move weight
-buckets through Store-RS instead of host offload or an external
-`checkpoint_engine` package.
-
-In this mode, trainer ranks register CUDA weight buckets with the
-Mooncake-compatible `register_buffer(ptr, size)` API and write them to Store-RS.
-Rollout ranks read the assigned buckets from Store-RS directly into registered
-CUDA buffers, then broadcast the bucket inside the rollout process group.
-
-The reusable Store-RS checkpoint engine owns the send/receive weight flow,
-bucket manifest exchange, Store-RS put/get calls, and rollout-side broadcast.
-The VeRL plugin module,
-`mooncake_rl.checkpoint_engine.verl_backend`, only adapts VeRL runtime hooks and
-registers that engine with VeRL's `CheckpointEngineRegistry`. The old
-checkpoint-engine parameter server, host pinned-memory checkpoint registration,
-standalone HTTP service, and Ascend/HCCL hardware path are not shipped. P2P
-transfer is provided by the Store-RS Rust transport layer and the Mooncake
-Transfer Engine built from the repository submodule, not by the external Python
-`mooncake.engine` package.
-
 ## Python Read Acceleration
 
 ### Daemon-local hot cache

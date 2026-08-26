@@ -40,7 +40,7 @@ echo "python: ${PYTHON_BIN}"
 echo "wheel:  ${WHEEL_PATH}"
 echo "links:  ${WHEEL_DIR}"
 
-PIP_INDEX=${PIP_INDEX_URL:-"https://mirrors.aliyun.com/pypi/simple/"}
+PIP_INDEX=${PIP_INDEX_URL:-"https://pypi.org/simple/"}
 
 # Install in two steps to avoid --force-reinstall uninstalling and
 # re-downloading all transitive dependencies (aiohttp, requests, etc.):

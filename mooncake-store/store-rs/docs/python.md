@@ -84,61 +84,18 @@ backend can skip the redirect entirely and import directly:
 from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 ```
 
-That form needs no environment variable and is what this repository's own
-`mooncake_rl` adapters use.
+That form needs no environment variable.
 
 ## What the Python Layer Provides
 
 - `MooncakeDistributedStore` as the main compatibility API
 - `MooncakeHostMemAllocator` for caller-owned registered buffers
-- `mooncake_rl.checkpoint_engine` as a Store-RS-maintained RL checkpoint adapter
 - real and dummy execution modes for Mooncake / HiCache-style integration
 - batch I/O, registered-buffer I/O, and multi-buffer I/O
 - the same storage-owner CLOCK eviction and route-owner CAS reclaim as Rust callers
 - the same background watermark eviction defaults as Rust callers
 - route query, lifecycle, and metrics helpers
 - wheel packaging for the native extension plus the bundled runtime libraries
-
-## RL Checkpoint Integration
-
-The `mooncake_rl` package is part of the `mooncake` wheel. It vendors the
-MoonshotAI checkpoint-engine v0.4.1 CUDA/NCCL process-group shape under
-`mooncake_rl.checkpoint_engine`, then removes the legacy parameter server, host
-pinned-memory offload, standalone HTTP API, and Ascend/HCCL paths. Integrations
-should import the Store-RS RL client and CUDA/NCCL distributed helpers from
-`mooncake_rl.checkpoint_engine.*` instead of depending on an external
-`checkpoint_engine` or `mooncake.engine.TransferEngine` installation.
-
-Store-RS-specific RL weight updates share
-`mooncake_rl.checkpoint_engine.base.WeightSyncBase` for topology setup, process
-group lifecycle, versioned Store-RS key prefixes, and checkpoint-object cleanup.
-The actual transfer behavior is implemented by sibling strategies:
-
-- `mooncake_rl.checkpoint_engine.kimi_ckpt.KimiCkptWeightSync` implements the
-  Kimi-style checkpoint update pipeline: trainer ranks pack weights into
-  Store-RS bucket objects, rollout ranks read assigned buckets into registered
-  CUDA buffers, and rollout ranks broadcast those buckets inside the rollout
-  process group.
-- `mooncake_rl.checkpoint_engine.direct.DirectWeightSync` stores one Store-RS
-  object per tensor. Every rollout rank reads every tensor object directly into
-  its own CUDA buffer and yields the normal VeRL weight stream without the
-  rollout-side broadcast step.
-
-Both strategies use `mooncake_rl.checkpoint_engine.store_rs.MooncakeStoreClient`
-for Store-RS object I/O. Trainer ranks register CUDA tensors with the
-Mooncake-compatible `register_buffer(ptr, size)` API and write through
-registered-buffer Store-RS calls.
-
-The P2P data path is the same data path as `MooncakeDistributedStore`: the
-Python adapter calls Store-RS registered-buffer APIs, and the Rust transport
-layer uses the Mooncake Transfer Engine built from this repository's submodule.
-No Python-side host pin-memory bridge is used for these RL bucket transfers.
-VeRL integration is provided as an external plugin module,
-`mooncake_rl.checkpoint_engine.verl_backend`; it only adapts VeRL runtime hooks
-and registers the Store-RS weight-sync strategies with VeRL's
-`CheckpointEngineRegistry`, so no Store-RS backend file has to live inside the
-VeRL source tree. The backend names are `kimi_ckpt` for the Kimi-style
-checkpoint update pipeline and `direct` for the one-object-per-tensor baseline.
 
 ## Execution Modes
 
