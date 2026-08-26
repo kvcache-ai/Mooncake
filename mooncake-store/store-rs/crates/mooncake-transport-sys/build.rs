@@ -287,13 +287,20 @@ fn ensure_yalantinglibs_prefix(upstream_dir: &Path, build_dir: &Path) -> PathBuf
         return install_dir;
     }
 
-    let source_dir = upstream_dir.join("extern/yalantinglibs");
-    if !source_dir.exists() {
-        panic!(
-            "yalantinglibs source was not found at {}",
-            source_dir.display()
-        );
-    }
+    let source_candidates = [
+        upstream_dir.join("extern/yalantinglibs"),
+        build_dir.join("_deps/yalantinglibs-src"),
+    ];
+    let source_dir = source_candidates
+        .iter()
+        .find(|candidate| candidate.join("CMakeLists.txt").is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "yalantinglibs source was not found in {} or {}",
+                source_candidates[0].display(),
+                source_candidates[1].display()
+            )
+        });
     let ylt_build_dir = build_dir.join("yalantinglibs-build");
 
     run(
