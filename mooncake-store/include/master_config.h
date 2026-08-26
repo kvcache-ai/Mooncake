@@ -69,8 +69,7 @@ struct MasterConfig {
     int64_t global_file_segment_size;
     std::string memory_allocator;
     std::string allocation_strategy;
-    double size_class_free_ratio_weight =
-        DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
+    double size_class_free_ratio_weight = DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
     double size_class_matching_share_weight =
         DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT;
 
@@ -216,8 +215,7 @@ class MasterServiceSupervisorConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
-    double size_class_free_ratio_weight =
-        DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
+    double size_class_free_ratio_weight = DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
     double size_class_matching_share_weight =
         DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -560,8 +558,7 @@ class WrappedMasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
-    double size_class_free_ratio_weight =
-        DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
+    double size_class_free_ratio_weight = DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
     double size_class_matching_share_weight =
         DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -791,8 +788,7 @@ class WrappedMasterServiceConfig {
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
         allocation_strategy_type = config.allocation_strategy_type;
-        size_class_free_ratio_weight =
-            config.size_class_free_ratio_weight;
+        size_class_free_ratio_weight = config.size_class_free_ratio_weight;
         size_class_matching_share_weight =
             config.size_class_matching_share_weight;
         enable_disk_eviction = config.enable_disk_eviction;
@@ -864,8 +860,7 @@ class MasterServiceConfigBuilder {
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type_ =
         AllocationStrategyType::RANDOM;
-    double size_class_free_ratio_weight_ =
-        DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
+    double size_class_free_ratio_weight_ = DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
     double size_class_matching_share_weight_ =
         DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT;
     bool enable_disk_eviction_ = true;
@@ -1262,8 +1257,7 @@ class MasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
-    double size_class_free_ratio_weight =
-        DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
+    double size_class_free_ratio_weight = DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT;
     double size_class_matching_share_weight =
         DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -1358,8 +1352,7 @@ class MasterServiceConfig {
         memory_allocator =
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
         allocation_strategy_type = config.allocation_strategy_type;
-        size_class_free_ratio_weight =
-            config.size_class_free_ratio_weight;
+        size_class_free_ratio_weight = config.size_class_free_ratio_weight;
         size_class_matching_share_weight =
             config.size_class_matching_share_weight;
         enable_disk_eviction = config.enable_disk_eviction;
@@ -1431,8 +1424,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.memory_allocator = memory_allocator_;
     config.allocation_strategy_type = allocation_strategy_type_;
     config.size_class_free_ratio_weight = size_class_free_ratio_weight_;
-    config.size_class_matching_share_weight =
-        size_class_matching_share_weight_;
+    config.size_class_matching_share_weight = size_class_matching_share_weight_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;

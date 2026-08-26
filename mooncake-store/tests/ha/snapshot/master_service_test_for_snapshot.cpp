@@ -184,12 +184,11 @@ TEST_F(MasterServiceSnapshotTest, RestoresOffsetAllocatorSizeClassProfile) {
         << "Failed to persist state: " << persist_result.error().message;
 
     ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
-    auto restore_config =
-        MasterServiceConfig::builder()
-            .set_memory_allocator(BufferAllocatorType::OFFSET)
-            .set_enable_snapshot_restore(true)
-            .set_snapshot_object_store_type("local")
-            .build();
+    auto restore_config = MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_enable_snapshot_restore(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
     auto restored_service = std::make_unique<MasterService>(restore_config);
     ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
 

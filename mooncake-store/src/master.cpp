@@ -320,10 +320,9 @@ DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
-DEFINE_string(
-    allocation_strategy, "random",
-    "Allocation strategy for segments, random | free_ratio_first | "
-    "size_class_aware | cxl | ssd_free_ratio_first | local_first");
+DEFINE_string(allocation_strategy, "random",
+              "Allocation strategy for segments, random | free_ratio_first | "
+              "size_class_aware | cxl | ssd_free_ratio_first | local_first");
 DEFINE_double(size_class_free_ratio_weight,
               mooncake::DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT,
               "Free-ratio score weight for size_class_aware placement");
@@ -331,10 +330,9 @@ DEFINE_double(size_class_matching_share_weight,
               mooncake::DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT,
               "Matching-size-class score weight for size_class_aware "
               "placement");
-DEFINE_validator(size_class_free_ratio_weight,
-                 [](const char*, double value) {
-                     return std::isfinite(value) && value > 0.0;
-                 });
+DEFINE_validator(size_class_free_ratio_weight, [](const char*, double value) {
+    return std::isfinite(value) && value > 0.0;
+});
 DEFINE_validator(size_class_matching_share_weight,
                  [](const char*, double value) {
                      return std::isfinite(value) && value >= 0.0;
@@ -1166,15 +1164,15 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
     }
-    if ((google::GetCommandLineFlagInfo(
-             "size_class_free_ratio_weight", &info) &&
+    if ((google::GetCommandLineFlagInfo("size_class_free_ratio_weight",
+                                        &info) &&
          !info.is_default) ||
         !conf_set) {
         master_config.size_class_free_ratio_weight =
             FLAGS_size_class_free_ratio_weight;
     }
-    if ((google::GetCommandLineFlagInfo(
-             "size_class_matching_share_weight", &info) &&
+    if ((google::GetCommandLineFlagInfo("size_class_matching_share_weight",
+                                        &info) &&
          !info.is_default) ||
         !conf_set) {
         master_config.size_class_matching_share_weight =

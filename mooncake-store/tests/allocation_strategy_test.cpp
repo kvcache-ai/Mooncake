@@ -685,7 +685,8 @@ TEST_F(AllocationStrategyTest, SizeClassAwarePrefersMatchingSegment) {
               "small");
 }
 
-TEST_F(AllocationStrategyTest, SizeClassAwareUsesFreeRatioBetweenMatchingSegments) {
+TEST_F(AllocationStrategyTest,
+       SizeClassAwareUsesFreeRatioBetweenMatchingSegments) {
     constexpr size_t kSegmentSize = 64 * MiB;
     constexpr size_t kRequestSize = 4 * MiB;
     auto fuller_match = std::make_shared<OffsetBufferAllocator>(
@@ -724,8 +725,7 @@ TEST_F(AllocationStrategyTest, SizeClassAwareBoundsAffinityByFreeRatio) {
     auto fuller_match = std::make_shared<OffsetBufferAllocator>(
         "fuller-match", 0x390000000ULL, kSegmentSize, "fuller-match");
     auto emptier_mismatch = std::make_shared<OffsetBufferAllocator>(
-        "emptier-mismatch", 0x3a0000000ULL, kSegmentSize,
-        "emptier-mismatch");
+        "emptier-mismatch", 0x3a0000000ULL, kSegmentSize, "emptier-mismatch");
 
     std::vector<std::unique_ptr<AllocatedBuffer>> matching_seeds;
     for (int i = 0; i < 8; ++i) {
@@ -756,8 +756,7 @@ TEST_F(AllocationStrategyTest, SizeClassAwareWeightsControlTradeoff) {
     auto matching = std::make_shared<OffsetBufferAllocator>(
         "matching", 0x3d0000000ULL, kSegmentSize, "matching");
     auto emptier_mismatch = std::make_shared<OffsetBufferAllocator>(
-        "emptier-mismatch", 0x3e0000000ULL, kSegmentSize,
-        "emptier-mismatch");
+        "emptier-mismatch", 0x3e0000000ULL, kSegmentSize, "emptier-mismatch");
 
     std::vector<std::unique_ptr<AllocatedBuffer>> matching_seeds;
     for (int i = 0; i < 4; ++i) {
@@ -773,8 +772,8 @@ TEST_F(AllocationStrategyTest, SizeClassAwareWeightsControlTradeoff) {
 
     {
         SizeClassAwareAllocationStrategy capacity_first(1.0, 0.0);
-        auto capacity_result = capacity_first.Allocate(allocator_manager,
-                                                       kRequestSize);
+        auto capacity_result =
+            capacity_first.Allocate(allocator_manager, kRequestSize);
         ASSERT_TRUE(capacity_result.has_value());
         EXPECT_EQ(capacity_result->front()
                       .get_descriptor()
@@ -784,8 +783,8 @@ TEST_F(AllocationStrategyTest, SizeClassAwareWeightsControlTradeoff) {
     }
 
     SizeClassAwareAllocationStrategy affinity_first(0.75, 0.25);
-    auto affinity_result = affinity_first.Allocate(allocator_manager,
-                                                   kRequestSize);
+    auto affinity_result =
+        affinity_first.Allocate(allocator_manager, kRequestSize);
     ASSERT_TRUE(affinity_result.has_value());
     EXPECT_EQ(affinity_result->front()
                   .get_descriptor()
@@ -868,8 +867,8 @@ TEST_F(AllocationStrategyTest, SizeClassAwareSupportsNofOffsetAllocator) {
     allocator_manager.addAllocator("nof-mismatched", mismatched);
 
     SizeClassAwareAllocationStrategy strategy;
-    auto result = strategy.Allocate(
-        allocator_manager, kRequestSize, 1, {}, {}, ReplicaType::NOF_SSD);
+    auto result = strategy.Allocate(allocator_manager, kRequestSize, 1, {}, {},
+                                    ReplicaType::NOF_SSD);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1);
     EXPECT_EQ(result->front()

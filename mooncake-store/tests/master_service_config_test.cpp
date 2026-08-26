@@ -64,9 +64,8 @@ TEST(MasterServiceConfigTest, SizeClassAwareStrategyIsParsed) {
 }
 
 TEST(MasterServiceConfigTest, SizeClassWeightsBuilderOverrideRespected) {
-    auto config = MasterServiceConfig::builder()
-                      .set_size_class_weights(0.6, 0.4)
-                      .build();
+    auto config =
+        MasterServiceConfig::builder().set_size_class_weights(0.6, 0.4).build();
 
     EXPECT_DOUBLE_EQ(config.size_class_free_ratio_weight, 0.6);
     EXPECT_DOUBLE_EQ(config.size_class_matching_share_weight, 0.4);

@@ -176,8 +176,7 @@ TEST_F(BufferAllocatorTest, NofOffsetAllocationSizeProfileTracksLiveBytes) {
     EXPECT_EQ(restored_profile->matching_live_bytes, 4096);
 
     small.reset();
-    const auto remaining_profile =
-        allocator->getAllocationSizeProfile(4096);
+    const auto remaining_profile = allocator->getAllocationSizeProfile(4096);
     ASSERT_TRUE(remaining_profile.has_value());
     EXPECT_EQ(remaining_profile->total_live_bytes, 4097);
     EXPECT_EQ(remaining_profile->matching_live_bytes, 0);

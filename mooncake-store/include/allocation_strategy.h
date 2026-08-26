@@ -559,8 +559,7 @@ class SizeClassAwareAllocationStrategy final : public RankedAllocationStrategy {
    public:
     explicit SizeClassAwareAllocationStrategy(
         double free_ratio_weight = DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT,
-        double matching_share_weight =
-            DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT)
+        double matching_share_weight = DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT)
         : free_ratio_weight_(free_ratio_weight),
           matching_share_weight_(matching_share_weight) {
         if (!std::isfinite(free_ratio_weight_) || free_ratio_weight_ <= 0.0 ||
@@ -587,8 +586,7 @@ class SizeClassAwareAllocationStrategy final : public RankedAllocationStrategy {
 
    private:
     double GetSegmentScore(const AllocatorManager& allocator_manager,
-                                  const std::string& name,
-                                  const size_t slice_length) {
+                           const std::string& name, const size_t slice_length) {
         const auto* allocators = allocator_manager.getAllocators(name);
         if (!allocators || allocators->empty()) {
             return 0.0;
@@ -728,8 +726,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
  */
 inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
     AllocationStrategyType type, const LocalSsdManager& local_ssd,
-    double size_class_free_ratio_weight =
-        DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT,
+    double size_class_free_ratio_weight = DEFAULT_SIZE_CLASS_FREE_RATIO_WEIGHT,
     double size_class_matching_share_weight =
         DEFAULT_SIZE_CLASS_MATCHING_SHARE_WEIGHT) {
     switch (type) {
@@ -739,8 +736,7 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
             return std::make_shared<FreeRatioFirstAllocationStrategy>();
         case AllocationStrategyType::SIZE_CLASS_AWARE:
             return std::make_shared<SizeClassAwareAllocationStrategy>(
-                size_class_free_ratio_weight,
-                size_class_matching_share_weight);
+                size_class_free_ratio_weight, size_class_matching_share_weight);
         case AllocationStrategyType::CXL:
             return std::make_shared<CxlAllocationStrategy>();
         case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
