@@ -275,7 +275,7 @@ impl StoreClient {
         changed_replica
     }
 
-    fn remove_object_route_with_retry(
+    pub(super) fn remove_object_route_with_retry(
         &self,
         object_id: &LogicalObjectId,
         object_key: &ObjectKey,
