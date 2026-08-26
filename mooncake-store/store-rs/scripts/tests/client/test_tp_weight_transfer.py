@@ -105,9 +105,9 @@ def run_tp_split(
         for rank, buf_results in enumerate(results):
             for key_idx, key_results in enumerate(buf_results):
                 for frag_idx, val in enumerate(key_results):
-                    assert (
-                        val > 0
-                    ), f"rank {rank} key {key_idx} frag {frag_idx} failed: {val}"
+                    assert val > 0, (
+                        f"rank {rank} key {key_idx} frag {frag_idx} failed: {val}"
+                    )
 
         # Verify buffer contents
         for rank in range(rollouter_tp):
@@ -182,9 +182,9 @@ def run_tp_merge(
         for rank, buf_results in enumerate(results):
             for key_idx, key_results in enumerate(buf_results):
                 for frag_idx, val in enumerate(key_results):
-                    assert (
-                        val > 0
-                    ), f"rank {rank} key {key_idx} frag {frag_idx} failed: {val}"
+                    assert val > 0, (
+                        f"rank {rank} key {key_idx} frag {frag_idx} failed: {val}"
+                    )
 
         # Verify buffer contents
         for rank in range(rollouter_tp):
@@ -194,12 +194,12 @@ def run_tp_merge(
             expected_b = make_shard_data(shard_b, shard_size)
             actual = (ctypes.c_ubyte * rank_size).from_address(buffer_ptrs[rank])
             actual_bytes = bytes(actual)
-            assert (
-                actual_bytes[:shard_size] == expected_a
-            ), f"rank {rank} first half mismatch"
-            assert (
-                actual_bytes[shard_size:] == expected_b
-            ), f"rank {rank} second half mismatch"
+            assert actual_bytes[:shard_size] == expected_a, (
+                f"rank {rank} first half mismatch"
+            )
+            assert actual_bytes[shard_size:] == expected_b, (
+                f"rank {rank} second half mismatch"
+            )
     finally:
         for ptr in buffer_ptrs:
             store.unregister_buffer(ptr, rank_size)

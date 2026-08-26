@@ -7,7 +7,9 @@ import pytest
 
 from mooncake_store_rs.buffer_pool import BufferPool
 
-pytestmark = pytest.mark.skipif(BufferPool is None, reason="native BufferPool is unavailable")
+pytestmark = pytest.mark.skipif(
+    BufferPool is None, reason="native BufferPool is unavailable"
+)
 
 
 class _LocalLease:
@@ -196,7 +198,9 @@ def test_buffer_pool_overflow_unregister_failure_can_retry_release() -> None:
     pool.close()
 
 
-def test_buffer_pool_drop_reclaims_overflow_after_transient_unregister_failure() -> None:
+def test_buffer_pool_drop_reclaims_overflow_after_transient_unregister_failure() -> (
+    None
+):
     store = _FakeStore(local_capacity=32)
     pool = BufferPool(store, alignment=64)
     lease = pool.acquire(64)
