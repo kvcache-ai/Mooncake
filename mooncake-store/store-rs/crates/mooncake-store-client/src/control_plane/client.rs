@@ -82,6 +82,12 @@ fn decode_route_list_by_replica_owner_reply(
     reply: pb::ListRoutesByReplicaOwnerReply,
 ) -> Result<RouteControlResponse> {
     decode_error(reply.error)?;
+    if reply.routes.len() > mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE {
+        return Err(StoreError::Transport(format!(
+            "control plane owner-route page exceeds the {}-route limit",
+            mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE
+        )));
+    }
     let routes = reply
         .routes
         .into_iter()
@@ -93,6 +99,25 @@ fn decode_route_list_by_replica_owner_reply(
             next_cursor: reply.next_cursor,
         },
     ))
+}
+
+#[cfg(test)]
+mod owner_page_decode_tests {
+    use super::*;
+
+    #[test]
+    fn owner_route_reply_rejects_oversized_pages_before_decoding() {
+        let routes = (0..=mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+            .map(|_| pb::ObjectRoute::default())
+            .collect();
+        let error = decode_route_list_by_replica_owner_reply(pb::ListRoutesByReplicaOwnerReply {
+            routes,
+            error: None,
+            next_cursor: None,
+        })
+        .expect_err("an oversized transport page must fail closed");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
 }
 
 impl ControlPlaneClient {

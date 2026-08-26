@@ -93,6 +93,11 @@ fn validate_owner_route_page(
     page: &crate::RouteOwnerPage,
     seen_cursors: &mut HashSet<String>,
 ) -> Result<()> {
+    if page.routes.len() > DEFAULT_ROUTE_OWNER_PAGE_SIZE {
+        return Err(StoreError::Transport(format!(
+            "route owner page exceeds the {DEFAULT_ROUTE_OWNER_PAGE_SIZE}-route limit"
+        )));
+    }
     let mut previous = cursor;
     for route in &page.routes {
         if previous.is_some_and(|previous| route.key.0.as_str() <= previous) {
@@ -1520,6 +1525,23 @@ mod owner_page_contract_tests {
             &mut seen,
         )
         .expect_err("a cursor cycle must fail closed");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+
+    #[test]
+    fn owner_route_pages_reject_oversized_responses() {
+        let routes = (0..=DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+            .map(|index| route(&format!("route-{index:04}")))
+            .collect();
+        let error = validate_owner_route_page(
+            None,
+            &crate::RouteOwnerPage {
+                routes,
+                next_cursor: None,
+            },
+            &mut HashSet::new(),
+        )
+        .expect_err("an oversized route page must fail closed");
         assert!(matches!(error, StoreError::Transport(_)));
     }
 }
