@@ -25,6 +25,10 @@ option(WITH_RUST_EXAMPLE
        "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
 option(
+  WITH_STORE_RS
+  "build the Rust-native Mooncake Store implementation (mooncake-store/store-rs)"
+  OFF)
+option(
   WITH_STORE_C_SHARED
   "build a self-contained libmooncake_store.so exposing only the store_c.h C ABI (for dlopen consumers)"
   OFF)
@@ -143,6 +147,11 @@ if(WITH_STORE_RUST)
   endif()
   message(STATUS "Mooncake Store Rust bindings will be built")
   add_subdirectory(mooncake-store/rust)
+endif()
+
+if (WITH_STORE_RS)
+  message(STATUS "Mooncake Store Rust-native implementation (store-rs) will be built")
+  add_subdirectory(mooncake-store/store-rs)
 endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
