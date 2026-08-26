@@ -16,9 +16,9 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
-#include <mutex>
+#include <functional>
+#include <thread>
 #include <vector>
 
 #include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
@@ -31,34 +31,38 @@ namespace {
 
 using namespace std::chrono_literals;
 
+bool WaitUntil(const std::function<bool()>& predicate,
+               std::chrono::milliseconds timeout = 2s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    return predicate();
+}
+
 TEST(HighPerformanceTcpWorkersTest, PreservesExplicitWorkerAffinity) {
     HighPerformanceTcpWorkers workers({.worker_count = 2, .queue_capacity = 4});
     ASSERT_TRUE(workers.start().ok());
 
-    std::mutex mutex;
-    std::condition_variable cv;
-    size_t completed = 0;
-    size_t wrong_worker = 0;
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> wrong_worker{0};
     for (size_t expected_worker : {0u, 1u, 0u, 1u}) {
         ASSERT_TRUE(workers
                         .submitToWorker(expected_worker,
                                         [&, expected_worker](size_t worker_id) {
-                                            std::lock_guard<std::mutex> guard(
-                                                mutex);
-                                            ++completed;
                                             if (worker_id != expected_worker) {
-                                                ++wrong_worker;
+                                                wrong_worker.fetch_add(1);
                                             }
-                                            cv.notify_all();
+                                            completed.fetch_add(1);
                                         })
                         .ok());
     }
 
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        ASSERT_TRUE(cv.wait_for(lock, 2s, [&] { return completed == 4; }));
-    }
-    EXPECT_EQ(wrong_worker, 0u);
+    ASSERT_TRUE(WaitUntil([&] { return completed.load() == 4; }));
+    EXPECT_EQ(wrong_worker.load(), 0u);
     EXPECT_TRUE(workers.stop().ok());
 }
 
@@ -66,33 +70,26 @@ TEST(HighPerformanceTcpWorkersTest, EnforcesPerWorkerQueueBound) {
     HighPerformanceTcpWorkers workers({.worker_count = 1, .queue_capacity = 1});
     ASSERT_TRUE(workers.start().ok());
 
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool first_started = false;
-    bool release_first = false;
-    ASSERT_TRUE(
-        workers
-            .submitToWorker(0,
-                            [&](size_t) {
-                                std::unique_lock<std::mutex> lock(mutex);
-                                first_started = true;
-                                cv.notify_all();
-                                cv.wait(lock, [&] { return release_first; });
-                            })
-            .ok());
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        ASSERT_TRUE(cv.wait_for(lock, 2s, [&] { return first_started; }));
-    }
+    std::atomic<bool> first_started{false};
+    std::atomic<bool> release_first{false};
+    ASSERT_TRUE(workers
+                    .submitToWorker(0,
+                                    [&](size_t) {
+                                        first_started.store(
+                                            true, std::memory_order_release);
+                                        while (!release_first.load(
+                                            std::memory_order_acquire)) {
+                                            std::this_thread::sleep_for(1ms);
+                                        }
+                                    })
+                    .ok());
+    ASSERT_TRUE(WaitUntil(
+        [&] { return first_started.load(std::memory_order_acquire); }));
 
     ASSERT_TRUE(workers.submitToWorker(0, [](size_t) {}).ok());
     EXPECT_TRUE(workers.submitToWorker(0, [](size_t) {}).IsTooManyRequests());
 
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        release_first = true;
-    }
-    cv.notify_all();
+    release_first.store(true, std::memory_order_release);
     EXPECT_TRUE(workers.stop().ok());
 }
 
@@ -100,35 +97,28 @@ TEST(HighPerformanceTcpWorkersTest, DoesNotStealFromAFullAffinityWorker) {
     HighPerformanceTcpWorkers workers({.worker_count = 2, .queue_capacity = 1});
     ASSERT_TRUE(workers.start().ok());
 
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool first_started = false;
-    bool release_first = false;
-    ASSERT_TRUE(
-        workers
-            .submitToWorker(0,
-                            [&](size_t) {
-                                std::unique_lock<std::mutex> lock(mutex);
-                                first_started = true;
-                                cv.notify_all();
-                                cv.wait(lock, [&] { return release_first; });
-                            })
-            .ok());
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        ASSERT_TRUE(cv.wait_for(lock, 2s, [&] { return first_started; }));
-    }
+    std::atomic<bool> first_started{false};
+    std::atomic<bool> release_first{false};
+    ASSERT_TRUE(workers
+                    .submitToWorker(0,
+                                    [&](size_t) {
+                                        first_started.store(
+                                            true, std::memory_order_release);
+                                        while (!release_first.load(
+                                            std::memory_order_acquire)) {
+                                            std::this_thread::sleep_for(1ms);
+                                        }
+                                    })
+                    .ok());
+    ASSERT_TRUE(WaitUntil(
+        [&] { return first_started.load(std::memory_order_acquire); }));
     ASSERT_TRUE(workers.submitToWorker(0, [](size_t) {}).ok());
 
     // A connection owner must remain on worker 0.  A saturated mailbox is
     // backpressure, not permission to move its socket state to worker 1.
     EXPECT_TRUE(workers.submitToWorker(0, [](size_t) {}).IsTooManyRequests());
 
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        release_first = true;
-    }
-    cv.notify_all();
+    release_first.store(true, std::memory_order_release);
     EXPECT_TRUE(workers.stop().ok());
 }
 
@@ -154,24 +144,21 @@ TEST(HighPerformanceTcpWorkersTest,
     HighPerformanceTcpWorkers workers({.worker_count = 2, .queue_capacity = 1});
     ASSERT_TRUE(workers.start().ok());
 
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool blocker_started = false;
-    bool release_blocker = false;
-    ASSERT_TRUE(
-        workers
-            .submitToWorker(1,
-                            [&](size_t) {
-                                std::unique_lock<std::mutex> lock(mutex);
-                                blocker_started = true;
-                                cv.notify_all();
-                                cv.wait(lock, [&] { return release_blocker; });
-                            })
-            .ok());
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        ASSERT_TRUE(cv.wait_for(lock, 2s, [&] { return blocker_started; }));
-    }
+    std::atomic<bool> blocker_started{false};
+    std::atomic<bool> release_blocker{false};
+    ASSERT_TRUE(workers
+                    .submitToWorker(1,
+                                    [&](size_t) {
+                                        blocker_started.store(
+                                            true, std::memory_order_release);
+                                        while (!release_blocker.load(
+                                            std::memory_order_acquire)) {
+                                            std::this_thread::sleep_for(1ms);
+                                        }
+                                    })
+                    .ok());
+    ASSERT_TRUE(WaitUntil(
+        [&] { return blocker_started.load(std::memory_order_acquire); }));
     ASSERT_TRUE(workers.submitToWorker(1, [](size_t) {}).ok());
     ASSERT_EQ(workers.mailboxDepth(1), 1u);
 
@@ -194,11 +181,7 @@ TEST(HighPerformanceTcpWorkersTest,
     EXPECT_EQ(workers.mailboxDepth(0), 0u);
     EXPECT_EQ(ran.load(), 0u);
 
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        release_blocker = true;
-    }
-    cv.notify_all();
+    release_blocker.store(true, std::memory_order_release);
     EXPECT_TRUE(workers.stop().ok());
 }
 
