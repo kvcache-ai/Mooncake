@@ -380,6 +380,9 @@ errors.
 The client supports tenant-scoped keys and tenant-aware request builders.
 
 This keeps API usage explicit while still allowing a default tenant for simpler applications.
+Tenant, domain, object-set, and logical-key components are percent-encoded
+before route separators are added. Reserved separator characters therefore
+remain distinct across tenants and keys, including the default namespace path.
 
 Route-authority policy has a default cluster policy per metadata keyspace. `route_control` is a cluster-level deployment decision fixed at startup (determines whether WRH authority mesh or Redis-only route storage is used). `route_topk` can be overridden per-tenant via admin policy. Runtime bootstrap resolves the effective `route_topk` from the tenant policy if present, otherwise uses the CLI default.
 
