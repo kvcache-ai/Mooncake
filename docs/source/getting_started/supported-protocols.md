@@ -9,6 +9,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **tcp** | Standard network | General purpose, works everywhere | ✅ Primary |
 | **rdma** | RDMA-capable NIC | High-performance, low-latency | ✅ Primary |
 | **efa** | AWS EFA-capable instance | High-performance on AWS (libfabric SRD) | ✅ Primary |
+| **flagcx** | FlagCX-supported accelerator + RDMA-capable NIC | Cross-vendor P2P transfer through FlagOS FlagCX | ⚠️ Source build |
 | **nvmeof** | NVMe-oF capable storage | Direct NVMe storage access | ⚠️ Advanced |
 | **nvlink** | NVIDIA MNNVL | Inter-node GPU communication | ⚠️ Advanced |
 | **musa** | Moore Threads GPU + MTLink | Intra-node GPU IPC/P2P | ⚠️ Advanced |
@@ -167,6 +168,55 @@ cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON
 - ~88% of RoCE RDMA throughput
 
 **Documentation:** See [EFA Transport](../design/transfer-engine/efa_transport.md) for build instructions, benchmarks, and tuning.
+
+### FlagOS FlagCX Transport (flagcx)
+
+**Description:** [FlagCX](https://github.com/flagos-ai/FlagCX) is the cross-chip communication
+library in the FlagOS ecosystem. Mooncake integrates its P2P Engine as a classic Transfer Engine
+transport, allowing the same Mooncake data-transfer workflow to use accelerator and network
+backends supported by the installed FlagCX build.
+
+**Use When:**
+- Deploying Mooncake on a platform supported by FlagCX
+- Using FlagCX's P2P Engine for host or accelerator memory transfers
+- Building a cross-vendor deployment around the FlagOS communication stack
+
+**Build Requirements:**
+```bash
+cmake -S . -B build \
+  -DUSE_FLAGCX=ON \
+  -DFLAGCX_HOME=/path/to/FlagCX/build
+cmake --build build -j
+```
+
+`FLAGCX_HOME` must contain `include/flagcx_p2p.h` and either `lib/libflagcx.so` or
+`lib64/libflagcx.so`. If it is omitted, Mooncake checks `$FLAGCX_HOME` and then
+`$HOME/FlagCX/build`.
+
+**Configuration:**
+```python
+engine.initialize(
+    hostname="node1",
+    metadata_server="P2PHANDSHAKE",
+    protocol="flagcx",
+    device_name=""
+)
+```
+
+```bash
+# Select the interface used by the FlagCX handshake and data path.
+export FLAGCX_SOCKET_IFNAME="eth0"
+```
+
+**Current Scope:**
+- Available through the classic Transfer Engine; it is not a TENT transport
+- Must be built from source with `USE_FLAGCX=ON`
+- Should be selected as the standalone `flagcx` protocol, not as part of a multi-protocol string
+- Buffers should be registered before the first transfer to a peer and remain registered while
+  that peer connection is active
+
+See [FlagOS FlagCX Transport](../design/transfer-engine/flagcx_transport.md) for dependency,
+build, benchmark, runtime configuration, and troubleshooting details.
 
 ## Advanced Protocols (C++ Transfer Engine)
 
@@ -427,6 +477,10 @@ export MOONCAKE_DEVICE="mlx5_0"
 export MOONCAKE_PROTOCOL="rdma"
 export MOONCAKE_DEVICE="auto-discovery"
 
+# FlagOS FlagCX (requires a USE_FLAGCX=ON source build)
+export MOONCAKE_PROTOCOL="flagcx"
+export FLAGCX_SOCKET_IFNAME="eth0"
+
 # Other configuration
 export MOONCAKE_MASTER="10.0.0.1:50051"
 export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
@@ -441,6 +495,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | Production Inference | rdma | Best performance and latency |
 | AWS Cloud (EFA instances) | efa | High performance on p5e, p6-b200, p4d, etc. |
 | Cloud Environments | tcp or rdma (if available) | Check cloud provider support |
+| FlagOS / cross-vendor accelerator clusters | flagcx | Build Mooncake against the platform's FlagCX backend |
 | Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
 | Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
@@ -484,6 +539,7 @@ If a protocol fails to initialize:
 
 - [Quick Start](quick-start.md) - Start with Mooncake integrations for serving frameworks
 - [Transfer Engine Design](../design/transfer-engine/index.md) - Detailed architecture
+- [FlagOS FlagCX Transport](../design/transfer-engine/flagcx_transport.md) - FlagCX build and usage guide
 - [Transfer Engine Benchmark](../design/transfer-engine/transfer-engine-bench-tuning.md) - Performance tuning
 - [Python API Reference](../api-reference/python/transfer-engine.md) - API documentation
 - [Deployment Guide](../deployment/mooncake-store-deployment-guide.md) - Production deployment
