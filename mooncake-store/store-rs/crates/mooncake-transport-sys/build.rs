@@ -143,8 +143,7 @@ fn python_config_for_candidate(candidate: &Path) -> Option<PythonConfig> {
 
     let (include_dir, library_path, library_name) = query_python_dev(candidate)?;
     Some(PythonConfig {
-        executable: resolve_python_executable(candidate)
-            .unwrap_or_else(|| candidate.to_path_buf()),
+        executable: resolve_python_executable(candidate).unwrap_or_else(|| candidate.to_path_buf()),
         include_dir,
         library_path,
         library_name,
@@ -306,7 +305,7 @@ fn ensure_yalantinglibs_prefix(upstream_dir: &Path, build_dir: &Path) -> PathBuf
     run(
         Command::new("cmake")
             .arg("-S")
-            .arg(&source_dir)
+            .arg(source_dir)
             .arg("-B")
             .arg(&ylt_build_dir)
             .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install_dir.display()))
