@@ -12,7 +12,10 @@
 namespace mooncake {
 namespace {
 
-inline constexpr uint64_t kMinBytesPerChannelStep = 256ull << 10;
+// Keep each participant's Ring shard large enough to amortize step signaling
+// while allowing small collectives to use more of the fixed channel grid.
+inline constexpr uint64_t kMinBytesPerChannelStep = 8ull << 10;
+inline constexpr int kProtocolThreads = 512;
 
 template <typename T>
 [[nodiscard]] __device__ __forceinline__ uint32_t
@@ -141,8 +144,8 @@ template <typename T, ReduceOp Op>
 }
 
 template <typename T, ReduceOp Op>
-__global__ void ringAllReduceKernel(RingAllReduceKernelArgs request,
-                                    RingAllReduceDeviceState* state) {
+__global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
+    RingAllReduceKernelArgs request, RingAllReduceDeviceState* state) {
     const auto block = cooperative_groups::this_thread_block();
     const uint32_t channel = blockIdx.x;
     PG_DEVICE_ASSERT(state);
@@ -321,7 +324,6 @@ cudaError_t launchReduction(const RingAllReduceKernelArgs& request,
 cudaError_t launchRingAllReduceKernel(const RingAllReduceKernelArgs& request,
                                       RingAllReduceDeviceState* state,
                                       cudaStream_t stream) {
-    constexpr int kProtocolThreads = 256;
     const dim3 grid(kMaxDeviceCollectiveChannels);
     switch (request.datatype) {
         case DataType::Float16:

@@ -13,10 +13,14 @@ namespace mooncake {
 
 class P2pTransferTicket {
    public:
-    // P2P stores complete before put() returns. Keep a ticket-shaped
-    // result so callers use the same submit/wait API as asynchronous routes.
+    // p2pPut() and p2pSignal() synchronize the CTA before the leader publishes
+    // the peer-visible signal, ordering every payload store before that signal.
+    // wait() supplies the separate completion barrier: no thread returns until
+    // the leader has issued the signal. Callers that only require submission
+    // may drop the ticket and overlap independent work with the leader's store.
     __device__ __forceinline__ TransferResult
-    wait(cooperative_groups::thread_block) const {
+    wait(cooperative_groups::thread_block block) const {
+        block.sync();
         return TransferResult::Succeeded;
     }
 };
@@ -66,7 +70,6 @@ __device__ __forceinline__ void applyP2pSignalAction(
         }
         device::mc_st_release_u64(target, value);
     }
-    block.sync();
 }
 
 __device__ __forceinline__ P2pTransferTicket
