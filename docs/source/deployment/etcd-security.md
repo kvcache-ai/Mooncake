@@ -19,6 +19,25 @@ before (plaintext, no authentication). Invalid or incomplete TLS combinations
 are rejected during client initialization; the wrapper does not silently fall
 back to plaintext when TLS-related variables are partially configured.
 
+## Notes and limitations
+
+### Process-wide configuration
+
+The wrapper loads `MC_ETCD_*` variables once and caches them for the lifetime
+of the process (via `sync.Once`). The same cached credentials and TLS settings
+are applied to all etcd clients created by the process (Store / Transfer Engine
+metadata / snapshot clients). One process cannot connect to different etcd
+clusters with different security settings.
+
+### RBAC token expiry
+
+If your etcd cluster issues RBAC authentication tokens with a finite TTL, long-lived
+watch streams and lease keepalives may stop working after the token expires.
+This PR focuses on RBAC/TLS configuration and validation and does not implement
+token refresh or automatic re-authentication. For secured HA deployments, ensure
+that the token TTL is compatible with your availability requirements or plan to
+add an explicit token-refresh mechanism.
+
 ## Example
 
 ```bash

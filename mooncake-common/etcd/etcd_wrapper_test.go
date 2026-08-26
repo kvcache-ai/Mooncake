@@ -10,7 +10,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,6 +97,114 @@ func writeTempCACert(t *testing.T) string {
 	}
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	return writeTempFile(t, "ca.crt", string(pemBytes))
+}
+
+func generateTestCA(t *testing.T) (*x509.Certificate, *rsa.PrivateKey, []byte) {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "mooncake-test-ca",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	return cert, key, pemBytes
+}
+
+func generateServerTLSConfig(t *testing.T, caCert *x509.Certificate, caKey *rsa.PrivateKey, dnsName string) *tls.Config {
+	t.Helper()
+
+	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa key: %v", err)
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject: pkix.Name{
+			CommonName: dnsName,
+		},
+		DNSNames:              []string{dnsName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &serverKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
+	serverCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("X509KeyPair: %v", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		MinVersion:   tls.VersionTLS12,
+	}
+}
+
+func runSingleTLSHandshake(t *testing.T, serverTLS *tls.Config, clientTLS *tls.Config) error {
+	t.Helper()
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
+	if err != nil {
+		t.Fatalf("tls.Listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer conn.Close()
+		tc, ok := conn.(*tls.Conn)
+		if !ok {
+			serverErrCh <- errors.New("expected tls.Conn")
+			return
+		}
+		serverErrCh <- tc.Handshake()
+	}()
+
+	conn, err := tls.Dial("tcp", ln.Addr().String(), clientTLS)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := conn.Handshake(); err != nil {
+		return err
+	}
+
+	serverErr := <-serverErrCh
+	if serverErr != nil {
+		return serverErr
+	}
+	return nil
 }
 
 func TestParseRbacCredentialsFile(t *testing.T) {
@@ -228,5 +338,79 @@ func TestApplySecurityConfigLoadsRbacAndTLS(t *testing.T) {
 	if cfg.TLS.RootCAs == nil {
 		t.Fatalf("expected RootCAs to be populated")
 >>>>>>> 2b0ef06b ([Common] Narrow etcd RBAC/TLS wrapper scope and add tests)
+	}
+}
+
+func TestTLSHandshakeSucceedsWithTrustedCAAndServerName(t *testing.T) {
+	resetSecurityStateForTest(t)
+	caCert, caKey, caPEM := generateTestCA(t)
+	caPath := writeTempFile(t, "ca.crt", string(caPEM))
+
+	t.Setenv("MC_ETCD_CONF_FILE", "")
+	t.Setenv("MC_ETCD_TLS_CA_CERT", caPath)
+	t.Setenv("MC_ETCD_TLS_SERVER_NAME", "etcd.internal")
+	t.Setenv("MC_ETCD_TLS_INSECURE_SKIP_VERIFY", "false")
+
+	cfg := clientv3.Config{}
+	if err := applySecurityConfig(&cfg); err != nil {
+		t.Fatalf("applySecurityConfig returned error: %v", err)
+	}
+
+	serverTLS := generateServerTLSConfig(t, caCert, caKey, "etcd.internal")
+	if err := runSingleTLSHandshake(t, serverTLS, cfg.TLS); err != nil {
+		t.Fatalf("expected handshake to succeed, got: %v", err)
+	}
+}
+
+func TestTLSHandshakeFailsWithUntrustedCA(t *testing.T) {
+	resetSecurityStateForTest(t)
+	caCert, caKey, _ := generateTestCA(t)
+	trustedCert, _, trustedPEM := generateTestCA(t)
+	trustedCAPath := writeTempFile(t, "trusted-ca.crt", string(trustedPEM))
+
+	t.Setenv("MC_ETCD_CONF_FILE", "")
+	t.Setenv("MC_ETCD_TLS_CA_CERT", trustedCAPath)
+	t.Setenv("MC_ETCD_TLS_SERVER_NAME", "etcd.internal")
+	t.Setenv("MC_ETCD_TLS_INSECURE_SKIP_VERIFY", "false")
+
+	cfg := clientv3.Config{}
+	if err := applySecurityConfig(&cfg); err != nil {
+		t.Fatalf("applySecurityConfig returned error: %v", err)
+	}
+
+	serverTLS := generateServerTLSConfig(t, caCert, caKey, "etcd.internal")
+	err := runSingleTLSHandshake(t, serverTLS, cfg.TLS)
+	if err == nil {
+		t.Fatalf("expected handshake to fail")
+	}
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) && !strings.Contains(err.Error(), "unknown") && !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("unexpected handshake error: %v", err)
+	}
+	_ = trustedCert
+}
+
+func TestTLSHandshakeFailsOnHostnameMismatch(t *testing.T) {
+	resetSecurityStateForTest(t)
+	caCert, caKey, caPEM := generateTestCA(t)
+	caPath := writeTempFile(t, "ca.crt", string(caPEM))
+
+	t.Setenv("MC_ETCD_CONF_FILE", "")
+	t.Setenv("MC_ETCD_TLS_CA_CERT", caPath)
+	t.Setenv("MC_ETCD_TLS_SERVER_NAME", "wrong.internal")
+	t.Setenv("MC_ETCD_TLS_INSECURE_SKIP_VERIFY", "false")
+
+	cfg := clientv3.Config{}
+	if err := applySecurityConfig(&cfg); err != nil {
+		t.Fatalf("applySecurityConfig returned error: %v", err)
+	}
+
+	serverTLS := generateServerTLSConfig(t, caCert, caKey, "etcd.internal")
+	err := runSingleTLSHandshake(t, serverTLS, cfg.TLS)
+	if err == nil {
+		t.Fatalf("expected handshake to fail")
+	}
+	if !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "hostname") && !strings.Contains(err.Error(), "valid for") {
+		t.Fatalf("unexpected handshake error: %v", err)
 	}
 }
