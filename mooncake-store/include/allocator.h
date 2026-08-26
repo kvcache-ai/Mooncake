@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "allocator_import.h"
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.h"
 #include "storage_usage.h"
@@ -70,6 +71,10 @@ class AllocatedBuffer {
         return !allocator_.expired();
     }
 
+    [[nodiscard]] std::shared_ptr<BufferAllocatorBase> lockAllocator() const {
+        return allocator_.lock();
+    }
+
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
 
@@ -117,6 +122,7 @@ class BufferAllocatorBase {
     virtual void deallocate(AllocatedBuffer* handle) = 0;
     virtual size_t capacity() const = 0;
     virtual size_t size() const = 0;
+    virtual uintptr_t base() const = 0;
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
 
@@ -175,6 +181,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
         return kAllocatorUnknownFreeSpace;
     }
     size_t size() const override { return 0; }
+    uintptr_t base() const override { return 0; }
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
@@ -223,6 +230,7 @@ class CachelibBufferAllocator
 
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return GetUsageBytes(); }
+    uintptr_t base() const override { return base_; }
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
@@ -239,7 +247,7 @@ class CachelibBufferAllocator
 
    private:
     std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
-        const AllocatedBuffer::Descriptor& descriptor);
+        const LiveAllocation& allocation);
     // metadata
     const std::string segment_name_;
     const size_t base_;
@@ -257,10 +265,10 @@ class CachelibBufferAllocator
 
     friend struct RestoredCachelibBufferAllocator;
     friend std::optional<struct RestoredCachelibBufferAllocator>
-    RestoreCachelibBufferAllocator(
+    ImportCachelibBufferAllocator(
         std::string segment_name, size_t base, size_t size,
         std::string transport_endpoint,
-        const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+        const std::vector<LiveAllocation>& allocations,
         ReplicaType replica_type);
 };
 
@@ -268,6 +276,12 @@ struct RestoredCachelibBufferAllocator {
     std::shared_ptr<CachelibBufferAllocator> allocator;
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
 };
+
+std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<LiveAllocation>& allocations,
+    ReplicaType replica_type = ReplicaType::MEMORY);
 
 std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
@@ -296,6 +310,7 @@ class OffsetBufferAllocator
 
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return GetUsageBytes(); }
+    uintptr_t base() const override { return base_; }
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
@@ -335,9 +350,15 @@ struct RestoredOffsetBufferAllocator {
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
 };
 
-// Reconstructs an empty OffsetBufferAllocator from final live descriptors.
-// The returned buffers follow descriptor input order. No state is exposed on
+// Reconstructs an empty OffsetBufferAllocator from final live allocations.
+// The returned buffers follow allocation input order. No state is exposed on
 // validation or allocation failure.
+std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<LiveAllocation>& allocations,
+    ReplicaType replica_type = ReplicaType::MEMORY);
+
 std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
