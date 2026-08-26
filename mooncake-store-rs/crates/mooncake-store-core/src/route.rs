@@ -21,7 +21,11 @@ impl ObjectKey {
 
     pub fn from_scope(scope: &NamespaceScope, logical_key: &str) -> Self {
         if scope.domain == DEFAULT_DOMAIN && scope.object_set == DEFAULT_OBJECT_SET {
-            return Self::new(format!("{}::{}", scope.tenant, logical_key));
+            return Self::new(format!(
+                "{}::{}",
+                encode_key_component(&scope.tenant),
+                encode_key_component(logical_key)
+            ));
         }
         Self::new(format!(
             "{}::ns/{}/{}/{}",
@@ -792,6 +796,19 @@ mod tests {
             ObjectKey::from_scope(&scope, "logical-a").0,
             "tenant-a::logical-a"
         );
+    }
+
+    #[test]
+    fn default_namespace_object_key_encodes_components_without_collisions() {
+        let tenant_delimiter_in_key = NamespaceScope::with_defaults(Some("a"), None, None);
+        let delimiter_in_tenant = NamespaceScope::with_defaults(Some("a::b"), None, None);
+
+        let key_a = ObjectKey::from_scope(&tenant_delimiter_in_key, "b::c");
+        let key_b = ObjectKey::from_scope(&delimiter_in_tenant, "c");
+
+        assert_eq!(key_a.0, "a::b%3A%3Ac");
+        assert_eq!(key_b.0, "a%3A%3Ab::c");
+        assert_ne!(key_a, key_b);
     }
 
     #[test]
