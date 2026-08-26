@@ -832,6 +832,40 @@ TEST_F(MasterAdminServerWithServiceTest, GetSegmentsDetailReturnsDetailedInfo) {
               std::string::npos);
 }
 
+TEST_F(MasterAdminServerWithServiceTest,
+       GetSegmentsDetailReportsPhysicalSameNameRegions) {
+    const std::string name = "admin_same_name_" + UuidToString(generate_uuid());
+    const UUID client_id = generate_uuid();
+    Segment first;
+    first.id = generate_uuid();
+    first.name = name;
+    first.base = 0x710000000ULL;
+    first.size = 8 * 1024 * 1024;
+    first.te_endpoint = name + "-first";
+    Segment second = first;
+    second.id = generate_uuid();
+    second.base = 0x720000000ULL;
+    second.te_endpoint = name + "-second";
+    ASSERT_TRUE(service_->MountSegment(first, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(second, client_id).has_value());
+
+    auto details = service_->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    size_t matched = 0;
+    for (const auto& detail : *details) {
+        if (detail.segment_name != name) {
+            continue;
+        }
+        ++matched;
+        EXPECT_EQ(detail.allocator_capacity_bytes, first.size);
+        EXPECT_EQ(detail.allocator_used_bytes, 0U);
+    }
+    EXPECT_EQ(matched, 2U);
+
+    EXPECT_TRUE(service_->UnmountSegment(first.id, client_id).has_value());
+    EXPECT_TRUE(service_->UnmountSegment(second.id, client_id).has_value());
+}
+
 // -----------------------------------------------------------------------
 // POST /api/v1/drain_jobs
 // -----------------------------------------------------------------------

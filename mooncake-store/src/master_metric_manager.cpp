@@ -7,7 +7,7 @@
 #include <vector>   // Required by histogram serialization
 #include <cmath>
 
-#include "segment.h"
+#include "segment/usage.h"
 #include "utils.h"
 
 namespace mooncake {

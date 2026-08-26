@@ -273,33 +273,6 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
                                            std::move(buffers)};
 }
 
-std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
-    std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type) {
-    if (base > std::numeric_limits<size_t>::max() - size) {
-        return std::nullopt;
-    }
-    const size_t end = base + size;
-    std::vector<LiveAllocation> allocations;
-    allocations.reserve(descriptors.size());
-    for (const auto& descriptor : descriptors) {
-        if (descriptor.protocol_ == "cxl" ||
-            descriptor.transport_endpoint_ != transport_endpoint ||
-            descriptor.size_ == 0 || descriptor.buffer_address_ < base ||
-            descriptor.buffer_address_ >= end ||
-            descriptor.size_ > end - descriptor.buffer_address_) {
-            return std::nullopt;
-        }
-        allocations.push_back(
-            {descriptor.buffer_address_ - base, descriptor.size_});
-    }
-    return ImportCachelibBufferAllocator(std::move(segment_name), base, size,
-                                         std::move(transport_endpoint),
-                                         allocations, replica_type);
-}
-
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
@@ -525,32 +498,6 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     gaps.clear();
     return RestoredOffsetBufferAllocator{std::move(allocator),
                                          std::move(buffers)};
-}
-
-std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
-    std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type) {
-    if (base > std::numeric_limits<size_t>::max() - size) {
-        return std::nullopt;
-    }
-    const size_t end = base + size;
-    std::vector<LiveAllocation> allocations;
-    allocations.reserve(descriptors.size());
-    for (const auto& descriptor : descriptors) {
-        if (descriptor.transport_endpoint_ != transport_endpoint ||
-            descriptor.size_ == 0 || descriptor.buffer_address_ < base ||
-            descriptor.buffer_address_ >= end ||
-            descriptor.size_ > end - descriptor.buffer_address_) {
-            return std::nullopt;
-        }
-        allocations.push_back(
-            {descriptor.buffer_address_ - base, descriptor.size_});
-    }
-    return ImportOffsetBufferAllocator(std::move(segment_name), base, size,
-                                       std::move(transport_endpoint),
-                                       allocations, replica_type);
 }
 
 SimpleAllocator::SimpleAllocator(size_t size) {

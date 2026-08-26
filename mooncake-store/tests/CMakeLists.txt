@@ -39,9 +39,9 @@ add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
+add_store_test(nof_segment_manager_test nof_segment_manager_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
-add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_test(
   NAME replica_selection_env_opt_in_test
@@ -127,7 +127,6 @@ endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
-add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest

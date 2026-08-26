@@ -2501,13 +2501,13 @@ TEST_F(MasterServiceTest, MasterConfigParsesLocalFirstStrategy) {
     WrappedMasterServiceConfig wrapped_config(config, 0);
     MasterServiceConfig service_config(wrapped_config);
     EXPECT_EQ(service_config.allocation_strategy_type,
-              AllocationStrategyType::LOCAL_FIRST);
+              PlacementPolicyType::LOCAL_FIRST);
 }
 
 TEST_F(MasterServiceTest, LocalFirstPutPrefersWriterHost) {
     auto service_config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterService service(service_config);
     const UUID writer_client_id = generate_uuid();
@@ -2558,7 +2558,7 @@ TEST_F(MasterServiceTest, PreferSameNodeUsesHostAwareLocalFirstPlacement) {
 TEST_F(MasterServiceTest, LocalFirstPutFallsBackToNextOrderedHost) {
     auto service_config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterService service(service_config);
     const UUID writer_client_id = generate_uuid();
@@ -2585,7 +2585,7 @@ TEST_F(MasterServiceTest, LocalFirstPutFallsBackToNextOrderedHost) {
 TEST_F(MasterServiceTest, LocalFirstPutFallsBackWhenLocalSegmentIsFull) {
     auto service_config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterService service(service_config);
     const UUID writer_client_id = generate_uuid();
@@ -2626,7 +2626,7 @@ TEST_F(MasterServiceTest, LocalFirstPutFallsBackWhenLocalSegmentIsFull) {
 TEST_F(MasterServiceTest, ExplicitPreferredSegmentOverridesLocalFirst) {
     auto service_config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterService service(service_config);
     const UUID writer_client_id = generate_uuid();
@@ -2655,7 +2655,7 @@ TEST_F(MasterServiceTest, ExplicitPreferredSegmentOverridesLocalFirst) {
 TEST_F(MasterServiceTest, ExplicitPreferredSegmentFallsBackToLocalFirst) {
     auto service_config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterService service(service_config);
     const UUID writer_client_id = generate_uuid();

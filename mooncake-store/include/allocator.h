@@ -287,12 +287,6 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
-std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
-    std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type = ReplicaType::MEMORY);
-
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
  * strategy, which provides efficient memory allocation with bin-based
@@ -362,12 +356,6 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<LiveAllocation>& allocations,
-    ReplicaType replica_type = ReplicaType::MEMORY);
-
-std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
-    std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
 // The main difference is that it allocates real memory and returns it, while

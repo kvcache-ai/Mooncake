@@ -444,28 +444,14 @@ struct Segment {
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 
 /**
- * @brief Allocation strategy type for segment allocation
+ * @brief Placement policy type for region allocation
  */
-enum class AllocationStrategyType {
+enum class PlacementPolicyType {
     RANDOM = 0,            // Pure random allocation
     FREE_RATIO_FIRST,      // Free-ratio-first allocation
     CXL,                   // CXL-specific allocation
     SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
     LOCAL_FIRST            // Prefer local host before ordered remote fallback
-};
-
-/**
- * @brief Placement policy used by the new replica allocation mechanism.
- *
- * This remains separate from AllocationStrategyType until MasterService
- * switches to the new path in the final stacked change.
- */
-enum class PlacementPolicyType {
-    RANDOM = 0,
-    FREE_RATIO_FIRST,
-    CXL,
-    SSD_FREE_RATIO_FIRST,
-    LOCAL_FIRST,
 };
 
 /**
