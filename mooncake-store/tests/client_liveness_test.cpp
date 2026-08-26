@@ -99,21 +99,23 @@ TEST(ClientLivenessRecordTest, RetireCallbackRunsAfterTransitionGuardRelease) {
     std::thread probe;
 
     EXPECT_EQ(
-        record.EvaluateAndRetire(initial + 30s, 10s, 20s, [&] {
-            probe = std::thread([&] {
-                rejected_offline =
-                    !record.TryAcquireRetainingGuard().has_value();
-                {
-                    std::lock_guard<std::mutex> lock(completion_mutex);
-                    completed = true;
-                }
-                completion_cv.notify_one();
-            });
+        record.EvaluateAndRetire(
+            initial + 30s, 10s, 20s,
+            [&] {
+                probe = std::thread([&] {
+                    rejected_offline =
+                        !record.TryAcquireRetainingGuard().has_value();
+                    {
+                        std::lock_guard<std::mutex> lock(completion_mutex);
+                        completed = true;
+                    }
+                    completion_cv.notify_one();
+                });
 
-            std::unique_lock<std::mutex> lock(completion_mutex);
-            EXPECT_TRUE(completion_cv.wait_for(lock, 1s,
-                                               [&] { return completed; }));
-        }),
+                std::unique_lock<std::mutex> lock(completion_mutex);
+                EXPECT_TRUE(completion_cv.wait_for(lock, 1s,
+                                                   [&] { return completed; }));
+            }),
         ClientLivenessTransition::BECAME_OFFLINE);
 
     probe.join();

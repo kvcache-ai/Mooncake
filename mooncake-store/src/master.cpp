@@ -281,9 +281,8 @@ DEFINE_string(ha_backend_connstring, "",
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
-DEFINE_int64(
-    client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-    "Deprecated alias for --client_active_ttl_sec");
+DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+             "Deprecated alias for --client_active_ttl_sec");
 DEFINE_int64(client_active_ttl_sec, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "Seconds a client remains active after its last liveness "
              "observation");
@@ -1385,9 +1384,8 @@ std::optional<int64_t> GetExplicitInt64Flag(const char* name, int64_t value) {
     return std::nullopt;
 }
 
-void InitClientLivenessConf(
-    const mooncake::DefaultConfig* default_config,
-    mooncake::MasterConfig& master_config) {
+void InitClientLivenessConf(const mooncake::DefaultConfig* default_config,
+                            mooncake::MasterConfig& master_config) {
     const mooncake::ClientLivenessConfigSource config_file{
         .active_ttl_sec =
             GetConfiguredInt64(default_config, "client_active_ttl_sec"),
@@ -1397,10 +1395,9 @@ void InitClientLivenessConf(
             GetConfiguredInt64(default_config, "client_suspicion_ttl_sec"),
     };
     const mooncake::ClientLivenessConfigSource command_line{
-        .active_ttl_sec = GetExplicitInt64Flag(
-            "client_active_ttl_sec", FLAGS_client_active_ttl_sec),
-        .legacy_ttl_sec =
-            GetExplicitInt64Flag("client_ttl", FLAGS_client_ttl),
+        .active_ttl_sec = GetExplicitInt64Flag("client_active_ttl_sec",
+                                               FLAGS_client_active_ttl_sec),
+        .legacy_ttl_sec = GetExplicitInt64Flag("client_ttl", FLAGS_client_ttl),
         .suspicion_ttl_sec = GetExplicitInt64Flag(
             "client_suspicion_ttl_sec", FLAGS_client_suspicion_ttl_sec),
     };
@@ -1491,8 +1488,7 @@ int main(int argc, char* argv[]) {
     try {
         InitClientLivenessConf(loaded_default_config, master_config);
     } catch (const std::invalid_argument& error) {
-        LOG(ERROR) << "Invalid Client liveness configuration: "
-                   << error.what();
+        LOG(ERROR) << "Invalid Client liveness configuration: " << error.what();
         return 1;
     }
     ResolveRpcAddressFromInterfaceOrDie(master_config);
@@ -1614,8 +1610,7 @@ int main(int argc, char* argv[]) {
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
-        << ", client_active_ttl_sec="
-        << master_config.client_active_ttl_sec
+        << ", client_active_ttl_sec=" << master_config.client_active_ttl_sec
         << ", client_suspicion_ttl_sec="
         << master_config.client_suspicion_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num

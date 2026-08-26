@@ -335,12 +335,11 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     segment.base = 0x300000000;
     segment.size = 1024 * 1024 * 16;
     UUID client_id = generate_uuid();
-    ASSERT_EQ(
-        source_manager.getSegmentAccess().MountSegment(
-            segment, client_id,
-            std::make_shared<ClientLivenessRecord>(
-                ClientLivenessRecord::Clock::now())),
-        ErrorCode::OK);
+    ASSERT_EQ(source_manager.getSegmentAccess().MountSegment(
+                  segment, client_id,
+                  std::make_shared<ClientLivenessRecord>(
+                      ClientLivenessRecord::Clock::now())),
+              ErrorCode::OK);
     const int64_t capacity_after_mount = metrics.get_total_mem_capacity();
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               static_cast<int64_t>(segment.size));

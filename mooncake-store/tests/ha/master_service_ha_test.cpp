@@ -773,16 +773,15 @@ class MasterServiceHATest : public ::testing::Test {
         return service.FindClientRecord(client_id);
     }
 
-    static bool ProcessClientOffboardingForTesting(
-        MasterService& service, ClientOffboardingJob& job) {
+    static bool ProcessClientOffboardingForTesting(MasterService& service,
+                                                   ClientOffboardingJob& job) {
         return service.ProcessClientOffboardingJob(job);
     }
 
-    static bool HasCompletedMemoryReplicaForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const size_t shard_idx =
-            service.getMetadataShardIndex(tenant_id, key);
+    static bool HasCompletedMemoryReplicaForTesting(MasterService& service,
+                                                    const TenantId& tenant_id,
+                                                    const std::string& key) {
+        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
         MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
         const auto tenant = shard->tenants.find(tenant_id);
         if (tenant == shard->tenants.end()) {
@@ -791,8 +790,7 @@ class MasterServiceHATest : public ::testing::Test {
         const auto metadata = tenant->second.metadata.find(key);
         return metadata != tenant->second.metadata.end() &&
                metadata->second.HasReplica([](const Replica& replica) {
-                   return replica.is_memory_replica() &&
-                          replica.is_completed();
+                   return replica.is_memory_replica() && replica.is_completed();
                });
     }
 
@@ -1106,12 +1104,11 @@ TEST_F(MasterServiceHATest,
     const UUID actual_owner = generate_uuid();
     ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, actual_owner)
                     .has_value());
-    const auto actual_record =
-        ClientRecordForTesting(service, actual_owner);
+    const auto actual_record = ClientRecordForTesting(service, actual_owner);
     ASSERT_TRUE(actual_record);
     EXPECT_FALSE(ClientRecordForTesting(service, writer_id));
-    EXPECT_TRUE(MemoryReplicaAffiliatedWithForTesting(
-        service, kDefaultTenant, key, actual_record));
+    EXPECT_TRUE(MemoryReplicaAffiliatedWithForTesting(service, kDefaultTenant,
+                                                      key, actual_record));
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesHardPinned) {
@@ -1492,8 +1489,8 @@ TEST_F(MasterServiceHATest,
     ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
     EXPECT_FALSE(job.metadata_cleanup_accepted);
     ASSERT_EQ(job.prepared_segments.size(), 1u);
-    EXPECT_TRUE(HasCompletedMemoryReplicaForTesting(
-        service, kDefaultTenant, key));
+    EXPECT_TRUE(
+        HasCompletedMemoryReplicaForTesting(service, kDefaultTenant, key));
     EXPECT_TRUE(service.QuerySegmentStatusById(segment.id).has_value());
 
     ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
@@ -1549,8 +1546,7 @@ TEST_F(MasterServiceHATest,
 
     auto replacement = MakeSegment(segment.name, /*base=*/0x400000000);
     const UUID replacement_client = generate_uuid();
-    auto blocked_mount =
-        service.MountSegment(replacement, replacement_client);
+    auto blocked_mount = service.MountSegment(replacement, replacement_client);
     ASSERT_FALSE(blocked_mount.has_value());
     EXPECT_EQ(blocked_mount.error(), ErrorCode::INVALID_PARAMS);
 
@@ -1785,8 +1781,7 @@ TEST_F(MasterServiceHATest, RestoreRejectsOverlappingMemoryDescriptors) {
               0);
 }
 
-TEST_F(MasterServiceHATest,
-       FailedRemountPreservesRestoreGateAndCanBeRetried) {
+TEST_F(MasterServiceHATest, FailedRemountPreservesRestoreGateAndCanBeRetried) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 

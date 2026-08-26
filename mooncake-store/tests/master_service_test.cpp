@@ -5680,13 +5680,12 @@ TEST_F(MasterServiceTest,
     auto prepared_segment = MakeSegment("offboarding_prepared_segment");
     auto blocked_segment =
         MakeSegment("offboarding_blocked_segment", /*base=*/0x400000000);
-    ASSERT_TRUE(
-        service.MountSegment(prepared_segment, client_id).has_value());
+    ASSERT_TRUE(service.MountSegment(prepared_segment, client_id).has_value());
     ASSERT_TRUE(service.MountSegment(blocked_segment, client_id).has_value());
-    ASSERT_TRUE(service
-                    .GracefulUnmountSegment(blocked_segment.id, client_id,
-                                             /*grace_period_ms=*/60'000)
-                    .has_value());
+    size_t blocked_metrics_dec_capacity = 0;
+    ASSERT_EQ(ErrorCode::OK,
+              PrepareUnmountSegmentForTest(service, blocked_segment.id,
+                                           blocked_metrics_dec_capacity));
 
     ClientOffboardingJob job;
     job.client_id = client_id;
@@ -5715,6 +5714,14 @@ TEST_F(MasterServiceTest,
     EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
     EXPECT_EQ(job.prepared_segments.front().metrics_dec_capacity,
               retained_capacity);
+
+    ASSERT_EQ(ErrorCode::OK, CommitUnmountSegmentForTest(
+                                 service, blocked_segment.id, client_id,
+                                 blocked_metrics_dec_capacity));
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_TRUE(job.prepared_segments.empty());
+    EXPECT_TRUE(job.pending_prepare_segments.empty());
+    EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
 }
 
 // ===================== Graceful Unmount Tests =====================

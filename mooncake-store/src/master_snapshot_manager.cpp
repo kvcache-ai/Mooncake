@@ -151,8 +151,7 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
                 close(log_pipe[1]);
                 break;
             }
-            if (master_service_
-                    ->ShouldSkipSnapshotForClientOffboarding()) {
+            if (master_service_->ShouldSkipSnapshotForClientOffboarding()) {
                 LOG(WARNING)
                     << "[Snapshot] Skipping snapshot while Client offboarding "
                        "is pending, snapshot_id="

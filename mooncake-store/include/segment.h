@@ -121,10 +121,9 @@ class ScopedSegmentAccess {
      * errors. When encounters unsolvable errors, the segment will not be
      * mounted while the return value will be OK.
      */
-    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
-                             const UUID& client_id,
-                             std::shared_ptr<ClientLivenessRecord>
-                                 client_liveness);
+    ErrorCode ReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        std::shared_ptr<ClientLivenessRecord> client_liveness);
 
     ErrorCode ValidateRemountSegment(const Segment& segment,
                                      const UUID& client_id) const;

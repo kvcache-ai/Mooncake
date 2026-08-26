@@ -9,8 +9,7 @@ TEST(ClientLivenessConfigTest, UsesIndependentDefaultsWhenNothingIsSet) {
     const auto resolved = ResolveClientLivenessConfig({}, {});
 
     EXPECT_EQ(resolved.active_ttl_sec, DEFAULT_CLIENT_LIVE_TTL_SEC);
-    EXPECT_EQ(resolved.suspicion_ttl_sec,
-              DEFAULT_CLIENT_SUSPICION_TTL_SEC);
+    EXPECT_EQ(resolved.suspicion_ttl_sec, DEFAULT_CLIENT_SUSPICION_TTL_SEC);
 }
 
 TEST(ClientLivenessConfigTest, ExplicitActiveAlsoDefaultsSuspicion) {
@@ -51,14 +50,12 @@ TEST(ClientLivenessConfigTest, RejectsNonPositiveExplicitValues) {
         .suspicion_ttl_sec = 0,
     };
 
-    EXPECT_THROW(ResolveClientLivenessConfig(file, {}),
-                 std::invalid_argument);
+    EXPECT_THROW(ResolveClientLivenessConfig(file, {}), std::invalid_argument);
 }
 
 TEST(ClientLivenessConfigTest, LegacyBuilderSetterDefaultsBothWindows) {
-    const auto config = MasterServiceConfig::builder()
-                            .set_client_live_ttl_sec(45)
-                            .build();
+    const auto config =
+        MasterServiceConfig::builder().set_client_live_ttl_sec(45).build();
 
     EXPECT_EQ(config.client_active_ttl_sec, 45);
     EXPECT_EQ(config.client_suspicion_ttl_sec, 45);

@@ -88,9 +88,8 @@ MasterMetricManager::MasterMetricManager()
           "master_client_offboarding_duration_ms",
           "Asynchronous Store Client offboarding duration in milliseconds",
           {1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000}),
-      client_offboarding_retries_(
-          "master_client_offboarding_retries_total",
-          "Retried Store Client offboarding attempts"),
+      client_offboarding_retries_("master_client_offboarding_retries_total",
+                                  "Retried Store Client offboarding attempts"),
       client_offboarding_alerts_(
           "master_client_offboarding_alerts_total",
           "Offboarding retries at or above the operator alert threshold"),

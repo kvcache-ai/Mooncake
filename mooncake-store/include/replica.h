@@ -390,12 +390,10 @@ class Replica {
         }
         descriptor = get_descriptor();
         if (is_memory_replica()) {
-            return std::get<MemoryReplicaData>(data_)
-                .buffer->isAvailable();
+            return std::get<MemoryReplicaData>(data_).buffer->isAvailable();
         }
         if (is_nof_replica()) {
-            return std::get<NoFReplicaData>(data_)
-                .buffer->isAvailable();
+            return std::get<NoFReplicaData>(data_).buffer->isAvailable();
         }
         if (is_local_disk_replica()) {
             const auto& data = std::get<LocalDiskReplicaData>(data_);
@@ -516,18 +514,19 @@ class Replica {
     }
 
     /**
-     * @brief Check if a local_disk replica's owner client is still alive.
+     * @brief Check if a local_disk replica's owner still retains resources.
      * Used by CleanupStaleHandles to remove replicas belonging to expired
      * clients. For non-local_disk replicas, always returns false.
-     * @param alive_clients Set of currently alive client IDs.
-     * @return true if this is a local_disk replica whose client is not alive.
+     * @param retaining_clients Clients whose resources must be retained.
+     * @return true if this replica's owner no longer retains resources.
      */
     [[nodiscard]] bool has_stale_local_disk_client(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients)
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
         const {
         auto client_id = get_local_disk_client_id();
         if (client_id.has_value()) {
-            return alive_clients.find(client_id.value()) == alive_clients.end();
+            return retaining_clients.find(client_id.value()) ==
+                   retaining_clients.end();
         }
         return false;
     }

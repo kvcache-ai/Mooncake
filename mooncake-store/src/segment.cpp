@@ -9,8 +9,7 @@ namespace mooncake {
 namespace {
 
 bool HasAllocatorRegistration(
-    const AllocatorManager& allocator_manager,
-    const std::string& segment_name,
+    const AllocatorManager& allocator_manager, const std::string& segment_name,
     const std::shared_ptr<SegmentAllocatorRegistration>& registration) {
     const auto* allocators = allocator_manager.getAllocators(segment_name);
     if (allocators == nullptr) {
@@ -167,11 +166,9 @@ std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
     return it->second;
 }
 
-ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
-                                            const UUID& client_id,
-                                            std::shared_ptr<
-                                                ClientLivenessRecord>
-                                                client_liveness) {
+ErrorCode ScopedSegmentAccess::MountSegment(
+    const Segment& segment, const UUID& client_id,
+    std::shared_ptr<ClientLivenessRecord> client_liveness) {
     // SEGMENT_ALREADY_EXISTS is a liveness signal only for a confirmed replay
     // of the same mount. Keep this common to every memory protocol, including
     // CXL, instead of letting protocol-specific branches bypass it.
@@ -181,10 +178,9 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
         const auto owner = segment_manager_->client_segments_.find(client_id);
-        const bool owned =
-            owner != segment_manager_->client_segments_.end() &&
-            std::find(owner->second.begin(), owner->second.end(), segment.id) !=
-                owner->second.end();
+        const bool owned = owner != segment_manager_->client_segments_.end() &&
+                           std::find(owner->second.begin(), owner->second.end(),
+                                     segment.id) != owner->second.end();
         const auto& mounted = existing->second.segment;
         if (!owned || mounted.name != segment.name ||
             mounted.base != segment.base || mounted.size != segment.size ||
@@ -194,12 +190,6 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         }
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
-    const auto name_it =
-        segment_manager_->segment_id_by_name_.find(segment.name);
-    if (name_it != segment_manager_->segment_id_by_name_.end()) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
 
@@ -285,7 +275,6 @@ void ScopedSegmentAccess::BindClientLiveness(
             }
         }
     }
-
 }
 
 ErrorCode ScopedSegmentAccess::ReMountSegment(

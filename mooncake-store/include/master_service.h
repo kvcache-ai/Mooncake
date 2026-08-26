@@ -1005,13 +1005,16 @@ class MasterService {
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const;
+    // Caller must hold client_mutex_.
+    std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
+        const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
     void ClearInvalidHandles();
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
     // all shards. Owner-targeted on purpose: a liveness-complement sweep
     // classifies by absence from a point-in-time set, so an owner that
@@ -2043,7 +2046,8 @@ class MasterService {
     };
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const;
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+        const;
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale) const;
@@ -2070,10 +2074,10 @@ class MasterService {
         -> tl::expected<ResolvedSoftPinRequest, ErrorCode>;
 
     // Helper to clean up stale handles pointing to unmounted segments
-    // or local_disk replicas whose owner client is no longer alive.
+    // or local_disk replicas whose owner client no longer retains resources.
     bool CleanupStaleHandles(
         TenantState& tenant_state, ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
         MetadataShardAccessorRW* shard = nullptr);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (quota release, promotion-task cancellation, disk-replica
@@ -2955,8 +2959,8 @@ class MasterService {
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
-    bool TryGetReadableReplicaDescriptor(
-        const Replica& replica, Replica::Descriptor& descriptor) const;
+    bool TryGetReadableReplicaDescriptor(const Replica& replica,
+                                         Replica::Descriptor& descriptor) const;
     std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
         const ObjectMetadata& metadata) const;
     bool IsReplicaReadable(const Replica& replica) const;

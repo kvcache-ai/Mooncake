@@ -200,8 +200,7 @@ class AllocatorManager {
     std::vector<std::string> names_;
     // Segment name to allocator registrations mapping.
     std::unordered_map<
-        std::string,
-        std::vector<std::shared_ptr<SegmentAllocatorRegistration>>>
+        std::string, std::vector<std::shared_ptr<SegmentAllocatorRegistration>>>
         allocators_;
     std::unordered_map<std::string, UUID> owner_by_name_;
     friend class ScopedSegmentAccess;
@@ -606,8 +605,8 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
             const auto capacity =
                 static_cast<uint64_t>(buffer_allocator->capacity());
             total_capacity += capacity;
-            total_free += capacity -
-                          static_cast<uint64_t>(buffer_allocator->size());
+            total_free +=
+                capacity - static_cast<uint64_t>(buffer_allocator->size());
         }
         if (total_capacity == 0) {
             return 0.0;

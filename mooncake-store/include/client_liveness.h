@@ -156,8 +156,7 @@ class ClientLivenessRecord {
     [[nodiscard]] ClientLivenessTransition EvaluateAndRetire(
         TimePoint now, Clock::duration active_ttl,
         Clock::duration suspicion_ttl, RetireOperation&& retire_operation) {
-        ClientLivenessTransition transition =
-            ClientLivenessTransition::NONE;
+        ClientLivenessTransition transition = ClientLivenessTransition::NONE;
         {
             std::lock_guard<std::mutex> lock(transition_mutex_);
             switch (state_.load(std::memory_order_relaxed)) {
@@ -166,8 +165,7 @@ class ClientLivenessRecord {
                         suspected_since_ = now;
                         state_.store(ClientLivenessState::SUSPECTED,
                                      std::memory_order_release);
-                        transition =
-                            ClientLivenessTransition::BECAME_SUSPECTED;
+                        transition = ClientLivenessTransition::BECAME_SUSPECTED;
                     }
                     break;
                 case ClientLivenessState::SUSPECTED:
@@ -193,8 +191,8 @@ class ClientLivenessRecord {
    private:
     [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
         TimePoint now) {
-        return CommitObservationLocked(
-            now, state_.load(std::memory_order_relaxed));
+        return CommitObservationLocked(now,
+                                       state_.load(std::memory_order_relaxed));
     }
 
     [[nodiscard]] ClientLivenessObservation CommitObservationLocked(

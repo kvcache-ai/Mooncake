@@ -28,11 +28,9 @@ inline ResolvedClientLivenessConfig ResolveClientLivenessConfig(
     const ClientLivenessConfigSource& config_file,
     const ClientLivenessConfigSource& command_line,
     int64_t default_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-    int64_t default_suspicion_ttl_sec =
-        DEFAULT_CLIENT_SUSPICION_TTL_SEC) {
+    int64_t default_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC) {
     const auto validate_source = [](const ClientLivenessConfigSource& source) {
-        for (const auto value : {source.active_ttl_sec,
-                                 source.legacy_ttl_sec,
+        for (const auto value : {source.active_ttl_sec, source.legacy_ttl_sec,
                                  source.suspicion_ttl_sec}) {
             if (value.has_value() && *value <= 0) {
                 throw std::invalid_argument(
@@ -67,8 +65,7 @@ inline ResolvedClientLivenessConfig ResolveClientLivenessConfig(
         config_file.legacy_ttl_sec.has_value();
     const int64_t suspicion = command_line.suspicion_ttl_sec.value_or(
         config_file.suspicion_ttl_sec.value_or(
-            active_explicitly_configured ? active
-                                         : default_suspicion_ttl_sec));
+            active_explicitly_configured ? active : default_suspicion_ttl_sec));
 
     return {
         .active_ttl_sec = active,
@@ -247,8 +244,7 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> nof_eviction_high_watermark_ratio{
         "nof_eviction_high_watermark_ratio"};
     RequiredParam<int64_t> client_active_ttl_sec{"client_active_ttl_sec"};
-    RequiredParam<int64_t> client_suspicion_ttl_sec{
-        "client_suspicion_ttl_sec"};
+    RequiredParam<int64_t> client_suspicion_ttl_sec{"client_suspicion_ttl_sec"};
     RequiredParam<int64_t> nof_heartbeat_interval_sec{
         "nof_heartbeat_interval_sec"};
     RequiredParam<uint32_t> nof_heartbeat_probe_timeout_ms{
@@ -1436,11 +1432,9 @@ class MasterServiceConfig {
 
 // Implementation of MasterServiceConfigBuilder::build()
 inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
-    const int64_t suspicion_ttl =
-        client_suspicion_ttl_sec_.value_or(
-            client_active_ttl_explicitly_set_
-                ? client_active_ttl_sec_
-                : DEFAULT_CLIENT_SUSPICION_TTL_SEC);
+    const int64_t suspicion_ttl = client_suspicion_ttl_sec_.value_or(
+        client_active_ttl_explicitly_set_ ? client_active_ttl_sec_
+                                          : DEFAULT_CLIENT_SUSPICION_TTL_SEC);
     if (client_active_ttl_sec_ <= 0 || suspicion_ttl <= 0) {
         throw std::invalid_argument("Client liveness TTLs must be positive");
     }

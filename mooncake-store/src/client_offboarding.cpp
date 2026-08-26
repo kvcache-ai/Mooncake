@@ -55,12 +55,10 @@ bool ClientOffboardingWorker::Schedule(ClientOffboardingJob job) {
     return true;
 }
 
-std::chrono::seconds ClientOffboardingWorker::RetryDelay(
-    uint64_t retry_count) {
+std::chrono::seconds ClientOffboardingWorker::RetryDelay(uint64_t retry_count) {
     constexpr uint64_t kBackoffs[] = {1, 2, 4, 8, 16, 30};
     const size_t index = static_cast<size_t>(std::min<uint64_t>(
-        retry_count == 0 ? 0 : retry_count - 1,
-        std::size(kBackoffs) - 1));
+        retry_count == 0 ? 0 : retry_count - 1, std::size(kBackoffs) - 1));
     return std::chrono::seconds(kBackoffs[index]);
 }
 
@@ -85,8 +83,7 @@ void ClientOffboardingWorker::DropJob(const ClientOffboardingJob& job,
     MasterMetricManager::instance().dec_client_offboarding_queue_depth();
     LOG(ERROR) << "client_id=" << job.client_id
                << ", action=client_offboarding_dropped"
-               << ", reason=" << reason
-               << ", retry_count=" << job.retry_count;
+               << ", reason=" << reason << ", retry_count=" << job.retry_count;
 }
 
 void ClientOffboardingWorker::ThreadFunc() {
@@ -109,7 +106,8 @@ void ClientOffboardingWorker::ThreadFunc() {
             }
 
             const auto next = std::min_element(
-                jobs_.begin(), jobs_.end(), [](const auto& lhs, const auto& rhs) {
+                jobs_.begin(), jobs_.end(),
+                [](const auto& lhs, const auto& rhs) {
                     return lhs.next_attempt_at < rhs.next_attempt_at;
                 });
             const auto now = std::chrono::steady_clock::now();

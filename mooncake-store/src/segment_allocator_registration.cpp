@@ -12,8 +12,8 @@ SegmentAllocatorRegistration::SegmentAllocatorRegistration(
       client_liveness_(std::move(client_liveness)) {}
 
 bool SegmentAllocatorRegistration::IsServing() const {
-    const auto record = std::atomic_load_explicit(
-        &client_liveness_, std::memory_order_acquire);
+    const auto record =
+        std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
     return lifetime_.isAvailable() && (!record || record->IsServing());
 }
 
@@ -22,8 +22,8 @@ std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
     if (!lifetime_.isAvailable()) {
         return nullptr;
     }
-    const auto record = std::atomic_load_explicit(
-        &client_liveness_, std::memory_order_acquire);
+    const auto record =
+        std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
     std::optional<ClientLivenessRecord::ServingGuard> serving_guard;
     if (record) {
         serving_guard = record->TryAcquireServingGuard();

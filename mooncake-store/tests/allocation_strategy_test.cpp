@@ -126,10 +126,10 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
 TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     const auto initial = ClientLivenessRecord::TimePoint{};
     auto suspected = std::make_shared<ClientLivenessRecord>(initial);
-    ASSERT_EQ(suspected->Evaluate(initial + std::chrono::seconds(1),
-                                  std::chrono::seconds(1),
-                                  std::chrono::seconds(10)),
-              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(
+        suspected->Evaluate(initial + std::chrono::seconds(1),
+                            std::chrono::seconds(1), std::chrono::seconds(10)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
     auto active = std::make_shared<ClientLivenessRecord>(initial);
 
     auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
@@ -149,8 +149,8 @@ TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
           AllocationStrategyType::SSD_FREE_RATIO_FIRST,
           AllocationStrategyType::CXL}) {
         auto strategy = CreateAllocationStrategy(strategy_type, local_ssd);
-        auto result = strategy->Allocate(allocator_manager, 1024, 1,
-                                         {"shared"}, {});
+        auto result =
+            strategy->Allocate(allocator_manager, 1024, 1, {"shared"}, {});
         ASSERT_TRUE(result.has_value());
         ASSERT_EQ(result->size(), 1);
         const auto expected_endpoint =
@@ -855,8 +855,7 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
     EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_, "2-segment");
 }
 
-TEST_F(AllocationStrategyTest,
-       SsdFreeRatioFirstSnapshotPreservesOwnerRanking) {
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstSnapshotPreservesOwnerRanking) {
     const size_t kSegmentSize = 64 * MiB;
     SsdPlacementTestState state;
     state.AddSegment("busy", 0, kSegmentSize, 1000 * MiB, 900 * MiB);
