@@ -88,7 +88,7 @@ if command -v apt-get &> /dev/null; then
 elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
     yum makecache
-    yum install -y \
+    yum install -y cmake \
             gflags-devel \
             glog-devel \
             libibverbs-devel \
@@ -107,8 +107,8 @@ elif command -v yum &> /dev/null; then
     clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
     cd yaml-cpp || exit
     rm -rf build
-    cmake -B build -G Ninja
-    cmake --build build
+    cmake -B build
+    cmake --build build -j$(nproc)
     cmake --install build
     cd -
 
@@ -117,8 +117,8 @@ elif command -v yum &> /dev/null; then
     cd msgpack-c || exit
     git checkout cpp-7.0.0
     rm -rf build
-    cmake -B build -G Ninja
-    cmake --build build
+    cmake -B build
+    cmake --build build -j$(nproc)
     cmake --install build
     cd -
 else
