@@ -28,6 +28,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/pool_read_access.cpp
     segment/pool_write_access.cpp
     segment/resource_view.cpp
+    segment/snapshot_view.cpp
+    ha/snapshot/allocator_snapshot_codec.cpp
+    ha/snapshot/store_resource_snapshot_codec.cpp
     segment.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp

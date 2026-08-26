@@ -11,6 +11,7 @@ namespace mooncake {
 
 class ScopedSegmentPoolReadAccess;
 class SegmentPool;
+class SegmentPoolSnapshotView;
 
 // Borrowed resource view. Keep the originating Pool read access alive while
 // using it.
@@ -35,6 +36,7 @@ class RegionResourceReadView final {
     const SegmentPool* segment_pool_;
 
     friend class ScopedSegmentPoolReadAccess;
+    friend class SegmentPoolSnapshotView;
 };
 
 }  // namespace mooncake
