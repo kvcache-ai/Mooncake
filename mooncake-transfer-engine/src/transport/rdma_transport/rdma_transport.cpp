@@ -232,7 +232,14 @@ int RdmaTransport::install(std::string &local_server_name,
 }
 
 int RdmaTransport::preTouchMemory(void *addr, size_t length) {
-    if (context_list_.size() == 0) {
+    std::shared_ptr<RdmaContext> pretouch_context;
+    for (auto &context : context_list_) {
+        if (context && context->active()) {
+            pretouch_context = context;
+            break;
+        }
+    }
+    if (!pretouch_context) {
         // At least one context is required for pre-touch.
         return 0;
     }
@@ -253,9 +260,9 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
 
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
         void *block_addr = static_cast<char *>(addr) + thread_i * block_size;
-        threads.emplace_back([this, thread_i, block_addr, block_size,
-                              &thread_results]() {
-            int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
+        threads.emplace_back([pretouch_context, thread_i, block_addr,
+                              block_size, &thread_results]() {
+            int ret = pretouch_context->preTouchMemory(block_addr, block_size);
             thread_results[thread_i] = ret;
         });
     }

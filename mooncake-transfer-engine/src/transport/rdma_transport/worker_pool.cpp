@@ -16,8 +16,11 @@
 
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <functional>
+#include <thread>
 
 #include "config.h"
 #include "memory_location.h"
@@ -116,9 +119,13 @@ static void getPostingShardAssignment(int thread_id, int &post_tid,
 }
 
 WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
+    : WorkerPool(context, numa_socket_id, true) {}
+
+WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id,
+                       bool start_workers)
     : context_(context),
       numa_socket_id_(numa_socket_id),
-      workers_running_(true),
+      workers_running_(start_workers),
       parked_worker_count_(0),
       redispatch_counter_(0),
       submitted_slice_count_(0),
@@ -126,6 +133,7 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     for (int i = 0; i < kShardCount; ++i)
         slice_queue_count_[i].store(0, std::memory_order_relaxed);
     collective_slice_queue_.resize(kTransferWorkerCount);
+    if (!start_workers) return;
     for (int i = 0; i < kTransferWorkerCount; ++i)
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
@@ -251,9 +259,23 @@ int WorkerPool::submitPostSend(
                 }
             }
             if (!found) {
-                slice->markFailed();  // All rails unavailable
-                all_rails_failed_count++;
-                continue;
+                if (noRouteRetryTimedOut(slice)) {
+                    LOG(ERROR) << "Cannot submit RDMA slice because all peer "
+                                  "rails are "
+                                  "paused before timeout, target="
+                               << slice->target_id
+                               << ", selected peer=" << peer_nic_path
+                               << ", retry_cnt=" << slice->rdma.retry_cnt;
+                    slice->markFailed();
+                    all_rails_failed_count++;
+                    continue;
+                }
+                if (slice->ts <= 0) slice->ts = getCurrentTimeInNano();
+                VLOG(1) << "Deferring RDMA slice because all peer rails are "
+                           "paused, target="
+                        << slice->target_id
+                        << ", selected peer=" << peer_nic_path
+                        << ", retry_cnt=" << slice->rdma.retry_cnt;
             }
         }
 
@@ -337,21 +359,94 @@ int WorkerPool::submitPreparedPostSend(
 void WorkerPool::trackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
-    if (!globalConfig().track_rdma_posted_slices) return;
+    if ((!globalConfig().track_rdma_posted_slices &&
+         globalConfig().slice_timeout <= 0) ||
+        count == 0)
+        return;
 
     std::lock_guard<std::mutex> lock(posted_slices_mutex_);
     for (size_t i = first; i < first + count; ++i)
         posted_slices_.insert(slice_list[i]);
 }
 
+void WorkerPool::trackPostedSlices(const SliceList &slice_list, size_t count) {
+    trackPostedSlices(slice_list, 0, count);
+}
+
 void WorkerPool::untrackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
-    if (!globalConfig().track_rdma_posted_slices) return;
+    if ((!globalConfig().track_rdma_posted_slices &&
+         globalConfig().slice_timeout <= 0) ||
+        count == 0)
+        return;
 
     std::lock_guard<std::mutex> lock(posted_slices_mutex_);
     for (size_t i = first; i < first + count; ++i)
         posted_slices_.erase(slice_list[i]);
+}
+
+void WorkerPool::untrackPostedSlices(const ibv_wc *wc_list, int count) {
+    if ((!globalConfig().track_rdma_posted_slices &&
+         globalConfig().slice_timeout <= 0) ||
+        count <= 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(posted_slices_mutex_);
+    for (int i = 0; i < count; ++i) {
+        auto *slice = reinterpret_cast<Transport::Slice *>(wc_list[i].wr_id);
+        posted_slices_.erase(slice);
+    }
+}
+
+WorkerPool::SliceList WorkerPool::reapTimedOutPostedSlices(
+    uint64_t current_ts) {
+    SliceList timed_out;
+    if (globalConfig().slice_timeout <= 0) return timed_out;
+
+    const uint64_t timeout_ns =
+        static_cast<uint64_t>(globalConfig().slice_timeout) * 1000000000ull;
+    std::lock_guard<std::mutex> lock(posted_slices_mutex_);
+    for (auto it = posted_slices_.begin(); it != posted_slices_.end();) {
+        auto *slice = *it;
+        const int64_t ts = slice->ts;
+        if (ts > 0 && current_ts > static_cast<uint64_t>(ts) &&
+            current_ts - static_cast<uint64_t>(ts) > timeout_ns) {
+            timed_out.push_back(slice);
+            it = posted_slices_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return timed_out;
+}
+
+void WorkerPool::handleTimedOutPostedSlices(const SliceList &timed_out_slices) {
+    std::unordered_set<std::string> failed_peer_rails;
+    std::unordered_set<RdmaEndPoint *> deleted_endpoints;
+    for (auto *slice : timed_out_slices) {
+        LOG(ERROR) << "RDMA slice timeout: context=" << context_.deviceName()
+                   << ", peer_nic=" << slice->peer_nic_path
+                   << ", dest_addr=" << (void *)slice->rdma.dest_addr
+                   << ", length=" << slice->length
+                   << ", retry_cnt=" << slice->rdma.retry_cnt
+                   << ", max_retry_cnt=" << slice->rdma.max_retry_cnt;
+        if (!slice->peer_nic_path.empty() &&
+            failed_peer_rails.insert(slice->peer_nic_path).second &&
+            hasAvailablePeerRailAlternative(slice, slice->peer_nic_path)) {
+            markRailFailed(slice->peer_nic_path, true);
+            redispatch_counter_++;
+        }
+        if (slice->rdma.endpoint &&
+            deleted_endpoints.insert(slice->rdma.endpoint).second) {
+            context_.deleteEndpointByPtr(slice->rdma.endpoint);
+        }
+    }
+    if (!timed_out_slices.empty() &&
+        parked_worker_count_.load(std::memory_order_acquire) > 0) {
+        std::lock_guard<std::mutex> lock(cond_mutex_);
+        cond_var_.notify_all();
+    }
 }
 
 void WorkerPool::performPostSend(int thread_id) {
@@ -426,6 +521,7 @@ void WorkerPool::performPostSend(int thread_id) {
 #endif
 
     SliceList failed_slice_list;
+    bool deferred_no_route = false;
     for (auto &entry : local_slice_queue) {
         if (entry.second.empty()) continue;
 
@@ -442,8 +538,13 @@ void WorkerPool::performPostSend(int thread_id) {
         // deadline; only a genuine connection/QP failure can arm or extend it.
         if (!isRailAvailable(entry.first) ||
             context_.isConnectPaused(entry.first)) {
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            entry.second.clear();
+            SliceList keep;
+            for (auto &slice : entry.second) {
+                deferred_no_route |=
+                    keepNoRouteSlice(slice, keep, failed_slice_list,
+                                     "rail is paused", entry.first);
+            }
+            entry.second.swap(keep);
             continue;
         }
 #ifdef CONFIG_CACHE_ENDPOINT
@@ -493,6 +594,16 @@ void WorkerPool::performPostSend(int thread_id) {
                     redispatch_counter_++;
                 }
                 context_.deleteEndpointByPtr(endpoint.get());
+                if (!has_peer_alternative && !local_context_inactive) {
+                    SliceList keep;
+                    for (auto &slice : entry.second) {
+                        deferred_no_route |= keepNoRouteSlice(
+                            slice, keep, failed_slice_list,
+                            "no alternate peer RNIC is available", entry.first);
+                    }
+                    entry.second.swap(keep);
+                    continue;
+                }
                 for (auto &slice : entry.second) {
                     if (!has_peer_alternative && local_context_inactive &&
                         tryHandoffToAnotherLocalWorker(slice)) {
@@ -531,11 +642,10 @@ void WorkerPool::performPostSend(int thread_id) {
         SliceList retry_list;
         SliceList local_retry_list;
         for (auto &slice : failed_slice_list) {
-            if (shouldRetrySlice(slice)) {
-                if (!context_.active())
-                    local_retry_list.push_back(slice);
-                else
-                    retry_list.push_back(slice);
+            if (!context_.active()) {
+                local_retry_list.push_back(slice);
+            } else if (shouldRetrySlice(slice)) {
+                retry_list.push_back(slice);
             } else {
                 slice->markFailed();
                 processed_slice_count_++;
@@ -546,6 +656,9 @@ void WorkerPool::performPostSend(int thread_id) {
         }
         if (!local_retry_list.empty())
             redispatch(local_retry_list, thread_id, true);
+    }
+    if (deferred_no_route) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
 
@@ -602,13 +715,7 @@ void WorkerPool::performPollCq(int thread_id) {
             continue;
         }
 
-        if (nr_poll > 0 && globalConfig().track_rdma_posted_slices) {
-            std::lock_guard<std::mutex> lock(posted_slices_mutex_);
-            for (int i = 0; i < nr_poll; ++i) {
-                auto *slice = reinterpret_cast<Transport::Slice *>(wc[i].wr_id);
-                posted_slices_.erase(slice);
-            }
-        }
+        untrackPostedSlices(wc, nr_poll);
 
         for (int i = 0; i < nr_poll; ++i) {
             Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
@@ -630,11 +737,8 @@ void WorkerPool::performPollCq(int thread_id) {
                                 << "Worker: WR flush error on inactive "
                                 << "local context " << context_.deviceName()
                                 << " (peer_nic: " << slice->peer_nic_path
-                                << "), handing off if retry allows";
-                        if (shouldRetrySlice(slice))
-                            local_failed_slice_list.push_back(slice);
-                        else
-                            finalize_slice(slice, false);
+                                << "), handing off if a local RNIC recovers";
+                        local_failed_slice_list.push_back(slice);
                     } else {
                         if (globalConfig().trace)
                             LOG(INFO) << "Worker: WR flush error (peer_nic: "
@@ -704,7 +808,9 @@ void WorkerPool::performPollCq(int thread_id) {
                         context_.deleteEndpointByPtr(slice->rdma.endpoint);
                     }
                 }
-                if (shouldRetrySlice(slice)) {
+                if (retry_list == &local_failed_slice_list) {
+                    retry_list->push_back(slice);
+                } else if (shouldRetrySlice(slice)) {
                     retry_list->push_back(slice);
                 } else {
                     finalize_slice(slice, false);
@@ -742,6 +848,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
         segment_desc_map;
     const bool use_local_queue = workerCanPost(thread_id);
     int shared_redispatch_count = 0;
+    bool deferred_no_route = false;
     // Remote redispatch needs target metadata to choose a new peer RNIC.
     // Local handoff keeps the peer RNIC fixed and only switches source RNIC, so
     // it can skip this lookup.
@@ -757,39 +864,49 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
     }
 
     for (auto &slice : slice_list) {
+        if (handoff_to_local_worker) {
+            if (tryHandoffToAnotherLocalWorker(slice)) {
+                processed_slice_count_++;
+            } else if (noRouteRetryTimedOut(slice)) {
+                LOG(ERROR)
+                    << "Worker: Cannot redispatch slice because all local "
+                       "RNICs are unavailable before timeout for target "
+                    << slice->target_id << ", peer=" << slice->peer_nic_path
+                    << ", retry_cnt=" << slice->rdma.retry_cnt;
+                slice->markFailed();
+                processed_slice_count_++;
+            } else {
+                deferred_no_route |= deferNoRouteRedispatch(
+                    slice, thread_id, slice->peer_nic_path, -1, true,
+                    shared_redispatch_count, "all local RNICs are unavailable");
+            }
+            continue;
+        }
+
         if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
             slice->markFailed();
             processed_slice_count_++;
         } else {
-            if (handoff_to_local_worker) {
-                if (tryHandoffToAnotherLocalWorker(slice)) {
-                    processed_slice_count_++;
-                    continue;
-                }
-                // A local RNIC failure cannot be repaired by keeping this
-                // worker/context and changing the remote rail. If no other
-                // local worker can take the slice, fail it immediately.
-                slice->markFailed();
-                processed_slice_count_++;
-                continue;
-            }
-
             // Remote-side/default policy: keep local context fixed and switch
             // remote path.
             auto &peer_segment_desc = segment_desc_map[slice->target_id];
             int buffer_id, device_id;
-            if (!peer_segment_desc ||
-                selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
-                                 slice->length, context_.deviceName(),
-                                 buffer_id, device_id, slice->rdma.retry_cnt)) {
+            if (!peer_segment_desc) {
                 LOG(ERROR) << "Worker: Cannot redispatch slice for target "
-                           << slice->target_id
-                           << ", peer segment unavailable or no target RNIC, "
+                           << slice->target_id << ", peer segment unavailable, "
                            << "dest_addr=" << (void *)slice->rdma.dest_addr
                            << ", length=" << slice->length
                            << ", retry_cnt=" << slice->rdma.retry_cnt;
                 slice->markFailed();
                 processed_slice_count_++;
+                continue;
+            }
+            if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
+                                 slice->length, context_.deviceName(),
+                                 buffer_id, device_id, slice->rdma.retry_cnt)) {
+                deferred_no_route |= deferNoRouteRedispatch(
+                    slice, thread_id, slice->peer_nic_path, -1, use_local_queue,
+                    shared_redispatch_count, "no target RNIC is available");
                 continue;
             }
             slice->rdma.dest_rkey =
@@ -821,14 +938,10 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                     }
                 }
                 if (!found) {
-                    LOG(ERROR)
-                        << "Worker: Cannot redispatch slice because all peer "
-                           "rails are paused for target "
-                        << slice->target_id
-                        << ", selected peer=" << peer_nic_path
-                        << ", retry_cnt=" << slice->rdma.retry_cnt;
-                    slice->markFailed();
-                    processed_slice_count_++;
+                    deferred_no_route |= deferNoRouteRedispatch(
+                        slice, thread_id, peer_nic_path, device_id,
+                        use_local_queue, shared_redispatch_count,
+                        "all peer rails are paused");
                     continue;
                 }
             }
@@ -871,6 +984,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
         parked_worker_count_.load(std::memory_order_acquire) > 0) {
         std::lock_guard<std::mutex> lock(cond_mutex_);
         cond_var_.notify_all();
+    }
+    if (deferred_no_route) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
 
@@ -1162,8 +1278,11 @@ void WorkerPool::maybeActivateRecoveredContext() {
 
 bool WorkerPool::hasAvailablePeerRailAlternative(
     Transport::Slice *slice, const std::string &failed_peer_path) {
+    auto &metadata = context_.engine().meta();
+    if (!metadata) return false;
+
     auto peer_segment_desc =
-        context_.engine().meta()->getSegmentDescByID(slice->target_id, false);
+        metadata->getSegmentDescByID(slice->target_id, false);
     if (!peer_segment_desc) return false;
 
     int buffer_id = -1;
@@ -1203,6 +1322,7 @@ void WorkerPool::refreshPublishedLocalTopology() {
     auto updated_desc = std::make_shared<RdmaTransport::SegmentDesc>(*desc);
     updated_desc->topology = *context_.engine().local_topology_;
     for (const auto &context : context_.engine().context_list_) {
+        if (!context) continue;
         if (context->active()) continue;
         updated_desc->topology.disableDevice(context->deviceName());
     }
@@ -1246,6 +1366,10 @@ void WorkerPool::monitorWorker() {
         const uint64_t current_ts =
             static_cast<uint64_t>(getCurrentTimeInNano());
         maybeActivateRecoveredContext();
+
+        auto timed_out_slices = reapTimedOutPostedSlices(current_ts);
+        handleTimedOutPostedSlices(timed_out_slices);
+
         if (current_ts - last_reset_ts > 1000000000ll) {
             // Drain endpoint_store_->waiting_list_ even when no new
             // insertions are happening. Without this, reclaim only runs
@@ -1412,6 +1536,74 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
         return true;
     }
     return false;
+}
+
+bool WorkerPool::keepNoRouteSlice(Transport::Slice *slice, SliceList &keep,
+                                  SliceList &failed, const std::string &reason,
+                                  const std::string &peer_nic_path) {
+    if (slice == nullptr) return false;
+    if (noRouteRetryTimedOut(slice)) {
+        LOG(ERROR) << "RDMA no-route retry timed out while " << reason << ": "
+                   << peer_nic_path << ", target=" << slice->target_id
+                   << ", retry_cnt=" << slice->rdma.retry_cnt;
+        failed.push_back(slice);
+        return false;
+    }
+
+    keep.push_back(slice);
+    return true;
+}
+
+bool WorkerPool::deferNoRouteRedispatch(Transport::Slice *slice, int thread_id,
+                                        const std::string &peer_nic_path,
+                                        int device_id, bool use_local_queue,
+                                        int &shared_redispatch_count,
+                                        const std::string &reason) {
+    if (slice == nullptr) return false;
+    if (noRouteRetryTimedOut(slice)) {
+        LOG(ERROR) << "Worker: Cannot redispatch slice because " << reason
+                   << " before timeout for target " << slice->target_id
+                   << ", peer=" << peer_nic_path
+                   << ", dest_addr=" << (void *)slice->rdma.dest_addr
+                   << ", length=" << slice->length
+                   << ", retry_cnt=" << slice->rdma.retry_cnt;
+        slice->markFailed();
+        processed_slice_count_++;
+        return false;
+    }
+
+    VLOG(1) << "Deferring redispatch because " << reason << " for target "
+            << slice->target_id << ", peer=" << peer_nic_path
+            << ", retry_cnt=" << slice->rdma.retry_cnt;
+    if (slice->ts <= 0) slice->ts = getCurrentTimeInNano();
+
+    if (use_local_queue) {
+        collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
+        return true;
+    }
+
+    const int shard_id =
+        (slice->target_id * 10007 + (device_id >= 0 ? device_id : 0)) %
+        kShardCount;
+    slice_queue_lock_[shard_id].lock();
+    slice_queue_[shard_id][peer_nic_path].push_back(slice);
+    slice_queue_count_[shard_id].fetch_add(1, std::memory_order_relaxed);
+    slice_queue_lock_[shard_id].unlock();
+    shared_redispatch_count++;
+    return true;
+}
+
+bool WorkerPool::noRouteRetryTimedOut(Transport::Slice *slice) const {
+    if (globalConfig().slice_timeout <= 0) return true;
+    if (slice == nullptr || slice->ts <= 0) return false;
+    const uint64_t no_route_timeout_s = std::max<uint64_t>(
+        static_cast<uint64_t>(globalConfig().slice_timeout),
+        globalConfig().rdma_rail_pause_seconds +
+            static_cast<uint64_t>(globalConfig().handshake_connect_timeout));
+    const uint64_t timeout_ns = no_route_timeout_s * 1000000000ull;
+    const uint64_t retry_start_ts = static_cast<uint64_t>(slice->ts);
+    const uint64_t now = getCurrentTimeInNano();
+    return now > retry_start_ts && now - retry_start_ts > timeout_ns;
 }
 
 // Unified retry logic: increment retry count and return whether retry is
