@@ -249,8 +249,8 @@ std::shared_ptr<FakeHaKvBackend> MakeBackendWithBatch(
     auto backend = std::make_shared<FakeHaKvBackend>();
     EXPECT_EQ(ErrorCode::OK,
               backend->Put(BuildDurablePrefixKey(cluster_id),
-                           EncodeDurablePrefix({.batch_id = batch_id,
-                                                .last_seq = last_seq})));
+                           EncodeDurablePrefix(
+                               {.batch_id = batch_id, .last_seq = last_seq})));
     EXPECT_EQ(ErrorCode::OK,
               backend->Put(BuildBatchRecordKey(cluster_id, batch_id),
                            EncodeOpLogBatchRecord(
@@ -260,8 +260,8 @@ std::shared_ptr<FakeHaKvBackend> MakeBackendWithBatch(
 
 bool WaitForAppliedSequence(HotStandbyService& service, uint64_t seq,
                             int max_attempts = 200) {
-    for (int i = 0; i < max_attempts && service.GetLatestAppliedSequenceId() < seq;
-         ++i) {
+    for (int i = 0;
+         i < max_attempts && service.GetLatestAppliedSequenceId() < seq; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     return service.GetLatestAppliedSequenceId() >= seq;
@@ -369,8 +369,8 @@ TEST_F(HotStandbyServiceTest, TestStart_InvalidEtcdEndpoints) {
     config_.enable_oplog_following = true;
     service_ = std::make_unique<HotStandbyService>(config_);
 
-    const ErrorCode err = service_->Start(
-        "primary", "http://127.0.0.1:1", cluster_id_);
+    const ErrorCode err =
+        service_->Start("primary", "http://127.0.0.1:1", cluster_id_);
     EXPECT_NE(ErrorCode::OK, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #else
@@ -420,8 +420,8 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
     config_.enable_oplog_following = true;
     service_ = std::make_unique<HotStandbyService>(config_);
 
-    const ErrorCode err = service_->Start(
-        "primary", "http://127.0.0.1:1", cluster_id_);
+    const ErrorCode err =
+        service_->Start("primary", "http://127.0.0.1:1", cluster_id_);
     EXPECT_NE(ErrorCode::OK, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #else
@@ -562,9 +562,10 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithLocalState) {
 
 TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
     auto backend = std::make_shared<FakeHaKvBackend>();
-    ASSERT_EQ(ErrorCode::OK,
-              backend->Put(BuildDurablePrefixKey(cluster_id_),
-                           EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
     config_.enable_oplog_following = true;
     config_.enable_snapshot_bootstrap = false;
     config_.oplog_poll_interval_ms = 1;
@@ -579,9 +580,10 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
 
 TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
     auto backend = std::make_shared<FakeHaKvBackend>();
-    ASSERT_EQ(ErrorCode::OK,
-              backend->Put(BuildDurablePrefixKey(cluster_id_),
-                           EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
     config_.enable_snapshot_bootstrap = true;
     config_.enable_oplog_following = true;
     config_.oplog_poll_interval_ms = 1;
@@ -859,11 +861,10 @@ TEST_F(HotStandbyServiceTest, TestReplicationLoop_UpdatesMetrics) {
     service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
 
     std::atomic<uint64_t> observed_applied{0};
-    service_->SetSyncStatusCallback(
-        [&](const StandbySyncStatus& status) {
-            observed_applied.store(status.applied_seq_id,
-                                   std::memory_order_relaxed);
-        });
+    service_->SetSyncStatusCallback([&](const StandbySyncStatus& status) {
+        observed_applied.store(status.applied_seq_id,
+                               std::memory_order_relaxed);
+    });
 
     ASSERT_EQ(ErrorCode::OK,
               service_->Start("primary", oplog_endpoints_, cluster_id_));
