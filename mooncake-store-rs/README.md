@@ -815,7 +815,7 @@ Build a distributable wheel and package the standalone client binary:
 Or build in Ubuntu Docker with an explicit Python runtime:
 
 ```bash
-PYTHON=python3.12 ./scripts/build/build-wheel.sh
+PYTHON_VERSION=3.12 ./scripts/build/build-wheel-ubuntu-docker.sh
 ```
 
 The default output layout is:

@@ -157,7 +157,7 @@ What it contains:
 - metadata URL parsing for Redis and etcd
 - shm registration helpers and dummy compatibility RPC client
 
-### `python/mooncake`
+### `python/mooncake_store_rs`
 
 Purpose:
 

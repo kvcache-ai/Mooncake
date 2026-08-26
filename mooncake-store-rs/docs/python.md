@@ -1,6 +1,6 @@
 # Python Guide
 
-`mooncake-store-rs` ships a Python compatibility layer in `crates/mooncake-store-py` and a convenience package in `python/mooncake`.
+`mooncake-store-rs` ships a Python compatibility layer in `crates/mooncake-store-py` and a convenience package in `python/mooncake_store_rs`.
 
 The Python package does not wrap a second store implementation. It reuses the same Rust runtime, control plane, allocator, reclaim logic, tracing, and metrics that the Rust client uses.
 
@@ -249,13 +249,13 @@ Common variants:
 DIST_DIR=artifacts ./scripts/build/build-wheel.sh
 ```
 
-CI jobs that already downloaded native artifacts can skip the upstream CMake
+Build environments that already provide native artifacts can skip the upstream CMake
 portion and reuse `MOONCAKE_UPSTREAM_BUILD_DIR` directly:
 
 ```bash
 MOONCAKE_REUSE_NATIVE_ARTIFACTS=1 \
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
-MOONCAKE_UPSTREAM_BUILD_DIR="$PWD/third_party/Mooncake/build-wheel-compat" \
+MOONCAKE_UPSTREAM_BUILD_DIR="$PWD/build" \
 MOONCAKE_CLASSIC_SHIM_LIB_PATH="$PWD/dist/lib/libmooncake_classic_shim.so" \
 MOONCAKE_TENT_SHIM_LIB_PATH="$PWD/dist/lib/libmooncake_tent_shim.so" \
 ./scripts/build/build-wheel.sh --interpreter python3.10
@@ -266,9 +266,9 @@ instead. It reuses `scripts/build/build-wheel.sh` inside the container and
 produces the same `dist/wheels/` and `dist/bin/` outputs:
 
 ```bash
-./scripts/build/build-wheel.sh
-PYTHON=python3.11 ./scripts/build/build-wheel.sh
-PYTHON=python3.12 ./scripts/build/build-wheel.sh
+./scripts/build/build-wheel-ubuntu-docker.sh
+PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
+PYTHON_VERSION=3.12 ./scripts/build/build-wheel-ubuntu-docker.sh
 ```
 
 Docker wheel notes:

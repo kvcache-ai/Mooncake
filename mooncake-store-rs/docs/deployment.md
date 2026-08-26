@@ -356,7 +356,7 @@ If the host OS is missing wheel-build dependencies, use the Ubuntu Docker
 wrapper and pin the Python runtime explicitly:
 
 ```bash
-PYTHON=python3.11 ./scripts/build/build-wheel.sh
+PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
 ```
 
 The Docker wrapper writes the same wheelhouse outputs as the host build script.

@@ -277,11 +277,11 @@ Keyspace behavior is conditional:
 
 The binary is installed alongside `mooncake-store-client` and `mooncake-store-admin`:
 
-- `build-wheel.sh` installs `mooncake-store-bench` to `dist/bin/` and injects it into the wheel zip under `mooncake/mooncake-store-bench`
-- `pyproject.toml` registers `mooncake-store-bench = "mooncake.cli:main"` as an entry point
+- `build-wheel.sh` installs `mooncake-store-bench` to `dist/bin/` and injects it into the wheel zip under `mooncake_store_rs/mooncake-store-bench`
+- `pyproject.toml` registers `mooncake-store-bench = "mooncake_store_rs.cli:main"` as an entry point
 - `_runtime.py` recognises `mooncake-store-bench` in `invoked_binary_name()` and dispatches `execute_packaged_binary`
 
-After `pip install mooncake`, the tool is available as `mooncake-store-bench` on `$PATH`.
+After `pip install mooncake-store-rs`, the tool is available as `mooncake-store-bench` on `$PATH`.
 
 ## Next reading
 
