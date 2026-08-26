@@ -13,6 +13,7 @@ namespace mooncake {
 
 class ScopedSegmentPoolWriteAccess;
 class ScopedSegmentPoolReadAccess;
+class SegmentPoolSnapshotView;
 
 class SegmentPool final {
    public:
@@ -23,6 +24,7 @@ class SegmentPool final {
     ScopedSegmentPoolWriteAccess AcquireWriteAccess();
     ScopedSegmentPoolReadAccess AcquireReadAccess() const;
     ScopedPlacementReadAccess AcquirePlacementAccess() const;
+    SegmentPoolSnapshotView GetSnapshotView() const noexcept;
 
     [[nodiscard]] StorageUsageSnapshot GetMemoryUsageSnapshot() const;
     [[nodiscard]] StorageUsage GetMemoryUsage() const noexcept {
@@ -46,6 +48,7 @@ class SegmentPool final {
     friend class ScopedSegmentPoolWriteAccess;
     friend class ScopedSegmentPoolReadAccess;
     friend class RegionResourceReadView;
+    friend class SegmentPoolSnapshotView;
     friend class SegmentTest;
 };
 
