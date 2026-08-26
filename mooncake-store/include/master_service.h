@@ -10,7 +10,7 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
-#include "ha/oplog/oplog_manager.h"
+#include "p2p/ha/oplog/oplog_manager.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "replica.h"

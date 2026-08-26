@@ -13,7 +13,7 @@
 #include "ha_helper.h"
 #include "http_metadata_server.h"
 #include "centralized_rpc_service.h"
-#include "p2p_rpc_service.h"
+#include "p2p/master/p2p_rpc_service.h"
 #include "rpc_service.h"
 #include "types.h"
 

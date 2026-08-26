@@ -4,7 +4,7 @@
 
 #include "types.h"
 #include "replica.h"
-#include "heartbeat_type.h"
+#include "p2p/client/heartbeat_type.h"
 #include "task_manager.h"
 
 namespace mooncake {

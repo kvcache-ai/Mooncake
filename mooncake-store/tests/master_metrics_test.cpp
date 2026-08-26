@@ -9,7 +9,7 @@
 #include "master_config.h"
 #include "centralized_master_metric_manager.h"
 #include "master_metric_manager.h"
-#include "p2p_master_metric_manager.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake::test {
 

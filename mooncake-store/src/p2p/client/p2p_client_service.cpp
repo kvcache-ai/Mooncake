@@ -1,0 +1,2829 @@
+#include "p2p/client/p2p_client_service.h"
+
+#include <glog/logging.h>
+
+#include <csignal>
+#include <algorithm>
+#include <charconv>
+#include <limits>
+#include <coroutine>
+#include <cstring>
+#include <cstdlib>
+#include <exception>
+#include <future>
+#include <thread>
+
+#include <async_simple/Try.h>
+#include <async_simple/coro/Lazy.h>
+#include <async_simple/coro/SyncAwait.h>
+#include <ylt/coro_io/coro_io.hpp>
+
+#include "utils/scoped_vlog_timer.h"
+
+namespace mooncake {
+
+namespace {
+
+// Max retries when AsyncWriteRevoke or AsyncUnPinKey fails on the forward path
+// (e.g. after TE write failure, or read cleanup). LEASE_EXPIRED is treated as
+// success; a missing owner record is already OK (idempotent).
+constexpr int kRevokeRetryMaxCnt = 3;
+
+}  // namespace
+
+// ============================================================================
+// Construction / Destruction
+// ============================================================================
+
+P2PClientService::P2PClientService(
+    const std::string& metadata_connstring, uint16_t http_port,
+    bool enable_http_server, const std::map<std::string, std::string>& labels,
+    bool enable_metric_collection)
+    : ClientService(metadata_connstring, http_port, enable_http_server, labels),
+      metrics_(enable_metric_collection ? P2PClientMetric::Create(labels)
+                                        : nullptr),
+      master_client_(client_id_,
+                     metrics_ ? &metrics_->master_client_metric : nullptr) {
+    runtime_config_store_ =
+        std::make_unique<RuntimeConfigStore>(DeploymentMode::P2P);
+}
+
+void P2PClientService::Stop() {
+    LOG(INFO) << "P2PClientService::Stop() — begin";
+
+    {
+        // Holding registration_mutex_ first blocks new (un)registrations and
+        // lets active ones finish before MarkShuttingDown() drains the
+        // in-flight tracker
+        MutexLocker lk(&registration_mutex_);
+
+        // 1. Reject + drain the client's OWN in-flight API calls; also the
+        //    idempotency gate for Stop() (returns false if already shut down).
+        if (!MarkShuttingDown()) {
+            return;  // Already shut down.
+        }
+
+        // 2. Unregister client FIRST so the master stops routing NEW requests
+        // to us (also stops the heartbeat and enters LOCAL_ONLY). The in-flight
+        // tracker is already closed by step 1, so the public UnregisterClient()
+        // would be rejected; call InnerUnregisterClient() directly.
+        if (registered_.load(std::memory_order_acquire)) {
+            try {
+                auto r = InnerUnregisterClient();
+                if (!r) {
+                    LOG(WARNING)
+                        << "Stop(): UnregisterClient failed: " << r.error()
+                        << " — continuing shutdown";
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Stop(): UnregisterClient threw: " << e.what()
+                           << " — continuing shutdown";
+            }
+        }
+    }
+
+    // 3. Reject + drain in-flight INCOMING peer RPCs so their responses are
+    //    delivered before the RPC server is force-closed below. (RouteCaches on
+    //    other clients may still point here even after unregister.)
+    if (client_rpc_service_) {
+        client_rpc_service_->Stop();
+    }
+
+    // 4. Stop HA recovery thread.
+    if (ha_manager_) {
+        ha_manager_->Stop();
+    }
+
+    // 5. Stop async notifier before data_manager to drain pending ops.
+    if (async_route_notifier_) {
+        async_route_notifier_->Stop();
+    }
+
+    // 6. Stop tier scheduler of tiered_backend.
+    if (data_manager_.has_value()) {
+        data_manager_->Stop();
+    }
+
+    // 7. force-stop the RPC server (in-flight peer RPCs already drained).
+    if (client_rpc_server_) {
+        client_rpc_server_->stop();
+    }
+    if (client_rpc_server_thread_.joinable()) {
+        client_rpc_server_thread_.join();
+    }
+
+    // 8. Stop heartbeat + base teardown.
+    try {
+        ClientService::Stop();
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Stop(): ClientService::Stop threw: " << e.what();
+    }
+
+    LOG(INFO) << "P2PClientService::Stop() — complete";
+}
+
+void P2PClientService::Destroy() {
+    LOG(INFO) << "P2PClientService::Destroy() — begin";
+
+    {
+        std::lock_guard<std::mutex> lock(peer_clients_mutex_);
+        peer_clients_.clear();
+    }
+
+    client_rpc_service_.reset();
+    ha_manager_.reset();
+    async_route_notifier_.reset();
+    if (data_manager_.has_value()) {
+        data_manager_->Destroy();
+    }
+    data_manager_.reset();
+
+    ClientService::Destroy();
+
+    LOG(INFO) << "P2PClientService::Destroy() — complete";
+}
+
+P2PClientService::~P2PClientService() {
+    Stop();
+    Destroy();
+}
+
+ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
+    client_rpc_port_ = config.client_rpc_port;
+    transfer_direction_mode_ = config.transfer_direction_mode;
+    master_client_.SetHeartbeatRpcPort(config.heartbeat_rpc_port);
+    // Saved so a later re-registration (after UnregisterClient) can restart
+    // the heartbeat with the same master entry.
+    master_server_entry_ = config.master_server_entry;
+    SetMasterDiscoveryConfig(config);
+
+    local_ip_ = config.local_ip;
+
+    // 1. Try to connect to master (allow failure for degraded startup)
+    bool master_connected = false;
+    ErrorCode err = ConnectToMaster(config.master_server_entry);
+    if (err == ErrorCode::OK) {
+        master_connected = true;
+        LOG(INFO) << "Connected to master successfully";
+    } else {
+        LOG(WARNING)
+            << "Failed to connect to master, starting in DEGRADED mode: "
+            << err;
+    }
+
+    // 2. Try to register with master (allow failure for degraded startup)
+    //    Note: RegisterClient before InitStorage sends empty segments.
+    //    Segment info will be updated via MountSegment during InitStorage
+    //    (if connected) or during recovery (if degraded).
+    bool client_registered = false;
+    if (master_connected) {
+        auto reg = RegisterClient();
+        if (reg) {
+            client_registered = true;
+            LOG(INFO) << "Registered with master successfully";
+        } else {
+            LOG(WARNING) << "Failed to register with master: " << reg.error()
+                         << ", starting in DEGRADED mode";
+        }
+    }
+
+    // 3. Initialize HA recovery manager with appropriate initial state.
+    //    FULL: master connected and client registered.
+    //    DEGRADED: connection or registration failed.
+    HAClientState initial_state =
+        client_registered ? HAClientState::FULL : HAClientState::DEGRADED;
+    auto recovery_mode =
+        config.master_server_entry.rfind("redis://", 0) == 0
+            ? HARecoveryManager::RecoveryMode::RegisterOnly
+            : HARecoveryManager::RecoveryMode::FullMetadataSync;
+    ha_manager_ = std::make_unique<HARecoveryManager>(
+        client_id_, master_client_, data_manager_, async_route_notifier_,
+        view_version_, initial_state, recovery_mode);
+
+    // 4. Start heartbeat immediately after registration so master does not
+    //    consider this client disconnected during a lengthy initialization.
+    StartHeartbeat(config.master_server_entry);
+
+    // 5. Initialize transfer engine (local operation, no master dependency)
+    if (config.transfer_engine == nullptr) {
+        err = InitTransferEngine(config.te_port, metadata_connstring_,
+                                 config.protocol, config.rdma_devices);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to initialize transfer engine";
+            return err;
+        }
+    } else {
+        transfer_engine_ = config.transfer_engine;
+        LOG(INFO) << "Use existing transfer engine instance. Skip its "
+                     "initialization.";
+    }
+    initTeEndpoint();
+
+    // 6. Initialize TieredBackend + DataManager.
+    //    SegmentSyncCallback will check degraded state and skip MountSegment.
+    err = InitStorage(config);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to initialize TieredBackend";
+        return err;
+    }
+
+    // 7. Initialize shared buffer allocator
+    constexpr size_t kDefaultHttpPoolSize = 64ULL * 1024 * 1024;
+    size_t pool_size = config.local_buffer_size > 0 ? config.local_buffer_size
+                                                    : kDefaultHttpPoolSize;
+    InitLocalBufferAllocator(pool_size, config.protocol);
+
+    // 8. Initialize async route notifier if enabled
+    if (config.async_sender_thread_count > 0) {
+        // When async ADD is rejected by Master, delete the local replica
+        // since Master won't track it.
+        SyncFailureCallback failure_cb = [this](std::string_view key,
+                                                const UUID& segment_id,
+                                                ErrorCode error) {
+            LOG(WARNING) << "Async ADD rejected by Master, deleting local"
+                         << ", key=" << key << ", error=" << error;
+            if (data_manager_.has_value()) {
+                auto r = data_manager_->Delete(key, segment_id,
+                                               /*notify_master=*/false);
+                if (!r) {
+                    LOG(ERROR) << "Failed to delete local replica"
+                               << ", key=" << key << ", error=" << r.error();
+                }
+            }
+        };
+        async_route_notifier_ = std::make_unique<AsyncMetadataNotifier>(
+            master_client_, client_id_, config.async_sender_thread_count,
+            config.async_max_batch_size, config.async_route_queue_size,
+            std::move(failure_cb));
+        async_route_notifier_->Start();
+        LOG(INFO) << "Async route notifier enabled, thread_count="
+                  << config.async_sender_thread_count
+                  << ", queue_size=" << config.async_route_queue_size;
+    }
+
+    // 9. Start P2P client RPC service
+    client_rpc_service_.emplace(*data_manager_, metrics_);
+    client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+        config.rpc_thread_num, client_rpc_port_);
+    RegisterClientRpcService(*client_rpc_server_, *client_rpc_service_);
+
+    auto rpc_start_failed = std::make_shared<std::atomic<bool>>(false);
+    client_rpc_server_thread_ = std::thread([this, rpc_start_failed]() {
+        auto ec = client_rpc_server_->start();
+        if (ec) {
+            rpc_start_failed->store(true);
+            LOG(ERROR) << "P2P RPC server failed to start on port "
+                       << client_rpc_port_ << ": " << ec.message();
+        }
+    });
+
+    // Give RPC server a moment to start
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (rpc_start_failed->load()) {
+        LOG(ERROR) << "P2P RPC server could not bind on port "
+                   << client_rpc_port_ << "; aborting service initialization.";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    LOG(INFO) << "P2P RPC server started on port " << client_rpc_port_;
+
+    // 10. If started in FULL state, notify master that sync is complete.
+    //    If in DEGRADED state, heartbeat will recover later.
+    if (!ha_manager_->IsDegraded()) {
+        ha_manager_->SetSyncCompleted();
+    } else {
+        LOG(INFO) << "P2P client started in DEGRADED mode, heartbeat will "
+                  << "establish master connection when available";
+    }
+
+    // 11. Mark service as ready for recovery. HA recovery thread can now
+    // proceed.
+    ha_manager_->SetReadyForRecovery();
+
+    if (!runtime_config_store_->loadFromJson(config.runtime_config_json)) {
+        LOG(ERROR) << "runtime config validation failed during startup, "
+                   << "init aborted";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    // 12. Apply periodic metric-reporting config
+    if (metrics_) {
+        metrics_->StartMetricReporting(config.metric_report_interval_seconds);
+    }
+
+    return ErrorCode::OK;
+}
+
+ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
+    auto tiered_backend =
+        std::make_unique<TieredBackend>(config.lock_shard_count);
+
+    auto add_replica_callback = BuildAddReplicaCallback();
+    auto remove_replica_callback = BuildRemoveReplicaCallback();
+    auto segment_sync_callback = BuildSegmentSyncCallback();
+
+    auto init_result = tiered_backend->Init(
+        config.tiered_backend_config, transfer_engine_.get(),
+        add_replica_callback, remove_replica_callback, segment_sync_callback,
+        metrics_ ? metrics_->tier_metric : nullptr,
+        metrics_ ? metrics_->key_retention : nullptr);
+    if (!init_result) {
+        LOG(ERROR) << "Failed to init TieredBackend: " << init_result.error();
+        return init_result.error();
+    }
+
+    LocalTransferConfig local_transfer_config;
+    local_transfer_config.mode = config.local_transfer_mode;
+    local_transfer_config.te_async_poll_worker_num =
+        config.te_async_poll_worker_num;
+    if (config.local_transfer_mode == LocalTransferMode::TE) {
+        local_transfer_config.te_endpoint = get_te_endpoint();
+    } else {
+        local_transfer_config.local_memcpy_async_worker_num =
+            config.local_memcpy_async_worker_num;
+    }
+    KeyLeaseConfig key_lease_config;
+    key_lease_config.duration_ms = config.p2p_key_lease_duration_ms;
+    key_lease_config.scan_interval_ms = config.p2p_key_lease_scan_interval_ms;
+
+    data_manager_.emplace(std::move(tiered_backend), transfer_engine_,
+                          config.lock_shard_count, local_transfer_config,
+                          key_lease_config);
+    // Set rectify callback on DataManager to remove stale replicas from master
+    data_manager_->SetRectifyCallback([this](std::string_view key,
+                                             std::optional<UUID> tier_id) {
+        if (async_route_notifier_) {
+            if (!tier_id.has_value()) {
+                auto tier_views = data_manager_->GetTierViews();
+                for (const auto& tv : tier_views) {
+                    auto r = async_route_notifier_->EnqueueRemove(key, tv.id);
+                    if (!r) {
+                        LOG(WARNING) << "Failed to enqueue rectify remove"
+                                     << ", key=" << key;
+                    }
+                }
+            } else {
+                auto r = async_route_notifier_->EnqueueRemove(key, *tier_id);
+                if (!r) {
+                    LOG(WARNING) << "Failed to enqueue rectify remove"
+                                 << ", key=" << key;
+                }
+            }
+        } else {
+            if (!tier_id.has_value()) {
+                auto tier_views = data_manager_->GetTierViews();
+                std::vector<UUID> segment_ids;
+                segment_ids.reserve(tier_views.size());
+                for (const auto& tv : tier_views) {
+                    segment_ids.push_back(tv.id);
+                }
+                SyncBatchRemoveReplica(key, std::move(segment_ids));
+            } else {
+                SyncRemoveReplica(key, *tier_id);
+            }
+        }
+    });
+
+    // Initialize route cache
+    if (config.route_cache_max_memory_bytes > 0 &&
+        config.route_cache_ttl_ms > 0) {
+        route_cache_.emplace(config.route_cache_max_memory_bytes,
+                             config.route_cache_ttl_ms);
+    }
+
+    StartHttpServer();
+
+    return ErrorCode::OK;
+}
+
+AddReplicaCallback P2PClientService::BuildAddReplicaCallback() {
+    return [this](std::string_view key, const UUID& tier_id,
+                  size_t size) -> tl::expected<void, ErrorCode> {
+        // In degraded mode, skip metadata notification to Master.
+        // The data is stored locally; the recovery pipeline will re-sync
+        // all local metadata to Master when the connection is restored.
+        if (ha_manager_ && ha_manager_->IsLocalService()) {
+            return {};
+        }
+        if (async_route_notifier_) {
+            return async_route_notifier_->EnqueueAdd(key, tier_id, size);
+        }
+        return SyncAddReplica(key, tier_id, size);
+    };
+}
+
+RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
+    return [this](std::string_view key,
+                  const UUID& tier_id) -> tl::expected<void, ErrorCode> {
+        // In degraded mode, skip metadata notification to Master.
+        // The recovery pipeline will re-sync all local metadata,
+        // and Master will discard routes for keys that no longer
+        // exist locally.
+        if (ha_manager_ && ha_manager_->IsLocalService()) {
+            return {};
+        }
+        if (async_route_notifier_) {
+            return async_route_notifier_->EnqueueRemove(key, tier_id);
+        }
+        return SyncRemoveReplica(key, tier_id);
+    };
+}
+
+tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
+    std::string_view key, const UUID& tier_id, size_t size) {
+    AddReplicaRequest req;
+    req.key = key;
+    req.size = size;
+    req.client_id = client_id_;
+    req.segment_id = tier_id;
+    auto result = master_client_.AddReplica(req);
+    if (!result) {
+        LOG(ERROR) << "Failed to add replica for key: " << key
+                   << " error: " << result.error();
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> P2PClientService::SyncRemoveReplica(
+    std::string_view key, const UUID& tier_id) {
+    RemoveReplicaRequest req;
+    req.key = key;
+    req.client_id = client_id_;
+    req.segment_id = tier_id;
+    auto result = master_client_.RemoveReplica(req);
+    if (!result) {
+        LOG(ERROR) << "Failed to remove replica for key: " << key
+                   << " error: " << result.error();
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+P2PClientService::SyncBatchRemoveReplica(std::string_view key,
+                                         std::vector<UUID> segment_ids) {
+    BatchRemoveReplicaRequest req;
+    req.key = key;
+    req.client_id = client_id_;
+    req.segment_ids = std::move(segment_ids);
+    auto results = master_client_.BatchRemoveReplica(req);
+    for (size_t i = 0; i < results.size(); i++) {
+        if (!results[i]) {
+            LOG(ERROR) << "Failed to remove replica for key: " << key
+                       << ", segment_id: " << req.segment_ids[i]
+                       << ", error: " << results[i].error();
+        }
+    }
+    return results;
+}
+
+SegmentSyncCallback P2PClientService::BuildSegmentSyncCallback() {
+    return [this](const Segment& segment,
+                  bool mount) -> tl::expected<void, ErrorCode> {
+        if (mount) {
+            // Skip MountSegment in degraded mode (master not connected).
+            // Registration during heartbeat recovery will include segment info.
+            if (ha_manager_ && ha_manager_->IsLocalService()) {
+                LOG(INFO) << "Skipping MountSegment in DEGRADED mode: id="
+                          << segment.id << ", name=" << segment.name;
+                return {};
+            }
+            // TODO: There is a race window between the IsLocalService() check
+            // above and the MountSegment() call below. During this window, the
+            // system could transition to degraded mode (e.g., due to master
+            // connection loss), causing the MountSegment RPC to fail. This
+            // would result in segment initialization failure even though the
+            // segment could be registered later during heartbeat recovery.
+            //
+            // Future improvement: Remove BuildSegmentSyncCallback function to
+            // decouple storage layer initialization from master interaction.
+            // The P2PClientService will manage this logic instead, and can
+            // directly convert ha_status to degraded upon RPC failure during
+            // initialization.
+            LOG(INFO) << "Mounting segment with Master: id=" << segment.id
+                      << ", name=" << segment.name << ", size=" << segment.size;
+            auto result = master_client_.MountSegment(segment);
+            if (!result) {
+                LOG(ERROR) << "Failed to mount segment with Master: id="
+                           << segment.id << ", error=" << result.error();
+                return tl::unexpected(result.error());
+            }
+            return {};
+        } else {
+            LOG(INFO) << "Unmounting segment from Master: id=" << segment.id
+                      << ", name=" << segment.name;
+            auto result = master_client_.UnmountSegment(segment.id);
+            if (!result) {
+                LOG(ERROR) << "Failed to unmount segment from Master: id="
+                           << segment.id << ", error=" << result.error();
+                return tl::unexpected(result.error());
+            }
+            return {};
+        }
+    };
+}
+
+// ============================================================================
+// Heartbeat & Registration
+// ============================================================================
+
+HeartbeatRequest P2PClientService::build_heartbeat_request() {
+    HeartbeatRequest req;
+    req.client_id = client_id_;
+
+    if (data_manager_.has_value()) {
+        SyncSegmentMetaParam param;
+        auto tier_views = data_manager_->GetTierViews();
+        for (const auto& view : tier_views) {
+            TierUsageInfo info;
+            info.segment_id = view.id;
+            info.usage = view.usage;
+            param.tier_usages.push_back(info);
+        }
+        req.tasks.emplace_back(HeartbeatTaskType::SYNC_SEGMENT_META,
+                               std::move(param));
+    }
+
+    if (metrics_ && ++metric_sync_heartbeat_count_ >= METRIC_SYNC_FREQ) {
+        metric_sync_heartbeat_count_ = 0;
+        SyncClientMetricParam param;
+        param.snapshot = metrics_->BuildSyncSnapshot();
+        req.tasks.emplace_back(HeartbeatTaskType::SYNC_CLIENT_METRIC,
+                               std::move(param));
+    }
+
+    return req;
+}
+
+std::vector<Segment> P2PClientService::CollectTierSegments() const {
+    std::vector<Segment> segments;
+    if (!data_manager_.has_value()) {
+        return segments;
+    }
+
+    auto tier_views = data_manager_->GetTierViews();
+    segments.reserve(tier_views.size());
+    for (const auto& view : tier_views) {
+        Segment seg;
+        seg.id = view.id;
+        seg.name = view.GetName();
+        seg.size = view.capacity;
+        auto& p2p_extra = seg.GetP2PExtra();
+        p2p_extra.priority = view.priority;
+        p2p_extra.tags = view.tags;
+        p2p_extra.memory_type = view.type;
+        p2p_extra.usage = view.usage;
+        segments.push_back(std::move(seg));
+    }
+    return segments;
+}
+
+tl::expected<RegisterClientResponse, ErrorCode>
+P2PClientService::InnerRegisterClient() {
+    RegisterClientRequest req;
+    req.client_id = client_id_;
+    req.segments = CollectTierSegments();
+    req.deployment_mode = DeploymentMode::P2P;
+    req.ip_address = local_ip_;
+    req.rpc_port = client_rpc_port_;
+
+    auto register_result = master_client_.RegisterClient(req);
+    if (!register_result) {
+        LOG(ERROR) << "Failed to register P2P client: "
+                   << register_result.error() << ", client_id=" << client_id_;
+    } else {
+        view_version_ = register_result.value().view_version;
+        registered_.store(true, std::memory_order_release);
+
+        // A successful register means the master did not have us — drive HA
+        // recovery to re-sync metadata. The register entry points refuse to run
+        // once the service is shutting down, so this only fires while alive.
+        if (ha_manager_) {
+            ha_manager_->HandleEvent(HAEvent::MASTER_RECONNECTED);
+            if (!heartbeat_running_) {
+                LOG(INFO) << "Re-registration: restarting heartbeat"
+                          << ", client_id=" << client_id_;
+                StartHeartbeat(master_server_entry_);
+            }
+        }
+    }
+    return register_result;
+}
+
+tl::expected<void, ErrorCode> P2PClientService::UnregisterClient() {
+    MutexLocker lk(&registration_mutex_);
+    InflightTracker::Guard guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(WARNING) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    return InnerUnregisterClient();
+}
+
+tl::expected<void, ErrorCode> P2PClientService::InnerUnregisterClient() {
+    bool was_registered =
+        registered_.exchange(false, std::memory_order_acq_rel);
+
+    // 1. Tell the master to drop us — but only if we were registered AND still
+    //    believe the master is reachable
+    tl::expected<void, ErrorCode> ret;  // OK unless an attempted RPC fails
+    bool is_local_service = ha_manager_ && ha_manager_->IsLocalService();
+    if (was_registered && !is_local_service) {
+        UnregisterClientRequest req;
+        req.client_id = client_id_;
+        req.deployment_mode = DeploymentMode::P2P;
+        auto result = master_client_.UnregisterClient(req);
+        if (!result) {
+            LOG(ERROR) << "UnregisterClient RPC failed: " << result.error()
+                       << ", client_id=" << client_id_
+                       << " -- proceeding to local-only anyway";
+            ret = tl::make_unexpected(result.error());
+        }
+    }
+
+    // 2. Always become a local-only service: stop the heartbeat (so it no
+    // longer auto-rejoins) and force LOCAL_ONLY. Both are idempotent
+    InnerStopHeartbeat();
+    if (ha_manager_) {
+        ha_manager_->EnterLocalOnly();
+    }
+
+    LOG(INFO) << "UnregisterClient done, now local-only, client_id="
+              << client_id_;
+    return ret;
+}
+
+// ============================================================================
+// HA Recovery — delegate to HARecoveryManager
+// ============================================================================
+
+void P2PClientService::OnHAEvent(HAEvent event) {
+    if (ha_manager_) ha_manager_->HandleEvent(event);
+}
+
+void P2PClientService::RecordLocalInflight(bool entering) {
+    if (!metrics_) return;
+    if (entering) {
+        metrics_->total_request.inflight.inc();
+    } else {
+        metrics_->total_request.inflight.dec();
+    }
+}
+
+std::string P2PClientService::GetHealthStatus() const {
+    if (ha_manager_) {
+        return toString(ha_manager_->GetState());
+    }
+    return "OK";
+}
+
+// ============================================================================
+// Put Operations
+// ============================================================================
+
+tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
+                                                    std::vector<Slice>& slices,
+                                                    const WriteConfig& config) {
+    std::vector<std::vector<Slice>> batched_slices{std::move(slices)};
+    auto result = BatchPut({key}, batched_slices, config);
+    if (result.empty()) {
+        LOG(ERROR) << "BatchPut returned empty result for key: " << key;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    slices = std::move(batched_slices[0]);  // restore original slices
+    return result[0];
+}
+
+std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const WriteConfig& config) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    ScopedVLogTimer timer(1, "P2PClientService::BatchPut");
+    timer.LogRequest("batch_size=", keys.size());
+
+    auto batch_start = std::chrono::steady_clock::now();
+
+    // Compute sizes once after validation; reused by routing and metric
+    // recording. Empty on invalid-input paths.
+    std::vector<size_t> sizes;
+
+    auto guard = AcquireInflightGuard();
+    const auto* route_cfg_ptr = std::get_if<WriteRouteRequestConfig>(&config);
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::SHUTTING_DOWN));
+    } else if (keys.size() != batched_slices.size()) {
+        LOG(ERROR) << "BatchPut input size mismatch";
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!route_cfg_ptr) {
+        LOG(ERROR) << "P2PClientService expects WriteRouteRequestConfig";
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!route_cfg_ptr->IsValid()) {
+        LOG(ERROR) << "invalid WriteRouteRequestConfig: " << *route_cfg_ptr;
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::INVALID_PARAMS));
+    } else {
+        sizes.resize(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            sizes[i] = ClientService::CalculateSliceSize(batched_slices[i]);
+        }
+        results = InnerBatchPut(keys, batched_slices, sizes, *route_cfg_ptr);
+    }
+
+    // Record batch-level metric and count successes in one pass.
+    auto batch_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - batch_start)
+                             .count();
+    size_t success_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (metrics_) {
+            ErrorCode err =
+                results[i].has_value() ? ErrorCode::OK : results[i].error();
+            // sizes is only populated on the valid-input path; bytes are
+            // counted for successful puts only anyway.
+            uint64_t bytes = i < sizes.size() ? sizes[i] : 0;
+            metrics_->total_request.RecordPut(batch_elapsed, err, bytes);
+        }
+        // An idempotent rewrite (already exists) surfaces as success to the
+        // caller but is ignored in all metric layers.
+        if (!results[i].has_value() &&
+            IsAlreadyExistsError(results[i].error())) {
+            results[i] = {};
+        }
+        if (results[i].has_value()) {
+            success_count++;
+        }
+    }
+
+    timer.LogResponse("success=", success_count,
+                      " fail=", keys.size() - success_count);
+    return results;
+}
+
+bool P2PClientService::IsLocalWrite(const WriteRouteRequestConfig& cfg) const {
+    if (ha_manager_ && ha_manager_->IsLocalService()) return true;
+    if (cfg.remote_weight <= 0.0) return true;   // force local
+    if (cfg.remote_weight >= 1.0) return false;  // force remote
+    return IsBelowLocalWaterline(cfg);
+}
+
+bool P2PClientService::IsBelowLocalWaterline(
+    const WriteRouteRequestConfig& cfg) const {
+    if (cfg.local_write_waterline <= 0.0 || !data_manager_) return false;
+
+    auto tiers = data_manager_->GetTierViews();
+    auto eligible = [&](const TierView& t) {
+        if (t.priority < cfg.priority_limit) return false;
+        for (const auto& tag : cfg.tag_filters)
+            if (std::find(t.tags.begin(), t.tags.end(), tag) != t.tags.end())
+                return false;
+        return true;
+    };
+
+    // Single pass: accumulate all-tier and top-tier stats.
+    size_t all_free = 0, all_total = 0, top_free = 0, top_total = 0;
+    int max_priority = std::numeric_limits<int>::min();
+    for (const auto& t : tiers) {
+        if (!eligible(t)) continue;
+        all_total += t.capacity;
+        all_free += t.free_space;
+        if (t.priority > max_priority) {
+            max_priority = t.priority;
+            top_free = t.free_space;
+            top_total = t.capacity;
+        } else if (t.priority == max_priority) {
+            top_total += t.capacity;
+            top_free += t.free_space;
+        }
+    }
+
+    const size_t total = cfg.top_tier_only ? top_total : all_total;
+    const size_t free = cfg.top_tier_only ? top_free : all_free;
+    if (total == 0) return false;
+    const double utilization = 1.0 - static_cast<double>(free) / total;
+    return utilization < cfg.local_write_waterline;
+}
+
+std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<size_t>& sizes,
+    const WriteRouteRequestConfig& route_config) {
+    if (IsLocalWrite(route_config)) {
+        return InnerBatchPutLocalOnly(keys, batched_slices, sizes);
+    }
+    return InnerBatchPutNormal(keys, batched_slices, sizes, route_config);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+P2PClientService::InnerBatchPutLocalOnly(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<size_t>& sizes) {
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "Data manager not initialized";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    }
+
+    // Phase 1: dispatch all local writes in parallel.
+    std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
+        handles;
+    handles.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        handles.push_back(CreatePutHandleFromLocal(keys[i], batched_slices[i]));
+    }
+
+    // Phase 2: wait each handle and collect results.
+    return CollectResults(handles, keys, metrics_.get(), &sizes);
+}
+
+tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
+P2PClientService::CreatePutHandleFromLocal(std::string_view key,
+                                           std::vector<Slice>& slices) {
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "Data manager not initialized";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto local_handle = data_manager_->Put(key, slices);
+
+    if (local_handle) {
+        return std::move(local_handle.value());
+    } else if (!IsAlreadyExistsError(local_handle.error())) {
+        LOG(ERROR) << "Local write failed for key: " << key
+                   << ", error: " << local_handle.error();
+    }
+
+    return tl::unexpected(local_handle.error());
+}
+
+std::vector<tl::expected<void, ErrorCode>> P2PClientService::CollectResults(
+    std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>&
+        handles,
+    const std::vector<ObjectKey>& keys, P2PClientMetric* metrics,
+    const std::vector<size_t>* sizes) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    for (size_t i = 0; i < handles.size(); ++i) {
+        auto io_start = std::chrono::steady_clock::now();
+        if (!handles[i]) {
+            if (IsAlreadyExistsError(handles[i].error())) {
+                LOG(WARNING) << "Put skipped (already exists), key: " << keys[i]
+                             << ", error: " << handles[i].error();
+            } else {
+                LOG(ERROR) << "Failed to put key: " << keys[i]
+                           << ", error: " << handles[i].error();
+            }
+            results[i] = tl::unexpected(handles[i].error());
+        } else if (!handles[i].value()) {
+            LOG(ERROR) << "put task handle is null for key: " << keys[i];
+            results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        } else {
+            auto wait_result = handles[i].value()->Wait();
+            if (!wait_result) {
+                if (IsAlreadyExistsError(wait_result.error())) {
+                    LOG(WARNING)
+                        << "Put skipped (already exists), key: " << keys[i]
+                        << ", error: " << wait_result.error();
+                } else {
+                    LOG(ERROR) << "Failed to put key: " << keys[i]
+                               << ", error: " << wait_result.error();
+                }
+            }
+            // Keep the raw error (including already-exists); BatchPut
+            // normalizes it for the caller after metric recording.
+            results[i] = wait_result;
+        }
+        if (metrics && sizes) {
+            // TODO(metric): local write per-op latency is timed around Wait().
+            // This is not fully accurate: for TE mode the transfer is submitted
+            // at Dispatch() and Wait() only polls, so elapsed may undercount;
+            // in a serial wait loop later keys may also undercount because
+            // their I/O makes progress while earlier keys are being waited on.
+            // Will be fixed once TE supports a completion callback.
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - io_start)
+                    .count();
+            ErrorCode err =
+                results[i].has_value() ? ErrorCode::OK : results[i].error();
+            metrics->local_request.RecordPut(elapsed, err, (*sizes)[i]);
+        }
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+P2PClientService::InnerBatchPutNormal(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<size_t>& sizes,
+    const WriteRouteRequestConfig& route_config) {
+    // Phase 1: fetch write routes from master.
+    auto batch_routes = BatchFetchWriteRoutes(keys, sizes, route_config);
+    if (!batch_routes) {
+        LOG(ERROR) << "BatchGetWriteRoute RPC failed: " << batch_routes.error();
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(batch_routes.error()));
+    }
+
+    // Phase 2:
+    // 2.1: async dispatch first-candidate writes for each key
+    // 2.2: wrap each key in a retry chain based on rotute
+    auto handles = CreatePutHandlesFromRoute(
+        keys, batched_slices, sizes, route_config, batch_routes.value());
+
+    // Phase 3: wait every retry chain and collect results.
+    return CollectResults(handles, keys);
+}
+
+tl::expected<BatchGetWriteRouteResponse, ErrorCode>
+P2PClientService::BatchFetchWriteRoutes(const std::vector<ObjectKey>& keys,
+                                        const std::vector<size_t>& sizes,
+                                        const WriteRouteRequestConfig& config) {
+    BatchGetWriteRouteRequest req;
+    req.client_id = client_id_;
+    req.config = config;
+    req.keys.assign(keys.begin(), keys.end());
+    req.sizes = sizes;
+    auto batch_route_result = master_client_.BatchGetWriteRoute(req);
+    if (!batch_route_result) {
+        LOG(ERROR) << "BatchGetWriteRoute RPC failed: "
+                   << batch_route_result.error();
+        return batch_route_result;
+    }
+    return batch_route_result;
+}
+
+std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
+P2PClientService::CreatePutHandlesFromRoute(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<size_t>& sizes,
+    const WriteRouteRequestConfig& route_config,
+    BatchGetWriteRouteResponse& batch_resp) {
+    struct WriteTask {
+        std::unique_ptr<TaskHandle<void>> first_task;
+        std::unique_ptr<WriteOp> first_op;
+        std::vector<std::unique_ptr<WriteOp>> retry_op_list;
+    };
+
+    // Step 1: dispatch first candidate for each key so all writes are
+    // in-flight before we build retry chain.
+    std::vector<tl::expected<WriteTask, ErrorCode>> tasks;
+    tasks.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (batch_resp.error_codes[i] != ErrorCode::OK) {
+            tasks.push_back(tl::unexpected(batch_resp.error_codes[i]));
+            continue;
+        }
+        auto ops =
+            BuildWriteOps(keys[i], batched_slices[i], sizes[i], route_config,
+                          std::move(batch_resp.responses[i].candidates));
+        if (!ops) {
+            LOG(ERROR) << "fail to build write ops"
+                       << ", key=" << keys[i] << ", error=" << ops.error();
+            tasks.push_back(tl::unexpected(ops.error()));
+            continue;
+        }
+        std::string first_route(ops->front()->route());
+        std::unique_ptr<TaskHandle<void>> first_task;
+        try {
+            // start a async write task and generate a wait handle
+            first_task = ops->front()->Dispatch();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "First-candidate dispatch threw, key: " << keys[i]
+                       << ", route: " << first_route << ", what: " << e.what();
+            tasks.push_back(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+            continue;
+        } catch (...) {
+            LOG(ERROR) << "First-candidate dispatch threw unknown, key: "
+                       << keys[i] << ", route: " << first_route;
+            tasks.push_back(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+            continue;
+        }
+        tasks.push_back(WriteTask{std::move(first_task),
+                                  std::move(ops->front()),
+                                  {std::make_move_iterator(ops->begin() + 1),
+                                   std::make_move_iterator(ops->end())}});
+    }
+
+    // Step 2: build a retry chain for each key and wrap it in task_handle
+    using Handle = tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>;
+    std::vector<Handle> handles;
+    handles.reserve(keys.size());
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        if (!tasks[i]) {
+            handles.push_back(tl::unexpected(tasks[i].error()));
+            continue;
+        }
+        auto& task = *tasks[i];
+        auto promise = std::make_shared<
+            async_simple::Promise<tl::expected<void, ErrorCode>>>();
+        auto future = promise->getFuture();
+        RunWriteWithRetry(std::move(promise), std::move(task.first_task),
+                          std::move(task.first_op),
+                          std::move(task.retry_op_list), keys[i], sizes[i])
+            .via(GetCoroExecutor())
+            .start([](auto&&) {});
+        handles.push_back(FutureHandle<void>::Create(std::shared_ptr<void>{},
+                                                     std::move(future)));
+    }
+    return handles;
+}
+
+auto P2PClientService::BuildWriteOps(std::string_view key,
+                                     std::vector<Slice>& slices,
+                                     size_t object_size,
+                                     const WriteRouteRequestConfig& config,
+                                     std::vector<WriteCandidate> candidates)
+    -> tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode> {
+    if (candidates.empty()) {
+        LOG(ERROR) << "No write candidates for key: " << key;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    auto write_req = std::make_shared<RemoteWriteRequest>();
+    write_req->key = key;
+    for (const auto& slice : slices) {
+        RemoteBufferDesc buf;
+        buf.segment_endpoint = get_te_endpoint();
+        buf.addr = reinterpret_cast<uintptr_t>(slice.ptr);
+        buf.size = slice.size;
+        write_req->src_buffers.push_back(buf);
+    }
+
+    std::vector<std::unique_ptr<WriteOp>> write_ops;
+    for (auto& candidate : candidates) {
+        if (candidate.client_id == client_id_) {
+            // Defensive check: master should not return local candidates when
+            // remote_weight>=1 (force remote), but if it does, just skip it.
+            if (config.remote_weight >= 1.0) {
+                LOG(WARNING) << "Master returned local candidate but "
+                                "remote_weight>=1 (force remote), skipping";
+                continue;
+            } else if (!data_manager_.has_value()) {
+                LOG(ERROR) << "Data manager not initialized";
+                continue;
+            }
+            write_ops.push_back(
+                std::make_unique<LocalWriteOp>(&*data_manager_, key, &slices));
+        } else {
+            std::string endpoint =
+                candidate.ip_address + ":" + std::to_string(candidate.rpc_port);
+            auto* peer = &GetOrCreatePeerClient(endpoint);
+            if (transfer_direction_mode_ == TransferDirectionMode::FORWARD) {
+                if (!data_manager_.has_value()) {
+                    LOG(ERROR) << "Data manager not initialized";
+                    continue;
+                }
+                DataManager* dm = &*data_manager_;
+                RemoteForwardWriteOp::TeTransferFn te_transfer =
+                    [dm](void* local_base, size_t size,
+                         const std::vector<RemoteBufferDesc>& dest_buffers) {
+                        return dm->TransferDataAsync(
+                            local_base, size, dest_buffers,
+                            Transport::TransferRequest::WRITE);
+                    };
+                write_ops.push_back(std::make_unique<RemoteForwardWriteOp>(
+                    peer, metrics_, write_req, endpoint, &slices,
+                    std::move(te_transfer), dm->GetCoroExecutor()));
+            } else {
+                // segment_id is intentionally left unset: the write route is
+                // client-granular; the remote peer picks the concrete segment.
+                P2PProxyDescriptor proxy;
+                proxy.client_id = candidate.client_id;
+                proxy.ip_address = candidate.ip_address;
+                proxy.rpc_port = candidate.rpc_port;
+                proxy.object_size = object_size;
+                write_ops.push_back(std::make_unique<RemoteReverseWriteOp>(
+                    peer, write_req, std::move(proxy),
+                    route_cache_ ? &*route_cache_ : nullptr, endpoint));
+            }
+        }
+    }
+
+    if (write_ops.empty()) {
+        LOG(ERROR) << "No valid candidates for key: " << key;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    return write_ops;
+}
+
+// DataManager bridges local TE Put so WaitAsync only awaits TE wait (via
+// te_wait_pool_ when configured); copy/commit run after resume on the business
+// executor. Wait coroutines poll getTransferStatus and yield with
+// coro_io::sleep_for.
+std::unique_ptr<TaskHandle<void>> P2PClientService::LocalWriteOp::Dispatch() {
+    if (!data_manager) {
+        LOG(ERROR) << "Data manager not initialized";
+        return CallableTaskHandle<void>::Create(
+            []() -> tl::expected<void, ErrorCode> {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            });
+    }
+    dispatch_start = std::chrono::steady_clock::now();
+    auto handle = data_manager->Put(key, *slices);
+    if (!handle) {
+        if (!IsAlreadyExistsError(handle.error())) {
+            LOG(ERROR) << "Local write failed (dispatch), key: " << key
+                       << ", error: " << handle.error();
+        }
+        return CallableTaskHandle<void>::Create(
+            [e = handle.error()]() -> tl::expected<void, ErrorCode> {
+                return tl::make_unexpected(e);
+            });
+    }
+    return std::move(handle.value());
+}
+
+std::unique_ptr<TaskHandle<void>>
+P2PClientService::RemoteForwardWriteOp::Dispatch() {
+    dispatch_start = std::chrono::steady_clock::now();
+    if (!peer_ptr || !te_transfer || !write_req || !slices) {
+        LOG(ERROR) << "Forward remote write missing peer, transfer callback, "
+                      "request, or slices";
+        return CallableTaskHandle<void>::Create(
+            []() -> tl::expected<void, ErrorCode> {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            });
+    }
+    auto promise = std::make_shared<WritePromise>();
+    auto future = promise->getFuture();
+    RemoteForwardWriteOp::RunForwardRemotePut(
+        std::move(promise), peer_ptr, metrics, te_transfer, write_req, slices)
+        .via(coro_executor != nullptr ? coro_executor
+                                      : coro_io::get_global_executor())
+        .start([](auto&&) {});
+    return FutureHandle<void>::Create(write_req, std::move(future));
+}
+
+std::unique_ptr<TaskHandle<void>>
+P2PClientService::RemoteReverseWriteOp::Dispatch() {
+    dispatch_start = std::chrono::steady_clock::now();
+    if (!peer_ptr || !write_req) {
+        LOG(ERROR) << "Reverse remote write missing peer or request";
+        return CallableTaskHandle<void>::Create(
+            []() -> tl::expected<void, ErrorCode> {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            });
+    }
+    auto promise = std::make_shared<
+        async_simple::Promise<tl::expected<void, ErrorCode>>>();
+    auto future = promise->getFuture();
+
+    auto req = write_req;
+    auto cached_proxy = proxy;
+    auto* cache = route_cache;
+
+    peer_ptr->AsyncWriteRemoteData(*write_req)
+        .start([promise, req, cached_proxy,
+                cache](async_simple::Try<tl::expected<UUID, ErrorCode>>&&
+                           remote_res) mutable {
+            tl::expected<void, ErrorCode> out;
+            try {
+                auto& result = remote_res.value();
+                if (result.has_value()) {
+                    if (cache) {
+                        P2PProxyDescriptor desc = cached_proxy;
+                        desc.segment_id = result.value();
+                        cache->Upsert(req->key, {desc});
+                    }
+                } else {
+                    if (!IsAlreadyExistsError(result.error())) {
+                        LOG(ERROR)
+                            << "Failed to write to remote, key: " << req->key
+                            << ", error: " << result.error();
+                    }
+                    out = tl::make_unexpected(result.error());
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Remote write threw, key: " << req->key
+                           << ", what: " << e.what();
+                out = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            } catch (...) {
+                LOG(ERROR) << "Remote write threw unknown, key: " << req->key;
+                out = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            promise->setValue(std::move(out));
+        });
+
+    return FutureHandle<void>::Create(req, std::move(future));
+}
+
+async_simple::coro::Lazy<void> P2PClientService::RunWriteWithRetry(
+    std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+        promise,
+    std::unique_ptr<TaskHandle<void>> current_task,
+    std::unique_ptr<WriteOp> current_op,
+    std::vector<std::unique_ptr<WriteOp>> retry_op_list, std::string_view key,
+    size_t object_size) {
+    size_t retry_cnt = 0;
+    tl::expected<void, ErrorCode> result;
+    // we assume that current_task non-null implies current_op non-null
+    while (current_task) {
+        try {
+            result = co_await current_task->WaitAsync();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Wait threw, key: " << key
+                       << ", route: " << current_op->route()
+                       << ", what: " << e.what();
+            result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        } catch (...) {
+            LOG(ERROR) << "Wait threw unknown, key: " << key
+                       << ", route: " << current_op->route();
+            result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        // Per-attempt metric: elapsed from dispatch to completion.
+        if (metrics_) {
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() -
+                    current_op->dispatch_start)
+                    .count();
+            bool is_local = (current_op->route() == "local");
+            ErrorCode err = result.has_value() ? ErrorCode::OK : result.error();
+            if (is_local) {
+                metrics_->local_request.RecordPut(elapsed, err, object_size);
+            } else {
+                metrics_->remote_request.RecordPut(elapsed, err, object_size);
+            }
+        }
+
+        if (result.has_value() || IsAlreadyExistsError(result.error())) {
+            promise->setValue(std::move(result));
+            co_return;
+        }
+        LOG(ERROR) << "Write candidate failed, key: " << key
+                   << ", route: " << current_op->route()
+                   << ", retry_cnt: " << retry_cnt
+                   << ", error: " << result.error();
+        current_task.reset();
+        current_op.reset();
+        while (retry_cnt < retry_op_list.size() && !current_task) {
+            auto& op = retry_op_list[retry_cnt];
+            current_op = std::move(op);
+            // Count every retry attempt, including ones whose Dispatch
+            // throws below.
+            if (metrics_) {
+                metrics_->remote_request.write_retries.inc();
+            }
+            try {
+                current_task = current_op->Dispatch();
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Dispatch threw, key: " << key
+                           << ", route: " << current_op->route()
+                           << ", retry_cnt: " << retry_cnt
+                           << ", what: " << e.what();
+                current_op.reset();
+            } catch (...) {
+                LOG(ERROR) << "Dispatch threw unknown, key: " << key
+                           << ", retry_cnt: " << retry_cnt
+                           << ", route: " << current_op->route();
+                current_op.reset();
+            }
+            retry_cnt++;
+        }
+    }
+    if (result.has_value()) {
+        result = tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    LOG(ERROR) << "write failed with all retry list"
+               << ", key:" << key << ", error: " << result.error();
+    promise->setValue(std::move(result));
+}
+
+// ============================================================================
+// Get Operations
+// ============================================================================
+
+tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
+    const std::string& key, std::shared_ptr<ClientBufferAllocator> allocator,
+    const ReadRouteConfig& config) {
+    return std::move(BatchGet({key}, allocator, config)[0]);
+}
+
+tl::expected<int64_t, ErrorCode> P2PClientService::Get(
+    const std::string& key, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes, const ReadRouteConfig& config) {
+    return std::move(BatchGet({key}, {buffers}, {sizes}, config)[0]);
+}
+
+std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
+P2PClientService::BatchGet(const std::vector<std::string>& keys,
+                           std::shared_ptr<ClientBufferAllocator> allocator,
+                           const ReadRouteConfig& config) {
+    if (!allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return std::vector<
+            tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    auto create_handles = [&] {
+        return BatchCreateGetHandles(keys, allocator, config);
+    };
+    auto extract_buf = [](ReadTaskHandle& h) { return h.read_buf; };
+
+    return BatchGetImpl<std::shared_ptr<BufferHandle>>(keys, create_handles,
+                                                       extract_buf);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const ReadRouteConfig& config, bool /*aggregate_same_segment_task*/) {
+    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
+        LOG(ERROR) << "Input vector sizes mismatch";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::vector<std::vector<Slice>> all_slices(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        all_slices[i].reserve(all_buffers[i].size());
+        for (size_t j = 0; j < all_buffers[i].size(); ++j) {
+            all_slices[i].emplace_back(
+                Slice{all_buffers[i][j], all_sizes[i][j]});
+        }
+    }
+
+    auto create_handles = [&] {
+        return BatchCreateGetHandles(keys, all_slices, config);
+    };
+    auto extract_size = [](ReadTaskHandle& h) { return h.data_size; };
+
+    return BatchGetImpl<int64_t>(keys, create_handles, extract_size);
+}
+
+template <typename ResultT, typename CreateHandlesFn, typename ExtractFn>
+std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
+    const std::vector<std::string>& keys, CreateHandlesFn&& create_handles,
+    ExtractFn&& extract) {
+    ScopedVLogTimer timer(1, "P2PClientService::BatchGet");
+    timer.LogRequest("batch_size=", keys.size());
+
+    auto batch_start = std::chrono::steady_clock::now();
+
+    std::vector<tl::expected<ResultT, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    std::vector<tl::expected<ReadTaskHandle, ErrorCode>> handles;
+
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::SHUTTING_DOWN));
+    } else {
+        handles = create_handles();
+        if (handles.size() != keys.size()) {
+            LOG(ERROR) << "handles size mismatch";
+            std::fill(results.begin(), results.end(),
+                      tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        } else {
+            for (size_t i = 0; i < handles.size(); ++i) {
+                if (!handles[i]) {
+                    if (handles[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+                        LOG(ERROR)
+                            << "Failed to create get handle for key: "
+                            << keys[i] << ", error: " << handles[i].error();
+                    }
+                    results[i] = tl::unexpected(handles[i].error());
+                } else {
+                    auto io_start = std::chrono::steady_clock::now();
+                    auto wait_result = handles[i]->task_handle->Wait();
+                    auto elapsed =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - io_start)
+                            .count();
+                    if (!wait_result) {
+                        if (wait_result.error() !=
+                            ErrorCode::OBJECT_NOT_FOUND) {
+                            LOG(ERROR) << "Failed to get key: " << keys[i]
+                                       << ", error: " << wait_result.error();
+                        } else {
+                            VLOG(1) << "key not found: " << keys[i];
+                        }
+                        results[i] = tl::unexpected(wait_result.error());
+                    } else {
+                        results[i] = extract(handles[i].value());
+                    }
+                    // Record per-key local read metric.
+                    if (metrics_ && handles[i]->is_local) {
+                        // TODO(wanyue.wy):
+                        // Currently the latency of local read per-op is not
+                        // accurate. Before the Wait() function is executed, the
+                        // data may have already been transferred to the target
+                        // buffer. This issue will be fixed once TE supports a
+                        // completion callback.
+                        ErrorCode err = results[i].has_value()
+                                            ? ErrorCode::OK
+                                            : results[i].error();
+                        uint64_t bytes =
+                            results[i].has_value() ? handles[i]->data_size : 0;
+                        metrics_->local_request.RecordGet(elapsed, err, bytes);
+                    }
+                }
+            }  // end for
+        }
+    }
+
+    // Record batch-level metric and count successes in one pass.
+    auto batch_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - batch_start)
+                             .count();
+    size_t success_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value()) {
+            success_count++;
+        }
+        if (metrics_) {
+            ErrorCode err =
+                results[i].has_value() ? ErrorCode::OK : results[i].error();
+            uint64_t bytes = results[i].has_value()
+                                 ? static_cast<uint64_t>(handles[i]->data_size)
+                                 : 0;
+            metrics_->total_request.RecordGet(batch_elapsed, err, bytes);
+        }
+    }
+
+    timer.LogResponse("success=", success_count,
+                      " fail=", keys.size() - success_count);
+    return results;
+}
+
+std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
+P2PClientService::BatchCreateGetHandles(
+    const std::vector<std::string>& keys,
+    std::shared_ptr<ClientBufferAllocator> allocator,
+    const ReadRouteConfig& config) {
+    auto local_get = [&](std::string_view key,
+                         size_t) -> tl::expected<ReadTaskHandle, ErrorCode> {
+        if (!data_manager_.has_value()) {
+            LOG(ERROR) << "Data manager is not initialized";
+            return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        return data_manager_->Get(key, allocator);
+    };
+    auto remote_get = [&](std::string_view key, size_t,
+                          std::vector<ResolvedRoute> routes) {
+        return CreateRemoteGetHandle(key, allocator, config, std::move(routes));
+    };
+    return BatchCreateGetHandlesImpl(keys, config, local_get, remote_get);
+}
+
+std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
+P2PClientService::BatchCreateGetHandles(
+    const std::vector<std::string>& keys,
+    std::vector<std::vector<Slice>>& all_slices,
+    const ReadRouteConfig& config) {
+    auto local_get = [&](std::string_view key,
+                         size_t i) -> tl::expected<ReadTaskHandle, ErrorCode> {
+        if (!data_manager_.has_value()) {
+            LOG(ERROR) << "Data manager is not initialized";
+            return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        return data_manager_->Get(key, all_slices[i]);
+    };
+    auto remote_get = [&](std::string_view key, size_t i,
+                          std::vector<ResolvedRoute> routes) {
+        return CreateRemoteGetHandle(key, all_slices[i], config,
+                                     std::move(routes));
+    };
+    return BatchCreateGetHandlesImpl(keys, config, local_get, remote_get);
+}
+
+template <typename LocalGetFn, typename RemoteGetFn>
+std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
+P2PClientService::BatchCreateGetHandlesImpl(
+    const std::vector<std::string>& keys, const ReadRouteConfig& config,
+    LocalGetFn&& local_get, RemoteGetFn&& remote_get) {
+    std::vector<tl::expected<ReadTaskHandle, ErrorCode>> handles;
+    handles.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        handles.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    }
+
+    // Phase A: try local for all keys; collect indices that need remote fetch.
+    std::vector<size_t> miss_indices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto start = std::chrono::steady_clock::now();
+        auto local = local_get(keys[i], i);
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        if (local.has_value()) {
+            handles[i] = std::move(local.value());
+            handles[i]->is_local = true;
+            // Local hit: per-attempt metric recorded after Wait() in
+            // BatchGetImpl.
+        } else if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to get from local, key: " << keys[i]
+                       << ", error: " << local.error();
+            handles[i] = tl::unexpected(local.error());
+            if (metrics_) {
+                metrics_->local_request.RecordGet(elapsed, local.error(), 0);
+            }
+        } else {
+            if (metrics_) {
+                metrics_->local_request.RecordGet(
+                    elapsed, ErrorCode::OBJECT_NOT_FOUND, 0);
+            }
+            miss_indices.push_back(i);
+        }
+    }
+
+    if (miss_indices.empty()) {
+        // All keys are found locally.
+        return handles;
+    }
+
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
+        // DEGRADED: master is unreachable, so a local miss is the terminal
+        // answer. The underlying TieredBackend keeps its miss at VLOG; surface
+        // the end-to-end miss here as a warning.
+        for (size_t i : miss_indices) {
+            LOG(WARNING) << "degraded service: key not found locally"
+                         << ", key=" << keys[i];
+        }
+        return handles;
+    }
+
+    // Phase B: batch-fetch routes for local-miss keys
+    std::vector<std::string_view> miss_key_views;
+    miss_key_views.reserve(miss_indices.size());
+    for (size_t i : miss_indices) {
+        miss_key_views.emplace_back(keys[i]);
+    }
+    auto routes = BatchFetchReadRoutes(miss_key_views, config);
+
+    // Phase C: remote get for each miss
+    for (size_t j = 0; j < miss_indices.size(); ++j) {
+        const size_t i = miss_indices[j];
+        if (!routes[j]) {
+            if (routes[j].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                // Local miss + master has no route => the key does not exist
+                // anywhere in the cluster. This is the authoritative end-to-end
+                // read miss for a non-degraded service.
+                LOG(WARNING) << "remote read miss: key not found in cluster"
+                             << ", key=" << keys[i];
+            }
+            handles[i] = tl::unexpected(routes[j].error());
+        } else {
+            handles[i] = remote_get(keys[i], i, std::move(routes[j].value()));
+        }
+    }
+    return handles;
+}
+
+std::vector<
+    tl::expected<std::vector<P2PClientService::ResolvedRoute>, ErrorCode>>
+P2PClientService::BatchFetchReadRoutes(
+    const std::vector<std::string_view>& keys, const ReadRouteConfig& config) {
+    std::vector<tl::expected<std::vector<ResolvedRoute>, ErrorCode>> result(
+        keys.size(), std::vector<ResolvedRoute>{});
+
+    // check route cache, collect misses
+    std::vector<std::string_view> miss_keys;
+    std::vector<size_t> miss_pos;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto cached = LoadCachedRoutes(keys[i]);
+        if (!cached.empty()) {
+            result[i] = std::move(cached);
+        } else {
+            miss_keys.push_back(keys[i]);
+            miss_pos.push_back(i);
+        }
+    }
+    if (miss_keys.empty()) {
+        // all keys are found in route cache
+        return result;
+    }
+
+    // Single batch RPC to master
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> responses;
+    responses = master_client_.BatchGetReplicaList(miss_keys, config);
+    for (size_t k = 0; k < responses.size(); ++k) {
+        if (!responses[k]) {
+            if (responses[k].error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(ERROR) << "BatchFetchReadRoutes failed: "
+                           << responses[k].error();
+            }
+            result[miss_pos[k]] = tl::unexpected(responses[k].error());
+            continue;
+        }
+        auto routes = ReplicasToRoutes(responses[k].value().replicas);
+        if (routes.empty()) {
+            LOG(ERROR) << "invalid route, key=" << miss_keys[k];
+            result[miss_pos[k]] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            continue;
+        }
+        if (route_cache_) {
+            std::vector<P2PProxyDescriptor> descriptors;
+            descriptors.reserve(routes.size());
+            for (const auto& r : routes) {
+                descriptors.push_back(r.proxy);
+            }
+            route_cache_->Upsert(miss_keys[k], std::move(descriptors));
+        }
+        result[miss_pos[k]] = std::move(routes);
+    }
+    return result;
+}
+
+std::vector<P2PClientService::ResolvedRoute> P2PClientService::LoadCachedRoutes(
+    std::string_view key) {
+    std::vector<ResolvedRoute> routes;
+    if (route_cache_) {
+        for (const auto& item : route_cache_->Get(key).items()) {
+            P2PProxyDescriptor proxy;
+            proxy.client_id = item.client_id;
+            proxy.segment_id = item.segment_id;
+            proxy.ip_address = item.ip_address;
+            proxy.rpc_port = item.rpc_port;
+            proxy.object_size = item.object_size;
+            if (proxy.ip_address.empty() || proxy.rpc_port == 0) {
+                LOG(ERROR) << "skip invalid cached p2p route, empty ip or zero "
+                              "port, key="
+                           << key << ", client_id=" << proxy.client_id
+                           << ", ip_address='" << proxy.ip_address << "'"
+                           << ", rpc_port=" << proxy.rpc_port;
+                continue;
+            }
+            std::string endpoint =
+                proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+            auto& peer = GetOrCreatePeerClient(endpoint);
+            routes.push_back(
+                {&peer, proxy.object_size, /*is_cached=*/true, proxy});
+        }
+    }
+    return routes;
+}
+
+std::vector<P2PClientService::ResolvedRoute> P2PClientService::ReplicasToRoutes(
+    const std::vector<Replica::Descriptor>& replicas) {
+    std::vector<ResolvedRoute> routes;
+    if (replicas.empty()) {
+        LOG(WARNING) << "replicas is empty";
+        return routes;
+    }
+    uint64_t total_size = 0;
+    for (const auto& replica : replicas) {
+        if (!replica.is_p2p_proxy_replica()) {
+            LOG(ERROR) << "invalid replica, not p2p proxy replica";
+            return routes;
+        }
+    }
+    total_size = calculate_total_size(replicas[0]);
+    if (total_size == 0) {
+        LOG(ERROR) << "invalid replica, total size is 0";
+        return routes;
+    }
+
+    for (const auto& replica : replicas) {
+        auto proxy = replica.get_p2p_proxy_descriptor();
+        if (proxy.ip_address.empty() || proxy.rpc_port == 0) {
+            LOG(ERROR) << "skip invalid p2p route, empty ip or zero port"
+                       << ", client_id=" << proxy.client_id << ", ip_address='"
+                       << proxy.ip_address << "'"
+                       << ", rpc_port=" << proxy.rpc_port;
+            continue;
+        }
+        std::string endpoint =
+            proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+        auto& peer = GetOrCreatePeerClient(endpoint);
+        routes.push_back({&peer, total_size, /*is_cached=*/false, proxy});
+    }
+    return routes;
+}
+
+tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
+    std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator,
+    const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched) {
+    auto iter = BuildRouteIter(key, config, std::move(pre_fetched));
+    if (!iter) {
+        LOG(ERROR) << "Failed to build route iterator, key=" << key
+                   << ", error=" << iter.error();
+        return tl::unexpected(iter.error());
+    }
+
+    const uint64_t object_size = iter->object_size();
+    auto alloc_result = allocator->allocate(object_size);
+    if (!alloc_result) {
+        LOG(ERROR) << "Failed to allocate buffer for get, key: " << key;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    auto read_buf = std::make_shared<BufferHandle>(std::move(*alloc_result));
+    std::vector<Slice> slices = {{read_buf->ptr(), object_size}};
+
+    auto result = InnerGetViaRoute(key, slices, std::move(*iter));
+    if (!result) {
+        LOG(ERROR) << "Failed to get via route, key=" << key
+                   << ", error=" << result.error();
+        return tl::unexpected(result.error());
+    } else {
+        // the read_buf is allocated in this function,
+        // so we need to guarantee the lifetime of read_buf
+        result->read_buf = std::move(read_buf);
+    }
+    return result;
+}
+
+tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
+    std::string_view key, std::vector<Slice>& slices,
+    const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched) {
+    auto iter = BuildRouteIter(key, config, std::move(pre_fetched));
+    if (!iter) {
+        if (iter.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to build route iterator, key=" << key
+                       << ", error=" << iter.error();
+        }
+        return tl::unexpected(iter.error());
+    }
+    auto result = InnerGetViaRoute(key, slices, std::move(*iter));
+    if (!result) {
+        LOG(ERROR) << "Failed to get via route, key=" << key
+                   << ", error=" << result.error();
+        return tl::unexpected(result.error());
+    }
+    return result;
+}
+
+tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
+    std::string_view key, std::vector<Slice>& slices, RouteIterator iter) {
+    auto req = std::make_shared<RemoteReadRequest>();
+    req->key = key;
+    for (const auto& s : slices) {
+        RemoteBufferDesc buf;
+        buf.segment_endpoint = get_te_endpoint();
+        buf.addr = reinterpret_cast<uintptr_t>(s.ptr);
+        buf.size = s.size;
+        req->dest_buffers.push_back(buf);
+    }
+
+    auto promise = std::make_shared<
+        async_simple::Promise<tl::expected<void, ErrorCode>>>();
+    auto future = promise->getFuture();
+
+    const uint64_t object_size = iter.object_size();
+    RunReadWithRetry(std::move(iter), req, promise)
+        .via(GetCoroExecutor())
+        .start([](auto&&) {});
+
+    ReadTaskHandle res;
+    res.data_size = object_size;
+    res.task_handle =
+        FutureHandle<void>::Create(std::move(req), std::move(future));
+    return res;
+}
+
+async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
+    const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
+    std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+        promise) {
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "Forward transfer read requires DataManager";
+        co_return ErrorCode::INTERNAL_ERROR;
+    }
+    if (req->dest_buffers.size() != 1) {
+        LOG(ERROR)
+            << "Forward transfer read supports a single dest buffer only, key="
+            << req->key << ", buffer_count=" << req->dest_buffers.size();
+        co_return ErrorCode::NOT_IMPLEMENTED;
+    }
+    void* base = reinterpret_cast<void*>(req->dest_buffers[0].addr);
+    const size_t total = req->dest_buffers[0].size;
+
+    // Scope `pin` so the tl::expected does not live across the TE-wait
+    // suspend point. Hold the produced Future in an optional (async_simple::
+    // Future has no default ctor) so only a Future/trivial locals cross the
+    // suspend. Works around gcc-11/12 coroutine-lowering ICE in
+    // build_special_member_call.
+    std::optional<async_simple::Future<tl::expected<void, ErrorCode>>>
+        transfer_fut;
+    UUID read_operation_id{};
+    {
+        PinKeyRequest pin_req;
+        pin_req.key = req->key;
+        auto pin = co_await route.peer->AsyncPinKey(pin_req);
+        if (!pin) {
+            if (pin.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(ERROR) << "AsyncPinKey failed, key=" << req->key
+                           << ", error=" << pin.error();
+            }
+            co_return pin.error();
+        }
+        read_operation_id = pin.value().read_operation_id;
+        transfer_fut = data_manager_->TransferDataAsync(
+            base, total, {pin.value().remote_buffer},
+            Transport::TransferRequest::READ);
+    }
+
+    auto tr = co_await AwaitExpectedFuture(std::move(*transfer_fut),
+                                           GetCoroExecutor());
+    if (!tr) {
+        LOG(ERROR) << "Forward TE read failed, key=" << req->key
+                   << ", error=" << tr.error();
+        UnPinKeyRequest cleanup;
+        cleanup.key = req->key;
+        cleanup.read_operation_id = read_operation_id;
+        Stopwatch rollback_sw;
+        bool cleanup_ok = false;
+        ErrorCode cleanup_error = ErrorCode::OK;
+        for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
+            if (metrics_) {
+                metrics_->rollback.unpin_key_requests.inc();
+            }
+            auto r = co_await route.peer->AsyncUnPinKey(cleanup);
+            if (r) {
+                cleanup_ok = true;
+                break;
+            }
+            cleanup_error = r.error();
+            if (cleanup_error == ErrorCode::LEASE_EXPIRED) {
+                cleanup_ok = true;
+                break;
+            }
+            if (attempt + 1 < kRevokeRetryMaxCnt) {
+                LOG(WARNING)
+                    << "AsyncUnPinKey retry after TE failure, key=" << req->key
+                    << ", attempt=" << (attempt + 1)
+                    << ", error=" << cleanup_error;
+            }
+        }
+        if (metrics_) {
+            if (cleanup_ok) {
+                metrics_->rollback.unpin_key_latency_success.observe(
+                    rollback_sw.elapsed_us());
+            } else {
+                metrics_->rollback.unpin_key_failures.inc();
+                metrics_->rollback.unpin_key_latency_failure.observe(
+                    rollback_sw.elapsed_us());
+            }
+        }
+        if (!cleanup_ok) {
+            LOG(ERROR) << "AsyncUnPinKey failed after TE read failure, key="
+                       << req->key << ", error=" << cleanup_error;
+        }
+        co_return tr.error();
+    }
+    // Success: skip UnPinKey to save RPC latency; owner lease / scanner
+    // releases pin.
+    promise->setValue(tl::expected<void, ErrorCode>{});
+    co_return ErrorCode::OK;
+}
+
+// Coroutine iterates route candidates and retries on failure.
+async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
+    RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
+    std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+        promise) {
+    const uint64_t object_size = iter.object_size();
+    ErrorCode final_result = ErrorCode::OBJECT_NOT_FOUND;
+    try {
+        bool first_attempt = true;
+        while (auto route = co_await iter.AsyncNext()) {
+            // Every route iteration after the first is a retry.
+            if (!first_attempt && metrics_) {
+                metrics_->remote_request.read_retries.inc();
+            }
+            first_attempt = false;
+            auto attempt_start = std::chrono::steady_clock::now();
+            try {
+                const bool forward_read =
+                    transfer_direction_mode_ == TransferDirectionMode::FORWARD;
+                ErrorCode route_result;
+                if (forward_read) {
+                    route_result =
+                        co_await RunForwardReadOnRoute(*route, req, promise);
+                } else {
+                    auto result =
+                        co_await route->peer->AsyncReadRemoteData(*req);
+                    route_result =
+                        result.has_value() ? ErrorCode::OK : result.error();
+                }
+
+                auto elapsed =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - attempt_start)
+                        .count();
+                if (metrics_) {
+                    metrics_->remote_request.RecordGet(elapsed, route_result,
+                                                       object_size);
+                }
+
+                if (route_result == ErrorCode::OK) {
+                    if (!forward_read) {
+                        tl::expected<void, ErrorCode> ok;
+                        promise->setValue(std::move(ok));
+                    }
+                    co_return;
+                } else if (route_result != ErrorCode::OBJECT_NOT_FOUND) {
+                    LOG(ERROR)
+                        << (forward_read ? "Forward read failed, key: "
+                                         : "Failed to get from remote, key: ")
+                        << req->key << ", error: " << route_result
+                        << ", route: " << route->proxy.ip_address << ":"
+                        << route->proxy.rpc_port
+                        << ", client_id: " << route->proxy.client_id
+                        << ", segment_id: " << route->proxy.segment_id
+                        << ", is_cached: " << route->is_cached;
+                    if (route_result == ErrorCode::INVALID_PARAMS ||
+                        route_result == ErrorCode::NOT_IMPLEMENTED) {
+                        promise->setValue(tl::expected<void, ErrorCode>(
+                            tl::unexpected(route_result)));
+                        co_return;
+                    }
+                }
+
+                final_result = route_result;
+            } catch (const std::exception& e) {
+                auto elapsed =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - attempt_start)
+                        .count();
+                if (metrics_) {
+                    metrics_->remote_request.RecordGet(
+                        elapsed, ErrorCode::INTERNAL_ERROR, object_size);
+                }
+
+                final_result = ErrorCode::INTERNAL_ERROR;
+                LOG(ERROR) << "Failed to get from remote, key: " << req->key
+                           << ", exception: " << e.what()
+                           << ", route: " << route->proxy.ip_address << ":"
+                           << route->proxy.rpc_port
+                           << ", client_id: " << route->proxy.client_id
+                           << ", segment_id: " << route->proxy.segment_id
+                           << ", is_cached: " << route->is_cached;
+            } catch (...) {
+                auto elapsed =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - attempt_start)
+                        .count();
+                if (metrics_) {
+                    metrics_->remote_request.RecordGet(
+                        elapsed, ErrorCode::INTERNAL_ERROR, object_size);
+                }
+                final_result = ErrorCode::INTERNAL_ERROR;
+                LOG(ERROR) << "Failed to get from remote, key: " << req->key
+                           << ", unknown exception"
+                           << ", route: " << route->proxy.ip_address << ":"
+                           << route->proxy.rpc_port
+                           << ", client_id: " << route->proxy.client_id
+                           << ", segment_id: " << route->proxy.segment_id
+                           << ", is_cached: " << route->is_cached;
+            }
+            iter.Evict(*route);
+        }
+        tl::expected<void, ErrorCode> err = tl::make_unexpected(final_result);
+        promise->setValue(std::move(err));
+    } catch (...) {
+        tl::expected<void, ErrorCode> internal_err =
+            tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        promise->setValue(std::move(internal_err));
+    }
+}
+
+// ============================================================================
+// P2PClientService::RouteIterator
+// ============================================================================
+
+P2PClientService::RouteIterator::RouteIterator(
+    std::string_view key, std::vector<ResolvedRoute> initial,
+    uint64_t object_size, RouteCache* route_cache, MasterFetch master_fetch)
+    : key_(key),
+      routes_(std::move(initial)),
+      object_size_(object_size),
+      route_cache_(route_cache),
+      master_fetch_(std::move(master_fetch)) {}
+
+void P2PClientService::RouteIterator::Prime() {
+    if (!routes_.empty() || master_queried_) {
+        return;
+    }
+    master_queried_ = true;
+    // syncAwait is safe here: Prime() is always called from the user thread,
+    // not an IO/RPC callback thread.
+    auto master_routes = async_simple::coro::syncAwait(master_fetch_());
+    if (master_routes.empty()) {
+        return;
+    }
+    UpsertToCache(master_routes);
+    routes_.insert(routes_.end(),
+                   std::make_move_iterator(master_routes.begin()),
+                   std::make_move_iterator(master_routes.end()));
+    if (!routes_.empty()) {
+        object_size_ = routes_.front().object_size;
+    }
+}
+
+auto P2PClientService::RouteIterator::AsyncNext()
+    -> async_simple::coro::Lazy<std::optional<ResolvedRoute>> {
+    if (idx_ < routes_.size()) {
+        co_return routes_[idx_++];
+    }
+    if (master_queried_) {
+        co_return std::nullopt;
+    }
+    master_queried_ = true;
+    auto master_routes = co_await master_fetch_();
+    if (master_routes.empty()) {
+        co_return std::nullopt;
+    }
+    UpsertToCache(master_routes);
+    routes_.insert(routes_.end(),
+                   std::make_move_iterator(master_routes.begin()),
+                   std::make_move_iterator(master_routes.end()));
+    if (object_size_ == 0) {
+        object_size_ = routes_[idx_].object_size;
+    }
+    if (idx_ < routes_.size()) {
+        co_return routes_[idx_++];
+    }
+    co_return std::nullopt;
+}
+
+void P2PClientService::RouteIterator::UpsertToCache(
+    const std::vector<ResolvedRoute>& routes) {
+    if (!route_cache_ || routes.empty()) {
+        return;
+    }
+    std::vector<P2PProxyDescriptor> ps;
+    ps.reserve(routes.size());
+    for (const auto& r : routes) {
+        ps.push_back(r.proxy);
+    }
+    route_cache_->Upsert(key_, ps);
+}
+
+void P2PClientService::RouteIterator::Evict(const ResolvedRoute& route) {
+    if (route.is_cached && route_cache_) {
+        route_cache_->RemoveReplica(key_, {route.proxy});
+    }
+}
+
+tl::expected<P2PClientService::RouteIterator, ErrorCode>
+P2PClientService::BuildRouteIter(std::string_view key,
+                                 const ReadRouteConfig& config) {
+    return BuildRouteIter(key, config, LoadCachedRoutes(key));
+}
+
+tl::expected<P2PClientService::RouteIterator, ErrorCode>
+P2PClientService::BuildRouteIter(std::string_view key,
+                                 const ReadRouteConfig& config,
+                                 std::vector<ResolvedRoute> pre_fetched) {
+    auto routes = std::move(pre_fetched);
+    uint64_t object_size = routes.empty() ? 0 : routes.front().object_size;
+    RouteIterator iter(key, std::move(routes), object_size,
+                       route_cache_ ? &(*route_cache_) : nullptr,
+                       [this, key, config]() {
+                           return AsyncResolveRoutesFromMaster(key, config);
+                       });
+    if (iter.empty()) {
+        iter.Prime();
+        if (iter.empty()) {
+            return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+    }
+    return iter;
+}
+
+async_simple::coro::Lazy<std::vector<P2PClientService::ResolvedRoute>>
+P2PClientService::AsyncResolveRoutesFromMaster(std::string_view key,
+                                               const ReadRouteConfig& config) {
+    auto replica_result =
+        co_await master_client_.AsyncGetReplicaList(key, config);
+    if (!replica_result) {
+        if (replica_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to query replica list, key=" << key
+                       << ", error=" << replica_result.error();
+        }
+        co_return std::vector<ResolvedRoute>{};
+    }
+    auto routes = ReplicasToRoutes(replica_result.value().replicas);
+    if (routes.empty()) {
+        LOG(ERROR) << "Cannot determine size for key: " << key;
+    }
+    co_return routes;
+}
+
+// ============================================================================
+// IsExist / BatchIsExist (P2P: local-first)
+// ============================================================================
+
+tl::expected<bool, ErrorCode> P2PClientService::IsExist(
+    const std::string& key) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+
+    // Check local first
+    if (data_manager_.has_value() && data_manager_->Exist(key)) {
+        return true;
+    }
+
+    // DEGRADED: skip Master fallback, return local-only result
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
+        return false;
+    }
+
+    // Fallback to master
+    return master_client_.ExistKey(key);
+}
+
+std::vector<tl::expected<bool, ErrorCode>> P2PClientService::BatchIsExist(
+    const std::vector<std::string>& keys) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::SHUTTING_DOWN));
+    }
+
+    std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
+    std::vector<size_t> miss_indices;
+    std::vector<std::string_view> miss_keys;
+
+    // Batch local check
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool local_hit =
+            data_manager_.has_value() && data_manager_->Exist(keys[i]);
+        if (local_hit) {
+            results[i] = true;
+        } else {
+            miss_indices.push_back(i);
+            miss_keys.emplace_back(keys[i]);
+        }
+    }
+
+    // Local-only service (LOCAL_ONLY/DEGRADED): skip the master fallback and
+    // report misses as not-found, matching the singular IsExist().
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
+        for (size_t idx : miss_indices) {
+            results[idx] = false;
+        }
+        return results;
+    }
+
+    // Batch query master for misses
+    if (!miss_keys.empty()) {
+        auto master_results = master_client_.BatchExistKey(miss_keys);
+        for (size_t j = 0; j < miss_indices.size(); ++j) {
+            results[miss_indices[j]] = master_results[j];
+        }
+    }
+
+    return results;
+}
+
+// ============================================================================
+// Query Operations
+// ============================================================================
+
+tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
+    const std::string& object_key, const ReadRouteConfig& config) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+
+    // 1) Local first
+    if (data_manager_.has_value()) {
+        auto local = data_manager_->Query(object_key);
+        if (local.has_value()) {
+            P2PProxyDescriptor proxy;
+            proxy.client_id = client_id_;
+            proxy.segment_id = local.value().first;
+            proxy.ip_address = local_ip_;
+            proxy.rpc_port = client_rpc_port_;
+            proxy.object_size = local.value().second;
+
+            Replica::Descriptor desc;
+            desc.descriptor_variant = std::move(proxy);
+            desc.status = ReplicaStatus::COMPLETE;
+
+            std::vector<Replica::Descriptor> replicas;
+            replicas.push_back(std::move(desc));
+            return std::make_unique<QueryResult>(std::move(replicas));
+        }
+        if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "fail to query local object"
+                       << ", key=" << object_key << ", error=" << local.error();
+            return tl::make_unexpected(local.error());
+        }
+    }
+
+    // 2) Local miss + DEGRADED: master unreachable, treat as not found.
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
+        LOG(WARNING) << "fail to access master"
+                     << ", key=" << object_key;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    // 3) Local miss + healthy: fall back to master.
+    auto result = master_client_.GetReplicaList(object_key, config);
+    if (!result) {
+        LOG(WARNING) << "fail to get replica list"
+                     << ", key=" << object_key << ", error=" << result.error();
+        return tl::unexpected(result.error());
+    }
+
+    return std::make_unique<QueryResult>(std::move(result.value().replicas));
+}
+
+std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
+P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
+                             const ReadRouteConfig& config) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
+            results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.push_back(tl::make_unexpected(ErrorCode::SHUTTING_DOWN));
+        }
+        return results;
+    }
+    // Local-only service (LOCAL_ONLY/DEGRADED): master is unreachable / no
+    // longer routing for us, so treat every key as not-found, matching the
+    // singular Query().
+    if (ha_manager_ && ha_manager_->IsLocalService()) {
+        std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
+            results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+        }
+        return results;
+    }
+
+    std::vector<std::string_view> key_views(object_keys.begin(),
+                                            object_keys.end());
+    auto responses = master_client_.BatchGetReplicaList(key_views, config);
+    std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>> results;
+    results.reserve(responses.size());
+    for (size_t i = 0; i < responses.size(); ++i) {
+        if (responses[i]) {
+            results.emplace_back(std::make_unique<QueryResult>(
+                std::move(responses[i].value().replicas)));
+        } else {
+            results.emplace_back(tl::unexpected(responses[i].error()));
+        }
+    }
+    return results;
+}
+
+// ============================================================================
+// Remove Operations (Not Supported in P2P)
+// Attention:
+// The behavior of this type of interface has not yet been defined.
+// At present, all keys will be evicted by the client's scheduler according
+// to a specific strategy.
+// The external active remove call is not allowed currently
+// ============================================================================
+
+tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key,
+                                                       bool force) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    LOG(WARNING) << "Remove is not supported in P2P mode";
+    return {};  // return ok for ut
+}
+
+tl::expected<long, ErrorCode> P2PClientService::RemoveByRegex(
+    const ObjectKey& str, bool force) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    LOG(WARNING) << "RemoveByRegex is not supported in P2P mode";
+    return {};  // return ok for ut
+}
+
+tl::expected<long, ErrorCode> P2PClientService::RemoveAll(bool force) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    LOG(WARNING) << "RemoveAll is not supported in P2P mode";
+    return {};  // return ok for ut
+}
+
+tl::expected<long, ErrorCode> P2PClientService::RemoveAllLocal() {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "data_manager_ is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto result = data_manager_->RemoveAll();
+    if (!result.has_value()) {
+        LOG(ERROR) << "fail to call RemoveAll"
+                   << ", error_code=" << result.error();
+        return tl::make_unexpected(result.error());
+    }
+    LOG(INFO) << "RemoveAllLocal: removed " << result.value() << " local keys";
+    return result.value();
+}
+
+tl::expected<void, ErrorCode> P2PClientService::RemoveLocal(
+    const ObjectKey& key) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "data_manager_ is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto result = data_manager_->Delete(key);
+    if (!result.has_value()) {
+        LOG(ERROR) << "fail to call Delete"
+                   << ", key=" << key << ", error_code=" << result.error();
+        return tl::make_unexpected(result.error());
+    }
+    LOG(INFO) << "RemoveLocal: removed key=" << key;
+    return {};
+}
+
+tl::expected<size_t, ErrorCode> P2PClientService::GetLocalKeyCount() {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "data_manager_ is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    size_t count = 0;
+    data_manager_->ForEachKeyBatch(
+        [&count](std::vector<ReplicaLocation>&& batch) {
+            count += batch.size();
+            return true;
+        });
+    return count;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+P2PClientService::GetLocalKeys(size_t limit) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "data_manager_ is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::vector<std::string> keys;
+    data_manager_->ForEachKeyBatch(
+        [&keys, limit](std::vector<ReplicaLocation>&& batch) {
+            // limit <= 0 means no limit
+            const bool need_limit = limit > 0;
+            keys.reserve(keys.size() + batch.size());
+            for (auto& loc : batch) {
+                keys.push_back(std::move(loc.key));
+                if (need_limit && keys.size() >= limit) {
+                    return false;  // no need to continue
+                }
+            }
+            return true;
+        });
+    return keys;
+}
+
+// ============================================================================
+// MountSegment / UnmountSegment (Not Supported)
+// ============================================================================
+
+tl::expected<void, ErrorCode> P2PClientService::MountSegment(
+    const void* buffer, size_t size, const std::string& protocol) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    // Due to TieredBackend does not support dynamic capacity scaling,
+    // P2PClientService could not support segment mount/unmount functions.
+    // Currently, the segment is mounted in TieredBackend::Init(),
+    // and is unmounted in TieredBackend::Destroy()
+    LOG(WARNING) << "MountSegment is not supported in P2P mode. "
+                 << "Please use TieredBackend::Init config for tier setup.";
+    return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<void, ErrorCode> P2PClientService::UnmountSegment(
+    const void* buffer, size_t size) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    // P2PClientService does not support dynamic segment mount/unmount.
+    // See MountSegment comment for details.
+    LOG(WARNING) << "UnmountSegment is not supported in P2P mode.";
+    return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+// ============================================================================
+// PeerClient management
+// ============================================================================
+
+async_simple::Executor* P2PClientService::GetCoroExecutor() const {
+    if (data_manager_.has_value()) {
+        if (async_simple::Executor* ex = data_manager_->GetCoroExecutor()) {
+            return ex;
+        }
+    }
+    return coro_io::get_global_executor();
+}
+
+PeerClient& P2PClientService::GetOrCreatePeerClient(
+    const std::string& endpoint) {
+    std::lock_guard<std::mutex> lock(peer_clients_mutex_);
+    auto it = peer_clients_.find(endpoint);
+    if (it != peer_clients_.end()) {
+        return *it->second;
+    }
+
+    auto client = std::make_unique<PeerClient>();
+    auto connect_result = client->Connect(endpoint);
+    if (!connect_result) {
+        LOG(ERROR) << "Failed to connect PeerClient to " << endpoint
+                   << " error: " << connect_result.error();
+        // Still store it; Connect may succeed lazily on first RPC.
+    }
+
+    auto [inserted_it, _] = peer_clients_.emplace(endpoint, std::move(client));
+    return *inserted_it->second;
+}
+
+async_simple::coro::Lazy<void>
+P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
+    std::shared_ptr<WritePromise> promise, PeerClient* peer,
+    std::shared_ptr<P2PClientMetric> metrics, TeTransferFn te_transfer,
+    std::shared_ptr<RemoteWriteRequest> write_req, std::vector<Slice>* slices) {
+    // Ensure the Dispatch()-side WritePromise always completes. TE poll cancel
+    // / shutdown completes the transfer Future with setException; without this
+    // catch the outer promise would hang forever (.start ignores Lazy errors).
+    try {
+        if (!peer || !te_transfer || !write_req || !slices) {
+            promise->setValue(tl::expected<void, ErrorCode>(
+                tl::unexpected(ErrorCode::INTERNAL_ERROR)));
+            co_return;
+        }
+        if (slices->size() != 1) {
+            LOG(ERROR)
+                << "Forward transfer write supports a single slice only, key="
+                << write_req->key << ", slice_count=" << slices->size();
+            promise->setValue(tl::expected<void, ErrorCode>(
+                tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
+            co_return;
+        }
+        PreWriteRequest pre_req;
+        pre_req.key = write_req->key;
+        pre_req.size_bytes = slices->front().size;
+        pre_req.target_tier_id = write_req->target_tier_id;
+
+        auto pre = co_await peer->AsyncPreWrite(pre_req);
+        if (!pre) {
+            if (!IsAlreadyExistsError(pre.error())) {
+                LOG(ERROR) << "AsyncPreWrite failed, key=" << write_req->key
+                           << ", error=" << pre.error();
+            }
+            promise->setValue(
+                tl::expected<void, ErrorCode>(tl::unexpected(pre.error())));
+            co_return;
+        }
+
+        std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
+        void* base = slices->front().ptr;
+        auto te = co_await AwaitExpectedFuture(
+            te_transfer(base, slices->front().size, dest));
+        if (!te) {
+            LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
+                       << ", error=" << te.error();
+            WriteRevokeRequest revoke_req;
+            revoke_req.key = write_req->key;
+            revoke_req.write_operation_id = pre.value().write_operation_id;
+            Stopwatch rollback_sw;
+            tl::expected<void, ErrorCode> revoke_res;
+            for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
+                if (metrics) {
+                    metrics->rollback.write_revoke_requests.inc();
+                }
+                revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
+                if (revoke_res) {
+                    break;
+                }
+                if (revoke_res.error() == ErrorCode::LEASE_EXPIRED) {
+                    revoke_res = tl::expected<void, ErrorCode>{};
+                    break;
+                }
+                if (attempt + 1 < kRevokeRetryMaxCnt) {
+                    LOG(WARNING)
+                        << "AsyncWriteRevoke retry after TE failure, key="
+                        << write_req->key << ", attempt=" << (attempt + 1)
+                        << ", error=" << revoke_res.error();
+                }
+            }
+            if (metrics) {
+                if (revoke_res) {
+                    metrics->rollback.write_revoke_latency_success.observe(
+                        rollback_sw.elapsed_us());
+                } else {
+                    metrics->rollback.write_revoke_failures.inc();
+                    metrics->rollback.write_revoke_latency_failure.observe(
+                        rollback_sw.elapsed_us());
+                }
+            }
+            if (!revoke_res) {
+                LOG(ERROR) << "AsyncWriteRevoke failed after TE failure, key="
+                           << write_req->key
+                           << ", error=" << revoke_res.error();
+            }
+            promise->setValue(
+                tl::expected<void, ErrorCode>(tl::unexpected(te.error())));
+            co_return;
+        }
+
+        WriteCommitRequest commit;
+        commit.key = write_req->key;
+        commit.write_operation_id = pre.value().write_operation_id;
+        auto cm = co_await peer->AsyncWriteCommit(commit);
+        if (!cm) {
+            promise->setValue(
+                tl::expected<void, ErrorCode>(tl::unexpected(cm.error())));
+            co_return;
+        }
+        promise->setValue(tl::expected<void, ErrorCode>{});
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "RunForwardRemotePut exception"
+                   << ", key=" << (write_req ? write_req->key : "<null>")
+                   << ", what=" << e.what();
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::INTERNAL_ERROR)));
+    } catch (...) {
+        LOG(ERROR) << "RunForwardRemotePut unknown exception"
+                   << ", key=" << (write_req ? write_req->key : "<null>");
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::INTERNAL_ERROR)));
+    }
+}
+
+// ============================================================================
+// HTTP data-ops endpoints
+// ============================================================================
+
+namespace {
+
+// Map ErrorCode to a sensible HTTP status. Defaults to 500 for unknown codes.
+coro_http::status_type ErrorToHttpStatus(ErrorCode err) {
+    using ST = coro_http::status_type;
+    switch (err) {
+        case ErrorCode::OBJECT_NOT_FOUND:
+            return ST::not_found;
+        case ErrorCode::SHUTTING_DOWN:
+            return ST::service_unavailable;
+        case ErrorCode::INVALID_PARAMS:
+            return ST::bad_request;
+        default:
+            return ST::internal_server_error;
+    }
+}
+
+}  // namespace
+
+void P2PClientService::RegisterHttpMethods() {
+    if (!http_server_) return;
+    ClientService::RegisterHttpMethods();
+
+    using namespace coro_http;
+
+    // curl "localhost:9003/get?key=test_key"
+    http_server_->set_http_handler<GET>(
+        "/get", [this](coro_http_request& req, coro_http_response& resp) {
+            auto key_view = req.get_query_value("key");
+            if (key_view.empty()) {
+                resp.set_status_and_content(status_type::bad_request,
+                                            "Missing key parameter");
+                return;
+            }
+            std::string key(key_view);
+
+            if (!local_buffer_allocator_) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "buffer allocator not initialized");
+                return;
+            }
+
+            auto result = Get(key, local_buffer_allocator_, {});
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            const auto& buffer = result.value();
+            resp.add_header("Content-Type", "application/octet-stream");
+            resp.set_status_and_content(
+                status_type::ok,
+                std::string(static_cast<const char*>(buffer->ptr()),
+                            buffer->size()));
+        });
+
+    // curl -X POST -d "hello world" "localhost:9003/put?key=test_key"
+    http_server_->set_http_handler<POST>(
+        "/put", [this](coro_http_request& req, coro_http_response& resp) {
+            auto key_view = req.get_query_value("key");
+            if (key_view.empty()) {
+                resp.set_status_and_content(status_type::bad_request,
+                                            "Missing key parameter");
+                return;
+            }
+            std::string key(key_view);
+            auto body = req.get_body();
+
+            if (!local_buffer_allocator_) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "buffer allocator not initialized");
+                return;
+            } else if (body.size() == 0) {
+                resp.set_status_and_content(status_type::bad_request,
+                                            "Missing body");
+                return;
+            }
+
+            auto alloc_result = local_buffer_allocator_->allocate(body.size());
+            if (!alloc_result) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "buffer pool exhausted");
+                return;
+            }
+            auto& buf_handle = *alloc_result;
+            memcpy(buf_handle.ptr(), body.data(), body.size());
+
+            Slice slice{static_cast<char*>(buf_handle.ptr()), body.size()};
+            std::vector<Slice> slices{slice};
+            auto result = Put(key, slices, WriteRouteRequestConfig{});
+
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    // curl -X POST "localhost:9003/remove_local?key=test_key"
+    http_server_->set_http_handler<POST>(
+        "/remove_local",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto key_view = req.get_query_value("key");
+            if (key_view.empty()) {
+                resp.set_status_and_content(status_type::bad_request,
+                                            "Missing key parameter");
+                return;
+            }
+            std::string key(key_view);
+            auto result = RemoveLocal(key);
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    // curl -X POST "localhost:9003/remove_all_local"
+    http_server_->set_http_handler<POST>(
+        "/remove_all_local",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto result = RemoveAllLocal();
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok,
+                                        std::to_string(result.value()));
+        });
+
+    // Number of keys stored in the local data plane.
+    // curl "localhost:9003/get_key_count"
+    http_server_->set_http_handler<GET>(
+        "/get_key_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto result = GetLocalKeyCount();
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok,
+                                        std::to_string(result.value()));
+        });
+
+    // Local keys, newline-separated in metadata iteration order. A key with
+    // replicas on multiple tiers appears once per replica.
+    // Optional ?limit=N truncates the response to the first N entries.
+    // curl "localhost:9003/get_all_keys"
+    // curl "localhost:9003/get_all_keys?limit=100"
+    http_server_->set_http_handler<GET>(
+        "/get_all_keys",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            size_t limit = 0;  // 0 means no limit
+            auto limit_view = req.get_query_value("limit");
+            if (!limit_view.empty()) {
+                auto [ptr, ec] = std::from_chars(
+                    limit_view.data(), limit_view.data() + limit_view.size(),
+                    limit);
+                if (ec != std::errc() ||
+                    ptr != limit_view.data() + limit_view.size() ||
+                    limit <= 0) {
+                    resp.set_status_and_content(
+                        status_type::bad_request,
+                        "limit must be a positive integer");
+                    return;
+                }
+            }
+
+            auto result = GetLocalKeys(limit);
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            auto keys = std::move(result.value());
+            std::string body;
+            for (const auto& key : keys) {
+                body += key;
+                body += "\n";
+            }
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    // Re-register with the master (e.g. after a prior /unregister), restoring
+    // global routing. curl -X POST "localhost:9003/register"
+    http_server_->set_http_handler<POST>(
+        "/register", [this](coro_http_request& req, coro_http_response& resp) {
+            auto result = RegisterClient();
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    // Unregister from the master and switch to local-only service.
+    // curl -X POST "localhost:9003/unregister"
+    http_server_->set_http_handler<POST>(
+        "/unregister",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto result = UnregisterClient();
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok, "OK");
+        });
+}
+
+}  // namespace mooncake

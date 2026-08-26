@@ -5,7 +5,7 @@ set(MOONCAKE_E2E_TEST_SOURCES
 
 add_executable(clientctl clientctl.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(clientctl PUBLIC
-    mooncake_store
+    ${MOONCAKE_STORE_LIBS}
     transfer_engine
     cachelib_memory_allocator
     glog
@@ -15,7 +15,7 @@ target_link_libraries(clientctl PUBLIC
 
 add_executable(e2e_rand_test e2e_rand_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(e2e_rand_test PUBLIC
-    mooncake_store
+    ${MOONCAKE_STORE_LIBS}
     transfer_engine
     cachelib_memory_allocator
     glog
@@ -26,7 +26,7 @@ target_link_libraries(e2e_rand_test PUBLIC
 
 add_executable(chaosctl chaosctl.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(chaosctl PUBLIC
-    mooncake_store
+    ${MOONCAKE_STORE_LIBS}
     transfer_engine
     cachelib_memory_allocator
     glog
@@ -36,7 +36,7 @@ target_link_libraries(chaosctl PUBLIC
 
 add_executable(client_runner client_runner.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(client_runner PUBLIC
-    mooncake_store
+    ${MOONCAKE_STORE_LIBS}
     transfer_engine
     cachelib_memory_allocator
     glog
@@ -46,7 +46,7 @@ target_link_libraries(client_runner PUBLIC
 
 add_executable(chaos_test chaos_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(chaos_test PUBLIC
-    mooncake_store
+    ${MOONCAKE_STORE_LIBS}
     transfer_engine
     cachelib_memory_allocator
     glog
@@ -57,7 +57,7 @@ target_link_libraries(chaos_test PUBLIC
 
 add_executable(chaos_rand_test chaos_rand_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(chaos_rand_test PUBLIC
-    mooncake_store
+    ${MOONCAKE_STORE_LIBS}
     transfer_engine
     cachelib_memory_allocator
     glog
@@ -69,7 +69,7 @@ target_link_libraries(chaos_rand_test PUBLIC
 if(STORE_USE_REDIS)
     add_executable(redis_chaos_test redis_chaos_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
     target_link_libraries(redis_chaos_test PUBLIC
-        mooncake_store
+        ${MOONCAKE_STORE_LIBS}
         transfer_engine
         cachelib_memory_allocator
         glog

@@ -2,25 +2,19 @@
 add_subdirectory(cachelib_memory_allocator)
 
 set(MOONCAKE_STORE_SOURCES
-    async_memcpy_executor.cpp
     replica.cpp
     allocator.cpp
     master_service.cpp
     centralized_master_service.cpp
     client_service.cpp
     centralized_client_service.cpp
-    p2p_client_service.cpp
-    p2p_client_metric.cpp
     client_metric.cpp
     types.cpp
     master_client.cpp
     centralized_master_client.cpp
-    p2p_master_client.cpp
     utils.cpp
     master_metric_manager.cpp
     centralized_master_metric_manager.cpp
-    p2p_master_metric_manager.cpp
-    client_metrics_aggregator.cpp
     storage_backend.cpp
     thread_pool.cpp
     etcd_helper.cpp
@@ -31,16 +25,11 @@ set(MOONCAKE_STORE_SOURCES
     client_manager.cpp
     centralized_client_manager.cpp
     centralized_client_meta.cpp
-    p2p_client_manager.cpp
-    p2p_master_service.cpp
-    p2p_client_meta.cpp
-    p2p_segment_manager.cpp
     transfer_task.cpp
     etcd_helper.cpp
     ha_helper.cpp
     rpc_service.cpp
     centralized_rpc_service.cpp
-    p2p_rpc_service.cpp
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
@@ -48,42 +37,7 @@ set(MOONCAKE_STORE_SOURCES
     dummy_client.cpp
     http_metadata_server.cpp
     file_storage.cpp
-    tiered_cache/copier_registry.cpp
-    tiered_cache/data_copier.cpp
-    tiered_cache/tiered_backend.cpp
-    data_manager.cpp
-    route_cache.cpp
-    async_metadata_notifier.cpp
-    ha_recovery_manager.cpp
-    client_rpc_service.cpp
-    peer_client.cpp
-    runtime_config_store.cpp
-    tiered_cache/tiers/dram_tier.cpp
-    tiered_cache/tiers/storage_tier.cpp
-    tiered_cache/scheduler/simple_policy.cpp
-    tiered_cache/scheduler/lru_policy.cpp
-    tiered_cache/scheduler/client_scheduler.cpp
-    tiered_cache/scheduler/scheduler_factory.cpp
-    tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
-    tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
-    tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
     task_manager.cpp
-    # HA OpLog components (ported from main branch)
-    ha/oplog/oplog_manager.cpp
-    ha/oplog/oplog_serializer.cpp
-    ha/oplog/localfs_oplog_store.cpp
-    ha/oplog/polling_oplog_change_notifier.cpp
-    ha/oplog/oplog_store_factory.cpp
-    ha/oplog/oplog_applier.cpp
-    ha/oplog/oplog_replicator.cpp
-    # P2P HA OpLog components
-    ha/oplog/p2p_oplog_types.cpp
-    ha/oplog/p2p_oplog_applier.cpp
-    ha/oplog/p2p_standby_metadata_store.cpp
-    ha/oplog/p2p_hot_standby_service.cpp
-    ha/oplog/p2p_standby_snapshot_service.cpp
-    standby_state_machine.cpp
-    ha_metric_manager.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -93,10 +47,10 @@ if(STORE_USE_REDIS)
     find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h REQUIRED)
     find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
     message(STATUS "Found hiredis: include=${HIREDIS_INCLUDE_DIR} lib=${HIREDIS_LIB}")
-    list(APPEND MOONCAKE_STORE_SOURCES redis_util.cpp)
-    list(APPEND MOONCAKE_STORE_SOURCES redis_election_helper.cpp)
-    list(APPEND MOONCAKE_STORE_SOURCES redis_master_view_helper.cpp)
-    list(APPEND MOONCAKE_STORE_SOURCES ha/oplog/redis_oplog_store.cpp)
+    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/redis_util.cpp)
+    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/redis_election_helper.cpp)
+    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/redis_master_view_helper.cpp)
+    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/oplog/redis_oplog_store.cpp)
     list(APPEND EXTRA_LIBS ${HIREDIS_LIB})
 endif()
 
@@ -132,7 +86,7 @@ endif()
 
 # Ascend Cache Tier support
 if(USE_ASCEND_CACHE_TIER)
-  list(APPEND MOONCAKE_STORE_SOURCES tiered_cache/tiers/ascend_tier.cpp)
+  list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/client/tiered_cache/tiers/ascend_tier.cpp)
   message(STATUS "Ascend Cache Tier enabled")
 endif()
 
@@ -165,6 +119,66 @@ target_link_libraries(mooncake_store
     PRIVATE
         transfer_engine
 )
+
+# P2P architecture library (P2P split, Phase 1). Transitional state: it still
+# links the whole mooncake_store because base-class inheritance is severed only
+# in Phase 2; the leaf-only layering constraint (§3.2) is enforced in Phase 3.
+list(APPEND MOONCAKE_STORE_P2P_SOURCES
+    p2p/master/p2p_master_service.cpp
+    p2p/master/p2p_master_client.cpp
+    p2p/master/p2p_master_metric_manager.cpp
+    p2p/master/p2p_segment_manager.cpp
+    p2p/master/p2p_rpc_service.cpp
+    p2p/master/p2p_client_meta.cpp
+    p2p/master/p2p_client_manager.cpp
+    p2p/client/p2p_client_service.cpp
+    p2p/client/p2p_client_metric.cpp
+    p2p/client/peer_client.cpp
+    p2p/client/client_rpc_service.cpp
+    p2p/client/data_manager.cpp
+    p2p/client/route_cache.cpp
+    p2p/client/async_memcpy_executor.cpp
+    p2p/client/async_metadata_notifier.cpp
+    p2p/client/client_metrics_aggregator.cpp
+    p2p/client/runtime_config_store.cpp
+    p2p/client/tiered_cache/copier_registry.cpp
+    p2p/client/tiered_cache/data_copier.cpp
+    p2p/client/tiered_cache/tiered_backend.cpp
+    p2p/client/tiered_cache/tiers/dram_tier.cpp
+    p2p/client/tiered_cache/tiers/storage_tier.cpp
+    p2p/client/tiered_cache/scheduler/simple_policy.cpp
+    p2p/client/tiered_cache/scheduler/lru_policy.cpp
+    p2p/client/tiered_cache/scheduler/client_scheduler.cpp
+    p2p/client/tiered_cache/scheduler/scheduler_factory.cpp
+    p2p/client/tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
+    p2p/client/tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
+    p2p/client/tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
+    p2p/ha/oplog/oplog_manager.cpp
+    p2p/ha/oplog/oplog_serializer.cpp
+    p2p/ha/oplog/localfs_oplog_store.cpp
+    p2p/ha/oplog/polling_oplog_change_notifier.cpp
+    p2p/ha/oplog/oplog_store_factory.cpp
+    p2p/ha/oplog/oplog_applier.cpp
+    p2p/ha/oplog/oplog_replicator.cpp
+    p2p/ha/oplog/p2p_oplog_types.cpp
+    p2p/ha/oplog/p2p_oplog_applier.cpp
+    p2p/ha/oplog/p2p_standby_metadata_store.cpp
+    p2p/ha/oplog/p2p_hot_standby_service.cpp
+    p2p/ha/oplog/p2p_standby_snapshot_service.cpp
+    p2p/ha/standby_state_machine.cpp
+    p2p/ha/ha_metric_manager.cpp
+    p2p/ha/ha_recovery_manager.cpp
+)
+
+add_library(mooncake_store_p2p_objects OBJECT ${MOONCAKE_STORE_P2P_SOURCES})
+target_link_libraries(mooncake_store_p2p_objects PUBLIC mooncake_store)
+
+# Keep the standalone P2P library artifact for installation. Internal
+# consumers use the object target above to avoid circular static-library
+# ordering constraints during the transitional split phases.
+add_library(mooncake_store_p2p
+    $<TARGET_OBJECTS:mooncake_store_p2p_objects>)
+target_link_libraries(mooncake_store_p2p PUBLIC mooncake_store)
 
 # Link Ascend ACL library if USE_ASCEND_CACHE_TIER is enabled
 if(USE_ASCEND_CACHE_TIER)
@@ -244,7 +258,7 @@ if (USE_ASCEND_DIRECT)
 endif()
 
 if (BUILD_SHARED_LIBS)
-  install(TARGETS mooncake_store DESTINATION lib)
+  install(TARGETS mooncake_store mooncake_store_p2p DESTINATION lib)
 endif()
 
 # Master binary
@@ -262,7 +276,7 @@ endif()
 
 target_include_directories(mooncake_master PRIVATE ${MASTER_EXTRA_INCS})
 target_link_libraries(mooncake_master PRIVATE
-    mooncake_store
+    ${MOONCAKE_STORE_LIBS}
     cachelib_memory_allocator
     pthread
     ibverbs
@@ -282,7 +296,7 @@ target_link_options(mooncake_master PRIVATE -Os -s)
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
-target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine asio_shared)
+target_link_libraries(mooncake_client PRIVATE ${MOONCAKE_STORE_LIBS} transfer_engine asio_shared)
 target_compile_options(mooncake_client PRIVATE -Os)
 target_link_options(mooncake_client PRIVATE -Os -s)
 

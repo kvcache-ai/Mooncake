@@ -6,8 +6,8 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "client_manager.h"
-#include "ha/oplog/oplog_manager.h"
-#include "ha/oplog/oplog_store_factory.h"
+#include "p2p/ha/oplog/oplog_manager.h"
+#include "p2p/ha/oplog/oplog_store_factory.h"
 #include "master_metric_manager.h"
 #include "types.h"
 

@@ -90,7 +90,7 @@ if (WITH_STORE)
             transfer_engine
             glog::glog
             gflags::gflags
-            mooncake_store
+            ${MOONCAKE_STORE_LIBS}
             cachelib_memory_allocator
         )
     else()
@@ -98,7 +98,7 @@ if (WITH_STORE)
             transfer_engine
             glog::glog
             gflags::gflags
-            mooncake_store
+            ${MOONCAKE_STORE_LIBS}
             cachelib_memory_allocator
         )
     endif()
