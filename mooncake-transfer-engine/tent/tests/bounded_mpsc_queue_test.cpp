@@ -14,8 +14,9 @@
 //
 // Regression coverage for issue #3637: a full queue used to spin push()
 // forever, so a worker re-enqueueing its own slices could wedge the only
-// consumer. try_push must report fullness instead, and the tick overflow
-// pattern (park, pop, flush) must keep every entry deliverable.
+// consumer. try_push must report fullness instead, and the worker-local
+// overflow must drain before the shared queue so parked entries cannot
+// starve behind contending producers.
 
 #include "tent/common/concurrent/bounded_mpsc_queue.h"
 
@@ -65,27 +66,37 @@ TEST(BoundedMPSCQueueTest, PopDrainsInOrderAfterFull) {
     EXPECT_EQ(queue.pop().num_slices, 0);
 }
 
-TEST(BoundedMPSCQueueTest, OverflowParkPopFlushKeepsEveryEntry) {
+TEST(BoundedMPSCQueueTest, ParkedEntryIsDrainedBeforeContendingProducers) {
+    // Model the production drain order: the worker consumes its local overflow
+    // before popping the shared queue, so a parked retry makes progress even
+    // while producers keep refilling freed slots (review feedback on #3683).
     Queue queue;
     for (int i = 0; i < 8; ++i) {
         auto item = entry(1);
         ASSERT_TRUE(queue.try_push(item));
     }
-    // The tick path: a full queue parks the entry and the flush retries once
-    // space frees up.
     std::vector<SliceList> overflow;
     auto parked = entry(7);
     ASSERT_FALSE(queue.try_push(parked));
     overflow.push_back(parked);
-    EXPECT_EQ(queue.pop().num_slices, 1);
-    auto it = overflow.begin();
-    while (it != overflow.end()) {
-        if (queue.try_push(*it)) {
-            it = overflow.erase(it);
-        } else {
-            ++it;
-        }
+
+    // First tick drains the shared queue fully; a producer instantly refills.
+    std::vector<SliceList> first_batch;
+    queue.pop(first_batch);
+    ASSERT_EQ(first_batch.size(), 8u);
+    auto fresh = entry(9);
+    ASSERT_TRUE(queue.try_push(fresh));
+
+    // Second tick: overflow first, then the shared queue.
+    std::vector<SliceList> batch;
+    for (auto it = overflow.begin(); it != overflow.end();) {
+        batch.push_back(*it);
+        it = overflow.erase(it);
     }
+    queue.pop(batch);
+    ASSERT_EQ(batch.size(), 2u);
+    EXPECT_EQ(batch[0].num_slices, 7);
+    EXPECT_EQ(batch[1].num_slices, 9);
     EXPECT_TRUE(overflow.empty());
 }
 

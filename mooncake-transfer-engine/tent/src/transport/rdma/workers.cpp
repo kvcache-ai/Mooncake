@@ -291,19 +291,6 @@ void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {
     worker.inflight_slices.fetch_add(1);
 }
 
-void Workers::flushTickOverflow(WorkerContext& worker) {
-    auto& overflow = worker.requeue_overflow;
-    if (overflow.empty()) return;
-    auto it = overflow.begin();
-    while (it != overflow.end()) {
-        if (worker.queues[it->first].try_push(it->second)) {
-            it = overflow.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 Status Workers::cancel(RdmaTask* task) {
     if (!task) return Status::InvalidArgument("Invalid RDMA task" LOC_MARK);
     if (task->cancel_requested.exchange(true, std::memory_order_acq_rel)) {
@@ -426,9 +413,21 @@ void Workers::asyncPostSend() {
     // Promote timed-out low priority requests
     promoteTimedOutRequests(worker);
 
-    // Priority selection: HIGH -> MEDIUM -> LOW
+    // Priority selection: HIGH -> MEDIUM -> LOW. The worker-local overflow is
+    // drained before the shared queues, so a parked retry can never starve
+    // behind producers that keep refilling freed slots (issue #3637).
+    auto& overflow = worker.requeue_overflow;
     for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
         if (shared_quota && !shared_quota->canSend(prio)) continue;
+        for (auto it = overflow.begin(); it != overflow.end();) {
+            if (it->first == prio) {
+                result.push_back(it->second);
+                it = overflow.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (!result.empty()) break;
         worker.queues[prio].pop(result);
         if (!result.empty()) break;
     }
@@ -814,7 +813,6 @@ void Workers::workerThread(int thread_id) {
         if (inflight_slices ||
             current_ts - grace_ts <
                 transport_->params_->workers.grace_period_ns) {
-            flushTickOverflow(worker);
             asyncPostSend();
             asyncPollCq();
             if (inflight_slices) grace_ts = current_ts;
