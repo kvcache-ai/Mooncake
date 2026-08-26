@@ -794,10 +794,6 @@ impl StoreClient {
         self.active_compatible_runtimes(true)
     }
 
-    fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
-        self.route_ops().list_routes_by_replica_owner(owner)
-    }
-
     fn route_object_id(&self, route: &ObjectRoute) -> Result<LogicalObjectId> {
         mooncake_store_core::route_logical_object_id(route)
     }
@@ -1701,28 +1697,31 @@ impl StoreClient {
 
     fn current_owned_allocations(&self) -> Result<BTreeSet<AllocationSpan>> {
         let mut allocations = BTreeSet::new();
-        for route in self.collect_routes_by_replica_owner(&self.lease.runtime)? {
-            let object_id = self.route_object_id(&route)?;
-            let tenant = object_id.scope.tenant;
-            let key = object_id.logical_key;
-            let Some(current) = self.query_route_in_tenant(&tenant, &key)? else {
-                continue;
-            };
-            if current.state != RouteState::Active {
-                continue;
-            }
-            for replica in current
-                .replicas
-                .iter()
-                .filter(|replica| replica.owner == self.lease.runtime)
-            {
-                allocations.insert(AllocationSpan {
-                    segment_name: replica.segment_name.clone(),
-                    offset_bytes: replica.segment_offset,
-                    length_bytes: replica.length,
-                });
-            }
-        }
+        let owner = self.lease.runtime.clone();
+        self.route_ops()
+            .visit_routes_by_replica_owner(&owner, &mut |route| {
+                let object_id = self.route_object_id(&route)?;
+                let tenant = object_id.scope.tenant;
+                let key = object_id.logical_key;
+                let Some(current) = self.query_route_in_tenant(&tenant, &key)? else {
+                    return Ok(());
+                };
+                if current.state != RouteState::Active {
+                    return Ok(());
+                }
+                for replica in current
+                    .replicas
+                    .iter()
+                    .filter(|replica| replica.owner == owner)
+                {
+                    allocations.insert(AllocationSpan {
+                        segment_name: replica.segment_name.clone(),
+                        offset_bytes: replica.segment_offset,
+                        length_bytes: replica.length,
+                    });
+                }
+                Ok(())
+            })?;
         Ok(allocations)
     }
 
@@ -1873,13 +1872,16 @@ impl StoreClient {
         let mut migrated = 0usize;
         loop {
             self.pin_draining_lease_for_evacuation()?;
-            let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
-            let had_routes = !routes.is_empty();
-            for route in routes {
-                if migrate_route(&route)? {
-                    migrated = migrated.saturating_add(1);
-                }
-            }
+            let owner = self.lease.runtime.clone();
+            let mut had_routes = false;
+            self.route_ops()
+                .visit_routes_by_replica_owner(&owner, &mut |route| {
+                    had_routes = true;
+                    if migrate_route(&route)? {
+                        migrated = migrated.saturating_add(1);
+                    }
+                    Ok(())
+                })?;
 
             flush_reclaims(self)?;
             let live_allocations = self.current_owned_allocations()?;

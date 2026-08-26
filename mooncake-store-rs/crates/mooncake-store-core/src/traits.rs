@@ -471,6 +471,26 @@ pub trait RouteDirectory: Send + Sync {
         ))
     }
 
+    /// Visits owner routes page by page without retaining the complete result.
+    fn visit_routes_by_replica_owner(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<()> {
+        const MAX_COMPAT_OWNER_ROUTES: usize = 256;
+        let routes = self.list_routes_by_replica_owner(observer, owner)?;
+        if routes.len() > MAX_COMPAT_OWNER_ROUTES {
+            return Err(crate::error::StoreError::Unsupported(
+                "owner-route listing exceeds the bounded compatibility page".to_string(),
+            ));
+        }
+        for route in routes {
+            visitor(route)?;
+        }
+        Ok(())
+    }
+
     fn list_routes_by_cold_backing(
         &self,
         _observer: &ClientLease,

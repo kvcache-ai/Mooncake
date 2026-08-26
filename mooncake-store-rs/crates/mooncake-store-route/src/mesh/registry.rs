@@ -10,6 +10,7 @@ use parking_lot::Mutex as ParkingMutex;
 
 use crate::shim::RouteAuthorityService;
 use crate::table::LocalRouteTable;
+use crate::{RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
 
 pub(crate) fn bind_local_authority_service(
     namespace: &str,
@@ -132,7 +133,33 @@ pub(crate) fn authority_list_routes_by_replica_owner(
     if slot.ref_count == 0 {
         return Err(not_attached(authority));
     }
-    Ok(slot.table.list_by_replica_owner(owner))
+    let page = slot
+        .table
+        .list_by_replica_owner_page(owner, None, DEFAULT_ROUTE_OWNER_PAGE_SIZE);
+    if page.next_cursor.is_some() {
+        return Err(StoreError::Unsupported(
+            "complete owner-route listing exceeds the bounded compatibility page".to_string(),
+        ));
+    }
+    Ok(page.routes)
+}
+
+pub(crate) fn authority_list_routes_by_replica_owner_page(
+    namespace: &str,
+    authority: &ClientStableId,
+    owner: &ClientRuntimeId,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<RouteOwnerPage> {
+    let mesh = route_mesh(namespace);
+    let slot = mesh
+        .authorities
+        .get(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    Ok(slot.table.list_by_replica_owner_page(owner, cursor, limit))
 }
 
 pub(crate) fn authority_list_routes(

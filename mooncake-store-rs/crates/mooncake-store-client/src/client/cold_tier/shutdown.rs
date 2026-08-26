@@ -64,75 +64,77 @@ impl StoreClient {
     }
 
     pub(in super::super) fn cleanup_owned_routes_on_shutdown(&self) {
-        let routes = match self.collect_routes_by_replica_owner(&self.lease.runtime) {
-            Ok(routes) => routes,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    runtime = %self.lease.runtime,
-                    "shutdown route cleanup: failed to list owned routes"
-                );
-                return;
-            }
-        };
-
         let mode = self.cold_tier_shutdown_mode;
         let mut cleaned = 0usize;
-        for route in &routes {
-            let mut next = route.clone();
-            next.version = route.version.next();
-            next.replicas
-                .retain(|replica| replica.owner != self.lease.runtime);
+        let mut total = 0usize;
+        let result =
+            self.route_ops()
+                .visit_routes_by_replica_owner(&self.lease.runtime, &mut |route| {
+                    total = total.saturating_add(1);
+                    let mut next = route.clone();
+                    next.version = route.version.next();
+                    next.replicas
+                        .retain(|replica| replica.owner != self.lease.runtime);
 
-            if mode == ColdTierShutdownMode::Restart
-                && next.replicas.is_empty()
-                && !route.cold_backing.as_ref().is_some_and(|cold_backing| {
-                    cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
-                })
-            {
-                continue;
-            }
+                    if mode == ColdTierShutdownMode::Restart
+                        && next.replicas.is_empty()
+                        && !route.cold_backing.as_ref().is_some_and(|cold_backing| {
+                            cold_backing.state
+                                == mooncake_store_core::ColdBackingState::Materialized
+                        })
+                    {
+                        return Ok(());
+                    }
 
-            if mode == ColdTierShutdownMode::Decommission
-                && route
-                    .cold_backing
-                    .as_ref()
-                    .is_some_and(|cold_backing| self.cold_backing_on_local_device(cold_backing))
-            {
-                next.cold_backing = route.cold_backing.clone();
-                if let Some(cold_backing) = next.cold_backing.as_mut() {
-                    cold_backing.state = mooncake_store_core::ColdBackingState::PendingDelete;
-                }
-            }
+                    if mode == ColdTierShutdownMode::Decommission
+                        && route.cold_backing.as_ref().is_some_and(|cold_backing| {
+                            self.cold_backing_on_local_device(cold_backing)
+                        })
+                    {
+                        next.cold_backing = route.cold_backing.clone();
+                        if let Some(cold_backing) = next.cold_backing.as_mut() {
+                            cold_backing.state =
+                                mooncake_store_core::ColdBackingState::PendingDelete;
+                        }
+                    }
 
-            let should_delete = mode == ColdTierShutdownMode::Decommission
-                && next.replicas.is_empty()
-                && next.cold_backing.is_none();
-            let cas_result = if should_delete {
-                self.route_ops()
-                    .delete_route(&route.key, Some(route.version))
-            } else if next.replicas.len() < route.replicas.len()
-                || next.cold_backing != route.cold_backing
-            {
-                self.route_ops()
-                    .prune_route(&route.key, Some(route.version), &next)
-            } else {
-                continue;
-            };
+                    let should_delete = mode == ColdTierShutdownMode::Decommission
+                        && next.replicas.is_empty()
+                        && next.cold_backing.is_none();
+                    let cas_result = if should_delete {
+                        self.route_ops()
+                            .delete_route(&route.key, Some(route.version))
+                    } else if next.replicas.len() < route.replicas.len()
+                        || next.cold_backing != route.cold_backing
+                    {
+                        self.route_ops()
+                            .prune_route(&route.key, Some(route.version), &next)
+                    } else {
+                        return Ok(());
+                    };
 
-            match cas_result {
-                Ok(cas) if cas.applied => {
-                    cleaned = cleaned.saturating_add(1);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        key = %route.key.0,
-                        error = %error,
-                        "shutdown route cleanup CAS failed"
-                    );
-                }
-            }
+                    match cas_result {
+                        Ok(cas) if cas.applied => {
+                            cleaned = cleaned.saturating_add(1);
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                key = %route.key.0,
+                                error = %error,
+                                "shutdown route cleanup CAS failed"
+                            );
+                        }
+                    }
+                    Ok(())
+                });
+        if let Err(error) = result {
+            tracing::warn!(
+                error = %error,
+                runtime = %self.lease.runtime,
+                "shutdown route cleanup: failed to list owned routes"
+            );
+            return;
         }
 
         if mode == ColdTierShutdownMode::Decommission {
@@ -143,7 +145,7 @@ impl StoreClient {
             tracing::info!(
                 runtime = %self.lease.runtime,
                 cleaned,
-                total = routes.len(),
+                total,
                 mode = ?mode,
                 "shutdown route cleanup complete"
             );

@@ -6,6 +6,7 @@ use mooncake_store_core::{
 };
 
 use crate::metrics::record_cas_outcome;
+use crate::DEFAULT_ROUTE_OWNER_PAGE_SIZE;
 
 pub(crate) fn build_metadata_route_directory(
     metadata: Arc<dyn MetadataBackend>,
@@ -51,12 +52,21 @@ impl RouteDirectory for MetadataRouteDirectory {
         _observer: &ClientLease,
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>> {
-        Ok(self
+        let mut routes = self
             .metadata
             .list_object_routes()?
             .into_iter()
             .filter(|route| route.replicas.iter().any(|replica| replica.owner == *owner))
-            .collect())
+            .take(DEFAULT_ROUTE_OWNER_PAGE_SIZE.saturating_add(1))
+            .collect::<Vec<_>>();
+        if routes.len() > DEFAULT_ROUTE_OWNER_PAGE_SIZE {
+            return Err(mooncake_store_core::StoreError::Unsupported(
+                "MetadataOnly owner-route listing exceeds the fixed compatibility limit"
+                    .to_string(),
+            ));
+        }
+        routes.sort_by(|left, right| left.key.0.cmp(&right.key.0));
+        Ok(routes)
     }
 
     fn list_routes_in_scope(

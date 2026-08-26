@@ -69,6 +69,36 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
             .collect())
     }
 
+    fn list_routes_by_replica_owner_page(
+        &self,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> mooncake_store_core::Result<mooncake_store_route::RouteOwnerPage> {
+        let routes = self.routes.lock();
+        let mut matching = routes
+            .iter()
+            .filter(|(key, route)| {
+                cursor.map_or(true, |cursor| key.as_str() > cursor)
+                    && route.replicas.iter().any(|replica| &replica.owner == owner)
+            })
+            .map(|(_, route)| route.clone())
+            .take(limit.max(1).saturating_add(1))
+            .collect::<Vec<_>>();
+        let next_cursor = if matching.len() > limit.max(1) {
+            matching.pop();
+            matching.last().map(|route| route.key.0.clone())
+        } else {
+            None
+        };
+        Ok(mooncake_store_route::RouteOwnerPage {
+            routes: matching,
+            next_cursor,
+        })
+    }
+
     fn compare_and_swap_route(
         &self,
         _namespace: &str,
@@ -2000,11 +2030,43 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .into_inner();
         assert!(cas_reply.error.is_some());
 
+        let first_page = service
+            .list_routes_by_replica_owner(Request::new(pb::ListRoutesByReplicaOwnerRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                owner: Some(pb_runtime_id(&owner)),
+                cursor: None,
+                limit: 1,
+            }))
+            .await
+            .expect("first owner route page should reply")
+            .into_inner();
+        assert_eq!(first_page.routes.len(), 1);
+        assert_eq!(first_page.routes[0].key, "alpha");
+        assert_eq!(first_page.next_cursor.as_deref(), Some("alpha"));
+
+        let second_page = service
+            .list_routes_by_replica_owner(Request::new(pb::ListRoutesByReplicaOwnerRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                owner: Some(pb_runtime_id(&owner)),
+                cursor: first_page.next_cursor,
+                limit: 1,
+            }))
+            .await
+            .expect("second owner route page should reply")
+            .into_inner();
+        assert_eq!(second_page.routes.len(), 1);
+        assert_eq!(second_page.routes[0].key, "beta");
+        assert_eq!(second_page.next_cursor, None);
+
         let list_error = service
             .list_routes_by_replica_owner(Request::new(pb::ListRoutesByReplicaOwnerRequest {
                 namespace: "ns-a".to_string(),
                 authority: "authority".to_string(),
                 owner: None,
+                cursor: None,
+                limit: 0,
             }))
             .await
             .expect_err("missing owner should be rejected");
@@ -2243,6 +2305,48 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             panic!("unexpected track stream reply body");
         };
         assert_eq!(body.accepted, 1);
+    });
+}
+
+#[test]
+fn owner_route_rpc_defaults_and_clamps_page_limit() {
+    let authority = Arc::new(TestAuthority::default());
+    let owner = sample_owner();
+    for index in 0..=mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE {
+        authority.insert(sample_route(&format!("route-{index:04}"), 1, &owner));
+    }
+    let service = GrpcControlPlaneService::new(
+        authority,
+        Arc::new(TestAllocator::default()),
+        Arc::new(TestEviction::default()),
+    );
+    let runtime = RuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime should start");
+
+    runtime.block_on(async {
+        for limit in [0, u32::MAX] {
+            let reply = service
+                .list_routes_by_replica_owner(Request::new(pb::ListRoutesByReplicaOwnerRequest {
+                    namespace: "ns-a".to_string(),
+                    authority: "authority".to_string(),
+                    owner: Some(pb_runtime_id(&owner)),
+                    cursor: None,
+                    limit,
+                }))
+                .await
+                .expect("bounded owner route request should reply")
+                .into_inner();
+            assert_eq!(
+                reply.routes.len(),
+                mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE
+            );
+            assert_eq!(
+                reply.next_cursor.as_deref(),
+                reply.routes.last().map(|route| route.key.as_str())
+            );
+        }
     });
 }
 

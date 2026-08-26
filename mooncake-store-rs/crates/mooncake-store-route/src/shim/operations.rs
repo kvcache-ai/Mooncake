@@ -156,6 +156,15 @@ impl RouteOperations {
             .list_routes_by_replica_owner(&self.observer, owner)
     }
 
+    pub fn visit_routes_by_replica_owner(
+        &self,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<()> {
+        self.directory
+            .visit_routes_by_replica_owner(&self.observer, owner, visitor)
+    }
+
     pub fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
         self.directory.list_routes_in_scope(&self.observer, scope)
     }

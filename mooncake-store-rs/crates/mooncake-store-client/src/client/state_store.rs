@@ -1434,25 +1434,24 @@ impl StorageOwnerState {
     fn rebuild_clock(&self) -> Result<()> {
         let tracker = OperationTracker::new("storage_owner_rebuild_clock");
         let result = (|| {
-            let routes = self.collect_routes_by_replica_owner(&self.runtime)?;
             let mut clock = StorageClockState::default();
-            for route in &routes {
-                clock.track_route(route, &self.runtime);
-            }
+            let mut route_count = 0usize;
+            self.route_ops
+                .visit_routes_by_replica_owner(&self.runtime, &mut |route| {
+                    clock.track_route(&route, &self.runtime);
+                    route_count = route_count.saturating_add(1);
+                    Ok(())
+                })?;
             *self.hot_replicas.clock.lock() = clock;
             debug!(
                 runtime = %self.runtime,
-                routes = routes.len(),
+                routes = route_count,
                 "storage-owner rebuilt eviction clock"
             );
             Ok(())
         })();
         tracker.finish(&result, 0);
         result
-    }
-
-    fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
-        self.route_ops.list_routes_by_replica_owner(owner)
     }
 }
 

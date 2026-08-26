@@ -4,8 +4,26 @@ use std::time::Instant;
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result,
-    RouteCasRequest, RouteVersion,
+    RouteCasRequest, RouteVersion, StoreError,
 };
+
+pub const DEFAULT_ROUTE_OWNER_PAGE_SIZE: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteOwnerPage {
+    pub routes: Vec<ObjectRoute>,
+    /// The final route key returned by this page. Callers resume strictly after it.
+    pub next_cursor: Option<String>,
+}
+
+impl RouteOwnerPage {
+    pub fn empty() -> Self {
+        Self {
+            routes: Vec::new(),
+            next_cursor: None,
+        }
+    }
+}
 
 pub(crate) trait RouteAuthorityClient: Send + Sync {
     fn batch_get_routes(
@@ -47,6 +65,16 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
         authority: &ClientStableId,
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>>;
+
+    fn list_routes_by_replica_owner_page(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RouteOwnerPage>;
 }
 
 pub trait RouteAuthorityService: Send + Sync {
@@ -63,6 +91,22 @@ pub trait RouteAuthorityService: Send + Sync {
         authority: &ClientStableId,
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>>;
+
+    fn list_routes_by_replica_owner_page(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RouteOwnerPage> {
+        // Legacy service implementations remain source-compatible. Bounded callers fail closed
+        // until the service supplies an indexed pagination implementation.
+        let _ = (namespace, authority, owner, cursor, limit);
+        Err(StoreError::Unsupported(
+            "route authority does not implement bounded owner-route pagination".to_string(),
+        ))
+    }
 
     fn compare_and_swap_route(
         &self,

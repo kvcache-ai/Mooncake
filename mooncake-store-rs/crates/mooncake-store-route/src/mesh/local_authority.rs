@@ -8,10 +8,11 @@ use mooncake_store_core::{
 use super::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
     authority_get, authority_get_many, authority_list_routes,
-    authority_list_routes_by_replica_owner, authority_replace, authority_replace_many,
-    bind_local_authority_service,
+    authority_list_routes_by_replica_owner, authority_list_routes_by_replica_owner_page,
+    authority_replace, authority_replace_many, bind_local_authority_service,
 };
 use crate::shim::RouteAuthorityService;
+use crate::RouteOwnerPage;
 
 #[derive(Clone, Debug)]
 pub struct LocalRouteAuthority {
@@ -52,6 +53,21 @@ impl LocalRouteAuthority {
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>> {
         authority_list_routes_by_replica_owner(&self.namespace, &self.authority, owner)
+    }
+
+    pub fn list_routes_by_replica_owner_page(
+        &self,
+        owner: &ClientRuntimeId,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RouteOwnerPage> {
+        authority_list_routes_by_replica_owner_page(
+            &self.namespace,
+            &self.authority,
+            owner,
+            cursor,
+            limit,
+        )
     }
 
     pub fn compare_and_swap_route(

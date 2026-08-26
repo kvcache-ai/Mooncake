@@ -44,6 +44,19 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         authority_list_routes_by_replica_owner(namespace, authority, owner)
     }
 
+    fn list_routes_by_replica_owner_page(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<mooncake_store_route::RouteOwnerPage> {
+        crate::route_directory::authority_list_routes_by_replica_owner_page(
+            namespace, authority, owner, cursor, limit,
+        )
+    }
+
     fn compare_and_swap_route(
         &self,
         namespace: &str,

@@ -87,7 +87,12 @@ fn decode_route_list_by_replica_owner_reply(
         .into_iter()
         .map(try_object_route)
         .collect::<Result<Vec<_>>>()?;
-    Ok(RouteControlResponse::ListByReplicaOwner(routes))
+    Ok(RouteControlResponse::ListByReplicaOwner(
+        mooncake_store_route::RouteOwnerPage {
+            routes,
+            next_cursor: reply.next_cursor,
+        },
+    ))
 }
 
 impl ControlPlaneClient {
@@ -178,7 +183,11 @@ impl ControlPlaneClient {
                 namespace,
                 authority,
                 owner,
-            } => self.send_route_list_by_replica_owner(lease, namespace, authority, owner),
+                cursor,
+                limit,
+            } => self.send_route_list_by_replica_owner(
+                lease, namespace, authority, owner, cursor, limit,
+            ),
         }
     }
 
@@ -340,11 +349,15 @@ impl ControlPlaneClient {
         namespace: String,
         authority: ClientStableId,
         owner: ClientRuntimeId,
+        cursor: Option<String>,
+        limit: usize,
     ) -> Result<RouteControlResponse> {
         let request = pb::ListRoutesByReplicaOwnerRequest {
             namespace,
             authority: authority.0.clone(),
             owner: Some(pb_runtime_id(&owner)),
+            cursor,
+            limit: limit.try_into().unwrap_or(u32::MAX),
         };
         match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
             request_id,
@@ -526,14 +539,22 @@ impl ControlPlaneClient {
                 namespace: namespace.to_string(),
                 authority: authority.clone(),
                 owner: owner.clone(),
+                cursor: None,
+                limit: mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE,
             },
         )?;
-        match response {
-            RouteControlResponse::ListByReplicaOwner(routes) => Ok(routes),
-            _ => Err(StoreError::Transport(
+        let RouteControlResponse::ListByReplicaOwner(page) = response else {
+            return Err(StoreError::Transport(
                 "test list_routes_by_replica_owner returned non-list route response".to_string(),
-            )),
+            ));
+        };
+        if page.next_cursor.is_some() {
+            return Err(StoreError::Unsupported(
+                "test complete owner-route listing exceeds the bounded compatibility page"
+                    .to_string(),
+            ));
         }
+        Ok(page.routes)
     }
 
     pub(crate) fn batch_report_route_hits(
