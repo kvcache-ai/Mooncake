@@ -37,7 +37,7 @@ from ..manifest import (
     WeightPlacementManifest,
 )
 from ..storage_manifest import (
-    StoredFragment,
+    StoredFragmentSnapshot,
     StoredManifestIdentity,
     WeightManifest,
     validate_weight_manifest_snapshot,
@@ -370,7 +370,9 @@ ExecutableTransferOperation: TypeAlias = ExecutableTransferRegion
 LiveTransferOperation: TypeAlias = TransferRegion[
     BoundWeightFragment, BoundWeightFragment
 ]
-StoredLoadOperation: TypeAlias = TransferRegion[StoredFragment, BoundWeightFragment]
+StoredLoadOperation: TypeAlias = TransferRegion[
+    StoredFragmentSnapshot, BoundWeightFragment
+]
 
 
 def _is_canonical_operation(value: object) -> bool:
@@ -391,7 +393,7 @@ def _validate_logical_operation(
     if source_has_placement:
         if not isinstance(operation.source, PlacementFragment):
             raise ValueError("logical transfer plan source must be a placement")
-    elif not isinstance(operation.source, StoredFragment):
+    elif not isinstance(operation.source, StoredFragmentSnapshot):
         raise ValueError("logical transfer plan source has no placement")
     operation.validate_bounds()
 
@@ -606,7 +608,7 @@ class LogicalTransferPlan:
         for operation in self.operations:
             source = operation.source
             if (
-                not isinstance(source, StoredFragment)
+                not isinstance(source, StoredFragmentSnapshot)
                 or source_by_id.get(source.fragment_id) != source
             ):
                 raise ValueError(

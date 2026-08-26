@@ -13,7 +13,7 @@ from mooncake.reshard.weight import (
     OwnershipAxis,
     SplitAxis,
 )
-from mooncake.reshard.weight._planner.bound_contracts import RuntimeLeaseSnapshot
+from mooncake.reshard.weight._planner.bound_contracts import RuntimeFragmentSnapshot
 
 from .helpers import (
     RuntimeInputs,
@@ -447,14 +447,14 @@ def test_bound_participant_lease_collection_is_linear(monkeypatch) -> None:
     )
 
     comparisons = 0
-    original_eq = RuntimeLeaseSnapshot.__eq__
+    original_eq = RuntimeFragmentSnapshot.__eq__
 
     def counting_eq(self, other):
         nonlocal comparisons
         comparisons += 1
         return original_eq(self, other)
 
-    monkeypatch.setattr(RuntimeLeaseSnapshot, "__eq__", counting_eq)
+    monkeypatch.setattr(RuntimeFragmentSnapshot, "__eq__", counting_eq)
 
     plan = plan_transfer(source, target)
 

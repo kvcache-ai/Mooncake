@@ -59,7 +59,7 @@ class TargetPlacementManifestTest(unittest.TestCase):
         self.assertNotIn('"generation":', encoded)
         self.assertNotIn("lease", encoded)
         self.assertFalse(_contains_json_key(payload, "owner"))
-        self.assertNotIn("fragment_leases", encoded)
+        self.assertNotIn("fragment_snapshots", encoded)
         self.assertEqual(payload["placement_id"], placement.placement_id)
 
     def test_json_round_trip_accepts_canonical_split_descriptor(self) -> None:

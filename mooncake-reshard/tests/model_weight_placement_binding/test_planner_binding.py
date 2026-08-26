@@ -65,7 +65,7 @@ class PlacementPlannerTest(unittest.TestCase):
         self.assertEqual(bound.operations[0].source.rank.tp, 0)
         self.assertEqual(bound.operations[0].target.rank.tp, 1)
         self.assertEqual(
-            bound.source_executors[0].fragment_leases[0].lease_generation,
+            bound.source_executors[0].fragment_snapshots[0].lease_generation,
             3,
         )
 
@@ -193,7 +193,7 @@ class PlacementPlannerTest(unittest.TestCase):
         )
         self.assertEqual(
             {
-                executor.instance_id: executor.fragment_leases[0].lease_generation
+                executor.instance_id: executor.fragment_snapshots[0].lease_generation
                 for executor in plan.source_executors
             },
             {"source-dp0-instance": 3},
