@@ -116,39 +116,38 @@ pub(in super::super) fn repair_initial_write_cold_backings(
         return Ok(0);
     }
 
-    let routes = match storage_owner
-        .route_ops
-        .list_routes_by_replica_owner(&storage_owner.runtime)
-    {
-        Ok(routes) => routes,
-        Err(StoreError::Unsupported(_)) => return Ok(0),
-        Err(error) => return Err(error),
-    };
-
     let mut attempted = 0usize;
     let mut published = 0usize;
     let publish_limit = publish_limit.max(1);
-    for route in routes {
-        if route.state != RouteState::Active || route.cold_backing.is_some() {
-            storage_owner.sync_route(&route);
-            continue;
-        }
-        if attempted >= publish_limit {
-            break;
-        }
-        attempted = attempted.saturating_add(1);
-        match publish_initial_write_cold_backing(storage_owner, &route) {
-            Ok(Some(_)) => published = published.saturating_add(1),
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    runtime = %storage_owner.runtime,
-                    key = %route.key.0,
-                    error = %error,
-                    "owner-side initial cold backing repair skipped route"
-                );
+    let result = storage_owner.route_ops.visit_routes_by_replica_owner(
+        &storage_owner.runtime,
+        &mut |route| {
+            if route.state != RouteState::Active || route.cold_backing.is_some() {
+                storage_owner.sync_route(&route);
+                return Ok(());
             }
-        }
+            if attempted >= publish_limit {
+                return Ok(());
+            }
+            attempted = attempted.saturating_add(1);
+            match publish_initial_write_cold_backing(storage_owner, &route) {
+                Ok(Some(_)) => published = published.saturating_add(1),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        runtime = %storage_owner.runtime,
+                        key = %route.key.0,
+                        error = %error,
+                        "owner-side initial cold backing repair skipped route"
+                    );
+                }
+            }
+            Ok(())
+        },
+    );
+    match result {
+        Ok(()) | Err(StoreError::Unsupported(_)) => {}
+        Err(error) => return Err(error),
     }
     Ok(published)
 }

@@ -7,7 +7,7 @@ use mooncake_store_core::{
 };
 use mooncake_store_route::{
     set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityService, RouteMembershipProvider,
-    RouteMetricsSink,
+    RouteMetricsSink, RouteOwnerPage,
 };
 
 use crate::client::{
@@ -80,6 +80,17 @@ pub(crate) fn authority_list_routes_by_replica_owner(
     owner: &ClientRuntimeId,
 ) -> Result<Vec<ObjectRoute>> {
     LocalRouteAuthority::new(namespace, authority.clone()).list_routes_by_replica_owner(owner)
+}
+
+pub(crate) fn authority_list_routes_by_replica_owner_page(
+    namespace: &str,
+    authority: &ClientStableId,
+    owner: &ClientRuntimeId,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<RouteOwnerPage> {
+    LocalRouteAuthority::new(namespace, authority.clone())
+        .list_routes_by_replica_owner_page(owner, cursor, limit)
 }
 
 pub(crate) fn authority_compare_and_swap(

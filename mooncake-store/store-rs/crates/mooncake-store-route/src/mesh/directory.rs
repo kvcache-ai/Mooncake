@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use crate::mesh::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
     authority_get_many, authority_get_version_floor, authority_get_version_floors,
     authority_is_local, authority_list_reuse_candidates, authority_list_routes,
-    authority_list_routes_by_replica_owner, authority_list_routes_in_scope,
+    authority_list_routes_by_replica_owner_page, authority_list_routes_in_scope,
     local_authority_service, register_local_authority, unregister_local_authority,
 };
 use crate::mesh::selection::{
@@ -33,6 +33,7 @@ use crate::mesh::selection::{
 use crate::metrics::record_cas_outcome;
 use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
 use crate::util::{route_read_source, sampled_per_key_debug_log};
+use crate::DEFAULT_ROUTE_OWNER_PAGE_SIZE;
 
 pub(crate) fn build_embedded_wrh_route_directory(
     route_topk: usize,
@@ -78,6 +79,42 @@ struct RouteCasAttempt {
     resolved: Vec<Option<Result<CasResult>>>,
     resolved_authorities: Vec<Option<ClientLease>>,
     last_errors: Vec<Option<StoreError>>,
+}
+
+struct OwnerRoutePageScan {
+    authority: ClientLease,
+    routes: VecDeque<ObjectRoute>,
+    next_cursor: Option<String>,
+    seen_cursors: HashSet<String>,
+}
+
+fn validate_owner_route_page(
+    cursor: Option<&str>,
+    page: &crate::RouteOwnerPage,
+    seen_cursors: &mut HashSet<String>,
+) -> Result<()> {
+    let mut previous = cursor;
+    for route in &page.routes {
+        if previous.is_some_and(|previous| route.key.0.as_str() <= previous) {
+            return Err(StoreError::Transport(
+                "route owner page keys must advance strictly after the cursor".to_string(),
+            ));
+        }
+        previous = Some(route.key.0.as_str());
+    }
+    if let Some(next_cursor) = page.next_cursor.as_ref() {
+        if page.routes.last().map(|route| route.key.0.as_str()) != Some(next_cursor.as_str()) {
+            return Err(StoreError::Transport(
+                "route owner page cursor must equal its final route key".to_string(),
+            ));
+        }
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(StoreError::Transport(
+                "route owner page returned a previously seen cursor".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl EmbeddedWrhRouteDirectory {
@@ -347,31 +384,123 @@ impl EmbeddedWrhRouteDirectory {
         authority_is_local(&self.namespace, &authority.runtime.stable_id)
     }
 
-    fn list_routes_by_replica_owner_from_authority(
+    fn list_routes_by_replica_owner_page_from_authority(
         &self,
         authority: &ClientLease,
         owner: &ClientRuntimeId,
-    ) -> Result<Vec<ObjectRoute>> {
+        cursor: Option<&str>,
+    ) -> Result<crate::RouteOwnerPage> {
         if self.authority_is_local(authority) {
             if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
-                return service.list_routes_by_replica_owner(
+                return service.list_routes_by_replica_owner_page(
                     &self.namespace,
                     &authority.runtime.stable_id,
                     owner,
+                    cursor,
+                    DEFAULT_ROUTE_OWNER_PAGE_SIZE,
                 );
             }
-            return authority_list_routes_by_replica_owner(
+            return authority_list_routes_by_replica_owner_page(
                 &self.namespace,
                 &authority.runtime.stable_id,
                 owner,
+                cursor,
+                DEFAULT_ROUTE_OWNER_PAGE_SIZE,
             );
         }
-        self.authority_client.list_routes_by_replica_owner(
+        self.authority_client.list_routes_by_replica_owner_page(
             authority,
             &self.namespace,
             &authority.runtime.stable_id,
             owner,
+            cursor,
+            DEFAULT_ROUTE_OWNER_PAGE_SIZE,
         )
+    }
+
+    fn visit_routes_by_replica_owner_pages(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<()> {
+        let mut scans = Vec::new();
+        for authority in self.authority_candidates(observer)? {
+            match self.list_routes_by_replica_owner_page_from_authority(&authority, owner, None) {
+                Ok(page) => {
+                    let mut seen_cursors = HashSet::new();
+                    validate_owner_route_page(None, &page, &mut seen_cursors)?;
+                    scans.push(OwnerRoutePageScan {
+                        authority,
+                        routes: VecDeque::from(page.routes),
+                        next_cursor: page.next_cursor,
+                        seen_cursors,
+                    });
+                }
+                Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "route_list_by_replica_owner_failed",
+                    );
+                    return Err(error);
+                }
+            }
+        }
+
+        loop {
+            for scan in &mut scans {
+                if !scan.routes.is_empty() || scan.next_cursor.is_none() {
+                    continue;
+                }
+                let cursor = scan
+                    .next_cursor
+                    .take()
+                    .expect("checked that the owner route page cursor exists");
+                let page = self.list_routes_by_replica_owner_page_from_authority(
+                    &scan.authority,
+                    owner,
+                    Some(&cursor),
+                )?;
+                validate_owner_route_page(Some(&cursor), &page, &mut scan.seen_cursors)?;
+                scan.routes = VecDeque::from(page.routes);
+                scan.next_cursor = page.next_cursor;
+            }
+
+            let Some(next_key) = scans
+                .iter()
+                .filter_map(|scan| scan.routes.front().map(|route| route.key.0.as_str()))
+                .min()
+                .map(ToOwned::to_owned)
+            else {
+                return Ok(());
+            };
+            let mut merged = BTreeMap::new();
+            for scan in &mut scans {
+                if scan
+                    .routes
+                    .front()
+                    .is_some_and(|route| route.key.0 == next_key)
+                {
+                    let route = scan
+                        .routes
+                        .pop_front()
+                        .expect("front route was checked before removal");
+                    merge_route_listing(
+                        &mut merged,
+                        route,
+                        &scan.authority.runtime.to_string(),
+                        &self.namespace,
+                    );
+                }
+            }
+            visitor(
+                merged
+                    .into_values()
+                    .next()
+                    .expect("a route matched the selected page key"),
+            )?;
+        }
     }
 
     fn list_routes_in_scope_from_authority(
@@ -1138,19 +1267,27 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         observer: &ClientLease,
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>> {
-        self.query_authorities_with_merge(
-            observer,
-            "route_list_by_replica_owner_failed",
-            |authority| self.list_routes_by_replica_owner_from_authority(authority, owner),
-            |authority, error| {
-                warn!(
-                    authority = %authority.runtime,
-                    owner = %owner,
-                    error = %error,
-                    "route-owner listing failed on authority"
-                );
-            },
-        )
+        let mut routes = Vec::new();
+        self.visit_routes_by_replica_owner_pages(observer, owner, &mut |route| {
+            if routes.len() == DEFAULT_ROUTE_OWNER_PAGE_SIZE {
+                return Err(StoreError::Unsupported(
+                    "complete owner-route listing exceeds the bounded compatibility page; use the visitor API"
+                        .to_string(),
+                ));
+            }
+            routes.push(route);
+            Ok(())
+        })?;
+        Ok(routes)
+    }
+
+    fn visit_routes_by_replica_owner(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_routes_by_replica_owner_pages(observer, owner, visitor)
     }
 
     fn list_routes_in_scope(
@@ -1335,6 +1472,55 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 &requests,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_page_contract_tests {
+    use super::*;
+    use mooncake_store_core::{CompatibilityDescriptor, RouteState};
+
+    fn route(key: &str) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new(key),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::new(),
+            cold_backing: None,
+        }
+    }
+
+    #[test]
+    fn owner_route_pages_reject_cursor_cycles() {
+        let mut seen = HashSet::new();
+        for (cursor, key) in [(None, "route-a"), (Some("route-a"), "route-b")] {
+            validate_owner_route_page(
+                cursor,
+                &crate::RouteOwnerPage {
+                    routes: vec![route(key)],
+                    next_cursor: Some(key.to_string()),
+                },
+                &mut seen,
+            )
+            .expect("forward pages should satisfy the cursor contract");
+        }
+
+        let error = validate_owner_route_page(
+            Some("route-b"),
+            &crate::RouteOwnerPage {
+                routes: vec![route("route-a")],
+                next_cursor: Some("route-a".to_string()),
+            },
+            &mut seen,
+        )
+        .expect_err("a cursor cycle must fail closed");
+        assert!(matches!(error, StoreError::Transport(_)));
     }
 }
 

@@ -9,6 +9,7 @@ use super::*;
 use crate::observability::registry;
 use mooncake_store_route::{
     serve_route_control_request, RouteControlRequest, RouteControlResponse,
+    DEFAULT_ROUTE_OWNER_PAGE_SIZE,
 };
 use std::time::{Duration, Instant};
 
@@ -576,12 +577,21 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             namespace: request.namespace,
             authority: ClientStableId::new(request.authority),
             owner,
+            cursor: request.cursor,
+            limit: if request.limit == 0 {
+                DEFAULT_ROUTE_OWNER_PAGE_SIZE
+            } else {
+                usize::try_from(request.limit)
+                    .unwrap_or(DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+                    .clamp(1, DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+            },
         };
         let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
-            Ok(RouteControlResponse::ListByReplicaOwner(routes)) => {
+            Ok(RouteControlResponse::ListByReplicaOwner(page)) => {
                 pb::ListRoutesByReplicaOwnerReply {
-                    routes: routes.iter().map(pb_object_route).collect(),
+                    routes: page.routes.iter().map(pb_object_route).collect(),
                     error: None,
+                    next_cursor: page.next_cursor,
                 }
             }
             Ok(_) => pb::ListRoutesByReplicaOwnerReply {
@@ -590,10 +600,12 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     "control plane list_routes_by_replica_owner returned non-list route response"
                         .to_string(),
                 ))),
+                next_cursor: None,
             },
             Err(error) => pb::ListRoutesByReplicaOwnerReply {
                 routes: Vec::new(),
                 error: Some(pb_error(error)),
+                next_cursor: None,
             },
         };
         Ok(Response::new(reply))

@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
+use std::ops::Bound;
 
 use mooncake_store_core::{
     route_reuse_identity, CasResult, ClientRuntimeId, ColdBackingState, NamespaceScope, ObjectKey,
@@ -7,6 +8,7 @@ use mooncake_store_core::{
 };
 
 use crate::metrics::record_cas_outcome;
+use crate::{RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
 
 fn route_has_materialized_cold_backing(route: &ObjectRoute) -> bool {
     route
@@ -18,6 +20,7 @@ fn route_has_materialized_cold_backing(route: &ObjectRoute) -> bool {
 #[derive(Default)]
 pub(crate) struct LocalRouteTable {
     routes: HashMap<String, ObjectRoute>,
+    owner_index: HashMap<ClientRuntimeId, BTreeSet<String>>,
     scope_index: HashMap<NamespaceScope, HashSet<String>>,
     reuse_index: HashMap<ReuseIdentity, HashSet<String>>,
     version_floors: HashMap<String, RouteVersion>,
@@ -82,12 +85,38 @@ impl LocalRouteTable {
         self.routes.values().cloned().collect()
     }
 
-    pub(crate) fn list_by_replica_owner(&self, owner: &ClientRuntimeId) -> Vec<ObjectRoute> {
-        self.routes
-            .values()
-            .filter(|route| route.replicas.iter().any(|replica| replica.owner == *owner))
-            .cloned()
-            .collect()
+    pub(crate) fn list_by_replica_owner_page(
+        &self,
+        owner: &ClientRuntimeId,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> RouteOwnerPage {
+        let Some(keys) = self.owner_index.get(owner) else {
+            return RouteOwnerPage::empty();
+        };
+        let start = cursor.map_or(Bound::Unbounded, Bound::Excluded);
+        let limit = if limit == 0 {
+            DEFAULT_ROUTE_OWNER_PAGE_SIZE
+        } else {
+            limit.clamp(1, DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+        };
+        let mut routes = Vec::with_capacity(limit);
+        for key in keys.range::<str, _>((start, Bound::Unbounded)) {
+            let Some(route) = self.routes.get(key) else {
+                continue;
+            };
+            if routes.len() == limit {
+                return RouteOwnerPage {
+                    next_cursor: routes.last().map(|route: &ObjectRoute| route.key.0.clone()),
+                    routes,
+                };
+            }
+            routes.push(route.clone());
+        }
+        RouteOwnerPage {
+            routes,
+            next_cursor: None,
+        }
     }
 
     pub(crate) fn list_in_scope(&self, scope: &NamespaceScope) -> Vec<ObjectRoute> {
@@ -206,6 +235,17 @@ impl LocalRouteTable {
     }
 
     fn insert_indexes(&mut self, key: &ObjectKey, route: &ObjectRoute) {
+        for owner in route
+            .replicas
+            .iter()
+            .map(|replica| replica.owner.clone())
+            .collect::<BTreeSet<_>>()
+        {
+            self.owner_index
+                .entry(owner)
+                .or_default()
+                .insert(key.0.clone());
+        }
         if let Some(scope) = route.namespace.clone() {
             self.scope_index
                 .entry(scope)
@@ -221,12 +261,34 @@ impl LocalRouteTable {
     }
 
     fn remove_indexes(&mut self, key: &ObjectKey, route: &ObjectRoute) {
+        for owner in route
+            .replicas
+            .iter()
+            .map(|replica| replica.owner.clone())
+            .collect::<BTreeSet<_>>()
+        {
+            remove_ordered_index_key(&mut self.owner_index, &owner, key.0.as_str());
+        }
         if let Some(scope) = route.namespace.as_ref() {
             remove_index_key(&mut self.scope_index, scope, key.0.as_str());
         }
         if let Ok(reuse) = route_reuse_identity(route) {
             remove_index_key(&mut self.reuse_index, &reuse, key.0.as_str());
         }
+    }
+}
+
+fn remove_ordered_index_key<K: Eq + Hash>(
+    index: &mut HashMap<K, BTreeSet<String>>,
+    identity: &K,
+    key: &str,
+) {
+    let Some(keys) = index.get_mut(identity) else {
+        return;
+    };
+    keys.remove(key);
+    if keys.is_empty() {
+        index.remove(identity);
     }
 }
 
@@ -309,5 +371,111 @@ mod tests {
             Some(RouteVersion(4))
         );
         assert_eq!(table.version_floor(&key), None);
+    }
+
+    #[test]
+    fn owner_route_pages_are_sorted_bounded_and_resume_after_cursor() {
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut table = LocalRouteTable::default();
+        for key in ["route-c", "route-a", "route-b"] {
+            let key = ObjectKey::new(key.to_string());
+            table.replace(&key, Some(&test_route(&key, 1)));
+        }
+
+        let first = table.list_by_replica_owner_page(&owner, None, 2);
+        assert_eq!(
+            first
+                .routes
+                .iter()
+                .map(|route| route.key.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["route-a", "route-b"]
+        );
+        assert_eq!(first.next_cursor.as_deref(), Some("route-b"));
+
+        let second = table.list_by_replica_owner_page(&owner, first.next_cursor.as_deref(), 2);
+        assert_eq!(
+            second
+                .routes
+                .iter()
+                .map(|route| route.key.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["route-c"]
+        );
+        assert_eq!(second.next_cursor, None);
+    }
+
+    #[test]
+    fn owner_route_index_tracks_replica_owner_replacement() {
+        let old_owner = ClientRuntimeId::new("owner-old", ClientEpoch(1));
+        let new_owner = ClientRuntimeId::new("owner-new", ClientEpoch(2));
+        let key = ObjectKey::new("route-owner-move".to_string());
+        let mut table = LocalRouteTable::default();
+        let mut old_route = test_route(&key, 1);
+        old_route.replicas[0].owner = old_owner.clone();
+        table.replace(&key, Some(&old_route));
+
+        let mut new_route = old_route.clone();
+        new_route.version = RouteVersion(2);
+        new_route.replicas[0].owner = new_owner.clone();
+        table.replace(&key, Some(&new_route));
+
+        assert!(table
+            .list_by_replica_owner_page(&old_owner, None, 0)
+            .routes
+            .is_empty());
+        assert_eq!(
+            table
+                .list_by_replica_owner_page(&new_owner, None, 0)
+                .routes
+                .into_iter()
+                .map(|route| route.key.0)
+                .collect::<Vec<_>>(),
+            vec!["route-owner-move"]
+        );
+    }
+
+    #[test]
+    fn owner_route_page_clamps_requested_limit() {
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut table = LocalRouteTable::default();
+        for index in 0..=DEFAULT_ROUTE_OWNER_PAGE_SIZE {
+            let key = ObjectKey::new(format!("route-{index:04}"));
+            table.replace(&key, Some(&test_route(&key, 1)));
+        }
+
+        for limit in [0, usize::MAX] {
+            let page = table.list_by_replica_owner_page(&owner, None, limit);
+            assert_eq!(page.routes.len(), DEFAULT_ROUTE_OWNER_PAGE_SIZE);
+            assert_eq!(
+                page.next_cursor.as_deref(),
+                page.routes.last().map(|route| route.key.0.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn owner_route_index_removes_deleted_keys_and_deduplicates_replica_owners() {
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let key = ObjectKey::new("route-a");
+        let mut route = test_route(&key, 1);
+        route.replicas.push(route.replicas[0].clone());
+        let mut table = LocalRouteTable::default();
+
+        table.replace(&key, Some(&route));
+        assert_eq!(
+            table
+                .list_by_replica_owner_page(&owner, None, 0)
+                .routes
+                .len(),
+            1
+        );
+
+        table.replace(&key, None);
+        assert!(table
+            .list_by_replica_owner_page(&owner, None, 0)
+            .routes
+            .is_empty());
+        assert!(!table.owner_index.contains_key(&owner));
     }
 }

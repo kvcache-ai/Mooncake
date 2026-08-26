@@ -322,72 +322,79 @@ impl StorageOwnerState {
     }
 
     fn hot_replica_count_for_debug_evict_all(&self) -> Result<usize> {
-        Ok(self.collect_routes_by_replica_owner(&self.runtime)?.len())
+        let mut count = 0usize;
+        self.route_ops
+            .visit_routes_by_replica_owner(&self.runtime, &mut |_| {
+                count = count.saturating_add(1);
+                Ok(())
+            })?;
+        Ok(count)
     }
 
     fn repair_stuck_pending_offloads_for_debug_evict_all(&self) -> Result<usize> {
-        let routes = self.collect_routes_by_replica_owner(&self.runtime)?;
         let mut repaired = 0usize;
         let offload_worker_idle = !self.pending_offloads.is_materializing();
-        for route in routes {
-            if route.state != RouteState::Active {
-                self.sync_route(&route);
-                continue;
-            }
-            if !route
-                .replicas
-                .iter()
-                .any(|replica| replica.owner == self.runtime)
-            {
-                self.sync_route(&route);
-                continue;
-            }
-            let Some(cold_backing) = route.cold_backing.clone() else {
-                continue;
-            };
-            if cold_backing.owner != self.runtime
-                || cold_backing.state != mooncake_store_core::ColdBackingState::PendingOffload
-            {
-                continue;
-            }
-            if super::cold_tier_disabled() {
-                super::offload::clear_unavailable_pending_cold_backing(
-                    self,
-                    &route,
-                    &cold_backing,
-                    "debug_evict_all_cold_tier_disabled",
-                    None,
-                )?;
-                repaired = repaired.saturating_add(1);
-                continue;
-            }
-            if let Err(error) = self.cold_tier_devices.backend_for(&cold_backing) {
-                super::offload::clear_unavailable_pending_cold_backing(
-                    self,
-                    &route,
-                    &cold_backing,
-                    "debug_evict_all_backend_unavailable",
-                    Some(&error),
-                )?;
-                repaired = repaired.saturating_add(1);
-                continue;
-            }
-            if offload_worker_idle
-                && self.pending_offloads.requeue_for_debug_evict_all(
-                    route.key.clone(),
-                    route.version,
-                    Some(cold_backing.length),
-                )
-            {
-                repaired = repaired.saturating_add(1);
-                warn!(
-                    runtime = %self.runtime,
-                    key = %route.key.0,
-                    route_version = route.version.0,
-                    "debug evict_all requeued stuck pending offload"
-                );
-            }
-        }
+        self.route_ops
+            .visit_routes_by_replica_owner(&self.runtime, &mut |route| {
+                if route.state != RouteState::Active {
+                    self.sync_route(&route);
+                    return Ok(());
+                }
+                if !route
+                    .replicas
+                    .iter()
+                    .any(|replica| replica.owner == self.runtime)
+                {
+                    self.sync_route(&route);
+                    return Ok(());
+                }
+                let Some(cold_backing) = route.cold_backing.clone() else {
+                    return Ok(());
+                };
+                if cold_backing.owner != self.runtime
+                    || cold_backing.state != mooncake_store_core::ColdBackingState::PendingOffload
+                {
+                    return Ok(());
+                }
+                if super::cold_tier_disabled() {
+                    super::offload::clear_unavailable_pending_cold_backing(
+                        self,
+                        &route,
+                        &cold_backing,
+                        "debug_evict_all_cold_tier_disabled",
+                        None,
+                    )?;
+                    repaired = repaired.saturating_add(1);
+                    return Ok(());
+                }
+                if let Err(error) = self.cold_tier_devices.backend_for(&cold_backing) {
+                    super::offload::clear_unavailable_pending_cold_backing(
+                        self,
+                        &route,
+                        &cold_backing,
+                        "debug_evict_all_backend_unavailable",
+                        Some(&error),
+                    )?;
+                    repaired = repaired.saturating_add(1);
+                    return Ok(());
+                }
+                if offload_worker_idle
+                    && self.pending_offloads.requeue_for_debug_evict_all(
+                        route.key.clone(),
+                        route.version,
+                        Some(cold_backing.length),
+                    )
+                {
+                    repaired = repaired.saturating_add(1);
+                    warn!(
+                        runtime = %self.runtime,
+                        key = %route.key.0,
+                        route_version = route.version.0,
+                        "debug evict_all requeued stuck pending offload"
+                    );
+                }
+                Ok(())
+            })?;
         Ok(repaired)
     }
 }

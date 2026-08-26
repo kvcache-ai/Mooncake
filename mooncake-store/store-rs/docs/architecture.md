@@ -89,6 +89,15 @@ The route crate is split into three route-specific layers:
 - `table`: single-authority local route table storage, CAS, and indexes
 - `mesh`: distributed route-authority protocol, including Embedded WRH selection, primary CAS, mirror/repair/fallback, local authority binding, and per-authority table registration
 
+Each route authority maintains an exact `replica owner -> ordered object key` index. Owner maintenance
+queries use cursor pagination with a fixed 256-route default and maximum page size; compatibility
+maintenance visitors consume these bounded pages until the response omits `next_cursor`.
+
+Owner maintenance consumes pages through a visitor and retains only the current authority pages.
+The compatibility `Vec` API has a fixed 256-route total limit and returns an explicit error when a
+continuation exists. Custom authority services keep source compatibility and fail closed until they
+implement the paginated service method. `MetadataOnly` applies the same fixed compatibility limit.
+
 Route authority policy is bootstrap-validated through metadata:
 
 - every client starts with a local `route_control` (cluster-level, fixed at startup) and `route_topk` (fallback, overridable via tenant policy)

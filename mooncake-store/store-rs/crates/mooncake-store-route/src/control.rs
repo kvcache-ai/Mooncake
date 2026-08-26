@@ -5,7 +5,9 @@ use mooncake_store_core::{
     RouteCasRequest, StoreError,
 };
 
-use crate::shim::{RouteAuthorityClient, RouteAuthorityService};
+use crate::shim::{
+    RouteAuthorityClient, RouteAuthorityService, RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE,
+};
 
 #[derive(Clone, Debug)]
 pub enum RouteControlRequest {
@@ -33,6 +35,8 @@ pub enum RouteControlRequest {
         namespace: String,
         authority: ClientStableId,
         owner: ClientRuntimeId,
+        cursor: Option<String>,
+        limit: usize,
     },
 }
 
@@ -82,7 +86,7 @@ pub enum RouteControlResponse {
     BatchContains(Vec<Result<bool>>),
     BatchCompareAndSwap(Vec<Result<CasResult>>),
     BatchReplace(Vec<Result<()>>),
-    ListByReplicaOwner(Vec<ObjectRoute>),
+    ListByReplicaOwner(RouteOwnerPage),
 }
 
 pub trait RouteControlTransport: Send + Sync {
@@ -130,8 +134,16 @@ pub fn serve_route_control_request(
             namespace,
             authority,
             owner,
+            cursor,
+            limit,
         } => service
-            .list_routes_by_replica_owner(&namespace, &authority, &owner)
+            .list_routes_by_replica_owner_page(
+                &namespace,
+                &authority,
+                &owner,
+                cursor.as_deref(),
+                limit,
+            )
             .map(RouteControlResponse::ListByReplicaOwner),
     }
 }
@@ -258,18 +270,46 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         authority: &ClientStableId,
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>> {
+        let page = self.list_routes_by_replica_owner_page(
+            lease,
+            namespace,
+            authority,
+            owner,
+            None,
+            DEFAULT_ROUTE_OWNER_PAGE_SIZE,
+        )?;
+        if page.next_cursor.is_some() {
+            return Err(StoreError::Unsupported(
+                "complete owner-route listing exceeds the bounded compatibility page; use pagination"
+                    .to_string(),
+            ));
+        }
+        Ok(page.routes)
+    }
+
+    fn list_routes_by_replica_owner_page(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RouteOwnerPage> {
         let response = self.transport.send_route_control(
             lease,
             RouteControlRequest::ListByReplicaOwner {
                 namespace: namespace.to_string(),
                 authority: authority.clone(),
                 owner: owner.clone(),
+                cursor: cursor.map(ToOwned::to_owned),
+                limit,
             },
         )?;
-        let RouteControlResponse::ListByReplicaOwner(routes) = response else {
+        let RouteControlResponse::ListByReplicaOwner(page) = response else {
             return unexpected_response("list_routes_by_replica_owner");
         };
-        Ok(routes)
+        Ok(page)
     }
 }
 

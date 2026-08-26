@@ -328,11 +328,14 @@ message ListRoutesByReplicaOwnerRequest {
   string namespace = 1;
   string authority = 2;
   ClientRuntimeId owner = 3;
+  optional string cursor = 4;
+  uint32 limit = 5;
 }
 
 message ListRoutesByReplicaOwnerReply {
   repeated ObjectRoute routes = 1;
   ErrorDetail error = 2;
+  optional string next_cursor = 3;
 }
 
 message BatchReportRouteHitsRequest {
