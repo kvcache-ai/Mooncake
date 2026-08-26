@@ -77,25 +77,25 @@
         },
         "tcp": {
             "enable": true,
-            "implementation": "standard",
             "max_retry_count": 3,
             "retry_base_delay_ms": 100,
             "retry_max_delay_ms": 2000,
-            "max_concurrent_tasks": 16,
-            "high_performance": {
-                "bind_address": "",
-                "advertise_address": "",
-                "port": 0,
-                "worker_count": 16,
-                "queue_capacity_per_worker": 256,
-                "connections_per_peer": 4,
-                "max_outstanding_tasks": 4096,
-                "max_outstanding_bytes": 4294967296,
-                "max_transfer_bytes": 1073741824,
-                "chunk_size": 1048576,
-                "connect_timeout_ms": 2000,
-                "progress_timeout_ms": 30000
-            }
+            "max_concurrent_tasks": 16
+        },
+        "hp_tcp": {
+            "enable": false,
+            "bind_address": "",
+            "advertise_address": "",
+            "port": 0,
+            "worker_count": 16,
+            "queue_capacity_per_worker": 256,
+            "connections_per_peer": 4,
+            "max_outstanding_tasks": 4096,
+            "max_outstanding_bytes": 4294967296,
+            "max_transfer_bytes": 1073741824,
+            "chunk_size": 1048576,
+            "connect_timeout_ms": 2000,
+            "progress_timeout_ms": 30000
         },
         "gds": {
             "enable" : true

@@ -69,7 +69,7 @@ TEST(HighPerformanceTcpTransportTest,
 
     const SegmentDescRef local = metadata->segmentManager().getLocal();
     const auto attr_it = local->getMemory().transport_attrs.find(
-        static_cast<int>(TransportType::TCP));
+        static_cast<int>(TransportType::HP_TCP));
     ASSERT_NE(attr_it, local->getMemory().transport_attrs.end());
     HighPerformanceTcpEndpointAttr endpoint;
     ASSERT_TRUE(
@@ -87,8 +87,8 @@ TEST(HighPerformanceTcpTransportTest,
     local_options.perm = kLocalReadWrite;
     ASSERT_TRUE(transport.addMemoryBuffer(local_only, local_options).ok());
     EXPECT_TRUE(transport.tracksLocalBuffer(local_only));
-    EXPECT_FALSE(ContainsTransport(local_only, TransportType::TCP));
-    EXPECT_EQ(local_only.transport_attrs.count(TransportType::TCP), 0U);
+    EXPECT_FALSE(ContainsTransport(local_only, TransportType::HP_TCP));
+    EXPECT_EQ(local_only.transport_attrs.count(TransportType::HP_TCP), 0U);
 
     std::array<uint8_t, 64> global_storage{};
     BufferDesc global;
@@ -98,8 +98,8 @@ TEST(HighPerformanceTcpTransportTest,
     MemoryOptions global_options;
     global_options.perm = kGlobalReadWrite;
     ASSERT_TRUE(transport.addMemoryBuffer(global, global_options).ok());
-    EXPECT_TRUE(ContainsTransport(global, TransportType::TCP));
-    const auto buffer_attr = global.transport_attrs.find(TransportType::TCP);
+    EXPECT_TRUE(ContainsTransport(global, TransportType::HP_TCP));
+    const auto buffer_attr = global.transport_attrs.find(TransportType::HP_TCP);
     ASSERT_NE(buffer_attr, global.transport_attrs.end());
     HighPerformanceTcpBufferAttr decoded_buffer;
     ASSERT_TRUE(

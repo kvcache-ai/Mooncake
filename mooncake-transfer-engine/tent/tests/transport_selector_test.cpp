@@ -188,6 +188,7 @@ TEST(TransportSelectorTest, TransportTypeNameMapping) {
     EXPECT_STREQ(transportTypeName(SUNRISE_LINK), "sunrise_link");
     EXPECT_STREQ(transportTypeName(UB), "ub");
     EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
+    EXPECT_STREQ(transportTypeName(HP_TCP), "hp_tcp");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
@@ -203,6 +204,7 @@ TEST(TransportSelectorTest, ParseTransportType) {
     EXPECT_EQ(parseTransportType("sunrise_link"), SUNRISE_LINK);
     EXPECT_EQ(parseTransportType("ub"), UB);
     EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
+    EXPECT_EQ(parseTransportType("hp_tcp"), HP_TCP);
     EXPECT_EQ(parseTransportType("unknown"), UNSPEC);
 }
 
@@ -212,7 +214,7 @@ TEST(TransportSelectorTest, UbTransportNameRoundTrips) {
     EXPECT_EQ(parseTransportType(name), UB);
 }
 
-TEST(TransportTypeTest, WireValuesRemainStableWithUbAppended) {
+TEST(TransportTypeTest, WireValuesRemainStableWithHpTcpAppended) {
     EXPECT_EQ(static_cast<int>(UNSPEC), 0);
     EXPECT_EQ(static_cast<int>(RDMA), 1);
     EXPECT_EQ(static_cast<int>(MNNVL), 2);
@@ -226,7 +228,8 @@ TEST(TransportTypeTest, WireValuesRemainStableWithUbAppended) {
     EXPECT_EQ(static_cast<int>(TPU), 10);
     EXPECT_EQ(static_cast<int>(UB), 11);
     EXPECT_EQ(static_cast<int>(MPCOMM), 12);
-    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 13);
+    EXPECT_EQ(static_cast<int>(HP_TCP), 13);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 14);
 }
 
 // MPComm is appended after UB, so it takes wire value 12. The same integer is
@@ -243,6 +246,14 @@ TEST(TransportTypeTest, MpcommWireValueMatchesCApiAndRoundTrips) {
     // "transports": ["mpcomm"] resolve to UNSPEC silently.
     EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
     EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
+}
+
+TEST(TransportTypeTest, HpTcpWireValueMatchesCApiAndRoundTrips) {
+    EXPECT_EQ(static_cast<int>(HP_TCP), 13);
+    EXPECT_EQ(TRANSPORT_HP_TCP, static_cast<int>(HP_TCP));
+    EXPECT_EQ(c_to_transport_hint(TRANSPORT_HP_TCP), HP_TCP);
+    EXPECT_STREQ(transportTypeName(HP_TCP), "hp_tcp");
+    EXPECT_EQ(parseTransportType("hp_tcp"), HP_TCP);
 }
 
 // Topology::NicType is serialized as an integer. These values are therefore a

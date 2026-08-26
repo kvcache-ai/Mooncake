@@ -64,24 +64,20 @@ std::shared_ptr<Config> MakeHpConfig() {
     auto config = std::make_shared<Config>();
     config->set("metadata_type", "p2p");
     config->set("metadata_servers", "P2PHANDSHAKE");
-    config->set("transports/tcp/enable", true);
-    config->set("transports/tcp/implementation", "high_performance");
-    config->set("transports/tcp/high_performance/bind_address", "127.0.0.1");
-    config->set("transports/tcp/high_performance/advertise_address",
-                "127.0.0.1");
-    config->set("transports/tcp/high_performance/port", 0);
-    config->set("transports/tcp/high_performance/worker_count", 4);
-    config->set("transports/tcp/high_performance/queue_capacity_per_worker",
-                64);
-    config->set("transports/tcp/high_performance/connections_per_peer", 4);
-    config->set("transports/tcp/high_performance/max_outstanding_tasks", 128);
-    config->set("transports/tcp/high_performance/max_outstanding_bytes",
-                64ULL << 20);
-    config->set("transports/tcp/high_performance/max_transfer_bytes",
-                8ULL << 20);
-    config->set("transports/tcp/high_performance/chunk_size", 64ULL << 10);
-    config->set("transports/tcp/high_performance/connect_timeout_ms", 2000);
-    config->set("transports/tcp/high_performance/progress_timeout_ms", 5000);
+    config->set("transports/tcp/enable", false);
+    config->set("transports/hp_tcp/enable", true);
+    config->set("transports/hp_tcp/bind_address", "127.0.0.1");
+    config->set("transports/hp_tcp/advertise_address", "127.0.0.1");
+    config->set("transports/hp_tcp/port", 0);
+    config->set("transports/hp_tcp/worker_count", 4);
+    config->set("transports/hp_tcp/queue_capacity_per_worker", 64);
+    config->set("transports/hp_tcp/connections_per_peer", 4);
+    config->set("transports/hp_tcp/max_outstanding_tasks", 128);
+    config->set("transports/hp_tcp/max_outstanding_bytes", 64ULL << 20);
+    config->set("transports/hp_tcp/max_transfer_bytes", 8ULL << 20);
+    config->set("transports/hp_tcp/chunk_size", 64ULL << 10);
+    config->set("transports/hp_tcp/connect_timeout_ms", 2000);
+    config->set("transports/hp_tcp/progress_timeout_ms", 5000);
     config->set("transports/rdma/enable", false);
     config->set("transports/shm/enable", false);
     config->set("rpc_server_threads", 1);
@@ -211,7 +207,7 @@ void RunWriteThenReadAcrossProcesses(size_t task_count) {
         write_request.target_id = segment;
         write_request.target_offset = info.buffers[0].base + task * kDataLength;
         write_request.length = kDataLength;
-        write_request.transport_hint = TCP;
+        write_request.transport_hint = HP_TCP;
         writes.push_back(write_request);
 
         Request read_request{};
@@ -221,7 +217,7 @@ void RunWriteThenReadAcrossProcesses(size_t task_count) {
         read_request.target_id = segment;
         read_request.target_offset = info.buffers[0].base + task * kDataLength;
         read_request.length = kDataLength;
-        read_request.transport_hint = TCP;
+        read_request.transport_hint = HP_TCP;
         reads.push_back(read_request);
     }
 

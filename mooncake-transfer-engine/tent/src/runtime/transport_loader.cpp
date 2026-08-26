@@ -54,16 +54,12 @@ namespace mooncake {
 namespace tent {
 
 Status TransferEngineImpl::loadTransports() {
-    if (tcp_transport_config_.enabled) {
-        if (tcp_transport_config_.implementation ==
-            TcpImplementation::kStandard) {
-            transport_list_[TCP] = std::make_shared<TcpTransport>();
-        } else {
-            transport_list_[TCP] =
-                std::make_shared<HighPerformanceTcpTransport>(
-                    tcp_transport_config_.high_performance);
-        }
-    }
+    if (conf_->get("transports/tcp/enable", true))
+        transport_list_[TCP] = std::make_shared<TcpTransport>();
+
+    if (hp_tcp_transport_config_.enabled)
+        transport_list_[HP_TCP] = std::make_shared<HighPerformanceTcpTransport>(
+            hp_tcp_transport_config_.params);
 
     // SHM is opt-in: default false because the current path is not NUMA-aware
     // (see tent/config/transfer-engine.json for an example that enables it).

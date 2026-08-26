@@ -1,6 +1,6 @@
 // Copyright 2026 KVCache.AI
-#ifndef TENT_RUNTIME_TCP_TRANSPORT_CONFIG_H_
-#define TENT_RUNTIME_TCP_TRANSPORT_CONFIG_H_
+#ifndef TENT_RUNTIME_HP_TCP_TRANSPORT_CONFIG_H_
+#define TENT_RUNTIME_HP_TCP_TRANSPORT_CONFIG_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,8 +9,6 @@
 #include "tent/common/config.h"
 
 namespace mooncake::tent {
-
-enum class TcpImplementation { kStandard, kHighPerformance };
 
 struct HighPerformanceTcpParams {
     std::string bind_address;
@@ -27,20 +25,18 @@ struct HighPerformanceTcpParams {
     uint64_t progress_timeout_ms{30000};
 };
 
-struct TcpTransportConfig {
-    bool enabled{true};
-    TcpImplementation implementation{TcpImplementation::kStandard};
-    HighPerformanceTcpParams high_performance;
-
-    bool hpRequired() const {
-        return enabled && implementation == TcpImplementation::kHighPerformance;
-    }
+struct HpTcpTransportConfig {
+    bool enabled{false};
+    HighPerformanceTcpParams params;
 };
 
-// This is intentionally the sole parser for transports/tcp.  Config::get()
+// This is intentionally the sole parser for transports/hp_tcp. Config::get()
 // silently substitutes defaults for type mismatches and is not suitable here.
-Status ParseTcpTransportConfig(const Config& config, TcpTransportConfig* out);
+// HP TCP and standard TCP are mutually exclusive in v1 because both data
+// planes currently own the single ControlService notification callback.
+Status ParseHpTcpTransportConfig(const Config& config,
+                                 HpTcpTransportConfig* out);
 
 }  // namespace mooncake::tent
 
-#endif  // TENT_RUNTIME_TCP_TRANSPORT_CONFIG_H_
+#endif  // TENT_RUNTIME_HP_TCP_TRANSPORT_CONFIG_H_

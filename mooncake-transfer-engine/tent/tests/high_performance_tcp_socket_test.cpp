@@ -48,6 +48,16 @@ struct Completion {
     }
 };
 
+template <typename Predicate>
+bool WaitUntil(Predicate&& predicate, std::chrono::milliseconds timeout = 2s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) return true;
+        std::this_thread::sleep_for(1ms);
+    }
+    return predicate();
+}
+
 // The server and client intentionally share an in-process backing buffer in
 // these socket tests. The protocol ACK provides the ordering, but
 // ThreadSanitizer cannot infer a C++ happens-before edge through the kernel TCP
@@ -63,7 +73,7 @@ bool SocketOrderedEqual(const std::array<uint8_t, Size>& left,
 
 class CoreRuntime {
    public:
-    CoreRuntime()
+    explicit CoreRuntime(size_t max_connections = 32)
         : workers({.worker_count = 2, .queue_capacity = 32}),
           client({.max_transfer_bytes = 1 << 20,
                   .chunk_size = 128,
@@ -76,7 +86,7 @@ class CoreRuntime {
                   .max_transfer_bytes = 1 << 20,
                   .chunk_size = 128,
                   .progress_timeout_ms = 500,
-                  .max_connections = 32},
+                  .max_connections = max_connections},
                  &registry, &workers) {}
 
     ~CoreRuntime() {
@@ -342,6 +352,31 @@ TEST(HighPerformanceTcpSocketTest, MalformedFrameGetsErrorAndConnectionCloses) {
     socket.read_some(asio::buffer(extra), error);
     EXPECT_TRUE(error == asio::error::eof ||
                 error == asio::error::connection_reset);
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     ClosedSessionsAreReapedAndConnectionBudgetIsReusable) {
+    constexpr size_t kMaxConnections = 2;
+    constexpr size_t kConnectionCycles = 16;
+    CoreRuntime runtime(kMaxConnections);
+    runtime.start();
+
+    for (size_t cycle = 0; cycle < kConnectionCycles; ++cycle) {
+        SCOPED_TRACE(cycle);
+        asio::io_context io;
+        asio::ip::tcp::socket socket(io);
+        socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+
+        ASSERT_TRUE(WaitUntil(
+            [&] { return runtime.server.activeSessionsForTest() == 1u; }));
+
+        std::error_code ignored;
+        socket.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
+        socket.close(ignored);
+
+        ASSERT_TRUE(WaitUntil(
+            [&] { return runtime.server.activeSessionsForTest() == 0u; }));
+    }
 }
 
 }  // namespace

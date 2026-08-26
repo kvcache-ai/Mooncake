@@ -33,7 +33,7 @@
 #include "tent/runtime/admission_queue.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
-#include "tent/runtime/tcp_transport_config.h"
+#include "tent/runtime/hp_tcp_transport_config.h"
 
 namespace mooncake {
 namespace tent {
@@ -484,7 +484,7 @@ class TransferEngineImpl {
 
    private:
     std::shared_ptr<Config> conf_;
-    TcpTransportConfig tcp_transport_config_;
+    HpTcpTransportConfig hp_tcp_transport_config_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;

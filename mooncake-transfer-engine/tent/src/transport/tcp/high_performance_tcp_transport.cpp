@@ -118,9 +118,9 @@ Status HighPerformanceTcpTransport::rollbackPublishedEndpoint(
             auto& attrs =
                 std::get<MemorySegmentDesc>(desc.detail).transport_attrs;
             if (previous_attr.has_value()) {
-                attrs[static_cast<int>(TransportType::TCP)] = *previous_attr;
+                attrs[static_cast<int>(TransportType::HP_TCP)] = *previous_attr;
             } else {
-                attrs.erase(static_cast<int>(TransportType::TCP));
+                attrs.erase(static_cast<int>(TransportType::HP_TCP));
             }
             return Status::OK();
         });
@@ -159,7 +159,7 @@ Status HighPerformanceTcpTransport::install(
                 "HP TCP requires a local memory segment" LOC_MARK);
         }
         const auto& attrs = local->getMemory().transport_attrs;
-        const auto it = attrs.find(static_cast<int>(TransportType::TCP));
+        const auto it = attrs.find(static_cast<int>(TransportType::HP_TCP));
         if (it != attrs.end()) previous_attr = it->second;
     }
 
@@ -229,8 +229,8 @@ Status HighPerformanceTcpTransport::install(
                             "HP TCP local segment changed type" LOC_MARK);
                     }
                     std::get<MemorySegmentDesc>(desc.detail)
-                        .transport_attrs[static_cast<int>(TransportType::TCP)] =
-                        encoded;
+                        .transport_attrs[static_cast<int>(
+                            TransportType::HP_TCP)] = encoded;
                     return Status::OK();
                 });
         }
@@ -319,7 +319,7 @@ Status HighPerformanceTcpTransport::uninstall() {
                 }
                 std::get<MemorySegmentDesc>(desc.detail)
                     .transport_attrs.erase(
-                        static_cast<int>(TransportType::TCP));
+                        static_cast<int>(TransportType::HP_TCP));
                 return Status::OK();
             });
         first = FirstError(std::move(first), removed);
@@ -414,11 +414,11 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
             BufferDesc* buffer =
                 segment->findBuffer(request.target_offset, request.length);
             if (buffer == nullptr ||
-                !HasTransport(*buffer, TransportType::TCP)) {
+                !HasTransport(*buffer, TransportType::HP_TCP)) {
                 return NeedsRefresh("HP TCP target buffer is not advertised");
             }
             const auto endpoint_it = segment->getMemory().transport_attrs.find(
-                static_cast<int>(TransportType::TCP));
+                static_cast<int>(TransportType::HP_TCP));
             if (endpoint_it == segment->getMemory().transport_attrs.end()) {
                 return NeedsRefresh("HP TCP endpoint metadata is missing");
             }
@@ -428,7 +428,7 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
                 return NeedsRefresh("HP TCP endpoint metadata is incompatible");
             }
             const auto registration_it =
-                buffer->transport_attrs.find(TransportType::TCP);
+                buffer->transport_attrs.find(TransportType::HP_TCP);
             if (registration_it == buffer->transport_attrs.end()) {
                 return NeedsRefresh("HP TCP buffer registration is missing");
             }
@@ -636,9 +636,9 @@ Status HighPerformanceTcpTransport::addMemoryBuffer(
         (void)registry_.remove(desc.addr, desc.length);
         return status;
     }
-    desc.transport_attrs[TransportType::TCP] = std::move(encoded);
-    if (!HasTransport(desc, TransportType::TCP)) {
-        desc.transports.push_back(TransportType::TCP);
+    desc.transport_attrs[TransportType::HP_TCP] = std::move(encoded);
+    if (!HasTransport(desc, TransportType::HP_TCP)) {
+        desc.transports.push_back(TransportType::HP_TCP);
     }
     return Status::OK();
 }
@@ -647,10 +647,10 @@ Status HighPerformanceTcpTransport::removeMemoryBuffer(BufferDesc& desc) {
     if (!registry_.tracks(desc.addr, desc.length)) return Status::OK();
     Status status = registry_.remove(desc.addr, desc.length);
     if (!status.ok()) return status;
-    desc.transport_attrs.erase(TransportType::TCP);
+    desc.transport_attrs.erase(TransportType::HP_TCP);
     desc.transports.erase(
         std::remove(desc.transports.begin(), desc.transports.end(),
-                    TransportType::TCP),
+                    TransportType::HP_TCP),
         desc.transports.end());
     return Status::OK();
 }

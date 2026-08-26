@@ -335,7 +335,7 @@ Status TransferEngineImpl::setupLocalSegment() {
 }
 
 Status TransferEngineImpl::construct() {
-    CHECK_STATUS(ParseTcpTransportConfig(*conf_, &tcp_transport_config_));
+    CHECK_STATUS(ParseHpTcpTransportConfig(*conf_, &hp_tcp_transport_config_));
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
 
@@ -392,7 +392,7 @@ Status TransferEngineImpl::construct() {
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this,
-                                         !tcp_transport_config_.hpRequired());
+                                         !hp_tcp_transport_config_.enabled);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_, rpc_server_threads));
 
@@ -424,9 +424,9 @@ Status TransferEngineImpl::construct() {
             auto status = transport->install(local_segment_name_, metadata_,
                                              topology_, conf_);
             if (!status.ok()) {
-                if (tcp_transport_config_.hpRequired() &&
+                if (hp_tcp_transport_config_.enabled &&
                     transport_index ==
-                        static_cast<size_t>(TransportType::TCP)) {
+                        static_cast<size_t>(TransportType::HP_TCP)) {
                     // HP TCP is explicitly required, so a failed install is a
                     // construction failure rather than an optional-transport
                     // skip. Unwind the already-started control service and
@@ -724,15 +724,19 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = SHM;
         else if (transport_list_[RDMA])
             options.type = RDMA;
-        else
+        else if (transport_list_[TCP])
             options.type = TCP;
+        else
+            options.type = HP_TCP;
     } else {
         if (transport_list_[MNNVL])
             options.type = MNNVL;
         else if (transport_list_[RDMA])
             options.type = RDMA;
-        else
+        else if (transport_list_[TCP])
             options.type = TCP;
+        else
+            options.type = HP_TCP;
     }
     return allocateLocalMemory(addr, size, options);
 }
@@ -744,6 +748,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = RDMA;
         else if (transport_list_[TCP])
             options.type = TCP;
+        else if (transport_list_[HP_TCP])
+            options.type = HP_TCP;
         else
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
@@ -807,6 +813,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
+    if (transport_list_[HP_TCP]) result.push_back(HP_TCP);
     if (transport_list_[GDS]) result.push_back(GDS);
     if (transport_list_[MPCOMM]) result.push_back(MPCOMM);
     if (transport_list_[TPU]) result.push_back(TPU);
@@ -1566,7 +1573,8 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
     // An empty stage location means "no staging needed on that side".
     if (transport_list_[TPU] &&
-        (transport_list_[RDMA] || transport_list_[TCP])) {
+        (transport_list_[RDMA] || transport_list_[TCP] ||
+         transport_list_[HP_TCP])) {
         if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
             policy.clear();
             policy.push_back(server_addr);
@@ -1621,7 +1629,7 @@ Status TransferEngineImpl::prepareSubmit(
         PreparedSubmit::Owner owner;
         owner.request = request;
         owner.route = resolveTransport(owner.request, 0);
-        if (owner.route.transport == TCP) {
+        if (owner.route.transport == TCP || owner.route.transport == HP_TCP) {
             findStagingPolicy(owner.request, owner.staging_params);
             owner.staging = !owner.staging_params.empty() && staging_proxy_;
         }
@@ -1936,7 +1944,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         return finishQueuedOwner(owner_id, FAILED);
     }
 
-    if (task.type == TCP) {
+    if (task.type == TCP || task.type == HP_TCP) {
         std::vector<std::string> staging_params;
         findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {

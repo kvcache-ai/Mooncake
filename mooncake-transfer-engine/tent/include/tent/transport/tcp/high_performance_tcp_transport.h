@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "tent/runtime/tcp_transport_config.h"
+#include "tent/runtime/hp_tcp_transport_config.h"
 #include "tent/runtime/transport.h"
 #include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
 #include "tent/transport/tcp/high_performance_tcp_client.h"
@@ -62,7 +62,7 @@ class HighPerformanceTcpTransport final : public Transport {
     Status receiveNotification(
         std::vector<Notification>& notifications) override;
 
-    const char* getName() const override { return "tcp_high_performance"; }
+    const char* getName() const override { return "hp_tcp"; }
 
    private:
     struct TaskPlan;
