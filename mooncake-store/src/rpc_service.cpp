@@ -922,18 +922,33 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     return results;
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
-    const Segment& segment, const UUID& client_id) {
+tl::expected<UpdateSegmentsResponse, ErrorCode>
+WrappedMasterService::UpdateSegments(const UpdateSegmentsRequest& request) {
     return execute_rpc(
-        "MountSegment",
-        [&] { return master_service_.MountSegment(segment, client_id); },
+        "UpdateSegments",
+        [&] { return master_service_.UpdateSegments(request); },
         [&](auto& timer) {
-            timer.LogRequest("base=", segment.base, ", size=", segment.size,
-                             ", segment_name=", segment.name,
-                             ", id=", segment.id);
+            timer.LogRequest(
+                "segments_count=", request.segments.size(),
+                ", request_intent=", static_cast<int>(request.request_intent),
+                ", client_id=", request.client_id);
         },
-        [] { MasterMetricManager::instance().inc_mount_segment_requests(); },
-        [] { MasterMetricManager::instance().inc_mount_segment_failures(); });
+        [&] {
+            if (request.request_intent ==
+                SegmentUpdateRequestIntent::REGISTER) {
+                MasterMetricManager::instance().inc_mount_segment_requests();
+            } else {
+                MasterMetricManager::instance().inc_remount_segment_requests();
+            }
+        },
+        [&] {
+            if (request.request_intent ==
+                SegmentUpdateRequestIntent::REGISTER) {
+                MasterMetricManager::instance().inc_mount_segment_failures();
+            } else {
+                MasterMetricManager::instance().inc_remount_segment_failures();
+            }
+        });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountNoFSegment(
@@ -953,19 +968,6 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountNoFSegment(
         [] {
             MasterMetricManager::instance().inc_mount_nof_segment_failures();
         });
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
-    const std::vector<SegmentUpdate>& updates, const UUID& client_id) {
-    return execute_rpc(
-        "ReMountSegment",
-        [&] { return master_service_.ReMountSegment(updates, client_id); },
-        [&](auto& timer) {
-            timer.LogRequest("segments_count=", updates.size(),
-                             ", client_id=", client_id);
-        },
-        [] { MasterMetricManager::instance().inc_remount_segment_requests(); },
-        [] { MasterMetricManager::instance().inc_remount_segment_failures(); });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::ReMountNoFSegment(
@@ -1778,11 +1780,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchRemove>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
+    server.register_handler<&mooncake::WrappedMasterService::UpdateSegments>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MountNoFSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReMountNoFSegment>(
         &wrapped_master_service);

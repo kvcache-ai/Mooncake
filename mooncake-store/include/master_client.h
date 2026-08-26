@@ -316,11 +316,10 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false);
 
-    /**
-     * @brief Registers a segment to master for allocation
-     * @param segment Segment to register
-     * @return tl::expected<void, ErrorCode> indicating success/failure
-     */
+    [[nodiscard]] tl::expected<UpdateSegmentsResponse, ErrorCode>
+    UpdateSegments(const UpdateSegmentsRequest& request);
+
+    // Compatibility helper implemented through UpdateSegments(REGISTER).
     [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
         const Segment& segment);
 
@@ -335,14 +334,7 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> MountNoFSegment(
         const NoFSegment& segment);
 
-    /**
-     * @brief Re-mount segments, invoked when the client is the first time to
-     * connect to the master or the client Ping TTL is expired and need
-     * to remount. This function is idempotent. Client should retry if the
-     * return code is not ErrorCode::OK.
-     * @param updates Segments to reconcile and their per-segment intent
-     * @return tl::expected<void, ErrorCode> indicating success/failure
-     */
+    // Compatibility helper implemented through UpdateSegments(RECONCILE).
     [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
         const std::vector<SegmentUpdate>& updates);
 

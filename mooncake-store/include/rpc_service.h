@@ -151,14 +151,11 @@ class WrappedMasterService {
         const std::vector<std::string>& keys, bool force = false,
         const std::string& tenant_id = "default");
 
-    tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
-                                               const UUID& client_id);
+    tl::expected<UpdateSegmentsResponse, ErrorCode> UpdateSegments(
+        const UpdateSegmentsRequest& request);
 
     tl::expected<void, ErrorCode> MountNoFSegment(const NoFSegment& segment,
                                                   const UUID& client_id);
-
-    tl::expected<void, ErrorCode> ReMountSegment(
-        const std::vector<SegmentUpdate>& updates, const UUID& client_id);
 
     tl::expected<void, ErrorCode> ReMountNoFSegment(
         const std::vector<NoFSegment>& segments, const UUID& client_id);

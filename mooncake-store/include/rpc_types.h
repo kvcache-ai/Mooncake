@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "types.h"
 #include "replica.h"
@@ -13,12 +14,21 @@ namespace mooncake {
  * @brief Describes how the master should reconcile a segment registration.
  *
  * This is request intent, not the master-side availability status of a
- * segment. The same segment is NEW when first registered with a master and
- * REMOUNT when it is registered again after master-side state is lost.
+ * segment. NEW always uses ordinary idempotent registration and never standby
+ * recovery; REMOUNT restores a segment that predates loss of Master state.
  */
 enum class SegmentRegistrationIntent : uint8_t {
     NEW = 0,
     REMOUNT = 1,
+};
+
+enum class SegmentUpdateRequestIntent : uint8_t {
+    // Incremental registration. Every item must have NEW intent and this
+    // request never confirms the client's complete segment snapshot.
+    REGISTER = 0,
+    // Full pending snapshot. NEW and REMOUNT items are both accepted, and a
+    // complete success confirms the client in ok_client_.
+    RECONCILE = 1,
 };
 
 /**
@@ -34,6 +44,28 @@ struct SegmentUpdate {
         : segment(segment_param), intent(intent_param) {}
 };
 YLT_REFL(SegmentUpdate, segment, intent);
+
+struct UpdateSegmentsRequest {
+    UUID client_id{};
+    SegmentUpdateRequestIntent request_intent{
+        SegmentUpdateRequestIntent::REGISTER};
+    std::vector<SegmentUpdate> segments;
+};
+YLT_REFL(UpdateSegmentsRequest, client_id, request_intent, segments);
+
+struct SegmentUpdateResult {
+    UUID segment_id{};
+    ErrorCode error_code{ErrorCode::OK};
+};
+YLT_REFL(SegmentUpdateResult, segment_id, error_code);
+
+struct UpdateSegmentsResponse {
+    // Master-side status after handling the request. REGISTER may succeed per
+    // segment while still returning NEED_REMOUNT for the client as a whole.
+    ClientStatus client_status{ClientStatus::NEED_REMOUNT};
+    std::vector<SegmentUpdateResult> results;
+};
+YLT_REFL(UpdateSegmentsResponse, client_status, results);
 
 struct ObjectMeta {
     std::string key;
