@@ -216,4 +216,3 @@ std::shared_ptr<ShmHelper::ShmSegment> ShmHelper::get_shm(void* addr) {
 }
 
 }  // namespace mooncake
-
