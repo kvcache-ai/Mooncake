@@ -241,6 +241,7 @@ By default the script:
 Repository packaging rule:
 
 - `scripts/build/build-wheel.sh` is the single owner of wheel asset injection and `auditwheel repair`
+- nested monorepo builds bootstrap FetchContent dependencies from the enclosing Mooncake CMake tree before building the wheel
 
 Common variants:
 

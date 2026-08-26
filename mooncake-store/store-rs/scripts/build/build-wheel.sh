@@ -48,7 +48,7 @@ Environment:
   PYTHON                     Python interpreter used to create the build venv
   WHEEL_VENV                 Virtualenv directory for build tools
   DIST_DIR                   Output directory for wheel and binary artifacts
-  MOONCAKE_UPSTREAM_DIR      Mooncake upstream submodule path
+  MOONCAKE_UPSTREAM_DIR      Mooncake upstream source tree
   MOONCAKE_UPSTREAM_BUILD_DIR  Upstream build directory used for engine/CLI assets
   YALANTINGLIBS_PREFIX       Install prefix for bundled yalantinglibs
   YALANTINGLIBS_PREBUILT_DIR Prebuilt yalantinglibs directory (if set, skip build and copy from here)
@@ -196,6 +196,7 @@ AUDITWHEEL_EXCLUDES=(
 
 ensure_yalantinglibs() {
   local source_dir="${UPSTREAM_DIR}/extern/yalantinglibs"
+  local fetched_source_dir="${UPSTREAM_BUILD_DIR}/_deps/yalantinglibs-src"
   local build_dir="${UPSTREAM_BUILD_DIR}/yalantinglibs-build"
   local config_file="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs/yalantinglibsConfig.cmake"
   local header_file="${YALANTINGLIBS_PREFIX}/include/ylt/easylog.hpp"
@@ -219,9 +220,30 @@ ensure_yalantinglibs() {
     fi
   fi
 
-  # 从源码编译
-  if [[ ! -d "${source_dir}" ]]; then
-    echo "missing yalantinglibs source: ${source_dir}" >&2
+  # In the monorepo layout yalantinglibs is populated by the enclosing CMake
+  # FetchContent declaration. Bootstrap configuration once so the same pinned
+  # source is available before this script installs its reusable CMake package.
+  if [[ ! -f "${source_dir}/CMakeLists.txt" && ! -f "${fetched_source_dir}/CMakeLists.txt" ]]; then
+    echo "Preparing fetched yalantinglibs source..."
+    PATH="${VENV_BIN}:${PATH}" cmake \
+      -S "${UPSTREAM_DIR}" \
+      -B "${UPSTREAM_BUILD_DIR}" \
+      -DPython3_EXECUTABLE="${VENV_PYTHON}" \
+      -DWITH_TE=ON \
+      -DWITH_STORE=OFF \
+      -DWITH_STORE_RUST=OFF \
+      -DBUILD_EXAMPLES=OFF \
+      -DBUILD_UNIT_TESTS=OFF \
+      -DUSE_TENT=ON \
+      -DUSE_REDIS=ON \
+      -DUSE_HTTP=ON \
+      -DUSE_ETCD=OFF
+  fi
+  if [[ ! -f "${source_dir}/CMakeLists.txt" ]]; then
+    source_dir=${fetched_source_dir}
+  fi
+  if [[ ! -f "${source_dir}/CMakeLists.txt" ]]; then
+    echo "missing yalantinglibs source in source and CMake build trees" >&2
     exit 1
   fi
 
