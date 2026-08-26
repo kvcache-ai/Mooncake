@@ -28,17 +28,17 @@ PYTHON_ASSETS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Replace the packaged mooncake.engine runtime assets in a Store-RS "
+            "Replace the packaged mooncake_store_rs.engine runtime assets in a Store-RS "
             "wheel with assets extracted from an upstream Mooncake release wheel."
         )
     )
     parser.add_argument(
         "--target-wheel",
-        help="Store-RS runtime mooncake wheel to rewrite.",
+        help="Store-RS runtime wheel to rewrite.",
     )
     parser.add_argument(
         "--target-wheel-glob",
-        default="dist/wheels/mooncake-*.whl",
+        default="dist/wheels/mooncake_store_rs-*.whl",
         help="Glob used when --target-wheel is omitted.",
     )
     parser.add_argument(
@@ -53,7 +53,7 @@ def pick_target_wheel(pattern: str) -> pathlib.Path:
     candidates = [
         pathlib.Path(path)
         for path in glob.glob(pattern)
-        if pathlib.Path(path).name.startswith("mooncake-")
+        if pathlib.Path(path).name.startswith("mooncake_store_rs-")
     ]
     if not candidates:
         raise FileNotFoundError(f"no Store-RS runtime wheel matched {pattern!r}")
@@ -70,7 +70,7 @@ def copy_release_assets(
     release_root: pathlib.Path, target_root: pathlib.Path
 ) -> list[str]:
     release_package = release_root / "mooncake"
-    target_package = target_root / "mooncake"
+    target_package = target_root / "mooncake_store_rs"
     if not release_package.is_dir():
         raise FileNotFoundError(f"{release_package} not found in release wheel")
     if not target_package.is_dir():
@@ -99,8 +99,9 @@ def copy_release_assets(
         shutil.copy2(source, target)
         copied.append(target.relative_to(target_root).as_posix())
 
-    for source_dir in sorted(release_root.glob("*.libs")):
-        target_dir = target_root / source_dir.name
+    source_dir = release_root / "mooncake.libs"
+    if source_dir.is_dir():
+        target_dir = target_root / "mooncake_store_rs.libs"
         if target_dir.exists():
             shutil.rmtree(target_dir)
         shutil.copytree(source_dir, target_dir)
