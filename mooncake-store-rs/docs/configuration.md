@@ -438,6 +438,11 @@ Notes:
 
 ### Redis authentication
 
+Redis compatibility list operations are fail-closed and bounded. Indexed sets
+accept at most 4096 members per call, while legacy key migration scans accept at
+most 64 pages and 4096 matching keys. Larger namespaces must use an exact or
+paginated maintenance surface instead of relying on a collect-all list.
+
 Use `MC_REDIS_PASSWORD` for password-only Redis deployments, including cloud Redis instances that authenticate the default user:
 
 ```bash
