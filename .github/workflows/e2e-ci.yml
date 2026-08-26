@@ -14,6 +14,15 @@ on:
         description: 'PR head SHA to checkout'
         required: false
         type: string
+      tone_sha:
+        description: 'Source SHA whose CUDA wheel artifact is used by TONE'
+        required: false
+        type: string
+      run_ascend:
+        description: 'Run the Ascend E2E job'
+        required: false
+        default: true
+        type: boolean
       triggered_by:
         description: 'User who triggered this'
         required: false
@@ -30,7 +39,7 @@ concurrency:
 jobs:
   ascend-test:
     if: >
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_ascend) ||
       github.event.label.name == 'run-e2e-ci'
     uses: ./.github/workflows/ci_ascend.yml
     with:
@@ -51,7 +60,7 @@ jobs:
       github.event.label.name == 'run-e2e-ci'
     uses: ./.github/workflows/integration-test.yml
     with:
-      pr_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
+      pr_sha: ${{ inputs.tone_sha || inputs.pr_sha || github.event.pull_request.head.sha }}
       pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
     secrets: inherit
 
