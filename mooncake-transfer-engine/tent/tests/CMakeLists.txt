@@ -491,3 +491,15 @@ if(USE_TPU)
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 endif()
+
+# A peer restart invalidates every connection pooled for it; one failed call
+# must flush the whole pool. Loopback only, no NIC required.
+add_executable(tent_rpc_reconnect_test rpc_reconnect_test.cpp)
+target_link_libraries(tent_rpc_reconnect_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_rpc_reconnect_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_rpc_reconnect_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rpc_reconnect_test COMMAND tent_rpc_reconnect_test)
