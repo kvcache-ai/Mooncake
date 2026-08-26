@@ -34,6 +34,7 @@ Under real workloads, Mooncake’s innovative architecture enables Kimi to handl
 
 <h2 id="updates">🔄 Updates</h2>
 
+- **Aug 26, 2026**: Mooncake now supports [FlagCX](https://github.com/flagos-ai/FlagCX), the unified communication library in the FlagOS ecosystem for multi-vendor and cross-vendor deployments.
 - **Aug 24, 2026**: Mooncake now supports [UCL-MPComm](https://github.com/Tencent/UCL-MPComm) as a TENT transport backend, an RDMA-native multi-rail data plane open-sourced by the Tencent Astral Network Team. It can achieve maximum performance in both DRAM and VRAM transfer scenarios.
 - **Aug 20, 2026**: Mooncake is integrated into [Miles](https://github.com/radixark/miles) as a rollout data-transfer backend for the fragmented, heterogeneous data moving between rollout and training in disaggregated RL. Blogs: [KVCache.AI](https://kvcache.ai/blog/mooncake-rl-rollout-data-transfer/), [lmsys](https://www.lmsys.org/blog/2026-08-20-miles-mooncake-rollout-data-transfer).
 - **Aug 17, 2026**: Mooncake is integrated into [Speculators](https://github.com/vllm-project/speculators) as a distributed backend for multi-node online training, efficiently moves hidden-state between vLLM inference workers and Speculators trainers through RDMA, eliminating the need for massive hidden-state storage in offline training. [Benchmark on GB300 NVL72](https://x.com/mgoin_/status/2072785822231728363).
