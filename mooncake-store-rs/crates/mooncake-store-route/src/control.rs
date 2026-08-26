@@ -5,9 +5,7 @@ use mooncake_store_core::{
     RouteCasRequest, StoreError,
 };
 
-use crate::shim::{
-    RouteAuthorityClient, RouteAuthorityService, RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE,
-};
+use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteOwnerPage};
 
 #[derive(Clone, Debug)]
 pub enum RouteControlRequest {
@@ -261,30 +259,6 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         };
         ensure_batch_len("batch_replace_routes", requests.len(), replies.len())?;
         Ok(replies)
-    }
-
-    fn list_routes_by_replica_owner(
-        &self,
-        lease: &ClientLease,
-        namespace: &str,
-        authority: &ClientStableId,
-        owner: &ClientRuntimeId,
-    ) -> Result<Vec<ObjectRoute>> {
-        let page = self.list_routes_by_replica_owner_page(
-            lease,
-            namespace,
-            authority,
-            owner,
-            None,
-            DEFAULT_ROUTE_OWNER_PAGE_SIZE,
-        )?;
-        if page.next_cursor.is_some() {
-            return Err(StoreError::Unsupported(
-                "complete owner-route listing exceeds the bounded compatibility page; use pagination"
-                    .to_string(),
-            ));
-        }
-        Ok(page.routes)
     }
 
     fn list_routes_by_replica_owner_page(

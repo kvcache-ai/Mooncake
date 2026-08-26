@@ -58,14 +58,6 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
         requests: &[RouteCasRequest],
     ) -> Result<Vec<Result<()>>>;
 
-    fn list_routes_by_replica_owner(
-        &self,
-        lease: &ClientLease,
-        namespace: &str,
-        authority: &ClientStableId,
-        owner: &ClientRuntimeId,
-    ) -> Result<Vec<ObjectRoute>>;
-
     fn list_routes_by_replica_owner_page(
         &self,
         lease: &ClientLease,
