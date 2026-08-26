@@ -24,7 +24,7 @@ pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
 The install helper also supports bundle-local wheelhouses on another machine:
 
 ```bash
-./scripts/build/install-wheel.sh --wheel-dir /tmp/sglang-true-e2e-bundle/dist/wheels
+./scripts/build/install-wheel.sh --wheel-dir /path/to/wheelhouse
 ```
 
 After installation:
@@ -241,7 +241,6 @@ By default the script:
 Repository packaging rule:
 
 - `scripts/build/build-wheel.sh` is the single owner of wheel asset injection and `auditwheel repair`
-- outer wrappers such as `abs_scripts/build.sh` only prepare the environment and collect the wheels already produced in `dist/wheels/`
 
 Common variants:
 
@@ -267,9 +266,9 @@ instead. It reuses `scripts/build/build-wheel.sh` inside the container and
 produces the same `dist/wheels/` and `dist/bin/` outputs:
 
 ```bash
-./scripts/build/build-wheel-ubuntu-docker.sh
-PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
-PYTHON_VERSION=3.12 UBUNTU_VERSION=24.04 ./scripts/build/build-wheel-ubuntu-docker.sh
+./scripts/build/build-wheel.sh
+PYTHON=python3.11 ./scripts/build/build-wheel.sh
+PYTHON=python3.12 ./scripts/build/build-wheel.sh
 ```
 
 Docker wheel notes:
@@ -1004,8 +1003,7 @@ The same metrics HTTP server also exposes `/breakdown` for SGLang/HiCache
 diagnosis. Use `mooncake-store-client stats --breakdown --server <host:port>`
 for a readable summary, or add `--json` to keep the machine-readable API,
 phase, metadata, transport, runtime, and segment snapshot. The
-`scripts/sglang/sglang_true_e2e.py` workflow saves that endpoint as
-`sglang-true-e2e-breakdown-<stamp>.json` after the real SGLang run.
+An external validation harness can save that endpoint after a real SGLang run.
 
 ## Metadata URLs
 
@@ -1095,7 +1093,6 @@ Validation entry points are now grouped by purpose:
 - `scripts/clients/` — black-box real/dummy read-write validators
 - `scripts/e2e/` — generic compatibility and stress runners
 - `scripts/lib/` — shared shell bootstrap helpers used by script entrypoints
-- `scripts/sglang/` — SGLang-specific compatibility and true e2e runners
 - `scripts/tests/client/` — standalone client CLI regressions
 - `scripts/tests/rolling/` — rolling-upgrade and rollback regressions
 
@@ -1114,7 +1111,6 @@ Inspect what the runner will execute:
 Typical scoped runs:
 
 ```bash
-./scripts/run-all-tests.sh --skip-tag sglang
 ./scripts/run-all-tests.sh --tag rolling
 ```
 
@@ -1167,63 +1163,9 @@ This script verifies:
 - `/metrics` exposure for `storage_owner_background_eviction` and `storage_owner_evict_one`
 - tracing logs for route-owner CAS reclaim
 
-Run the HiCache compatibility validations:
+### SGLang HiCache integration
 
-```bash
-./scripts/sglang/run-sglang-hicache-dummy-compat.sh
-./scripts/sglang/run-sglang-hicache-real-compat.sh
-```
-
-Run the full SGLang HiCache e2e from a checkout:
-
-```bash
-./scripts/sglang/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
-```
-
-Build a portable bundle for another machine:
-
-```bash
-./scripts/build/build-sglang-e2e-bundle.sh
-```
-
-Then on machine B run:
-
-```bash
-cd /path/to/sglang-true-e2e-bundle
-./scripts/sglang/run-sglang-true-e2e-bundle.sh --model-path /models/Qwen3-0.6B
-```
-
-These runners verify:
-
-- two real storage `mooncake-store-client` processes plus one routed rw-only gateway
-- two `python -m sglang.launch_server` processes using the packaged Mooncake backend
-- baseline cross-process put/get through Mooncake HiCache
-- one lightweight drain request after each writer phase before put metric assertions, matching SGLang's asynchronous write-through backup timing
-- storage expansion while requests are still served
-- forced storage kill with retry-based recovery instead of persistent request failure
-- graceful storage shrink with retry-based recovery instead of persistent request failure
-- per-phase completion wall time plus gateway-side operation latency breakdowns for TTFT triage
-
-The true e2e runner prints, for each phase:
-
-- completion wall time in milliseconds for both SGLang servers
-- gateway aggregate put/get call counts, total latency, average latency, and peak latency
-- focused gateway operation deltas for `batch_put_from`, `batch_get_into`, hot-cache probes, and the Python compat dispatcher bridge
-
-Portable bundle notes:
-
-- machine B installs `mooncake_store_rs` from `dist/wheels/` inside the bundle
-- machine B only needs `python3`, working `python3 -m venv`, `redis-server`, `redis-cli`, and a compatible GPU/SGLang stack
-- machine B does not need a source checkout, `git`, `cargo`, `cmake`, or `third_party/Mooncake`
-- logs default to `target/sglang-true-e2e/`, overridable with `--workdir` or `MC_STORE_RS_SGLANG_TRUE_E2E_WORKDIR`
-
-Model selection is explicit:
-
-- use `--model-path` or `MC_STORE_RS_SGLANG_MODEL_PATH` for a local model directory
-- use `--auto-download-model --model-id <repo>` only when the runner is allowed to download from Hugging Face
-- use `--model-cache` or `MC_STORE_RS_SGLANG_MODEL_CACHE` to control the optional download cache
-
-Manual `sglang.launch_server` patterns:
+Example `sglang.launch_server` patterns:
 
 - real-mode SGLang with an in-process rw-only client (`global_segment_size=0`)
 
@@ -1314,7 +1256,6 @@ Port role summary:
 
 - real mode publishes `local_hostname[:transport_rpc_port]` to peers and does not use `client_server_address`
 - dummy mode only needs `client_server_address`
-- the current `run-sglang-true-e2e.sh` validation path uses the dummy/gateway topology
 
 Current coverage includes:
 

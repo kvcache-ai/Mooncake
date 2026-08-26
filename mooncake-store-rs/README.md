@@ -1,7 +1,5 @@
 # mooncake-store-rs
 
-> AI agents must install and use the repository skill before making changes in this repository: run `./scripts/install-dev-skill.sh` first, then follow `docs/skills/mooncake-store-rs-dev/SKILL.md`.
-
 A Rust-native Mooncake Store implementation that keeps the Mooncake store programming model, reuses Mooncake TE/TENT for data transfer, and defaults to masterless route control.
 
 ## What This Project Is
@@ -28,34 +26,6 @@ Use the document that matches what you are doing.
 | understand implemented capabilities | `docs/features.md` |
 | understand runtime flow and control plane behavior | `docs/architecture.md` |
 | add or review tests, run the suite, understand the fault-injection model | `docs/testing.md` |
-| onboard an AI agent or collaborator to the repo workflow | `docs/skills/mooncake-store-rs-dev/SKILL.md`, `docs/skills/ha-regression-debugging/SKILL.md`, `docs/skills/stateful-boundary-invariants/SKILL.md`, `scripts/install-dev-skill.sh`, `scripts/install-total-skills.sh` |
-
-## AI Agent Skills
-
-This repository ships a main development skill plus companion skills for
-regression debugging and stateful boundary review.
-
-- canonical in-repo skill sources:
-  - `docs/skills/mooncake-store-rs-dev/`
-  - `docs/skills/ha-regression-debugging/`
-  - `docs/skills/stateful-boundary-invariants/`
-- install only the primary development skill: `./scripts/install-dev-skill.sh`
-- install only the HA regression debugging skill: `./scripts/install-ha-regression-debugging-skill.sh`
-- install only the stateful boundary review skill: `./scripts/install-stateful-boundary-invariants-skill.sh`
-- install the full skill bundle: `./scripts/install-total-skills.sh`
-
-Typical setup:
-
-```bash
-./scripts/install-dev-skill.sh
-git config core.hooksPath scripts/lib/git-hooks
-```
-
-Recommended skill usage:
-
-- `mooncake-store-rs-dev`: repository workflow, validation, docs sync, and commit conventions
-- `ha-regression-debugging`: sequential, restart, and HA regression investigation
-- `stateful-boundary-invariants`: synchronization, default-derivation, and long-lived state review
 
 ## Project Map
 
@@ -597,7 +567,7 @@ python -c "import mooncake_store_rs as m; print(m.__build_info__)"
 If the host OS is missing build dependencies, use the Ubuntu Docker wrapper:
 
 ```bash
-PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
+PYTHON=python3.11 ./scripts/build/build-wheel.sh
 ```
 
 The Docker wrapper produces the same `dist/wheels/` and `dist/bin/` outputs and
@@ -619,44 +589,9 @@ python -m mooncake_store_rs.doctor # report which backend is active
 See `docs/python.md` for how the redirect works and why the variable has to be
 exported before the interpreter starts.
 
-### Run the HiCache compatibility checks
+### SGLang HiCache integration
 
-```bash
-./scripts/sglang/run-sglang-hicache-dummy-compat.sh
-./scripts/sglang/run-sglang-hicache-real-compat.sh
-```
-
-These scripts validate:
-
-- the dummy path through the standalone compatibility service plus shm buffer registration
-- the real path through the native distributed store runtime plus registered-buffer I/O
-
-### Run the true SGLang HiCache e2e
-
-```bash
-./scripts/sglang/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
-```
-
-This script performs a full end-to-end run with:
-
-- two standalone storage `mooncake-store-client` processes
-- one routed rw-only `mooncake-store-client` gateway exposed through `client_server_address`
-- two `python -m sglang.launch_server` processes
-- baseline cross-process put/get verification through Mooncake HiCache
-- storage expansion while SGLang continues serving requests
-- forced storage kill validation with retry-based recovery instead of persistent request failure
-- graceful storage shrink validation with request retry and eventual recovery
-
-Useful knobs:
-
-- `--model-path` or `MC_STORE_RS_SGLANG_MODEL_PATH` to point at the local model directory used by `sglang.launch_server`
-- `--auto-download-model --model-id Qwen/Qwen3-0.6B` or `MC_STORE_RS_SGLANG_AUTO_DOWNLOAD_MODEL=1` for opt-in Hugging Face download
-- `MC_STORE_RS_SGLANG_SERVER_A_GPU` and `MC_STORE_RS_SGLANG_SERVER_B_GPU` to pin GPU ids
-- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to override the real data-plane backend during validation and current SGLang real-mode compatibility; the default is `classic_te`
-- `MC_STORE_RS_SGLANG_SKIP_WHEEL_BUILD=1` to reuse an existing local wheel build
-- `MC_STORE_RS_SGLANG_SKIP_PIP_INSTALL=1` to reuse an already prepared SGLang venv
-
-Manual launch patterns:
+Example launch patterns:
 
 - real-mode SGLang with an in-process rw-only client (`global_segment_size=0`)
 
@@ -748,9 +683,6 @@ python -m sglang.launch_server \
 
 - real mode uses `setup(...)` and requires a reachable `local_hostname[:transport_rpc_port]`
 - dummy mode uses `setup_dummy(...)` through `client_server_address`
-- the current `run-sglang-true-e2e.sh` path validates the dummy/gateway topology
-
-The script does not auto-detect cached models. This keeps CI and production validation deterministic: provide an explicit local model path, or opt into download explicitly.
 
 For Python build and API details, read `docs/python.md`.
 
@@ -883,7 +815,7 @@ Build a distributable wheel and package the standalone client binary:
 Or build in Ubuntu Docker with an explicit Python runtime:
 
 ```bash
-PYTHON_VERSION=3.12 ./scripts/build/build-wheel-ubuntu-docker.sh
+PYTHON=python3.12 ./scripts/build/build-wheel.sh
 ```
 
 The default output layout is:
@@ -1050,7 +982,6 @@ scripts/
   clients/                  Real-mode and dummy-mode black-box validators
   e2e/                      Generic local compatibility and stress runners
   lib/                      Shared shell bootstrap helpers for script entrypoints
-  sglang/                   SGLang-specific compatibility and true e2e runners
   tests/client/             Standalone client CLI regressions
   tests/rolling/            Rolling-upgrade and rollback regressions
 third_party/
@@ -1070,7 +1001,6 @@ Useful variants:
 
 ```bash
 ./scripts/run-all-tests.sh --list
-./scripts/run-all-tests.sh --skip-tag sglang
 ./scripts/run-all-tests.sh --include rolling
 ```
 

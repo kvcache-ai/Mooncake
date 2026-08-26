@@ -160,7 +160,7 @@ Important points:
 Python real-mode example:
 
 ```python
-from mooncake import MooncakeDistributedStore
+from mooncake_store_rs.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup({
@@ -184,7 +184,7 @@ Use real mode when Python should participate directly in the same distributed ru
 Python dummy-mode example:
 
 ```python
-from mooncake import MooncakeDistributedStore
+from mooncake_store_rs.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup_dummy(
@@ -341,7 +341,6 @@ If you want to validate the feature end-to-end:
 - `scripts/e2e/run-local-e2e.sh` covers multi-tenant behavior and strict tenant quota in the Rust e2e harness
 - `scripts/e2e/run-python-compat-e2e.sh` covers the Python compatibility API surface
 - `scripts/e2e/run-local-hot-cache-e2e.sh` validates real-mode local hot-cache reuse and dummy-mode shm-backed hot-cache reuse
-- `scripts/sglang/run-sglang-hicache-dummy-compat.sh` and `scripts/sglang/run-sglang-hicache-real-compat.sh` validate the two Python execution modes against the HiCache compatibility flows
 - `docs/deployment.md` describes the recommended operator workflow from policy authoring to local validation
 - `docs/python.md` documents the current Python `keyspace` / `worker_scope` behavior in more detail
 

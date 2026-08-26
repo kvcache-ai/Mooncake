@@ -182,8 +182,6 @@ For production dashboards, pair the in-process exporter with infrastructure expo
 Run the compatibility checks for both Python execution modes:
 
 ```bash
-./scripts/sglang/run-sglang-hicache-dummy-compat.sh
-./scripts/sglang/run-sglang-hicache-real-compat.sh
 ```
 
 What they validate:
@@ -198,40 +196,9 @@ Deployment note:
 - `client_server_address` does not carry real-mode TENT traffic
 - Python real-mode validation can provide `local_hostname + transport_rpc_port` either explicitly or through `--local_host host:port`
 
-### True SGLang e2e
+### SGLang HiCache integration
 
-Run the full HiCache end-to-end validation:
-
-```bash
-./scripts/sglang/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
-```
-
-What the script does:
-
-- builds and installs the current Pro wheel into a dedicated SGLang venv unless reuse is requested
-- starts two real storage clients plus one routed rw-only gateway client
-- starts two `python -m sglang.launch_server` processes against that standalone gateway
-- verifies baseline cross-process HiCache write/read through gateway `/metrics`
-- issues a one-token drain request after each writer phase before checking put metrics, because SGLang write-through backup is finalized on a later scheduler tick
-- starts an extra storage node and verifies SGLang keeps serving requests after expansion
-- hard-kills one storage node and retries completions until recovery, validating that requests do not stay broken after forced shrink
-- gracefully drains one storage node and retries completions until recovery, validating that requests do not stay broken after shrink
-- prints per-phase completion wall time and gateway latency breakdowns so TTFT regressions can be attributed to put/get, hot-cache probe, or compat bridge overhead
-- writes `sglang-true-e2e-breakdown-<stamp>.json` with Store-RS API, phase, metadata, transport, runtime, segment, and bottleneck-candidate data from the gateway `/breakdown` endpoint
-
-Important inputs:
-
-- `--model-path` or `MC_STORE_RS_SGLANG_MODEL_PATH` must point to the local model directory used by SGLang
-- `--auto-download-model` or `MC_STORE_RS_SGLANG_AUTO_DOWNLOAD_MODEL=1` opts into Hugging Face download when no local model path is provided
-- `--model-id` or `MC_STORE_RS_SGLANG_MODEL_ID` selects the download target; the default is `Qwen/Qwen3-0.6B`
-- `--model-cache` or `MC_STORE_RS_SGLANG_MODEL_CACHE` selects the Hugging Face cache directory for optional downloads
-- `MC_STORE_RS_SGLANG_SERVER_A_GPU` and `MC_STORE_RS_SGLANG_SERVER_B_GPU` control `--base-gpu-id`; when server B is unset, the runner now picks a different GPU automatically when `nvidia-smi` reports more than one visible device
-- `MC_STORE_RS_SGLANG_MEM_FRACTION_STATIC` controls the SGLang `--mem-fraction-static` used by this true e2e path; the default is `0.25`
-- `MC_STORE_RS_SGLANG_HICACHE_SIZE_GB` controls the SGLang `--hicache-size` used by this true e2e path; the default is `20` so the host-side HiCache stays larger than the device-side pool on the current dual-A10 validation host
-- `SGLANG_HICACHE_MOONCAKE_REUSE_TE` defaults to `0` for this validation path
-- logs are written to `target/sglang-true-e2e-*.log`
-
-Manual launch patterns:
+Example launch patterns:
 
 - real-mode SGLang with an in-process rw-only client (`global_segment_size=0`)
 
@@ -326,10 +293,7 @@ python -m sglang.launch_server \
 
 - real mode uses `setup(...)` and does not use `client_server_address`
 - dummy mode uses `setup_dummy(...)` and only needs `client_server_address`
-- dummy mode also consumes `MC_STORE_RS_KEYSPACE` as a Python wrapper fallback when `setup_dummy(...)` does not pass `keyspace`, which is how the true SGLang e2e aligns the dummy side-channel namespace with the routed gateway
-- the current `run-sglang-true-e2e.sh` workflow validates the dummy/gateway topology
-
-The runner intentionally does not scan local model caches. A missing model path is a configuration error unless auto-download is explicitly enabled.
+- dummy mode also consumes `MC_STORE_RS_KEYSPACE` as a Python wrapper fallback when `setup_dummy(...)` does not pass `keyspace`, aligning the dummy side-channel namespace with the routed gateway
 
 ### Multi-client stress benchmark
 
@@ -392,7 +356,7 @@ If the host OS is missing wheel-build dependencies, use the Ubuntu Docker
 wrapper and pin the Python runtime explicitly:
 
 ```bash
-PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
+PYTHON=python3.11 ./scripts/build/build-wheel.sh
 ```
 
 The Docker wrapper writes the same wheelhouse outputs as the host build script.

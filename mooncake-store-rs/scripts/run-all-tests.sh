@@ -67,7 +67,6 @@ Examples:
   ./scripts/run-all-tests.sh --list
   ./scripts/run-all-tests.sh --jobs 4
   ./scripts/run-all-tests.sh --include rolling --include hot-upgrade
-  ./scripts/run-all-tests.sh --skip-tag sglang
   ./scripts/run-all-tests.sh --tag client --tag rolling
 
 Environment:
@@ -75,16 +74,14 @@ Environment:
   MC_STORE_RS_SCRIPT_CI_LOG_DIR             Log directory override
   MC_STORE_RS_SCRIPT_TIMEOUT_DEFAULT        Default per-test timeout in seconds
                                             (default: 1800)
-  MC_STORE_RS_SCRIPT_TIMEOUT_SGLANG_TRUE    Timeout for `run-sglang-true-e2e.sh`
-                                            (default: 10800)
   MC_STORE_RS_SCRIPT_TIMEOUT_STRESS         Timeout for stress runners
                                             (default: 3600)
   MC_STORE_RS_SCRIPT_TIMEOUT_ROLLING        Timeout for rolling-upgrade runners
                                             (default: 2400)
 
 Tag examples:
-  e2e, sglang, client, rolling, serial, compat, stress, hot-cache,
-  hot-upgrade, rollback, redis-recovery, real, dummy, requires-model
+  e2e, client, rolling, serial, compat, stress, hot-cache,
+  hot-upgrade, rollback, redis-recovery, real, dummy
 EOF
 }
 
@@ -158,7 +155,6 @@ script_tags() {
 
   case "${path}" in
     scripts/e2e/*) tags+=(e2e) ;;
-    scripts/sglang/*) tags+=(sglang) ;;
     scripts/tests/client/*) tags+=(client) ;;
     scripts/tests/rolling/*) tags+=(rolling serial) ;;
   esac
@@ -173,9 +169,6 @@ script_tags() {
   fi
   [[ "${path}" == *dummy* ]] && tags+=(dummy)
   [[ "${path}" == *real* ]] && tags+=(real)
-  if [[ "${path}" == "scripts/sglang/run-sglang-true-e2e.sh" ]]; then
-    tags+=(true-e2e requires-model)
-  fi
 
   printf '%s\n' "${tags[*]}"
 }
@@ -183,9 +176,6 @@ script_tags() {
 script_timeout_seconds() {
   local path=$1
   case "${path}" in
-    scripts/sglang/run-sglang-true-e2e.sh)
-      printf '%s\n' "${MC_STORE_RS_SCRIPT_TIMEOUT_SGLANG_TRUE:-10800}"
-      ;;
     *stress*)
       printf '%s\n' "${MC_STORE_RS_SCRIPT_TIMEOUT_STRESS:-3600}"
       ;;
