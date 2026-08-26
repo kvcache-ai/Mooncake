@@ -143,23 +143,14 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * entering ShardedTenantQuotaTable, so these two locks are never nested.
  */
 
-// Shared, lock-free lease for a grouped object set. Every member of a group
-// references the same GroupLease: a read of any member extends the group TTL
-// (via GrantReadLease), and eviction consults the single GroupLease instead of
-// scanning each member's own lease. GroupLease is self-contained on purpose:
-// the read paths of different members run under different metadata-shard locks,
-// so no single shard lock guards the shared deadline. The deadline is kept in a
-// lock-free atomic and updated with a CAS monotonic-max, because a single hot
-// group is read by many threads at once — a plain spin lock would serialize all
-// of them on one cache line. This is the read-path cost of the shared-group-TTL
-// design; keeping it lock-free lets hot-group reads stay parallel.
+// Shared, lock-free lease for a group: a read of any member extends its TTL and
+// eviction reads it directly. Lock-free (atomic, CAS monotonic-max) so a hot
+// group's readers — running under different member-shard locks — do not
+// serialize on one spin lock.
 class GroupLease {
    public:
-    // Extend the group TTL to now + ttl_ms (monotonic max), lock-free.
-    // Conditional refresh: if the current deadline is already more than half a
-    // TTL away, the CAS is skipped. A hot group's members are read continuously,
-    // so the deadline stays far in the future and most reads degrade to a single
-    // atomic load + compare instead of contending on one cache line.
+    // Unless the deadline is already over half a TTL out, extend it (max) to
+    // now + ttl_ms. The early-out keeps hot-group reads lock-free.
     void GrantReadLease(const uint64_t ttl_ms) {
         const int64_t now = NowNs();
         const int64_t half_ttl_ns = static_cast<int64_t>(ttl_ms) * 500000LL;
@@ -1173,19 +1164,12 @@ class MasterService {
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
-        // This own-lease value is the authoritative lease ONLY for ungrouped
-        // objects. For grouped objects it is not maintained (a read refreshes
-        // the shared group TTL and leaves this at its default, so it reads as
-        // already expired) — do NOT read this field directly for a grouped
-        // object. Use IsLeaseExpired()/EvictionDeadline()/GrantReadLease(), which
-        // are group-aware. Still serialized for snapshot backward-compatibility.
+        // Authoritative lease for ungrouped objects only. Grouped objects do not
+        // maintain it; use the group-aware lease methods instead of this field.
         mutable std::chrono::system_clock::time_point lease_timeout
-            GUARDED_BY(lock);  // hard lease (ungrouped only)
-        // For grouped objects only: the shared group TTL this member belongs
-        // to. Reading any member extends the group TTL, so eviction can consult
-        // this single lease instead of scanning every member's own lease. This is
-        // the authoritative lease for grouped objects. Null for ungrouped
-        // objects. Not persisted; rebuilt from snapshots.
+            GUARDED_BY(lock);  // hard lease (ungrouped)
+        // Shared group TTL for grouped objects (the authoritative lease); null if
+        // ungrouped. Not persisted; rebuilt from snapshots.
         mutable std::shared_ptr<GroupLease> group_lease_ GUARDED_BY(lock);
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
@@ -1405,12 +1389,9 @@ class MasterService {
         // lifetime is intentionally independent from reads.
         void GrantReadLease(const uint64_t ttl) const {
             SpinLocker locker(&lock);
-            // Grouped object: the shared group TTL is the single authoritative
-            // lease, so a read extends only the group (via the GroupLease), and
-            // this object's own lease_timeout is not authoritative for grouped
-            // objects. Guard on ttl > 0 so PutEnd's GrantReadLease(0)
-            // (releasing the write lease) does not mark the whole group as
-            // expired.
+            // Grouped: extend the group TTL; this object's own lease is not
+            // authoritative. Guard on ttl > 0 so PutEnd's GrantReadLease(0) does
+            // not mark the whole group as expired.
             if (group_lease_ != nullptr) {
                 if (ttl > 0) {
                     group_lease_->GrantReadLease(ttl);
@@ -1435,12 +1416,8 @@ class MasterService {
             return deadline <= now + std::chrono::milliseconds(ttl / 2);
         }
 
-        // Check if the (authoritative) lease has expired. For a grouped object
-        // the authoritative lease is the shared group TTL (a read of any member
-        // protects the whole group); an ungrouped object uses its own
-        // lease_timeout. Use these methods (not the raw lease_timeout field)
-        // whenever the object may be grouped — the raw field is not maintained
-        // for grouped objects.
+        // Group-aware lease check: grouped objects use the shared group TTL
+        // (reading any member protects the whole group), ungrouped use their own.
         bool IsLeaseExpired() const {
             SpinLocker locker(&lock);
             if (group_lease_ != nullptr) {
@@ -1449,7 +1426,6 @@ class MasterService {
             return std::chrono::system_clock::now() >= lease_timeout;
         }
 
-        // Check if the lease has expired (with a caller-provided `now`).
         bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const {
             SpinLocker locker(&lock);
             if (group_lease_ != nullptr) {
@@ -1458,12 +1434,8 @@ class MasterService {
             return now >= lease_timeout;
         }
 
-        // Deadline the eviction census should use to decide evictability and to
-        // rank candidates. Grouped objects are one all-or-none eviction unit
-        // keyed by the shared group TTL (consistent across members, so the
-        // candidate cutoff aligns with group boundaries); ungrouped objects use
-        // their own lease. The group deadline read is lock-free on the GroupLease
-        // atomic, so this is safe from the unguarded census loop.
+        // Lease deadline for the eviction census (grouped -> shared group TTL,
+        // ungrouped -> own lease), aligned with the all-or-none group eviction.
         std::chrono::system_clock::time_point EvictionDeadline() const {
             if (group_lease_ != nullptr) {
                 return group_lease_->ExpiresAt();
@@ -1810,13 +1782,9 @@ class MasterService {
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
-    // Group domain: one GroupShard holds all groups. Object routing is
-    // decoupled from groups — objects are always routed by hash(tenant, key);
-    // group membership is a lifecycle constraint consulted at eviction time.
-    // Group protection is carried by one shared GroupLease: reading any member
-    // extends the group TTL (via the object's group_lease_ pointer, so the read
-    // path never touches this table), and eviction consults a single group
-    // lease instead of scanning every member's own lease.
+    // Group domain: all groups in one shard. Routing stays hash(tenant, key);
+    // group state is just member keys + one shared lease, consulted at eviction
+    // (all-or-none) — the read path never touches this table.
     struct GroupState {
         std::unordered_set<std::string> member_keys;
         std::shared_ptr<GroupLease> lease;
@@ -1824,10 +1792,7 @@ class MasterService {
         bool Empty() const { return member_keys.empty(); }
     };
 
-    // Group state is small (member key list + one shared lease) and group
-    // operations are infrequent (put/register and eviction), so a single lock
-    // spanning all groups is fine and simpler than sharding by
-    // hash(tenant, group_id).
+    // Small and low-frequency (put/register + eviction), so one lock is enough.
     struct GroupShard {
         mutable SharedMutex mutex;
         // key: tenant_id.MakeScopedKey(group_id)
@@ -2128,9 +2093,7 @@ class MasterService {
     void RebuildGroupState();
     // Post-restore migration: re-route every object to its hash(tenant, key)
     // shard, fixing snapshots that placed grouped objects on hash(group_id)
-    // shards so they are reachable by the key-routing lookups. Also recomputes
-    // per-shard disk_object_count afterwards. No-op for snapshots already
-    // routed by hash(tenant, key).
+    // shards. No-op for correctly-routed snapshots.
     void ReRouteRestoredObjectsByKey();
     static void ApplySoftPinMetricDelta(int metric_delta);
     size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
