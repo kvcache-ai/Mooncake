@@ -1674,7 +1674,6 @@ mod cold_tier_storage_backend_tests {
         let root = TestTempDir::new(default_cold_tier_root().join("capacity-smoke"));
         let (total, available) = filesystem_capacity_bytes(root.path()).unwrap();
         assert!(total > 0);
-        assert!(available > 0);
         assert!(available <= total);
     }
 

@@ -235,43 +235,41 @@ impl StoreClient {
         &self,
         object_id: &LogicalObjectId,
         scoped_key: &ObjectKey,
-        eviction_candidates: &mut VecDeque<LogicalObjectId>,
+        eviction_candidates: &mut VecDeque<(ObjectKey, LogicalObjectId)>,
         attempted_victims: &mut BTreeSet<ObjectKey>,
     ) -> Result<bool> {
         loop {
             if eviction_candidates.is_empty() {
                 let scope = self.tenant_quota_scope(object_id);
-                let candidates = self
-                    .metadata
-                    .list_tenant_eviction_candidates(
-                        &scope,
-                        TENANT_LOCAL_EVICTION_CANDIDATE_BATCH_SIZE,
-                    )?
-                    .into_iter()
-                    .filter(|candidate| {
-                        candidate.key != *scoped_key
-                            && candidate.state == TenantObjectAccountingState::Active
-                            && !attempted_victims.contains(&candidate.key)
-                    })
-                    .filter_map(|candidate| {
-                        mooncake_store_core::parse_legacy_scoped_key(&candidate.key)
-                            .ok()
-                            .filter(|victim| victim.scope.tenant == object_id.scope.tenant)
-                    })
-                    .collect::<VecDeque<_>>();
+                let mut candidates = VecDeque::new();
+                for candidate in self.metadata.list_tenant_eviction_candidates(
+                    &scope,
+                    TENANT_LOCAL_EVICTION_CANDIDATE_BATCH_SIZE,
+                )? {
+                    if candidate.key == *scoped_key
+                        || candidate.state != TenantObjectAccountingState::Active
+                        || attempted_victims.contains(&candidate.key)
+                    {
+                        continue;
+                    }
+                    let Some(route) = self.route_ops.load_route(&candidate.key)? else {
+                        attempted_victims.insert(candidate.key);
+                        continue;
+                    };
+                    let victim = mooncake_store_core::route_logical_object_id(&route)?;
+                    if victim.scope.tenant == object_id.scope.tenant {
+                        candidates.push_back((candidate.key, victim));
+                    }
+                }
                 if candidates.is_empty() {
                     return Ok(false);
                 }
                 *eviction_candidates = candidates;
             }
-            while let Some(victim) = eviction_candidates.pop_front() {
-                attempted_victims.insert(ObjectKey::from_logical_id(&victim));
+            while let Some((victim_key, victim)) = eviction_candidates.pop_front() {
+                attempted_victims.insert(victim_key.clone());
                 if self
-                    .remove_in_tenant(
-                        victim.scope.tenant.as_str(),
-                        victim.logical_key.as_str(),
-                        false,
-                    )
+                    .remove_object_route_with_retry(&victim, &victim_key, false)
                     .is_ok()
                 {
                     return Ok(true);
