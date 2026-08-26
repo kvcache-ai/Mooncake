@@ -1512,23 +1512,41 @@ fn bounded_set_members_with_limit(
     operation: &str,
     max_items: usize,
 ) -> Result<Vec<String>> {
-    let count: usize = connection
-        .scard(key)
-        .map_err(|error| metadata_error(operation, error))?;
-    if count > max_items {
-        return Err(StoreError::Metadata(format!(
-            "{operation} exceeds the fixed {max_items}-item bound"
-        )));
+    scan_set_members_bounded(connection, key, max_items, MAX_REDIS_SCAN_PAGES)
+        .map_err(|error| metadata_error(operation, error))
+}
+
+fn scan_set_members_bounded(
+    connection: &mut redis::Connection,
+    key: &str,
+    max_items: usize,
+    max_pages: usize,
+) -> std::result::Result<Vec<String>, redis::RedisError> {
+    let mut cursor = 0u64;
+    let mut members = Vec::new();
+    for _ in 0..max_pages {
+        let (next, batch): (u64, Vec<String>) = cmd("SSCAN")
+            .arg(key)
+            .arg(cursor)
+            .arg("COUNT")
+            .arg(REDIS_SCAN_COUNT)
+            .query(connection)?;
+        if members.len().saturating_add(batch.len()) > max_items {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::TypeError,
+                "bounded Redis set listing exceeded its item limit",
+            )));
+        }
+        members.extend(batch);
+        if next == 0 {
+            return Ok(members);
+        }
+        cursor = next;
     }
-    let members: Vec<String> = connection
-        .smembers(key)
-        .map_err(|error| metadata_error(operation, error))?;
-    if members.len() > max_items {
-        return Err(StoreError::Metadata(format!(
-            "{operation} exceeds the fixed {max_items}-item bound"
-        )));
-    }
-    Ok(members)
+    Err(redis::RedisError::from((
+        redis::ErrorKind::TypeError,
+        "bounded Redis set listing exceeded its page limit",
+    )))
 }
 
 fn scan_keys(connection: &mut redis::Connection, pattern: &str) -> Result<Vec<String>> {
@@ -1584,7 +1602,12 @@ fn legacy_tenant_policy_keys(
         None::<String>,
     ));
     let mut keys = Vec::from([root_key.clone()]);
-    keys.extend(scan_keys(connection, &format!("{}/*", root_key))?);
+    keys.extend(scan_keys_bounded(
+        connection,
+        &format!("{}/*", root_key),
+        MAX_REDIS_LIST_ITEMS.saturating_sub(keys.len()),
+        MAX_REDIS_SCAN_PAGES,
+    )?);
     keys.sort();
     keys.dedup();
     Ok(keys)
@@ -1775,22 +1798,14 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
         let index = self.keyspace.client_index();
-        let count: usize = self.query_readonly("redis count live client index", |connection| {
-            connection.scard(&index)
-        })?;
-        if count > MAX_REDIS_LIST_ITEMS {
-            return Err(StoreError::Metadata(format!(
-                "redis list live clients exceeds the fixed {MAX_REDIS_LIST_ITEMS}-item bound"
-            )));
-        }
         let keys: Vec<String> = self.query_readonly("redis list live clients", |connection| {
-            connection.smembers(&index)
+            scan_set_members_bounded(
+                connection,
+                &index,
+                MAX_REDIS_LIST_ITEMS,
+                MAX_REDIS_SCAN_PAGES,
+            )
         })?;
-        if keys.len() > MAX_REDIS_LIST_ITEMS {
-            return Err(StoreError::Metadata(format!(
-                "redis list live clients exceeds the fixed {MAX_REDIS_LIST_ITEMS}-item bound"
-            )));
-        }
         let entries = self.query_readonly("redis fetch client leases", |connection| {
             if keys.is_empty() {
                 return Ok(Vec::new());
@@ -2067,23 +2082,15 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
         let index = self.keyspace.object_index();
-        let count: usize = self.query_readonly("redis count object route index", |connection| {
-            connection.scard(&index)
-        })?;
-        if count > MAX_REDIS_LIST_ITEMS {
-            return Err(StoreError::Metadata(format!(
-                "redis list object routes exceeds the fixed {MAX_REDIS_LIST_ITEMS}-item bound"
-            )));
-        }
-        let keys: Vec<String> = self
-            .query_readonly("redis list object route index", |connection| {
-                connection.smembers(&index)
+        let keys: Vec<String> =
+            self.query_readonly("redis list object route index", |connection| {
+                scan_set_members_bounded(
+                    connection,
+                    &index,
+                    MAX_REDIS_LIST_ITEMS,
+                    MAX_REDIS_SCAN_PAGES,
+                )
             })?;
-        if keys.len() > MAX_REDIS_LIST_ITEMS {
-            return Err(StoreError::Metadata(format!(
-                "redis list object routes exceeds the fixed {MAX_REDIS_LIST_ITEMS}-item bound"
-            )));
-        }
         let entries = self.query_readonly("redis list object routes", |connection| {
             let mut entries = Vec::with_capacity(keys.len());
             for key in &keys {
