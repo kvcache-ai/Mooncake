@@ -252,7 +252,7 @@ impl StoreClient {
                     {
                         continue;
                     }
-                    let Some(route) = self.route_ops.load_route(&candidate.key)? else {
+                    let Some(route) = self.route_ops().load_route(&candidate.key)? else {
                         attempted_victims.insert(candidate.key);
                         continue;
                     };
