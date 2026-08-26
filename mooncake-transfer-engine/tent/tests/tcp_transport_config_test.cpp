@@ -18,24 +18,37 @@ TEST(TcpTransportConfigTest, DefaultsToEnabledStandard) {
 
 TEST(TcpTransportConfigTest, RejectsWrongLeafTypes) {
     Config config;
-    ASSERT_TRUE(config.load(R"({"transports":{"tcp":{"implementation":7}}})").ok());
+    ASSERT_TRUE(
+        config.load(R"({"transports":{"tcp":{"implementation":7}}})").ok());
     TcpTransportConfig parsed;
     EXPECT_TRUE(ParseTcpTransportConfig(config, &parsed).IsInvalidArgument());
 
-    ASSERT_TRUE(config.load(R"({"transports":{"tcp":{"high_performance":{"worker_count":"16"}}}})").ok());
+    ASSERT_TRUE(
+        config
+            .load(
+                R"({"transports":{"tcp":{"high_performance":{"worker_count":"16"}}}})")
+            .ok());
     EXPECT_TRUE(ParseTcpTransportConfig(config, &parsed).IsInvalidArgument());
 }
 
 TEST(TcpTransportConfigTest, ParsesHighPerformanceAndValidatesLimits) {
     Config config;
-    ASSERT_TRUE(config.load(R"({"transports":{"tcp":{"implementation":"high_performance","high_performance":{"port":0,"worker_count":4,"queue_capacity_per_worker":8,"connections_per_peer":2,"max_outstanding_tasks":16,"max_outstanding_bytes":4096,"max_transfer_bytes":1024,"chunk_size":512,"connect_timeout_ms":1,"progress_timeout_ms":2}}}})").ok());
+    ASSERT_TRUE(
+        config
+            .load(
+                R"({"transports":{"tcp":{"implementation":"high_performance","high_performance":{"port":0,"worker_count":4,"queue_capacity_per_worker":8,"connections_per_peer":2,"max_outstanding_tasks":16,"max_outstanding_bytes":4096,"max_transfer_bytes":1024,"chunk_size":512,"connect_timeout_ms":1,"progress_timeout_ms":2}}}})")
+            .ok());
     TcpTransportConfig parsed;
     ASSERT_TRUE(ParseTcpTransportConfig(config, &parsed).ok());
     EXPECT_TRUE(parsed.hpRequired());
     EXPECT_EQ(parsed.high_performance.worker_count, 4U);
     EXPECT_EQ(parsed.high_performance.chunk_size, 512U);
 
-    ASSERT_TRUE(config.load(R"({"transports":{"tcp":{"implementation":"high_performance","high_performance":{"chunk_size":2,"max_transfer_bytes":1}}}})").ok());
+    ASSERT_TRUE(
+        config
+            .load(
+                R"({"transports":{"tcp":{"implementation":"high_performance","high_performance":{"chunk_size":2,"max_transfer_bytes":1}}}})")
+            .ok());
     EXPECT_TRUE(ParseTcpTransportConfig(config, &parsed).IsInvalidArgument());
 }
 

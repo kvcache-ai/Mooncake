@@ -15,7 +15,7 @@
 namespace mooncake::tent {
 
 class HighPerformanceTcpBufferRegistry {
- public:
+   public:
     enum class AcquireFailure {
         kNone,
         kRangeRejected,
@@ -36,7 +36,7 @@ class HighPerformanceTcpBufferRegistry {
     };
 
     class Lease {
-     public:
+       public:
         Lease() = default;
         Lease(const Lease&) = delete;
         Lease& operator=(const Lease&) = delete;
@@ -49,7 +49,7 @@ class HighPerformanceTcpBufferRegistry {
         uint64_t length() const;
         explicit operator bool() const { return entry_ != nullptr; }
 
-     private:
+       private:
         friend class HighPerformanceTcpBufferRegistry;
         explicit Lease(std::shared_ptr<Entry> entry);
         std::shared_ptr<Entry> entry_;
@@ -66,7 +66,7 @@ class HighPerformanceTcpBufferRegistry {
     bool tracks(uint64_t base, uint64_t length) const;
     size_t size() const;
 
- private:
+   private:
     Status acquire(uint64_t addr, uint64_t length, uint64_t registration_id,
                    HighPerformanceTcpOpcode opcode, bool remote, Lease* lease,
                    AcquireFailure* failure);

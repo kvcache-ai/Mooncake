@@ -55,11 +55,13 @@ namespace tent {
 
 Status TransferEngineImpl::loadTransports() {
     if (tcp_transport_config_.enabled) {
-        if (tcp_transport_config_.implementation == TcpImplementation::kStandard) {
+        if (tcp_transport_config_.implementation ==
+            TcpImplementation::kStandard) {
             transport_list_[TCP] = std::make_shared<TcpTransport>();
         } else {
-            transport_list_[TCP] = std::make_shared<HighPerformanceTcpTransport>(
-                tcp_transport_config_.high_performance);
+            transport_list_[TCP] =
+                std::make_shared<HighPerformanceTcpTransport>(
+                    tcp_transport_config_.high_performance);
         }
     }
 

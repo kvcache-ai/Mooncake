@@ -43,12 +43,12 @@ struct HighPerformanceTcpResponseFrame {
     uint64_t committed_bytes{0};
 };
 
-std::array<uint8_t, kHighPerformanceTcpRequestSize> EncodeHighPerformanceTcpRequest(
-    const HighPerformanceTcpRequestFrame& frame);
+std::array<uint8_t, kHighPerformanceTcpRequestSize>
+EncodeHighPerformanceTcpRequest(const HighPerformanceTcpRequestFrame& frame);
 Status DecodeHighPerformanceTcpRequest(const uint8_t* bytes, size_t size,
                                        HighPerformanceTcpRequestFrame* frame);
-std::array<uint8_t, kHighPerformanceTcpResponseSize> EncodeHighPerformanceTcpResponse(
-    const HighPerformanceTcpResponseFrame& frame);
+std::array<uint8_t, kHighPerformanceTcpResponseSize>
+EncodeHighPerformanceTcpResponse(const HighPerformanceTcpResponseFrame& frame);
 Status DecodeHighPerformanceTcpResponse(const uint8_t* bytes, size_t size,
                                         HighPerformanceTcpResponseFrame* frame);
 
@@ -66,12 +66,12 @@ struct HighPerformanceTcpBufferAttr {
     std::string permission;
 };
 
-Status EncodeHighPerformanceTcpEndpointAttr(const HighPerformanceTcpEndpointAttr& attr,
-                                            std::string* encoded);
-Status DecodeHighPerformanceTcpEndpointAttr(const std::string& encoded,
-                                            HighPerformanceTcpEndpointAttr* attr);
-Status EncodeHighPerformanceTcpBufferAttr(const HighPerformanceTcpBufferAttr& attr,
-                                          std::string* encoded);
+Status EncodeHighPerformanceTcpEndpointAttr(
+    const HighPerformanceTcpEndpointAttr& attr, std::string* encoded);
+Status DecodeHighPerformanceTcpEndpointAttr(
+    const std::string& encoded, HighPerformanceTcpEndpointAttr* attr);
+Status EncodeHighPerformanceTcpBufferAttr(
+    const HighPerformanceTcpBufferAttr& attr, std::string* encoded);
 Status DecodeHighPerformanceTcpBufferAttr(const std::string& encoded,
                                           HighPerformanceTcpBufferAttr* attr);
 const char* HighPerformanceTcpPermissionName(Permission permission);

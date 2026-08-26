@@ -233,7 +233,9 @@ ControlService::ControlService(const std::string& type,
                                const std::string& servers,
                                TransferEngineImpl* impl,
                                bool enable_bulk_data_rpc)
-    : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl),
+    : bootstrap_callback_(nullptr),
+      notify_callback_(nullptr),
+      impl_(impl),
       enable_bulk_data_rpc_(enable_bulk_data_rpc) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
@@ -417,7 +419,8 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
     if (!enable_bulk_data_rpc_) {
-        response = "SendData disabled: high-performance TCP data plane required";
+        response =
+            "SendData disabled: high-performance TCP data plane required";
         return;
     }
     if (request.size() < sizeof(XferDataDesc)) {
@@ -445,7 +448,8 @@ void ControlService::onSendData(const std::string_view& request,
 void ControlService::onRecvData(const std::string_view& request,
                                 std::string& response) {
     if (!enable_bulk_data_rpc_) {
-        response = "RecvData disabled: high-performance TCP data plane required";
+        response =
+            "RecvData disabled: high-performance TCP data plane required";
         if (request.size() >= sizeof(XferDataDesc)) {
             uint64_t wire_length = 0;
             std::memcpy(&wire_length,

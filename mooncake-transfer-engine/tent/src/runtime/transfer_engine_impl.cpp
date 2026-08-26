@@ -390,8 +390,9 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->loadFromConfig(*conf_, {loader}));
 
-    metadata_ = std::make_shared<ControlService>(metadata_type, metadata_servers,
-                                                  this, !tcp_transport_config_.hpRequired());
+    metadata_ =
+        std::make_shared<ControlService>(metadata_type, metadata_servers, this,
+                                         !tcp_transport_config_.hpRequired());
 
     CHECK_STATUS(metadata_->start(port_, ipv6_, rpc_server_threads));
 
@@ -416,13 +417,16 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(loadTransports());
 
     std::string transport_string;
-    for (size_t transport_index = 0; transport_index < transport_list_.size(); ++transport_index) {
+    for (size_t transport_index = 0; transport_index < transport_list_.size();
+         ++transport_index) {
         auto& transport = transport_list_[transport_index];
         if (transport) {
             auto status = transport->install(local_segment_name_, metadata_,
                                              topology_, conf_);
             if (!status.ok()) {
-                if (tcp_transport_config_.hpRequired() && transport_index == static_cast<size_t>(TransportType::TCP)) {
+                if (tcp_transport_config_.hpRequired() &&
+                    transport_index ==
+                        static_cast<size_t>(TransportType::TCP)) {
                     return status;
                 }
                 LOG(WARNING) << "Transport " << transport->getName()
@@ -864,8 +868,11 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
                 auto& transport = transport_list_[type];
                 if (!transport) continue;
                 const auto transport_type = static_cast<TransportType>(type);
-                const bool advertised = std::find(desc.transports.begin(), desc.transports.end(), transport_type) != desc.transports.end();
-                if (!advertised && !transport->tracksLocalBuffer(desc)) continue;
+                const bool advertised =
+                    std::find(desc.transports.begin(), desc.transports.end(),
+                              transport_type) != desc.transports.end();
+                if (!advertised && !transport->tracksLocalBuffer(desc))
+                    continue;
                 auto status = transport->removeMemoryBuffer(desc);
                 if (!status.ok()) LOG(WARNING) << status.ToString();
             }
@@ -892,9 +899,14 @@ Status TransferEngineImpl::unregisterLocalMemory(
                 for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                     auto& transport = transport_list_[type];
                     if (!transport) continue;
-                    const auto transport_type = static_cast<TransportType>(type);
-                    const bool advertised = std::find(desc.transports.begin(), desc.transports.end(), transport_type) != desc.transports.end();
-                    if (!advertised && !transport->tracksLocalBuffer(desc)) continue;
+                    const auto transport_type =
+                        static_cast<TransportType>(type);
+                    const bool advertised =
+                        std::find(desc.transports.begin(),
+                                  desc.transports.end(),
+                                  transport_type) != desc.transports.end();
+                    if (!advertised && !transport->tracksLocalBuffer(desc))
+                        continue;
                     auto s = transport->removeMemoryBuffer(desc);
                     if (!s.ok()) LOG(WARNING) << s.ToString();
                 }
