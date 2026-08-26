@@ -602,12 +602,71 @@ pybind11::object decode_tensor_object_buffer(uintptr_t buffer_ptr, size_t size,
     if (!is_valid_tensor_object_buffer(buffer_ptr, size, operation_name)) {
         return py::none();
     }
+    if (size > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        LOG(ERROR) << "Tensor buffer is too large for " << operation_name;
+        return py::none();
+    }
+    auto runtime_accelerator =
+        mooncake::device::GetAcceleratorRegistry().RuntimeAccelerators();
+    // Preserve the existing zero-copy view for host/SHM buffers. Device
+    // pointers must be materialized first because buffer_to_tensor creates a
+    // CPU-addressable view over the serialized object.
+    if (!runtime_accelerator.FindDeviceForPointer(
+            reinterpret_cast<const void *>(buffer_ptr))) {
+        return buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
+                                static_cast<int64_t>(size));
+    }
+
+    char *host_buffer = nullptr;
+    try {
+        host_buffer = new char[size];
+    } catch (const std::exception &) {
+        LOG(ERROR) << "Failed to allocate host tensor buffer for "
+                   << operation_name << ", size=" << size;
+        return py::none();
+    }
+    if (!runtime_accelerator.CopyToHost(
+            host_buffer, reinterpret_cast<const void *>(buffer_ptr), size)) {
+        delete[] host_buffer;
+        LOG(ERROR) << "Failed to copy tensor buffer to host for "
+                   << operation_name;
+        return py::none();
+    }
     pybind11::object tensor = buffer_to_tensor(
-        NULL, reinterpret_cast<char *>(buffer_ptr), static_cast<int64_t>(size));
+        NULL, host_buffer, static_cast<int64_t>(size), true);
     if (tensor.is_none()) {
         LOG(ERROR) << "Failed to decode tensor buffer for " << operation_name;
     }
     return tensor;
+}
+
+std::optional<std::vector<char>> materialize_tensor_object_buffer(
+    uintptr_t buffer_ptr, size_t size, const char *operation_name) {
+    if (!is_valid_tensor_object_buffer(buffer_ptr, size, operation_name)) {
+        return std::nullopt;
+    }
+    if (size > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        LOG(ERROR) << "Tensor buffer is too large for " << operation_name;
+        return std::nullopt;
+    }
+    std::vector<char> host_buffer;
+    try {
+        host_buffer.resize(size);
+    } catch (const std::exception &) {
+        LOG(ERROR) << "Failed to allocate host tensor buffer for "
+                   << operation_name << ", size=" << size;
+        return std::nullopt;
+    }
+    auto runtime_accelerator =
+        mooncake::device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyToHost(
+            host_buffer.data(), reinterpret_cast<const void *>(buffer_ptr),
+            size)) {
+        LOG(ERROR) << "Failed to copy tensor buffer to host for "
+                   << operation_name;
+        return std::nullopt;
+    }
+    return host_buffer;
 }
 
 std::string get_tp_write_shard_key(const std::string &base_key, int rank,
@@ -671,6 +730,13 @@ int execute_tp_tensor_write_from_impl(const std::string &key,
     if (!parsed.has_value()) {
         return to_py_ret(ErrorCode::INVALID_PARAMS);
     }
+    auto host_buffer = materialize_tensor_object_buffer(
+        buffer_ptr, size, error_context);
+    if (!host_buffer.has_value()) {
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    const uintptr_t host_buffer_ptr =
+        reinterpret_cast<uintptr_t>(host_buffer->data());
 
     for (int rank = 0; rank < tp_size; ++rank) {
         std::string shard_key = get_tp_write_shard_key(key, rank, axes);
@@ -720,7 +786,7 @@ int execute_tp_tensor_write_from_impl(const std::string &key,
                             plan->metadata.header.data_offset);
         for (const auto &[src_offset, part_size] : plan->data_ranges) {
             values.emplace_back(
-                reinterpret_cast<const char *>(buffer_ptr + src_offset),
+                reinterpret_cast<const char *>(host_buffer_ptr + src_offset),
                 part_size);
         }
         int ret = write_parts(shard_key, values, config);
@@ -810,9 +876,11 @@ std::vector<int> batch_decode_tensor_buffers_and_write(
             continue;
         }
 
-        py::object tensor =
-            buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptrs[i]),
-                             static_cast<int64_t>(sizes[i]));
+        const std::string operation =
+            std::string(decode_error_context) + " at index " +
+            std::to_string(i);
+        py::object tensor = decode_tensor_object_buffer(
+            buffer_ptrs[i], sizes[i], operation.c_str());
         if (tensor.is_none()) {
             LOG(ERROR) << decode_error_context << " at index " << i;
             final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -851,6 +919,13 @@ int execute_direct_parallelism_shard_write_from(
     if (!parsed.has_value()) {
         return to_py_ret(ErrorCode::INVALID_PARAMS);
     }
+    auto host_buffer = materialize_tensor_object_buffer(
+        buffer_ptr, size, error_context);
+    if (!host_buffer.has_value()) {
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    const uintptr_t host_buffer_ptr =
+        reinterpret_cast<uintptr_t>(host_buffer->data());
 
     auto metadata = build_shard_metadata_from_shapes(
         parsed->metadata.header.dtype,
@@ -869,7 +944,8 @@ int execute_direct_parallelism_shard_write_from(
                         metadata->header.data_offset);
     if (parsed->data_bytes > 0) {
         values.emplace_back(
-            reinterpret_cast<const char *>(buffer_ptr + parsed->data_offset),
+            reinterpret_cast<const char *>(host_buffer_ptr +
+                                           parsed->data_offset),
             parsed->data_bytes);
     }
     return execute_tensor_parts_write(shard_key, values, config, ops,
@@ -887,6 +963,13 @@ int execute_writer_partition_shard_write_from(
     if (!parsed.has_value()) {
         return to_py_ret(ErrorCode::INVALID_PARAMS);
     }
+    auto host_buffer = materialize_tensor_object_buffer(
+        buffer_ptr, size, error_context);
+    if (!host_buffer.has_value()) {
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    const uintptr_t host_buffer_ptr =
+        reinterpret_cast<uintptr_t>(host_buffer->data());
 
     auto plan = build_raw_tensor_shard_write_plan(
         *parsed, writer.split_dim, writer.rank, writer.size, error_context);
@@ -914,7 +997,8 @@ int execute_writer_partition_shard_write_from(
                         plan->metadata.header.data_offset);
     for (const auto &[src_offset, part_size] : plan->data_ranges) {
         values.emplace_back(
-            reinterpret_cast<const char *>(buffer_ptr + src_offset), part_size);
+            reinterpret_cast<const char *>(host_buffer_ptr + src_offset),
+            part_size);
     }
 
     int ret = execute_tensor_parts_write(

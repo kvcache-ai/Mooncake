@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <thread>
@@ -43,14 +44,24 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::isExist_internal>(&rc);
     server.register_handler<&RealClient::getSize_internal>(&rc);
     server.register_handler<&RealClient::get_into_range_shm_helper>(&rc);
+    server.register_handler<&RealClient::get_into_ranges_shm_helper>(&rc);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
+    server.register_handler<
+        &RealClient::batch_put_from_multi_buffers_dummy_helper>(&rc);
+    server.register_handler<
+        &RealClient::batch_upsert_from_dummy_helper>(&rc);
+    server.register_handler<
+        &RealClient::batch_upsert_from_multi_buffers_dummy_helper>(&rc);
+    server.register_handler<
+        &RealClient::batch_get_into_multi_buffers_dummy_helper>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::release_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_release_hot_cache>(&rc);
     server.register_handler<&RealClient::acquire_buffer_dummy>(&rc);
     server.register_handler<&RealClient::release_buffer_dummy>(&rc);
+    server.register_handler<&RealClient::allocate_buffer_dummy>(&rc);
     server.register_handler<&RealClient::batch_acquire_buffer_dummy>(&rc);
     server.register_handler<&RealClient::batch_get_query_results>(&rc);
 }
@@ -616,6 +627,92 @@ TEST_F(DummyClientGetBufferTest, Perf_BatchHotVsCold) {
 
     EXPECT_LT(hot_ms, fallback_ms)
         << "Batch hot cache path should be faster than fallback";
+}
+
+// External host pointers are not part of the dummy SHM mapping. They must be
+// copied through a real-client-owned staging buffer while preserving the
+// public register/put/get API contract.
+TEST_F(DummyClientGetBufferTest, ExternalHostAddressUsesStaging) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    constexpr size_t kSize = 4096;
+    std::vector<char> source(kSize);
+    std::vector<char> destination(kSize, static_cast<char>(0x5a));
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+
+    ASSERT_EQ(dummy_client_->register_buffer(source.data(), source.size()), 0);
+    ASSERT_EQ(dummy_client_->register_buffer(destination.data(),
+                                             destination.size()),
+              0);
+
+    const std::string key = "dummy_external_host_staging";
+    ASSERT_EQ(dummy_client_->put_from(key, source.data(), source.size()), 0);
+    ASSERT_EQ(dummy_client_->get_into(key, destination.data(),
+                                      destination.size()),
+              static_cast<int64_t>(kSize));
+    EXPECT_EQ(source, destination);
+
+    std::vector<char> ranged_destination(kSize, static_cast<char>(0x3c));
+    std::vector<void *> range_buffers{ranged_destination.data()};
+    std::vector<std::vector<std::string>> range_keys{{key}};
+    std::vector<std::vector<std::vector<size_t>>> dst_offsets(1);
+    std::vector<std::vector<std::vector<size_t>>> src_offsets(1);
+    std::vector<std::vector<std::vector<size_t>>> range_sizes(1);
+    dst_offsets[0].push_back({128});
+    src_offsets[0].push_back({64});
+    range_sizes[0].push_back({32});
+    auto range_results = dummy_client_->get_into_ranges(
+        range_buffers, range_keys, dst_offsets, src_offsets, range_sizes);
+    ASSERT_EQ(range_results.size(), 1U);
+    ASSERT_EQ(range_results[0].size(), 1U);
+    ASSERT_EQ(range_results[0][0].size(), 1U);
+    EXPECT_EQ(range_results[0][0][0], 32);
+    EXPECT_TRUE(std::all_of(ranged_destination.begin(),
+                            ranged_destination.begin() + 128,
+                            [](char value) { return value == 0x3c; }));
+    EXPECT_TRUE(std::equal(source.begin() + 64, source.begin() + 96,
+                           ranged_destination.begin() + 128));
+
+    ASSERT_EQ(dummy_client_->unregister_buffer(source.data()), 0);
+    ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
+}
+
+TEST_F(DummyClientGetBufferTest, ExternalRegisteredCapacityIsEnforced) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    constexpr size_t kSize = 64;
+    std::vector<char> source(kSize, 's');
+    std::vector<char> destination(kSize, 'd');
+    ASSERT_EQ(dummy_client_->register_buffer(source.data(), kSize), 0);
+    ASSERT_EQ(dummy_client_->register_buffer(destination.data(), kSize), 0);
+
+    const std::string key = "dummy_external_capacity";
+    ASSERT_EQ(dummy_client_->put_from(key, source.data(), kSize), 0);
+    EXPECT_EQ(dummy_client_->put_from(key, source.data(), kSize + 1),
+              toInt(ErrorCode::INVALID_PARAMS));
+    EXPECT_EQ(dummy_client_->get_into(key, destination.data(), kSize + 1),
+              static_cast<int64_t>(toInt(ErrorCode::INVALID_PARAMS)));
+
+    std::vector<void*> range_buffers{destination.data()};
+    std::vector<std::vector<std::string>> range_keys{{key}};
+    std::vector<std::vector<std::vector<size_t>>> dst_offsets(1);
+    std::vector<std::vector<std::vector<size_t>>> src_offsets(1);
+    std::vector<std::vector<std::vector<size_t>>> range_sizes(1);
+    dst_offsets[0].push_back({kSize - 1});
+    src_offsets[0].push_back({0});
+    range_sizes[0].push_back({2});
+    auto range_results = dummy_client_->get_into_ranges(
+        range_buffers, range_keys, dst_offsets, src_offsets, range_sizes);
+    ASSERT_EQ(range_results.size(), 1U);
+    ASSERT_EQ(range_results[0].size(), 1U);
+    ASSERT_EQ(range_results[0][0].size(), 1U);
+    EXPECT_EQ(range_results[0][0][0],
+              static_cast<int64_t>(toInt(ErrorCode::INVALID_PARAMS)));
+
+    ASSERT_EQ(dummy_client_->unregister_buffer(source.data()), 0);
+    ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
 }
 
 }  // namespace testing

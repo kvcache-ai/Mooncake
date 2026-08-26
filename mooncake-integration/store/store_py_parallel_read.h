@@ -18,8 +18,13 @@ std::optional<ParsedTensorMetadata> get_tensor_metadata(
     if (buffer_handle_out) {
         *buffer_handle_out = buffer_handle;
     }
-    return ParseTensorMetadata(static_cast<const char *>(buffer_handle->ptr()),
-                               buffer_handle->size());
+    // The returned handle may refer to accelerator memory on clients that
+    // expose device-backed buffers. Read the fixed metadata header through
+    // RuntimeAccelerator instead of dereferencing the pointer on the host;
+    // host/SHM handles continue to use the same memcpy-backed path.
+    return parse_tensor_metadata_from_raw_buffer(
+        reinterpret_cast<uintptr_t>(buffer_handle->ptr()),
+        buffer_handle->size(), "get_tensor_metadata");
 }
 
 std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_prefix(
@@ -312,7 +317,9 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
         return std::nullopt;
     }
     if (target_start < 0 || target_extent < 0 ||
-        target_start + target_extent > global_shape[split_dim]) {
+        global_shape[split_dim] < 0 ||
+        target_extent > global_shape[split_dim] ||
+        target_start > global_shape[split_dim] - target_extent) {
         LOG(ERROR) << context << ": invalid target shard range";
         return std::nullopt;
     }
@@ -327,17 +334,24 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
         return std::nullopt;
     }
 
-    size_t target_tensor_numel = 1;
-    for (size_t dim = 0; dim < global_shape.size(); ++dim) {
-        const int64_t dim_extent = static_cast<int>(dim) == split_dim
-                                       ? target_extent
-                                       : global_shape[dim];
-        target_tensor_numel *= static_cast<size_t>(dim_extent);
+    std::vector<int64_t> target_shape = global_shape;
+    target_shape[split_dim] = target_extent;
+    auto target_tensor_numel = checked_shape_numel(target_shape, context);
+    if (!target_tensor_numel.has_value()) {
+        return std::nullopt;
     }
-    const size_t target_tensor_bytes = target_tensor_numel * *element_size;
-    const size_t total_length = sizeof(TensorMetadata) + target_tensor_bytes;
+    auto target_tensor_bytes = checked_size_mul(*target_tensor_numel,
+                                                *element_size, context);
+    auto total_length = target_tensor_bytes.has_value()
+                            ? checked_size_add(sizeof(TensorMetadata),
+                                               *target_tensor_bytes, context)
+                            : std::nullopt;
+    if (!total_length.has_value()) {
+        return std::nullopt;
+    }
 
-    if (total_length > size || region->offset + total_length > region->size) {
+    if (*total_length > size || *total_length > region->size ||
+        region->offset > region->size - *total_length) {
         LOG(ERROR) << context << ": buffer too small for reconstructed tensor";
         return std::nullopt;
     }
@@ -346,17 +360,17 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
     plan.user_buffer_ptr = buffer_ptr;
     plan.registered_buffer_ptr = reinterpret_cast<uintptr_t>(region->base);
     plan.registered_buffer_size = region->size;
-    plan.total_length = total_length;
+    plan.total_length = *total_length;
     plan.materialized_metadata = target_metadata;
-    plan.materialized_metadata->header.data_bytes = target_tensor_bytes;
+    plan.materialized_metadata->header.data_bytes = *target_tensor_bytes;
 
-    int64_t elements_before = 1;
-    for (int i = 0; i < split_dim; ++i) {
-        elements_before *= global_shape[i];
-    }
-    int64_t elements_after = 1;
-    for (size_t i = split_dim + 1; i < global_shape.size(); ++i) {
-        elements_after *= global_shape[i];
+    auto elements_before = checked_shape_numel_range(
+        global_shape, 0, static_cast<size_t>(split_dim), context);
+    auto elements_after = checked_shape_numel_range(
+        global_shape, static_cast<size_t>(split_dim + 1), global_shape.size(),
+        context);
+    if (!elements_before.has_value() || !elements_after.has_value()) {
+        return std::nullopt;
     }
 
     std::vector<bool> covered(
@@ -369,38 +383,84 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
         }
         const auto [source_start, source_extent] = *source_range;
         const int64_t overlap_start = std::max(source_start, target_start);
-        const int64_t overlap_end = std::min(source_start + source_extent,
-                                             target_start + target_extent);
+        if (source_start < 0 || source_extent < 0 ||
+            global_shape[split_dim] < 0 ||
+            source_extent > global_shape[split_dim] ||
+            source_start > global_shape[split_dim] - source_extent) {
+            LOG(ERROR) << context << ": invalid source shard range";
+            return std::nullopt;
+        }
+        const int64_t source_end = source_start + source_extent;
+        const int64_t target_end = target_start + target_extent;
+        const int64_t overlap_end = std::min(source_end, target_end);
         if (overlap_end <= overlap_start) {
             continue;
         }
         const int64_t overlap_extent = overlap_end - overlap_start;
         const int64_t src_inner_offset = overlap_start - source_start;
         const int64_t dst_inner_offset = overlap_start - target_start;
-        const size_t row_bytes = static_cast<size_t>(overlap_extent) *
-                                 static_cast<size_t>(elements_after) *
-                                 *element_size;
+        auto row_elements = checked_size_mul(
+            static_cast<size_t>(overlap_extent), *elements_after, context);
+        auto row_bytes = row_elements.has_value()
+                             ? checked_size_mul(*row_elements, *element_size,
+                                                context)
+                             : std::nullopt;
+        if (!row_bytes.has_value()) {
+            return std::nullopt;
+        }
         for (int64_t idx = dst_inner_offset;
              idx < dst_inner_offset + overlap_extent; ++idx) {
             covered[static_cast<size_t>(idx)] = true;
         }
 
-        for (int64_t slice_idx = 0; slice_idx < elements_before; ++slice_idx) {
-            const size_t dst_offset =
-                region->offset + sizeof(TensorMetadata) +
-                static_cast<size_t>(slice_idx * target_extent +
-                                    dst_inner_offset) *
-                    static_cast<size_t>(elements_after) * *element_size;
-            const size_t src_offset =
-                source.metadata.data_offset +
-                static_cast<size_t>(slice_idx * source_extent +
-                                    src_inner_offset) *
-                    static_cast<size_t>(elements_after) * *element_size;
+        for (size_t slice_idx = 0; slice_idx < *elements_before; ++slice_idx) {
+            auto dst_index = checked_size_mul(
+                slice_idx, static_cast<size_t>(target_extent), context);
+            auto src_index = checked_size_mul(
+                slice_idx, static_cast<size_t>(source_extent), context);
+            if (!dst_index.has_value() || !src_index.has_value()) {
+                return std::nullopt;
+            }
+            dst_index = checked_size_add(*dst_index,
+                                         static_cast<size_t>(dst_inner_offset),
+                                         context);
+            src_index = checked_size_add(*src_index,
+                                         static_cast<size_t>(src_inner_offset),
+                                         context);
+            auto dst_bytes = dst_index.has_value()
+                                 ? checked_size_mul(*dst_index, *elements_after,
+                                                    context)
+                                 : std::nullopt;
+            auto src_bytes = src_index.has_value()
+                                 ? checked_size_mul(*src_index, *elements_after,
+                                                    context)
+                                 : std::nullopt;
+            dst_bytes = dst_bytes.has_value()
+                            ? checked_size_mul(*dst_bytes, *element_size,
+                                               context)
+                            : std::nullopt;
+            src_bytes = src_bytes.has_value()
+                            ? checked_size_mul(*src_bytes, *element_size,
+                                               context)
+                            : std::nullopt;
+            auto dst_base = checked_size_add(region->offset,
+                                             sizeof(TensorMetadata), context);
+            auto dst_offset = dst_base.has_value() && dst_bytes.has_value()
+                                  ? checked_size_add(*dst_base, *dst_bytes,
+                                                     context)
+                                  : std::nullopt;
+            auto src_offset = src_bytes.has_value()
+                                  ? checked_size_add(source.metadata.data_offset,
+                                                     *src_bytes, context)
+                                  : std::nullopt;
+            if (!dst_offset.has_value() || !src_offset.has_value()) {
+                return std::nullopt;
+            }
             plan.fragments.push_back(TensorIntoFragment{
                 .read_key = source.read_key,
-                .dst_offset = dst_offset,
-                .src_offset = src_offset,
-                .size = row_bytes,
+                .dst_offset = *dst_offset,
+                .src_offset = *src_offset,
+                .size = *row_bytes,
             });
         }
     }
@@ -413,7 +473,7 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
             return std::nullopt;
         }
     }
-    if (plan.fragments.empty() && target_tensor_bytes != 0) {
+    if (plan.fragments.empty() && *target_tensor_bytes != 0) {
         LOG(ERROR) << context << ": no fragments planned for reconstruction";
         return std::nullopt;
     }
@@ -453,19 +513,16 @@ pybind11::object get_tensor_with_writer_shard_full(const std::string &key,
         LOG(ERROR) << "Client is not initialized";
         return pybind11::none();
     }
-    if (use_dummy_client_) {
-        LOG(ERROR) << context << ": dummy client is not supported";
-        return pybind11::none();
-    }
 
     auto reconstruction = load_writer_shard_reconstruction(key, context);
     if (!reconstruction.has_value()) {
         return get_tensor(key);
     }
 
-    size_t total_tensor_numel = 1;
-    for (auto dim : reconstruction->global_shape) {
-        total_tensor_numel *= static_cast<size_t>(dim);
+    auto total_tensor_numel =
+        checked_shape_numel(reconstruction->global_shape, context);
+    if (!total_tensor_numel.has_value()) {
+        return py::none();
     }
 
     auto element_size =
@@ -474,17 +531,24 @@ pybind11::object get_tensor_with_writer_shard_full(const std::string &key,
         return py::none();
     }
 
-    const size_t total_length =
-        sizeof(TensorMetadata) + total_tensor_numel * *element_size;
-    char *owned_buffer = new char[total_length];
-    if (store_->register_buffer(owned_buffer, total_length) != 0) {
+    auto total_bytes = checked_size_mul(*total_tensor_numel, *element_size,
+                                       context);
+    auto total_length = total_bytes.has_value()
+                            ? checked_size_add(sizeof(TensorMetadata),
+                                               *total_bytes, context)
+                            : std::nullopt;
+    if (!total_length.has_value()) {
+        return py::none();
+    }
+    char *owned_buffer = new char[*total_length];
+    if (store_->register_buffer(owned_buffer, *total_length) != 0) {
         LOG(ERROR) << context << ": failed to register reconstruction buffer";
         delete[] owned_buffer;
         return py::none();
     }
 
     auto plan = build_full_tensor_into_plan_from_sources(
-        reinterpret_cast<uintptr_t>(owned_buffer), total_length,
+        reinterpret_cast<uintptr_t>(owned_buffer), *total_length,
         reconstruction->sources, reconstruction->global_shape,
         reconstruction->split_dim, reconstruction->dtype, context,
         reconstruction->allow_empty_fragments);
@@ -503,13 +567,17 @@ pybind11::object get_tensor_with_writer_shard_full(const std::string &key,
         return py::none();
     }
 
-    return buffer_to_tensor(
-        new BufferHandle(owned_buffer, total_length,
-                         [this, owned_buffer]() {
-                             store_->unregister_buffer(owned_buffer);
-                             delete[] owned_buffer;
-                         }),
-        nullptr, 0);
+    auto owned_handle = std::make_unique<BufferHandle>(
+        owned_buffer, *total_length, [this, owned_buffer]() {
+            store_->unregister_buffer(owned_buffer);
+            delete[] owned_buffer;
+        });
+    auto tensor = buffer_to_tensor(owned_handle.get(), nullptr, 0);
+    // buffer_to_tensor copies the payload into the returned NumPy/Torch
+    // storage; release the temporary registered buffer immediately so full
+    // reconstruction reads do not leak one allocation per call.
+    owned_handle.reset();
+    return tensor;
 }
 
 pybind11::object get_tensor_with_tp_full(
@@ -518,10 +586,6 @@ pybind11::object get_tensor_with_tp_full(
     const std::optional<TensorParallelismSpec> &parallelism = std::nullopt) {
     if (!is_client_initialized()) {
         LOG(ERROR) << "Client is not initialized";
-        return pybind11::none();
-    }
-    if (use_dummy_client_) {
-        LOG(ERROR) << context << ": dummy client is not supported";
         return pybind11::none();
     }
     ParallelAxisSpec axis{
@@ -542,27 +606,35 @@ pybind11::object get_tensor_with_tp_full(
         return pybind11::none();
     }
 
-    const size_t total_tensor_numel =
-        std::accumulate(reconstruction->global_shape.begin(),
-                        reconstruction->global_shape.end(),
-                        static_cast<size_t>(1), std::multiplies<size_t>());
+    auto total_tensor_numel =
+        checked_shape_numel(reconstruction->global_shape, context);
+    if (!total_tensor_numel.has_value()) {
+        return pybind11::none();
+    }
     auto element_size =
         extract_reconstruction_element_size(reconstruction->sources, context);
     if (!element_size.has_value()) {
         return pybind11::none();
     }
-    const size_t total_length =
-        sizeof(TensorMetadata) + total_tensor_numel * *element_size;
+    auto total_bytes = checked_size_mul(*total_tensor_numel, *element_size,
+                                       context);
+    auto total_length = total_bytes.has_value()
+                            ? checked_size_add(sizeof(TensorMetadata),
+                                               *total_bytes, context)
+                            : std::nullopt;
+    if (!total_length.has_value()) {
+        return pybind11::none();
+    }
 
-    char *owned_buffer = new char[total_length];
-    if (store_->register_buffer(owned_buffer, total_length) != 0) {
+    char *owned_buffer = new char[*total_length];
+    if (store_->register_buffer(owned_buffer, *total_length) != 0) {
         LOG(ERROR) << context << ": failed to register reconstruction buffer";
         delete[] owned_buffer;
         return pybind11::none();
     }
 
     auto plan = build_full_tensor_into_plan_from_sources(
-        reinterpret_cast<uintptr_t>(owned_buffer), total_length,
+        reinterpret_cast<uintptr_t>(owned_buffer), *total_length,
         reconstruction->sources, reconstruction->global_shape,
         reconstruction->split_dim, reconstruction->dtype, context,
         reconstruction->allow_empty_fragments);
@@ -581,13 +653,14 @@ pybind11::object get_tensor_with_tp_full(
         return py::none();
     }
 
-    return buffer_to_tensor(
-        new BufferHandle(owned_buffer, total_length,
-                         [this, owned_buffer]() {
-                             store_->unregister_buffer(owned_buffer);
-                             delete[] owned_buffer;
-                         }),
-        nullptr, 0);
+    auto owned_handle = std::make_unique<BufferHandle>(
+        owned_buffer, *total_length, [this, owned_buffer]() {
+            store_->unregister_buffer(owned_buffer);
+            delete[] owned_buffer;
+        });
+    auto tensor = buffer_to_tensor(owned_handle.get(), nullptr, 0);
+    owned_handle.reset();
+    return tensor;
 }
 
 std::optional<TensorIntoPlan> build_tp_full_tensor_into_plan(
@@ -1097,21 +1170,25 @@ std::optional<TensorIntoPlan> build_parallelism_full_tensor_into_formula_plan(
         return std::nullopt;
     }
 
-    size_t tensor_numel = 1;
-    for (auto dim : global_shape) {
-        if (dim < 0) {
-            return std::nullopt;
-        }
-        tensor_numel *= static_cast<size_t>(dim);
+    auto tensor_numel = checked_shape_numel(global_shape, context);
+    if (!tensor_numel.has_value()) {
+        return std::nullopt;
     }
-    const size_t tensor_bytes = tensor_numel * *element_size;
-    const size_t total_length = sizeof(TensorMetadata) + tensor_bytes;
+    auto tensor_bytes = checked_size_mul(*tensor_numel, *element_size, context);
+    auto total_length = tensor_bytes.has_value()
+                            ? checked_size_add(sizeof(TensorMetadata),
+                                               *tensor_bytes, context)
+                            : std::nullopt;
+    if (!total_length.has_value()) {
+        return std::nullopt;
+    }
 
     auto region = resolve_writable_buffer_region(buffer_ptr, size, context);
     if (!region.has_value()) {
         return std::nullopt;
     }
-    if (total_length > size || region->offset + total_length > region->size) {
+    if (*total_length > size || *total_length > region->size ||
+        region->offset > region->size - *total_length) {
         LOG(ERROR) << context << ": buffer too small for reconstructed tensor";
         return std::nullopt;
     }
@@ -1120,11 +1197,11 @@ std::optional<TensorIntoPlan> build_parallelism_full_tensor_into_formula_plan(
     plan.user_buffer_ptr = buffer_ptr;
     plan.registered_buffer_ptr = reinterpret_cast<uintptr_t>(region->base);
     plan.registered_buffer_size = region->size;
-    plan.total_length = total_length;
+    plan.total_length = *total_length;
     plan.materialized_metadata =
         BuildTensorMetadata(manifest->manifest.header.dtype, global_shape,
                             global_shape, TensorLayoutKind::FULL);
-    plan.materialized_metadata->header.data_bytes = tensor_bytes;
+    plan.materialized_metadata->header.data_bytes = *tensor_bytes;
 
     TensorIntoRegularFullFormulaPlan formula;
     formula.global_shape = global_shape;
@@ -1237,26 +1314,31 @@ pybind11::object get_tensor_with_parallelism_shard_full_materialized(
         return py::none();
     }
 
-    size_t target_tensor_numel = 1;
-    for (size_t dim = 0; dim < reconstruction->global_shape.size(); ++dim) {
-        const int64_t dim_extent =
-            static_cast<int>(dim) == reconstruction->split_dim
-                ? target_extent
-                : reconstruction->global_shape[dim];
-        target_tensor_numel *= static_cast<size_t>(dim_extent);
+    auto target_shape = reconstruction->global_shape;
+    target_shape[reconstruction->split_dim] = target_extent;
+    auto target_tensor_numel = checked_shape_numel(target_shape, context);
+    if (!target_tensor_numel.has_value()) {
+        return py::none();
     }
-    const size_t total_length =
-        sizeof(TensorMetadata) + target_tensor_numel * *element_size;
+    auto target_bytes = checked_size_mul(*target_tensor_numel, *element_size,
+                                        context);
+    auto total_length = target_bytes.has_value()
+                            ? checked_size_add(sizeof(TensorMetadata),
+                                               *target_bytes, context)
+                            : std::nullopt;
+    if (!total_length.has_value()) {
+        return py::none();
+    }
 
-    char *owned_buffer = new char[total_length];
-    if (store_->register_buffer(owned_buffer, total_length) != 0) {
+    char *owned_buffer = new char[*total_length];
+    if (store_->register_buffer(owned_buffer, *total_length) != 0) {
         LOG(ERROR) << context << ": failed to register reconstruction buffer";
         delete[] owned_buffer;
         return py::none();
     }
 
     auto plan = build_parallelism_shard_tensor_into_plan(
-        key, reinterpret_cast<uintptr_t>(owned_buffer), total_length,
+        key, reinterpret_cast<uintptr_t>(owned_buffer), *total_length,
         parallelism, context);
     if (!plan.has_value()) {
         store_->unregister_buffer(owned_buffer);
@@ -1273,13 +1355,14 @@ pybind11::object get_tensor_with_parallelism_shard_full_materialized(
         return py::none();
     }
 
-    return buffer_to_tensor(
-        new BufferHandle(owned_buffer, total_length,
-                         [this, owned_buffer]() {
-                             store_->unregister_buffer(owned_buffer);
-                             delete[] owned_buffer;
-                         }),
-        nullptr, 0);
+    auto owned_handle = std::make_unique<BufferHandle>(
+        owned_buffer, *total_length, [this, owned_buffer]() {
+            store_->unregister_buffer(owned_buffer);
+            delete[] owned_buffer;
+        });
+    auto tensor = buffer_to_tensor(owned_handle.get(), nullptr, 0);
+    owned_handle.reset();
+    return tensor;
 }
 
 std::vector<bool> execute_tensor_into_plan_transfers(
@@ -1302,7 +1385,6 @@ std::vector<bool> execute_tensor_into_plan_transfers(
 
     std::vector<size_t> transfer_plan_indices;
     transfer_plan_indices.reserve(plans.size());
-
     for (size_t plan_idx = 0; plan_idx < plans.size(); ++plan_idx) {
         const auto &plan = plans[plan_idx];
         std::unordered_map<std::string, size_t> key_to_index;
@@ -1318,14 +1400,14 @@ std::vector<bool> execute_tensor_into_plan_transfers(
             src_offsets.resize(keys.size());
             sizes.resize(keys.size());
 
-            int64_t elements_before = 1;
-            for (int i = 0; i < formula.split_dim; ++i) {
-                elements_before *= formula.global_shape[i];
-            }
-            int64_t elements_after = 1;
-            for (size_t i = formula.split_dim + 1;
-                 i < formula.global_shape.size(); ++i) {
-                elements_after *= formula.global_shape[i];
+            auto elements_before = checked_shape_numel_range(
+                formula.global_shape, 0,
+                static_cast<size_t>(formula.split_dim), "execute_tensor_into");
+            auto elements_after = checked_shape_numel_range(
+                formula.global_shape, static_cast<size_t>(formula.split_dim + 1),
+                formula.global_shape.size(), "execute_tensor_into");
+            if (!elements_before.has_value() || !elements_after.has_value()) {
+                return success;
             }
             const size_t base_dst_offset =
                 plan.user_buffer_ptr - plan.registered_buffer_ptr;
@@ -1339,31 +1421,73 @@ std::vector<bool> execute_tensor_into_plan_transfers(
                 if (shard_extent <= 0) {
                     continue;
                 }
-                const size_t row_bytes = static_cast<size_t>(shard_extent) *
-                                         static_cast<size_t>(elements_after) *
-                                         formula.element_size;
-                if (row_bytes == 0) {
+                auto row_elements = checked_size_mul(
+                    static_cast<size_t>(shard_extent), *elements_after,
+                    "execute_tensor_into");
+                auto row_bytes = row_elements.has_value()
+                                     ? checked_size_mul(
+                                           *row_elements, formula.element_size,
+                                           "execute_tensor_into")
+                                     : std::nullopt;
+                if (!row_bytes.has_value() || *row_bytes == 0) {
+                    if (!row_bytes.has_value()) return success;
                     continue;
                 }
-                dst_offsets[shard_rank].reserve(
-                    static_cast<size_t>(elements_before));
-                src_offsets[shard_rank].reserve(
-                    static_cast<size_t>(elements_before));
-                sizes[shard_rank].reserve(static_cast<size_t>(elements_before));
-                for (int64_t slice_idx = 0; slice_idx < elements_before;
+                dst_offsets[shard_rank].reserve(*elements_before);
+                src_offsets[shard_rank].reserve(*elements_before);
+                sizes[shard_rank].reserve(*elements_before);
+                for (size_t slice_idx = 0; slice_idx < *elements_before;
                      ++slice_idx) {
-                    dst_offsets[shard_rank].push_back(
-                        base_dst_offset + sizeof(TensorMetadata) +
-                        static_cast<size_t>(slice_idx * split_extent +
-                                            shard_start) *
-                            static_cast<size_t>(elements_after) *
-                            formula.element_size);
-                    src_offsets[shard_rank].push_back(
-                        formula.data_offset +
-                        static_cast<size_t>(slice_idx * shard_extent) *
-                            static_cast<size_t>(elements_after) *
-                            formula.element_size);
-                    sizes[shard_rank].push_back(row_bytes);
+                    auto dst_index = checked_size_mul(
+                        slice_idx, static_cast<size_t>(split_extent),
+                        "execute_tensor_into");
+                    auto src_index = checked_size_mul(
+                        slice_idx, static_cast<size_t>(shard_extent),
+                        "execute_tensor_into");
+                    if (!dst_index.has_value() || !src_index.has_value()) {
+                        return success;
+                    }
+                    dst_index = checked_size_add(
+                        *dst_index, static_cast<size_t>(shard_start),
+                        "execute_tensor_into");
+                    if (!dst_index.has_value() || !src_index.has_value()) {
+                        return success;
+                    }
+                    auto dst_bytes = checked_size_mul(
+                        *dst_index, *elements_after, "execute_tensor_into");
+                    auto src_bytes = checked_size_mul(
+                        *src_index, *elements_after, "execute_tensor_into");
+                    if (!dst_bytes.has_value() || !src_bytes.has_value()) {
+                        return success;
+                    }
+                    dst_bytes = checked_size_mul(*dst_bytes,
+                                                 formula.element_size,
+                                                 "execute_tensor_into");
+                    src_bytes = checked_size_mul(*src_bytes,
+                                                 formula.element_size,
+                                                 "execute_tensor_into");
+                    if (!dst_bytes.has_value() || !src_bytes.has_value()) {
+                        return success;
+                    }
+                    auto dst_base = checked_size_add(
+                        base_dst_offset, sizeof(TensorMetadata),
+                        "execute_tensor_into");
+                    auto dst_offset = dst_base.has_value()
+                                          ? checked_size_add(
+                                                *dst_base, *dst_bytes,
+                                                "execute_tensor_into")
+                                          : std::nullopt;
+                    auto src_offset = src_bytes.has_value()
+                                          ? checked_size_add(
+                                                formula.data_offset, *src_bytes,
+                                                "execute_tensor_into")
+                                          : std::nullopt;
+                    if (!dst_offset.has_value() || !src_offset.has_value()) {
+                        return success;
+                    }
+                    dst_offsets[shard_rank].push_back(*dst_offset);
+                    src_offsets[shard_rank].push_back(*src_offset);
+                    sizes[shard_rank].push_back(*row_bytes);
                 }
             }
         } else {
@@ -1394,10 +1518,12 @@ std::vector<bool> execute_tensor_into_plan_transfers(
 
         if (keys.empty()) {
             if (plan.materialized_metadata.has_value()) {
-                std::memcpy(reinterpret_cast<void *>(plan.user_buffer_ptr),
-                            &*plan.materialized_metadata,
-                            sizeof(TensorMetadata));
-                success[plan_idx] = true;
+                auto runtime_accelerator =
+                    mooncake::device::GetAcceleratorRegistry()
+                        .RuntimeAccelerators();
+                success[plan_idx] = runtime_accelerator.CopyFromHost(
+                    reinterpret_cast<void *>(plan.user_buffer_ptr),
+                    &*plan.materialized_metadata, sizeof(TensorMetadata));
             }
             continue;
         }
@@ -1467,10 +1593,15 @@ std::vector<bool> execute_tensor_into_plan_transfers(
             continue;
         }
         if (plans[plan_idx].materialized_metadata.has_value()) {
-            std::memcpy(
-                reinterpret_cast<void *>(plans[plan_idx].user_buffer_ptr),
-                &*plans[plan_idx].materialized_metadata,
-                sizeof(TensorMetadata));
+            auto runtime_accelerator =
+                mooncake::device::GetAcceleratorRegistry()
+                    .RuntimeAccelerators();
+            if (!runtime_accelerator.CopyFromHost(
+                    reinterpret_cast<void *>(plans[plan_idx].user_buffer_ptr),
+                    &*plans[plan_idx].materialized_metadata,
+                    sizeof(TensorMetadata))) {
+                success[plan_idx] = false;
+            }
         }
     }
     return success;
@@ -1486,9 +1617,11 @@ py::list execute_tensor_into_plans(std::vector<TensorIntoPlan> plans) {
         if (!success[i]) {
             continue;
         }
-        results[i] = buffer_to_tensor(
-            NULL, reinterpret_cast<char *>(plans[i].user_buffer_ptr),
-            static_cast<int64_t>(plans[i].total_length));
+        const std::string operation = "tensor read result at index " +
+                                      std::to_string(i);
+        results[i] = decode_tensor_object_buffer(
+            plans[i].user_buffer_ptr, plans[i].total_length,
+            operation.c_str());
     }
     return results;
 }

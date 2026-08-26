@@ -199,6 +199,27 @@ class DummyClient : public PyClient {
     std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
 
    private:
+    struct PreparedBuffer {
+        void* original = nullptr;
+        void* dummy = nullptr;
+        size_t size = 0;
+        std::unique_ptr<BufferHandle> staging;
+        bool copy_back = false;
+    };
+
+    bool is_dummy_shm_buffer(void* buffer, size_t size) const;
+    std::optional<size_t> external_buffer_remaining(void* buffer) const;
+    std::optional<PreparedBuffer> prepare_buffer(void* buffer, size_t size,
+                                                 bool copy_to_staging,
+                                                 bool copy_back = false);
+    bool copy_from_staging(const PreparedBuffer& buffer, size_t size) const;
+
+    std::vector<int> batch_write_from_multi_buffers_impl(
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<void*>>& all_buffers,
+        const std::vector<std::vector<size_t>>& all_sizes,
+        const ReplicateConfig& config, bool upsert);
+
     ErrorCode connect(const std::string &server_address);
 
     int register_ascend_shm(const ShmHelper::ShmSegment *shm,
@@ -214,6 +235,24 @@ class DummyClient : public PyClient {
 
     [[nodiscard]] std::vector<ShmHelper::ShmSegment>
     get_registered_device_buffers() const;
+#endif
+
+#if defined(USE_ASCEND_DIRECT)
+    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
+    get_registered_external_fabric_buffers() const;
+#endif
+
+    mutable std::mutex registered_external_buffers_mutex_;
+    std::unordered_map<uintptr_t, size_t> registered_external_buffers_;
+#if defined(USE_ASCEND_DIRECT)
+    // Fabric-backed host registrations are mapped in the RealClient process
+    // and need an explicit remote unmap when the caller unregisters them.
+    std::unordered_map<uintptr_t, size_t>
+        registered_external_fabric_buffers_;
+    // Serializes Fabric registration RPCs with reconnect and unregister so a
+    // reconnect snapshot cannot re-register an address after its owner has
+    // released it.
+    mutable std::mutex external_fabric_registration_mutex_;
 #endif
 
     /**

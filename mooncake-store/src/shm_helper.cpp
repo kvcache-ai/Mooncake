@@ -171,10 +171,14 @@ int ShmHelper::free(void* addr) {
 
 std::shared_ptr<ShmHelper::ShmSegment> ShmHelper::get_shm(void* addr) {
     std::lock_guard<std::mutex> lock(shm_mutex_);
+    const auto address = reinterpret_cast<uintptr_t>(addr);
     for (auto& shm : shms_) {
-        if (addr >= shm->base_addr &&
-            reinterpret_cast<uint8_t*>(addr) <
-                reinterpret_cast<uint8_t*>(shm->base_addr) + shm->size) {
+        const auto base = reinterpret_cast<uintptr_t>(shm->base_addr);
+        // Compare integer addresses so querying an arbitrary external pointer
+        // (for example a CUDA or pinned-CPU allocation) is well-defined. C++
+        // relational comparisons between pointers to unrelated objects are
+        // otherwise unspecified.
+        if (address >= base && address - base < shm->size) {
             return shm;
         }
     }

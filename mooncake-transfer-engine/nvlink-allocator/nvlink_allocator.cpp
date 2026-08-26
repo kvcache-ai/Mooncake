@@ -3,17 +3,35 @@
 
 #include <iostream>
 
+// CUDA Fabric Memory was introduced after the CUDA 12.0 driver headers.  The
+// allocator is also built for ordinary CUDA builds, so keep Fabric-only
+// symbols out of older-toolkit compilations and use cudaMalloc there.
+#if defined(USE_CUDA)
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12040
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 1
+#else
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 0
+#endif
+#elif defined(USE_MUSA) || defined(USE_HIP) || defined(USE_MACA) || \
+    defined(USE_SUPA)
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 1
+#else
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 0
+#endif
+
 // ref: http://github.com/NVIDIA/nccl/blob/v2.28.9-1/src/allocator.cc#L53-L68
 static CUresult cuMemCreateTryFabric(CUmemGenericAllocationHandle *handle,
                                      size_t size, CUmemAllocationProp *prop,
                                      unsigned long long flags) {
     CUresult err = cuMemCreate(handle, size, prop, flags);
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
     if ((prop->requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
         (err == CUDA_ERROR_NOT_PERMITTED || err == CUDA_ERROR_NOT_SUPPORTED)) {
         prop->requestedHandleTypes = static_cast<CUmemAllocationHandleType>(
             prop->requestedHandleTypes & ~CU_MEM_HANDLE_TYPE_FABRIC);
         err = cuMemCreate(handle, size, prop, flags);
     }
+#endif
     return err;
 }
 
@@ -22,6 +40,10 @@ enum class MemoryBackendType { use_cudamalloc, use_cumemcreate, unknown };
 namespace {
 
 MemoryBackendType ProbeAllocatorBackend(int device_id) {
+#if !MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
+    (void)device_id;
+    return MemoryBackendType::use_cudamalloc;
+#else
     CUdevice dev;
     CUresult res = cuDeviceGet(&dev, device_id);
     if (res != CUDA_SUCCESS) {
@@ -50,9 +72,43 @@ MemoryBackendType ProbeAllocatorBackend(int device_id) {
         return MemoryBackendType::use_cumemcreate;
     }
     return MemoryBackendType::use_cudamalloc;
+#endif
 }
 
 void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
+#if !MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
+    (void)stream;
+    int previous_device = -1;
+    auto result = cudaGetDevice(&previous_device);
+    if (result != cudaSuccess) {
+        std::cerr << "cudaGetDevice fallback failed: " << result << "\n";
+        return nullptr;
+    }
+    const bool switched = device >= 0 && previous_device != device;
+    if (switched) {
+        result = cudaSetDevice(device);
+        if (result != cudaSuccess) {
+            std::cerr << "cudaSetDevice fallback failed: " << result << "\n";
+            return nullptr;
+        }
+    }
+    void *ptr = nullptr;
+    result = cudaMalloc(&ptr, static_cast<size_t>(size));
+    if (switched) {
+        auto restore_result = cudaSetDevice(previous_device);
+        if (restore_result != cudaSuccess) {
+            std::cerr << "cudaSetDevice restore failed: " << restore_result
+                      << "\n";
+            if (result == cudaSuccess) cudaFree(ptr);
+            return nullptr;
+        }
+    }
+    if (result != cudaSuccess) {
+        std::cerr << "cudaMalloc fallback failed: " << result << "\n";
+        return nullptr;
+    }
+    return ptr;
+#else
     (void)stream;
     size_t granularity = 0;
     CUdevice currentDev;
@@ -132,10 +188,43 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
         return nullptr;
     }
     return ptr;
+#endif
 }
 
 void FreeFabricMemory(void *ptr, ssize_t ssize, int device,
                       cudaStream_t stream) {
+#if !MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
+    (void)ssize;
+    (void)stream;
+    if (ptr == nullptr) return;
+    int previous_device = -1;
+    auto result = cudaGetDevice(&previous_device);
+    if (result != cudaSuccess) {
+        std::cerr << "cudaGetDevice free fallback failed: " << result << "\n";
+        return;
+    }
+    const bool switched = device >= 0 && previous_device != device;
+    if (switched) {
+        result = cudaSetDevice(device);
+        if (result != cudaSuccess) {
+            std::cerr << "cudaSetDevice free fallback failed: " << result
+                      << "\n";
+            return;
+        }
+    }
+    result = cudaFree(ptr);
+    if (switched) {
+        auto restore_result = cudaSetDevice(previous_device);
+        if (restore_result != cudaSuccess) {
+            std::cerr << "cudaSetDevice free restore failed: "
+                      << restore_result << "\n";
+        }
+    }
+    if (result != cudaSuccess) {
+        std::cerr << "cudaFree fallback failed: " << result << "\n";
+    }
+    return;
+#else
     (void)ssize;
     (void)device;
     (void)stream;
@@ -153,6 +242,7 @@ void FreeFabricMemory(void *ptr, ssize_t ssize, int device,
         cuMemAddressFree((CUdeviceptr)ptr, size);
     }
     cuMemRelease(handle);
+#endif
 }
 
 }  // namespace

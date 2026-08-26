@@ -16,7 +16,18 @@
 namespace mooncake {
 
 #ifndef USE_MUSA
+#if defined(USE_CUDA) && defined(CUDA_VERSION) && CUDA_VERSION >= 12040
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 1
+#elif defined(USE_MACA)
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 1
+#else
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 0
+#endif
+
 static bool checkSupportFabricMem() {
+#if !MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
+    return false;
+#else
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
     bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;
     if (!fabric_enabled) return false;
@@ -32,6 +43,7 @@ static bool checkSupportFabricMem() {
         if (!supported) return false;
     }
     return true;
+#endif
 }
 #else
 static bool checkSupportFabricMem() { return false; }

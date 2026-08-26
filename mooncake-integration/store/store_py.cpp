@@ -17,6 +17,7 @@
 #include "ssd_register_client.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
+#include "shm_helper.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -393,6 +394,72 @@ inline int to_py_ret(ErrorCode error_code) {
     return static_cast<int>(error_code);
 }
 
+// Reconstruction manifests are stored data and must not be allowed to make
+// arithmetic wrap before a destination buffer or transfer range is checked.
+std::optional<size_t> checked_size_add(size_t lhs, size_t rhs,
+                                       const std::string &context) {
+    if (rhs > std::numeric_limits<size_t>::max() - lhs) {
+        LOG(ERROR) << context << ": size addition overflow";
+        return std::nullopt;
+    }
+    return lhs + rhs;
+}
+
+std::optional<size_t> checked_size_mul(size_t lhs, size_t rhs,
+                                       const std::string &context) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        LOG(ERROR) << context << ": size multiplication overflow";
+        return std::nullopt;
+    }
+    return lhs * rhs;
+}
+
+std::optional<size_t> checked_shape_numel(
+    const std::vector<int64_t> &shape, const std::string &context) {
+    size_t numel = 1;
+    for (int64_t dim : shape) {
+        if (dim < 0 || static_cast<uint64_t>(dim) >
+                           static_cast<uint64_t>(
+                               std::numeric_limits<size_t>::max())) {
+            LOG(ERROR) << context << ": invalid tensor dimension";
+            return std::nullopt;
+        }
+        auto next = checked_size_mul(numel, static_cast<size_t>(dim),
+                                     context);
+        if (!next.has_value()) {
+            return std::nullopt;
+        }
+        numel = *next;
+    }
+    return numel;
+}
+
+std::optional<size_t> checked_shape_numel_range(
+    const std::vector<int64_t> &shape, size_t begin, size_t end,
+    const std::string &context) {
+    if (begin > end || end > shape.size()) {
+        LOG(ERROR) << context << ": invalid tensor dimension range";
+        return std::nullopt;
+    }
+    size_t numel = 1;
+    for (size_t i = begin; i < end; ++i) {
+        const int64_t dim = shape[i];
+        if (dim < 0 || static_cast<uint64_t>(dim) >
+                           static_cast<uint64_t>(
+                               std::numeric_limits<size_t>::max())) {
+            LOG(ERROR) << context << ": invalid tensor dimension";
+            return std::nullopt;
+        }
+        auto next = checked_size_mul(numel, static_cast<size_t>(dim),
+                                     context);
+        if (!next.has_value()) {
+            return std::nullopt;
+        }
+        numel = *next;
+    }
+    return numel;
+}
+
 #include "store_py_internal.h"
 
 }  // namespace
@@ -678,7 +745,11 @@ class MooncakeStorePyWrapper {
             total_length = store_->get_into(key, buffer, size);
         }
 
-        return buffer_to_tensor(NULL, buffer, total_length);
+        if (total_length < 0) {
+            return buffer_to_tensor(NULL, buffer, total_length);
+        }
+        return decode_tensor_object_buffer(
+            buffer_ptr, static_cast<size_t>(total_length), "get_tensor_into");
     }
 
     pybind11::list batch_get_tensor_into(
@@ -733,8 +804,15 @@ class MooncakeStorePyWrapper {
         for (size_t i = 0; i < total_lengths.size(); i++) {
             const auto &buffer = buffers[i];
             const auto total_length = total_lengths[i];
-            results_list.append(buffer_to_tensor(
-                NULL, static_cast<char *>(buffer), total_length));
+            if (total_length < 0) {
+                results_list.append(buffer_to_tensor(
+                    NULL, static_cast<char *>(buffer), total_length));
+            } else {
+                results_list.append(decode_tensor_object_buffer(
+                    reinterpret_cast<uintptr_t>(buffer),
+                    static_cast<size_t>(total_length),
+                    "batch_get_tensor_into"));
+            }
         }
         return results_list;
     }
@@ -822,8 +900,11 @@ class MooncakeStorePyWrapper {
         auto metadata = batch_get_tensor_metadata_prefixes(keys, context);
         std::vector<CudaIpcReadRequest> read_requests;
         std::vector<size_t> original_indices;
+        std::vector<size_t> staging_indices;
+        std::vector<uintptr_t> staging_ptrs(keys.size(), 0);
         read_requests.reserve(keys.size());
         original_indices.reserve(keys.size());
+        staging_indices.reserve(keys.size());
 
         for (size_t i = 0; i < keys.size(); ++i) {
             PyTensorInfo target = extract_tensor_destination_info(
@@ -840,9 +921,12 @@ class MooncakeStorePyWrapper {
             auto dst_buffer = mooncake::device::ExportCudaIpcBuffer(
                 reinterpret_cast<void *>(target.data_ptr), target.tensor_size);
             if (!dst_buffer) {
-                LOG(ERROR) << context
-                           << ": destination tensor is not CUDA IPC exportable "
-                           << "for key " << keys[i];
+                // CUDA IPC is an optimization, not a requirement. The dummy
+                // client can stage an arbitrary device destination through a
+                // real-client-owned shared-memory buffer and copy the bytes
+                // back after the ranged read completes.
+                staging_indices.push_back(i);
+                staging_ptrs[i] = target.data_ptr;
                 continue;
             }
             read_requests.push_back(CudaIpcReadRequest{
@@ -865,6 +949,45 @@ class MooncakeStorePyWrapper {
             }
             apply_indexed_results(context.c_str(), op_results, original_indices,
                                   results);
+        }
+
+        std::vector<size_t> active_staging_indices;
+        std::vector<void *> range_buffers;
+        std::vector<std::vector<std::string>> range_keys;
+        std::vector<std::vector<std::vector<size_t>>> dst_offsets;
+        std::vector<std::vector<std::vector<size_t>>> src_offsets;
+        std::vector<std::vector<std::vector<size_t>>> range_sizes;
+        for (size_t index : staging_indices) {
+            void *destination = reinterpret_cast<void *>(staging_ptrs[index]);
+            if (destination == nullptr || !metadata[index].has_value()) {
+                continue;
+            }
+            active_staging_indices.push_back(index);
+            range_buffers.push_back(destination);
+            range_keys.push_back({keys[index]});
+            dst_offsets.push_back({{{0}}});
+            src_offsets.push_back({{{metadata[index]->data_offset}}});
+            range_sizes.push_back({{{metadata[index]->data_bytes}}});
+        }
+
+        if (!range_buffers.empty()) {
+            std::vector<std::vector<std::vector<int64_t>>> range_results;
+            {
+                py::gil_scoped_release release_gil;
+                range_results = store_->get_into_ranges(
+                    range_buffers, range_keys, dst_offsets, src_offsets,
+                    range_sizes);
+            }
+            for (size_t i = 0; i < active_staging_indices.size(); ++i) {
+                const size_t index = active_staging_indices[i];
+                if (i < range_results.size() &&
+                    range_results[i].size() == 1 &&
+                    range_results[i][0].size() == 1) {
+                    results[index] = range_results[i][0][0];
+                } else {
+                    results[index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                }
+            }
         }
         return results;
     }
@@ -1217,7 +1340,9 @@ class MooncakeStorePyWrapper {
             LOG(ERROR) << "Buffer size too small for tensor metadata";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (!ParseTensorMetadata(reinterpret_cast<const char *>(buffer), size)
+        if (!parse_tensor_metadata_from_raw_buffer(
+                reinterpret_cast<uintptr_t>(buffer), size,
+                "put_tensor_from")
                  .has_value()) {
             LOG(ERROR) << "Invalid tensor metadata";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -1257,8 +1382,8 @@ class MooncakeStorePyWrapper {
                 return std::vector<int>(keys.size(),
                                         to_py_ret(ErrorCode::INVALID_PARAMS));
             }
-            if (!ParseTensorMetadata(
-                     reinterpret_cast<const char *>(buffer_ptrs[i]), sizes[i])
+            if (!parse_tensor_metadata_from_raw_buffer(
+                     buffer_ptrs[i], sizes[i], "batch_put_tensor_from")
                      .has_value()) {
                 LOG(ERROR) << "Invalid tensor metadata at index " << i;
                 return std::vector<int>(keys.size(),
@@ -1334,9 +1459,8 @@ class MooncakeStorePyWrapper {
             return put_tensor_from(key, buffer_ptr, size);
         }
 
-        pybind11::object tensor =
-            buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
-                             static_cast<int64_t>(size));
+        pybind11::object tensor = decode_tensor_object_buffer(
+            buffer_ptr, size, "put_tensor_with_tp_from");
         if (tensor.is_none()) {
             LOG(ERROR) << "Failed to decode full tensor buffer for "
                           "put_tensor_with_tp_from";
@@ -1387,9 +1511,8 @@ class MooncakeStorePyWrapper {
                 continue;
             }
 
-            py::object tensor =
-                buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptrs[i]),
-                                 static_cast<int64_t>(sizes[i]));
+            py::object tensor = decode_tensor_object_buffer(
+                buffer_ptrs[i], sizes[i], "batch_put_tensor_with_tp_from");
             if (tensor.is_none()) {
                 LOG(ERROR) << "Failed to decode full tensor buffer at index "
                            << i;
@@ -1431,6 +1554,33 @@ class MooncakeStorePyWrapper {
     std::optional<RealClient::WritableBufferRegion>
     resolve_writable_buffer_region(uintptr_t buffer_ptr, size_t size,
                                    const std::string &context) const {
+        if (use_dummy_client_) {
+            if (buffer_ptr == 0 || size == 0) {
+                LOG(ERROR) << context << ": invalid destination buffer";
+                return std::nullopt;
+            }
+            void *buffer = reinterpret_cast<void *>(buffer_ptr);
+            if (auto shm = ShmHelper::getInstance()->get_shm(buffer);
+                shm != nullptr) {
+                auto base = reinterpret_cast<uintptr_t>(shm->base_addr);
+                if (buffer_ptr < base || buffer_ptr - base > shm->size ||
+                    size > shm->size - (buffer_ptr - base)) {
+                    LOG(ERROR) << context
+                               << ": destination range exceeds dummy SHM";
+                    return std::nullopt;
+                }
+                return RealClient::WritableBufferRegion{
+                    .base = shm->base_addr,
+                    .size = shm->size,
+                    .offset = buffer_ptr - base,
+                };
+            }
+            return RealClient::WritableBufferRegion{
+                .base = buffer,
+                .size = size,
+                .offset = 0,
+            };
+        }
         auto real_client = get_real_client();
         if (!real_client) {
             LOG(ERROR) << context << ": real client is not available";
@@ -1576,8 +1726,8 @@ class MooncakeStorePyWrapper {
                 return std::vector<int>(keys.size(),
                                         to_py_ret(ErrorCode::INVALID_PARAMS));
             }
-            if (!ParseTensorMetadata(
-                     reinterpret_cast<const char *>(buffer_ptrs[i]), sizes[i])
+            if (!parse_tensor_metadata_from_raw_buffer(
+                     buffer_ptrs[i], sizes[i], "batch_upsert_tensor_from")
                      .has_value()) {
                 LOG(ERROR) << "Invalid tensor metadata at index " << i;
                 return std::vector<int>(keys.size(),
@@ -1640,7 +1790,9 @@ class MooncakeStorePyWrapper {
             LOG(ERROR) << "Buffer size too small for tensor metadata";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (!ParseTensorMetadata(reinterpret_cast<const char *>(buffer), size)
+        if (!parse_tensor_metadata_from_raw_buffer(
+                reinterpret_cast<uintptr_t>(buffer), size,
+                "upsert_tensor_from")
                  .has_value()) {
             LOG(ERROR) << "Invalid tensor metadata";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
