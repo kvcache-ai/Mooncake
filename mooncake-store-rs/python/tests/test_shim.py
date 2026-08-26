@@ -182,7 +182,8 @@ class RedirectTests(ShimTestCase):
 
         missing = staged - set(_shim._REDIRECTS)
         self.assertFalse(
-            missing, f"vendored but not redirected, unreachable as mooncake.*: {missing}"
+            missing,
+            f"vendored but not redirected, unreachable as mooncake.*: {missing}",
         )
 
     def test_unlisted_submodules_are_left_to_upstream(self) -> None:

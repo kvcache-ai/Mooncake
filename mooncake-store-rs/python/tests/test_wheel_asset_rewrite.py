@@ -35,25 +35,17 @@ class WheelAssetRewriteTests(unittest.TestCase):
 
             copied = MODULE.copy_release_assets(release_root, target_root)
 
-            self.assertEqual(
-                (target_package / "engine.so").read_bytes(), b"engine"
-            )
-            self.assertTrue(
-                (target_package / "mooncake_config.py").is_file()
-            )
+            self.assertEqual((target_package / "engine.so").read_bytes(), b"engine")
+            self.assertTrue((target_package / "mooncake_config.py").is_file())
             self.assertEqual(
                 (
-                    target_root
-                    / "mooncake_store_rs.libs"
-                    / "libtransfer_engine.so"
+                    target_root / "mooncake_store_rs.libs" / "libtransfer_engine.so"
                 ).read_bytes(),
                 b"library",
             )
             self.assertFalse((target_root / "mooncake").exists())
             self.assertIn("mooncake_store_rs/engine.so", copied)
-            self.assertIn(
-                "mooncake_store_rs.libs/libtransfer_engine.so", copied
-            )
+            self.assertIn("mooncake_store_rs.libs/libtransfer_engine.so", copied)
 
 
 if __name__ == "__main__":
