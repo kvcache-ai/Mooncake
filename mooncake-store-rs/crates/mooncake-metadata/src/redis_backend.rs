@@ -4222,7 +4222,9 @@ mod tests {
             1,
         )
         .expect_err("set listing should reject more than one member");
-        assert!(set_error.to_string().contains("fixed 1-item bound"));
+        assert!(set_error
+            .to_string()
+            .contains("bounded Redis set listing exceeded its item limit"));
 
         connection
             .set::<_, _, ()>("bounded-scan/one", "1")
