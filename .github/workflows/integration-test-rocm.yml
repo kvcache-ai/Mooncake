@@ -1,0 +1,148 @@
+name: 'Integration test (ROCm)'
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: 'Git revision whose ROCm wheel and integration tests are exercised'
+        required: false
+        type: string
+      run_sglang:
+        description: 'Run SGLang cases in addition to vLLM'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  test-rocm-integration:
+    name: ROCm MI350X external PD
+    runs-on: [self-hosted, Linux, X64, amd, rocm, gfx950, mooncake-pd]
+    timeout-minutes: 390
+    concurrency:
+      group: mooncake-rocm-mi350x
+      cancel-in-progress: false
+    env:
+      REGISTRY_ADDR_SGLANG: 'lmsysorg/sglang:v0.5.18-rocm720-mi35x@sha256:6d68cd19206716cb3f1e31e2ad89cd0852d7ae614a792773c30a4277f8955c72'
+      REGISTRY_ADDR_VLLM: 'vllm/vllm-openai-rocm:v0.21.0@sha256:98a77b20df03adeb1cfc0ced009b4df6dd52b0a994ab99a32421f30876a9ae0c'
+    steps:
+      # Pytest previously ran as root in a bind-mounted container and left
+      # caches that the non-root runner could not remove on the next checkout.
+      - name: Remove root-owned Python test caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network=none \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            --entrypoint /bin/rm \
+            "${REGISTRY_ADDR_VLLM}" \
+            -rf \
+            /workspace/scripts/tone_tests/python/.pytest_cache \
+            /workspace/scripts/tone_tests/python/__pycache__
+
+      - name: Check out tested revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+          clean: true
+
+      - name: Download Python 3.10 ROCm wheel
+        if: inputs.run_sglang
+        uses: actions/download-artifact@v4
+        with:
+          name: mooncake-wheel-rocm-ubuntu-py310
+          path: ${{ runner.temp }}/mooncake-wheel-rocm-py310
+
+      - name: Download Python 3.12 ROCm wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: mooncake-wheel-rocm-ubuntu-py312
+          path: ${{ runner.temp }}/mooncake-wheel-rocm-py312
+
+      - name: Run two-node ROCm external PD suite
+        shell: bash
+        env:
+          WHEEL_DIR_SGLANG: ${{ runner.temp }}/mooncake-wheel-rocm-py310
+          WHEEL_DIR_VLLM: ${{ runner.temp }}/mooncake-wheel-rocm-py312
+        run: |
+          set -euo pipefail
+          [ "$(id -u)" -ne 0 ] || {
+            echo "The self-hosted runner must not run as root" >&2
+            exit 1
+          }
+          [ -r /etc/mooncake-ci/runner.env ] || {
+            echo "Missing controller profile: /etc/mooncake-ci/runner.env" >&2
+            exit 1
+          }
+          set -a
+          # shellcheck disable=SC1091
+          source /etc/mooncake-ci/runner.env
+          set +a
+          export REGISTRY_ADDR_SGLANG REGISTRY_ADDR_VLLM
+          export WHEEL_DIR_SGLANG WHEEL_DIR_VLLM
+
+          required_vars=(
+            CI_ACCELERATOR LOCAL_IP REMOTE_IP REMOTE_SSH_TARGET
+            MODEL_CACHE MOONCAKE_CI_TIER MOONCAKE_GPU_INDICES
+            MOONCAKE_RENDER_DEVICES MOONCAKE_CPUSET_CPUS
+            MOONCAKE_CPUSET_MEMS MOONCAKE_SSH_CONFIG
+            MOONCAKE_LOCK_FILE REMOTE_TEST_DIR MOONCAKE_RDMA_DEVICES
+            MOONCAKE_RDMA_NETDEVS MOONCAKE_TRANSFER_DEVICE
+            MOONCAKE_GID_INDEX MOONCAKE_SGLANG_BASE_GPU_ID
+            MOONCAKE_EPD_ENCODER_GPU_ID MOONCAKE_EPD_PREFILL_GPU_ID
+            MOONCAKE_EPD_DECODE_GPU_ID MOONCAKE_VLLM_VISIBLE_DEVICES
+            MOONCAKE_SGLANG_MEM_FRACTION_STATIC AINIC_VERSION
+          )
+          for variable in "${required_vars[@]}"; do
+            [ -n "${!variable:-}" ] || {
+              echo "Missing controller setting: $variable" >&2
+              exit 1
+            }
+          done
+          [ "$CI_ACCELERATOR" = rocm ]
+          export SSH_CMD="ssh -F ${MOONCAKE_SSH_CONFIG}"
+
+          for command in docker flock rocm-smi rsync ssh; do
+            command -v "$command" >/dev/null || {
+              echo "Missing required command: $command" >&2
+              exit 1
+            }
+          done
+          test -c /dev/kfd
+          ssh -F "${MOONCAKE_SSH_CONFIG}" "${REMOTE_SSH_TARGET}" true
+          [ -w "$(dirname "$MOONCAKE_LOCK_FILE")" ] || {
+            echo "Runner cannot write the Mooncake lock directory" >&2
+            exit 1
+          }
+
+          exec 9>"${MOONCAKE_LOCK_FILE}"
+          flock -n 9 || {
+            echo "The MI350X Mooncake allocation is already in use" >&2
+            exit 1
+          }
+
+          cleanup() {
+            if [ -f scripts/tone_tests/run/.shrc ]; then
+              set +e
+              # shellcheck disable=SC1091
+              source scripts/tone_tests/run/.shrc
+              # shellcheck disable=SC1091
+              source scripts/tone_tests/scripts/common.sh
+              cleanup_test_env double
+            fi
+          }
+          trap cleanup EXIT INT TERM
+          if ${{ inputs.run_sglang }}; then
+            bash scripts/tone_tests/scripts/run_test.sh run-all
+          else
+            bash scripts/tone_tests/scripts/run_test.sh run-all VLLM
+          fi
+
+      - name: Upload ROCm external PD logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocm-external-pd-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: scripts/tone_tests/run/logs
+          if-no-files-found: warn
+          retention-days: 14
