@@ -5,6 +5,7 @@
 #include "master_metric_manager.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "segment/pool_read_access.h"
 #include "task_manager.h"
 
 #include <glog/logging.h>
@@ -276,7 +277,9 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // === LocalSSD persisted state ===
         {
             for (const auto& name : state.all_segments) {
-                auto client_id = service->segment_pool_.GetOwnerClientId(name);
+                auto client_id = service->segment_pool_.AcquireReadAccess()
+                                     .Catalog()
+                                     .FindOwnerClientId(name);
                 if (client_id) {
                     state.client_by_name[name] = *client_id;
                 }

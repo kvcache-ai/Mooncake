@@ -33,6 +33,7 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "nof_segment_manager.h"
+#include "placement/domain.h"
 #include "segment/pool.h"
 #include "segment/pool_write_access.h"
 #include "local_ssd/manager.h"
@@ -92,7 +93,7 @@ class MasterServiceTenantQuotaTest;
 class MasterScenario;
 class MasterServiceHATest;
 // Friended so the processing_keys double-erase reproduction test can
-// invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
+// invalidate a segment allocator via PrepareUnmount WITHOUT the
 // ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
 class MasterServiceProcessingKeyDoubleEraseTest;
 // Friended so the LOCAL_DISK deregistration interleaving tests can run the
@@ -973,6 +974,8 @@ class MasterService {
 
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
+    std::string ResolveWriterHostId(const UUID& client_id,
+                                    const ReplicateConfig& config);
 
     void ClearInvalidHandles();
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
@@ -2632,8 +2635,8 @@ class MasterService {
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
-    const PlacementPolicyType memory_policy_type_;
-    const PlacementPolicyType nof_policy_type_;
+    ReplicaPlacement<SegmentPool> memory_placement_;
+    ReplicaPlacement<NoFSegmentManager> nof_placement_;
 
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;

@@ -34,9 +34,6 @@ class AllocationTarget final {
 
     size_t Capacity() const { return allocator_->capacity(); }
     size_t Used() const { return allocator_->size(); }
-    size_t LargestFreeRegion() const {
-        return allocator_->getLargestFreeRegion();
-    }
     AllocationTargetKind kind() const noexcept { return kind_; }
 
    private:

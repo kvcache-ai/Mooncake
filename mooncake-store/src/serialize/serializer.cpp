@@ -516,7 +516,7 @@ tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
     }
 
     Segment segment;
-    ErrorCode ret = segment_view.GetSegment(allocator, segment);
+    ErrorCode ret = segment_view.Resources().GetSegment(allocator, segment);
     if (ret != ErrorCode::OK) {
         return tl::unexpected(SerializationError(
             ErrorCode::SERIALIZE_FAIL,
@@ -588,7 +588,8 @@ auto Serializer<AllocatedBuffer>::deserialize(
     }
 
     MountedRegion mounted_region;
-    ErrorCode ret = segment_view.GetMountedRegion(segment_uuid, mounted_region);
+    ErrorCode ret =
+        segment_view.Catalog().GetMountedRegion(segment_uuid, mounted_region);
     if (ret != ErrorCode::OK) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -608,7 +609,7 @@ auto Serializer<AllocatedBuffer>::deserialize(
     }
 
     std::shared_ptr<BufferAllocatorBase> allocator =
-        segment_view.GetAllocator(segment_uuid);
+        segment_view.Resources().GetAllocator(segment_uuid);
     // Check if allocator is valid
     if (!allocator) {
         return tl::unexpected(SerializationError(

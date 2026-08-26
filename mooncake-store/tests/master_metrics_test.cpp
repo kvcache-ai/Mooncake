@@ -325,7 +325,7 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     // Mount a segment through the accounted path so the gauge is non-zero.
     RegionDriverConfig driver_config;
     driver_config.memory_allocator = BufferAllocatorType::OFFSET;
-    SegmentPool source_manager(driver_config);
+    SegmentPool source_manager(CreateRegionDrivers(driver_config));
     Segment segment;
     segment.id = generate_uuid();
     segment.name = "snapshot_reader_segment";
@@ -348,10 +348,10 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
         // CatalogBackedSnapshotProvider does). The reader's records never
         // contributed to the capacity metrics, so destroying it must leave
         // the gauges untouched.
-        SegmentPool reader(driver_config);
-        ASSERT_TRUE(
-            ha::StoreResourceSnapshotCodec::Decode(reader, snapshot.value())
-                .has_value());
+        SegmentPool reader(CreateRegionDrivers(driver_config));
+        ASSERT_TRUE(ha::StoreResourceSnapshotCodec::Decode(
+                        reader, snapshot.value(), false)
+                        .has_value());
     }
     ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_after_mount);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
@@ -360,14 +360,51 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     // Unmount to restore the gauges for the other tests.
     {
         auto access = source_manager.AcquireWriteAccess();
-        size_t dec_capacity = 0;
-        ASSERT_EQ(access.PrepareUnmountSegment(segment.id, dec_capacity),
-                  ErrorCode::OK);
-        ASSERT_EQ(
-            access.CommitUnmountSegment(segment.id, client_id, dec_capacity),
-            ErrorCode::OK);
+        auto transaction = access.PrepareUnmount(segment.id, client_id);
+        ASSERT_TRUE(transaction.has_value());
+        ASSERT_EQ(access.CommitUnmount(*transaction), ErrorCode::OK);
     }
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+}
+
+TEST_F(MasterMetricsTest, LiveSnapshotAdoptionTracksCapacityForTeardown) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t capacity_before = metrics.get_total_mem_capacity();
+
+    RegionDriverConfig driver_config;
+    driver_config.memory_allocator = BufferAllocatorType::OFFSET;
+    SegmentPool source(CreateRegionDrivers(driver_config));
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "live_snapshot_capacity_segment";
+    segment.base = 0x320000000;
+    segment.size = 16 * 1024 * 1024;
+    const UUID client_id = generate_uuid();
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client_id),
+              ErrorCode::OK);
+
+    auto snapshot = ha::StoreResourceSnapshotCodec::Encode(
+        source, LocalSsdPersistedState{});
+    ASSERT_TRUE(snapshot.has_value());
+    {
+        SegmentPool restored(CreateRegionDrivers(driver_config));
+        ASSERT_TRUE(ha::StoreResourceSnapshotCodec::Decode(
+                        restored, snapshot.value(), true)
+                        .has_value());
+        EXPECT_EQ(metrics.get_total_mem_capacity(),
+                  capacity_before + 2 * static_cast<int64_t>(segment.size));
+        restored.AcquireWriteAccess().Clear();
+        EXPECT_EQ(metrics.get_total_mem_capacity(),
+                  capacity_before + static_cast<int64_t>(segment.size));
+    }
+
+    {
+        auto access = source.AcquireWriteAccess();
+        auto transaction = access.PrepareUnmount(segment.id, client_id);
+        ASSERT_TRUE(transaction.has_value());
+        ASSERT_EQ(access.CommitUnmount(*transaction), ErrorCode::OK);
+    }
+    EXPECT_EQ(metrics.get_total_mem_capacity(), capacity_before);
 }
 
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {

@@ -1,10 +1,10 @@
 #include "segment/pool_write_access.h"
 
 #include <algorithm>
-#include <numeric>
-
+#include <unordered_set>
 #include "master_metric_manager.h"
 #include "segment/pool.h"
+#include "segment/region_initial_state.h"
 
 namespace mooncake {
 namespace {
@@ -54,18 +54,53 @@ bool SameSegment(const Segment& lhs, const Segment& rhs) {
 
 }  // namespace
 
-tl::expected<PreparedMountedRegion, ErrorCode>
-ScopedSegmentPoolWriteAccess::PrepareMount(
+ScopedSegmentPoolWriteAccess::ScopedSegmentPoolWriteAccess(
+    SegmentPool* segment_pool)
+    : segment_pool_(segment_pool), lock_(segment_pool->pool_mutex_) {}
+
+tl::expected<RegionMountTxn, ErrorCode>
+ScopedSegmentPoolWriteAccess::PrepareMount(const Segment& segment,
+                                           const UUID& client_id) {
+    return PrepareWithInitialState(segment, client_id, {}, 0);
+}
+
+tl::expected<RegionMountTxn, ErrorCode>
+ScopedSegmentPoolWriteAccess::PrepareRestore(
     const Segment& segment, const UUID& client_id,
-    const RegionInitialState& initial_state) {
+    std::span<const AllocatedBuffer::Descriptor> descriptors) {
+    if (std::any_of(descriptors.begin(), descriptors.end(),
+                    [](const auto& descriptor) {
+                        return descriptor.protocol_ == "cxl";
+                    })) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    auto initial_state =
+        BuildRegionInitialState(MakeResourceSpec(segment), descriptors);
+    if (!initial_state) {
+        return tl::make_unexpected(initial_state.error());
+    }
+    uint64_t requested_bytes = 0;
+    for (const auto& allocation : initial_state->allocations) {
+        requested_bytes += allocation.requested_bytes;
+    }
+    return PrepareWithInitialState(segment, client_id, *initial_state,
+                                   requested_bytes);
+}
+
+tl::expected<RegionMountTxn, ErrorCode>
+ScopedSegmentPoolWriteAccess::PrepareWithInitialState(
+    const Segment& segment, const UUID& client_id,
+    const RegionInitialState& initial_state,
+    uint64_t imported_requested_bytes) {
     const RegionKind kind = ClassifyRegion(segment);
     RegionDriver* driver = segment_pool_->GetDriver(kind);
     if (!driver) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
 
-    auto existing = segment_pool_->mounted_regions_.find(segment.id);
-    const bool existed = existing != segment_pool_->mounted_regions_.end();
+    auto existing = segment_pool_->catalog_.mounted_regions_.find(segment.id);
+    const bool existed =
+        existing != segment_pool_->catalog_.mounted_regions_.end();
     if (existed) {
         if (existing->second.status == SegmentStatus::UNMOUNTING) {
             return tl::make_unexpected(
@@ -80,9 +115,10 @@ ScopedSegmentPoolWriteAccess::PrepareMount(
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     } else {
-        auto owner =
-            segment_pool_->owner_client_by_group_name_.find(segment.name);
-        if (owner != segment_pool_->owner_client_by_group_name_.end() &&
+        auto owner = segment_pool_->catalog_.owner_client_by_group_name_.find(
+            segment.name);
+        if (owner !=
+                segment_pool_->catalog_.owner_client_by_group_name_.end() &&
             owner->second != client_id) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -97,13 +133,14 @@ ScopedSegmentPoolWriteAccess::PrepareMount(
     if (existed) {
         mounted.status = existing->second.status;
     }
-    return PreparedMountedRegion(std::move(mounted), existed, true,
-                                 std::move(*resource));
+    return RegionMountTxn(std::move(mounted), existed, true,
+                          std::move(*resource), imported_requested_bytes);
 }
 
-tl::expected<PreparedMountedRegion, ErrorCode>
+tl::expected<RegionMountTxn, ErrorCode>
 ScopedSegmentPoolWriteAccess::PrepareAdopt(
-    MountedRegion mounted, std::shared_ptr<BufferAllocatorBase> allocator) {
+    MountedRegion mounted, std::shared_ptr<BufferAllocatorBase> allocator,
+    bool account_capacity_metrics) {
     mounted.kind = ClassifyRegion(mounted.segment);
     RegionDriver* driver = segment_pool_->GetDriver(mounted.kind);
     if (!driver) {
@@ -114,59 +151,65 @@ ScopedSegmentPoolWriteAccess::PrepareAdopt(
     if (!resource) {
         return tl::make_unexpected(resource.error());
     }
-    return PreparedMountedRegion(std::move(mounted), false, false,
-                                 std::move(*resource));
+    return RegionMountTxn(std::move(mounted), false, account_capacity_metrics,
+                          std::move(*resource));
 }
 
-void ScopedSegmentPoolWriteAccess::CommitPreparedRegion(
-    PreparedMountedRegion& prepared) noexcept {
-    RegionDriver* driver = segment_pool_->GetDriver(prepared.mounted_.kind);
+void ScopedSegmentPoolWriteAccess::CommitMount(
+    RegionMountTxn& transaction) noexcept {
+    DCHECK(!transaction.committed_);
+    RegionDriver* driver = segment_pool_->GetDriver(transaction.mounted_.kind);
     RegionResource* old_resource = nullptr;
-    if (prepared.existed_) {
-        old_resource = driver->GetResource(prepared.mounted_.segment.id);
+    if (transaction.existed_) {
+        old_resource = driver->GetResource(transaction.mounted_.segment.id);
     }
-    RegionResource* new_resource = prepared.resource_.resource();
-    prepared.resource_.Commit();
+    RegionResource* new_resource = transaction.resource_.resource();
+    transaction.resource_.Commit();
+    transaction.committed_ = true;
 
-    if (prepared.existed_) {
-        if (prepared.mounted_.status == SegmentStatus::OK) {
+    if (transaction.existed_) {
+        if (transaction.mounted_.status == SegmentStatus::OK) {
             const bool replaced = segment_pool_->placement_index_.ReplaceTarget(
-                prepared.mounted_.segment.name, &old_resource->target,
+                transaction.mounted_.segment.name, &old_resource->target,
                 &new_resource->target);
             DCHECK(replaced);
         } else {
-            (void)driver->Deactivate(prepared.mounted_.segment.id);
+            (void)driver->Deactivate(transaction.mounted_.segment.id);
         }
-        if (prepared.account_capacity_metrics_ &&
-            prepared.mounted_.kind == RegionKind::HOST_MEMORY &&
-            segment_pool_->capacity_accounted_regions_
-                .insert(prepared.mounted_.segment.id)
+        if (transaction.account_capacity_metrics_ &&
+            transaction.mounted_.kind == RegionKind::HOST_MEMORY &&
+            segment_pool_->catalog_.capacity_accounted_region_ids_
+                .insert(transaction.mounted_.segment.id)
                 .second) {
             MasterMetricManager::instance().inc_total_mem_capacity(
-                prepared.mounted_.segment.name, prepared.mounted_.segment.size);
+                transaction.mounted_.segment.name,
+                transaction.mounted_.segment.size);
         }
         return;
     }
 
-    const auto& mounted = prepared.mounted_;
-    segment_pool_->mounted_regions_.emplace(mounted.segment.id, mounted);
-    segment_pool_->region_ids_by_client_[mounted.client_id].push_back(
+    const auto& mounted = transaction.mounted_;
+    segment_pool_->catalog_.mounted_regions_.emplace(mounted.segment.id,
+                                                     mounted);
+    segment_pool_->catalog_.region_ids_by_client_[mounted.client_id].push_back(
         mounted.segment.id);
-    segment_pool_->owner_client_by_group_name_[mounted.segment.name] =
+    segment_pool_->catalog_.owner_client_by_group_name_[mounted.segment.name] =
         mounted.client_id;
-    segment_pool_->region_ids_by_group_name_[mounted.segment.name].push_back(
-        mounted.segment.id);
+    segment_pool_->catalog_.region_ids_by_group_name_[mounted.segment.name]
+        .push_back(mounted.segment.id);
     if (mounted.status == SegmentStatus::OK) {
         const bool added = segment_pool_->placement_index_.AddTarget(
             mounted.segment.name, &new_resource->target);
         DCHECK(added);
-        AddHostRegion(segment_pool_->regions_by_host_, mounted.segment);
+        AddHostRegion(segment_pool_->catalog_.regions_by_host_,
+                      mounted.segment);
     } else {
         (void)driver->Deactivate(mounted.segment.id);
     }
-    if (prepared.account_capacity_metrics_ &&
+    if (transaction.account_capacity_metrics_ &&
         mounted.kind == RegionKind::HOST_MEMORY) {
-        segment_pool_->capacity_accounted_regions_.insert(mounted.segment.id);
+        segment_pool_->catalog_.capacity_accounted_region_ids_.insert(
+            mounted.segment.id);
         MasterMetricManager::instance().inc_total_mem_capacity(
             mounted.segment.name, mounted.segment.size);
     }
@@ -174,8 +217,9 @@ void ScopedSegmentPoolWriteAccess::CommitPreparedRegion(
 
 ErrorCode ScopedSegmentPoolWriteAccess::MountSegment(const Segment& segment,
                                                      const UUID& client_id) {
-    if (segment_pool_->mounted_regions_.contains(segment.id)) {
-        const auto& mounted = segment_pool_->mounted_regions_.at(segment.id);
+    if (segment_pool_->catalog_.mounted_regions_.contains(segment.id)) {
+        const auto& mounted =
+            segment_pool_->catalog_.mounted_regions_.at(segment.id);
         return mounted.status == SegmentStatus::OK
                    ? ErrorCode::SEGMENT_ALREADY_EXISTS
                    : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
@@ -184,67 +228,81 @@ ErrorCode ScopedSegmentPoolWriteAccess::MountSegment(const Segment& segment,
     if (!prepared) {
         return prepared.error();
     }
-    CommitPreparedRegion(*prepared);
+    CommitMount(*prepared);
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentPoolWriteAccess::ValidateRemountSegment(
-    const Segment& segment, const UUID& client_id) const {
-    auto mounted = segment_pool_->mounted_regions_.find(segment.id);
-    if (mounted == segment_pool_->mounted_regions_.end()) {
-        return ErrorCode::OK;
+ErrorCode ScopedSegmentPoolWriteAccess::ValidateRemount(
+    std::span<const Segment> segments, const UUID& client_id) const {
+    std::unordered_set<UUID, boost::hash<UUID>> ids;
+    ids.reserve(segments.size());
+    for (const auto& segment : segments) {
+        if (!ids.insert(segment.id).second) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        auto mounted =
+            segment_pool_->catalog_.mounted_regions_.find(segment.id);
+        if (mounted != segment_pool_->catalog_.mounted_regions_.end() &&
+            (mounted->second.client_id != client_id ||
+             !SameSegment(mounted->second.segment, segment))) {
+            return ErrorCode::INVALID_PARAMS;
+        }
     }
-    return mounted->second.client_id == client_id &&
-                   SameSegment(mounted->second.segment, segment)
-               ? ErrorCode::OK
-               : ErrorCode::INVALID_PARAMS;
+    return ErrorCode::OK;
 }
 
 bool ScopedSegmentPoolWriteAccess::GetSegment(const UUID& segment_id,
                                               Segment& segment) const {
-    auto mounted = segment_pool_->mounted_regions_.find(segment_id);
-    if (mounted == segment_pool_->mounted_regions_.end()) {
+    auto mounted = segment_pool_->catalog_.mounted_regions_.find(segment_id);
+    if (mounted == segment_pool_->catalog_.mounted_regions_.end()) {
         return false;
     }
     segment = mounted->second.segment;
     return true;
 }
 
-ErrorCode ScopedSegmentPoolWriteAccess::PrepareUnmountSegment(
-    const UUID& segment_id, size_t& metrics_dec_capacity) {
-    auto mounted = segment_pool_->mounted_regions_.find(segment_id);
-    if (mounted == segment_pool_->mounted_regions_.end()) {
-        return ErrorCode::SEGMENT_NOT_FOUND;
+tl::expected<RegionUnmountTxn, ErrorCode>
+ScopedSegmentPoolWriteAccess::PrepareUnmount(const UUID& segment_id,
+                                             const UUID& client_id) {
+    auto mounted = segment_pool_->catalog_.mounted_regions_.find(segment_id);
+    if (mounted == segment_pool_->catalog_.mounted_regions_.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    if (mounted->second.client_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (mounted->second.status == SegmentStatus::UNMOUNTING) {
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     RegionResource* resource = segment_pool_->GetResource(mounted->second);
     if (!resource) {
-        return ErrorCode::INTERNAL_ERROR;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    metrics_dec_capacity = mounted->second.segment.size;
-    if (segment_pool_->placement_index_.Contains(mounted->second.segment.name,
-                                                 &resource->target)) {
-        segment_pool_->placement_index_.RemoveTarget(
-            mounted->second.segment.name, &resource->target);
-    }
-    RemoveHostRegion(segment_pool_->regions_by_host_, mounted->second.segment);
+    Segment segment = mounted->second.segment;
+    (void)segment_pool_->placement_index_.RemoveTarget(
+        mounted->second.segment.name, &resource->target);
+    RemoveHostRegion(segment_pool_->catalog_.regions_by_host_,
+                     mounted->second.segment);
     if (resource->active) {
         (void)segment_pool_->GetDriver(mounted->second.kind)
             ->Deactivate(segment_id);
     }
     mounted->second.status = SegmentStatus::UNMOUNTING;
-    return ErrorCode::OK;
+    return RegionUnmountTxn(std::move(segment), client_id);
 }
 
-ErrorCode ScopedSegmentPoolWriteAccess::RollbackUnmountSegment(
-    const UUID& segment_id) {
-    auto mounted = segment_pool_->mounted_regions_.find(segment_id);
-    if (mounted == segment_pool_->mounted_regions_.end()) {
+ErrorCode ScopedSegmentPoolWriteAccess::RollbackUnmount(
+    RegionUnmountTxn& transaction) {
+    if (transaction.finished_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    const UUID& segment_id = transaction.segment_.id;
+    auto mounted = segment_pool_->catalog_.mounted_regions_.find(segment_id);
+    if (mounted == segment_pool_->catalog_.mounted_regions_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
-    if (mounted->second.status != SegmentStatus::UNMOUNTING) {
+    if (mounted->second.client_id != transaction.client_id_ ||
+        mounted->second.status != SegmentStatus::UNMOUNTING) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     RegionResource* resource = segment_pool_->GetResource(mounted->second);
@@ -255,16 +313,21 @@ ErrorCode ScopedSegmentPoolWriteAccess::RollbackUnmountSegment(
     const bool added = segment_pool_->placement_index_.AddTarget(
         mounted->second.segment.name, &resource->target);
     DCHECK(added);
-    AddHostRegion(segment_pool_->regions_by_host_, mounted->second.segment);
+    AddHostRegion(segment_pool_->catalog_.regions_by_host_,
+                  mounted->second.segment);
     mounted->second.status = SegmentStatus::OK;
+    transaction.finished_ = true;
     return ErrorCode::OK;
 }
 
 ErrorCode ScopedSegmentPoolWriteAccess::PrepareGracefulUnmountSegment(
-    const UUID& segment_id) {
-    auto mounted = segment_pool_->mounted_regions_.find(segment_id);
-    if (mounted == segment_pool_->mounted_regions_.end()) {
+    const UUID& segment_id, const UUID& client_id) {
+    auto mounted = segment_pool_->catalog_.mounted_regions_.find(segment_id);
+    if (mounted == segment_pool_->catalog_.mounted_regions_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    if (mounted->second.client_id != client_id) {
+        return ErrorCode::INVALID_PARAMS;
     }
     if (mounted->second.status == SegmentStatus::GRACEFULLY_UNMOUNTING) {
         return ErrorCode::OK;
@@ -277,12 +340,10 @@ ErrorCode ScopedSegmentPoolWriteAccess::PrepareGracefulUnmountSegment(
     if (!resource) {
         return ErrorCode::INTERNAL_ERROR;
     }
-    if (segment_pool_->placement_index_.Contains(mounted->second.segment.name,
-                                                 &resource->target)) {
-        segment_pool_->placement_index_.RemoveTarget(
-            mounted->second.segment.name, &resource->target);
-    }
-    RemoveHostRegion(segment_pool_->regions_by_host_, mounted->second.segment);
+    (void)segment_pool_->placement_index_.RemoveTarget(
+        mounted->second.segment.name, &resource->target);
+    RemoveHostRegion(segment_pool_->catalog_.regions_by_host_,
+                     mounted->second.segment);
     if (resource->active) {
         (void)segment_pool_->GetDriver(mounted->second.kind)
             ->Deactivate(segment_id);
@@ -291,17 +352,37 @@ ErrorCode ScopedSegmentPoolWriteAccess::PrepareGracefulUnmountSegment(
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentPoolWriteAccess::CommitUnmountSegment(
+ErrorCode ScopedSegmentPoolWriteAccess::CommitUnmount(
+    RegionUnmountTxn& transaction) {
+    if (transaction.finished_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    auto result =
+        EraseUnmountedRegion(transaction.segment_.id, transaction.client_id_,
+                             SegmentStatus::UNMOUNTING);
+    if (result == ErrorCode::OK) {
+        transaction.finished_ = true;
+    }
+    return result;
+}
+
+ErrorCode ScopedSegmentPoolWriteAccess::FinalizeGracefulUnmount(
+    const UUID& segment_id, const UUID& client_id) {
+    return EraseUnmountedRegion(segment_id, client_id,
+                                SegmentStatus::GRACEFULLY_UNMOUNTING);
+}
+
+ErrorCode ScopedSegmentPoolWriteAccess::EraseUnmountedRegion(
     const UUID& segment_id, const UUID& client_id,
-    const size_t& metrics_dec_capacity) {
-    auto mounted = segment_pool_->mounted_regions_.find(segment_id);
-    if (mounted == segment_pool_->mounted_regions_.end()) {
+    SegmentStatus expected_status) {
+    auto mounted = segment_pool_->catalog_.mounted_regions_.find(segment_id);
+    if (mounted == segment_pool_->catalog_.mounted_regions_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     const MountedRegion record = mounted->second;
     RegionDriver* driver = segment_pool_->GetDriver(record.kind);
-    if (record.client_id != client_id || !driver ||
-        !driver->GetResource(segment_id)) {
+    if (record.client_id != client_id || record.status != expected_status ||
+        !driver || !driver->GetResource(segment_id)) {
         return ErrorCode::INTERNAL_ERROR;
     }
     // Resource existence was validated above. Erase is the commit point; all
@@ -309,22 +390,22 @@ ErrorCode ScopedSegmentPoolWriteAccess::CommitUnmountSegment(
     const bool erased = driver->Erase(segment_id);
     DCHECK(erased);
 
-    auto client = segment_pool_->region_ids_by_client_.find(client_id);
-    if (client != segment_pool_->region_ids_by_client_.end()) {
+    auto client = segment_pool_->catalog_.region_ids_by_client_.find(client_id);
+    if (client != segment_pool_->catalog_.region_ids_by_client_.end()) {
         auto id =
             std::find(client->second.begin(), client->second.end(), segment_id);
         if (id != client->second.end()) {
             client->second.erase(id);
         }
         if (client->second.empty()) {
-            segment_pool_->region_ids_by_client_.erase(client);
+            segment_pool_->catalog_.region_ids_by_client_.erase(client);
         }
     }
-    RemoveHostRegion(segment_pool_->regions_by_host_, record.segment);
-    segment_pool_->mounted_regions_.erase(mounted);
-    auto group =
-        segment_pool_->region_ids_by_group_name_.find(record.segment.name);
-    DCHECK(group != segment_pool_->region_ids_by_group_name_.end());
+    RemoveHostRegion(segment_pool_->catalog_.regions_by_host_, record.segment);
+    segment_pool_->catalog_.mounted_regions_.erase(mounted);
+    auto group = segment_pool_->catalog_.region_ids_by_group_name_.find(
+        record.segment.name);
+    DCHECK(group != segment_pool_->catalog_.region_ids_by_group_name_.end());
     auto group_id =
         std::find(group->second.begin(), group->second.end(), segment_id);
     DCHECK(group_id != group->second.end());
@@ -332,13 +413,15 @@ ErrorCode ScopedSegmentPoolWriteAccess::CommitUnmountSegment(
     group->second.pop_back();
     const bool removed_group = group->second.empty();
     if (removed_group) {
-        segment_pool_->region_ids_by_group_name_.erase(group);
-        segment_pool_->owner_client_by_group_name_.erase(record.segment.name);
+        segment_pool_->catalog_.region_ids_by_group_name_.erase(group);
+        segment_pool_->catalog_.owner_client_by_group_name_.erase(
+            record.segment.name);
     }
     if (record.kind == RegionKind::HOST_MEMORY &&
-        segment_pool_->capacity_accounted_regions_.erase(segment_id) != 0) {
+        segment_pool_->catalog_.capacity_accounted_region_ids_.erase(
+            segment_id) != 0) {
         MasterMetricManager::instance().dec_total_mem_capacity(
-            record.segment.name, metrics_dec_capacity);
+            record.segment.name, record.segment.size);
         if (removed_group) {
             MasterMetricManager::instance().remove_segment_metrics(
                 record.segment.name);
@@ -349,14 +432,14 @@ ErrorCode ScopedSegmentPoolWriteAccess::CommitUnmountSegment(
 
 ErrorCode ScopedSegmentPoolWriteAccess::GetClientSegments(
     const UUID& client_id, std::vector<Segment>& segments) const {
-    auto client = segment_pool_->region_ids_by_client_.find(client_id);
-    if (client == segment_pool_->region_ids_by_client_.end()) {
+    auto client = segment_pool_->catalog_.region_ids_by_client_.find(client_id);
+    if (client == segment_pool_->catalog_.region_ids_by_client_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     segments.clear();
     for (const auto& id : client->second) {
-        auto mounted = segment_pool_->mounted_regions_.find(id);
-        if (mounted != segment_pool_->mounted_regions_.end()) {
+        auto mounted = segment_pool_->catalog_.mounted_regions_.find(id);
+        if (mounted != segment_pool_->catalog_.mounted_regions_.end()) {
             segments.push_back(mounted->second.segment);
         }
     }
@@ -364,28 +447,30 @@ ErrorCode ScopedSegmentPoolWriteAccess::GetClientSegments(
 }
 
 bool ScopedSegmentPoolWriteAccess::ExistsSegmentName(
-    const std::string& segment_name) const {
-    return segment_pool_->region_ids_by_group_name_.contains(segment_name);
+    std::string_view segment_name) const {
+    return segment_pool_->catalog_.region_ids_by_group_name_.contains(
+        segment_name);
 }
 
 bool ScopedSegmentPoolWriteAccess::IsSegmentAllocatable(
-    const std::string& segment_name) const {
+    std::string_view segment_name) const {
     return segment_pool_->placement_index_.GetView().Find(segment_name) !=
            nullptr;
 }
 
 ErrorCode ScopedSegmentPoolWriteAccess::GetSegmentStatusByName(
-    const std::string& segment_name, SegmentStatus& status) const {
-    auto group = segment_pool_->region_ids_by_group_name_.find(segment_name);
-    if (group == segment_pool_->region_ids_by_group_name_.end() ||
+    std::string_view segment_name, SegmentStatus& status) const {
+    auto group =
+        segment_pool_->catalog_.region_ids_by_group_name_.find(segment_name);
+    if (group == segment_pool_->catalog_.region_ids_by_group_name_.end() ||
         group->second.empty()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
 
     status = SegmentStatus::UNDEFINED;
     for (const auto& id : group->second) {
-        auto mounted = segment_pool_->mounted_regions_.find(id);
-        if (mounted == segment_pool_->mounted_regions_.end()) {
+        auto mounted = segment_pool_->catalog_.mounted_regions_.find(id);
+        if (mounted == segment_pool_->catalog_.mounted_regions_.end()) {
             return ErrorCode::INTERNAL_ERROR;
         }
         if (SegmentStatusAvailabilityRank(mounted->second.status) <
@@ -397,14 +482,15 @@ ErrorCode ScopedSegmentPoolWriteAccess::GetSegmentStatusByName(
 }
 
 ErrorCode ScopedSegmentPoolWriteAccess::SetSegmentStatusByName(
-    const std::string& segment_name, SegmentStatus status) {
-    auto group = segment_pool_->region_ids_by_group_name_.find(segment_name);
-    if (group == segment_pool_->region_ids_by_group_name_.end()) {
+    std::string_view segment_name, SegmentStatus status) {
+    auto group =
+        segment_pool_->catalog_.region_ids_by_group_name_.find(segment_name);
+    if (group == segment_pool_->catalog_.region_ids_by_group_name_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     for (const auto& id : group->second) {
-        auto mounted = segment_pool_->mounted_regions_.find(id);
-        if (mounted == segment_pool_->mounted_regions_.end() ||
+        auto mounted = segment_pool_->catalog_.mounted_regions_.find(id);
+        if (mounted == segment_pool_->catalog_.mounted_regions_.end() ||
             !segment_pool_->GetDriver(mounted->second.kind) ||
             !segment_pool_->GetResource(mounted->second)) {
             return ErrorCode::INTERNAL_ERROR;
@@ -415,31 +501,22 @@ ErrorCode ScopedSegmentPoolWriteAccess::SetSegmentStatusByName(
     }
 
     for (const auto& id : group->second) {
-        auto mounted = segment_pool_->mounted_regions_.find(id);
+        auto mounted = segment_pool_->catalog_.mounted_regions_.find(id);
         RegionDriver* driver = segment_pool_->GetDriver(mounted->second.kind);
         RegionResource* resource = segment_pool_->GetResource(mounted->second);
-        const bool placed = segment_pool_->placement_index_.Contains(
-            segment_name, &resource->target);
         if (status == SegmentStatus::OK) {
             if (!resource->active) {
                 const bool reactivated = driver->Reactivate(id);
                 DCHECK(reactivated);
             }
-            if (!placed) {
-                const bool added = segment_pool_->placement_index_.AddTarget(
-                    segment_name, &resource->target);
-                DCHECK(added);
-            }
-            AddHostRegion(segment_pool_->regions_by_host_,
+            (void)segment_pool_->placement_index_.AddTarget(segment_name,
+                                                            &resource->target);
+            AddHostRegion(segment_pool_->catalog_.regions_by_host_,
                           mounted->second.segment);
         } else {
-            if (placed) {
-                const bool removed =
-                    segment_pool_->placement_index_.RemoveTarget(
-                        segment_name, &resource->target);
-                DCHECK(removed);
-            }
-            RemoveHostRegion(segment_pool_->regions_by_host_,
+            (void)segment_pool_->placement_index_.RemoveTarget(
+                segment_name, &resource->target);
+            RemoveHostRegion(segment_pool_->catalog_.regions_by_host_,
                              mounted->second.segment);
             if (resource->active) {
                 const bool deactivated = driver->Deactivate(id);
@@ -452,18 +529,18 @@ ErrorCode ScopedSegmentPoolWriteAccess::SetSegmentStatusByName(
 }
 
 void ScopedSegmentPoolWriteAccess::Clear() noexcept {
-    for (const auto& [id, mounted] : segment_pool_->mounted_regions_) {
+    for (const auto& [id, mounted] : segment_pool_->catalog_.mounted_regions_) {
         if (auto* driver = segment_pool_->GetDriver(mounted.kind)) {
             (void)driver->Erase(id);
         }
     }
     segment_pool_->ReleaseCapacityMetrics();
     segment_pool_->placement_index_.Clear();
-    segment_pool_->mounted_regions_.clear();
-    segment_pool_->region_ids_by_client_.clear();
-    segment_pool_->owner_client_by_group_name_.clear();
-    segment_pool_->region_ids_by_group_name_.clear();
-    segment_pool_->regions_by_host_.clear();
+    segment_pool_->catalog_.mounted_regions_.clear();
+    segment_pool_->catalog_.region_ids_by_client_.clear();
+    segment_pool_->catalog_.owner_client_by_group_name_.clear();
+    segment_pool_->catalog_.region_ids_by_group_name_.clear();
+    segment_pool_->catalog_.regions_by_host_.clear();
 }
 
 }  // namespace mooncake

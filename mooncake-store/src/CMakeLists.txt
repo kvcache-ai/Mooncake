@@ -19,8 +19,10 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_repository.cpp
     master_metric_manager.cpp
     segment/pool.cpp
+    segment/catalog.cpp
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
+    segment/resource_view.cpp
     placement/index.cpp
     placement/replica_allocator.cpp
     nof_segment_manager.cpp

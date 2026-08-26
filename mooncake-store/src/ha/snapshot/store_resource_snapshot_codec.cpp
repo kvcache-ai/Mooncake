@@ -29,7 +29,7 @@ struct DecodedMountedRegion final {
 };
 
 tl::expected<void, SerializationError> EncodeMountedRegion(
-    const MountedRegion& mounted, const RegionResourceView& resource,
+    const MountedRegion& mounted, const BufferAllocatorBase* allocator,
     MsgpackPacker& packer) {
     // Preserved wire shape: [segment_id, segment_name, segment_base,
     // segment_size, te_endpoint, status, has_allocator, allocator, host_id].
@@ -40,10 +40,9 @@ tl::expected<void, SerializationError> EncodeMountedRegion(
     packer.pack(static_cast<uint64_t>(mounted.segment.size));
     packer.pack(mounted.segment.te_endpoint);
     packer.pack(static_cast<int16_t>(mounted.status));
-    if (resource.allocator) {
+    if (allocator) {
         packer.pack(true);
-        auto encoded =
-            AllocatorSnapshotCodec::Encode(*resource.allocator, packer);
+        auto encoded = AllocatorSnapshotCodec::Encode(*allocator, packer);
         if (!encoded) {
             return tl::make_unexpected(encoded.error());
         }
@@ -127,13 +126,13 @@ StoreResourceSnapshotCodec::Encode(
     const SegmentPool& segment_pool,
     const LocalSsdPersistedState& local_ssd_state) {
     auto view = segment_pool.AcquireReadAccess();
-    const auto allocator_type = view.GetMemoryAllocatorType();
+    const auto allocator_type = view.Resources().GetMemoryAllocatorType();
     if (!allocator_type || *allocator_type != BufferAllocatorType::OFFSET) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::SERIALIZE_UNSUPPORTED,
             "snapshot SegmentPool memory driver is not offset"));
     }
-    if (view.HasKind(RegionKind::CXL)) {
+    if (view.Resources().HasKind(RegionKind::CXL)) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::SERIALIZE_UNSUPPORTED,
             "snapshot SegmentPool CXL resource is unsupported"));
@@ -148,7 +147,7 @@ StoreResourceSnapshotCodec::Encode(
 
     packer.pack("an");
     std::vector<std::string> active_names;
-    view.GetActiveGroupNames(active_names);
+    view.Placement().GetActiveGroupNames(active_names);
     packer.pack_array(active_names.size());
     for (const auto& name : active_names) {
         packer.pack(name);
@@ -156,20 +155,20 @@ StoreResourceSnapshotCodec::Encode(
 
     packer.pack("ms");
     std::vector<std::pair<UUID, MountedRegion>> mounted_regions;
-    view.GetMountedRegions(mounted_regions);
+    view.Catalog().GetMountedRegions(mounted_regions);
     std::sort(
         mounted_regions.begin(), mounted_regions.end(),
         [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
     packer.pack_map(mounted_regions.size());
     for (const auto& [id, mounted] : mounted_regions) {
-        auto resource = view.GetResourceView(id);
-        if (!resource) {
+        auto allocator = view.Resources().GetAllocator(id);
+        if (!allocator) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::SERIALIZE_FAIL,
                 "snapshot mounted region has no driver resource"));
         }
         packer.pack(UuidToString(id));
-        auto encoded = EncodeMountedRegion(mounted, *resource, packer);
+        auto encoded = EncodeMountedRegion(mounted, allocator.get(), packer);
         if (!encoded) {
             return tl::make_unexpected(encoded.error());
         }
@@ -177,7 +176,7 @@ StoreResourceSnapshotCodec::Encode(
 
     packer.pack("cs");
     std::vector<std::pair<UUID, std::vector<UUID>>> clients;
-    view.GetClientRegions(clients);
+    view.Catalog().GetClientRegions(clients);
     std::sort(
         clients.begin(), clients.end(),
         [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
@@ -201,7 +200,8 @@ StoreResourceSnapshotCodec::Encode(
 
 tl::expected<LocalSsdPersistedState, SerializationError>
 StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
-                                   const std::vector<uint8_t>& data) {
+                                   const std::vector<uint8_t>& data,
+                                   bool account_capacity_metrics) {
     std::vector<uint8_t> decompressed;
     try {
         decompressed = zstd_decompress(data);
@@ -236,7 +236,7 @@ StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
     }
 
     const auto memory_allocator_type =
-        segment_pool.AcquireReadAccess().GetMemoryAllocatorType();
+        segment_pool.AcquireReadAccess().Resources().GetMemoryAllocatorType();
     const auto allocator_field = fields->find("ma");
     if (!memory_allocator_type || allocator_field == fields->end() ||
         allocator_field->second->type != msgpack::type::POSITIVE_INTEGER ||
@@ -367,6 +367,7 @@ StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
     }
 
     std::unordered_map<std::string, UUID> owner_by_name;
+    std::set<std::string> expected_active_names;
     for (const auto& [_, region] : decoded) {
         auto [owner, inserted] = owner_by_name.emplace(
             region.mounted.segment.name, region.mounted.client_id);
@@ -375,6 +376,24 @@ StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
                 ErrorCode::DESERIALIZE_FAIL,
                 "snapshot logical region group has multiple owners"));
         }
+        if (region.mounted.status == SegmentStatus::OK) {
+            expected_active_names.insert(region.mounted.segment.name);
+        }
+    }
+
+    std::set<std::string> decoded_active_names;
+    for (const auto& name : active_names) {
+        if (!decoded_active_names.insert(name).second ||
+            !expected_active_names.contains(name)) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "snapshot contains invalid active region names"));
+        }
+    }
+    if (decoded_active_names != expected_active_names) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "snapshot active region names do not match mounted regions"));
     }
 
     std::vector<UUID> order;
@@ -396,11 +415,12 @@ StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
     }
 
     auto access = segment_pool.AcquireWriteAccess();
-    std::vector<PreparedMountedRegion> prepared;
+    std::vector<RegionMountTxn> prepared;
     prepared.reserve(order.size());
     for (const auto& id : order) {
         auto& region = decoded.at(id);
-        auto next = access.PrepareAdopt(region.mounted, region.allocator);
+        auto next = access.PrepareAdopt(region.mounted, region.allocator,
+                                        account_capacity_metrics);
         if (!next) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
@@ -412,7 +432,7 @@ StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
     // untouched. Once every resource is ready, replacement is no-fail.
     access.Clear();
     for (auto& region : prepared) {
-        access.CommitPreparedRegion(region);
+        access.CommitMount(region);
     }
     return std::move(*local_ssd);
 }

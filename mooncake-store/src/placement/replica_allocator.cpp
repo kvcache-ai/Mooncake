@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "local_ssd/manager.h"
+#include "placement/index.h"
 #include "random.h"
 
 namespace mooncake {
@@ -10,10 +11,6 @@ namespace {
 
 constexpr size_t kMaxRetryLimit = 100;
 constexpr size_t kCandidateMultiplier = 6;
-
-size_t RandomTargetIndex(size_t upper_bound) noexcept {
-    return randomIndex(upper_bound);
-}
 
 struct Candidate {
     PlacementGroup* group;
@@ -32,6 +29,16 @@ struct PlacementScratch {
         used.clear();
         candidates.clear();
     }
+};
+
+struct ResolvedReplicaAllocationRequest final {
+    size_t size;
+    size_t replica_count;
+    std::string_view preferred_group;
+    std::span<const std::string> preferred_groups;
+    std::span<PlacementGroup* const> resolved_preferred_groups;
+    std::span<const std::string> excluded_groups;
+    ReplicaType replica_type;
 };
 
 PlacementScratch& GetPlacementScratch() {
@@ -74,7 +81,7 @@ AllocateFromGroup(PlacementGroup* group, size_t size) {
         return TryTarget<CxlOnly>(target, size);
     }
 
-    size_t index = RandomTargetIndex(group->targets.size());
+    size_t index = randomIndex(group->targets.size());
     for (size_t i = 0; i < group->targets.size(); ++i) {
         auto* target = group->targets[index];
         if (auto buffer = TryTarget<CxlOnly>(target, size)) [[likely]] {
@@ -138,7 +145,7 @@ struct CxlPolicy {
 };
 
 void ResolveRequest(const PlacementReadView& view,
-                    const ReplicaAllocationRequest& request,
+                    const ResolvedReplicaAllocationRequest& request,
                     PlacementScratch& scratch) {
     for (const auto& excluded : request.excluded_groups) {
         AppendUnique(scratch.excluded, view.Find(excluded));
@@ -158,8 +165,8 @@ void ResolveRequest(const PlacementReadView& view,
 
 template <typename Policy>
 tl::expected<std::vector<Replica>, ErrorCode> AllocateWithPolicy(
-    const PlacementReadView& view, const ReplicaAllocationRequest& request,
-    const Policy& policy) {
+    const PlacementReadView& view,
+    const ResolvedReplicaAllocationRequest& request, const Policy& policy) {
     if (request.size == 0 || request.replica_count == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -321,23 +328,45 @@ std::optional<double> LocalSSDMetricsView::GetFreeRatio(
 }
 
 tl::expected<std::vector<Replica>, ErrorCode> ReplicaAllocator::Allocate(
-    ScopedPlacementReadAccess& placement, PlacementPolicyType policy_type,
+    ScopedPlacementReadAccess& placement,
     const ReplicaAllocationRequest& request,
-    std::optional<LocalSSDMetricsView> local_ssd_metrics) const {
+    PlacementDiagnostics* diagnostics) const {
+    if (diagnostics) {
+        diagnostics->has_sufficient_active_group_count =
+            placement.GetView().size() >= request.replica_count;
+    }
+
+    std::span<PlacementGroup* const> host_ordered_groups;
+    if (!request.writer_host_id.empty()) {
+        thread_local std::vector<PlacementGroup*> host_ordered_scratch;
+        placement.GetHostOrderedGroups(
+            request.writer_host_id, request.object_key, host_ordered_scratch);
+        host_ordered_groups = host_ordered_scratch;
+    }
+
+    const ResolvedReplicaAllocationRequest resolved{
+        .size = request.size,
+        .replica_count = request.replica_count,
+        .preferred_group = request.preferred_group,
+        .preferred_groups = request.preferred_groups,
+        .resolved_preferred_groups = host_ordered_groups,
+        .excluded_groups = request.excluded_groups,
+        .replica_type = request.replica_type,
+    };
     auto view = placement.GetView();
 
-    switch (policy_type) {
+    switch (policy_type_) {
         case PlacementPolicyType::RANDOM:
         case PlacementPolicyType::LOCAL_FIRST:
-            return AllocateWithPolicy(view, request, RandomPolicy{});
+            return AllocateWithPolicy(view, resolved, RandomPolicy{});
         case PlacementPolicyType::FREE_RATIO_FIRST:
-            return AllocateWithPolicy(view, request, FreeRatioFirstPolicy{});
+            return AllocateWithPolicy(view, resolved, FreeRatioFirstPolicy{});
         case PlacementPolicyType::SSD_FREE_RATIO_FIRST:
             return AllocateWithPolicy(
-                view, request,
-                SsdFreeRatioFirstPolicy{placement, local_ssd_metrics});
+                view, resolved,
+                SsdFreeRatioFirstPolicy{placement, local_ssd_metrics_});
         case PlacementPolicyType::CXL:
-            return AllocateWithPolicy(view, request, CxlPolicy{});
+            return AllocateWithPolicy(view, resolved, CxlPolicy{});
     }
     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 }

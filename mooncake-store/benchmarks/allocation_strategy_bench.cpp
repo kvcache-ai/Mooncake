@@ -19,6 +19,7 @@
 
 #include "offset_allocator/offset_allocator.h"
 #include "allocator.h"
+#include "placement/index.h"
 #include "placement/replica_allocator.h"
 
 // --- gflags definitions ---
@@ -341,7 +342,7 @@ class BenchmarkPlacement final {
         ReplicaAllocationRequest request;
         request.size = size;
         request.replica_count = replica_count;
-        return replica_allocator_.Allocate(access, policy, request);
+        return ReplicaAllocator(policy).Allocate(access, request);
     }
 
     const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators()
@@ -354,7 +355,6 @@ class BenchmarkPlacement final {
     std::shared_mutex mutex_;
     std::vector<std::shared_ptr<BufferAllocatorBase>> allocators_;
     std::vector<std::unique_ptr<AllocationTarget>> targets_;
-    ReplicaAllocator replica_allocator_;
 };
 
 /**

@@ -98,14 +98,6 @@ bool PlacementIndex::ReplaceTarget(std::string_view name,
     return true;
 }
 
-bool PlacementIndex::Contains(std::string_view name,
-                              const AllocationTarget* target) const {
-    auto it = by_name_.find(name);
-    return it != by_name_.end() &&
-           std::find(it->second->targets.begin(), it->second->targets.end(),
-                     target) != it->second->targets.end();
-}
-
 void PlacementIndex::Clear() {
     by_name_.clear();
     active_groups_.clear();
@@ -113,12 +105,21 @@ void PlacementIndex::Clear() {
 }
 
 PlacementReadView PlacementIndex::GetView() const {
-    return PlacementReadView(this);
+    return PlacementReadView(*this);
 }
 
 PlacementGroup* PlacementReadView::Find(std::string_view name) const {
-    auto it = index_->by_name_.find(name);
-    return it == index_->by_name_.end() ? nullptr : it->second;
+    auto it = index_.by_name_.find(name);
+    return it == index_.by_name_.end() ? nullptr : it->second;
+}
+
+void PlacementReadView::GetActiveGroupNames(
+    std::vector<std::string>& names) const {
+    names.clear();
+    names.reserve(index_.active_groups_.size());
+    for (const auto* group : index_.active_groups_) {
+        names.push_back(group->name);
+    }
 }
 
 void ScopedPlacementReadAccess::GetHostOrderedGroups(

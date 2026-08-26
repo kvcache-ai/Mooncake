@@ -186,10 +186,9 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             return nullptr;
         }
         EXPECT_TRUE(manager.placement_index_.ReplaceTarget(
-            segment_name, mounted->second.allocation_target.get(),
-            target.get()));
-        mounted->second.buf_allocator = allocator;
-        mounted->second.allocation_target = std::move(target);
+            segment_name, mounted->second.target.get(), target.get()));
+        mounted->second.allocator = allocator;
+        mounted->second.target = std::move(target);
         return allocator;
     }
 #endif

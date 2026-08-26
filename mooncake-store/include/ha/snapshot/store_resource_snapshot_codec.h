@@ -24,7 +24,8 @@ class StoreResourceSnapshotCodec final {
         const SegmentPool& segment_pool,
         const LocalSsdPersistedState& local_ssd_state);
     static tl::expected<LocalSsdPersistedState, SerializationError> Decode(
-        SegmentPool& segment_pool, const std::vector<uint8_t>& data);
+        SegmentPool& segment_pool, const std::vector<uint8_t>& data,
+        bool account_capacity_metrics);
 };
 
 }  // namespace mooncake::ha

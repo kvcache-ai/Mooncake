@@ -128,8 +128,8 @@ MasterSnapshotCodec::EncodeSegments(const SegmentPool& segment_pool,
 
 tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeSegments(
     MasterService* master_service, const std::vector<uint8_t>& data) const {
-    auto local_ssd_state =
-        StoreResourceSnapshotCodec::Decode(master_service->segment_pool_, data);
+    auto local_ssd_state = StoreResourceSnapshotCodec::Decode(
+        master_service->segment_pool_, data, true);
     if (!local_ssd_state) {
         return tl::unexpected(local_ssd_state.error());
     }

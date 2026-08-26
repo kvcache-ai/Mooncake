@@ -15,33 +15,30 @@
 
 namespace mooncake {
 
+struct RegionInitialState;
+
 struct RegionResource final {
-    RegionResource(RegionResourceSpec resource_spec,
-                   std::shared_ptr<BufferAllocatorBase> resource_allocator,
+    RegionResource(std::shared_ptr<BufferAllocatorBase> resource_allocator,
                    AllocationTargetKind target_kind,
                    std::string cxl_binding_name = {})
-        : spec(std::move(resource_spec)),
-          allocator(std::move(resource_allocator)),
+        : allocator(std::move(resource_allocator)),
           target(allocator.get(), target_kind, std::move(cxl_binding_name)) {}
 
-    RegionResourceSpec spec;
     std::shared_ptr<BufferAllocatorBase> allocator;
     AllocationTarget target;
     bool active{false};
 };
 
 class RegionDriver;
+using RegionResourceMap = std::map<UUID, std::unique_ptr<RegionResource>>;
 
 class PreparedRegionResource final {
    public:
-    PreparedRegionResource() = default;
-    PreparedRegionResource(
-        RegionDriver* driver, UUID id,
-        std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers);
-    ~PreparedRegionResource();
+    ~PreparedRegionResource() = default;
 
-    PreparedRegionResource(PreparedRegionResource&& other) noexcept;
-    PreparedRegionResource& operator=(PreparedRegionResource&& other) noexcept;
+    PreparedRegionResource(PreparedRegionResource&& other) noexcept = default;
+    PreparedRegionResource& operator=(PreparedRegionResource&& other) noexcept =
+        default;
     PreparedRegionResource(const PreparedRegionResource&) = delete;
     PreparedRegionResource& operator=(const PreparedRegionResource&) = delete;
 
@@ -55,16 +52,16 @@ class PreparedRegionResource final {
     }
 
     void Commit() noexcept;
-    bool committed() const noexcept { return committed_; }
 
    private:
-    void Rollback() noexcept;
+    PreparedRegionResource(
+        RegionDriver* driver, RegionResourceMap::node_type resource,
+        std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers);
 
     RegionDriver* driver_{nullptr};
-    UUID id_{0, 0};
+    RegionResourceMap::node_type resource_;
     std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers_;
     std::unique_ptr<RegionResource> replaced_resource_;
-    bool committed_{false};
 
     friend class RegionDriver;
 };
@@ -96,17 +93,14 @@ class RegionDriver {
         : allocator_type_(allocator_type) {}
 
     tl::expected<PreparedRegionResource, ErrorCode> Stage(
-        std::unique_ptr<RegionResource> resource,
+        const UUID& id, std::unique_ptr<RegionResource> resource,
         std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers = {});
 
    private:
     const std::optional<BufferAllocatorType> allocator_type_;
-    RegionResource* GetPreparedResource(const UUID& id);
     void CommitPrepared(PreparedRegionResource& prepared) noexcept;
-    void RollbackPrepared(const UUID& id) noexcept;
 
-    std::map<UUID, std::unique_ptr<RegionResource>> resources_;
-    std::map<UUID, std::unique_ptr<RegionResource>> prepared_;
+    RegionResourceMap resources_;
 
     friend class PreparedRegionResource;
 };
@@ -137,20 +131,11 @@ class CxlRegionDriver final : public RegionDriver {
         std::shared_ptr<BufferAllocatorBase> allocator) override;
 
    private:
-    std::string path_;
-    size_t size_;
     std::shared_ptr<BufferAllocatorBase> global_allocator_;
 };
 
-struct RegionKindHash {
-    size_t operator()(RegionKind kind) const noexcept {
-        return static_cast<size_t>(kind);
-    }
-};
-
 using RegionDriverRegistry =
-    std::unordered_map<RegionKind, std::unique_ptr<RegionDriver>,
-                       RegionKindHash>;
+    std::unordered_map<RegionKind, std::unique_ptr<RegionDriver>>;
 
 struct RegionDriverConfig {
     BufferAllocatorType memory_allocator{BufferAllocatorType::CACHELIB};

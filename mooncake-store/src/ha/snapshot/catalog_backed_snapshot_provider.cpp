@@ -478,9 +478,9 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
 
         RegionDriverConfig driver_config;
         driver_config.memory_allocator = BufferAllocatorType::OFFSET;
-        SegmentPool segment_pool(driver_config);
+        SegmentPool segment_pool(CreateRegionDrivers(driver_config));
         auto deserialize_segments = ha::StoreResourceSnapshotCodec::Decode(
-            segment_pool, segments_content);
+            segment_pool, segments_content, false);
         if (!deserialize_segments) {
             LOG(ERROR) << "Failed to deserialize snapshot segments payload, "
                        << "snapshot_id=" << descriptor.snapshot_id
@@ -521,10 +521,10 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         // for each segment type.
         ScopedSegmentPoolReadAccess view = segment_pool.AcquireReadAccess();
         std::vector<std::pair<UUID, MountedRegion>> all_segments;
-        view.GetMountedRegions(all_segments);
+        view.Catalog().GetMountedRegions(all_segments);
         for (const auto& [segment_id, mounted] : all_segments) {
             const auto& segment = mounted.segment;
-            if (!view.GetResourceView(segment_id)) {
+            if (!view.Resources().GetAllocator(segment_id)) {
                 // Defensive: a catalog entry without a driver resource should
                 // not exist. Log and skip rather than emitting a half-populated
                 // StandbySegmentInfo.

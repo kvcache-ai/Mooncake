@@ -18,9 +18,10 @@
 
 #include <gflags/gflags.h>
 
-#include "placement/replica_allocator.h"
 #include "allocator.h"
 #include "offset_allocator/offset_allocator.h"
+#include "placement/index.h"
+#include "placement/replica_allocator.h"
 
 DEFINE_uint32(threads, 16, "Number of concurrent worker threads");
 DEFINE_uint64(iterations, 100000, "Measured operations per worker and phase");
@@ -328,8 +329,7 @@ class PutAllocationFixture {
         auto access = ScopedPlacementReadAccess(placement_, placement_mutex_);
         ReplicaAllocationRequest request;
         request.size = request_size;
-        auto result = replica_allocator_.Allocate(
-            access, PlacementPolicyType::RANDOM, request);
+        auto result = replica_allocator_.Allocate(access, request);
         return !result.has_value();
     }
 
@@ -337,8 +337,7 @@ class PutAllocationFixture {
         auto access = ScopedPlacementReadAccess(placement_, placement_mutex_);
         ReplicaAllocationRequest request;
         request.size = request_size;
-        auto result = replica_allocator_.Allocate(
-            access, PlacementPolicyType::RANDOM, request);
+        auto result = replica_allocator_.Allocate(access, request);
         return result.has_value();
     }
 
@@ -352,7 +351,7 @@ class PutAllocationFixture {
     AllocationTarget target_;
     PlacementIndex placement_;
     std::shared_mutex placement_mutex_;
-    ReplicaAllocator replica_allocator_;
+    ReplicaAllocator replica_allocator_{PlacementPolicyType::RANDOM};
     std::vector<std::unique_ptr<AllocatedBuffer>> held_;
 };
 

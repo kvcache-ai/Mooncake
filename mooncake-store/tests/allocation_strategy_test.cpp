@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "local_ssd/manager.h"
+#include "placement/index.h"
 #include "test_buffer_allocator.h"
 
 namespace mooncake::test {
@@ -110,11 +111,10 @@ TEST(PlacementIndexTest, PointersStayStableAcrossGrowthAndSwapPopRemoval) {
 
 TEST(ReplicaAllocatorTest, RejectsEmptyAndInvalidRequests) {
     PlacementState empty;
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
     auto request = Request();
     auto access = empty.Access();
-    EXPECT_EQ(allocator.Allocate(access, PlacementPolicyType::RANDOM, request)
-                  .error(),
+    EXPECT_EQ(allocator.Allocate(access, request).error(),
               ErrorCode::NO_AVAILABLE_HANDLE);
 
     PlacementState state;
@@ -122,20 +122,17 @@ TEST(ReplicaAllocatorTest, RejectsEmptyAndInvalidRequests) {
     auto invalid = Request();
     invalid.size = 0;
     auto populated = state.Access();
-    EXPECT_EQ(
-        allocator.Allocate(populated, PlacementPolicyType::RANDOM, invalid)
-            .error(),
-        ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(allocator.Allocate(populated, invalid).error(),
+              ErrorCode::INVALID_PARAMS);
 }
 
 TEST(ReplicaAllocatorTest, SingleGroupFastPathIsBestEffort) {
     PlacementState state;
     state.Add("only", "only");
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
     auto request = Request(3);
     auto access = state.Access();
-    auto result =
-        allocator.Allocate(access, PlacementPolicyType::RANDOM, request);
+    auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1U);
     EXPECT_EQ(ReplicaEndpoint(result->front()), "only");
@@ -147,12 +144,11 @@ TEST(ReplicaAllocatorTest, SameNameTargetsFallbackInsideOneGroup) {
     state.Add("logical", "physical-good");
     failing->SetAlwaysFail();
 
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
     for (size_t i = 0; i < 64; ++i) {
         auto request = Request();
         auto access = state.Access();
-        auto result =
-            allocator.Allocate(access, PlacementPolicyType::RANDOM, request);
+        auto result = allocator.Allocate(access, request);
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(ReplicaEndpoint(result->front()), "physical-good");
     }
@@ -165,11 +161,10 @@ TEST(ReplicaAllocatorTest, AtMostOneReplicaPerLogicalGroup) {
     state.Add("shared", "shared-1");
     state.Add("other", "other");
 
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
     auto request = Request(2);
     auto access = state.Access();
-    auto result =
-        allocator.Allocate(access, PlacementPolicyType::RANDOM, request);
+    auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 2U);
     auto endpoints = Endpoints(*result);
@@ -185,12 +180,11 @@ TEST(ReplicaAllocatorTest, FailedPreferenceDoesNotConsumeReplicaSlot) {
     state.Add("fallback", "fallback");
     std::vector<std::string> preferred{"failed", "preferred"};
 
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
     auto request = Request(2);
     request.preferred_groups = preferred;
     auto access = state.Access();
-    auto result =
-        allocator.Allocate(access, PlacementPolicyType::RANDOM, request);
+    auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(Endpoints(*result),
               (std::set<std::string>{"fallback", "preferred"}));
@@ -204,12 +198,11 @@ TEST(ReplicaAllocatorTest, ExclusionsAndInsufficientGroupsReturnBestEffort) {
     state.Add("c", "c");
     std::vector<std::string> excluded{"c"};
 
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
     auto request = Request(4);
     request.excluded_groups = excluded;
     auto access = state.Access();
-    auto result =
-        allocator.Allocate(access, PlacementPolicyType::RANDOM, request);
+    auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(Endpoints(*result), (std::set<std::string>{"a", "b"}));
 }
@@ -223,11 +216,10 @@ TEST(ReplicaAllocatorTest, FreeRatioFirstRanksAndFallsBackAfterFailure) {
     (void)fullest;
     best->SetAlwaysFail();
 
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::FREE_RATIO_FIRST);
     auto request = Request();
     auto access = state.Access();
-    auto result = allocator.Allocate(
-        access, PlacementPolicyType::FREE_RATIO_FIRST, request);
+    auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(ReplicaEndpoint(result->front()), "second");
     EXPECT_GE(best->allocation_calls(), 1U);
@@ -248,58 +240,56 @@ TEST(ReplicaAllocatorTest, SsdFreeRatioFirstUsesOwnerMetrics) {
     ASSERT_TRUE(state.local_ssd.AdjustUsedBytes(low_client, 900));
     ASSERT_TRUE(state.local_ssd.AdjustUsedBytes(high_client, 100));
 
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::SSD_FREE_RATIO_FIRST,
+                               LocalSSDMetricsView(state.local_ssd));
     auto request = Request();
     auto access = state.Access();
-    auto result =
-        allocator.Allocate(access, PlacementPolicyType::SSD_FREE_RATIO_FIRST,
-                           request, LocalSSDMetricsView(state.local_ssd));
+    auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(ReplicaEndpoint(result->front()), "high");
 }
 
-TEST(ReplicaAllocatorTest, LocalFirstConsumesResolvedGroupsInOrder) {
+TEST(ReplicaAllocatorTest, LocalFirstConsumesHostOrderedGroupsInOrder) {
     PlacementState state;
     state.Add("remote", "remote");
     state.Add("local-a", "local-a");
     state.Add("local-b", "local-b");
-    auto view = state.index.GetView();
-    std::vector<PlacementGroup*> ordered{view.Find("local-b"),
-                                         view.Find("local-a")};
+    state.hosts["writer"]["local-a"].insert(generate_uuid());
+    state.hosts["writer"]["local-b"].insert(generate_uuid());
 
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::LOCAL_FIRST);
     auto request = Request(2);
-    request.resolved_preferred_groups = ordered;
+    request.writer_host_id = "writer";
+    request.object_key = "key";
     auto access = state.Access();
-    auto result =
-        allocator.Allocate(access, PlacementPolicyType::LOCAL_FIRST, request);
+    std::vector<PlacementGroup*> expected;
+    access.GetHostOrderedGroups(request.writer_host_id, request.object_key,
+                                expected);
+    ASSERT_EQ(expected.size(), 2U);
+    auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 2U);
-    EXPECT_EQ(ReplicaEndpoint((*result)[0]), "local-b");
-    EXPECT_EQ(ReplicaEndpoint((*result)[1]), "local-a");
+    EXPECT_EQ(ReplicaEndpoint((*result)[0]), expected[0]->name);
+    EXPECT_EQ(ReplicaEndpoint((*result)[1]), expected[1]->name);
 }
 
 TEST(ReplicaAllocatorTest, CxlRequiresPreferenceAndConvertsDescriptor) {
     PlacementState state;
     state.Add("cxl-group", "global-cxl", kCapacity, 0,
               AllocationTargetKind::CXL, "client-binding");
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::CXL);
 
     auto missing_preference = Request();
     {
         auto access = state.Access();
-        EXPECT_EQ(
-            allocator
-                .Allocate(access, PlacementPolicyType::CXL, missing_preference)
-                .error(),
-            ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(allocator.Allocate(access, missing_preference).error(),
+                  ErrorCode::INVALID_PARAMS);
     }
 
     auto preferred = Request();
     preferred.preferred_group = "cxl-group";
     auto access = state.Access();
-    auto result =
-        allocator.Allocate(access, PlacementPolicyType::CXL, preferred);
+    auto result = allocator.Allocate(access, preferred);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1U);
     auto descriptor = result->front()
@@ -316,7 +306,7 @@ TEST(ReplicaAllocatorTest, AllocateFromResolvesOneNameAndUsesTargetFallback) {
     auto* failed = state.Add("logical", "bad");
     failed->SetAlwaysFail();
     state.Add("logical", "good");
-    ReplicaAllocator allocator;
+    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
 
     for (size_t i = 0; i < 64; ++i) {
         auto access = state.Access();

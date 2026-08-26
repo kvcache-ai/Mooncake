@@ -143,7 +143,7 @@ inline void PackDiskReplica(
 inline std::vector<uint8_t> BuildSegmentsPayload() {
     RegionDriverConfig driver_config;
     driver_config.memory_allocator = BufferAllocatorType::OFFSET;
-    SegmentPool segment_pool(driver_config);
+    SegmentPool segment_pool(CreateRegionDrivers(driver_config));
     auto serialized = ha::StoreResourceSnapshotCodec::Encode(
         segment_pool, LocalSsdPersistedState{});
     if (!serialized) {

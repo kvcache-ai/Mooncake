@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -15,26 +14,13 @@
 
 #include "placement/target.h"
 #include "types.h"
+#include "utils/transparent_string_hash.h"
 
 namespace mooncake {
 
 struct PlacementGroup final {
     std::string name;
     std::vector<AllocationTarget*> targets;
-};
-
-struct TransparentStringHash {
-    using is_transparent = void;
-
-    size_t operator()(std::string_view value) const noexcept {
-        return std::hash<std::string_view>{}(value);
-    }
-    size_t operator()(const std::string& value) const noexcept {
-        return (*this)(std::string_view(value));
-    }
-    size_t operator()(const char* value) const noexcept {
-        return (*this)(std::string_view(value));
-    }
 };
 
 class PlacementReadView;
@@ -51,7 +37,6 @@ class PlacementIndex final {
     bool RemoveTarget(std::string_view name, AllocationTarget* target);
     bool ReplaceTarget(std::string_view name, AllocationTarget* expected,
                        AllocationTarget* replacement);
-    bool Contains(std::string_view name, const AllocationTarget* target) const;
     void Clear();
 
     PlacementReadView GetView() const;
@@ -68,17 +53,21 @@ class PlacementIndex final {
 
 class PlacementReadView final {
    public:
-    explicit PlacementReadView(const PlacementIndex* index) : index_(index) {}
-
     PlacementGroup* Find(std::string_view name) const;
+    bool Contains(std::string_view name) const { return Find(name) != nullptr; }
+    void GetActiveGroupNames(std::vector<std::string>& names) const;
     std::span<PlacementGroup* const> active_groups() const {
-        return index_->active_groups_;
+        return index_.active_groups_;
     }
-    size_t size() const noexcept { return index_->active_groups_.size(); }
-    bool empty() const noexcept { return index_->active_groups_.empty(); }
+    size_t size() const noexcept { return index_.active_groups_.size(); }
+    bool empty() const noexcept { return index_.active_groups_.empty(); }
 
    private:
-    const PlacementIndex* index_;
+    explicit PlacementReadView(const PlacementIndex& index) : index_(index) {}
+
+    const PlacementIndex& index_;
+
+    friend class PlacementIndex;
 };
 
 using HostRegionIndex =
