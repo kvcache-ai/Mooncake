@@ -23,6 +23,9 @@ test -z "$GITHUB_MIRROR" || python3 -m pip config --user set \
   global.index-url https://mirrors.huaweicloud.com/repository/pypi/simple
 python3 -m pip install --upgrade pip cmake ninja
 
+# dirty hack for sudo
+ln -s ${MOONCAKE_TOOLCHAIN}/bin/cmake /usr/local/bin/cmake
+
 command -v go && test "$(go env GOVERSION)" = "$GO_VERSION" && exit
 ARCH=$(uname -m)
 test "$ARCH" = "x86_64" && GO_ARCH="amd64" || :
