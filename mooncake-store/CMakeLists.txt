@@ -24,26 +24,19 @@ include_directories(
     ${ETCD_WRAPPER_INCLUDE}
 )
 
-# Until base-class inheritance is severed (Phase 2) and centralized code is
-# restored (Phase 3), the two static archives have circular symbol references;
-# RESCAN lets the linker iterate the group until everything resolves.
-if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+# Until the base/P2P dependency direction is cleaned up in later phases, use a
+# native rescan group when available. Older CMake versions and toolchains
+# without RESCAN support consume the P2P object files directly, avoiding
+# static-archive ordering constraints while preserving the CMake 3.16 minimum.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24 AND
+   CMAKE_LINK_GROUP_USING_RESCAN_SUPPORTED)
     set(MOONCAKE_STORE_LIBS
         $<LINK_GROUP:RESCAN,mooncake_store,mooncake_store_p2p>)
-elseif(UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    # LINK_GROUP was added in CMake 3.24. Keep compatibility with the project's
-    # 3.16 minimum and older Linux CI images by spelling out the GNU ld group.
-    set(MOONCAKE_STORE_LIBS
-        -Wl,--start-group
-        mooncake_store
-        mooncake_store_p2p
-        -Wl,--end-group)
 else()
-    message(FATAL_ERROR
-        "Circular mooncake_store libraries require CMake 3.24 or a GNU-compatible linker")
+    set(MOONCAKE_STORE_LIBS mooncake_store_p2p_objects mooncake_store)
 endif()
 
-# mooncake-integration is a sibling directory and needs the same link group.
+# mooncake-integration is a sibling directory and needs the same Store linkage.
 set(MOONCAKE_STORE_LIBS ${MOONCAKE_STORE_LIBS} PARENT_SCOPE)
 
 # Add subdirectories

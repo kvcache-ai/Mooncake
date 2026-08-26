@@ -170,7 +170,14 @@ list(APPEND MOONCAKE_STORE_P2P_SOURCES
     p2p/ha/ha_recovery_manager.cpp
 )
 
-add_library(mooncake_store_p2p ${MOONCAKE_STORE_P2P_SOURCES})
+add_library(mooncake_store_p2p_objects OBJECT ${MOONCAKE_STORE_P2P_SOURCES})
+target_link_libraries(mooncake_store_p2p_objects PUBLIC mooncake_store)
+
+# Keep the standalone P2P library artifact for installation. Internal
+# consumers use the object target above to avoid circular static-library
+# ordering constraints during the transitional split phases.
+add_library(mooncake_store_p2p
+    $<TARGET_OBJECTS:mooncake_store_p2p_objects>)
 target_link_libraries(mooncake_store_p2p PUBLIC mooncake_store)
 
 # Link Ascend ACL library if USE_ASCEND_CACHE_TIER is enabled

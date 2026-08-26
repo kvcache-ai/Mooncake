@@ -217,6 +217,20 @@ class HARecoveryManagerTest : public ::testing::Test {
         FAIL() << "HARecoveryManager did not reach FULL state";
     }
 
+    bool WaitUntilReplicaVisible(
+        const std::string& key,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+        auto& svc = master_.GetWrapped().GetMasterService();
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        do {
+            if (svc.GetReplicaList(key).has_value()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    }
+
     static testing::InProcP2PMaster master_;
     static std::string master_addr_;
 
@@ -400,6 +414,11 @@ TEST_F(HARecoveryManagerTest, ReconnectResyncsLocalReplicaToP2PMaster) {
     mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     EXPECT_TRUE(notifier_->running_.load());
     WaitUntilFull(*mgr);
+
+    // Metadata delivery is asynchronous. Wait for the observable sync result
+    // instead of depending on sender-thread scheduling after the state change.
+    ASSERT_TRUE(WaitUntilReplicaVisible(key))
+        << "Replica did not become visible on the P2P master";
 
     auto& svc = master_.GetWrapped().GetMasterService();
     auto result = svc.GetReplicaList(key);
