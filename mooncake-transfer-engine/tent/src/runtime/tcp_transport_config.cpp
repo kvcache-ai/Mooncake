@@ -138,11 +138,6 @@ Status ParseTcpTransportConfig(const Config& config, TcpTransportConfig* out) {
         return Invalid("transports/tcp/high_performance",
                        "contains zero or inconsistent limits");
     }
-    if (!parsed.enabled &&
-        parsed.implementation == TcpImplementation::kHighPerformance) {
-        return Invalid("transports/tcp", "cannot disable high_performance TCP");
-    }
-
     *out = std::move(parsed);
     return Status::OK();
 }

@@ -170,7 +170,7 @@ add_executable(tent_high_performance_tcp_workers_test
                high_performance_tcp_workers_test.cpp)
 target_link_libraries(tent_high_performance_tcp_workers_test PRIVATE gtest
                                                                     gtest_main
-                                                                    tent_xport_tcp)
+                                                                    tent_xport_tcp_hp_core)
 target_include_directories(
   tent_high_performance_tcp_workers_test
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -185,6 +185,59 @@ target_include_directories(tent_high_performance_tcp_protocol_test
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_high_performance_tcp_protocol_test
          COMMAND tent_high_performance_tcp_protocol_test)
+
+add_executable(tent_high_performance_tcp_buffer_registry_test
+               high_performance_tcp_buffer_registry_test.cpp)
+target_link_libraries(tent_high_performance_tcp_buffer_registry_test PRIVATE
+                      gtest gtest_main tent_xport_tcp_hp_core)
+target_include_directories(
+  tent_high_performance_tcp_buffer_registry_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_high_performance_tcp_buffer_registry_test
+         COMMAND tent_high_performance_tcp_buffer_registry_test)
+
+add_executable(tent_high_performance_tcp_socket_test
+               high_performance_tcp_socket_test.cpp)
+target_link_libraries(tent_high_performance_tcp_socket_test PRIVATE gtest gtest_main
+                                                                  tent_xport_tcp_hp_core)
+target_include_directories(tent_high_performance_tcp_socket_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_high_performance_tcp_socket_test
+         COMMAND tent_high_performance_tcp_socket_test)
+
+add_executable(tent_high_performance_tcp_transport_test
+               high_performance_tcp_transport_test.cpp)
+target_link_libraries(tent_high_performance_tcp_transport_test PRIVATE
+                      gtest gtest_main tent_link_group)
+target_include_directories(tent_high_performance_tcp_transport_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_high_performance_tcp_transport_test
+         COMMAND tent_high_performance_tcp_transport_test)
+
+add_executable(tent_high_performance_tcp_rpc_gate_test
+               high_performance_tcp_rpc_gate_test.cpp)
+target_link_libraries(tent_high_performance_tcp_rpc_gate_test PRIVATE
+                      gtest gtest_main tent_link_group)
+target_include_directories(tent_high_performance_tcp_rpc_gate_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_high_performance_tcp_rpc_gate_test
+         COMMAND tent_high_performance_tcp_rpc_gate_test)
+
+add_executable(tent_high_performance_tcp_e2e_test
+               high_performance_tcp_e2e_test.cpp)
+target_link_libraries(tent_high_performance_tcp_e2e_test PRIVATE
+                      gtest gtest_main tent_link_group)
+target_include_directories(tent_high_performance_tcp_e2e_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_high_performance_tcp_e2e_test_concurrency_1
+         COMMAND tent_high_performance_tcp_e2e_test
+                 --gtest_filter=HighPerformanceTcpE2eTest.WriteThenReadConcurrency1)
+add_test(NAME tent_high_performance_tcp_e2e_test_concurrency_4
+         COMMAND tent_high_performance_tcp_e2e_test
+                 --gtest_filter=HighPerformanceTcpE2eTest.WriteThenReadConcurrency4)
+add_test(NAME tent_high_performance_tcp_e2e_test_concurrency_16
+         COMMAND tent_high_performance_tcp_e2e_test
+                 --gtest_filter=HighPerformanceTcpE2eTest.WriteThenReadConcurrency16)
 
 add_executable(tent_tcp_datapath_roundtrip_test
                tcp_datapath_roundtrip_test.cpp)

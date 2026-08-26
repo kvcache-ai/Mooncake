@@ -3,6 +3,7 @@
 #define TENT_HIGH_PERFORMANCE_TCP_BUFFER_REGISTRY_H_
 
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -29,6 +30,7 @@ class HighPerformanceTcpBufferRegistry {
         uint64_t length{0};
         uint64_t registration_id{0};
         Permission permission{kLocalReadWrite};
+
         std::mutex mutex;
         std::condition_variable drained;
         bool closing{false};
@@ -46,6 +48,7 @@ class HighPerformanceTcpBufferRegistry {
 
         void reset();
         void* data() const;
+        uint64_t base() const;
         uint64_t length() const;
         explicit operator bool() const { return entry_ != nullptr; }
 
@@ -58,11 +61,22 @@ class HighPerformanceTcpBufferRegistry {
     Status add(uint64_t base, uint64_t length, Permission permission,
                uint64_t* registration_id);
     Status remove(uint64_t base, uint64_t length);
+
+    // Prevent new registrations and leases during quiesce. Existing leases
+    // remain valid and drain through normal unregister/session completion.
+    void close();
+    Status reopen();
+    bool closing() const;
+
+    // Local access checks lifetime/range only. MemoryOptions::perm is a remote
+    // authorization policy and must not reject the local side of a transfer.
     Status acquireLocalLease(uint64_t addr, uint64_t length, Lease* lease);
+
     Status acquireRemoteLease(uint64_t addr, uint64_t length,
                               uint64_t registration_id,
                               HighPerformanceTcpOpcode opcode, Lease* lease,
                               AcquireFailure* failure = nullptr);
+
     bool tracks(uint64_t base, uint64_t length) const;
     size_t size() const;
 
@@ -74,7 +88,11 @@ class HighPerformanceTcpBufferRegistry {
     mutable std::mutex registry_mutex_;
     std::map<uint64_t, std::shared_ptr<Entry>> entries_;
     uint64_t next_registration_id_{1};
+    bool closing_{false};
 };
+
+HighPerformanceTcpStatus HighPerformanceTcpWireStatusForAcquireFailure(
+    HighPerformanceTcpBufferRegistry::AcquireFailure failure);
 
 }  // namespace mooncake::tent
 

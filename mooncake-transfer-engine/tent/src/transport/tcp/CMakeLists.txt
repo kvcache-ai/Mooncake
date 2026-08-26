@@ -1,6 +1,7 @@
 add_library(tent_xport_tcp_hp_core STATIC
   high_performance_tcp_protocol.cpp
   high_performance_tcp_workers.cpp
+  high_performance_tcp_task.cpp
   high_performance_tcp_buffer_registry.cpp
   high_performance_tcp_client.cpp
   high_performance_tcp_server.cpp)

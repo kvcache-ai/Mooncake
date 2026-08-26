@@ -427,6 +427,18 @@ Status TransferEngineImpl::construct() {
                 if (tcp_transport_config_.hpRequired() &&
                     transport_index ==
                         static_cast<size_t>(TransportType::TCP)) {
+                    // HP TCP is explicitly required, so a failed install is a
+                    // construction failure rather than an optional-transport
+                    // skip. Unwind the already-started control service and
+                    // any preceding transports immediately; the destructor's
+                    // later deconstruct() call is intentionally idempotent.
+                    const Status cleanup = deconstruct();
+                    if (!cleanup.ok()) {
+                        LOG(ERROR)
+                            << "Failed to unwind TENT after required HP TCP "
+                               "install failure: "
+                            << cleanup.ToString();
+                    }
                     return status;
                 }
                 LOG(WARNING) << "Transport " << transport->getName()
@@ -524,7 +536,13 @@ Status TransferEngineImpl::deconstruct() {
     }
 
     for (auto& transport : transport_list_) {
-        if (transport) transport->quiesce();
+        if (!transport) continue;
+        const Status status = transport->quiesce();
+        if (!status.ok()) {
+            LOG(ERROR) << "Transport " << transport->getName()
+                       << " quiesce failed during teardown: "
+                       << status.ToString();
+        }
     }
 
     // Destroy staging_proxy_ first: its destructor calls back into

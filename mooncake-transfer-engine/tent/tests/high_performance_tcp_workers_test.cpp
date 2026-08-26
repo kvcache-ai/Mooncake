@@ -21,6 +21,8 @@
 #include <mutex>
 #include <vector>
 
+#include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
+#include "tent/transport/tcp/high_performance_tcp_task.h"
 #include "tent/transport/tcp/high_performance_tcp_workers.h"
 
 namespace mooncake {
@@ -145,6 +147,135 @@ TEST(HighPerformanceTcpWorkersTest, StopIsABarrierAndRejectsNewWork) {
     // completion accounting and settles them before calling this barrier.
     EXPECT_LE(completed.load(), 6u);
     EXPECT_TRUE(workers.submit([](size_t) {}).IsInternalError());
+}
+
+TEST(HighPerformanceTcpWorkersTest,
+     AtomicBatchAdmissionHasZeroSideEffectsOnFullMailbox) {
+    HighPerformanceTcpWorkers workers({.worker_count = 2, .queue_capacity = 1});
+    ASSERT_TRUE(workers.start().ok());
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool blocker_started = false;
+    bool release_blocker = false;
+    ASSERT_TRUE(
+        workers
+            .submitToWorker(1,
+                            [&](size_t) {
+                                std::unique_lock<std::mutex> lock(mutex);
+                                blocker_started = true;
+                                cv.notify_all();
+                                cv.wait(lock, [&] { return release_blocker; });
+                            })
+            .ok());
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, 2s, [&] { return blocker_started; }));
+    }
+    ASSERT_TRUE(workers.submitToWorker(1, [](size_t) {}).ok());
+    ASSERT_EQ(workers.mailboxDepth(1), 1u);
+
+    HighPerformanceTcpAdmissionController admission(8, 4096);
+    std::atomic<size_t> ran{0};
+    bool ownership_committed = false;
+    std::vector<HighPerformanceTcpWorkers::Command> commands;
+    commands.push_back({.worker_id = 0,
+                        .run = [&](size_t) { ran.fetch_add(1); },
+                        .cancel = [] {}});
+    commands.push_back({.worker_id = 1,
+                        .run = [&](size_t) { ran.fetch_add(1); },
+                        .cancel = [] {}});
+    Status status = workers.tryCommitBatch(commands, &admission, 2, 1024,
+                                           [&] { ownership_committed = true; });
+    EXPECT_TRUE(status.IsTooManyRequests());
+    EXPECT_FALSE(ownership_committed);
+    EXPECT_EQ(admission.outstandingTasks(), 0u);
+    EXPECT_EQ(admission.outstandingBytes(), 0u);
+    EXPECT_EQ(workers.mailboxDepth(0), 0u);
+    EXPECT_EQ(ran.load(), 0u);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_blocker = true;
+    }
+    cv.notify_all();
+    EXPECT_TRUE(workers.stop().ok());
+}
+
+TEST(HighPerformanceTcpWorkersTest, AdmissionBoundsTasksAndBytes) {
+    HighPerformanceTcpAdmissionController admission(2, 100);
+    ASSERT_TRUE(admission.tryReserve(1, 60).ok());
+    EXPECT_TRUE(admission.tryReserve(1, 50).IsTooManyRequests());
+    EXPECT_EQ(admission.outstandingTasks(), 1u);
+    EXPECT_EQ(admission.outstandingBytes(), 60u);
+    admission.release(1, 60);
+    EXPECT_EQ(admission.outstandingTasks(), 0u);
+    EXPECT_EQ(admission.outstandingBytes(), 0u);
+    admission.close();
+    EXPECT_TRUE(admission.tryReserve(1, 1).IsTooManyRequests());
+}
+
+TEST(HighPerformanceTcpTaskTest,
+     CompletesExactlyOnceAndReleasesLeaseAndBudgetFirst) {
+    HighPerformanceTcpBufferRegistry registry;
+    std::array<uint8_t, 64> memory{};
+    uint64_t registration = 0;
+    ASSERT_TRUE(registry
+                    .add(reinterpret_cast<uint64_t>(memory.data()),
+                         memory.size(), kGlobalReadWrite, &registration)
+                    .ok());
+    HighPerformanceTcpBufferRegistry::Lease lease;
+    ASSERT_TRUE(
+        registry
+            .acquireLocalLease(reinterpret_cast<uint64_t>(memory.data()),
+                               memory.size(), &lease)
+            .ok());
+
+    HighPerformanceTcpAdmissionController admission(1, memory.size());
+    ASSERT_TRUE(admission.tryReserve(1, memory.size()).ok());
+    std::atomic<size_t> notifications{0};
+    Request request{};
+    request.opcode = Request::READ;
+    request.source = memory.data();
+    request.target_id = 1;
+    request.target_offset = 0;
+    request.length = memory.size();
+    auto task = std::make_shared<HighPerformanceTcpTaskState>(
+        request, 9,
+        [&](BatchID batch) {
+            EXPECT_EQ(batch, 9u);
+            // Terminal publication happens after resource retirement.
+            EXPECT_EQ(admission.outstandingTasks(), 0u);
+            notifications.fetch_add(1);
+        },
+        std::move(lease));
+    task->activateReservation(&admission, memory.size());
+
+    EXPECT_TRUE(task->completeOnce(COMPLETED, memory.size()));
+    EXPECT_FALSE(task->completeOnce(FAILED, 0));
+    EXPECT_EQ(task->snapshot().s, COMPLETED);
+    EXPECT_EQ(task->snapshot().transferred_bytes, memory.size());
+    EXPECT_EQ(notifications.load(), 1u);
+    EXPECT_EQ(admission.outstandingTasks(), 0u);
+    EXPECT_TRUE(
+        registry
+            .remove(reinterpret_cast<uint64_t>(memory.data()), memory.size())
+            .ok());
+}
+
+TEST(HighPerformanceTcpWorkersTest,
+     StopIsIdempotentAndRuntimeIsNotRestartable) {
+    HighPerformanceTcpWorkers workers({.worker_count = 2, .queue_capacity = 4});
+    ASSERT_TRUE(workers.start().ok());
+    Status a, b;
+    std::thread first([&] { a = workers.stop(); });
+    std::thread second([&] { b = workers.stop(); });
+    first.join();
+    second.join();
+    EXPECT_TRUE(a.ok());
+    EXPECT_TRUE(b.ok());
+    EXPECT_TRUE(workers.stop().ok());
+    EXPECT_TRUE(workers.start().IsInvalidArgument());
 }
 
 TEST(HighPerformanceTcpWorkersTest, RejectsInvalidConfiguration) {

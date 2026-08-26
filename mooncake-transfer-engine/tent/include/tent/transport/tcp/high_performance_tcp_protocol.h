@@ -3,6 +3,7 @@
 #define TENT_HIGH_PERFORMANCE_TCP_PROTOCOL_H_
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -12,12 +13,16 @@
 
 namespace mooncake::tent {
 
-constexpr uint32_t kHighPerformanceTcpMagic = 0x4d435450;  // MCTP
+constexpr uint32_t kHighPerformanceTcpMagic = 0x4d435450;  // "MCTP"
 constexpr uint16_t kHighPerformanceTcpVersion = 1;
 constexpr size_t kHighPerformanceTcpRequestSize = 48;
 constexpr size_t kHighPerformanceTcpResponseSize = 32;
 
-enum class HighPerformanceTcpOpcode : uint8_t { kRead = 1, kWrite = 2 };
+enum class HighPerformanceTcpOpcode : uint8_t {
+    kRead = 1,
+    kWrite = 2,
+};
+
 enum class HighPerformanceTcpStatus : uint16_t {
     kOk = 0,
     kBadVersion = 1,
@@ -37,6 +42,7 @@ struct HighPerformanceTcpRequestFrame {
     uint64_t remote_addr{0};
     uint64_t length{0};
 };
+
 struct HighPerformanceTcpResponseFrame {
     HighPerformanceTcpStatus status{HighPerformanceTcpStatus::kOk};
     uint64_t request_id{0};
@@ -45,10 +51,14 @@ struct HighPerformanceTcpResponseFrame {
 
 std::array<uint8_t, kHighPerformanceTcpRequestSize>
 EncodeHighPerformanceTcpRequest(const HighPerformanceTcpRequestFrame& frame);
-Status DecodeHighPerformanceTcpRequest(const uint8_t* bytes, size_t size,
-                                       HighPerformanceTcpRequestFrame* frame);
+
+Status DecodeHighPerformanceTcpRequest(
+    const uint8_t* bytes, size_t size, HighPerformanceTcpRequestFrame* frame,
+    HighPerformanceTcpStatus* wire_error = nullptr);
+
 std::array<uint8_t, kHighPerformanceTcpResponseSize>
 EncodeHighPerformanceTcpResponse(const HighPerformanceTcpResponseFrame& frame);
+
 Status DecodeHighPerformanceTcpResponse(const uint8_t* bytes, size_t size,
                                         HighPerformanceTcpResponseFrame* frame);
 
@@ -56,11 +66,13 @@ struct HighPerformanceTcpEndpoint {
     std::string host;
     uint16_t port{0};
 };
+
 struct HighPerformanceTcpEndpointAttr {
     std::string incarnation;
     std::vector<HighPerformanceTcpEndpoint> endpoints;
     uint64_t max_transfer_bytes{0};
 };
+
 struct HighPerformanceTcpBufferAttr {
     uint64_t registration_id{0};
     std::string permission;
@@ -74,6 +86,9 @@ Status EncodeHighPerformanceTcpBufferAttr(
     const HighPerformanceTcpBufferAttr& attr, std::string* encoded);
 Status DecodeHighPerformanceTcpBufferAttr(const std::string& encoded,
                                           HighPerformanceTcpBufferAttr* attr);
+
 const char* HighPerformanceTcpPermissionName(Permission permission);
+
 }  // namespace mooncake::tent
-#endif
+
+#endif  // TENT_HIGH_PERFORMANCE_TCP_PROTOCOL_H_

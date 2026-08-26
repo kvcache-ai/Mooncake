@@ -61,5 +61,19 @@ TEST(TcpTransportConfigTest, DisabledTcpDoesNotEnableHighPerformanceGate) {
     EXPECT_FALSE(parsed.hpRequired());
 }
 
+TEST(TcpTransportConfigTest, DisabledTcpIgnoresHighPerformanceImplementation) {
+    Config config;
+    ASSERT_TRUE(
+        config
+            .load(
+                R"({"transports":{"tcp":{"enable":false,"implementation":"high_performance","high_performance":{"worker_count":0}}}})")
+            .ok());
+    TcpTransportConfig parsed;
+    ASSERT_TRUE(ParseTcpTransportConfig(config, &parsed).ok());
+    EXPECT_FALSE(parsed.enabled);
+    EXPECT_EQ(parsed.implementation, TcpImplementation::kHighPerformance);
+    EXPECT_FALSE(parsed.hpRequired());
+}
+
 }  // namespace
 }  // namespace mooncake::tent
