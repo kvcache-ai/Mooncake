@@ -48,8 +48,7 @@ class Replica;
 
 class SegmentLifetime {
    public:
-    SegmentLifetime()
-        : available_(std::make_shared<std::atomic<bool>>(true)) {}
+    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
 
     [[nodiscard]] bool isAvailable() const {
         return available_->load(std::memory_order_acquire);

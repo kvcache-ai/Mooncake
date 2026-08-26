@@ -191,8 +191,8 @@ class ClientLivenessRecord {
    private:
     [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
         TimePoint now) {
-        return CommitObservationLocked(
-            now, state_.load(std::memory_order_relaxed));
+        return CommitObservationLocked(now,
+                                       state_.load(std::memory_order_relaxed));
     }
 
     [[nodiscard]] ClientLivenessObservation CommitObservationLocked(

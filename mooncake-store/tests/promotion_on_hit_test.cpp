@@ -2174,22 +2174,8 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     // different-shard admission must be rejected right now.
     auto second_holder = PrepareSegment(
         *service, "seg_b", kDefaultSegmentBase + seg_size, seg_size);
-    // Promote second_holder into ok_client_ via ReMountSegment so its
-    // LOCAL_DISK replicas survive any ClearInvalidHandles run triggered
-    // by the first holder's expiry. MountSegment alone does not register
-    // the client as alive (only ReMountSegment does), and
-    // CleanupStaleHandles uses ok_client_ to decide which LOCAL_DISK
-    // replicas to erase — without this, second_holder's k_other replica
-    // would be wiped alongside the first holder's k_cold replica when
-    // ClearInvalidHandles runs.
-    {
-        Segment seg_b =
-            MakeSegment("seg_b", kDefaultSegmentBase + seg_size, seg_size);
-        seg_b.id = second_holder.segment_id;
-        std::vector<Segment> segs{seg_b};
-        auto remount = service->ReMountSegment(segs, second_holder.client_id);
-        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
-    }
+    // MountSegment and MountLocalDiskSegment establish Active liveness; no
+    // ReMountSegment is needed for stale cleanup to retain this holder.
     ASSERT_TRUE(InjectLocalDiskReplica(*service, second_holder.client_id,
                                        "k_other", 1024,
                                        second_holder.segment_name));

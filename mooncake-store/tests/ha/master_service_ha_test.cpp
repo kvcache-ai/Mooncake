@@ -740,6 +740,47 @@ class MasterServiceHATest : public ::testing::Test {
                });
     }
 
+    static std::shared_ptr<ClientLivenessRecord> ClientRecordForTesting(
+        MasterService& service, const UUID& client_id) {
+        return service.FindClientRecord(client_id);
+    }
+
+    static bool ProcessClientOffboardingForTesting(MasterService& service,
+                                                   ClientOffboardingJob& job) {
+        return service.ProcessClientOffboardingJob(job);
+    }
+
+    static bool HasCompletedMemoryReplicaForTesting(MasterService& service,
+                                                    const TenantId& tenant_id,
+                                                    const std::string& key) {
+        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
+        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
+        const auto tenant = shard->tenants.find(tenant_id);
+        if (tenant == shard->tenants.end()) {
+            return false;
+        }
+        const auto metadata = tenant->second.metadata.find(key);
+        return metadata != tenant->second.metadata.end() &&
+               metadata->second.HasReplica([](const Replica& replica) {
+                   return replica.is_memory_replica() && replica.is_completed();
+               });
+    }
+
+    static bool MemoryReplicaAffiliatedWithForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key,
+        const std::shared_ptr<ClientLivenessRecord>& record) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return false;
+        }
+        return accessor.Get().HasReplica([&](const Replica& replica) {
+            return replica.is_memory_replica() &&
+                   replica.isAffiliatedWith(record);
+        });
+    }
+
     static void SetLeaseDeadlineForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key,
@@ -1570,6 +1611,115 @@ TEST_F(MasterServiceHATest,
     auto result = put.get();
     ASSERT_TRUE(result.has_value()) << toString(result.error());
     EXPECT_TRUE(completed_while_client_locked);
+}
+
+TEST_F(MasterServiceHATest,
+       ClientOffboardingRetriesRejectedMetadataOpLogBeforeSegmentCommit) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("offboarding_retry_oplog")
+                      .build();
+    MasterService service(config);
+    auto writer = InstallRejectOnceWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    ASSERT_NE(writer, nullptr);
+
+    auto segment = MakeSegment("offboarding_retry_oplog_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    const std::string key = "offboarding_retry_oplog_key";
+    PutObjectOnSegment(service, client_id, key, segment.name);
+
+    const auto liveness = ClientRecordForTesting(service, client_id);
+    ASSERT_TRUE(liveness);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = liveness;
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    writer->RejectNextCommit();
+    ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
+    EXPECT_FALSE(job.metadata_cleanup_accepted);
+    ASSERT_EQ(job.prepared_segments.size(), 1u);
+    EXPECT_TRUE(
+        HasCompletedMemoryReplicaForTesting(service, kDefaultTenant, key));
+    EXPECT_TRUE(service.QuerySegmentStatusById(segment.id).has_value());
+
+    ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
+    EXPECT_TRUE(job.prepared_segments.empty());
+    EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
+    EXPECT_FALSE(ClientRecordForTesting(service, client_id));
+}
+
+TEST_F(MasterServiceHATest,
+       ClientOffboardingRetainsNameAcrossRejectedUnmountOpLog) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("offboarding_retry_unmount_oplog")
+                      .build();
+    MasterService service(config);
+    auto writer = InstallRejectOnceWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    ASSERT_NE(writer, nullptr);
+
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline_capacity = metrics.get_total_mem_capacity();
+    auto segment = MakeSegment("offboarding_reserved_segment_name");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    ASSERT_EQ(metrics.get_total_mem_capacity(),
+              baseline_capacity + static_cast<int64_t>(segment.size));
+
+    const auto liveness = ClientRecordForTesting(service, client_id);
+    ASSERT_TRUE(liveness);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = liveness;
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    writer->RejectNextSegmentUnmount();
+    ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
+    EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
+    EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
+
+    auto replacement = MakeSegment(segment.name, /*base=*/0x400000000);
+    const UUID replacement_client = generate_uuid();
+    auto blocked_mount = service.MountSegment(replacement, replacement_client);
+    ASSERT_FALSE(blocked_mount.has_value());
+    EXPECT_EQ(blocked_mount.error(), ErrorCode::INVALID_PARAMS);
+
+    ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
+    EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
+    ASSERT_TRUE(
+        service.MountSegment(replacement, replacement_client).has_value());
 }
 
 TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {

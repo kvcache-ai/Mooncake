@@ -178,10 +178,9 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
         const auto owner = segment_manager_->client_segments_.find(client_id);
-        const bool owned =
-            owner != segment_manager_->client_segments_.end() &&
-            std::find(owner->second.begin(), owner->second.end(), segment.id) !=
-                owner->second.end();
+        const bool owned = owner != segment_manager_->client_segments_.end() &&
+                           std::find(owner->second.begin(), owner->second.end(),
+                                     segment.id) != owner->second.end();
         const auto& mounted = existing->second.segment;
         if (!owned || mounted.name != segment.name ||
             mounted.base != segment.base || mounted.size != segment.size ||
@@ -191,12 +190,6 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         }
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
-    const auto name_it =
-        segment_manager_->segment_id_by_name_.find(segment.name);
-    if (name_it != segment_manager_->segment_id_by_name_.end()) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
 
@@ -282,7 +275,6 @@ void ScopedSegmentAccess::BindClientLiveness(
             }
         }
     }
-
 }
 
 ErrorCode ScopedSegmentAccess::ReMountSegment(
