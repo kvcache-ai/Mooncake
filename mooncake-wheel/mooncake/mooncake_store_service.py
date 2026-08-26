@@ -310,7 +310,7 @@ class MooncakeStoreService:
                     previous_segment_ids = list(self.mounted_segment_ids)
                     # /api/reconfigure binds through store.mount_segment ->
                     # MooncakeDistributedStore.mount_segment -> RealClient::mountSegment
-                    # -> Client::MountSegmentAndGetId -> MasterClient::MountSegment,
+                    # -> Client::MountSegmentAndGetId -> MasterClient::UpdateSegments,
                     # the standard allocator path: each mount mints a fresh UUID
                     # and the duplicate check is UUID-keyed. That path never calls
                     # MountNoFSegment or enters ScopedNoFSegmentAccess, so the NoF

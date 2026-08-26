@@ -323,7 +323,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         # A remount to the SAME path that fails to mount must not destroy the
         # still-healthy previous segments: the node keeps serving from them and
         # stays in decode mode (make-before-break). Same-path MBB is safe here
-        # because /api/reconfigure binds through MasterClient::MountSegment,
+        # because /api/reconfigure binds through MasterClient::UpdateSegments,
         # which mints a fresh UUID per mount and does not enter the NoF
         # te_endpoint-dedup path, so old and new cannot collide on the same path.
         old_id = "00000000-0000-0000-0000-000000000001"

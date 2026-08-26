@@ -97,10 +97,22 @@ class SegmentClient {
         segment_.base = segment_base;
         segment_.size = segment_size;
         segment_.te_endpoint = name;
-        auto mount_ec = master_client_.MountSegment(segment_);
-        if (!mount_ec.has_value()) {
+        mooncake::UpdateSegmentsRequest mount_request;
+        mount_request.request_intent =
+            mooncake::SegmentUpdateRequestIntent::REGISTER;
+        mount_request.segments.emplace_back(
+            segment_, mooncake::SegmentRegistrationIntent::NEW);
+        auto mount_result = master_client_.UpdateSegments(mount_request);
+        if (!mount_result.has_value() || mount_result->results.size() != 1 ||
+            mount_result->results[0].error_code != mooncake::ErrorCode::OK) {
+            auto error = mount_result.has_value()
+                             ? mooncake::ErrorCode::INTERNAL_ERROR
+                             : mount_result.error();
+            if (mount_result.has_value() && mount_result->results.size() == 1) {
+                error = mount_result->results[0].error_code;
+            }
             throw std::runtime_error("Failed to mount segment " + name +
-                                     ", ec=" + toString(mount_ec.error()));
+                                     ", ec=" + toString(error));
         }
     }
 
@@ -132,8 +144,16 @@ class SegmentClient {
                 mooncake::ClientStatus::NEED_REMOUNT &&
             !remount_future_.valid()) {
             remount_future_ = std::async(std::launch::async, [&]() {
-                auto remount_ec = master_client_.ReMountSegment({segment_});
-                if (!remount_ec.has_value()) {
+                mooncake::UpdateSegmentsRequest request;
+                request.request_intent =
+                    mooncake::SegmentUpdateRequestIntent::RECONCILE;
+                request.segments.emplace_back(
+                    segment_, mooncake::SegmentRegistrationIntent::REMOUNT);
+                auto result = master_client_.UpdateSegments(request);
+                if (!result.has_value() ||
+                    result->client_status != mooncake::ClientStatus::OK ||
+                    result->results.size() != 1 ||
+                    result->results[0].error_code != mooncake::ErrorCode::OK) {
                     throw std::runtime_error("Failed to remount segment");
                 }
             });

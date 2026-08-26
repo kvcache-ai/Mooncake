@@ -18,6 +18,7 @@
 #include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
+#include "segment_update_test_utils.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "utils.h"
@@ -538,7 +539,8 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
     segment.base = 0x600000000;
     segment.size = 2000;
     UUID client_id = generate_uuid();
-    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(
+        RegisterNewSegmentForTest(*service, segment, client_id).has_value());
 
     int port = getFreeTcpPort();
     MasterAdminServer admin(static_cast<uint16_t>(port), false);
@@ -707,7 +709,7 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         segment_.base = 0x300000000;
         segment_.size = 8 * 1024 * 1024;
         UUID client_id = generate_uuid();
-        (void)service_->MountSegment(segment_, client_id);
+        (void)RegisterNewSegmentForTest(*service_, segment_, client_id);
 
         ReplicateConfig cfg;
         cfg.replica_num = 1;
@@ -875,7 +877,7 @@ TEST_F(MasterAdminServerWithServiceTest,
     s.name = seg;
     s.base = 0x600000000;
     s.size = 4 * 1024 * 1024;
-    (void)service_->MountSegment(s, generate_uuid());
+    (void)RegisterNewSegmentForTest(*service_, s, generate_uuid());
 
     std::string body = R"({"segments":[")" + seg + R"("]})";
     auto resp = HttpPostJson("/api/v1/drain_jobs", body);
@@ -913,7 +915,7 @@ TEST_F(MasterAdminServerWithServiceTest, QueryDrainJobReturnsCreatedJob) {
     s.name = seg;
     s.base = 0x700000000;
     s.size = 4 * 1024 * 1024;
-    (void)service_->MountSegment(s, generate_uuid());
+    (void)RegisterNewSegmentForTest(*service_, s, generate_uuid());
 
     std::string body = R"({"segments":[")" + seg + R"("]})";
     auto create_resp = HttpPostJson("/api/v1/drain_jobs", body);
@@ -960,7 +962,7 @@ TEST_F(MasterAdminServerWithServiceTest, CancelDrainJobSucceeds) {
     s.name = seg;
     s.base = 0x800000000;
     s.size = 4 * 1024 * 1024;
-    (void)service_->MountSegment(s, generate_uuid());
+    (void)RegisterNewSegmentForTest(*service_, s, generate_uuid());
 
     std::string body = R"({"segments":[")" + seg + R"("]})";
     auto create_resp = HttpPostJson("/api/v1/drain_jobs", body);
@@ -1088,7 +1090,7 @@ TEST_F(MasterAdminServerWithServiceTest, DrainJobFullLifecycle) {
     s.name = seg;
     s.base = 0x900000000;
     s.size = 4 * 1024 * 1024;
-    (void)service_->MountSegment(s, generate_uuid());
+    (void)RegisterNewSegmentForTest(*service_, s, generate_uuid());
 
     std::string body = R"({"segments":[")" + seg + R"("]})";
     auto create_resp = HttpPostJson("/api/v1/drain_jobs", body);
@@ -1190,14 +1192,16 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     seg1.name = "seg_alpha";
     seg1.base = 0x400000000;
     seg1.size = 8 * 1024 * 1024;
-    ASSERT_TRUE(service->MountSegment(seg1, client_id).has_value());
+    ASSERT_TRUE(
+        RegisterNewSegmentForTest(*service, seg1, client_id).has_value());
 
     Segment seg2;
     seg2.id = generate_uuid();
     seg2.name = "seg_beta";
     seg2.base = 0x500000000;
     seg2.size = 4 * 1024 * 1024;
-    ASSERT_TRUE(service->MountSegment(seg2, client_id).has_value());
+    ASSERT_TRUE(
+        RegisterNewSegmentForTest(*service, seg2, client_id).has_value());
 
     ReplicateConfig cfg;
     cfg.replica_num = 1;
@@ -1281,7 +1285,8 @@ TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
     segment.name = "ld_segment";
     segment.base = 0x600000000;
     segment.size = 8 * 1024 * 1024;
-    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(
+        RegisterNewSegmentForTest(*service, segment, client_id).has_value());
     ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
 
     const std::string key = "ld_only_key";

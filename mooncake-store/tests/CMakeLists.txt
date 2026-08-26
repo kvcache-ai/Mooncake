@@ -139,6 +139,7 @@ set_tests_properties(object_checksum_client_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(rpc_timeout_test rpc_timeout_test.cpp)
 add_store_test(rpc_timeout_config_test rpc_timeout_config_test.cpp)
+add_store_test(update_segments_rpc_test update_segments_rpc_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
 endif()
