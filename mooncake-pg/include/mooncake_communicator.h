@@ -140,6 +140,7 @@ class MooncakeCommunicator {
     int getRank() const { return rank_; }
     int getSize() const;
     int getMaxGroupSize() const { return max_group_size_; }
+    int getMaxWorldSize() const { return context_.max_world_size; }
     bool isCpu() const { return is_cpu_; }
 
     PGResult<std::unique_ptr<WorkCompletion>> sendCpu(
