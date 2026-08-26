@@ -332,8 +332,9 @@ void P2PProxy::reportPeerFailure(int peer_rank) {
     if (!communicator) return;
 
     LinkEvent event;
-    event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
-    event.target_rank_epochs.assign(kMaxNumRanks, 0);
+    const auto max_world_size = communicator->getMaxWorldSize();
+    event.events.assign(max_world_size, LinkEvent::EventType::None);
+    event.target_rank_epochs.assign(max_world_size, 0);
     event.events[peer_global] = LinkEvent::EventType::Failure;
     event.target_rank_epochs[peer_global] = target_rank_epoch;
     communicator->getAgent().pushLinkEvent(event);

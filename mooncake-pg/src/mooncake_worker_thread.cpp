@@ -383,9 +383,11 @@ void MooncakeWorker::startWorker() {
                             }
                             if (has_any_attempted) {
                                 LinkEvent event;
-                                event.events.assign(kMaxNumRanks,
-                                                    LinkEvent::EventType::None);
-                                event.target_rank_epochs.assign(kMaxNumRanks,
+                                const auto max_world_size =
+                                    group->communicator->getMaxWorldSize();
+                                event.events.assign(
+                                    max_world_size, LinkEvent::EventType::None);
+                                event.target_rank_epochs.assign(max_world_size,
                                                                 0);
                                 for (int j = 0; j < group->maxGroupSize; ++j) {
                                     const auto peer_global =
