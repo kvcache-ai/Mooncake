@@ -241,6 +241,13 @@ class MasterService {
     uint64_t GetKvClearedSuppressedForTesting() const;
 
     /**
+     * @brief Unified external entry point for incremental registration and
+     * full client segment reconciliation.
+     */
+    auto UpdateSegments(const UpdateSegmentsRequest& request)
+        -> tl::expected<UpdateSegmentsResponse, ErrorCode>;
+
+    /**
      * @brief Mount a memory segment for buffer allocation. This function is
      * idempotent.
      * @return ErrorCode::OK on success,
@@ -1004,6 +1011,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id);
+    std::vector<SegmentUpdateResult> MountNewSegments(
+        const std::vector<Segment>& segments, const UUID& client_id);
 
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);

@@ -349,10 +349,12 @@ class Client {
         ReplicaType replica_type);
 
     /**
-     * @brief Registers a memory segment to master for allocation
+     * @brief Registers local memory and queues the segment for asynchronous
+     * Master registration.
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
-     * @return ErrorCode indicating success/failure
+     * @return Success once local registration is accepted. Master-side
+     * registration is retried by the control-plane flusher.
      */
     tl::expected<void, ErrorCode> MountSegment(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
@@ -368,8 +370,8 @@ class Client {
                                                  size_t size);
 
     /**
-     * @brief Mounts a memory segment and returns its generated Segment UUID.
-     *        Logic is identical to MountSegment, but returns the segment id.
+     * @brief Registers local memory, queues Master registration, and returns
+     * the generated Segment UUID.
      */
     tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
@@ -932,7 +934,7 @@ class Client {
     enum class SegmentSyncState : uint8_t {
         NEW_PENDING = 0,
         REMOUNT_PENDING,
-        ALIGNED,
+        ACTIVE,
     };
 
     struct MountedSegmentEntry {
@@ -945,11 +947,11 @@ class Client {
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
+    // Serializes segment update RPCs with unmount operations. Mount only needs
+    // mounted_segments_mutex_, so newly created segments can enter the next
+    // flusher snapshot while an RPC is in flight.
+    std::mutex segment_update_mutex_;
     MountedSegmentMap mounted_segments_;
-    // True after the latest full segment reconciliation succeeds. Guarded by
-    // mounted_segments_mutex_ so mounts and NEED_REMOUNT transitions have one
-    // ordering point.
-    bool segments_aligned_with_master_{false};
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.
@@ -1006,6 +1008,9 @@ class Client {
     std::atomic<bool> leader_monitor_running_{false};
     std::thread storage_heartbeat_thread_;
     std::atomic<bool> storage_heartbeat_running_{false};
+    std::mutex storage_control_mutex_;
+    std::condition_variable storage_control_cv_;
+    std::atomic<bool> segment_flush_requested_{false};
     std::thread task_poll_thread_;
     std::atomic<bool> task_poll_running_{false};
     std::atomic<bool> last_ping_success_{false};
