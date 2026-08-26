@@ -1880,6 +1880,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     // Start put operation
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    if (!start_result &&
+        start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
+        healDanglingLocalDiskReplica(key)) {
+        start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    }
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -1991,6 +1996,47 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     return {};
+}
+
+bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
+    auto replicas = master_client_.GetReplicaList(key);
+    if (!replicas) {
+        return false;
+    }
+    bool has_completed_local_disk = false;
+    for (const auto& replica : replicas->replicas) {
+        if (replica.status != ReplicaStatus::COMPLETE) {
+            continue;
+        }
+        if (replica.is_local_disk_replica() &&
+            replica.get_local_disk_descriptor().client_id == client_id_) {
+            has_completed_local_disk = true;
+            continue;
+        }
+        // A completed replica owned elsewhere (memory, remote disk, DFS) can
+        // still serve reads, so there is nothing for this client to heal.
+        return false;
+    }
+    if (!has_completed_local_disk || !storage_backend_) {
+        return false;
+    }
+    // RemoveAll wipes client SSD files while master keeps the metadata
+    // (issue #3709), leaving a completed entry whose backing file is gone.
+    // Reporting success for a Put on top of it would store nothing.
+    auto exists = storage_backend_->IsExist(key);
+    if (!exists || *exists) {
+        return false;
+    }
+    auto evicted =
+        master_client_.EvictDiskReplica(key, ReplicaType::LOCAL_DISK);
+    if (!evicted) {
+        LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for key="
+                     << key << ": " << toString(evicted.error());
+        return false;
+    }
+    LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key=" << key
+                 << " (backing file already gone)";
+    return true;
 }
 
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,

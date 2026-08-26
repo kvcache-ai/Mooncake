@@ -14,6 +14,7 @@
 #include "storage_backend.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
+#include "utils.h"
 #include "utils/common.h"
 
 namespace mooncake {
@@ -868,6 +869,120 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
         FileStorageBatchLoad(fileStorage, allocate_res.value()->slices);
     ASSERT_TRUE(load_result);
     // No crash = success. No metrics pointer, so nothing to verify.
+}
+
+// Issue #3709: a RemoveAll-style physical wipe of the SSD files while master
+// still tracks the key's LOCAL_DISK replica leaves a dangling entry. A Put
+// for the same key must not report success while storing nothing: the client
+// evicts the dangling replica and retries PutStart, so the new data is
+// actually written.
+TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "heal_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+    // Memory segment and registered buffers, so the retried PutStart can
+    // allocate a memory replica and Get can read it back.
+    constexpr size_t kSegSize = 64 * 1024 * 1024;
+    void* seg_ptr = allocate_buffer_allocator_memory(kSegSize);
+    ASSERT_NE(seg_ptr, nullptr);
+    ASSERT_TRUE(
+        client.value()->MountSegment(seg_ptr, kSegSize, "tcp").has_value());
+    SimpleAllocator allocator(16 * 1024 * 1024);
+    ASSERT_TRUE(client.value()
+                    ->RegisterLocalMemory(allocator.getBase(), 16 * 1024 * 1024,
+                                          "cpu:0", false, false)
+                    .has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/heal_ssd";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+    ASSERT_TRUE(file_storage.storage_backend_->Init());
+    {
+        MutexLocker locker(&file_storage.offloading_mutex_);
+        file_storage.enable_offloading_ = true;
+    }
+
+    // Offload one key so master tracks a LOCAL_DISK replica backed by a real
+    // file on the client SSD.
+    const std::string key = "heal_key";
+    std::string original(512, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object.emplace(key, std::vector<Slice>{Slice{original.data(), 512}});
+    auto offload_result = file_storage.storage_backend_->BatchOffload(
+        batch_object,
+        [&file_storage](const std::vector<std::string>& keys,
+                        std::vector<StorageObjectMetadata>& metadatas) {
+            for (auto& metadata : metadatas) {
+                metadata.transport_endpoint = file_storage.local_rpc_addr_;
+            }
+            auto result =
+                file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
+            return result ? ErrorCode::OK : result.error();
+        });
+    ASSERT_TRUE(offload_result.has_value());
+
+    auto query = client.value()->Query(key);
+    ASSERT_TRUE(query.has_value());
+    bool has_local_disk = false;
+    for (const auto& replica : query->replicas) {
+        has_local_disk |= replica.is_local_disk_replica();
+    }
+    ASSERT_TRUE(has_local_disk);
+
+    // Simulate the #3709 divergence: the SSD file is wiped physically while
+    // master keeps the metadata.
+    file_storage.storage_backend_->RemoveAll();
+    auto exists = file_storage.storage_backend_->IsExist(key);
+    ASSERT_TRUE(exists.has_value());
+    ASSERT_FALSE(exists.value());
+    query = client.value()->Query(key);
+    ASSERT_TRUE(query.has_value());
+
+    // Put the same key again: the dangling replica must be evicted and the
+    // Put must really store new data.
+    void* buf = allocator.allocate(512);
+    ASSERT_NE(buf, nullptr);
+    std::string updated(512, 'y');
+    std::memcpy(buf, updated.data(), 512);
+    std::vector<Slice> slices{Slice{buf, 512}};
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto put = client.value()->Put(key, slices, cfg);
+    ASSERT_TRUE(put.has_value())
+        << "Put over a dangling replica failed: " << toString(put.error());
+    allocator.deallocate(buf, 512);
+
+    // The new data is readable through the normal Get path.
+    void* read_buf = allocator.allocate(512);
+    ASSERT_NE(read_buf, nullptr);
+    std::vector<Slice> read_slices{Slice{read_buf, 512}};
+    auto get = client.value()->Get(key, read_slices);
+    ASSERT_TRUE(get.has_value())
+        << "Get after self-heal failed: " << toString(get.error());
+    EXPECT_EQ(std::memcmp(read_slices[0].ptr, updated.data(), 512), 0);
+    allocator.deallocate(read_buf, 512);
+
+    auto unmount = client.value()->UnmountSegment(seg_ptr, kSegSize);
+    EXPECT_TRUE(unmount.has_value());
+    std::free(seg_ptr);
 }
 
 }  // namespace mooncake

@@ -775,6 +775,12 @@ class Client {
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
+    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
+    // completed replica is a LOCAL_DISK replica owned by this client and its
+    // backing file is gone (issue #3709). If so, evict the dangling replica
+    // so the Put can be retried. Returns true only when a replica was
+    // actually evicted.
+    bool healDanglingLocalDiskReplica(const ObjectKey& key);
     ErrorCode InitTransferEngine(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
