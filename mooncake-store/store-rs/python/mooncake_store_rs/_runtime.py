@@ -102,7 +102,7 @@ def upstream_roots(package_root: pathlib.Path | None = None) -> list[pathlib.Pat
     source_root = source_tree_root(package_root)
     if source_root is not None:
         candidates.append(source_root / "third_party" / "Mooncake")
-        candidates.extend(source_root.parents[:3])
+        candidates.extend(list(source_root.parents)[:3])
 
     return [
         candidate
