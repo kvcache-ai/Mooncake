@@ -51,6 +51,8 @@ using RdmaTaskStorage = Slab<RdmaTask>;
 struct RdmaTask {
     int num_slices;
     Request request;
+    BatchID progress_batch_id{0};
+    std::function<void(BatchID)> notify_progress;
     // Resolved by TransportSelector and copied from RdmaSubBatch. The
     // per-slice path runs later on worker threads, so it must carry the same
     // device policy as the aggregate allocation path.
@@ -148,7 +150,11 @@ static inline void updateSliceStatus(RdmaSlice* slice,
                 ? COMPLETED
                 : task->first_error;
         if (final_st == PENDING) final_st = FAILED;
-        __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
+        if (__sync_bool_compare_and_swap(&task->status_word, PENDING,
+                                         final_st)) {
+            if (task->notify_progress)
+                task->notify_progress(task->progress_batch_id);
+        }
     }
     task->deref();
 }
