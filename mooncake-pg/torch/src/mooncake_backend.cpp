@@ -435,16 +435,24 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::launchCollective(
     checkResult(GpuFn(args..., comm_, convertStream(stream),
                       failed_ranks_hint.data(), failed_ranks_hint_count),
                 operation);
+    // Clear a sticky error before recording the completion event and checking
+    // capture state on the collective's stream.
+    cudaGetLastError();
     if (postCompletion) postCompletion();
     auto event = std::make_shared<c10::Event>(kGpuDeviceType);
     event->record(stream);
-    if (at::cuda::currentStreamCaptureStatus() ==
-        c10::cuda::CaptureStatus::None) {
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream.stream(), &captureStatus);
+    const bool is_captured = captureStatus != cudaStreamCaptureStatusNone ||
+                             at::cuda::currentStreamCaptureStatus() !=
+                                 c10::cuda::CaptureStatus::None;
+    work_tracker_->notifyCapture(is_captured);
+    if (!is_captured) {
         work_tracker_->evictCompleted();
     }
     return c10::make_intrusive<MooncakeWorkCuda>(
         opType, std::move(event), std::move(failed_ranks_hint), work_tracker_,
-        std::move(keepAlive));
+        std::move(keepAlive), is_captured);
 }
 
 template <auto CpuFn, auto GpuFn, typename... Args>
