@@ -38,10 +38,11 @@ namespace {
 
 constexpr char kSegmentName[] = "local-notification-test-segment";
 
-std::shared_ptr<Config> makeConfig(bool enable_tcp) {
+std::shared_ptr<Config> makeConfig(bool enable_tcp,
+                                   const char* name = kSegmentName) {
     auto config = std::make_shared<Config>();
     config->set("metadata_type", "p2p");
-    config->set("local_segment_name", kSegmentName);
+    config->set("local_segment_name", name);
     config->set("rpc_server_hostname", "127.0.0.1");
     config->set("rpc_server_port", "0");
     config->set("log_level", "warning");
@@ -57,6 +58,11 @@ std::shared_ptr<Config> makeConfig(bool enable_tcp) {
     config->set("transports/mpcomm/enable", false);
     config->set("transports/tpu/enable", false);
     config->set("transports/ub/enable", false);
+    // The progress worker would fire submit hooks from its own thread while
+    // the test reads the stand-in transport's counter, and the runtime queue
+    // turns it on implicitly. Keep every poll on the calling thread.
+    config->set("enable_progress_worker", false);
+    config->set("enable_runtime_queue", false);
     return config;
 }
 
@@ -140,6 +146,8 @@ TEST(LocalNotificationTest, WorksWithoutAnyNotificationTransport) {
 class LocalSendFailsTransport : public Transport {
    public:
     int send_attempts = 0;
+    // Lets a test stop failing, standing in for a peer that comes back.
+    bool fail_sends = true;
 
     Status install(std::string&, std::shared_ptr<ControlService>,
                    std::shared_ptr<Topology>,
@@ -151,6 +159,7 @@ class LocalSendFailsTransport : public Transport {
 
     Status sendNotification(SegmentID, const Notification&) override {
         ++send_attempts;
+        if (!fail_sends) return Status::OK();
         return Status::InternalError("Notification QP not connected");
     }
 
@@ -228,6 +237,110 @@ TEST(LocalNotificationTest, TransferBoundSelfNotificationIsDelivered) {
     (void)engine.freeBatch(batch);
     (void)engine.unregisterLocalMemory(source.data(), kBufLen);
     (void)engine.unregisterLocalMemory(target.data(), kBufLen);
+}
+
+// A hook fires once per target, and it reruns from every later poll until all
+// of its targets have taken delivery. Self-targeted sends always succeed now,
+// so a peer that stays unreachable must not make the engine re-queue the local
+// copy on each of those polls: the receiver would see one "transfer complete"
+// per poll and the local queue would grow without bound.
+TEST(LocalNotificationTest, NotifiedTargetIsNotRedeliveredWhileAPeerFails) {
+    TransferEngineImpl peer(makeConfig(/*enable_tcp=*/true, "peer-segment"));
+    ASSERT_TRUE(peer.available());
+    TransferEngineImpl engine(makeConfig(/*enable_tcp=*/true));
+    ASSERT_TRUE(engine.available());
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> source(kBufLen, 0x5A);
+    std::vector<uint8_t> local_target(kBufLen, 0);
+    std::vector<uint8_t> peer_target(kBufLen, 0);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), kBufLen).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(local_target.data(), kBufLen).ok());
+    ASSERT_TRUE(peer.registerLocalMemory(peer_target.data(), kBufLen).ok());
+
+    SegmentID remote = ~0ull;
+    ASSERT_TRUE(engine.openSegment(remote, peer.getSegmentName()).ok());
+    ASSERT_NE(remote, LOCAL_SEGMENT_ID);
+
+    // Notification routing goes to a transport that always fails, so the hook's
+    // remote leg never succeeds while the data path still completes.
+    auto probe = std::make_shared<LocalSendFailsTransport>();
+    std::string seg_name = engine.getSegmentName();
+    ASSERT_TRUE(probe->install(seg_name, nullptr, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, probe);
+
+    Notification notifi;
+    notifi.name = kSegmentName;
+    notifi.msg = "two-targets";
+
+    Request local_req;
+    local_req.opcode = Request::WRITE;
+    local_req.source = source.data();
+    local_req.target_id = LOCAL_SEGMENT_ID;
+    local_req.target_offset = reinterpret_cast<uint64_t>(local_target.data());
+    local_req.length = kBufLen;
+
+    Request remote_req;
+    remote_req.opcode = Request::WRITE;
+    remote_req.source = source.data();
+    remote_req.target_id = remote;
+    remote_req.target_offset = reinterpret_cast<uint64_t>(peer_target.data());
+    remote_req.length = kBufLen;
+
+    BatchID batch = engine.allocateBatch(4);
+    // Submitted peer-first: hook.targets is an unordered_set, and on libstdc++
+    // it iterates in reverse insertion order, so this puts the local target
+    // ahead of the failing peer. The assertions below hold either way; this
+    // only decides whether the case is exercised or trivially satisfied.
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {remote_req, local_req}, notifi).ok());
+
+    TransferStatus overall{};
+    uint64_t polls = 0;
+    while (true) {
+        ASSERT_TRUE(engine.getTransferStatus(batch, overall).ok());
+        if (overall.s == TransferStatusEnum::COMPLETED) break;
+        ASSERT_NE(overall.s, TransferStatusEnum::FAILED);
+        waitBeforeNextPoll(polls++);
+        ASSERT_LT(polls, 100000u) << "two-target transfer did not complete";
+    }
+
+    // Keep polling: every poll of a completed batch reruns the hook, and the
+    // remote target keeps failing, so the hook is never marked fired.
+    size_t delivered = 0;
+    for (int i = 0; i < 5; ++i) {
+        std::vector<Notification> received;
+        (void)engine.receiveNotification(received);
+        delivered += received.size();
+        TransferStatus again{};
+        (void)engine.getTransferStatus(batch, again);
+    }
+
+    // Let the peer recover. The hook can now complete, and whichever target
+    // was still outstanding is sent - but a target that already took delivery
+    // must not be sent a second time.
+    probe->fail_sends = false;
+    for (int i = 0; i < 3; ++i) {
+        std::vector<Notification> received;
+        (void)engine.receiveNotification(received);
+        delivered += received.size();
+        TransferStatus again{};
+        (void)engine.getTransferStatus(batch, again);
+    }
+
+    // Exactly once, across the failing phase and the recovery. Without
+    // per-target progress the failing phase re-queues the local copy on every
+    // poll and this is 7.
+    EXPECT_EQ(delivered, 1u)
+        << "self-notification delivered " << delivered << " times";
+    // The peer really was retried while it was down, so the guard above comes
+    // from per-target progress and not from the hook giving up.
+    EXPECT_GT(probe->send_attempts, 1);
+
+    (void)engine.freeBatch(batch);
+    (void)engine.unregisterLocalMemory(source.data(), kBufLen);
+    (void)engine.unregisterLocalMemory(local_target.data(), kBufLen);
+    (void)peer.unregisterLocalMemory(peer_target.data(), kBufLen);
 }
 
 }  // namespace tent

@@ -2231,15 +2231,22 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
             }
         }
         if (!all_completed) continue;
-        Status last = Status::OK();
-        for (auto target_id : hook.targets) {
-            last = sendNotification(target_id, hook.notifi);
-            if (!last.ok()) {
-                LOG(WARNING) << "sendNotification failed: " << last.ToString();
+        // Drop each target as it takes delivery. The hook is only marked
+        // fired once every target has, so this loop reruns from a later poll
+        // while any of them still fails, and the ones that already succeeded
+        // must not be notified again. Self-targeted sends made that
+        // reachable: they now always succeed, so a peer that stays
+        // unreachable used to re-queue the local notification on every poll.
+        for (auto it = hook.targets.begin(); it != hook.targets.end();) {
+            auto status = sendNotification(*it, hook.notifi);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "sendNotification failed: " << status.ToString();
                 break;
             }
+            it = hook.targets.erase(it);
         }
-        if (last.ok()) hook.fired = true;
+        if (hook.targets.empty()) hook.fired = true;
     }
     return Status::OK();
 }
