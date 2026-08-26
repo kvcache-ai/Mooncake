@@ -142,9 +142,11 @@ void LocalTransferAdmissionQueue::DispatchScheduler::promoteDeadlineUrgentOwners
 }
 
 LocalTransferAdmissionQueue::DispatchScheduler::Candidate
-LocalTransferAdmissionQueue::DispatchScheduler::next(const OwnerMap& owners) {
+LocalTransferAdmissionQueue::DispatchScheduler::next(
+    size_t remaining_bytes, const OwnerMap& owners) {
     for (size_t priority = PRIO_HIGH; priority < classes_.size(); ++priority) {
         auto& priority_class = classes_[priority];
+        bool has_queued_owner = false;
         for (size_t offset = 0; offset < priority_class.lanes.size(); ++offset) {
             const size_t lane =
                 (priority_class.next_kind_lane + offset) %
@@ -154,11 +156,16 @@ LocalTransferAdmissionQueue::DispatchScheduler::next(const OwnerMap& owners) {
                 const auto owner_it = owners.find(queue.front());
                 if (owner_it != owners.end() &&
                     owner_it->second.state == QueueState::Queued) {
-                    return Candidate{queue.front(), priority, lane, true};
+                    has_queued_owner = true;
+                    if (owner_it->second.request.length <= remaining_bytes) {
+                        return Candidate{queue.front(), priority, lane, true};
+                    }
+                    break;
                 }
                 queue.pop_front();
             }
         }
+        if (has_queued_owner) return Candidate{0, priority, 0, true};
     }
     return {};
 }
@@ -189,17 +196,9 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     if (submit.batch_token == 0) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
     }
-    if (submit.owners.empty()) return Status::OK();
 
     std::vector<PendingPublicTask> public_tasks;
-    size_t public_task_count = 0;
-    for (const auto& owner : submit.owners) {
-        CHECK_STATUS(checkedAdd(public_task_count, 1, public_task_count));
-        CHECK_STATUS(checkedAdd(public_task_count,
-                                owner.derived_task_ids.size(),
-                                public_task_count));
-    }
-    public_tasks.reserve(public_task_count);
+    size_t public_task_extent = 0;
     size_t byte_charge = 0;
     size_t user_owner_charge = 0;
     size_t user_byte_charge = 0;
@@ -219,12 +218,13 @@ Status LocalTransferAdmissionQueue::tryAdmit(
             return Status::InvalidArgument("empty transfer request" LOC_MARK);
         }
 
+        size_t task_extent = 0;
+        CHECK_STATUS(checkedAdd(owner.owner_task_id, 1, task_extent));
+        public_task_extent = std::max(public_task_extent, task_extent);
         public_tasks.push_back({owner.owner_task_id, owner_index});
         for (const auto derived_task_id : owner.derived_task_ids) {
-            if (derived_task_id == owner.owner_task_id) {
-                return Status::InvalidArgument(
-                    "owner task id appears in derived task ids" LOC_MARK);
-            }
+            CHECK_STATUS(checkedAdd(derived_task_id, 1, task_extent));
+            public_task_extent = std::max(public_task_extent, task_extent);
             public_tasks.push_back({derived_task_id, owner_index});
         }
 
@@ -235,36 +235,6 @@ Status LocalTransferAdmissionQueue::tryAdmit(
             CHECK_STATUS(checkedAdd(user_byte_charge, owner.request.length,
                                     user_byte_charge));
         }
-    }
-
-    size_t first_public_task_id = std::numeric_limits<size_t>::max();
-    size_t public_task_extent = 0;
-    for (const auto& public_task : public_tasks) {
-        size_t task_extent = 0;
-        CHECK_STATUS(checkedAdd(public_task.task_id, 1, task_extent));
-        first_public_task_id =
-            std::min(first_public_task_id, public_task.task_id);
-        public_task_extent = std::max(public_task_extent, task_extent);
-    }
-
-    if (public_task_extent - first_public_task_id != public_tasks.size()) {
-        return Status::InvalidArgument(
-            "public task ids must form a contiguous range" LOC_MARK);
-    }
-    std::vector<size_t> pending_owner_indices(public_tasks.size(),
-                                              submit.owners.size());
-    for (const auto& public_task : public_tasks) {
-        auto& owner_index =
-            pending_owner_indices[public_task.task_id - first_public_task_id];
-        if (owner_index != submit.owners.size()) {
-            return Status::InvalidArgument("duplicate public task id" LOC_MARK);
-        }
-        owner_index = public_task.owner_index;
-    }
-
-    if (public_tasks.size() > submit.batch_slots_left) {
-        return Status::TooManyRequests(
-            "batch public task capacity exceeded" LOC_MARK);
     }
 
     auto batch_it = batch_index_.find(submit.batch_token);
@@ -316,8 +286,6 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     auto& batch_index =
         batch_index_.try_emplace(submit.batch_token).first->second;
 
-    std::vector<QueueOwnerId> owner_ids;
-    owner_ids.reserve(submit.owners.size());
     for (const auto& owner_input : submit.owners) {
         const QueueOwnerId owner_id = next_owner_id_++;
         QueueOwner owner;
@@ -327,7 +295,6 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.degradation_eligible = owner_input.degradation_eligible;
         owners_.emplace(owner_id, owner);
         batch_index.owner_ids.push_back(owner_id);
-        owner_ids.push_back(owner_id);
         scheduler_.enqueue(owner_id, owner_input.request.priority,
                            owner_input.kind, limits_.deadline_aware, owners_);
         admitted_owner_ids.push_back(owner_id);
@@ -335,10 +302,9 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     if (batch_index.public_task_owners.size() < public_task_extent) {
         batch_index.public_task_owners.resize(public_task_extent, 0);
     }
-    for (size_t offset = 0; offset < pending_owner_indices.size(); ++offset) {
-        const auto task_id = first_public_task_id + offset;
-        const auto owner_index = pending_owner_indices[offset];
-        batch_index.public_task_owners[task_id] = owner_ids[owner_index];
+    for (const auto& public_task : public_tasks) {
+        batch_index.public_task_owners[public_task.task_id] =
+            admitted_owner_ids[public_task.owner_index];
     }
 
     outstanding_owners_ = next_outstanding_owners;
@@ -426,8 +392,9 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     size_t used_owners = 0;
     size_t used_bytes = 0;
     while (used_owners < max_owners && used_bytes < max_bytes) {
-        const auto candidate = scheduler_.next(owners_);
-        if (!candidate.found) break;
+        const auto candidate =
+            scheduler_.next(max_bytes - used_bytes, owners_);
+        if (!candidate.found || candidate.owner_id == 0) break;
 
         auto owner_it = owners_.find(candidate.owner_id);
         if (owner_it == owners_.end()) continue;
@@ -440,15 +407,11 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
             continue;
         }
 
-        const auto& owner = owner_it->second;
-        const size_t remaining_bytes = max_bytes - used_bytes;
-        if (owner.request.length > remaining_bytes) break;
-
         scheduler_.consume(candidate);
         owner_it->second.state = QueueState::Dispatching;
         picked.push_back(candidate.owner_id);
         ++used_owners;
-        used_bytes += owner.request.length;
+        used_bytes += owner_it->second.request.length;
     }
     return picked;
 }

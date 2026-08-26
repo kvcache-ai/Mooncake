@@ -2077,7 +2077,6 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         batch->queue_token != 0 ? batch->queue_token : nextBatchToken();
     QueueSubmit submit;
     submit.batch_token = batch_token;
-    submit.batch_slots_left = batch->max_size - batch->task_list.size();
     submit.owners.reserve(prepared.owners.size());
     for (const auto& owner : prepared.owners) {
         if (owner.request.length > runtime_queue_config_.max_dispatch_bytes) {

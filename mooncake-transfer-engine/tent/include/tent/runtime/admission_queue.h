@@ -84,8 +84,6 @@ struct QueueOwnerInput {
 
 struct QueueSubmit {
     uint64_t batch_token{0};
-    // Caller-computed remaining public task slots for this submit.
-    size_t batch_slots_left{0};
     // Public task ids in one submit form a contiguous range in
     // Batch::task_list, although owner/derived ids need not be presented in
     // that order.
@@ -202,7 +200,10 @@ class LocalTransferAdmissionQueue {
                                          uint64_t promotion_slack_ns,
                                          const OwnerMap& owners);
 
-        Candidate next(const OwnerMap& owners);
+        // Returns a fitting owner from the highest non-empty priority. When
+        // that priority has queued work but no lane head fits, found is true
+        // and owner_id is zero so callers do not fall through to lower work.
+        Candidate next(size_t remaining_bytes, const OwnerMap& owners);
 
         void consume(const Candidate& candidate);
 
