@@ -638,6 +638,9 @@ library_assets = {
         upstream_build_dir / "mooncake-common" / "libasio.so",
         upstream_build_dir / "mooncake-asio" / "libasio.so",
     ],
+    "libmooncake_common.so": [
+        upstream_build_dir / "mooncake-common" / "src" / "libmooncake_common.so",
+    ],
     "libtransfer_engine.so": [
         upstream_build_dir / "mooncake-transfer-engine" / "src" / "libtransfer_engine.so",
     ],
@@ -664,6 +667,7 @@ if python_libdir and python_ldlibrary and python_ldlibrary.endswith(".so"):
 relative_rpath_assets = {
     "engine.so",
     "libtransfer_engine.so",
+    "libmooncake_common.so",
     "libtent_shared.so",
     "libmooncake_classic_shim.so",
     "libmooncake_tent_shim.so",
