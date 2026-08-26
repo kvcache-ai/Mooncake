@@ -9,13 +9,24 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+GIT_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+REPO_ROOT=${GIT_ROOT}
+REPO_PATH_IN_MOUNT=
+if [[ ! -f "${REPO_ROOT}/Cargo.toml" ]]; then
+  REPO_PATH_IN_MOUNT=mooncake-store/store-rs
+  REPO_ROOT="${GIT_ROOT}/${REPO_PATH_IN_MOUNT}"
+fi
+MOUNT_ROOT=${GIT_ROOT}
 
 UBUNTU_VERSION=${UBUNTU_VERSION:-22.04}
 PYTHON_VERSION=${PYTHON_VERSION:-system}
 DOCKER_IMAGE=${DOCKER_IMAGE:-}
 PYTHON_TAG=
-WORKDIR_IN_CONTAINER=${WORKDIR_IN_CONTAINER:-/work}
+MOUNT_POINT_IN_CONTAINER=${MOUNT_POINT_IN_CONTAINER:-/work}
+WORKDIR_IN_CONTAINER=${WORKDIR_IN_CONTAINER:-${MOUNT_POINT_IN_CONTAINER}}
+if [[ -n "${REPO_PATH_IN_MOUNT}" && "${WORKDIR_IN_CONTAINER}" == "${MOUNT_POINT_IN_CONTAINER}" ]]; then
+  WORKDIR_IN_CONTAINER="${MOUNT_POINT_IN_CONTAINER}/${REPO_PATH_IN_MOUNT}"
+fi
 CACHE_DIR=${MOONCAKE_DOCKER_CACHE_DIR:-"${REPO_ROOT}/target/docker-wheel-cache"}
 CACHE_DIR_IN_CONTAINER=${CACHE_DIR_IN_CONTAINER:-/cache}
 REBUILD_IMAGE=${REBUILD_IMAGE:-0}
@@ -34,8 +45,7 @@ Usage: scripts/build/build-wheel-ubuntu-docker.sh [maturin build args...]
 Build the Mooncake Python wheels inside an Ubuntu Docker image and write the
 same artifacts as scripts/build/build-wheel.sh:
 
-  dist/wheels/mooncake-*.whl
-  dist/wheels/mooncake_pro-*.whl
+  dist/wheels/mooncake_store_rs-*.whl
   dist/bin/mooncake-store-client
   dist/bin/mooncake-store-admin
 
@@ -209,14 +219,14 @@ map_repo_path() {
     return 0
   fi
 
-  if [[ "${value}" == "${REPO_ROOT}" ]]; then
-    printf '%s\n' "${WORKDIR_IN_CONTAINER}"
+  if [[ "${value}" == "${MOUNT_ROOT}" ]]; then
+    printf '%s\n' "${MOUNT_POINT_IN_CONTAINER}"
     return 0
   fi
 
-  if [[ "${value}" == "${REPO_ROOT}/"* ]]; then
-    relative=${value#"${REPO_ROOT}/"}
-    printf '%s/%s\n' "${WORKDIR_IN_CONTAINER}" "${relative}"
+  if [[ "${value}" == "${MOUNT_ROOT}/"* ]]; then
+    relative=${value#"${MOUNT_ROOT}/"}
+    printf '%s/%s\n' "${MOUNT_POINT_IN_CONTAINER}" "${relative}"
     return 0
   fi
 
@@ -407,8 +417,9 @@ declare -a DOCKER_RUN_ARGS=(
   -e "WHEEL_VENV=${CACHE_DIR_IN_CONTAINER}/venv"
   -e "MOONCAKE_UPSTREAM_BUILD_DIR=${DEFAULT_UPSTREAM_BUILD_DIR}"
   -e "PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  -e "CONTAINER_MOUNT_ROOT=${MOUNT_POINT_IN_CONTAINER}"
   -e "CONTAINER_WORKDIR=${WORKDIR_IN_CONTAINER}"
-  -v "${REPO_ROOT}:${WORKDIR_IN_CONTAINER}"
+  -v "${MOUNT_ROOT}:${MOUNT_POINT_IN_CONTAINER}"
   -v "${CACHE_DIR}:${CACHE_DIR_IN_CONTAINER}"
   -w "${WORKDIR_IN_CONTAINER}"
 )
@@ -460,25 +471,13 @@ set -euo pipefail
 
 configure_git_safe_directories() {
   local root=$1
-  local modules_file
-  local module_root
-  local key
-  local path
 
   git config --global --add safe.directory "${root}"
   git config --global --add safe.directory "${root}/*"
-
-  while IFS= read -r modules_file; do
-    module_root=$(cd -- "$(dirname "${modules_file}")" && pwd)
-    while read -r key path; do
-      [[ -z "${path:-}" ]] && continue
-      git config --global --add safe.directory "${module_root}/${path}"
-    done < <(git config --file "${modules_file}" --get-regexp "^submodule\\..*\\.path$" 2>/dev/null || true)
-  done < <(find "${root}" -name .gitmodules -print)
 }
 
 mkdir -p "${HOME}" "${CARGO_HOME}"
-configure_git_safe_directories "${CONTAINER_WORKDIR}"
+configure_git_safe_directories "${CONTAINER_MOUNT_ROOT}"
 cd "${CONTAINER_WORKDIR}"
 exec ./scripts/build/build-wheel.sh "$@"
 ' bash "$@"

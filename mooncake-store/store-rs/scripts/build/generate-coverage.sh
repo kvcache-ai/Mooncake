@@ -3,9 +3,16 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store/store-rs"
 
 COVERAGE_DIR=${COVERAGE_DIR:-"${REPO_ROOT}/target/coverage"}
-UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR:-"${REPO_ROOT}/third_party/Mooncake"}
+if [[ -n "${MOONCAKE_UPSTREAM_DIR:-}" ]]; then
+  UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR}
+elif [[ -d "${REPO_ROOT}/third_party/Mooncake/mooncake-transfer-engine" ]]; then
+  UPSTREAM_DIR="${REPO_ROOT}/third_party/Mooncake"
+else
+  UPSTREAM_DIR=$(cd -- "${REPO_ROOT}/../.." && pwd)
+fi
 SUMMARY_FILE="${COVERAGE_DIR}/summary.txt"
 JSON_FILE="${COVERAGE_DIR}/workspace.json"
 HTML_DIR="${COVERAGE_DIR}/html"
@@ -27,7 +34,7 @@ Notes:
 
 Environment:
   COVERAGE_DIR                Output directory for coverage artifacts
-  MOONCAKE_UPSTREAM_DIR       Mooncake upstream submodule path
+  MOONCAKE_UPSTREAM_DIR       Mooncake upstream source tree
   MOONCAKE_UPSTREAM_BUILD_DIR Explicit upstream build directory override
 EOF
 }
