@@ -278,7 +278,7 @@ if [[ ! -x "${VENV_BIN}/python3" ]]; then
   ln -sf "${VENV_PYTHON}" "${VENV_BIN}/python3"
 fi
 
-PIP_INDEX=${PIP_INDEX_URL:-"https://mirrors.aliyun.com/pypi/simple/"}
+PIP_INDEX=${PIP_INDEX_URL:-"https://pypi.org/simple/"}
 "${VENV_PYTHON}" -m pip install --no-cache-dir --upgrade -i "${PIP_INDEX}" pip >/dev/null
 if ! "${VENV_PYTHON}" -m pip show maturin >/dev/null 2>&1; then
   "${VENV_PYTHON}" -m pip install -i "${PIP_INDEX}" "maturin>=1.7,<2"
@@ -591,7 +591,6 @@ build_time = sys.argv[10]
 # checkout but the enclosing repository inside the Mooncake monorepo.
 upstream_dir = pathlib.Path(sys.argv[11])
 upstream_py_dir = upstream_dir / "mooncake-wheel" / "mooncake"
-rl_py_dir = repo_root / "python" / "mooncake_rl"
 transport_shim_out_dirs = sorted(transport_build_dir.glob("mooncake-transport-sys-*/out"))
 
 
@@ -713,15 +712,6 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
     shutil.copy2(
         repo_root / "python" / "mooncake_store_rs.pth",
         root / "mooncake_store_rs.pth",
-    )
-
-    rl_package_root = root / "mooncake_rl"
-    if rl_package_root.exists():
-        shutil.rmtree(rl_package_root)
-    shutil.copytree(
-        rl_py_dir,
-        rl_package_root,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
 
     (package_root / "build-info.json").write_text(

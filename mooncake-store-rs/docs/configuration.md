@@ -674,23 +674,6 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_ROUTE_CONTROL` | standalone client, Python wrapper setup fallback, and bench | route control mode, usually `embedded_wrh` |
 | `MC_STORE_RS_GID_INDEX` | compatibility layer, standalone client, Python wrapper, and bench | `classic_te` RDMA GID index override; forwarded to upstream `MC_GID_INDEX` |
 | `MC_STORE_RS_TRANSPORT_RPC_PORT` | standalone client and Python wrapper setup fallback | fixed real data-plane transport port |
-| `MC_RL_STORE_METADATA_URL` | `mooncake_rl` Store-RS checkpoint client | Store-RS metadata URL for RL checkpoint bucket routes; defaults to `redis://127.0.0.1:6379/0` |
-| `MC_RL_STORE_TRANSPORT_METADATA_URL` | `mooncake_rl` Store-RS checkpoint client | Store-RS transport metadata input for RL checkpoint clients; defaults to `P2PHANDSHAKE` |
-| `MC_RL_STORE_STORAGE_BYTES` | `mooncake_rl` Store-RS checkpoint client | local storage capacity when an RL checkpoint client is started as a storage runtime |
-| `MC_RL_STORE_SCRATCH_BYTES` | `mooncake_rl` Store-RS checkpoint client | local scratch capacity for RL checkpoint clients; default `268435456` |
-| `MC_RL_STORE_PROTOCOL` | `mooncake_rl` Store-RS checkpoint client | transfer protocol for RL checkpoint clients; default `rdma` |
-| `MC_RL_STORE_RDMA_DEVICES` | `mooncake_rl` Store-RS checkpoint client | RDMA device list for RL checkpoint clients; falls back to `NCCL_IB_HCA` |
-| `MC_RL_STORE_TRANSPORT_BACKEND` | `mooncake_rl` Store-RS checkpoint client | Store-RS transport backend for RL checkpoint clients; default `classic_te`; `classic_te` uses the Mooncake Transfer Engine built from this repository's submodule |
-| `MC_RL_STORE_ROUTED_WRITES` | `mooncake_rl` Store-RS checkpoint client | enable routed Store-RS writes for RL checkpoint buckets; default true |
-| `MC_RL_STORE_REPLICA_COUNT` | `mooncake_rl` Store-RS checkpoint client | replica count for RL checkpoint bucket writes; default `1` |
-| `MC_RL_STORE_ROUTE_TOPK` | `mooncake_rl` Store-RS checkpoint client | route-authority fanout for RL checkpoint clients; default `2` |
-| `MC_RL_STORE_TENANT` / `MC_RL_STORE_DOMAIN` / `MC_RL_STORE_OBJECT_SET` | `mooncake_rl` Store-RS checkpoint client | namespace scope for RL checkpoint bucket objects |
-
-For VeRL separated deployment, set
-`actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=mooncake_rl.checkpoint_engine.verl_backend`
-and `actor_rollout_ref.rollout.checkpoint_engine.backend=mooncake_store_rs_ckpt_engine`.
-The VeRL module is imported only for backend registration; the Store-RS
-checkpoint send/receive implementation lives in the `mooncake_rl` package.
 | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | standalone client and Python wrapper setup fallback | explicit local segment name |
 | `MC_STORE_RS_EXPIRES_AT_MS` | Python wrapper setup fallback | absolute lease expiry timestamp in milliseconds |
 | `MC_STORE_RS_LEASE_TTL_MS` | standalone client | lease TTL for the standalone heartbeat loop |
