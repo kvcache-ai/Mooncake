@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <set>
@@ -1606,20 +1607,20 @@ MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
     return {std::unique_lock<std::mutex>(object_operation_locks_[stripe_idx])};
 }
 
-void MasterService::RegisterGroupMember(const TenantId& tenant_id,
-                                        const std::string& key,
-                                        const std::string& group_id) {
+std::shared_ptr<GroupLease> MasterService::RegisterGroupMember(
+    const TenantId& tenant_id, const std::string& key,
+    const std::string& group_id) {
     if (group_id.empty()) {
-        return;
+        return nullptr;
     }
-    GroupShardAccessorRW shard(this, GetGroupShardIndex(tenant_id, group_id));
+    GroupShardAccessorRW shard(this);
     const auto scoped_group = tenant_id.MakeScopedKey(group_id);
     auto [it, inserted] = shard->groups.try_emplace(scoped_group);
     if (inserted) {
-        it->second.tenant_id = tenant_id;
-        it->second.group_id = group_id;
+        it->second.lease = std::make_shared<GroupLease>();
     }
     it->second.member_keys.insert(key);
+    return it->second.lease;
 }
 
 void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
@@ -1628,7 +1629,7 @@ void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
     if (group_id.empty()) {
         return;
     }
-    GroupShardAccessorRW shard(this, GetGroupShardIndex(tenant_id, group_id));
+    GroupShardAccessorRW shard(this);
     const auto scoped_group = tenant_id.MakeScopedKey(group_id);
     auto it = shard->groups.find(scoped_group);
     if (it == shard->groups.end()) {
@@ -1643,7 +1644,7 @@ void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
 std::vector<std::string> MasterService::GetGroupMemberKeys(
     const TenantId& tenant_id, const std::string& group_id) const {
     std::vector<std::string> member_keys;
-    GroupShardAccessorRO shard(this, GetGroupShardIndex(tenant_id, group_id));
+    GroupShardAccessorRO shard(this);
     auto it = shard->groups.find(tenant_id.MakeScopedKey(group_id));
     if (it != shard->groups.end()) {
         member_keys.assign(it->second.member_keys.begin(),
@@ -1652,43 +1653,20 @@ std::vector<std::string> MasterService::GetGroupMemberKeys(
     return member_keys;
 }
 
-bool MasterService::GroupHasActiveLease(
-    const TenantId& tenant_id, const std::vector<std::string>& member_keys,
-    const std::string& trigger_key, const TenantState& trigger_tenant_state,
-    std::chrono::system_clock::time_point now) const {
-    std::map<size_t, std::vector<std::string>> members_by_shard;
-    for (const auto& member_key : member_keys) {
-        members_by_shard[getShardIndex(tenant_id, member_key)].push_back(
-            member_key);
+std::shared_ptr<GroupLease> MasterService::GetGroupLease(
+    const TenantId& tenant_id, const std::string& group_id) const {
+    if (group_id.empty()) {
+        return nullptr;
     }
-
-    const size_t trigger_shard_idx = getShardIndex(tenant_id, trigger_key);
-    for (const auto& [shard_idx, keys] : members_by_shard) {
-        if (shard_idx == trigger_shard_idx) {
-            for (const auto& key : keys) {
-                auto it = trigger_tenant_state.metadata.find(key);
-                if (it != trigger_tenant_state.metadata.end() &&
-                    !it->second.IsLeaseExpired(now)) {
-                    return true;
-                }
-            }
-            continue;
-        }
-
-        MetadataShardAccessorRO shard(this, shard_idx);
-        auto tenant_it = shard->tenants.find(tenant_id);
-        if (tenant_it == shard->tenants.end()) {
-            continue;
-        }
-        for (const auto& key : keys) {
-            auto it = tenant_it->second.metadata.find(key);
-            if (it != tenant_it->second.metadata.end() &&
-                !it->second.IsLeaseExpired(now)) {
-                return true;
-            }
-        }
+    GroupShardAccessorRO shard(this);
+    auto it = shard->groups.find(tenant_id.MakeScopedKey(group_id));
+    if (it == shard->groups.end()) {
+        return nullptr;
     }
-    return false;
+    // Copy the shared_ptr while the group shard lock is held so the lease
+    // outlives the group entry in case a concurrent UnregisterGroupMember
+    // erases it right now.
+    return it->second.lease;
 }
 
 bool MasterService::HasCompletedMemoryCacheReplica(
@@ -2244,10 +2222,10 @@ void MasterService::ReleaseLocalDiskUsage(
 }
 
 void MasterService::RebuildGroupState() {
-    // Group shards are a derived index of grouped object membership. Rebuild
-    // them from object metadata after snapshot/standby restore.
-    for (size_t gs_idx = 0; gs_idx < kNumShards; ++gs_idx) {
-        GroupShardAccessorRW group_shard(this, gs_idx);
+    // The group domain is a derived index of grouped object membership. Rebuild
+    // it from object metadata after snapshot/standby restore.
+    {
+        GroupShardAccessorRW group_shard(this);
         group_shard->groups.clear();
     }
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
@@ -2257,7 +2235,83 @@ void MasterService::RebuildGroupState() {
                 if (!metadata.IsGrouped()) {
                     continue;
                 }
-                RegisterGroupMember(tenant_id, key, metadata.group_id);
+                // group_lease_ is mutable, so it can be wired through a const
+                // ref; RegisterGroupMember returns the group's shared lease.
+                auto lease =
+                    RegisterGroupMember(tenant_id, key, metadata.group_id);
+                metadata.group_lease_ = lease;
+                // A grouped object's authoritative lease is the shared group TTL,
+                // which is recreated empty on restore — clients re-establish
+                // sessions/leases after a restart, so the group is not protected
+                // until it is read again. The object's own lease_timeout is not
+                // authoritative for grouped objects.
+            }
+        }
+    }
+}
+
+void MasterService::ReRouteRestoredObjectsByKey() {
+    // Snapshots produced by a router that placed grouped objects on
+    // hash(group_id) shards restore those objects to the wrong shard; the
+    // rest of this version looks every object up by hash(tenant, key). Move any
+    // object whose hash(tenant, key) shard differs from the one it was restored
+    // to. Node handles transfer the storage without moving ObjectMetadata (which
+    // has const members), so no copy/move constructor is required.
+    bool moved = false;
+    for (size_t src_idx = 0; src_idx < kNumShards; ++src_idx) {
+        MetadataShardAccessorRW src(this, src_idx);
+        for (auto tenant_it = src->tenants.begin();
+             tenant_it != src->tenants.end();) {
+            const auto tenant_id = tenant_it->first;
+            auto& tenant_state = tenant_it->second;
+            for (auto obj_it = tenant_state.metadata.begin();
+                 obj_it != tenant_state.metadata.end();) {
+                const size_t dst_idx =
+                    getShardIndex(tenant_id, obj_it->second.user_key);
+                if (dst_idx == src_idx) {
+                    ++obj_it;
+                    continue;
+                }
+                auto next = std::next(obj_it);
+                auto node = tenant_state.metadata.extract(obj_it);
+                if (node.empty()) {
+                    obj_it = next;
+                    continue;
+                }
+                MetadataShardAccessorRW dst(this, dst_idx);
+                auto& dst_tenant =
+                    GetOrCreateTenantState(dst.get(), tenant_id);
+                // Restored snapshots have unique (tenant, key) so a collision
+                // here would only happen for a corrupt snapshot; keep the
+                // existing entry in that case.
+                dst_tenant.metadata.insert(std::move(node));
+                moved = true;
+                obj_it = next;
+            }
+            if (tenant_state.Empty()) {
+                tenant_it = src->tenants.erase(tenant_it);
+            } else {
+                ++tenant_it;
+            }
+        }
+    }
+
+    // Only recompute the per-shard counter when objects actually moved; a
+    // current-format snapshot needs no migration and its counts are already
+    // correct from DeserializeShard.
+    if (!moved) {
+        return;
+    }
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRW shard(this, i);
+        shard->disk_object_count = 0;
+        for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+            for (const auto& [key, metadata] : tenant_state.metadata) {
+                if (metadata.HasReplica([](const Replica& r) {
+                        return r.is_local_disk_replica() && r.is_completed();
+                    })) {
+                    shard->disk_object_count++;
+                }
             }
         }
     }
@@ -3196,7 +3250,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
             const auto& standby_meta = object.entry->metadata;
             auto& tenant_state =
                 GetOrCreateTenantState(shard.get(), object.tenant_id);
-            tenant_state.metadata.emplace(
+            auto [it, inserted] = tenant_state.metadata.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(object.user_key),
                 std::forward_as_tuple(
@@ -3205,9 +3259,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     standby_meta.hard_pinned.value_or(false),
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
+            (void)inserted;
             if (!standby_meta.group_id.empty()) {
-                RegisterGroupMember(object.tenant_id, object.user_key,
-                                    standby_meta.group_id);
+                it->second.group_lease_ =
+                    RegisterGroupMember(object.tenant_id, object.user_key,
+                                        standby_meta.group_id);
             }
             tenant_state.processing_keys.erase(object.user_key);
         }
@@ -4221,7 +4277,9 @@ auto MasterService::AllocateAndInsertMetadata(
                                         GetMetadataShardIndex(it->second),
                                         *deadline_to_index);
     }
-    RegisterGroupMember(tenant_id, key, group_id);
+    // Wire the object's lease pointer to the group's shared lease so the read
+    // path can extend the group TTL without touching the group table.
+    it->second.group_lease_ = RegisterGroupMember(tenant_id, key, group_id);
     tenant_state.processing_keys.insert(key);
 
     return replica_list;
@@ -9715,20 +9773,29 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     .evicted_objects = freed > 0 ? 1U : 0U};
         }
 
-        // Grouped object: evict the whole group (all-or-none). Object routing
-        // is decoupled from groups, so members live in different metadata
-        // shards; membership is read from group_shards_ (sharded by
-        // hash(tenant, group_id)).
+        // Grouped object: the group is evicted all-or-none at the group level
+        // (either the whole group is protected or it is a candidate), based on
+        // the shared group TTL. Within an evicted group, member-level
+        // best-effort safety still applies below (hard pins, soft pins, active
+        // writes, busy replicas are skipped). Object routing is decoupled from
+        // groups, so members live in different metadata shards; membership is
+        // read from group_shards_ (sharded by hash(tenant, group_id)).
         std::vector<std::string> member_keys =
             GetGroupMemberKeys(normalized_tenant, metadata.group_id);
         if (member_keys.empty()) {
             member_keys.push_back(key);
         }
 
-        // Group protection: skip the whole group if any member was recently
-        // accessed (its lease is still valid).
-        if (GroupHasActiveLease(normalized_tenant, member_keys, key,
-                                tenant_state, now)) {
+        // Group protection: skip the whole group if it was recently read. The
+        // group shares one GroupLease (extended by any member read), so we
+        // consult a single lease instead of scanning every member's own.
+        auto group_lease = GetGroupLease(normalized_tenant, metadata.group_id);
+        if (group_lease != nullptr && !group_lease->IsExpired(now)) {
+            return {};
+        }
+        // Fallback for a grouped object whose group entry is not yet registered:
+        // protect on the object's own lease.
+        if (group_lease == nullptr && !metadata.IsLeaseExpired(now)) {
             return {};
         }
 
@@ -10104,20 +10171,29 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return {.freed_bytes = freed, .evicted_objects = freed > 0 ? 1 : 0};
         }
 
-        // Grouped object: evict the whole group (all-or-none). Object routing
-        // is decoupled from groups, so members live in different metadata
-        // shards; membership is read from group_shards_ (sharded by
-        // hash(tenant, group_id)).
+        // Grouped object: the group is evicted all-or-none at the group level
+        // (either the whole group is protected or it is a candidate), based on
+        // the shared group TTL. Within an evicted group, member-level
+        // best-effort safety still applies below (hard pins, soft pins, active
+        // writes, busy replicas are skipped). Object routing is decoupled from
+        // groups, so members live in different metadata shards; membership is
+        // read from group_shards_ (sharded by hash(tenant, group_id)).
         std::vector<std::string> member_keys =
             GetGroupMemberKeys(tenant_id, metadata.group_id);
         if (member_keys.empty()) {
             member_keys.push_back(key);
         }
 
-        // Group protection: skip the whole group if any member was recently
-        // accessed (its lease is still valid).
-        if (GroupHasActiveLease(tenant_id, member_keys, key, tenant_state,
-                                now)) {
+        // Group protection: skip the whole group if it was recently read. The
+        // group shares one GroupLease (extended by any member read), so we
+        // consult a single lease instead of scanning every member's own.
+        auto group_lease = GetGroupLease(tenant_id, metadata.group_id);
+        if (group_lease != nullptr && !group_lease->IsExpired(now)) {
+            return {};
+        }
+        // Fallback for a grouped object whose group entry is not yet registered:
+        // protect on the object's own lease.
+        if (group_lease == nullptr && !metadata.IsLeaseExpired(now)) {
             return {};
         }
 
@@ -10248,20 +10324,22 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (it->second.IsHardPinned()) continue;
                         bool has_evictable = can_evict_replicas(it->second);
                         if (has_evictable) shard_evictable_count++;
-                        if (!it->second.IsLeaseExpired(now) || !has_evictable)
-                            continue;
+                        // Grouped objects are evicted all-or-none, so rank them by
+                        // the shared group TTL (consistent across members) instead
+                        // of each member's own lease; this keeps the candidate
+                        // cutoff aligned with group boundaries and prevents
+                        // over-eviction.
+                        const auto deadline = it->second.EvictionDeadline();
+                        if (now < deadline || !has_evictable) continue;
                         if (!IsSoftPinActive(it->second, now)) {
                             if (compact_frontier_prebypass) {
                                 local_candidates[t].push_back(
-                                    {s, tenant_id, it->first,
-                                     it->second.lease_timeout});
+                                    {s, tenant_id, it->first, deadline});
                             } else {
-                                local_no_pin[t].push_back(
-                                    it->second.lease_timeout);
+                                local_no_pin[t].push_back(deadline);
                             }
                         } else if (allow_evict_soft_pinned_objects_) {
-                            local_soft_pin[t].push_back(
-                                it->second.lease_timeout);
+                            local_soft_pin[t].push_back(deadline);
                         }
                     }
                 }
@@ -10351,20 +10429,23 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         for (const auto& [key, metadata] :
                              tenant_state.metadata) {
                             if (metadata.IsHardPinned() ||
-                                !metadata.IsLeaseExpired(now) ||
                                 IsSoftPinActive(metadata, now) ||
                                 !can_evict_replicas(metadata)) {
                                 continue;
                             }
+                            // Group-aware eviction deadline (shared group TTL for
+                            // grouped objects) so the cutoff matches eviction.
+                            const auto deadline = metadata.EvictionDeadline();
+                            if (now < deadline) continue;
                             if (use_cutoff) {
                                 const bool in_range =
                                     collect_older_or_equal
-                                        ? metadata.lease_timeout <= cutoff
-                                        : metadata.lease_timeout > cutoff;
+                                        ? deadline <= cutoff
+                                        : deadline > cutoff;
                                 if (!in_range) continue;
                             }
                             local_frontier[t].push_back(
-                                {s, tenant_id, key, metadata.lease_timeout});
+                                {s, tenant_id, key, deadline});
                         }
                     }
                 }
@@ -10442,7 +10523,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                          [](const Candidate& a, const Candidate& b) {
                              return a.lease_timeout < b.lease_timeout;
                          });
-        auto target_timeout = candidates[evict_num - 1].lease_timeout;
 
         // Treat evict_num as a minimum: if re-validation skips a candidate,
         // continue trying the next one so actual evicted count reaches
@@ -10450,8 +10530,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         long evicted_this_pass = 0;
         auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
             for (auto& c : batch) {
-                if (evicted_this_pass >= evict_num &&
-                    c.lease_timeout > target_timeout) {
+                // Stop once the target object count is reached. Grouped eviction
+                // is all-or-none, so evicting a group can overshoot evict_num by
+                // at most one group; using evict_num (rather than the per-object
+                // lease cutoff) bounds that overshoot and keeps the eviction
+                // ratio close to the target.
+                if (evicted_this_pass >= evict_num) {
                     no_pin_objects.push_back(c.lease_timeout);
                     continue;
                 }
@@ -10464,7 +10548,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     if (it == tenant_state.metadata.end()) continue;
 
                     // Re-validate: state may have changed since Phase 1
-                    if (!it->second.IsLeaseExpired(now) ||
+                    if (now < it->second.EvictionDeadline() ||
                         IsSoftPinActive(it->second, now) ||
                         !can_evict_replicas(it->second)) {
                         no_pin_objects.push_back(c.lease_timeout);
@@ -10555,8 +10639,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         while (it != tenant_state.metadata.end() &&
                                target_evict_num > 0) {
                             if (!it->second.IsHardPinned() &&
-                                it->second.IsLeaseExpired(now) &&
-                                it->second.lease_timeout <= target_timeout &&
+                                now >= it->second.EvictionDeadline() &&
+                                it->second.EvictionDeadline() <= target_timeout &&
                                 !IsSoftPinActive(it->second, now) &&
                                 can_evict_replicas(it->second)) {
                                 auto evict_result = try_evict_group_or_object(
@@ -10619,13 +10703,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         while (it != tenant_state.metadata.end() &&
                                target_evict_num > 0) {
                             if (it->second.IsHardPinned() ||
-                                !it->second.IsLeaseExpired(now) ||
+                                now < it->second.EvictionDeadline() ||
                                 !can_evict_replicas(it->second)) {
                                 ++it;
                                 continue;
                             }
                             if (!IsSoftPinActive(it->second, now) ||
-                                it->second.lease_timeout <=
+                                it->second.EvictionDeadline() <=
                                     soft_target_timeout) {
                                 auto evict_result = try_evict_group_or_object(
                                     tenant_it->first, it->first, it->second,
@@ -11495,7 +11579,12 @@ MasterService::MetadataSerializer::Deserialize(
 
         const msgpack::object& shard_obj = shard_oh.get();
 
-        // Get shard reference and deserialize
+        // Objects are restored to the shard index recorded in the snapshot (not
+        // re-routed to hash(tenant, key)). Snapshots produced by a router that
+        // placed grouped objects on hash(group_id) shards therefore leave those
+        // objects on a stale shard after an upgrade and become unreachable by
+        // the hash(tenant, key) lookups used by this version; such snapshots
+        // must be regenerated. See docs/source/design/store/mooncake-store.md.
         auto& shard = service_->metadata_shards_[shard_idx];
         auto result = DeserializeShard(shard_obj, shard);
         if (!result) {
@@ -11529,6 +11618,9 @@ MasterService::MetadataSerializer::Deserialize(
     auto next_id = replica_next_id_obj->as<uint64_t>();
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
+    // Migrate old-format snapshots: re-route objects to their hash(tenant, key)
+    // shards before rebuilding the group domain (which is derived from metadata).
+    service_->ReRouteRestoredObjectsByKey();
     service_->RebuildGroupState();
     service_->ClearCandidatesForReload();
     return {};
@@ -11539,8 +11631,8 @@ void MasterService::MetadataSerializer::Reset() {
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();
     }
-    for (size_t gs_idx = 0; gs_idx < kNumShards; ++gs_idx) {
-        GroupShardAccessorRW group_shard(service_, gs_idx);
+    {
+        GroupShardAccessorRW group_shard(service_);
         group_shard->groups.clear();
     }
     {

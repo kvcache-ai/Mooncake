@@ -187,9 +187,7 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        const size_t gs_idx =
-            service.GetGroupShardIndex(normalized_tenant, group_id);
-        MasterService::GroupShardAccessorRO gs(&service, gs_idx);
+        MasterService::GroupShardAccessorRO gs(&service);
         auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
         if (it == gs->groups.end()) {
             return {};
@@ -198,19 +196,88 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     void ClearGroupStateForTest(MasterService& service) {
-        for (size_t i = 0; i < service.group_shards_.size(); ++i) {
-            MasterService::GroupShardAccessorRW gs(&service, i);
-            gs->groups.clear();
-        }
+        MasterService::GroupShardAccessorRW gs(&service);
+        gs->groups.clear();
     }
 
     void RebuildGroupStateForTest(MasterService& service) {
         service.RebuildGroupState();
     }
 
-    size_t GetGroupShardIndexForTest(MasterService& service,
-                                     const std::string& group_id) {
-        return service.GetGroupShardIndex(TenantId::Default(), group_id);
+    // Friend-accessible helper: returns the group's shared GroupLease (the
+    // group owner is internal; GetGroupLease is private to MasterService).
+    std::shared_ptr<GroupLease> GetGroupLeaseForTest(
+        MasterService& service, const std::string& group_id,
+        const std::string& tenant_id = "default") {
+        const TenantId normalized_tenant =
+            service.ResolveRequestTenantId(TenantId(tenant_id));
+        return service.GetGroupLease(normalized_tenant, group_id);
+    }
+
+    // Friend-accessible helper: put a grouped + an ungrouped object, move the
+    // grouped one onto a stale shard (simulating an old-format snapshot), run
+    // the ReRouteRestoredObjectsByKey migration, and assert it is moved back to
+    // its correct hash(tenant, key) shard and reachable again.
+    void ReRouteRestoredObjectsMigrationForTest(MasterService& service) {
+        const UUID client_id = generate_uuid();
+        const std::string grouped_key = "reroute_grouped_key";
+        const std::string ungrouped_key = "reroute_ungrouped_key";
+        const std::string group_id = FindGroupIdOnDifferentShard(grouped_key);
+
+        ReplicateConfig grouped_config;
+        grouped_config.replica_num = 1;
+        grouped_config.group_ids = std::vector<std::string>{group_id};
+        ReplicateConfig ungrouped_config;
+        ungrouped_config.replica_num = 1;
+
+        PutCompletedObject(service, client_id, grouped_key, grouped_config);
+        PutCompletedObject(service, client_id, ungrouped_key, ungrouped_config);
+
+        const TenantId tenant = TenantId::Default();
+        const size_t grouped_correct = service.getShardIndex(tenant, grouped_key);
+        const size_t wrong = (grouped_correct + 1) %
+                             static_cast<size_t>(MasterService::kNumShards);
+
+        // Reachable initially (placed on the correct hash(tenant, key) shard).
+        EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
+
+        // Simulate an old snapshot that placed grouped_key on a stale shard.
+        {
+            MasterService::MetadataShardAccessorRW src(&service,
+                                                       grouped_correct);
+            auto tenant_it = src->tenants.find(tenant);
+            ASSERT_NE(tenant_it, src->tenants.end());
+            auto obj_it = tenant_it->second.metadata.find(grouped_key);
+            ASSERT_NE(obj_it, tenant_it->second.metadata.end());
+            auto node = tenant_it->second.metadata.extract(obj_it);
+            ASSERT_FALSE(node.empty());
+            MasterService::MetadataShardAccessorRW dst(&service, wrong);
+            auto& dst_tenant = service.GetOrCreateTenantState(dst.get(), tenant);
+            dst_tenant.metadata.insert(std::move(node));
+        }
+
+        // Now unreachable via hash(tenant, key) lookup (the old-snapshot problem).
+        EXPECT_FALSE(service.ExistKey(grouped_key, tenant).value_or(true));
+
+        // Run the migration.
+        service.ReRouteRestoredObjectsByKey();
+
+        // Reachable again, and back on the correct shard.
+        EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
+        MasterService::MetadataShardAccessorRW shard(&service, grouped_correct);
+        auto tenant_it = shard->tenants.find(tenant);
+        ASSERT_NE(tenant_it, shard->tenants.end());
+        EXPECT_NE(tenant_it->second.metadata.find(grouped_key),
+                  tenant_it->second.metadata.end());
+        // The stale shard no longer holds it.
+        MasterService::MetadataShardAccessorRW stale(&service, wrong);
+        auto stale_it = stale->tenants.find(tenant);
+        if (stale_it != stale->tenants.end()) {
+            EXPECT_EQ(stale_it->second.metadata.find(grouped_key),
+                      stale_it->second.metadata.end());
+        }
+        // The correctly-placed ungrouped object is unaffected.
+        EXPECT_TRUE(service.ExistKey(ungrouped_key, tenant).value_or(false));
     }
 
     std::optional<uint32_t> GetReplicaRefcntBySegmentName(
@@ -1350,9 +1417,7 @@ TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
         key_b = "route_decouple_key_b_" + std::to_string(i);
         shard_b = std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
     }
-    const size_t shard_g = GetGroupShardIndexForTest(*service_, group_id);
     ASSERT_NE(shard_a, shard_b);  // members span metadata shards
-    ASSERT_NE(shard_a, shard_g);  // two independent routing domains
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -1360,8 +1425,8 @@ TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
     PutCompletedObject(*service_, client_id, key_a, config);
     PutCompletedObject(*service_, client_id, key_b, config);
 
-    // Both members are reachable purely through hash(tenant, key) routing,
-    // even though their group lives on a different shard.
+    // Both members are reachable purely through hash(tenant, key) routing, which
+    // is decoupled from the group domain.
     EXPECT_TRUE(service_->ExistKey(key_a, TenantId::Default()).value_or(false));
     EXPECT_TRUE(service_->ExistKey(key_b, TenantId::Default()).value_or(false));
     EXPECT_TRUE(
@@ -1819,7 +1884,7 @@ TEST_F(MasterServiceTest, RemoveByRegexUnregistersGroupedRoute) {
     EXPECT_TRUE(service_->GetReplicaList(key, TenantId::Default()).has_value());
 }
 
-TEST_F(MasterServiceTest, GroupedReadRefreshesOnlyReadMemberLease) {
+TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(200).build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
@@ -1838,8 +1903,9 @@ TEST_F(MasterServiceTest, GroupedReadRefreshesOnlyReadMemberLease) {
     PutCompletedObject(*service_, client_id, key_a, config_a);
     PutCompletedObject(*service_, client_id, key_b, config_b);
 
-    // Read key_a (twice, near expiry). The read path is group-agnostic and
-    // refreshes ONLY key_a's own lease — not the whole group.
+    // Read key_a (twice, near expiry). Group protection is keyed on ONE shared
+    // group TTL, so reading a member refreshes the group TTL and protects the
+    // WHOLE group (both key_a and key_b), not just the read member.
     auto exists = service_->ExistKey(key_a, TenantId::Default());
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
@@ -1849,22 +1915,25 @@ TEST_F(MasterServiceTest, GroupedReadRefreshesOnlyReadMemberLease) {
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
 
-    // key_a's own lease is still valid, so a non-force remove is rejected.
+    // The shared group TTL is active, so a non-force remove of key_a is rejected.
     auto remove_read_member = service_->Remove(key_a, TenantId::Default());
     ASSERT_FALSE(remove_read_member.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_read_member.error());
 
-    // key_b's lease was never refreshed by reading key_a, so it is expired and
-    // can be removed without force.
-    EXPECT_TRUE(service_->Remove(key_b, TenantId::Default()).has_value());
+    // key_b shares the same group TTL and is therefore ALSO protected.
+    auto remove_peer = service_->Remove(key_b, TenantId::Default());
+    ASSERT_FALSE(remove_peer.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_peer.error());
 
-    // Force cleanup of the still-leased member.
+    // Force cleanup both members.
     EXPECT_TRUE(service_->Remove(key_a, TenantId::Default(), /*force=*/true)
+                    .has_value());
+    EXPECT_TRUE(service_->Remove(key_b, TenantId::Default(), /*force=*/true)
                     .has_value());
 }
 
 TEST_F(MasterServiceTest,
-       GroupedMembershipChangeDoesNotRefreshPeerLeaseOnRead) {
+       GroupedMembershipChangeStillSharesGroupLeaseOnRead) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(500).build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
@@ -1882,25 +1951,30 @@ TEST_F(MasterServiceTest,
     PutCompletedObject(*service_, client_id, key_a, config);
     ASSERT_TRUE(service_->ExistKey(key_a, TenantId::Default()).value_or(false));
 
-    // Add a new member to the group after key_a's lease was already granted.
+    // Add a new member to the group after key_a was already written. On put,
+    // key_b is wired to the SAME shared GroupLease, so it participates in the
+    // group's protection.
     PutCompletedObject(*service_, client_id, key_b, config);
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
-    // Reading key_a refreshes only key_a's own lease; the newly added key_b is
-    // NOT swept in (there is no whole-group lease refresh on the read path).
+    // Reading key_a refreshes the shared group TTL, which key_b also shares.
     auto exists = service_->ExistKey(key_a, TenantId::Default());
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
 
-    // key_a is protected by its own lease...
+    // key_a is protected by the shared group lease...
     auto remove_read_member = service_->Remove(key_a, TenantId::Default());
     ASSERT_FALSE(remove_read_member.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_read_member.error());
 
-    // ...but key_b's lease is expired, so it can be removed without force.
-    EXPECT_TRUE(service_->Remove(key_b, TenantId::Default()).has_value());
+    // ...and key_b (sharing the same group TTL) is protected too.
+    auto remove_peer = service_->Remove(key_b, TenantId::Default());
+    ASSERT_FALSE(remove_peer.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_peer.error());
 
     EXPECT_TRUE(service_->Remove(key_a, TenantId::Default(), /*force=*/true)
+                    .has_value());
+    EXPECT_TRUE(service_->Remove(key_b, TenantId::Default(), /*force=*/true)
                     .has_value());
 }
 
@@ -2209,6 +2283,57 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
     EXPECT_TRUE(
         service_->Remove(hard_pinned_key, TenantId::Default(), /*force=*/true)
             .has_value());
+}
+
+// A group keeps one shared GroupLease. Reading any member extends the group
+// TTL, so a fresh group (never read) is unprotected while a read group is
+// protected as a whole — without the read path ever touching the group table.
+TEST_F(MasterServiceTest, GroupLeaseIsSharedAndExtendsOnMemberRead) {
+    const uint64_t kv_lease_ttl = 1000;
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(kv_lease_ttl).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key_a = "group_lease_member_a";
+    const std::string key_b = "group_lease_member_b";
+    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    PutCompletedObject(*service_, client_id, key_a, config);
+    PutCompletedObject(*service_, client_id, key_b, config);
+
+    // Both members resolve to the SAME shared GroupLease.
+    const auto lease_a = GetGroupLeaseForTest(*service_, group_id);
+    ASSERT_NE(nullptr, lease_a);
+    const auto lease_b = GetGroupLeaseForTest(*service_, group_id);
+    ASSERT_NE(nullptr, lease_b);
+    EXPECT_EQ(lease_a.get(), lease_b.get());
+
+    // A freshly-created group (no reads yet) is not protected -> evictable.
+    EXPECT_TRUE(lease_a->IsExpired(std::chrono::system_clock::now()));
+
+    // Reading one member extends the shared group lease -> the whole group is
+    // now protected.
+    EXPECT_TRUE(
+        service_->GetReplicaList(key_a, TenantId::Default()).has_value());
+    EXPECT_FALSE(lease_a->IsExpired(std::chrono::system_clock::now()));
+    // The other member sees the same (shared) extended deadline.
+    EXPECT_FALSE(lease_b->IsExpired(std::chrono::system_clock::now()));
+}
+
+// Migration: a snapshot produced by a router that placed grouped objects on
+// hash(group_id) shards (rather than hash(tenant, key)) restores them onto a
+// stale shard, making them unreachable by the key-routing lookups. Verify that
+// ReRouteRestoredObjectsByKey moves such an object back onto its correct
+// hash(tenant, key) shard (and is a no-op for correctly-placed objects).
+TEST_F(MasterServiceTest, ReRouteRestoredObjectsMovesStaleShardObjects) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    ReRouteRestoredObjectsMigrationForTest(*service_);
 }
 
 TEST_F(MasterServiceTest, BatchUpsertStartMixedGroupIdsPreservesOrder) {
