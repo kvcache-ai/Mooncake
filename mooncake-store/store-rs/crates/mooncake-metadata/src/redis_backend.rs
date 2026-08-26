@@ -850,6 +850,9 @@ const DEFAULT_REDIS_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_REDIS_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_REDIS_CONNECTION_POOL_SIZE: usize = 16;
 const MAX_REDIS_CONNECTION_POOL_SIZE: usize = 256;
+const MAX_REDIS_LIST_ITEMS: usize = 4096;
+const MAX_REDIS_SCAN_PAGES: usize = 64;
+const REDIS_SCAN_COUNT: usize = 256;
 const DEFAULT_TENANT_QUOTA_TERMINAL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
@@ -1495,23 +1498,79 @@ fn duration_from_env_ms(name: &str, default: Duration) -> Duration {
         .unwrap_or(default)
 }
 
+fn bounded_set_members(
+    connection: &mut redis::Connection,
+    key: &str,
+    operation: &str,
+) -> Result<Vec<String>> {
+    bounded_set_members_with_limit(connection, key, operation, MAX_REDIS_LIST_ITEMS)
+}
+
+fn bounded_set_members_with_limit(
+    connection: &mut redis::Connection,
+    key: &str,
+    operation: &str,
+    max_items: usize,
+) -> Result<Vec<String>> {
+    let count: usize = connection
+        .scard(key)
+        .map_err(|error| metadata_error(operation, error))?;
+    if count > max_items {
+        return Err(StoreError::Metadata(format!(
+            "{operation} exceeds the fixed {max_items}-item bound"
+        )));
+    }
+    let members: Vec<String> = connection
+        .smembers(key)
+        .map_err(|error| metadata_error(operation, error))?;
+    if members.len() > max_items {
+        return Err(StoreError::Metadata(format!(
+            "{operation} exceeds the fixed {max_items}-item bound"
+        )));
+    }
+    Ok(members)
+}
+
 fn scan_keys(connection: &mut redis::Connection, pattern: &str) -> Result<Vec<String>> {
+    scan_keys_bounded(
+        connection,
+        pattern,
+        MAX_REDIS_LIST_ITEMS,
+        MAX_REDIS_SCAN_PAGES,
+    )
+}
+
+fn scan_keys_bounded(
+    connection: &mut redis::Connection,
+    pattern: &str,
+    max_items: usize,
+    max_pages: usize,
+) -> Result<Vec<String>> {
     let mut cursor = 0u64;
     let mut keys = Vec::new();
-    loop {
+    for _ in 0..max_pages {
         let (next, batch): (u64, Vec<String>) = cmd("SCAN")
             .arg(cursor)
             .arg("MATCH")
             .arg(pattern)
+            .arg("COUNT")
+            .arg(REDIS_SCAN_COUNT)
             .query(connection)
             .map_err(|error| metadata_error("redis scan keys", error))?;
+        if keys.len().saturating_add(batch.len()) > max_items {
+            return Err(StoreError::Metadata(format!(
+                "redis scan for {pattern:?} exceeds the fixed {max_items}-item bound"
+            )));
+        }
         keys.extend(batch);
         if next == 0 {
-            break;
+            return Ok(keys);
         }
         cursor = next;
     }
-    Ok(keys)
+    Err(StoreError::Metadata(format!(
+        "redis scan for {pattern:?} exceeds the fixed {max_pages}-page bound"
+    )))
 }
 
 fn legacy_tenant_policy_keys(
@@ -1716,24 +1775,9 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
         let index = self.keyspace.client_index();
-        let (keys, backfill_index) =
-            self.query_readonly("redis list live clients", |connection| {
-                let mut keys: Vec<String> = connection.smembers(&index)?;
-                let mut backfill_index = false;
-                if keys.is_empty() {
-                    keys = redis::cmd("KEYS")
-                        .arg(self.keyspace.client_pattern())
-                        .query(connection)?;
-                    backfill_index = !keys.is_empty();
-                }
-                Ok((keys, backfill_index))
-            })?;
-        if backfill_index && !keys.is_empty() {
-            let mut connection = self.connection("redis sadd legacy client index")?;
-            connection
-                .sadd::<_, _, ()>(&index, keys.clone())
-                .map_err(|error| metadata_error("redis sadd legacy client index", error))?;
-        }
+        let keys = self.query_readonly("redis list live clients", |connection| {
+            bounded_set_members(connection, &index, "redis list live clients")
+        })?;
         let entries = self.query_readonly("redis fetch client leases", |connection| {
             if keys.is_empty() {
                 return Ok(Vec::new());
@@ -2010,44 +2054,27 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
         let index = self.keyspace.object_index();
-        let (entries, backfill_index) =
-            self.query_readonly("redis list object routes", |connection| {
-                let mut keys: Vec<String> = connection.smembers(&index)?;
-                let mut backfill_index = false;
-                if keys.is_empty() {
-                    keys = redis::cmd("KEYS")
-                        .arg(self.keyspace.object_pattern())
-                        .query(connection)?;
-                    backfill_index = !keys.is_empty();
-                }
-
-                let mut entries = Vec::with_capacity(keys.len());
-                for key in keys {
-                    let payload: Option<String> = redis::cmd("HGET")
-                        .arg(key.as_str())
-                        .arg("payload")
-                        .query(connection)?;
-                    entries.push((key, payload));
-                }
-                Ok((entries, backfill_index))
-            })?;
+        let entries = self.query_readonly("redis list object routes", |connection| {
+            let keys = bounded_set_members(connection, &index, "redis list object route index")?;
+            let mut entries = Vec::with_capacity(keys.len());
+            for key in keys {
+                let payload: Option<String> = redis::cmd("HGET")
+                    .arg(key.as_str())
+                    .arg("payload")
+                    .query(connection)?;
+                entries.push((key, payload));
+            }
+            Ok(entries)
+        })?;
 
         let mut stale = Vec::new();
-        let mut live_keys = Vec::new();
         let mut routes = Vec::with_capacity(entries.len());
         for (key, payload) in entries {
             if let Some(payload) = payload {
-                live_keys.push(key);
                 routes.push(serde_json::from_str(&payload).map_err(json_error)?);
             } else {
                 stale.push(key);
             }
-        }
-        if backfill_index && !live_keys.is_empty() {
-            let mut connection = self.connection("redis sadd legacy object index")?;
-            connection
-                .sadd::<_, _, ()>(&index, live_keys)
-                .map_err(|error| metadata_error("redis sadd legacy object index", error))?;
         }
         if !stale.is_empty() {
             let mut connection = self.connection("redis srem stale object index")?;
@@ -2215,9 +2242,11 @@ impl MetadataBackend for RedisMetadataBackend {
                 .exists(&ready_key)
                 .map_err(|error| metadata_error("redis check tenant policy index ready", error))?
             {
-                connection
-                    .smembers(&index_key)
-                    .map_err(|error| metadata_error("redis list tenant policy index", error))?
+                bounded_set_members(
+                    &mut connection,
+                    &index_key,
+                    "redis list tenant policy index",
+                )?
             } else {
                 let lock_key = format!("{ready_key}:lock");
                 let acquired_lock = redis::cmd("SET")
@@ -2236,9 +2265,11 @@ impl MetadataBackend for RedisMetadataBackend {
                     if connection.exists(&ready_key).map_err(|error| {
                         metadata_error("redis recheck tenant policy index ready", error)
                     })? {
-                        connection.smembers(&index_key).map_err(|error| {
-                            metadata_error("redis list tenant policy index", error)
-                        })?
+                        bounded_set_members(
+                            &mut connection,
+                            &index_key,
+                            "redis list tenant policy index",
+                        )?
                     } else {
                         // The first scoped list migrates legacy Redis tenant-policy keys into the
                         // per-tenant index. After the ready marker is set, tenant-policy writers
@@ -2260,9 +2291,11 @@ impl MetadataBackend for RedisMetadataBackend {
                 } else if connection.exists(&ready_key).map_err(|error| {
                     metadata_error("redis recheck tenant policy index ready", error)
                 })? {
-                    connection
-                        .smembers(&index_key)
-                        .map_err(|error| metadata_error("redis list tenant policy index", error))?
+                    bounded_set_members(
+                        &mut connection,
+                        &index_key,
+                        "redis list tenant policy index",
+                    )?
                 } else {
                     legacy_tenant_policy_keys(&self.keyspace, tenant, &mut connection)?
                 }
@@ -3125,10 +3158,11 @@ mod tests {
     use redis::Commands;
 
     use super::{
-        is_legacy_redis_auth_arity_error, legacy_auth_connection_info, metadata_error,
-        redacted_route_namespace_source, redis_auth_probe_timeout, redis_connect_timeout,
-        redis_connection_info, redis_connection_pool_size, redis_error_diagnostic_hint,
-        redis_io_timeout, redis_retry_attempts, redis_retry_delay, resolve_redis_auth,
+        bounded_set_members_with_limit, is_legacy_redis_auth_arity_error,
+        legacy_auth_connection_info, metadata_error, redacted_route_namespace_source,
+        redis_auth_probe_timeout, redis_connect_timeout, redis_connection_info,
+        redis_connection_pool_size, redis_error_diagnostic_hint, redis_io_timeout,
+        redis_retry_attempts, redis_retry_delay, resolve_redis_auth, scan_keys_bounded,
         should_log_redis_diagnostic_occurrence, should_retry_readonly_redis_error,
         MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig,
         DEFAULT_REDIS_AUTH_PROBE_TIMEOUT, DEFAULT_REDIS_CONNECTION_POOL_SIZE,
@@ -3696,7 +3730,7 @@ mod tests {
     }
 
     #[test]
-    fn redis_backend_backfills_and_prunes_client_index() {
+    fn redis_backend_uses_and_prunes_client_index() {
         let Some(server) = RedisTestServer::start() else {
             return;
         };
@@ -3730,7 +3764,15 @@ mod tests {
 
         let listed = backend
             .list_live_clients()
-            .expect("legacy client listing should succeed");
+            .expect("unindexed client listing should succeed");
+        assert!(listed.is_empty());
+
+        connection
+            .sadd::<_, _, ()>(&index_key, &client_key)
+            .expect("client index insert should succeed");
+        let listed = backend
+            .list_live_clients()
+            .expect("indexed client listing should succeed");
         assert_eq!(listed, vec![lease.clone()]);
 
         let indexed: Vec<String> = connection
@@ -4072,7 +4114,7 @@ mod tests {
     }
 
     #[test]
-    fn redis_backend_backfills_and_prunes_object_index() {
+    fn redis_backend_uses_and_prunes_object_index() {
         let Some(server) = RedisTestServer::start() else {
             return;
         };
@@ -4097,8 +4139,12 @@ mod tests {
 
         let listed = backend
             .list_object_routes()
-            .expect("legacy object listing should succeed");
-        assert_eq!(listed, vec![route.clone()]);
+            .expect("unindexed object listing should succeed");
+        assert!(listed.is_empty());
+
+        connection
+            .sadd::<_, _, ()>(keyspace.object_index(), keyspace.object(&route.key))
+            .expect("object index restore should succeed");
 
         let indexed: Vec<String> = connection
             .smembers(keyspace.object_index())
@@ -4118,6 +4164,39 @@ mod tests {
             .smembers(keyspace.object_index())
             .expect("object index read after prune should succeed");
         assert!(indexed.is_empty());
+    }
+
+    #[test]
+    fn redis_listing_helpers_reject_results_beyond_fixed_bounds() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let client = redis::Client::open(server.url()).expect("redis client should open");
+        let mut connection = client
+            .get_connection()
+            .expect("redis connection should succeed");
+
+        connection
+            .sadd::<_, _, ()>("bounded-set", vec!["one", "two"])
+            .expect("bounded set should populate");
+        let set_error = bounded_set_members_with_limit(
+            &mut connection,
+            "bounded-set",
+            "redis bounded set regression",
+            1,
+        )
+        .expect_err("set listing should reject more than one member");
+        assert!(set_error.to_string().contains("fixed 1-item bound"));
+
+        connection
+            .set::<_, _, ()>("bounded-scan/one", "1")
+            .expect("first scan key should populate");
+        connection
+            .set::<_, _, ()>("bounded-scan/two", "2")
+            .expect("second scan key should populate");
+        let scan_error = scan_keys_bounded(&mut connection, "bounded-scan/*", 1, 64)
+            .expect_err("scan should reject more than one result");
+        assert!(scan_error.to_string().contains("fixed 1-item bound"));
     }
 
     #[test]
