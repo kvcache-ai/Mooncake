@@ -311,16 +311,6 @@ mod tests {
             Ok(requests.iter().map(|_| Ok(())).collect())
         }
 
-        fn list_routes_by_replica_owner(
-            &self,
-            _lease: &ClientLease,
-            _namespace: &str,
-            _authority: &ClientStableId,
-            _owner: &ClientRuntimeId,
-        ) -> Result<Vec<ObjectRoute>> {
-            Ok(Vec::new())
-        }
-
         fn list_routes_by_replica_owner_page(
             &self,
             _lease: &ClientLease,
