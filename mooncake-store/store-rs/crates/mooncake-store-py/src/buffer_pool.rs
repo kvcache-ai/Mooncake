@@ -516,8 +516,8 @@ impl BufferPool {
                 cvar: Condvar::new(),
             }),
         };
-        if prewarm_size.is_some() && prewarm_count > 0 {
-            pool.prewarm(prewarm_size.unwrap(), prewarm_count)?;
+        if let Some(prewarm_size) = prewarm_size.filter(|_| prewarm_count > 0) {
+            pool.prewarm(prewarm_size, prewarm_count)?;
         }
         Ok(pool)
     }
