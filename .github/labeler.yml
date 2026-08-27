@@ -13,7 +13,10 @@ Transfer Engine:
 
 PyTorch Backend:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-pg/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-pg/**/*'
+      - 'python/mooncake/pg.py'
+      - 'python/tests/pg/**/*'
 
 Mooncake EP:
   - changed-files:
@@ -57,6 +60,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/pg/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:
