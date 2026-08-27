@@ -952,6 +952,10 @@ class RealClient : public PyClient {
         void *shm_buffer = nullptr;
         size_t shm_size = 0;
         uintptr_t dummy_base_addr = 0;
+        // Whether this receiver-side mapping was registered with SPDK for NoF
+        // zero-copy (see RealClient::map_shm_internal_with_device). Must be
+        // unregistered before munmap on every teardown path.
+        bool spdk_registered = false;
         bool is_ascend = false;
         bool is_ipc = false;
         // Ascend physical device id from dummy (dummy-real RPC).

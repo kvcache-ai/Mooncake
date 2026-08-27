@@ -52,6 +52,12 @@ class ShmHelper {
 
     bool is_hugepage() const { return use_hugepage_; }
 
+    // Whether the MC_STORE_REGISTER_SPDK feature is enabled (env == "1").
+    // Single source of truth for the env semantics, shared by ShmHelper's
+    // constructor and the RealClient-side (receiver) registration so both sides
+    // of the dummy/real split gate identically.
+    static bool is_register_spdk_enabled();
+
     ShmHelper(const ShmHelper &) = delete;
     ShmHelper &operator=(const ShmHelper &) = delete;
 
