@@ -196,28 +196,35 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
     }
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     int device_index = -1;
-    PG_TRY_CUDA(cudaGetDevice(&device_index));
+    const auto get_device_result = cudaGetDevice(&device_index);
+    // The process-wide Context is shared by CPU and GPU communicators. A
+    // CPU-only process may have no usable CUDA device, so device resources are
+    // initialized only when CUDA is available. GPU communicator creation
+    // checks that these resources exist.
+    if (get_device_result == cudaSuccess) {
+        auto transfer_service = std::make_unique<DeviceTransferService>();
+        PG_TRY(transfer_service->initialize(
+            static_cast<GlobalRank>(rank), static_cast<uint32_t>(world_size),
+            device_index, *engine, link_manager, kDefaultPeerAccessibleCapacity,
+            kDefaultLocalStagingCapacity));
 
-    auto transfer_service = std::make_unique<DeviceTransferService>();
-    PG_TRY(transfer_service->initialize(
-        static_cast<GlobalRank>(rank), static_cast<uint32_t>(world_size),
-        device_index, *engine, link_manager, kDefaultPeerAccessibleCapacity,
-        kDefaultLocalStagingCapacity));
+        PG_TRY(auto workspace,
+               DeviceCollectiveWorkspace::create(
+                   *transfer_service, static_cast<GlobalRank>(rank),
+                   static_cast<uint32_t>(world_size),
+                   kDefaultDeviceCollectiveBufferSize));
 
-    PG_TRY(auto workspace, DeviceCollectiveWorkspace::create(
-                               *transfer_service, static_cast<GlobalRank>(rank),
-                               static_cast<uint32_t>(world_size),
-                               kDefaultDeviceCollectiveBufferSize));
+        PG_TRY(auto strong_stream, StrongStream::create(device_index));
 
-    PG_TRY(auto strong_stream, StrongStream::create(device_index));
+        auto recovery_worker =
+            std::make_unique<DeviceCollectiveRecoveryWorker>();
+        PG_TRY(recovery_worker->start());
 
-    auto recovery_worker = std::make_unique<DeviceCollectiveRecoveryWorker>();
-    PG_TRY(recovery_worker->start());
-
-    device_transfer_service = std::move(transfer_service);
-    device_collective_workspace = std::move(workspace);
-    device_collective_strong_stream = std::move(strong_stream);
-    device_collective_recovery_worker = std::move(recovery_worker);
+        device_transfer_service = std::move(transfer_service);
+        device_collective_workspace = std::move(workspace);
+        device_collective_strong_stream = std::move(strong_stream);
+        device_collective_recovery_worker = std::move(recovery_worker);
+    }
 #endif
 
     global_rank = rank;
