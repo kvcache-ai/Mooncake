@@ -41,6 +41,9 @@ class S3SnapshotObjectStore final : public SnapshotObjectStore {
         const std::string& prefix,
         std::vector<std::string>& object_keys) override;
 
+    tl::expected<SnapshotObjectInspection, std::string> InspectObject(
+        const std::string& key) override;
+
     bool IsNotFoundError(const std::string& error) const override;
     std::string GetConnectionInfo() const override;
 

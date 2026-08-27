@@ -29,8 +29,12 @@ DEFINE_string(
     "thus multiple transports — SHM for DRAM, NVLink for VRAM) "
     "concurrently. Empty falls back to --seg_type (single type, existing "
     "behavior). Requires transports to be enabled via MC_TENT_CONF.");
-DEFINE_string(target_seg_name, "", "Memory segment name for the target side");
-DEFINE_string(op_type, "read", "Operation type to benchmark: read|write|mix");
+DEFINE_string(target_seg_name, "",
+              "Target segment name for the initiator side. A comma-separated "
+              "list enables multi-target initiator mode.");
+DEFINE_string(
+    op_type, "read",
+    "Operation type to benchmark: read|write|mix|write_seed|read_verify");
 DEFINE_bool(check_consistency, false,
             "Enable data consistency check after transfer.");
 DEFINE_uint64(total_buffer_size, 1UL << 30,
@@ -44,6 +48,13 @@ DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
              "Maximum number of concurrent worker threads.");
+DEFINE_uint64(target_offset, 0,
+              "Base offset added to every target buffer address. Useful when "
+              "multiple initiator processes share one target segment.");
+DEFINE_uint64(
+    target_range_size, 0,
+    "Per-initiator target range size. 0 disables range validation; "
+    "non-zero requires every target address to stay inside the range.");
 DEFINE_string(
     qos_classes, "",
     "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
@@ -60,6 +71,9 @@ DEFINE_double(qos_link_capacity_gbps, 0.0,
               "Link capacity in GB/s for total utilization (0 reports N/A).");
 DEFINE_string(qos_output_jsonl, "",
               "Append versioned QoS metric records to this JSONL file.");
+DEFINE_uint64(request_interval_us, 0,
+              "Per-thread delay before issuing each transfer batch, in "
+              "microseconds. 0 disables pacing.");
 DEFINE_uint64(deadline_us, 0,
               "tent only: relative per-transfer deadline in microseconds for "
               "tight worker threads (0 disables deadline tagging); cannot be "
@@ -80,14 +94,15 @@ DEFINE_int32(
     rpc_server_port, 0,
     "RPC server port used for p2p metadata service (0 = auto-select).");
 DEFINE_string(xport_type, "",
-              "Transport type: rdma|shm|mnnvl|gds|iouring|sunrise_link");
+              "Transport type: "
+              "rdma|shm|mnnvl|gds|iouring|sunrise_link|mpcomm|flagcx");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
 DEFINE_string(
     tent_transport_hint, "unspec",
     "tent only: per-request transport_hint. "
-    "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
+    "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link|mpcomm");
 DEFINE_string(tent_intent_type, "unspec",
               "tent only: intent_type attached to every benchmark request. "
               "unspec|foreground_get|background_prefetch|migration|checkpoint|"
@@ -110,11 +125,14 @@ size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
+size_t XferBenchConfig::target_offset = 0;
+size_t XferBenchConfig::target_range_size = 0;
 std::string XferBenchConfig::qos_classes;
 std::string XferBenchConfig::qos_classes_json;
 std::string XferBenchConfig::workload_classes_json;
 double XferBenchConfig::qos_link_capacity_gbps = 0.0;
 std::string XferBenchConfig::qos_output_jsonl;
+uint64_t XferBenchConfig::request_interval_us = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
 bool XferBenchConfig::deadline_bw_arbitration = false;
@@ -146,11 +164,14 @@ void XferBenchConfig::loadFromFlags() {
     max_batch_size = FLAGS_max_batch_size;
     start_num_threads = FLAGS_start_num_threads;
     max_num_threads = FLAGS_max_num_threads;
+    target_offset = FLAGS_target_offset;
+    target_range_size = FLAGS_target_range_size;
     qos_classes = FLAGS_qos_classes;
     qos_classes_json = FLAGS_qos_classes_json;
     workload_classes_json = FLAGS_workload_classes_json;
     qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
     qos_output_jsonl = FLAGS_qos_output_jsonl;
+    request_interval_us = FLAGS_request_interval_us;
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
@@ -191,7 +212,8 @@ void printStatsHeader() {
     std::cout << std::left
               << std::setw(14) << "BlkSize (B)"
               << std::setw(8) << "Batch"
-              << std::setw(14) << "BW (GB/S)"
+              << std::setw(14) << "BW (GB/s)"
+              << std::setw(18) << "Avg Inst GB/s"
               << std::setw(14) << "Avg Lat (us)"
               << std::setw(14) << "Avg Tx (us)"
               << std::setw(14) << "P99 Tx (us)"
@@ -211,6 +233,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
     avg_latency = (total_duration * num_threads / num_ops);
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
                      (total_duration / 1e6));  // In GB/Sec
+    const double avg_instant_gbps = stats.instant_bandwidth.avg();
 
     // Tabulate print with fixed width for each string
     // clang-format off
@@ -218,6 +241,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
               << std::setw(14) << block_size
               << std::setw(8)  << batch_size
               << std::setw(14) << throughput_gb
+              << std::setw(18) << avg_instant_gbps
               << std::setprecision(1)
               << std::setw(14) << avg_latency
               << std::setw(14) << stats.transfer_duration.avg()
@@ -240,6 +264,28 @@ void printDeadlineGroupStats(const char* group, size_t block_size,
     std::cout << " operations=" << stats.transfer_duration.count()
               << " throughput=" << std::fixed << std::setprecision(6)
               << throughput_gbs << " GB/s" << std::endl;
+}
+
+std::vector<std::string> splitCommaSeparated(const std::string& value) {
+    std::vector<std::string> result;
+    std::stringstream ss(value);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        const size_t begin = token.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) continue;
+        const size_t end = token.find_last_not_of(" \t\r\n");
+        result.push_back(token.substr(begin, end - begin + 1));
+    }
+    return result;
+}
+
+uint8_t stableDataSeed(uint64_t target_addr) {
+    uint64_t value = target_addr;
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    uint8_t seed = static_cast<uint8_t>(value);
+    return seed == 0 ? 1 : seed;
 }
 
 }  // namespace tent

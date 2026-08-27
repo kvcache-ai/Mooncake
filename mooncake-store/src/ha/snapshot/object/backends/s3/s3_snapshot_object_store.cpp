@@ -81,6 +81,17 @@ tl::expected<void, std::string> S3SnapshotObjectStore::ListObjectsWithPrefix(
     return impl_->s3_helper_.ListObjectsWithPrefix(prefix, object_keys);
 }
 
+tl::expected<SnapshotObjectInspection, std::string>
+S3SnapshotObjectStore::InspectObject(const std::string& key) {
+    SnapshotObjectInspection inspection;
+    auto result = impl_->s3_helper_.InspectObject(key, inspection.stored_size,
+                                                  inspection.crc32c);
+    if (!result) {
+        return tl::make_unexpected(std::move(result.error()));
+    }
+    return inspection;
+}
+
 bool S3SnapshotObjectStore::IsNotFoundError(const std::string& error) const {
     return ContainsAsciiInsensitive(error, "nosuchkey") ||
            ContainsAsciiInsensitive(error, "not found") ||

@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -209,7 +210,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     }
     if (openRdmaDevice(device_name_, port, gid_index)) {
         LOG(ERROR) << "Failed to open device " << device_name_ << " on port "
-                   << port << " with GID " << gid_index;
+                   << static_cast<int>(port) << " with GID " << gid_index;
         return ERR_CONTEXT;
     }
 
@@ -640,9 +641,20 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     if (iter == memory_region_map_.end()) {
         return 0;
     }
+    // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
+    // reading mr->length (or the cached region length) afterwards is a use-
+    // after-free. We restore fork state on the same range to undo the
+    // MADV_DONTFORK applied at register time (see issue #3639).
+    void *region_addr = iter->second.addr;
+    size_t region_length = iter->second.mr->length;
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
+    }
+    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
+        PLOG(WARNING) << "Failed to restore fork state for memory region at "
+                      << region_addr << " (" << region_length
+                      << " bytes), deregister already succeeded";
     }
     memory_region_map_.erase(iter);
     return 0;
@@ -1213,8 +1225,8 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_port_attr attr;
         int ret = ibv_query_port(context, port, &attr);
         if (ret) {
-            LOG(ERROR) << "Failed to query port " << port << " on "
-                       << device_name << ": " << strerror(ret);
+            LOG(ERROR) << "Failed to query port " << static_cast<int>(port)
+                       << " on " << device_name << ": " << strerror(ret);
             int close_ret = ibv_close_device(context);
             if (close_ret) {
                 LOG(ERROR) << "ibv_close_device(" << device_name
@@ -1341,7 +1353,8 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ret = ibv_query_port(context, port, &port_attr);
         if (ret) {
             LOG(WARNING) << "Failed to query port attributes on " << device_name
-                         << "/" << port << ": " << strerror(ret);
+                         << "/" << static_cast<int>(port) << ": "
+                         << strerror(ret);
             int close_ret = ibv_close_device(context);
             if (close_ret) {
                 LOG(ERROR) << "ibv_close_device(" << device_name
@@ -1360,34 +1373,37 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                                          found_gid_index);
             if (gid_state != GidNetworkState::GID_NOT_FOUND) {
                 LOG(INFO) << "Find best gid index: " << found_gid_index
-                          << " on " << device_name << "/" << port
-                          << " (network state: "
+                          << " on " << device_name << "/"
+                          << static_cast<int>(port) << " (network state: "
                           << GidNetworkStateToString(gid_state) << ")";
                 gid_index = found_gid_index;
             } else {
                 LOG(WARNING) << "No suitable GID found on " << device_name
-                             << "/" << port;
+                             << "/" << static_cast<int>(port);
                 goto cleanup_context_and_devices;
             }
         } else {
             // Also check network state for user-specified GID
             bool has_ndev = !readGidNdev(device_name, port, gid_index).empty();
             if (!has_ndev) {
-                LOG(WARNING) << "User-specified GID index " << gid_index
-                             << " on " << device_name << "/" << port
-                             << " has no associated network device, "
-                             << "may not be optimal for RDMA operations";
+                LOG(WARNING)
+                    << "User-specified GID index " << gid_index << " on "
+                    << device_name << "/" << static_cast<int>(port)
+                    << " has no associated network device, "
+                    << "may not be optimal for RDMA operations";
             }
             LOG(INFO) << "Using user-specified GID index: " << gid_index
-                      << " on " << device_name << "/" << port << " ("
-                      << (has_ndev ? "with" : "without") << " network device)";
+                      << " on " << device_name << "/" << static_cast<int>(port)
+                      << " (" << (has_ndev ? "with" : "without")
+                      << " network device)";
         }
 
         // Continue with GID validation
         ret = ibv_query_gid(context, port, gid_index, &gid_);
         if (ret) {
             LOG(ERROR) << "Failed to query GID " << gid_index << " on "
-                       << device_name << "/" << port << ": " << strerror(ret);
+                       << device_name << "/" << static_cast<int>(port) << ": "
+                       << strerror(ret);
             goto cleanup_context_and_devices;
         }
 

@@ -237,6 +237,16 @@ DEFINE_uint32(promotion_max_per_heartbeat, 1,
               "SSD-read + RDMA-write on the client; serializing them avoids "
               "blocking past the client-liveness window. Default 1 is "
               "conservative.");
+DEFINE_string(dynamic_replication_mode, "off",
+              "Dynamic MEMORY replica fanout mode: off, observe, or enforce");
+DEFINE_uint32(dynamic_replication_heat_window_seconds, 10,
+              "Heat observation window for dynamic MEMORY replication");
+DEFINE_double(
+    dynamic_replication_admission_qps_threshold, 0.8,
+    "Per-key access frequency threshold for dynamic MEMORY replication");
+DEFINE_uint64(
+    dynamic_replication_max_memory_replicas, 2,
+    "Maximum MEMORY replicas allowed for one dynamically replicated key");
 DEFINE_bool(enable_kv_events, false,
             "Enable RFC #1527 KV cache event publisher over ZMQ");
 DEFINE_string(kv_events_bind_endpoint, "",
@@ -535,6 +545,26 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("promotion_max_per_heartbeat",
                              &master_config.promotion_max_per_heartbeat,
                              FLAGS_promotion_max_per_heartbeat);
+    default_config.GetString("dynamic_replication_mode",
+                             &master_config.dynamic_replication_mode,
+                             FLAGS_dynamic_replication_mode);
+    default_config.GetUInt32(
+        "dynamic_replication_heat_window_seconds",
+        &master_config.dynamic_replication_heat_window_seconds,
+        FLAGS_dynamic_replication_heat_window_seconds);
+    default_config.GetDouble(
+        "dynamic_replication_admission_qps_threshold",
+        &master_config.dynamic_replication_admission_qps_threshold,
+        FLAGS_dynamic_replication_admission_qps_threshold);
+    {
+        uint64_t tmp_dynamic_replication_max_memory_replicas =
+            FLAGS_dynamic_replication_max_memory_replicas;
+        default_config.GetUInt64("dynamic_replication_max_memory_replicas",
+                                 &tmp_dynamic_replication_max_memory_replicas,
+                                 FLAGS_dynamic_replication_max_memory_replicas);
+        master_config.dynamic_replication_max_memory_replicas =
+            static_cast<size_t>(tmp_dynamic_replication_max_memory_replicas);
+    }
     default_config.GetBool("enable_kv_events", &master_config.enable_kv_events,
                            FLAGS_enable_kv_events);
     default_config.GetString("kv_events_bind_endpoint",
@@ -905,6 +935,32 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.promotion_max_per_heartbeat =
             FLAGS_promotion_max_per_heartbeat;
     }
+    if ((google::GetCommandLineFlagInfo("dynamic_replication_mode", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dynamic_replication_mode = FLAGS_dynamic_replication_mode;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "dynamic_replication_heat_window_seconds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dynamic_replication_heat_window_seconds =
+            FLAGS_dynamic_replication_heat_window_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "dynamic_replication_admission_qps_threshold", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dynamic_replication_admission_qps_threshold =
+            FLAGS_dynamic_replication_admission_qps_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "dynamic_replication_max_memory_replicas", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dynamic_replication_max_memory_replicas =
+            static_cast<size_t>(FLAGS_dynamic_replication_max_memory_replicas);
+    }
     if ((google::GetCommandLineFlagInfo("enable_kv_events", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -981,6 +1037,25 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                      << "Clamping to 255. Lower the configured value to "
                      << "silence this warning.";
         master_config.promotion_admission_threshold = 255;
+    }
+    if (master_config.dynamic_replication_mode != "off" &&
+        master_config.dynamic_replication_mode != "observe" &&
+        master_config.dynamic_replication_mode != "enforce") {
+        LOG(FATAL)
+            << "dynamic_replication_mode must be one of off, observe, enforce";
+    }
+    if (master_config.dynamic_replication_heat_window_seconds == 0) {
+        LOG(WARNING)
+            << "dynamic_replication_heat_window_seconds=0; clamping to 1";
+        master_config.dynamic_replication_heat_window_seconds = 1;
+    }
+    if (master_config.dynamic_replication_admission_qps_threshold <= 0.0) {
+        LOG(FATAL) << "dynamic_replication_admission_qps_threshold must be > 0";
+    }
+    if (master_config.dynamic_replication_max_memory_replicas == 0) {
+        LOG(WARNING)
+            << "dynamic_replication_max_memory_replicas=0; clamping to 1";
+        master_config.dynamic_replication_max_memory_replicas = 1;
     }
     if ((google::GetCommandLineFlagInfo("ha_backend_type", &info) &&
          !info.is_default) ||

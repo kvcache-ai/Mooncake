@@ -587,6 +587,10 @@ void WorkerPool::performPollCq(int thread_id) {
     const static size_t kPollCount = 64;
     std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     std::unordered_set<RdmaEndPoint *> local_failed_endpoints;
+    // Peer NIC paths already charged a local-fault error this pass. A QP that
+    // takes a local fault completes every WR it still holds, so one burst must
+    // count as one error against the path, not one per slice.
+    std::unordered_set<std::string> local_failed_peer_paths;
     bool recorded_local_context_failure = false;
     SliceList failed_slice_list;
     SliceList local_failed_slice_list;
@@ -659,7 +663,24 @@ void WorkerPool::performPollCq(int thread_id) {
                            << ", max_retry_cnt: " << slice->rdma.max_retry_cnt
                            << "): " << ibv_wc_status_str(wc[i].status);
                 auto *retry_list = &failed_slice_list;
-                if (!context_.active() || isLocalWcFailure(wc[i])) {
+                const bool local_wc_failure = isLocalWcFailure(wc[i]);
+                if (!context_.active() || local_wc_failure) {
+                    // A local completion fault retires the endpoint, and the
+                    // slice is handed to another local RNIC that rebuilds its
+                    // own endpoint to the same peer NIC. If the fault keeps
+                    // recurring nothing throttles that cycle: the rail is
+                    // deliberately not paused on the local path, and the
+                    // context failure counter is cleared by any concurrent
+                    // success, so both RNICs re-handshake the same peer as fast
+                    // as the workers spin. Charge the path an error instead --
+                    // without an immediate pause, so a one-off fault still
+                    // costs nothing -- and let kRailErrorThreshold stop the
+                    // rebuild loop from this context. See issue #3299.
+                    if (local_wc_failure &&
+                        local_failed_peer_paths.insert(slice->peer_nic_path)
+                            .second) {
+                        markRailFailed(slice->peer_nic_path);
+                    }
                     if (!recorded_local_context_failure) {
                         handleLocalFailure(slice->peer_nic_path,
                                            slice->rdma.endpoint);
@@ -1357,6 +1378,12 @@ void WorkerPool::markRailFailed(const std::string &peer_nic_path,
     std::lock_guard<std::mutex> lock(rail_state_lock_);
     auto &state = rail_states_[peer_nic_path];
     uint64_t now = getCurrentTimeInNano();
+    // Only errors close together are consecutive. error_count is otherwise
+    // never cleared until a pause expires, so isolated failures spread over
+    // hours would eventually pause a rail that is working fine.
+    if (state.last_error_ns && now - state.last_error_ns > kRailErrorWindowNs)
+        state.error_count = 0;
+    state.last_error_ns = now;
     state.error_count++;
     if (immediate_pause && state.error_count < kRailErrorThreshold) {
         state.error_count = kRailErrorThreshold;

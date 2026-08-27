@@ -19,6 +19,7 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -234,6 +235,167 @@ Status Topology::parse(const std::string& json_content) {
     return Status::OK();
 }
 
+namespace {
+
+Topology::NicID ensureNic(
+    Topology& topo, const std::string& name,
+    std::unordered_map<std::string, Topology::NicID>* ids) {
+    auto it = ids->find(name);
+    if (it != ids->end()) return it->second;
+    Topology::NicID id = static_cast<Topology::NicID>(topo.nic_list_.size());
+    Topology::NicEntry nic;
+    nic.name = name;
+    nic.type = Topology::NIC_RDMA;
+    nic.numa_node = -1;
+    topo.nic_list_.push_back(std::move(nic));
+    (*ids)[name] = id;
+    return id;
+}
+
+}  // namespace
+
+Status Topology::parsePriorityMatrix(const std::string& json_content) {
+    try {
+        clear();
+        if (json_content.empty()) {
+            return Status::MalformedJson("empty priority matrix" LOC_MARK);
+        }
+        nlohmann::json root = nlohmann::json::parse(json_content);
+        if (!root.is_object()) {
+            return Status::MalformedJson(
+                "priority matrix must be a JSON object" LOC_MARK);
+        }
+
+        std::unordered_map<std::string, NicID> nic_ids;
+        std::vector<NicID> all_preferred;
+        std::vector<NicID> all_avail;
+        std::unordered_set<NicID> seen_preferred;
+        std::unordered_set<NicID> seen_avail;
+        // Canonical mem names, to reject configs that specify the same
+        // device twice via the "rocm:N" alias and the canonical "hip:N".
+        std::unordered_set<std::string> seen_mem_names;
+
+        for (auto it = root.begin(); it != root.end(); ++it) {
+            const auto& value = it.value();
+            if (!value.is_array() || value.size() != 2 ||
+                !value[0].is_array() || !value[1].is_array()) {
+                return Status::MalformedJson(
+                    "each priority matrix entry must be "
+                    "[[preferred...],[avail...]]" LOC_MARK);
+            }
+
+            MemEntry mem;
+            // Store canonical names: a legacy "rocm:N" key becomes "hip:N"
+            // so runtime lookups with canonical names match.
+            mem.name = canonicalizeLocation(it.key());
+            if (!seen_mem_names.insert(mem.name).second) {
+                return Status::MalformedJson(
+                    "duplicate location key \"" + mem.name +
+                    "\" (the rocm:N alias and hip:N key refer to the same "
+                    "device)" LOC_MARK);
+            }
+            mem.pci_bus_id = "";
+            mem.type = memTypeFromLocation(mem.name);
+            mem.numa_node = -1;
+
+            for (const auto& hca : value[0]) {
+                if (!hca.is_string()) {
+                    return Status::MalformedJson(
+                        "HCA names must be strings" LOC_MARK);
+                }
+                NicID id = ensureNic(*this, hca.get<std::string>(), &nic_ids);
+                mem.device_list[0].push_back(id);
+                if (seen_preferred.insert(id).second) {
+                    all_preferred.push_back(id);
+                }
+            }
+            for (const auto& hca : value[1]) {
+                if (!hca.is_string()) {
+                    return Status::MalformedJson(
+                        "HCA names must be strings" LOC_MARK);
+                }
+                NicID id = ensureNic(*this, hca.get<std::string>(), &nic_ids);
+                mem.device_list[1].push_back(id);
+                if (seen_avail.insert(id).second) {
+                    all_avail.push_back(id);
+                }
+            }
+            mem_list_.push_back(std::move(mem));
+        }
+
+        // Wildcard entry used when memory location is unknown.
+        MemEntry wildcard;
+        wildcard.name = kWildcardLocation;
+        wildcard.pci_bus_id = "";
+        wildcard.type = MEM_UNKNOWN;
+        wildcard.numa_node = -1;
+        wildcard.device_list[0] = all_preferred;
+        wildcard.device_list[1] = all_avail;
+        mem_list_.push_back(std::move(wildcard));
+    } catch (std::exception& e) {
+        clear();
+        return Status::MalformedJson(std::string(e.what()) + LOC_MARK);
+    }
+    return Status::OK();
+}
+
+Status Topology::parseCustomTopology(const std::string& json_content) {
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(json_content);
+    } catch (std::exception& e) {
+        return Status::MalformedJson(std::string(e.what()) + LOC_MARK);
+    }
+    if (j.is_object() && (j.contains("nics") || j.contains("mems"))) {
+        return parse(json_content);
+    }
+    return parsePriorityMatrix(json_content);
+}
+
+Status Topology::loadFromConfig(const Config& conf,
+                                const std::vector<Platform*>& platforms) {
+    if (conf.contains("topology/priority_matrix")) {
+        std::string matrix_json;
+        if (conf.dumpSubtree("topology/priority_matrix", &matrix_json)) {
+            auto status = parsePriorityMatrix(matrix_json);
+            if (status.ok()) {
+                LOG(INFO) << "Using custom NIC priority matrix from config";
+                return Status::OK();
+            }
+            LOG(WARNING) << "Failed to parse topology/priority_matrix: "
+                         << status.ToString()
+                         << ", falling back to auto-discover";
+            return discover(platforms);
+        }
+    }
+
+    auto path = conf.get("topology/custom_json_path", std::string());
+    if (!path.empty()) {
+        LOG(INFO) << "Using custom topology from: " << path;
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            LOG(WARNING) << "Failed to load custom topology from " << path
+                         << ", falling back to auto-detect.";
+            return discover(platforms);
+        }
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        std::string content = buffer.str();
+        if (content.empty()) {
+            LOG(WARNING) << "Failed to load custom topology from " << path
+                         << ", falling back to auto-detect.";
+            return discover(platforms);
+        }
+        auto status = parseCustomTopology(content);
+        if (status.ok()) return Status::OK();
+        LOG(WARNING) << "Failed to parse custom topology from " << path << ": "
+                     << status.ToString() << ", falling back to auto-detect.";
+        return discover(platforms);
+    }
+
+    return discover(platforms);
+}
+
 size_t Topology::getNicCount(NicType type) const {
     if (type == NIC_UNKNOWN) return nic_list_.size();
     size_t count = 0;
@@ -270,8 +432,9 @@ const Topology::NicEntry* Topology::getNicEntry(const std::string& name) const {
 }
 
 const Topology::MemEntry* Topology::getMemEntry(const std::string& name) const {
+    const auto canonical = canonicalizeLocation(name);
     for (size_t i = 0; i < mem_list_.size(); ++i) {
-        if (mem_list_[i].name == name) return &mem_list_[i];
+        if (mem_list_[i].name == canonical) return &mem_list_[i];
     }
     return nullptr;
 }
@@ -284,8 +447,9 @@ Topology::NicID Topology::getNicId(const std::string& name) const {
 }
 
 Topology::MemID Topology::getMemId(const std::string& name) const {
+    const auto canonical = canonicalizeLocation(name);
     for (size_t i = 0; i < mem_list_.size(); ++i) {
-        if (mem_list_[i].name == name) return (MemID)i;
+        if (mem_list_[i].name == canonical) return (MemID)i;
     }
     return -1;
 }

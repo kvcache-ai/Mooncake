@@ -10,6 +10,7 @@ add_subdirectory(ascend)
 add_subdirectory(sunrise_link)
 add_subdirectory(tpu)
 add_subdirectory(ub)
+add_subdirectory(mpcomm)
 
 add_library(tent_transport_all INTERFACE)
 foreach(
@@ -25,7 +26,8 @@ foreach(
   tent_xport_ub
   tent_xport_ascend_direct
   tent_xport_sunrise_link
-  tent_xport_tpu)
+  tent_xport_tpu
+  tent_xport_mpcomm)
   if(TARGET ${tgt})
     target_link_libraries(tent_transport_all INTERFACE ${tgt})
   endif()

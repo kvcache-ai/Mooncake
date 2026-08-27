@@ -13,6 +13,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +60,14 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->CountCandidatesForTesting(tenant);
     }
 
+    static constexpr uint32_t MaxPromotionCandidateRetriesForTesting() {
+        return MasterService::kPromotionCandidateMaxRetries;
+    }
+
+    static constexpr uint32_t MaxPromotionExecutionFailuresForTesting() {
+        return MasterService::kMaxPromotionExecutionFailures;
+    }
+
     static void ResetCandidateBackoffsForTesting(MasterService* service) {
         service->ResetCandidateBackoffsForTesting();
     }
@@ -86,6 +95,35 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_in_flight_.load(std::memory_order_relaxed);
     }
 
+    static bool HasPromotionTaskForTesting(MasterService* service,
+                                           const TenantId& tenant_id,
+                                           const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                   .user_key = key});
+        const auto* tenant_state = accessor.GetTenantState();
+        return tenant_state != nullptr &&
+               tenant_state->promotion_tasks.contains(key);
+    }
+
+    // std::nullopt when the key has no in-flight promotion task.
+    static std::optional<uint32_t> GetPromotionTaskExecutionFailuresForTesting(
+        MasterService* service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                   .user_key = key});
+        const auto* tenant_state = accessor.GetTenantState();
+        if (tenant_state == nullptr) {
+            return std::nullopt;
+        }
+        auto it = tenant_state->promotion_tasks.find(key);
+        if (it == tenant_state->promotion_tasks.end()) {
+            return std::nullopt;
+        }
+        return it->second.execution_failures;
+    }
+
     static bool PromotionAdmissionBlockedByPrimaryWriteForTesting(
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
@@ -106,6 +144,19 @@ class PromotionOnHitTest : public ::testing::Test {
         auto* replica = accessor.Get().GetReplicaByID(replica_id);
         ASSERT_NE(replica, nullptr);
         replica->mark_complete();
+    }
+
+    static std::unique_ptr<AllocatedBuffer> AllocateOnSegmentForTesting(
+        MasterService* service, const UUID& segment_id, size_t size) {
+        std::shared_ptr<BufferAllocatorBase> allocator;
+        {
+            auto segment_access = service->segment_manager_.getSegmentAccess();
+            allocator = segment_access.GetAllocator(segment_id);
+        }
+        if (!allocator) {
+            return nullptr;
+        }
+        return allocator->allocate(size);
     }
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
@@ -175,6 +226,14 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService& service, const UUID& client_id, const std::string& key,
         int64_t size, const std::string& transport_endpoint,
         std::string tenant_id = std::string(TenantId::kDefaultValue)) {
+        // NotifyOffloadSuccess registers replicas only for a client with a
+        // mounted LOCAL_DISK segment, the way the real offload pipeline
+        // mounts before registering. Idempotent, so repeat injections for
+        // the same client are fine.
+        auto mount = service.MountLocalDiskSegment(client_id, true);
+        if (!mount.has_value()) {
+            return false;
+        }
         std::vector<OffloadTaskItem> tasks{
             OffloadTaskItem{.tenant_id = tenant_id, .key = key, .size = size}};
         StorageObjectMetadata sm;
@@ -592,6 +651,17 @@ TEST_F(PromotionOnHitTest, StalePromotionReplicaCleanupErasesTask) {
     ASSERT_TRUE(
         service->UnmountSegment(target_segment.id, target_id).has_value());
 
+    constexpr auto kCleanupTimeout = std::chrono::seconds(5);
+    constexpr auto kPollInterval = std::chrono::milliseconds(10);
+    const auto cleanup_deadline =
+        std::chrono::steady_clock::now() + kCleanupTimeout;
+    while (HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                      "k_cold") &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::sleep_for(kPollInterval);
+    }
+    ASSERT_FALSE(HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                            "k_cold"));
     EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
     EXPECT_EQ(metrics.get_promotion_cancelled() - cancelled_before, 1);
     auto pending = service->PromotionObjectHeartbeat(holder_id);
@@ -1075,6 +1145,10 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
 TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{TenantId::Default().value(), 4096}});
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -1103,6 +1177,9 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     auto alloc = service->PromotionAllocStart(ctx.client_id, "k_cold",
                                               TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value());
+    ASSERT_EQ(
+        service->GetTenantQuotaSnapshot(TenantId::Default())->charged_bytes,
+        1024);
 
     // After AllocStart, the DRAM allocator must have committed bytes for
     // the staged PROCESSING MEMORY replica.
@@ -1134,6 +1211,8 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
         << "be freed back to the DRAM allocator. If this fires, the "
         << "reaper is not popping the staged replica and the buffer "
         << "leaks until the object itself is removed or evicted.";
+    EXPECT_EQ(
+        service->GetTenantQuotaSnapshot(TenantId::Default())->charged_bytes, 0);
 
     // NotifyPromotionSuccess for a reaped task must not commit anything
     // and must return REPLICA_IS_NOT_READY (the task entry is gone, so
@@ -1386,6 +1465,89 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
     service->RemoveAll();
 }
 
+TEST_F(PromotionOnHitTest, TenantQuotaChargesAtAllocStartAndSettlesLifecycle) {
+    const TenantId tenant_id("tenant-a");
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{tenant_id.value(), 4096}});
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "seg_quota", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "success", 1024,
+                                       seg.segment_name, tenant_id.value()));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "failure", 1024,
+                                       seg.segment_name, tenant_id.value()));
+
+    ASSERT_TRUE(service->GetReplicaList("success", tenant_id));
+    ASSERT_TRUE(service->PromotionAllocStart(seg.client_id, "success",
+                                             tenant_id, 1024, {}));
+    ASSERT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 1024);
+    ASSERT_TRUE(
+        service->NotifyPromotionSuccess(seg.client_id, "success", tenant_id));
+    EXPECT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 1024);
+
+    ASSERT_TRUE(service->GetReplicaList("failure", tenant_id));
+    ASSERT_TRUE(service->PromotionAllocStart(seg.client_id, "failure",
+                                             tenant_id, 1024, {}));
+    ASSERT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 2048);
+    ASSERT_TRUE(
+        service->NotifyPromotionFailure(seg.client_id, "failure", tenant_id));
+    EXPECT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 1024);
+
+    ASSERT_TRUE(service->Remove("success", tenant_id, /*force=*/true));
+    EXPECT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 0);
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, UpsertStartRejectsActivePromotionTask) {
+    const TenantId tenant_id("tenant-a");
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{tenant_id.value(), 4096}});
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    constexpr uint64_t object_size = 1024;
+    auto seg =
+        PrepareSegment(*service, "seg_quota", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "key",
+                                       object_size, seg.segment_name,
+                                       tenant_id.value()));
+
+    ASSERT_TRUE(service->GetReplicaList("key", tenant_id));
+    ASSERT_TRUE(service->PromotionAllocStart(seg.client_id, "key", tenant_id,
+                                             object_size, {}));
+    ASSERT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes,
+              object_size);
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    auto upsert = service->UpsertStart(seg.client_id, "key", tenant_id,
+                                       object_size, replicate_config);
+    ASSERT_FALSE(upsert.has_value());
+    EXPECT_EQ(upsert.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+    ASSERT_TRUE(
+        service->NotifyPromotionSuccess(seg.client_id, "key", tenant_id));
+    EXPECT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes,
+              object_size);
+    service->RemoveAll();
+}
+
 // PromotionAllocStart must reject when the in-flight task has been
 // reaped between the holder's heartbeat and the AllocStart RPC arriving
 // (e.g. client stall past put_start_release_timeout_sec_). Without the
@@ -1528,6 +1690,13 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
 // be silently dropped until reaper TTL if Notify-Failure didn't
 // fast-release. The TTL is set high enough here that any test pass
 // can be attributed to the explicit release, not to reaper expiry.
+//
+// Note: failure also re-records the failed key as a retry candidate
+// (transient execution errors are retried, not dropped). With queue_limit=1
+// the retried key and a fresh admission on another key race for the freed
+// slot; the assertions below accept either winner — what they must NOT
+// accept is an undeliverable heartbeat, which is what a saturated slot
+// would produce.
 TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -1554,6 +1723,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
 
     auto& mm = MasterMetricManager::instance();
     const int64_t failed_pre = mm.get_promotion_failed();
+    const int64_t recorded_pre = mm.get_promotion_candidate_recorded();
 
     // Admit + stage k_a. promotion_in_flight_ goes 0 -> 1.
     {
@@ -1580,6 +1750,12 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
         << "legitimate holder must succeed; error=" << failure.error();
     EXPECT_EQ(mm.get_promotion_failed() - failed_pre, 1)
         << "holder-reported failure must bump promotion_failed";
+    // The failure must also re-record a retry candidate for k_a (metric
+    // moves synchronously inside NotifyPromotionFailure; the background
+    // retry loop can only consume the candidate, never un-record it).
+    EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre, 1)
+        << "NotifyPromotionFailure must re-record k_a as a retry candidate "
+        << "so transient execution errors are retried, not dropped";
 
     // The staged buffer must be freed back to the DRAM allocator. If
     // this fires, NotifyPromotionFailure did not pop the staged replica
@@ -1592,20 +1768,31 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
         << "to the allocator; otherwise it leaks until the object is "
         << "removed or evicted.";
 
-    // The slot must be freed: a second admission on a different key must
-    // succeed even though queue_limit=1. Without the failure-side
-    // decrement the cap would stay saturated until reaper TTL.
+    // The slot must be freed. Two outcomes prove it, and which one occurs
+    // depends on a benign race with the eviction thread's retry loop:
+    //   (a) k_b's read admits k_b while the freed slot is still open, or
+    //   (b) k_a — re-recorded as a retry candidate by the failure above —
+    //       is re-admitted first, so k_b is cap-rejected and becomes a
+    //       candidate itself.
+    // Either way the heartbeat must deliver exactly one task (queue_limit=1)
+    // and it must be one of the two keys; before the fast-release fix the
+    // slot would have stayed saturated and the heartbeat would be empty.
     {
         auto r = service->GetReplicaList("k_b", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(heartbeat.has_value());
-    EXPECT_EQ(CountPromotionTask(*heartbeat, "k_b"), 1u)
-        << "k_b admission must succeed after k_a's failure released the "
-        << "slot. If this fires, NotifyPromotionFailure did not decrement "
-        << "promotion_in_flight_, and transient client-side errors "
-        << "would saturate the queue limit for the full reaper TTL.";
+    ASSERT_EQ(heartbeat->size(), 1u)
+        << "after k_a's failure released the slot, exactly one promotion "
+        << "must be deliverable (queue_limit=1); an empty result means "
+        << "NotifyPromotionFailure did not decrement promotion_in_flight_, "
+        << "and transient client-side errors would saturate the queue "
+        << "limit for the full reaper TTL";
+    const std::string& winner = heartbeat->front().key;
+    EXPECT_TRUE(winner == "k_a" || winner == "k_b")
+        << "delivered task must be the retried k_a or the newly admitted "
+        << "k_b, got: " << winner;
 
     // Idempotency: repeated failure notification on the same key must be
     // safe (return OK without underflowing the counter).
@@ -1614,6 +1801,160 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
     EXPECT_TRUE(failure_again.has_value())
         << "Repeated NotifyPromotionFailure should be idempotent (return "
         << "OK on already-released task), not error.";
+
+    service->RemoveAll();
+}
+
+// NotifyPromotionFailure must re-record a retry candidate for the failed
+// key so transient execution errors (DRAM pressure at AllocStart, TE write
+// flake, SSD throttle) are retried by the eviction-thread retry loop rather
+// than silently dropped. The re-admission can be driven by the background
+// retry loop or by an explicit scan — the final state is identical either
+// way: candidate consumed, key re-queued for the holder.
+TEST_F(PromotionOnHitTest, NotifyFailureRecordsCandidateAndRetries) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 5000;
+    config.put_start_release_timeout_sec = 300;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_a", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t recorded_pre = mm.get_promotion_candidate_recorded();
+
+    {
+        auto r = service->GetReplicaList("k_a", TenantId::Default());
+        ASSERT_TRUE(r.has_value());
+    }
+    auto alloc = service->PromotionAllocStart(seg.client_id, "k_a",
+                                              TenantId::Default(), 1024, {});
+    ASSERT_TRUE(alloc.has_value());
+
+    // Holder reports failure after a successful AllocStart (simulating an
+    // SSD read error / TE write flake past the staging point).
+    auto failure = service->NotifyPromotionFailure(seg.client_id, "k_a",
+                                                   TenantId::Default());
+    ASSERT_TRUE(failure.has_value());
+    EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre, 1)
+        << "NotifyPromotionFailure must re-record a retry candidate";
+
+    // Whether the eviction thread's retry loop or this explicit scan wins
+    // the race to re-admit, the resulting state is identical: the candidate
+    // is consumed and k_a is queued again for the holder.
+    ResetCandidateBackoffsForTesting(service.get());
+    RunPromotionCandidateRetryForTesting(service.get());
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u)
+        << "k_a must be re-admitted after its transient failure";
+    EXPECT_EQ(
+        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
+        0u)
+        << "the re-admitted candidate must be consumed";
+
+    auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(heartbeat.has_value());
+    ASSERT_EQ(heartbeat->size(), 1u);
+    EXPECT_EQ(heartbeat->front().key, "k_a");
+
+    service->RemoveAll();
+}
+
+// A persistently-failing key (e.g. a broken SSD file that still has a
+// LOCAL_DISK replica) must not re-record -> re-admit -> fail -> re-record
+// forever: each NotifyPromotionFailure re-records with execution_failures+1
+// (propagated candidate -> task at admission), and once the chain reaches
+// kMaxPromotionExecutionFailures the failure stops re-recording. The
+// give-up kills only the self-sustaining cycle — a genuine read afterwards
+// re-admits with a fresh count.
+TEST_F(PromotionOnHitTest, NotifyFailureGivesUpAfterMaxExecutionFailures) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 5000;
+    config.put_start_release_timeout_sec = 300;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_a", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t recorded_pre = mm.get_promotion_candidate_recorded();
+    const int64_t gave_up_pre = mm.get_promotion_execution_gave_up();
+
+    // First admission is driven by a real read (fresh chain, count 0).
+    {
+        auto r = service->GetReplicaList("k_a", TenantId::Default());
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // Fail kMaxPromotionExecutionFailures times. Each failure must re-record
+    // with an incremented count, and each re-admission must show the count
+    // propagated across the candidate's consumption. The background eviction
+    // thread may win the re-admission race against the explicit retry call —
+    // assertions only target the resulting terminal state, which is
+    // identical under both interleavings.
+    for (uint32_t i = 1; i <= MaxPromotionExecutionFailuresForTesting(); ++i) {
+        ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 1u)
+            << "chain must be in-flight at iteration " << i;
+        EXPECT_EQ(GetPromotionTaskExecutionFailuresForTesting(
+                      service.get(), TenantId::Default(), "k_a"),
+                  std::optional<uint32_t>(i - 1))
+            << "execution_failures must propagate candidate -> task";
+        auto alloc = service->PromotionAllocStart(
+            seg.client_id, "k_a", TenantId::Default(), 1024, {});
+        ASSERT_TRUE(alloc.has_value());
+        auto failure = service->NotifyPromotionFailure(seg.client_id, "k_a",
+                                                       TenantId::Default());
+        ASSERT_TRUE(failure.has_value());
+        EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre,
+                  static_cast<int64_t>(i))
+            << "failure " << i << " must re-record (still below the bound)";
+        ResetCandidateBackoffsForTesting(service.get());
+        RunPromotionCandidateRetryForTesting(service.get());
+    }
+
+    // The next failure hits the bound: no re-record, no re-admission.
+    ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(
+        GetPromotionTaskExecutionFailuresForTesting(service.get(),
+                                                    TenantId::Default(), "k_a"),
+        std::optional<uint32_t>(MaxPromotionExecutionFailuresForTesting()));
+    auto alloc = service->PromotionAllocStart(seg.client_id, "k_a",
+                                              TenantId::Default(), 1024, {});
+    ASSERT_TRUE(alloc.has_value());
+    auto failure = service->NotifyPromotionFailure(seg.client_id, "k_a",
+                                                   TenantId::Default());
+    ASSERT_TRUE(failure.has_value());
+    EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre,
+              static_cast<int64_t>(MaxPromotionExecutionFailuresForTesting()))
+        << "the bound-crossing failure must NOT re-record";
+    EXPECT_EQ(mm.get_promotion_execution_gave_up() - gave_up_pre, 1)
+        << "give-up must bump promotion_execution_gave_up";
+    EXPECT_EQ(
+        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
+        0u);
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u)
+        << "the self-sustaining cycle must be dead";
+
+    // Give-up kills only the self-sustaining cycle: a genuine read re-admits
+    // with a fresh chain (count 0).
+    {
+        auto r = service->GetReplicaList("k_a", TenantId::Default());
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(GetPromotionTaskExecutionFailuresForTesting(
+                  service.get(), TenantId::Default(), "k_a"),
+              std::optional<uint32_t>(0u));
 
     service->RemoveAll();
 }
@@ -2368,6 +2709,50 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
     wm_service->RemoveAll();
 }
 
+TEST_F(PromotionOnHitTest, WatermarkUsesAllocatorStateAfterMetricsReset) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.eviction_high_watermark_ratio = 0.5;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 12 * 1024 * 1024;
+    const std::string segment_name = "allocator_watermark_segment";
+    auto segment = PrepareSegment(*service, segment_name, kDefaultSegmentBase,
+                                  kSegmentSize);
+    auto allocated = AllocateOnSegmentForTesting(
+        service.get(), segment.segment_id, kAllocationSize);
+    ASSERT_NE(allocated, nullptr);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, segment.client_id,
+                                       "allocator_watermark_key", 1024,
+                                       segment.segment_name));
+
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_mem_size();
+    metrics.reset_total_mem_capacity();
+    metrics.reset_segment_allocated_mem_size(segment_name);
+    metrics.reset_segment_total_mem_capacity(segment_name);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+
+    const int64_t rejected_before = metrics.get_promotion_rejected_watermark();
+    auto get_result =
+        service->GetReplicaList("allocator_watermark_key", TenantId::Default());
+    EXPECT_TRUE(get_result.has_value());
+    EXPECT_EQ(metrics.get_promotion_rejected_watermark() - rejected_before, 1);
+
+    // Restore the observable gauges before normal teardown. The business
+    // assertion above intentionally reset them, but allocator and service
+    // destructors still emit their matching decrements.
+    metrics.inc_allocated_mem_size(segment_name, kAllocationSize);
+    metrics.inc_total_mem_capacity(segment_name, kSegmentSize);
+    allocated.reset();
+    service->RemoveAll();
+}
+
 TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2622,9 +3007,17 @@ TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
         CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
         1u);
 
-    auto failed = service->NotifyPromotionFailure(seg.client_id, "k_busy",
-                                                  TenantId::Default());
-    ASSERT_TRUE(failed.has_value());
+    // Release the slot via a *successful* promotion of k_busy. Using
+    // NotifyPromotionFailure here would change the candidate set: failure
+    // deliberately re-records a retry candidate for the failed key
+    // (transient execution errors are retried, not dropped), so k_busy
+    // would then compete with k_retry for the freed slot.
+    auto alloc = service->PromotionAllocStart(seg.client_id, "k_busy",
+                                              TenantId::Default(), 1024, {});
+    ASSERT_TRUE(alloc.has_value());
+    auto done = service->NotifyPromotionSuccess(seg.client_id, "k_busy",
+                                                TenantId::Default());
+    ASSERT_TRUE(done.has_value());
     ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
 
     ResetCandidateBackoffsForTesting(service.get());
@@ -2710,8 +3103,10 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ExhaustedAfterMaxRetries) {
 
     // Drive retries; each scan increments retry_count until exhausted.
     // Reset backoff timestamps before each scan so wall-clock time doesn't
-    // gate retries and the loop completes without sleeping.
-    for (int i = 0; i <= 10; ++i) {
+    // gate retries and the loop completes without sleeping. The scan count
+    // is derived from kPromotionCandidateMaxRetries (one scan to reach the
+    // limit, one more to observe it and erase).
+    for (uint32_t i = 0; i <= MaxPromotionCandidateRetriesForTesting(); ++i) {
         ResetCandidateBackoffsForTesting(service.get());
         RunPromotionCandidateRetryForTesting(service.get());
     }

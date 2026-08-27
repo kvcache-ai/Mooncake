@@ -18,6 +18,8 @@
 
 #include <graph/ascend_string.h>
 
+#include <acl/acl.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -75,90 +77,91 @@ enum FeatureType : int32_t {
     CLIENT_SERVER_COMM = 1,
 };
 
+using ShareableHandle = aclrtMemFabricHandle;
+
 class ASCEND_FUNC_VISIBILITY AdxlEngine {
    public:
     /**
-     * @brief 构造函数
+     * @brief Constructs an AdxlEngine instance.
      */
     AdxlEngine();
 
     /**
-     * @brief 析构函数
+     * @brief Destroys the AdxlEngine instance.
      */
     ~AdxlEngine();
 
     /**
-     * @brief 初始化AdxlEngine, 在调用其他接口前需要先调用该接口
-     * @param [in] local_engine
-     * AdxlEngine的唯一标识，如果是ipv4格式为host_ip:host_port或host_ip,
-     * 如果是ipv6格式为[host_ip]:host_port或[host_ip],
-     * 当设置host_port且host_port >
-     * 0时代表当前AdxlEngine作为server端，需要对配置端口进行监听
-     * @param [in] options 初始化所需的选项
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Initializes AdxlEngine before any other operation.
+     * @param [in] local_engine Unique engine identifier. IPv4 identifiers use
+     * host_ip or host_ip:host_port; IPv6 identifiers use [host_ip] or
+     * [host_ip]:host_port. A positive host_port makes this engine listen as a
+     * server.
+     * @param [in] options Initialization options.
+     * @return SUCCESS on success, or another status on failure.
      */
     Status Initialize(const AscendString& local_engine,
                       const std::map<AscendString, AscendString>& options);
 
     /**
-     * @brief AdxlEngine资源清理函数
+     * @brief Releases resources owned by AdxlEngine.
      */
     void Finalize();
 
     /**
-     * @brief 注册内存
-     * @param [in] mem 需要注册的内存的描述信息
-     * @param [in] type 需要注册的内存的类型
-     * @param [out] mem_handle 注册成功返回的内存handle, 可用于内存解注册
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Registers memory with the engine.
+     * @param [in] mem Description of the memory to register.
+     * @param [in] type Type of the memory to register.
+     * @param [out] mem_handle Handle used to deregister the memory.
+     * @return SUCCESS on success, or another status on failure.
      */
     Status RegisterMem(const MemDesc& mem, MemType type, MemHandle& mem_handle);
 
     /**
-     * @brief 解注册内存
-     * @param [in] mem_handle 注册内存返回的内存handle
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Deregisters memory from the engine.
+     * @param [in] mem_handle Handle returned by RegisterMem.
+     * @return SUCCESS on success, or another status on failure.
      */
     Status DeregisterMem(MemHandle mem_handle);
 
     /**
-     * @brief 与远端AdxlEngine进行建链
-     * @param [in] remote_engine 远端AdxlEngine的唯一标识
-     * @param [in] timeout_in_millis 建链的超时时间，单位ms
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Connects to a remote AdxlEngine.
+     * @param [in] remote_engine Unique identifier of the remote engine.
+     * @param [in] timeout_in_millis Connection timeout in milliseconds.
+     * @return SUCCESS on success, or another status on failure.
      */
     Status Connect(const AscendString& remote_engine,
                    int32_t timeout_in_millis = 1000);
 
     /**
-     * @brief 与远端AdxlEngine进行断链
-     * @param [in] remote_engine 远端AdxlEngine的唯一标识
-     * @param [in] timeout_in_millis 断链的超时时间，单位ms
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Disconnects from a remote AdxlEngine.
+     * @param [in] remote_engine Unique identifier of the remote engine.
+     * @param [in] timeout_in_millis Disconnection timeout in milliseconds.
+     * @return SUCCESS on success, or another status on failure.
      */
     Status Disconnect(const AscendString& remote_engine,
                       int32_t timeout_in_millis = 1000);
 
     /**
-     * @brief 与远端AdxlEngine进行内存传输
-     * @param [in] remote_engine 远端AdxlEngine的唯一标识
-     * @param [in] operation 将远端内存读到本地或者将本地内存写到远端
-     * @param [in] op_descs 批量操作的本地以及远端地址
-     * @param [in] timeout_in_millis 断链的超时时间，单位ms
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Transfers memory synchronously with a remote AdxlEngine.
+     * @param [in] remote_engine Unique identifier of the remote engine.
+     * @param [in] operation Reads remote memory or writes local memory.
+     * @param [in] op_descs Local and remote addresses for the batch.
+     * @param [in] timeout_in_millis Transfer timeout in milliseconds.
+     * @return SUCCESS on success, or another status on failure.
      */
     Status TransferSync(const AscendString& remote_engine, TransferOp operation,
                         const std::vector<TransferOpDesc>& op_descs,
                         int32_t timeout_in_millis = 1000);
 
     /**
-     * @brief 批量异步传输，下发传输请求
-     * @param [in] remote_engine 远端Hixl的唯一标识
-     * @param [in] operation 将远端内存读到本地或者将本地内存写到远端
-     * @param [in] op_descs 批量操作的本地以及远端地址
-     * @param [in] optional_args 可选参数，预留
-     * @param [out] req 请求的handle，用于查询请求状态
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Submits a batch of asynchronous transfers.
+     * @param [in] remote_engine Unique identifier of the remote engine.
+     * @param [in] operation Reads remote memory or writes local memory.
+     * @param [in] op_descs Local and remote addresses for the batch.
+     * @param [in] optional_args Reserved optional arguments.
+     * @param [out] req Request handle used to query transfer status.
+     * @return SUCCESS on success, or another status on failure.
      */
     __attribute__((weak)) Status
     TransferAsync(const AscendString& remote_engine, TransferOp operation,
@@ -166,36 +169,52 @@ class ASCEND_FUNC_VISIBILITY AdxlEngine {
                   const TransferArgs& optional_args, TransferReq& req);
 
     /**
-     * @brief 获取请求状态
-     * @param [in] req 请求handle，由TransferAsync API调用产生
-     * @param [out] status 传输状态
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Gets the status of an asynchronous transfer request.
+     * @param [in] req Request handle returned by TransferAsync.
+     * @param [out] status Current transfer status.
+     * @return SUCCESS on success, or another status on failure.
      */
     __attribute__((weak)) Status GetTransferStatus(const TransferReq& req,
                                                    TransferStatus& status);
 
     /**
-     * @brief 使用acl VMM机制申请内存
-     * @param [in] type 内存类型
-     * @param [in] size 内存大小
-     * @param [out] ptr 申请的虚拟内存ptr
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Allocates memory through ACL virtual memory management.
+     * @param [in] type Type of memory to allocate.
+     * @param [in] size Allocation size in bytes.
+     * @param [out] ptr Virtual address of the allocation.
+     * @return SUCCESS on success, or another status on failure.
      */
     __attribute__((weak)) static Status MallocMem(MemType type, size_t size,
                                                   void** ptr);
 
     /**
-     * @brief 释放MallocMem申请的内存内存
-     * @param [in] ptr 释放的虚拟内存ptr
-     * @return 成功:SUCCESS, 失败:其它.
+     * @brief Exports memory allocated by MallocMem as a fabric shareable
+     * handle.
+     *
+     * Each allocation is exported through ACL at most once. The first call
+     * exports and caches the handle; subsequent calls return the cached handle.
+     *
+     * @param [in] addr Virtual address returned by MallocMem.
+     * @param [out] handle Exported fabric shareable handle.
+     * @return SUCCESS on success, PARAM_INVALID if addr was not returned by
+     * MallocMem or has already been freed, and another error status otherwise.
+     */
+    __attribute__((weak)) static Status ExportToShareableHandle(
+        void* addr, ShareableHandle& handle);
+
+    /**
+     * @brief Frees memory allocated by MallocMem.
+     * @param [in] ptr Virtual address returned by MallocMem.
+     * @return SUCCESS on success, or another status on failure.
      */
     __attribute__((weak)) static Status FreeMem(void* ptr);
 
     /**
-     * @brief 查询库能力特性
-     * @param [in] feature_type 特性类型
-     * @param [out] value 1=支持，0=不支持
-     * @return 成功:SUCCESS；未知特性:UNSUPPORTED；参数非法:PARAM_INVALID
+     * @brief Queries a library capability.
+     * @param [in] feature_type Capability to query.
+     * @param [out] value 1 when supported, or 0 when unsupported.
+     * @return SUCCESS on success, UNSUPPORTED for an unknown capability, or
+     * PARAM_INVALID for an invalid argument.
      */
     __attribute__((weak)) static Status GetCapability(FeatureType feature_type,
                                                       int32_t& value);

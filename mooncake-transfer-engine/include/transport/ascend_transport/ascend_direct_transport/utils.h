@@ -86,6 +86,15 @@ bool IsRoceModeEnabled();
 // Parse ASCEND_GLOBAL_RESOURCE_CONFIG JSON for roce protocol_desc only.
 bool HasRoceProtocolDescInGlobalResourceConfig(const char *config_str);
 
+// True when the JSON configures fabric_memory (flat fabric_memory.* keys or a
+// nested fabric_memory object). Used so a normal/P2P TE can enable ADXL
+// EnableUseFabricMem without going through the Store-only env flag path.
+bool HasFabricMemoryInGlobalResourceConfig(const char *config_str);
+
+// True when the resolved ASCEND_GLOBAL_RESOURCE_CONFIG for this TE role
+// contains fabric_memory settings.
+bool IsFabricMemEnabledFromGlobalResourceConfig();
+
 // Resolve the effective ASCEND_GLOBAL_RESOURCE_CONFIG for the current TE role.
 // Schema: the top-level object is the default config (passed verbatim to adxl
 // for normal/P2P TEs); an optional "store" sub-object overrides it for a

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -174,6 +175,26 @@ TEST_F(RdmaContextConstructionTest, RejectsZeroCompletionChannelsBeforeSetup) {
                                   /*num_comp_channels=*/0),
               ERR_INVALID_ARGUMENT);
     EXPECT_FALSE(RdmaContextTestPeer::hasEndpointStore(*context_));
+}
+
+TEST_F(RdmaContextConstructionTest, LogsPortNumberAsIntegerNotCharacter) {
+    // `port` is a uint8_t; streaming it raw into glog renders the byte as a
+    // control character, so the operator sees "on port \x01" instead of the
+    // number they configured. The failure path for a missing device is enough
+    // to exercise the log line.
+    const bool saved_logtostderr = FLAGS_logtostderr;
+    FLAGS_logtostderr = true;
+    ::testing::internal::CaptureStderr();
+    EXPECT_EQ(context_->construct(/*num_cq_list=*/1,
+                                  /*num_comp_channels=*/1,
+                                  /*port=*/1,
+                                  /*gid_index=*/-1),
+              ERR_CONTEXT);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    FLAGS_logtostderr = saved_logtostderr;
+
+    EXPECT_NE(log.find("on port 1 with GID"), std::string::npos) << log;
+    EXPECT_EQ(log.find(std::string("on port \x01")), std::string::npos) << log;
 }
 
 TEST_F(RdmaContextConstructionTest,

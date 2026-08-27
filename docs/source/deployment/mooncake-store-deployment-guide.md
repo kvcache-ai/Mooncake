@@ -13,7 +13,7 @@ This guide covers minimal deployment, and operational tuning of Mooncake Store.
 
 **Metadata Service**: A separate service (etcd, Redis, or HTTP) used by the Transfer Engine for peer discovery and configuration. The master's embedded HTTP metadata server can replace an external etcd/Redis for simple deployments. We also provide a P2P handshake mechanism (`P2PHANDSHAKE`) that enables decentralized metadata management by storing metadata locally on each node, eliminating the need for a centralized service — this is the simplest metadata handshake method and the recommended starting point (see [Quick Start](#quick-start)).
 
-For a detailed design discussion, see the [Mooncake Store Design](../design/mooncake-store.md).
+For a detailed design discussion, see the [Mooncake Store Design](../design/store/mooncake-store.md).
 
 ---
 
@@ -386,10 +386,8 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 
 - `mooncake_tenant_quota_requested_bytes{tenant_id}`
 - `mooncake_tenant_quota_effective_bytes{tenant_id}`
-- `mooncake_tenant_quota_used_bytes{tenant_id}`
-- `mooncake_tenant_quota_reserved_bytes{tenant_id}`
-- `mooncake_tenant_quota_committed_count{tenant_id}`
-- `mooncake_tenant_quota_metadata_object_count{tenant_id}`
+- `mooncake_tenant_quota_charged_bytes{tenant_id}`
+- `mooncake_tenant_quota_admission_closed{tenant_id}`
 - `mooncake_tenant_quota_over_quota{tenant_id}`
 - `mooncake_tenant_quota_explicit_policy{tenant_id}`
 - `mooncake_tenant_quota_reject_total{tenant_id,reason}`
@@ -417,7 +415,7 @@ Multi-Tenant Deployment <multi-tenancy>
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
 - For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd/ssd-offload).
 - For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide)
-- For experimental 3FS (USRBIO) integration as a persistent storage backend, see the [3FS USRBIO Plugin guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
+- For the experimental HF3FS USRBIO adapter used by descriptor-based DFS replicas, see the [HF3FS USRBIO adapter guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
 - For detailed monitoring and observation see [Observability](../getting_started/observability)
 
 :::{toctree}
@@ -426,7 +424,7 @@ Multi-Tenant Deployment <multi-tenancy>
 
 KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
 SSD Storage<ssd/index>
-HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
+HF3FS USRBIO Adapter (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
 :::
 
@@ -678,14 +676,202 @@ When `--offload_on_evict=true` is active, each `BatchEvict` cycle can queue at m
 
 When `--allocation_strategy=cxl` is set alongside `--enable_cxl=true`, the master preferentially allocates new objects on CXL memory.
 
-### DFS Storage
+### Legacy Shared-filesystem `DISK` Persistence
+
+The older shared-filesystem persistence path remains available independently
+of descriptor-based DFS:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root_fs_dir` | empty | Legacy DFS persistence directory; do not use with SSD offload |
-| `--global_file_segment_size` | `INT64_MAX` (unlimited) | Max available space for DFS segments; default does not cap DFS usage |
+| `--root_fs_dir` | empty | Enable legacy `DISK` replicas under `<root_fs_dir>/<cluster_id>`. The path must resolve to the same shared filesystem location on every participating client. |
+| `--global_file_segment_size` | `INT64_MAX` (unlimited) | Declared legacy file capacity used by master usage metrics. It does not configure descriptor-based DFS shard files. |
 
-`--root_fs_dir` is a legacy persistence parameter and is expected to be replaced as the distributed filesystem path is refactored. For SSD offload, configure `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` on each real client instead.
+With `--root_fs_dir` set, the master adds a legacy `DISK` replica to each new
+object and clients write it asynchronously. This path is distinct from both
+client-owned `LOCAL_DISK` SSD offload and descriptor-based `DFS` replicas. Do
+not combine `--root_fs_dir` with `--enable_offload=true`; configure real-client
+SSD offload with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` instead.
+
+(dfs-storage)=
+### Descriptor-based DFS Storage
+
+```{warning}
+**Work in progress.** Descriptor-based DFS is intended for development and
+evaluation only. It is not production-ready and is not covered by Mooncake
+Store's general fault-tolerance, HA continuity, durability, or multi-tenant
+guarantees.
+```
+
+Mooncake Store can place an additional replica in a shared distributed
+filesystem. The master allocates aligned ranges in pre-created shard files and
+publishes a descriptor containing the shard, offset, and object size. Clients
+use that descriptor to access the same files through either regular POSIX I/O
+or the HF3FS USRBIO adapter.
+
+DFS replicas are separate from `LOCAL_DISK` SSD-offload replicas. They do not
+use the legacy `--root_fs_dir` persistence path or the master's asynchronous
+offload task queue.
+
+```{note}
+DFS allocator state is not yet restored after a master restart or HA leader
+failover. Do not enable descriptor-based DFS in a deployment that requires
+master recovery, HA continuity, or multiple tenants. See the complete list of
+limitations below.
+```
+
+#### Master configuration
+
+Enable the DFS allocator in the master process and select a shared root and
+shard layout. For example, to use HF3FS:
+
+```bash
+export MOONCAKE_ENABLE_DFS=1
+export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake
+export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_SHARD_COUNT=64
+export MOONCAKE_DFS_SHARD_CAPACITY=4294967296
+export MOONCAKE_DFS_ALIGNMENT=4096
+export MOONCAKE_DFS_SINGLE_TENANT=true
+
+mooncake_master [other master arguments]
+```
+
+At startup, the master creates `MOONCAKE_DFS_SHARD_COUNT` shard files and
+preallocates each file to `MOONCAKE_DFS_SHARD_CAPACITY`. The example therefore
+configures 256 GiB of total logical shard capacity (`64 * 4 GiB`). Ensure the
+shared filesystem has sufficient capacity; whether all backing space is
+reserved immediately depends on the selected filesystem adapter.
+
+The `hf3fs` adapter requires Mooncake to be built with `USE_3FS=ON`. Use
+`MOONCAKE_DFS_FS_ADAPTER=posix` for development and integration testing on a
+regular shared filesystem.
+
+#### Client configuration
+
+Every client that may read or write a DFS replica must initialize
+`FileStorage` and select the distributed backend. Use an absolute DFS root path;
+the root string, shard count, shard capacity, and alignment must match the
+master configuration. Select an adapter that can access the same underlying
+shared files; the examples use the same adapter in every process.
+
+```bash
+export MOONCAKE_OFFLOAD_ENABLED=true
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/data/file_storage
+export MOONCAKE_MASTER=127.0.0.1:50051
+export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake
+export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_SHARD_COUNT=64
+export MOONCAKE_DFS_SHARD_CAPACITY=4294967296
+export MOONCAKE_DFS_ALIGNMENT=4096
+export MOONCAKE_DFS_SINGLE_TENANT=true
+
+python -m mooncake.mooncake_store_service
+```
+
+For a programmatic Python client, pass `enable_ssd_offload=True` to `setup()`
+instead of `MOONCAKE_OFFLOAD_ENABLED`. Programmatic setup still reads the
+backend-specific `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` and
+`MOONCAKE_DFS_*` variables shown above; only the launcher-level setup fields are
+supplied as Python arguments. The
+`MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` directory must already exist and be an
+absolute, writable, non-symlink directory. DFS shard data is stored under
+`MOONCAKE_DFS_ROOT_DIR`; the FileStorage path is still required for client
+initialization because the shared `FileStorageConfig` validates it even when
+the selected backend stores data in the DFS root.
+
+Native C++ clients must initialize a `DistributedStorageBackend` with the same
+DFS layout and attach it to the client with `SetDfsStorageBackend()` before
+issuing DFS reads or writes. Reads and writes use the DFS descriptor carried by
+the current query or start-operation response; no client-side descriptor cache
+is required.
+
+#### DFS configuration reference
+
+| Variable | Scope | Default | Description |
+|----------|-------|---------|-------------|
+| `MOONCAKE_ENABLE_DFS` | Master | `false` | Enable master-side DFS allocation. `MOONCAKE_DFS_ENABLED` is accepted as a compatibility fallback. |
+| `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared shard root; use the same path string in every process. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
+| `MOONCAKE_DFS_FS_ADAPTER` | Master and clients | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. Falls back to `MOONCAKE_DISTRIBUTED_FS_TYPE`. |
+| `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Number of DFS shard files. |
+| `MOONCAKE_DFS_SHARD_CAPACITY` | Master and clients | `4294967296` (4 GiB) | Logical file capacity of each shard in bytes. Each object is allocated wholly within one shard. |
+| `MOONCAKE_DFS_ALIGNMENT` | Master and clients | `4096` | Allocation alignment in bytes; must be a power of two and divide the shard capacity. |
+| `MOONCAKE_DFS_SINGLE_TENANT` | Master and clients | `true` | Currently must remain `true`. |
+| `MOONCAKE_DFS_EVICTION_ENABLED` | Master | `true` | Enable DFS allocator eviction. |
+| `MOONCAKE_DFS_EVICTION_HIGH_WATERMARK` | Master | `0.9` | Usage ratio that triggers eviction. |
+| `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | Master | `0.7` | Usage ratio targeted by an eviction cycle. |
+| `MOONCAKE_DFS_DEFERRED_FREE_SECONDS` | Master | `30` | Delay before a freed shard range may be reused. |
+| `MOONCAKE_DFS_EVICTION_CHECK_INTERVAL` | Master | `5` | Eviction check interval in seconds. |
+
+#### Requesting and accessing DFS replicas
+
+Callers request DFS placement through `ReplicateConfig`:
+
+```python
+from mooncake.store import ReplicateConfig
+
+config = ReplicateConfig()
+config.replica_num = 1
+config.dfs_replica_num = 1
+store.put("key", b"value", config)
+```
+
+`dfs_replica_num` may currently be `0` or `1`. A DFS replica must be requested
+with at least one memory replica (`replica_num >= 1`), so DFS-only placement is
+not supported.
+
+Each key hashes to exactly one DFS shard. Allocation does not fall back to a
+different shard, so a request may return `NO_AVAILABLE_HANDLE` when its selected
+shard is full even if other shards have free space. A DFS object is never
+striped across shards. The selected shard must have room for the object rounded
+up to `MOONCAKE_DFS_ALIGNMENT`, plus up to one alignment unit of allocator
+padding (`MOONCAKE_DFS_ALIGNMENT - 1` bytes); usable object capacity is
+therefore lower than the shard file's
+logical size.
+
+For `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`, the client writes requested
+memory and NoF replicas, stages device buffers to host memory when necessary,
+and then performs positional DFS writes. A successful request means the
+requested DFS `WriteAt` operations completed. It does **not** imply that an
+additional `fsync` completed. Batch operations isolate failures by key; a
+failed key is revoked without downgrading successful keys.
+
+For a same-size `Upsert`, if either the existing object or the new request has
+a DFS replica, the requested memory, NoF, and DFS replica counts must match the
+existing topology. A different-size update releases the old placement and
+allocates a new topology.
+
+On reads, the master returns the readable replica list through the normal query
+path, and the client selects the first complete replica. If it selects DFS, any
+client configured with the same DFS root and shard layout can issue positional
+reads for that descriptor.
+
+#### Current limitations
+
+- Only the `default` tenant is supported.
+- `dfs_replica_num` must be `0` or `1`, and `replica_num >= 1` is required when
+  it is enabled.
+- C and Rust clients cannot currently request or access descriptor-based DFS:
+  their replication configuration does not expose `dfs_replica_num`, and their
+  setup API cannot initialize the distributed `FileStorage` backend. Use the
+  native C++ or Python/RealClient API.
+- A DFS object must fit in its key-selected shard after alignment and allocator
+  padding; objects are not striped and allocation does not fall back to another
+  shard.
+- DFS allocator state is currently in memory. A master restart or HA leader
+  failover does not reconstruct existing DFS allocations, so DFS cannot provide
+  continuity across those events.
+- DFS cannot be enabled with snapshot generation, snapshot restore, oplog
+  recovery, or standby restore until DFS allocator state restoration is
+  implemented.
+- There is currently no background DFS retry queue or configurable
+  asynchronous acknowledgement policy.
+- DFS writes currently have no DFS-specific timeout, request cancellation, or
+  `fsync` durability guarantee.
+
+The older `--root_fs_dir` and `--global_file_segment_size` flags configure the
+legacy `DISK` path described above and are not used by descriptor-based DFS
+replicas.
 
 ### NoF (NVMe-oF SSD Pool)
 
@@ -737,7 +923,7 @@ The client derives the host id from `local_hostname` by removing the port. For e
 
 A client is configured through one of the **methods** introduced in [Start a Store Client](#start-a-store-client), plus a shared family of engine-tuning variables:
 
-- **Method A — Programmatic (`setup()` arguments)**: you pass configuration as explicit Python arguments. `MOONCAKE_*` variables are **not** read in this method.
+- **Method A — Programmatic (`setup()` arguments)**: launcher-level fields are passed as explicit Python arguments instead of being loaded through `MooncakeConfig`. Backend-specific variables read by C++, including `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` and `MOONCAKE_DFS_*`, still apply.
 - **Method B — Service / Integration (`MOONCAKE_*` + CLI)**: `mooncake.mooncake_store_service` and the vLLM/SGLang connectors read `MOONCAKE_*` environment variables (via `MooncakeConfig`).
 - **Method C — Resource-owning real client (`mooncake_client`)**: configured through `mooncake_client` CLI flags (see the **Method C** subsection below).
 - **Engine runtime tuning (`MC_*`)**: low-level variables read by the C++ Transfer Engine / store client at runtime. They are orthogonal to the above and **apply to all methods**.
@@ -758,14 +944,14 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `rdma_devices` | str | required | RDMA NIC(s), comma-separated (pass `""` for non-RDMA). **Keyword is `rdma_devices`, not `device_name`** |
 | `master_server_addr` | str | required | Master `host:port`. **Keyword is `master_server_addr`, not `master_server_address`** |
 | `engine` | TransferEngine | `None` | *(advanced)* Reuse an existing Transfer Engine instance instead of creating one |
-| `enable_ssd_offload` | bool | `false` | *(advanced)* Enable client-side SSD offload |
-| `ssd_offload_path` | str | empty | *(advanced)* SSD offload directory |
+| `enable_ssd_offload` | bool | `false` | *(advanced)* Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
+| `ssd_offload_path` | str | empty | *(advanced)* FileStorage path; with the distributed backend, DFS data uses `MOONCAKE_DFS_ROOT_DIR` |
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 | `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
 
 ```{note}
-The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, and client HTTP endpoint fields) are optional. Also, in Method A the `MOONCAKE_*` variables used by `MooncakeConfig` are ignored; low-level runtime variables such as the `MC_*` engine variables below are still read by the C++ client.
+The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, and client HTTP endpoint fields) are optional. In Method A, launcher-level `MOONCAKE_*` variables used only by `MooncakeConfig` are ignored. Variables consumed directly by the C++ client, including the FileStorage/DFS backend variables and low-level `MC_*` engine variables below, are still read.
 ```
 
 ### Method B — Service / Integration (`MOONCAKE_*` + CLI)
@@ -789,8 +975,8 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `global_segment_size` | `3355443200` (3.125 GiB) | DRAM contributed; accepts byte integer **or** suffixed form like `500gb` |
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
-| `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Client-side SSD offload |
-| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | Offload directory |
+| `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; DFS shard data uses `MOONCAKE_DFS_ROOT_DIR` with the distributed backend |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
 | `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |
@@ -903,8 +1089,8 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp` or `rdma` |
-| `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for all client→master RPCs. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
-| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client |
+| `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for client→master RPCs and for store→store SSD offload reads. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
+| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
 | `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
 | `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |

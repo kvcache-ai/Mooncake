@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <barrier>
 #include <chrono>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <cuda_runtime_api.h>
 #endif
 
+#include "config.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 
@@ -61,6 +63,30 @@ class ScopedEnvVar {
     std::string name_;
     std::optional<std::string> previous_;
 };
+
+class ScopedMaxMrSize {
+   public:
+    explicit ScopedMaxMrSize(size_t max_mr_size)
+        : old_max_mr_size_(globalConfig().max_mr_size) {
+        globalConfig().max_mr_size = max_mr_size;
+    }
+
+    ~ScopedMaxMrSize() { globalConfig().max_mr_size = old_max_mr_size_; }
+
+   private:
+    size_t old_max_mr_size_;
+};
+
+TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
+    constexpr size_t kMaxMrSize = 64 * 1024 * 1024;
+    ScopedMaxMrSize limit(kMaxMrSize);
+
+    EXPECT_EQ(GetTransportRegistrationLimit("rdma"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("tcp"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
+    EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
+    EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
+}
 
 class RealClientTest : public ::testing::Test {
    protected:
@@ -276,6 +302,95 @@ TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
     EXPECT_EQ(allocated_size, slab_size * 2);
     ASSERT_FALSE(segment_ids.empty());
     EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
+TEST_F(RealClientTest, TcpSetupDoesNotSplitAtMaxMrSize) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(2 * slab_size);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE", 6 * slab_size,
+                               0, "tcp", "", master_address_),
+        0);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 1u);
+    EXPECT_EQ(details->front().size_bytes, 6 * slab_size);
+}
+
+TEST_F(RealClientTest, DynamicMountApisBalanceLimitedSegments) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17815", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "efa", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 2u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "efa", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 2u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 4u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 3 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
+TEST_F(RealClientTest, DynamicMountApisDoNotSplitRdma) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17816", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "rdma", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 1u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "rdma", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 1u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 2u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 6 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
 }
 
 TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
@@ -883,6 +998,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         0);
 
     std::string test_data(1000, '1');
+    std::string upsert_data(1000, '2');
     std::string dst_data(1000, '0');
 
     // Register buffers for zero-copy operations
@@ -894,26 +1010,36 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         py_client_->register_buffer(dst_data.data(), dst_data.size());
     ASSERT_EQ(reg_result_dst, 0)
         << "Dst data buffer registration should succeed";
+    int reg_result_upsert =
+        py_client_->register_buffer(upsert_data.data(), upsert_data.size());
+    ASSERT_EQ(reg_result_upsert, 0)
+        << "Upsert data buffer registration should succeed";
 
     std::vector<std::string> keys;
     std::vector<std::vector<void*>> all_ptrs;
+    std::vector<std::vector<void*>> all_upsert_ptrs;
     std::vector<std::vector<void*>> all_dst_ptrs;
     std::vector<std::vector<size_t>> all_sizes;
     auto ptr = test_data.data();
+    auto upsert_ptr = upsert_data.data();
     auto dst_ptr = dst_data.data();
     for (size_t i = 0; i < 10; i++) {
         keys.emplace_back("test_key_" + std::to_string(i));
         std::vector<void*> ptrs;
+        std::vector<void*> upsert_ptrs;
         std::vector<void*> dst_ptrs;
         std::vector<size_t> sizes;
         for (size_t j = 0; j < 10; j++) {
             ptrs.emplace_back(ptr);
+            upsert_ptrs.emplace_back(upsert_ptr);
             dst_ptrs.emplace_back(dst_ptr);
             sizes.emplace_back(10);
             ptr += 10;
+            upsert_ptr += 10;
             dst_ptr += 10;
         }
         all_ptrs.emplace_back(ptrs);
+        all_upsert_ptrs.emplace_back(upsert_ptrs);
         all_dst_ptrs.emplace_back(dst_ptrs);
         all_sizes.emplace_back(sizes);
     }
@@ -932,6 +1058,21 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     }
     EXPECT_EQ(dst_data, test_data) << "Retrieved data should match original";
 
+    std::vector<int> upsert_results =
+        py_client_->batch_upsert_from_multi_buffers(keys, all_upsert_ptrs,
+                                                    all_sizes, config);
+    for (auto result : upsert_results) {
+        EXPECT_EQ(result, 0) << "Upsert operation should succeed";
+    }
+    std::fill(dst_data.begin(), dst_data.end(), '0');
+    get_results = py_client_->batch_get_into_multi_buffers(keys, all_dst_ptrs,
+                                                           all_sizes, true);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, 100) << "Get after upsert should succeed";
+    }
+    EXPECT_EQ(dst_data, upsert_data)
+        << "Retrieved data should match upserted data";
+
     // Unregister buffers
     int unreg_result_test = py_client_->unregister_buffer(test_data.data());
     ASSERT_EQ(unreg_result_test, 0)
@@ -939,6 +1080,9 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     int unreg_result_dst = py_client_->unregister_buffer(dst_data.data());
     ASSERT_EQ(unreg_result_dst, 0)
         << "Dst data buffer unregistration should succeed";
+    int unreg_result_upsert = py_client_->unregister_buffer(upsert_data.data());
+    ASSERT_EQ(unreg_result_upsert, 0)
+        << "Upsert data buffer unregistration should succeed";
 }
 
 TEST_F(RealClientTest, TestPutGetSessionRanges) {

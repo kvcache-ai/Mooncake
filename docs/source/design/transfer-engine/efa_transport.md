@@ -31,7 +31,7 @@ cd Mooncake
 sudo ./dependencies.sh -y
 ```
 
-This installs all system packages, git submodules (including pybind11 and yalantinglibs), and Go.
+This installs all system packages, git submodules (pybind11), and Go.
 
 > **Note:** The EFA driver and libfabric are **not** installed by `dependencies.sh`. They must be pre-installed on the instance (see section 1 above).
 

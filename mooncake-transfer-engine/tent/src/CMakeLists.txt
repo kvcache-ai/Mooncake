@@ -66,14 +66,10 @@ else()
 endif()
 
 # io_uring
-find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib
-                                   /usr/local/lib64)
-find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
-if(URING_LIB AND URING_INCLUDE)
+if(TARGET Mooncake::liburing)
   message(STATUS "Uring: Enabled")
   target_compile_definitions(tent_interface INTERFACE USE_URING)
-  target_include_directories(tent_interface INTERFACE ${URING_INCLUDE})
-  target_link_libraries(tent_interface INTERFACE ${URING_LIB})
+  target_link_libraries(tent_interface INTERFACE Mooncake::liburing)
 else()
   message(STATUS "Uring: Disabled")
 endif()
@@ -85,15 +81,6 @@ if(USE_SUNRISE)
     tent_interface INTERFACE ${MC_TANGRT_ROOT}/lib/linux-x86_64
     ${MC_TANGRT_ROOT}/lib)
   target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
-endif()
-
-set(YALANTING_TARGET yalantinglibs::yalantinglibs)
-if(NOT TARGET ${YALANTING_TARGET})
-  if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    find_package(yalantinglibs CONFIG REQUIRED)
-  else()
-    message(FATAL_ERROR "yalantinglibs::yalantinglibs target not found")
-  endif()
 endif()
 
 add_subdirectory(common)
@@ -145,6 +132,7 @@ foreach(
   tent_xport_ascend_direct
   tent_xport_sunrise_link
   tent_xport_tpu
+  tent_xport_mpcomm
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})
