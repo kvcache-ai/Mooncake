@@ -349,12 +349,12 @@ class Client {
         ReplicaType replica_type);
 
     /**
-     * @brief Registers local memory and queues the segment for asynchronous
-     * Master registration.
+     * @brief Registers local memory and the segment with the Master.
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
-     * @return Success once local registration is accepted. Master-side
-     * registration is retried by the control-plane flusher.
+     * @return Success after incremental Master registration. If the Master
+     * requests a full reconciliation, the control-plane flusher completes it
+     * asynchronously.
      */
     tl::expected<void, ErrorCode> MountSegment(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
@@ -370,8 +370,8 @@ class Client {
                                                  size_t size);
 
     /**
-     * @brief Registers local memory, queues Master registration, and returns
-     * the generated Segment UUID.
+     * @brief Registers local memory and the segment with the Master, then
+     * returns the generated Segment UUID.
      */
     tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
