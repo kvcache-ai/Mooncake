@@ -56,6 +56,18 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      # workflow_dispatch may build a tag older than the verification helper.
+      # Keep release policy tied to the trusted workflow revision instead of
+      # relying on files from the historical source tree.
+      - name: Check out release verification helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-ci
+          persist-credentials: false
+          sparse-checkout: scripts/tone_tests/python/verify_rocm_wheel.py
+          sparse-checkout-cone-mode: false
+
       - name: Mark repository as safe
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
@@ -195,7 +207,8 @@ jobs:
           "$smoke_venv/bin/python" -m pip install --no-deps \
             mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
           export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
-          "$smoke_venv/bin/python" scripts/tone_tests/python/verify_rocm_wheel.py
+          "$smoke_venv/bin/python" \
+            .release-ci/scripts/tone_tests/python/verify_rocm_wheel.py
           site="$("$smoke_venv/bin/python" -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')"
           "$site/mooncake_master" --version
 

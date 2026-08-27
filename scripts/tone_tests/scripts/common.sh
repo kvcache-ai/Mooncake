@@ -1339,10 +1339,11 @@ hf_offline_prefix() {
     [ -z "$model_name" ] && return 0
     local cache_dir="models--$(echo "$model_name" | sed 's#/#--#g')"
     if docker exec -i "${CONTAINER_NAME}" python3 - \
-        "/root/.cache/huggingface/hub/${cache_dir}/snapshots/*" <<'PY'
+        "/root/.cache/huggingface/hub/${cache_dir}" <<'PY'
 import glob
 import json
 import os
+import re
 import sys
 
 
@@ -1370,7 +1371,19 @@ def snapshot_complete(snapshot):
     )
 
 
-sys.exit(0 if any(snapshot_complete(path) for path in glob.glob(sys.argv[1])) else 1)
+repository = sys.argv[1]
+ref_path = os.path.join(repository, "refs", "main")
+try:
+    with open(ref_path, encoding="utf-8") as ref_file:
+        revision = ref_file.read().strip()
+except OSError:
+    sys.exit(1)
+
+if re.fullmatch(r"[0-9a-fA-F]{40,64}", revision) is None:
+    sys.exit(1)
+
+snapshot = os.path.join(repository, "snapshots", revision)
+sys.exit(0 if snapshot_complete(snapshot) else 1)
 PY
     then
         echo "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "

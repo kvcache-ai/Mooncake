@@ -102,7 +102,7 @@ jobs:
           [ "$CI_ACCELERATOR" = rocm ]
           export SSH_CMD="ssh -F ${MOONCAKE_SSH_CONFIG}"
 
-          for command in docker flock rocm-smi rsync ssh; do
+          for command in docker flock realpath rocm-smi rsync ssh; do
             command -v "$command" >/dev/null || {
               echo "Missing required command: $command" >&2
               exit 1

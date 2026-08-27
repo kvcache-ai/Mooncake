@@ -253,11 +253,42 @@ EOF
     return 0
 }
 
+validated_remote_test_dir() {
+    local remote_dir=$1
+    local allowed_root
+    if [ "$CI_ACCELERATOR" = "rocm" ]; then
+        allowed_root=/var/lib/mooncake-ci/work
+    else
+        allowed_root=/tmp/Mooncake_tone/mooncake_ci_test
+    fi
+
+    if ! [[ "$remote_dir" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        echo "ERROR: REMOTE_TEST_DIR contains unsupported characters: $remote_dir" >&2
+        return 1
+    fi
+
+    local normalized_root normalized_dir
+    normalized_root=$(realpath -m -- "$allowed_root") || return 1
+    normalized_dir=$(realpath -m -- "$remote_dir") || return 1
+    case "$normalized_dir" in
+        "$normalized_root"|"$normalized_root"/*)
+            printf '%s\n' "$normalized_dir"
+            ;;
+        *)
+            echo "ERROR: REMOTE_TEST_DIR must remain under $normalized_root: $normalized_dir" >&2
+            return 1
+            ;;
+    esac
+}
+
 prepare_double_env(){
     local registry_addr=$1
     local framework_type=$2
 
     echo "===== Preparing Double-Machine Environment (local + remote) ====="
+
+    REMOTE_TEST_DIR=$(validated_remote_test_dir "$REMOTE_TEST_DIR") || return 1
+    export REMOTE_TEST_DIR
 
     if ! prepare_single_env "$registry_addr" "$framework_type"; then
         echo "ERROR: prepare_single_env failed"
@@ -270,17 +301,25 @@ prepare_double_env(){
     fi
 
     echo "Preparing remote machine $REMOTE_IP..."
-    ${SSH_CMD} "$REMOTE_SSH_TARGET" "rm -rf ${REMOTE_TEST_DIR} && mkdir -p ${REMOTE_TEST_DIR}"
-
-    rsync -av -e "$RSYNC_RSH" ${TONE_TESTS_DIR}/ "$REMOTE_SSH_TARGET:${REMOTE_TEST_DIR}/"
-    if [ $? -ne 0 ]; then
-        echo "Failed to sync files to remote server"
+    if ! ${SSH_CMD} "$REMOTE_SSH_TARGET" \
+        "set -eu; remote_test_dir='${REMOTE_TEST_DIR}'; rm -rf -- \"\$remote_test_dir\"; mkdir -p -- \"\$remote_test_dir\""; then
+        echo "ERROR: Failed to prepare remote test directory on $REMOTE_IP" >&2
         return 1
     fi
 
-    ${SSH_CMD} "$REMOTE_SSH_TARGET" "sed -i 's|^export BASE_DIR=.*$|export BASE_DIR=${REMOTE_TEST_DIR}|' ${REMOTE_TEST_DIR}/run/.shrc && \
-                            sed -i 's|^export TEST_RUN_DIR=.*$|export TEST_RUN_DIR=${REMOTE_TEST_DIR}/run|' ${REMOTE_TEST_DIR}/run/.shrc && \
-                            sed -i 's|^export TEST_RESULT_DIR=.*$|export TEST_RESULT_DIR=${REMOTE_TEST_DIR}/logs|' ${REMOTE_TEST_DIR}/run/.shrc"
+    if ! rsync -av -e "$RSYNC_RSH" "${TONE_TESTS_DIR}/" \
+        "$REMOTE_SSH_TARGET:${REMOTE_TEST_DIR}/"; then
+        echo "ERROR: Failed to sync files to remote server" >&2
+        return 1
+    fi
+
+    if ! ${SSH_CMD} "$REMOTE_SSH_TARGET" \
+        "sed -i 's|^export BASE_DIR=.*$|export BASE_DIR=${REMOTE_TEST_DIR}|' ${REMOTE_TEST_DIR}/run/.shrc && \
+         sed -i 's|^export TEST_RUN_DIR=.*$|export TEST_RUN_DIR=${REMOTE_TEST_DIR}/run|' ${REMOTE_TEST_DIR}/run/.shrc && \
+         sed -i 's|^export TEST_RESULT_DIR=.*$|export TEST_RESULT_DIR=${REMOTE_TEST_DIR}/logs|' ${REMOTE_TEST_DIR}/run/.shrc"; then
+        echo "ERROR: Failed to configure the remote test environment on $REMOTE_IP" >&2
+        return 1
+    fi
 
     echo "Remote preparation completed successfully"
 
