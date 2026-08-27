@@ -934,6 +934,98 @@ TEST_F(MetricsRecordingTest, BucketsAreCompileTimeDefaults) {
         << "latency buckets must be the compile-time defaults";
 }
 
+// Concurrency guard for the cached-cell hot path: several threads hammering
+// overlapping (transport, operation) labels must produce exactly the summed
+// counts — including the first-use window where multiple threads resolve the
+// same label cell concurrently. Exercises every hot-path metric family
+// (per-transport counters, N=2 attempt counters/histogram, stage histograms).
+TEST_F(MetricsRecordingTest, ConcurrentRecordsAcrossTransportsAreExact) {
+    constexpr int kThreads = 8;
+    constexpr int kIters = 2000;
+    constexpr size_t kBytes = 4096;
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([t] {
+            for (int i = 0; i < kIters; ++i) {
+                // Even threads write to rdma, odd threads to nvlink, so both
+                // transports' cells are resolved concurrently.
+                TransportType tp = (t % 2 == 0) ? RDMA : NVLINK;
+                Request::OpCode op =
+                    (i % 2 == 0) ? Request::WRITE : Request::READ;
+                TentMetrics::instance().recordTransportAttemptStarted(tp, op);
+                TentMetrics::instance().recordTransportAttemptFinished(
+                    tp, op, TransferStatusEnum::COMPLETED, 150.0);
+                if (op == Request::WRITE) {
+                    TentMetrics::instance().recordWriteCompleted(tp, kBytes,
+                                                                 0.002);
+                } else {
+                    TentMetrics::instance().recordReadCompleted(tp, kBytes,
+                                                                0.002);
+                }
+                TentMetrics::instance().recordStageLatency(
+                    TentMetrics::Stage::Transport, tp, 120.0);
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    auto after = MetricsSnapshot(TentMetrics::instance());
+    const int64_t total = kThreads * kIters;  // all attempts
+    const int64_t writes = total / 2;         // half the iterations
+    const int64_t bytes = writes * static_cast<int64_t>(kBytes);
+
+    EXPECT_EQ(after.counter("tent_write_bytes_total") -
+                  before.counter("tent_write_bytes_total"),
+              bytes);
+    EXPECT_EQ(after.counter("tent_read_bytes_total") -
+                  before.counter("tent_read_bytes_total"),
+              bytes);
+    EXPECT_EQ(after.counter("tent_write_requests_total") -
+                  before.counter("tent_write_requests_total"),
+              writes);
+    EXPECT_EQ(after.counter("tent_read_requests_total") -
+                  before.counter("tent_read_requests_total"),
+              writes);
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              total);
+    EXPECT_EQ(after.histogramCount("tent_transport_attempt_latency_us") -
+                  before.histogramCount("tent_transport_attempt_latency_us"),
+              total);
+    EXPECT_EQ(after.histogramCount("tent_write_latency_us") -
+                  before.histogramCount("tent_write_latency_us"),
+              writes);
+    EXPECT_EQ(after.histogramCount("tent_stage_transport_us") -
+                  before.histogramCount("tent_stage_transport_us"),
+              total);
+    // Per-label Prometheus series must also be exact: 4 threads per transport,
+    // half of their iterations are writes.
+    const double per_transport_bytes =
+        static_cast<double>(kThreads / 2) * (kIters / 2) * kBytes;
+    EXPECT_EQ(after.series("tent_write_bytes_total{transport=\"rdma\"}") -
+                  before.series("tent_write_bytes_total{transport=\"rdma\"}"),
+              per_transport_bytes);
+    EXPECT_EQ(after.series("tent_write_bytes_total{transport=\"nvlink\"}") -
+                  before.series("tent_write_bytes_total{transport=\"nvlink\"}"),
+              per_transport_bytes);
+    EXPECT_EQ(after.series("tent_transport_attempts_total{transport=\"nvlink\","
+                           "operation=\"read\"}") -
+                  before.series("tent_transport_attempts_total{transport="
+                                "\"nvlink\",operation=\"read\"}"),
+              static_cast<double>(kThreads / 2) * (kIters / 2));
+    EXPECT_EQ(after.counter("tent_write_failures_total") -
+                  before.counter("tent_write_failures_total"),
+              0);
+    EXPECT_EQ(after.counter("tent_read_failures_total") -
+                  before.counter("tent_read_failures_total"),
+              0);
+}
+
 // ---------------------------------------------------------------------------
 // L2 HTTP integration: scrape the real /metrics, /metrics/json, /health
 // endpoints via coro_http_client and assert on status + body. Validates the
