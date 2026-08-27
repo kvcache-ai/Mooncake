@@ -202,12 +202,21 @@ Status NVLinkTransport::submitTransferTasks(
     // Determine device for this batch and validate all requests
     int batch_device_id = -1;
     std::vector<NVLinkTask*> new_tasks;
+    // No I/O is started until startTransfer() below, so a synchronous
+    // failure must also roll back the half-appended task entries: the engine
+    // fails such tasks over to another transport, and stale never-started
+    // entries must not linger in the sub-batch (failover.md, hazard 2).
+    const size_t original_task_count = shm_batch->task_list.size();
+    auto rollback_tasks = [&shm_batch, original_task_count]() {
+        shm_batch->task_list.resize(original_task_count);
+    };
 
     for (auto& request : request_list) {
         // Find the buffer this source pointer belongs to
         BufferDesc* buf = local_segment->findBuffer(
             reinterpret_cast<uint64_t>(request.source), request.length);
         if (!buf) {
+            rollback_tasks();
             return Status::InvalidArgument(
                 "Unregistered buffer: source pointer not in any registered "
                 "buffer" LOC_MARK);
@@ -234,7 +243,10 @@ Status NVLinkTransport::submitTransferTasks(
         if (request.target_id != LOCAL_SEGMENT_ID) {
             auto status = relocateSharedMemoryAddress(
                 target_addr, request.length, request.target_id);
-            if (!status.ok()) return status;
+            if (!status.ok()) {
+                rollback_tasks();
+                return status;
+            }
         }
 
         task.target_addr = target_addr;
@@ -250,10 +262,16 @@ Status NVLinkTransport::submitTransferTasks(
             // CPU-only batch: use current CUDA device
             cudaGetDevice(&stream_device);
         }
-        CHECK_STATUS(platform_->getStreamFromPool(shm_batch->sync_stream,
-                                                  stream_device));
-        CHECK_STATUS(platform_->getStreamFromPool(shm_batch->async_stream,
-                                                  stream_device));
+        auto status =
+            platform_->getStreamFromPool(shm_batch->sync_stream, stream_device);
+        if (status.ok()) {
+            status = platform_->getStreamFromPool(shm_batch->async_stream,
+                                                  stream_device);
+        }
+        if (!status.ok()) {
+            rollback_tasks();
+            return status;
+        }
         shm_batch->stream_device_id = stream_device;
     }
 
@@ -610,16 +628,24 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         deserializeBinaryData(buffer->shm_path, output_buffer);
         cudaIpcMemHandle_t handle;
         memcpy(&handle, output_buffer.data(), sizeof(handle));
+        // Open the IPC handle on the CALLER's current device. Never switch to
+        // buffer->location's device index: that ordinal is the PEER's device
+        // index, relative to the peer's CUDA_VISIBLE_DEVICES. In the local
+        // process it may be an invalid ordinal (when the peer process sees
+        // more devices than we do), and even when numerically valid it may
+        // denote a different physical GPU. cudaIpcOpenMemHandle with
+        // cudaIpcMemLazyEnablePeerAccess is valid on the current device: the
+        // lazy flag enables peer access between the current device and the
+        // allocation's source device as needed, and subsequent copies already
+        // run cross-device via P2P (see startTransfer).
         int cuda_dev = 0;
         CHECK_CUDA(cudaGetDevice(&cuda_dev));
-        cudaSetDevice(location.index());
         CHECK_CUDA(cudaIpcOpenMemHandle(&shm_addr, handle,
                                         cudaIpcMemLazyEnablePeerAccess));
-        cudaSetDevice(cuda_dev);
         OpenedShmEntry shm_entry;
         shm_entry.shm_addr = shm_addr;
         shm_entry.length = buffer->length;
-        shm_entry.cuda_id = location.index();
+        shm_entry.cuda_id = cuda_dev;
         relocate_map_[target_id][buffer->addr] = shm_entry;
         tl_relocate_map = relocate_map_;
     }
