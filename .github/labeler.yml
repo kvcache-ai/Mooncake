@@ -29,7 +29,11 @@ P2P Store:
 
 Integration:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-integration/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-integration/**/*'
+      - 'python/mooncake/mooncake_connector_v1.py'
+      - 'python/mooncake/vllm_v1_proxy_server.py'
+      - 'python/tests/vllm/**/*'
 
 Common:
   - changed-files:
@@ -57,6 +61,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/vllm/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:
