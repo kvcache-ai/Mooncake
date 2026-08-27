@@ -1733,7 +1733,7 @@ class MooncakeStorePyWrapper {
                                    : results[0];
         }
         auto results = real_client_->batch_upsert_from_multi_buffers(
-            {key}, buffers, part_sizes, ReplicateConfig{}, true);
+            {key}, buffers, part_sizes, ReplicateConfig{});
         return results.empty() ? to_py_ret(ErrorCode::INTERNAL_ERROR)
                                : results[0];
     }
