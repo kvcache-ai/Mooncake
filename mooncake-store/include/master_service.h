@@ -1926,6 +1926,48 @@ class MasterService {
     // Reads the member keys registered for `group_id`; empty if unregistered.
     std::vector<std::string> GetGroupMemberKeys(
         const TenantId& tenant_id, const std::string& group_id) const;
+
+    // A single group member's eviction outcome, fed back by the
+    // EvictGroupOrObject callback.
+    struct EvictMemberOutcome {
+        uint64_t freed_bytes{0};
+        long evicted_objects{0};
+        bool stop_scan{false};
+        ErrorCode error{ErrorCode::OK};
+    };
+    // Aggregated outcome of a group eviction.
+    struct GroupEvictionResult {
+        uint64_t freed_bytes{0};
+        long evicted_objects{0};
+        bool stop_scan{false};
+        ErrorCode error{ErrorCode::OK};
+    };
+
+    // Evicts every member of `group_id` across its metadata shards. MUST be
+    // called WITHOUT holding any metadata shard lock: the caller releases the
+    // trigger shard lock first, so a caller-held trigger lock is never held
+    // while other shard locks are acquired (that ordering is the AB/BA
+    // cross-shard deadlock this function exists to remove). It acquires each
+    // member shard lock itself in canonical ascending shard order, so any two
+    // concurrent group evictions that touch the same shards acquire them in the
+    // same global order and cannot deadlock.
+    //
+    // Each member is re-looked-up and re-validated under its own lock (lease,
+    // hard/soft pin, evictable replica — all against `now`) because state may
+    // have changed since the caller's snapshot; members that no longer qualify
+    // are skipped without invoking the callback. `evict_one_member` therefore
+    // performs only the path-specific member eviction (oplog persist, offload,
+    // quota charge, publish) and may erase members other than `key`; the
+    // trigger `key` itself is left to the caller. Each call returns that
+    // member's contribution. Returns the aggregated outcome.
+    GroupEvictionResult EvictGroupOrObject(
+        const TenantId& tenant_id, const std::string& key,
+        const std::string& group_id, bool allow_soft_pinned,
+        std::chrono::system_clock::time_point now,
+        const std::function<EvictMemberOutcome(
+            const std::string&, ObjectMetadata&, TenantState&,
+            MetadataShardAccessorRW&)>& evict_one_member);
+
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
