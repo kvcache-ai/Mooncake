@@ -36,7 +36,6 @@ namespace mooncake {
 namespace tent {
 thread_local int tl_wid = -1;
 
-namespace {
 struct ArbitrationEntry {
     RdmaSlice* slice;
     double mlu;
@@ -46,7 +45,7 @@ struct ArbitrationEntry {
 // Look up (or create) the RailMonitor for `machine_id` on this worker's
 // map. Returning a stable reference is safe because the map stores values
 // via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
-RailMonitor& getOrCreateRail(
+static RailMonitor& getOrCreateRail(
     std::unordered_map<std::string, std::unique_ptr<RailMonitor>>& rails,
     const std::string& machine_id) {
     auto it = rails.find(machine_id);
@@ -54,7 +53,6 @@ RailMonitor& getOrCreateRail(
     auto [ins, _] = rails.emplace(machine_id, std::make_unique<RailMonitor>());
     return *ins->second;
 }
-}  // namespace
 
 Workers::Workers(RdmaTransport* transport)
     : transport_(transport),
@@ -312,67 +310,8 @@ void Workers::releaseSliceQuota(RdmaSlice* slice, double latency) {
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
-    std::string rpc_server_addr, target_seg_name, target_dev_name,
-        target_nic_path_name;
-    RouteHint hint;
-    auto& segment_manager = transport_->metadata_->segmentManager();
-    auto target_id = path.remote_segment_id;
-    auto device_id = path.remote_device_id;
-
-    auto status = segment_manager.withCachedSegment(
-        target_id, hint.pin, [&](SegmentDesc* segment) {
-            hint.segment = segment;
-            if (segment->type != SegmentType::Memory) {
-                return Status::NeedsRefreshCache(
-                    "Segment type is not Memory" LOC_MARK);
-            }
-            hint.topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
-            if (target_id != LOCAL_SEGMENT_ID) {
-                rpc_server_addr = segment->rpc_server_addr;
-            }
-            target_seg_name = segment->name;
-            target_nic_path_name = segment->nicPathServerName();
-            target_dev_name = hint.topo->getNicName(device_id);
-            if (target_seg_name.empty() || target_dev_name.empty()) {
-                return Status::NeedsRefreshCache(
-                    "Empty target segment or device name" LOC_MARK);
-            }
-            return Status::OK();
-        });
-
-    if (!status.ok()) {
-        LOG(ERROR) << status.ToString();
-        return nullptr;
-    }
-
-    auto context = transport_->context_set_[path.local_device_id].get();
-    if (context->status() != RdmaContext::DEVICE_ENABLED) {
-        // LOG(WARNING) << "Context " << context->name() << " is not serving";
-        return nullptr;  // experimental: force to fail this slice and mark this
-                         // connection unavailable
-    }
-    std::shared_ptr<RdmaEndPoint> endpoint;
-    auto peer_name = MakeNicPath(target_nic_path_name, target_dev_name);
-    endpoint = context->endpointStore()->getOrInsert(peer_name);
-    if (!endpoint) {
-        LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
-        return nullptr;
-    }
-    if (endpoint->status() != RdmaEndPoint::EP_READY) {
-        auto status = endpoint->connect(target_seg_name, target_dev_name,
-                                        rpc_server_addr);
-        if (!status.ok()) {
-            thread_local uint64_t tl_last_output_ts = 0;
-            uint64_t current_ts = getCurrentTimeInNano();
-            if (current_ts - tl_last_output_ts > 10000000000ull) {
-                tl_last_output_ts = current_ts;
-                LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
-                           << status.ToString();
-            }
-            return nullptr;
-        }
-    }
-    return endpoint;
+    return transport_->getEndpointForContextIndex(
+        path.local_device_id, path.remote_segment_id, path.remote_device_id);
 }
 
 void Workers::disableEndpoint(RdmaSlice* slice) {
@@ -884,27 +823,7 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
         }));
 
     hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
-    std::string location = hint.buffer->location;
-    if (!hint.buffer->regions.empty()) {
-        size_t offset = hint.buffer->addr;
-        size_t best_overlap = 0;
-        size_t target_start = addr;
-        size_t target_end = addr + length;
-        for (auto& entry : hint.buffer->regions) {
-            size_t region_start = offset;
-            size_t region_end = offset + entry.size;
-            size_t overlap_start = std::max(region_start, target_start);
-            size_t overlap_end = std::min(region_end, target_end);
-            size_t overlap = (overlap_end > overlap_start)
-                                 ? (overlap_end - overlap_start)
-                                 : 0;
-            if (overlap > best_overlap) {
-                best_overlap = overlap;
-                location = entry.location;
-            }
-            offset += entry.size;
-        }
-    }
+    std::string location = bufferLocationForRange(*hint.buffer, addr, length);
     auto mem_id = hint.topo->getMemId(location);
     if (mem_id < 0) mem_id = hint.topo->getMemId(kWildcardLocation);
     hint.topo_entry = hint.topo->getMemEntry(mem_id);
@@ -912,21 +831,12 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
     return Status::OK();
 }
 
-int Workers::getDeviceRank(const RouteHint& hint, int device_id) {
-    for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
-        auto& list = hint.topo_entry->device_list[rank];
-        for (auto& entry : list)
-            if (entry == device_id) return rank;
-    }
-    return -1;
-}
-
 Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                                     RdmaSlice* slice) {
     auto& worker = worker_context_[tl_wid];
     if (slice->source_dev_id < 0) {
         CHECK_STATUS(device_selector_->allocate(
-            slice->length, source.buffer->location, slice->source_dev_id,
+            slice->length, source.location, slice->source_dev_id,
             slice->priority, slice->task->device_mask));
         slice->quota_charged = true;
     }

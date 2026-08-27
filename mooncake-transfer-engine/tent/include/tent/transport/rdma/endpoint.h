@@ -129,6 +129,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     // Notification QP operations
     uint32_t notifyQpNum() const { return notify_qp_ ? notify_qp_->qp_num : 0; }
+    uint32_t directQpNum() const { return direct_qp_ ? direct_qp_->qp_num : 0; }
+    bool isDirectReady() const {
+        return direct_qp_ && peer_direct_qp_num_ != 0 &&
+               status_.load(std::memory_order_relaxed) == EP_READY;
+    }
 
     bool sendNotification(const std::string& name, const std::string& msg);
 
@@ -157,6 +162,10 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index);
 
+    Status submitDirectSlice(RdmaSlice* slice);
+
+    void completeDirectSlice(RdmaSlice* slice);
+
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
     size_t acknowledge(RdmaSlice* slice, TransferStatusEnum status);
@@ -180,6 +189,10 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     bool reserveQuota(int qp_index, int num_entries);
 
     void cancelQuota(int qp_index, int num_entries);
+
+    bool reserveDirectQuota();
+
+    void cancelDirectQuota();
 
    private:
     // Caller must hold lock_ in write mode.
@@ -218,8 +231,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::string peer_server_name_;
     std::string peer_nic_name_;
     std::vector<uint32_t> peer_qp_num_list_;
+    uint32_t peer_direct_qp_num_ = 0;
     // Notification QP (one per endpoint for control plane operations)
     ibv_qp* notify_qp_ = nullptr;
+    ibv_qp* direct_qp_ = nullptr;
+    std::atomic<int> direct_wr_depth_{0};
 
     // Notification buffers
     static constexpr size_t kNotifyBufferSize = 65536;  // 64 KB

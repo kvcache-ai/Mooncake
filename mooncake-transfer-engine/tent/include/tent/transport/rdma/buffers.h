@@ -15,10 +15,13 @@
 #ifndef TENT_BUFFERS_H
 #define TENT_BUFFERS_H
 
+#include <algorithm>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -78,6 +81,32 @@ struct BufferQueryResult {
     uint32_t rkey;
     int device_id;
 };
+
+static inline std::string bufferLocationForRange(const BufferDesc &buffer,
+                                                 uint64_t addr,
+                                                 uint64_t length) {
+    std::string location = buffer.location;
+    if (!buffer.regions.empty()) {
+        uint64_t offset = buffer.addr;
+        uint64_t best_overlap = 0;
+        uint64_t target_start = addr;
+        uint64_t target_end = addr + length;
+        for (const auto &entry : buffer.regions) {
+            uint64_t region_start = offset;
+            uint64_t region_end = offset + entry.size;
+            uint64_t overlap_start = std::max(region_start, target_start);
+            uint64_t overlap_end = std::min(region_end, target_end);
+            uint64_t overlap =
+                (overlap_end > overlap_start) ? overlap_end - overlap_start : 0;
+            if (overlap > best_overlap) {
+                best_overlap = overlap;
+                location = entry.location;
+            }
+            offset += entry.size;
+        }
+    }
+    return location;
+}
 
 class LocalBufferManager {
    public:
