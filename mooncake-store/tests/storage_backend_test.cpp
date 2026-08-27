@@ -5138,25 +5138,25 @@ TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
 // when datasync() fails inside WriteBucket, the freshly written .bucket file
 // must be removed by CleanupOrphanedBucket; otherwise repeated failures leave
 // orphan files that exhaust disk space until restart.
-    }
-    EXPECT_EQ(orphan_bucket_count, 0)
-        << "datasync failure must not leave an orphan .bucket file on disk";
+}
+EXPECT_EQ(orphan_bucket_count, 0)
+    << "datasync failure must not leave an orphan .bucket file on disk";
 
-    // No .meta file should have been written either (metadata commit comes
-    // after datasync, so it was never reached).
-    int meta_count = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.path().extension() == ".meta") {
-            ++meta_count;
-        }
+// No .meta file should have been written either (metadata commit comes
+// after datasync, so it was never reached).
+int meta_count = 0;
+for (const auto& entry : fs::directory_iterator(data_path)) {
+    if (entry.path().extension() == ".meta") {
+        ++meta_count;
     }
-    EXPECT_EQ(meta_count, 0)
-        << "metadata must not be committed when datasync fails";
+}
+EXPECT_EQ(meta_count, 0)
+    << "metadata must not be committed when datasync fails";
 
-    // The key must not be queryable.
-    auto exists = storage_backend.IsExist(key);
-    ASSERT_TRUE(exists.has_value());
-    EXPECT_FALSE(exists.value());
+// The key must not be queryable.
+auto exists = storage_backend.IsExist(key);
+ASSERT_TRUE(exists.has_value());
+EXPECT_FALSE(exists.value());
 }
 
 #endif
@@ -5197,6 +5197,25 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
         if (entry.path().extension() == ".bucket") {
             ++orphan_bucket_count;
         }
+    }
+    EXPECT_EQ(orphan_bucket_count, 0)
+        << "datasync failure must not leave an orphan .bucket file on disk";
 
+    // No .meta file should have been written either (metadata commit comes
+    // after datasync, so it was never reached).
+    int meta_count = 0;
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        if (entry.path().extension() == ".meta") {
+            ++meta_count;
+        }
+    }
+    EXPECT_EQ(meta_count, 0)
+        << "metadata must not be committed when datasync fails";
+
+    // The key must not be queryable.
+    auto exists = storage_backend.IsExist(key);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+}
 
 }  // namespace mooncake::test
