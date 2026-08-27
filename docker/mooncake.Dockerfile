@@ -15,6 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
+ARG TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0"
 # CI can opt in to removing /workspace/build from the builder layer.
 ARG CLEAN_BUILD_ARTIFACTS=0
 
@@ -74,7 +75,8 @@ RUN mkdir -p build && \
     cd /workspace && \
     OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
     python${PYTHON_VERSION} -m pip install --no-cache-dir dist/*.whl && \
-    python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
+    TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+        python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
     if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
         rm -rf build; \
     fi
