@@ -205,13 +205,15 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     // Friend-accessible helper: returns the group's shared GroupLease (the
-    // group owner is internal; GetGroupLease is private to MasterService).
+    // group owner is internal; read it straight from the group shard).
     std::shared_ptr<GroupLease> GetGroupLeaseForTest(
         MasterService& service, const std::string& group_id,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        return service.GetGroupLease(normalized_tenant, group_id);
+        MasterService::GroupShardAccessorRO gs(&service);
+        auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
+        return it == gs->groups.end() ? nullptr : it->second.lease;
     }
 
     // Friend-accessible helper: put a grouped + an ungrouped object, move the

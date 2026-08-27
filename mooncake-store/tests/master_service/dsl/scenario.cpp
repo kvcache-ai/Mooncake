@@ -1019,7 +1019,7 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
             return false;
         }
         SpinLocker locker(&metadata_it->second.lock);
-        metadata_it->second.lease_timeout = action.lease_timeout;
+        metadata_it->second.lease_->ExtendTo(action.lease_timeout);
         metadata_it->second.soft_pin_timeout = action.soft_pin_timeout;
         return true;
     };

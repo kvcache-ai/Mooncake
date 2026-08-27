@@ -1260,7 +1260,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             standby_allocator_keepalive_.erase(restore.segment.name);
         }
         for (const auto* metadata : affected_objects) {
-            metadata->GrantReadLease(default_kv_lease_ttl_);
+            metadata->GrantReadLease(
+                std::chrono::milliseconds(default_kv_lease_ttl_));
         }
 
         // Change the client status to OK
@@ -1651,22 +1652,6 @@ std::vector<std::string> MasterService::GetGroupMemberKeys(
                            it->second.member_keys.end());
     }
     return member_keys;
-}
-
-std::shared_ptr<GroupLease> MasterService::GetGroupLease(
-    const TenantId& tenant_id, const std::string& group_id) const {
-    if (group_id.empty()) {
-        return nullptr;
-    }
-    GroupShardAccessorRO shard(this);
-    auto it = shard->groups.find(tenant_id.MakeScopedKey(group_id));
-    if (it == shard->groups.end()) {
-        return nullptr;
-    }
-    // Copy the shared_ptr while the group shard lock is held so the lease
-    // outlives the group entry in case a concurrent UnregisterGroupMember
-    // erases it right now.
-    return it->second.lease;
 }
 
 bool MasterService::HasCompletedMemoryCacheReplica(
@@ -2235,16 +2220,14 @@ void MasterService::RebuildGroupState() {
                 if (!metadata.IsGrouped()) {
                     continue;
                 }
-                // group_lease_ is mutable, so it can be wired through a const
-                // ref; RegisterGroupMember returns the group's shared lease.
+                // lease_ is mutable, so it can be wired through a const ref;
+                // RegisterGroupMember returns the group's shared lease.
                 auto lease =
                     RegisterGroupMember(tenant_id, key, metadata.group_id);
-                metadata.group_lease_ = lease;
-                // A grouped object's authoritative lease is the shared group
-                // TTL, which is recreated empty on restore — clients
-                // re-establish sessions/leases after a restart, so the group is
-                // not protected until it is read again. The object's own
-                // lease_timeout is not authoritative for grouped objects.
+                metadata.lease_ = lease;
+                // Group lease is recreated empty on restore; clients
+                // re-establish sessions after restart, so it is unprotected
+                // until read again.
             }
         }
     }
@@ -2818,7 +2801,7 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
 
     // Grant a lease to the object as it may be further used by the client.
     // Read path is group-agnostic: only the object's own lease is refreshed.
-    metadata.GrantReadLease(default_kv_lease_ttl_);
+    metadata.GrantReadLease(std::chrono::milliseconds(default_kv_lease_ttl_));
     return true;
 }
 
@@ -2874,7 +2857,8 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
                 results[i] = false;
                 continue;
             }
-            metadata.GrantReadLease(default_kv_lease_ttl_);
+            metadata.GrantReadLease(
+                std::chrono::milliseconds(default_kv_lease_ttl_));
             results[i] = true;
         }
     }
@@ -3260,7 +3244,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     object.tenant_id, object.user_key));
             (void)inserted;
             if (!standby_meta.group_id.empty()) {
-                it->second.group_lease_ = RegisterGroupMember(
+                it->second.lease_ = RegisterGroupMember(
                     object.tenant_id, object.user_key, standby_meta.group_id);
             }
             tenant_state.processing_keys.erase(object.user_key);
@@ -3631,7 +3615,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                 }
 
                 results.emplace(key, std::move(replica_list));
-                metadata.GrantReadLease(default_kv_lease_ttl_);
+                metadata.GrantReadLease(
+                    std::chrono::milliseconds(default_kv_lease_ttl_));
             }
         }
     }
@@ -3698,7 +3683,8 @@ auto MasterService::GetReplicaList(const std::string& key,
         // Grant a lease to the object so it will not be removed
         // when the client is reading it. Read path is group-agnostic: only the
         // object's own lease is refreshed.
-        metadata.GrantReadLease(default_kv_lease_ttl_);
+        metadata.GrantReadLease(
+            std::chrono::milliseconds(default_kv_lease_ttl_));
 
         // Promotion-on-hit eligibility: only when no MEMORY replica is
         // present but at least one LOCAL_DISK replica is. Decided here while
@@ -3874,7 +3860,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                         static_cast<int64_t>(metadata.size));
                 }
                 MasterMetricManager::instance().inc_valid_get_nums();
-                metadata.GrantReadLease(default_kv_lease_ttl_);
+                metadata.GrantReadLease(
+                    std::chrono::milliseconds(default_kv_lease_ttl_));
 
                 if (promotion_on_hit_) {
                     const bool any_memory =
@@ -4275,9 +4262,11 @@ auto MasterService::AllocateAndInsertMetadata(
                                         GetMetadataShardIndex(it->second),
                                         *deadline_to_index);
     }
-    // Wire the object's lease pointer to the group's shared lease so the read
-    // path can extend the group TTL without touching the group table.
-    it->second.group_lease_ = RegisterGroupMember(tenant_id, key, group_id);
+    // Wire grouped objects to the group's shared lease; ungrouped objects keep
+    // the per-object lease created at construction.
+    if (!group_id.empty()) {
+        it->second.lease_ = RegisterGroupMember(tenant_id, key, group_id);
+    }
     tenant_state.processing_keys.insert(key);
 
     return replica_list;
@@ -4614,7 +4603,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 
     SyncCacheTotalAccounting(metadata);
     // TODO: add inc_nof_cache_nums() (ranhaojia)
-    metadata.GrantReadLease(0);
+    metadata.GrantReadLease(std::chrono::milliseconds::zero());
     PublishKvStored(key, replica_type, metadata, object_id.tenant_id);
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -9784,16 +9773,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             member_keys.push_back(key);
         }
 
-        // Group protection: skip the whole group if it was recently read. The
-        // group shares one GroupLease (extended by any member read), so we
-        // consult a single lease instead of scanning every member's own.
-        auto group_lease = GetGroupLease(normalized_tenant, metadata.group_id);
-        if (group_lease != nullptr && !group_lease->IsExpired(now)) {
-            return {};
-        }
-        // Fallback for a grouped object whose group entry is not yet
-        // registered: protect on the object's own lease.
-        if (group_lease == nullptr && !metadata.IsLeaseExpired(now)) {
+        // Group protection: skip the group when its shared lease is still live.
+        if (!metadata.lease_->IsExpired(now)) {
             return {};
         }
 
@@ -10182,16 +10163,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             member_keys.push_back(key);
         }
 
-        // Group protection: skip the whole group if it was recently read. The
-        // group shares one GroupLease (extended by any member read), so we
-        // consult a single lease instead of scanning every member's own.
-        auto group_lease = GetGroupLease(tenant_id, metadata.group_id);
-        if (group_lease != nullptr && !group_lease->IsExpired(now)) {
-            return {};
-        }
-        // Fallback for a grouped object whose group entry is not yet
-        // registered: protect on the object's own lease.
-        if (group_lease == nullptr && !metadata.IsLeaseExpired(now)) {
+        // Group protection: skip the group when its shared lease is still live.
+        if (!metadata.lease_->IsExpired(now)) {
             return {};
         }
 
@@ -11772,7 +11745,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
                 metadata_ptr->group_id, tenant_id, user_key));
 
-        it->second.lease_timeout = metadata_ptr->lease_timeout;
+        it->second.lease_->ExtendTo(metadata_ptr->lease_->ExpiresAt());
         it->second.object_checksum = metadata_ptr->object_checksum;
 
         // Recompute disk_object_count for restored metadata
@@ -11817,10 +11790,10 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Serialize size
     packer.pack(static_cast<uint64_t>(metadata.size));
 
-    // Serialize lease_timeout (convert to timestamp)
+    // Serialize the authoritative lease deadline (converted to timestamp).
     auto lease_timestamp =
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            metadata.lease_timeout.time_since_epoch())
+            metadata.lease_->ExpiresAt().time_since_epoch())
             .count();
     packer.pack(lease_timestamp);
 
@@ -11992,8 +11965,8 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         size, std::move(replicas), std::nullopt, is_hard_pinned, data_type,
         group_id);
     metadata->object_checksum = object_checksum;
-    metadata->lease_timeout = std::chrono::system_clock::time_point(
-        std::chrono::milliseconds(lease_timestamp));
+    metadata->lease_->ExtendTo(std::chrono::system_clock::time_point(
+        std::chrono::milliseconds(lease_timestamp)));
 
     return metadata;
 }

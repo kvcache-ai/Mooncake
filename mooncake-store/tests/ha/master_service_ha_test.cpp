@@ -681,7 +681,10 @@ class MasterServiceHATest : public ::testing::Test {
             &service, MasterService::ObjectIdentity{tenant_id, key});
         ASSERT_TRUE(accessor.Exists());
         SpinLocker locker(&accessor.Get().lock);
-        accessor.Get().lease_timeout = deadline;
+        // GroupLease only extends (monotonic max); reset to a fresh lease to
+        // force an earlier-expiry deadline.
+        accessor.Get().lease_ = std::make_shared<GroupLease>();
+        accessor.Get().lease_->ExtendTo(deadline);
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
@@ -694,7 +697,7 @@ class MasterServiceHATest : public ::testing::Test {
             return {};
         }
         SpinLocker locker(&accessor.Get().lock);
-        return accessor.Get().lease_timeout;
+        return accessor.Get().lease_->ExpiresAt();
     }
 
     static uint64_t EvictTenantMemoryForQuotaForTesting(

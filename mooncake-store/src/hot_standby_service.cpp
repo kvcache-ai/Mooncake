@@ -110,9 +110,13 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
             }
         }
 #else
-        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-        LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
-        return ErrorCode::INTERNAL_ERROR;
+        // Without STORE_USE_ETCD, the following loop needs an injected test
+        // backend.
+        if (!catch_up_batch_kv_backend_for_testing_) {
+            state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+            LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
+            return ErrorCode::INTERNAL_ERROR;
+        }
 #endif
     }
 
