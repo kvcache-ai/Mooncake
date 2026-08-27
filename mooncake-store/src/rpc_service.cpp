@@ -1814,6 +1814,8 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CalcCacheStats>(
+        &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::MountLocalDiskSegment>(
         &wrapped_master_service);
