@@ -43,6 +43,13 @@ class GroupLease {
         }
     }
 
+    // Overwrite the deadline with an exact value (may lower it). Unlike
+    // GrantReadLease/ExtendTo (monotonic max), this lets test scaffolding
+    // (e.g. the scenario DSL) force a lease to a precise expiry.
+    void SetDeadline(const std::chrono::system_clock::time_point deadline) {
+        deadline_ns_.store(NowNs(deadline), std::memory_order_relaxed);
+    }
+
     // True when the group has not been read within the TTL at `now`.
     bool IsExpired(const std::chrono::system_clock::time_point now) const {
         return NowNs(now) >= deadline_ns_.load(std::memory_order_relaxed);
