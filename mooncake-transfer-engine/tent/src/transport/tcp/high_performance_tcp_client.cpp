@@ -102,7 +102,6 @@ class HighPerformanceTcpClient::Lane
 
         try {
             if (connected_ && socket_.is_open()) {
-                parent_->clean_reuses_.fetch_add(1, std::memory_order_relaxed);
                 state_ = State::kIdle;
                 writeHeader(operation_epoch_);
             } else {

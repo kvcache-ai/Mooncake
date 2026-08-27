@@ -86,13 +86,18 @@ class Runtime {
         ASSERT_TRUE(server.start(&port).ok());
     }
     Status submit(HighPerformanceTcpClient::Operation operation) {
-        const size_t owner = workers.affinityOwner(
-            {operation.peer_id, 0, operation.lane_id, operation.incarnation});
-        return workers.submitToWorker(
-            owner,
-            [this, owner, operation = std::move(operation)](size_t) mutable {
-                client.enqueueOnOwner(owner, std::move(operation));
-            });
+        const size_t owner =
+            workers.affinityOwner(operation.peer_id, operation.lane_id);
+        std::vector<HighPerformanceTcpWorkers::Command> commands;
+        commands.push_back({.worker_id = owner,
+                            .run =
+                                [this, owner, operation = std::move(operation)](
+                                    size_t) mutable {
+                                    client.enqueueOnOwner(owner,
+                                                          std::move(operation));
+                                },
+                            .cancel = {}});
+        return workers.tryCommitBatch(commands, nullptr, 0, 0, [] {});
     }
 
     HighPerformanceTcpWorkers workers;
@@ -179,13 +184,14 @@ TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
     auto operation = Operation(local.data(), local.size(), 0x1000, 1, 3,
                                HighPerformanceTcpOpcode::kRead, &completion,
                                acceptor.local_endpoint().port());
-    ASSERT_TRUE(workers
-                    .submitToWorker(0,
-                                    [&](size_t) mutable {
-                                        client.enqueueOnOwner(
-                                            0, std::move(operation));
-                                    })
-                    .ok());
+    std::vector<HighPerformanceTcpWorkers::Command> commands;
+    commands.push_back({.worker_id = 0,
+                        .run =
+                            [&](size_t) mutable {
+                                client.enqueueOnOwner(0, std::move(operation));
+                            },
+                        .cancel = {}});
+    ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());
     EXPECT_EQ(completion.status, TIMEOUT);
     EXPECT_TRUE(client.cancelAll().ok());

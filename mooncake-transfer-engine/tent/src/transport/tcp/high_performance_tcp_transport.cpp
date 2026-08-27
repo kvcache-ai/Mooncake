@@ -153,7 +153,7 @@ Status HighPerformanceTcpTransport::rollbackPublishedEndpoint(
 }
 
 Status HighPerformanceTcpTransport::install(
-    std::string& local_segment_name, std::shared_ptr<ControlService> metadata,
+    std::string&, std::shared_ptr<ControlService> metadata,
     std::shared_ptr<Topology>, std::shared_ptr<Config>) {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     if (installed_.load(std::memory_order_acquire) || workers_ || server_ ||
@@ -169,7 +169,6 @@ Status HighPerformanceTcpTransport::install(
     }
 
     metadata_ = std::move(metadata);
-    local_segment_name_ = local_segment_name;
     stopping_.store(false, std::memory_order_release);
 
     std::optional<std::string> previous_attr;
@@ -237,10 +236,10 @@ Status HighPerformanceTcpTransport::install(
         status = Status::InvalidArgument(
             "unable to derive HP TCP advertise address" LOC_MARK);
     } else {
-        incarnation_ = makeIncarnation();
+        const std::string incarnation = makeIncarnation();
         std::string encoded;
         status = EncodeHighPerformanceTcpEndpointAttr(
-            {incarnation_, {{host, bound_port}}, params_.max_transfer_bytes},
+            {incarnation, {{host, bound_port}}, params_.max_transfer_bytes},
             &encoded);
         if (status.ok()) {
             status = metadata_->segmentManager().updateLocal(
@@ -276,7 +275,6 @@ Status HighPerformanceTcpTransport::install(
         workers_.reset();
         admission_.reset();
         metadata_.reset();
-        incarnation_.clear();
         return status;
     }
 
@@ -295,7 +293,7 @@ Status HighPerformanceTcpTransport::stopRuntime(bool close_registry) {
     if (server_) first = FirstError(std::move(first), server_->stopAccepting());
     if (close_registry) registry_.close();
 
-    if (workers_) workers_->cancelPending();
+    if (workers_) first = FirstError(std::move(first), workers_->barrier());
     if (client_)
         first = FirstError(std::move(first), client_->cancelAll(CANCELED));
     if (server_) first = FirstError(std::move(first), server_->cancelAll());
@@ -355,8 +353,6 @@ Status HighPerformanceTcpTransport::uninstall() {
     workers_.reset();
     admission_.reset();
     metadata_.reset();
-    local_segment_name_.clear();
-    incarnation_.clear();
     installed_.store(false, std::memory_order_release);
     return first;
 }
@@ -480,8 +476,8 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
     }
     const uint32_t lane_id = static_cast<uint32_t>(
         request_id % static_cast<uint64_t>(params_.connections_per_peer));
-    const size_t owner_worker = workers_->affinityOwner(
-        {request.target_id, 0, lane_id, endpoint_attr.incarnation});
+    const size_t owner_worker =
+        workers_->affinityOwner(request.target_id, lane_id);
 
     auto task = std::make_shared<HighPerformanceTcpTaskState>(
         request, batch->progress_batch_id, batch->notify_progress,

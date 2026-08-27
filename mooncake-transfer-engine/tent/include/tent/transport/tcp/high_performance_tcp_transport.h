@@ -81,8 +81,6 @@ class HighPerformanceTcpTransport final : public Transport {
 
     HighPerformanceTcpParams params_;
     std::shared_ptr<ControlService> metadata_;
-    std::string local_segment_name_;
-    std::string incarnation_;
 
     std::unique_ptr<HighPerformanceTcpAdmissionController> admission_;
     std::unique_ptr<HighPerformanceTcpWorkers> workers_;

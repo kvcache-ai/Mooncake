@@ -113,10 +113,6 @@ Status HighPerformanceTcpWorkers::start() {
     return Status::OK();
 }
 
-void HighPerformanceTcpWorkers::requestStop() {
-    running_.store(false, std::memory_order_release);
-}
-
 bool HighPerformanceTcpWorkers::onWorkerThread() const {
     const auto current = std::this_thread::get_id();
     return std::any_of(workers_.begin(), workers_.end(), [&](const auto& w) {
@@ -141,36 +137,15 @@ Status HighPerformanceTcpWorkers::stop() {
     return Status::OK();
 }
 
-size_t HighPerformanceTcpWorkers::affinityOwner(const AffinityKey& key) const {
-    size_t hash = std::hash<uint64_t>{}(key.peer);
+size_t HighPerformanceTcpWorkers::affinityOwner(uint64_t peer,
+                                                uint32_t lane) const {
+    size_t hash = std::hash<uint64_t>{}(peer);
     const auto mix = [&hash](size_t value) {
         hash ^= value + static_cast<size_t>(0x9e3779b97f4a7c15ULL) +
                 (hash << 6U) + (hash >> 2U);
     };
-    mix(std::hash<uint32_t>{}(key.endpoint));
-    mix(std::hash<uint32_t>{}(key.lane));
+    mix(std::hash<uint32_t>{}(lane));
     return config_.worker_count == 0 ? 0 : hash % config_.worker_count;
-}
-
-Status HighPerformanceTcpWorkers::submit(Task task) {
-    if (config_.worker_count == 0) {
-        return Status::InvalidArgument("HP TCP has no workers" LOC_MARK);
-    }
-    const size_t owner = next_worker_.fetch_add(1, std::memory_order_relaxed) %
-                         config_.worker_count;
-    return submitToWorker(owner, std::move(task));
-}
-
-Status HighPerformanceTcpWorkers::submitToWorker(size_t worker_id, Task task) {
-    Command command{worker_id, std::move(task), {}};
-    std::vector<Command> commands;
-    commands.push_back(std::move(command));
-    return tryCommitBatch(commands, [] {});
-}
-
-Status HighPerformanceTcpWorkers::tryCommitBatch(
-    std::vector<Command>& commands, const std::function<void()>& on_commit) {
-    return tryCommitBatch(commands, nullptr, 0, 0, on_commit);
 }
 
 Status HighPerformanceTcpWorkers::tryCommitBatch(
@@ -269,8 +244,6 @@ Status HighPerformanceTcpWorkers::barrier() {
     latch->cv.wait(lock, [&] { return latch->remaining == 0; });
     return Status::OK();
 }
-
-void HighPerformanceTcpWorkers::cancelPending() { (void)barrier(); }
 
 asio::io_context& HighPerformanceTcpWorkers::ioContext(size_t worker_id) {
     if (worker_id >= workers_.size()) {

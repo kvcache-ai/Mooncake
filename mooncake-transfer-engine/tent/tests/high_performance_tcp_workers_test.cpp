@@ -23,18 +23,22 @@ bool WaitUntil(Predicate predicate) {
     return predicate();
 }
 
+Status SubmitToWorker(HighPerformanceTcpWorkers& workers, size_t owner,
+                      HighPerformanceTcpWorkers::Task task) {
+    std::vector<HighPerformanceTcpWorkers::Command> commands{
+        {.worker_id = owner, .run = std::move(task), .cancel = {}}};
+    return workers.tryCommitBatch(commands, nullptr, 0, 0, [] {});
+}
+
 TEST(HighPerformanceTcpWorkersTest, PreservesAffinity) {
     HighPerformanceTcpWorkers workers({.worker_count = 2});
     ASSERT_TRUE(workers.start().ok());
     std::atomic<size_t> completed{0};
     for (size_t owner : {0u, 1u, 0u, 1u}) {
-        ASSERT_TRUE(workers
-                        .submitToWorker(owner,
-                                        [&, owner](size_t actual) {
-                                            EXPECT_EQ(actual, owner);
-                                            ++completed;
-                                        })
-                        .ok());
+        ASSERT_TRUE(SubmitToWorker(workers, owner, [&, owner](size_t actual) {
+                        EXPECT_EQ(actual, owner);
+                        ++completed;
+                    }).ok());
     }
     EXPECT_TRUE(WaitUntil([&] { return completed.load() == 4; }));
     EXPECT_TRUE(workers.stop().ok());
@@ -95,7 +99,7 @@ TEST(HighPerformanceTcpWorkersTest, StopIsIdempotentAndNotRestartable) {
     EXPECT_TRUE(workers.stop().ok());
     EXPECT_TRUE(workers.stop().ok());
     EXPECT_TRUE(workers.start().IsInvalidArgument());
-    EXPECT_TRUE(workers.submit([](size_t) {}).IsInternalError());
+    EXPECT_TRUE(SubmitToWorker(workers, 0, [](size_t) {}).IsInternalError());
 }
 
 }  // namespace

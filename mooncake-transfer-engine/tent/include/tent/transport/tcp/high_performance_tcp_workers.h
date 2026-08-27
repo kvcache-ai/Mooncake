@@ -11,7 +11,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <vector>
 
@@ -53,13 +52,6 @@ class HighPerformanceTcpWorkers {
         size_t worker_count{16};
     };
 
-    struct AffinityKey {
-        uint64_t peer{0};
-        uint32_t endpoint{0};
-        uint32_t lane{0};
-        std::string incarnation;
-    };
-
     using Task = std::function<void(size_t)>;
     struct Command {
         size_t worker_id{0};
@@ -76,20 +68,14 @@ class HighPerformanceTcpWorkers {
         delete;
 
     Status start();
-    void requestStop();
     Status stop();
-    Status submit(Task task);
-    Status submitToWorker(size_t worker_id, Task task);
-    Status tryCommitBatch(std::vector<Command>& commands,
-                          const std::function<void()>& on_commit);
     Status tryCommitBatch(std::vector<Command>& commands,
                           HighPerformanceTcpAdmissionController* admission,
                           uint64_t reserve_tasks, uint64_t reserve_bytes,
                           const std::function<void()>& on_commit);
 
-    void cancelPending();
     Status barrier();
-    size_t affinityOwner(const AffinityKey& key) const;
+    size_t affinityOwner(uint64_t peer, uint32_t lane) const;
     bool running() const { return running_.load(std::memory_order_acquire); }
     bool controlContextAvailable() const { return !workers_.empty(); }
     size_t workerCount() const { return config_.worker_count; }
@@ -110,7 +96,6 @@ class HighPerformanceTcpWorkers {
     std::vector<std::unique_ptr<WorkerContext>> workers_;
     std::atomic<bool> running_{false};
     bool started_{false};
-    std::atomic<size_t> next_worker_{0};
     mutable std::mutex lifecycle_mutex_;
     mutable std::mutex submit_mutex_;
 };

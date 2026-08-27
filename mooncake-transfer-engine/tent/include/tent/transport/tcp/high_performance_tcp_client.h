@@ -76,12 +76,6 @@ class HighPerformanceTcpClient {
     uint64_t connectionsCreatedForTest() const {
         return connections_created_.load(std::memory_order_acquire);
     }
-    uint64_t cleanReusesForTest() const {
-        return clean_reuses_.load(std::memory_order_acquire);
-    }
-    uint64_t activeOperationsForTest() const {
-        return active_operations_.load(std::memory_order_acquire);
-    }
 
    private:
     struct LaneKey {
@@ -115,7 +109,6 @@ class HighPerformanceTcpClient {
     std::atomic<bool> stopping_{false};
 
     std::atomic<uint64_t> connections_created_{0};
-    std::atomic<uint64_t> clean_reuses_{0};
     std::atomic<uint64_t> active_operations_{0};
     mutable std::mutex active_mutex_;
     std::condition_variable active_cv_;
