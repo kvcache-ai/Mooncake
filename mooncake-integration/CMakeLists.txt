@@ -181,7 +181,7 @@ if(USE_INTRA_NVLINK)
 endif()
 
 install(
-  FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py"
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/async_store.py"
   DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
   COMPONENT python)
 

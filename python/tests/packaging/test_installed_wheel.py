@@ -44,6 +44,7 @@ def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
 from importlib import metadata
 from pathlib import Path
 import mooncake
+import mooncake.async_store
 import mooncake.engine
 import mooncake.reshard
 import mooncake.store
@@ -53,6 +54,11 @@ repository_path = Path({str(REPOSITORY_ROOT)!r}).resolve()
 assert not package_path.is_relative_to(repository_path), (package_path, repository_path)
 assert metadata.version("mooncake-transfer-engine") == {_project_version()!r}
 assert mooncake.BufferPool is mooncake.store.BufferPool
+assert issubclass(
+    mooncake.async_store.MooncakeDistributedStoreAsync,
+    mooncake.store.MooncakeDistributedStore,
+)
+assert Path(mooncake.async_store.__file__).resolve().parent == package_path.parent
 assert mooncake.engine.TransferEngine is not None
 """
     subprocess.run(
