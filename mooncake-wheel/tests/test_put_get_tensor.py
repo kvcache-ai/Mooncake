@@ -169,6 +169,16 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.equal(self.store.get_tensor(put_key), tensor.cpu()))
         self.assertTrue(torch.equal(self.store.get_tensor(upsert_key), tensor.cpu()))
 
+        # RealClient must support the CUDA-destination tensor API without
+        # requiring callers to register the destination pointer first.
+        cuda_destination = torch.empty_like(tensor)
+        self.assertEqual(
+            self.store.get_tensor_into_cuda(put_key, cuda_destination),
+            tensor.numel() * tensor.element_size(),
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(cuda_destination, tensor))
+
         batch_put_keys = [f"{prefix}_batch_put_{i}" for i in range(2)]
         batch_upsert_keys = [f"{prefix}_batch_upsert_{i}" for i in range(2)]
         batch_tensors = [
@@ -183,6 +193,16 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.store.batch_upsert_tensor(batch_upsert_keys, batch_tensors),
             [0, 0],
         )
+        batch_destinations = [torch.empty_like(value) for value in batch_tensors]
+        self.assertEqual(
+            self.store.batch_get_tensor_into_cuda(
+                batch_put_keys, batch_destinations
+            ),
+            [value.numel() * value.element_size() for value in batch_tensors],
+        )
+        torch.cuda.synchronize()
+        for destination, expected in zip(batch_destinations, batch_tensors):
+            self.assertTrue(torch.equal(destination, expected))
         for key, expected_tensor in zip(batch_put_keys, batch_tensors):
             self.assertTrue(
                 torch.equal(self.store.get_tensor(key), expected_tensor.cpu())
