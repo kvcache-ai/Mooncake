@@ -31,7 +31,7 @@
 #include "background_worker.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
-#include "group_lease.h"
+#include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -1102,8 +1102,8 @@ class MasterService {
         mutable SpinLock lock;
         // Authoritative lease: ungrouped objects own one; grouped objects share
         // the group's. Never null after construction.
-        mutable std::shared_ptr<GroupLease> lease_ GUARDED_BY(lock) =
-            std::make_shared<GroupLease>();
+        mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
+            std::make_shared<Lease>();
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
                                                 // deadline
@@ -1693,18 +1693,18 @@ class MasterService {
     // (all-or-none) — the read path never touches this table.
     struct GroupState {
         std::unordered_set<std::string> member_keys;
-        std::shared_ptr<GroupLease> lease;
+        std::shared_ptr<Lease> lease;
 
         bool Empty() const { return member_keys.empty(); }
     };
 
     // Small and low-frequency (put/register + eviction), so one lock is enough.
-    struct GroupShard {
+    struct GroupDomain {
         mutable SharedMutex mutex;
         // key: tenant_id.MakeScopedKey(group_id)
         std::unordered_map<std::string, GroupState> groups GUARDED_BY(mutex);
     };
-    GroupShard group_shards_;
+    GroupDomain group_domain_;
 
     class SoftPinDeadlineIndex {
        public:
@@ -1848,37 +1848,37 @@ class MasterService {
     };
 
     // For accessing the group domain with read-write permission
-    class GroupShardAccessorRW {
+    class GroupDomainAccessorRW {
        public:
-        explicit GroupShardAccessorRW(MasterService* master_service)
-            : shard_(master_service->group_shards_), lock_(&shard_.mutex) {}
+        explicit GroupDomainAccessorRW(MasterService* master_service)
+            : shard_(master_service->group_domain_), lock_(&shard_.mutex) {}
 
-        GroupShard* operator->() { return &shard_; }
+        GroupDomain* operator->() { return &shard_; }
 
-        const GroupShard* operator->() const { return &shard_; }
+        const GroupDomain* operator->() const { return &shard_; }
 
-        GroupShard& get() { return shard_; }
+        GroupDomain& get() { return shard_; }
 
-        const GroupShard& get() const { return shard_; }
+        const GroupDomain& get() const { return shard_; }
 
        private:
-        GroupShard& shard_;
+        GroupDomain& shard_;
         SharedMutexLocker lock_;
     };
 
     // For accessing the group domain with read-only permission
-    class GroupShardAccessorRO {
+    class GroupDomainAccessorRO {
        public:
-        explicit GroupShardAccessorRO(const MasterService* master_service)
-            : shard_(master_service->group_shards_),
+        explicit GroupDomainAccessorRO(const MasterService* master_service)
+            : shard_(master_service->group_domain_),
               lock_(&shard_.mutex, shared_lock) {}
 
-        const GroupShard* operator->() const { return &shard_; }
+        const GroupDomain* operator->() const { return &shard_; }
 
-        const GroupShard& get() const { return shard_; }
+        const GroupDomain& get() const { return shard_; }
 
        private:
-        const GroupShard& shard_;
+        const GroupDomain& shard_;
         SharedMutexLocker lock_;
     };
 
@@ -1913,11 +1913,11 @@ class MasterService {
     }
 
     // Registers a member key under a group and returns the group's shared
-    // GroupLease (creating the group/lease on first member). Callers wire the
+    // Lease (creating the group/lease on first member). Callers wire the
     // returned lease into the object metadata so the read path can extend the
     // group TTL without touching this table. Returns nullptr for empty
     // group_id.
-    std::shared_ptr<GroupLease> RegisterGroupMember(
+    std::shared_ptr<Lease> RegisterGroupMember(
         const TenantId& tenant_id, const std::string& key,
         const std::string& group_id);
     void UnregisterGroupMember(const TenantId& tenant_id,

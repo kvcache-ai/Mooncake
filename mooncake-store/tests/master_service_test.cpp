@@ -473,7 +473,7 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        MasterService::GroupShardAccessorRO gs(&service);
+        MasterService::GroupDomainAccessorRO gs(&service);
         auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
         if (it == gs->groups.end()) {
             return {};
@@ -482,7 +482,7 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     void ClearGroupStateForTest(MasterService& service) {
-        MasterService::GroupShardAccessorRW gs(&service);
+        MasterService::GroupDomainAccessorRW gs(&service);
         gs->groups.clear();
     }
 
@@ -495,7 +495,7 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        MasterService::GroupShardAccessorRO gs(&service);
+        MasterService::GroupDomainAccessorRO gs(&service);
         auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
         return it == gs->groups.end() ? nullptr : it->second.lease;
     }
@@ -6538,7 +6538,7 @@ TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
     // Route-decoupling invariant: object routing is a pure function of
     // (tenant, key); the group_id is only a lifecycle annotation and never
     // affects which metadata shard an object lands in. The group domain is
-    // sharded by hash(tenant, group_id) and stores only the member key list.
+    // keyed by scoped(tenant, group_id) and stores only the member key list.
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();

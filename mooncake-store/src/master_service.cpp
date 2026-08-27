@@ -1608,17 +1608,17 @@ MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
     return {std::unique_lock<std::mutex>(object_operation_locks_[stripe_idx])};
 }
 
-std::shared_ptr<GroupLease> MasterService::RegisterGroupMember(
+std::shared_ptr<Lease> MasterService::RegisterGroupMember(
     const TenantId& tenant_id, const std::string& key,
     const std::string& group_id) {
     if (group_id.empty()) {
         return nullptr;
     }
-    GroupShardAccessorRW shard(this);
+    GroupDomainAccessorRW shard(this);
     const auto scoped_group = tenant_id.MakeScopedKey(group_id);
     auto [it, inserted] = shard->groups.try_emplace(scoped_group);
     if (inserted) {
-        it->second.lease = std::make_shared<GroupLease>();
+        it->second.lease = std::make_shared<Lease>();
     }
     it->second.member_keys.insert(key);
     return it->second.lease;
@@ -1630,7 +1630,7 @@ void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
     if (group_id.empty()) {
         return;
     }
-    GroupShardAccessorRW shard(this);
+    GroupDomainAccessorRW shard(this);
     const auto scoped_group = tenant_id.MakeScopedKey(group_id);
     auto it = shard->groups.find(scoped_group);
     if (it == shard->groups.end()) {
@@ -1645,7 +1645,7 @@ void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
 std::vector<std::string> MasterService::GetGroupMemberKeys(
     const TenantId& tenant_id, const std::string& group_id) const {
     std::vector<std::string> member_keys;
-    GroupShardAccessorRO shard(this);
+    GroupDomainAccessorRO shard(this);
     auto it = shard->groups.find(tenant_id.MakeScopedKey(group_id));
     if (it != shard->groups.end()) {
         member_keys.assign(it->second.member_keys.begin(),
@@ -2210,8 +2210,8 @@ void MasterService::RebuildGroupState() {
     // The group domain is a derived index of grouped object membership. Rebuild
     // it from object metadata after snapshot/standby restore.
     {
-        GroupShardAccessorRW group_shard(this);
-        group_shard->groups.clear();
+        GroupDomainAccessorRW group_domain(this);
+        group_domain->groups.clear();
     }
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
         MetadataShardAccessorRO shard(this, shard_idx);
@@ -9766,7 +9766,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         // best-effort safety still applies below (hard pins, soft pins, active
         // writes, busy replicas are skipped). Object routing is decoupled from
         // groups, so members live in different metadata shards; membership is
-        // read from group_shards_ (sharded by hash(tenant, group_id)).
+        // read from group_domain_ (keyed by scoped(tenant, group_id)).
         std::vector<std::string> member_keys =
             GetGroupMemberKeys(normalized_tenant, metadata.group_id);
         if (member_keys.empty()) {
@@ -10156,7 +10156,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // best-effort safety still applies below (hard pins, soft pins, active
         // writes, busy replicas are skipped). Object routing is decoupled from
         // groups, so members live in different metadata shards; membership is
-        // read from group_shards_ (sharded by hash(tenant, group_id)).
+        // read from group_domain_ (keyed by scoped(tenant, group_id)).
         std::vector<std::string> member_keys =
             GetGroupMemberKeys(tenant_id, metadata.group_id);
         if (member_keys.empty()) {
@@ -11605,8 +11605,8 @@ void MasterService::MetadataSerializer::Reset() {
         shard.tenants.clear();
     }
     {
-        GroupShardAccessorRW group_shard(service_);
-        group_shard->groups.clear();
+        GroupDomainAccessorRW group_domain(service_);
+        group_domain->groups.clear();
     }
     {
         std::lock_guard lock(service_->discarded_replicas_mutex_);

@@ -1,7 +1,7 @@
-// group_lease.h
+// lease.h
 //
 // Lock-free shared deadline for a group: every member holds a shared_ptr to the
-// same GroupLease (CAS monotonic-max), so a read of any member extends one TTL.
+// same Lease (CAS monotonic-max), so a read of any member extends one TTL.
 
 #pragma once
 
@@ -11,7 +11,7 @@
 
 namespace mooncake {
 
-class GroupLease {
+class Lease {
    public:
     // Unless the deadline is already over half a TTL out, extend it (max) to
     // now + ttl. The early-out keeps hot-group reads lock-free.

@@ -1021,7 +1021,7 @@ TEST_F(MasterServiceHATest,
 }
 
 TEST_F(MasterServiceHATest,
-       RestoreRejectsGroupedObjectDuplicatedIntoAnotherGroupShard) {
+       RestoreRejectsGroupedObjectDuplicatedIntoAnotherGroupDomain) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
