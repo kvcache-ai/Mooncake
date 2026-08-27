@@ -122,6 +122,10 @@ FileStorage::~FileStorage() {
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
+    // Drain any in-flight async offload before destroying the backend it uses.
+    if (offload_future_.valid()) {
+        offload_future_.wait();
+    }
     client_buffer_gc_running_ = false;
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
@@ -770,12 +774,34 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     }
 
     // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
+    // OffloadObjects writes every bucket to SSD synchronously and can take
+    // O(seconds) for large batches.  Running it on the heartbeat thread stalls
+    // the master ping (OffloadObjectHeartbeat), which causes the master to
+    // expire the client's offload tasks after client_ttl seconds (issue #2632).
+    //
+    // Fix: run OffloadObjects on a background future so this thread returns
+    // promptly.  At most one offload runs at a time — if the previous one is
+    // still in progress we skip this batch (the master will re-queue those keys
+    // on the next heartbeat).  The future is joined in the destructor before
+    // the storage backend is torn down.
     if (!offloading_objects.empty()) {
-        auto offload_result = OffloadObjects(offloading_objects);
-        if (!offload_result) {
-            LOG(ERROR) << "Failed to persist objects with error: "
-                       << offload_result.error();
-            return offload_result;
+        bool prev_done = !offload_future_.valid() ||
+                         offload_future_.wait_for(std::chrono::seconds(0)) ==
+                             std::future_status::ready;
+        if (prev_done) {
+            offload_future_ =
+                std::async(std::launch::async,
+                           [this, items = std::move(offloading_objects)]() {
+                               auto result = OffloadObjects(items);
+                               if (!result) {
+                                   LOG(ERROR) << "Async OffloadObjects failed: "
+                                              << result.error();
+                               }
+                           });
+        } else {
+            LOG(WARNING) << "Skipping offload batch of "
+                         << offloading_objects.size()
+                         << " object(s): previous offload still in progress";
         }
     }
 

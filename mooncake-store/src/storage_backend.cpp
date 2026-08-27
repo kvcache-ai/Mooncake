@@ -4821,8 +4821,8 @@ void OffsetAllocatorStorageBackend::EvictToMakeRoom(
                 continue;
             }
             // Defensive assertions against double-evict underflow.
-            // Precondition: single heartbeat_thread_ serialises offload;
-            // if concurrent offload is added, these must be re-evaluated.
+            // Precondition: offload_future_ in FileStorage ensures at most one
+            // OffloadObjects call is active; if that changes, re-evaluate.
             DCHECK_GE(total_size_.load(std::memory_order_relaxed),
                       it->second.total_size);
             DCHECK_GE(total_keys_.load(std::memory_order_relaxed), 1);
@@ -4935,9 +4935,11 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     //
     // BatchOffload, EvictToMakeRoom, and the watermark accounting on
     // total_size_ / total_keys_ assume only ONE thread calls
-    // BatchOffload at a time (currently guaranteed by FileStorage's
-    // single heartbeat_thread_).  The atomics make individual loads
-    // and stores atomic, but the read-modify-write sequences are NOT
+    // BatchOffload at a time.  FileStorage guarantees this via its
+    // offload_future_ serialisation: at most one async OffloadObjects task
+    // is in flight, so only that task's thread ever calls BatchOffload.
+    // The atomics make individual loads and stores atomic, but the
+    // read-modify-write sequences are NOT
     // atomic across threads.  If concurrent offload is added, the
     // DCHECK_GE guards in EvictToMakeRoom must also be re-evaluated.
     // ================================================================

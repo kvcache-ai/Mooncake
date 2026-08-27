@@ -220,6 +220,10 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
+    // Offload runs on a dedicated async task so the heartbeat thread is not
+    // blocked waiting for SSD writes to complete. At most one offload runs at a
+    // time; a heartbeat tick that arrives while one is in flight skips STEP 3.
+    std::future<void> offload_future_;
     // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the
     // heartbeat -- which would otherwise re-mount the segment the drain just
     // deregistered -- and aborts an in-flight metadata rescan. Checked at
