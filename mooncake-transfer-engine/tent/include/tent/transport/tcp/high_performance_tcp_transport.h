@@ -45,11 +45,15 @@ class HighPerformanceTcpTransport final : public Transport {
                                const std::vector<Request>& requests) override;
     Status getTransferStatus(SubBatchRef batch, int task_id,
                              TransferStatus& status) override;
+    Status retryTransferTask(SubBatchRef batch, int task_id,
+                             const Request& request) override;
 
     bool supportsCancellation() const override { return true; }
     Status cancelTransferTask(SubBatchRef batch, int task_id) override;
 
     Status addMemoryBuffer(BufferDesc& desc,
+                           const MemoryOptions& options) override;
+    Status addMemoryBuffer(std::vector<BufferDesc>& desc_list,
                            const MemoryOptions& options) override;
     Status removeMemoryBuffer(BufferDesc& desc) override;
     bool tracksLocalBuffer(const BufferDesc& desc) const override {

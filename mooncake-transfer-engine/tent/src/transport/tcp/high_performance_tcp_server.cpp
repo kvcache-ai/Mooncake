@@ -49,6 +49,8 @@ class HighPerformanceTcpServer::Session
         }
         lease_.reset();
         body_offset_ = 0;
+        ++request_epoch_;
+        armProgressTimer(request_epoch_);
         auto self = shared_from_this();
         asio::async_read(
             *socket_, asio::buffer(request_bytes_),
@@ -66,7 +68,6 @@ class HighPerformanceTcpServer::Session
     }
 
     void handleHeader() {
-        ++request_epoch_;
         HighPerformanceTcpStatus wire_error =
             HighPerformanceTcpStatus::kInternalError;
         const Status decoded = DecodeHighPerformanceTcpRequest(

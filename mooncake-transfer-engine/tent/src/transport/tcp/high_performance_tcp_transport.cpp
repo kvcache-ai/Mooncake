@@ -56,6 +56,29 @@ Status NeedsRefresh(const std::string& message) {
     return Status::NeedsRefreshCache(message + LOC_MARK);
 }
 
+Status RemoteWireStatus(HighPerformanceTcpStatus status) {
+    switch (status) {
+        case HighPerformanceTcpStatus::kStaleRegistration:
+            return Status::NeedsRefreshCache(
+                "remote HP TCP registration is stale" LOC_MARK);
+        case HighPerformanceTcpStatus::kPermissionDenied:
+            return Status::AddressNotRegistered(
+                "remote HP TCP permission denied" LOC_MARK);
+        case HighPerformanceTcpStatus::kRangeRejected:
+            return Status::AddressNotRegistered(
+                "remote HP TCP range rejected" LOC_MARK);
+        case HighPerformanceTcpStatus::kShuttingDown:
+            return Status::TooManyRequests(
+                "remote HP TCP transport is shutting down" LOC_MARK);
+        case HighPerformanceTcpStatus::kOk:
+            return Status::OK();
+        default:
+            return Status::InvalidEntry(
+                "remote HP TCP protocol status " +
+                std::to_string(static_cast<uint16_t>(status)) + LOC_MARK);
+    }
+}
+
 }  // namespace
 
 struct HighPerformanceTcpTransport::TaskPlan {
@@ -484,9 +507,11 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
                            ? HighPerformanceTcpOpcode::kRead
                            : HighPerformanceTcpOpcode::kWrite;
     operation.request_id = request_id;
-    operation.complete = [task](TransferStatusEnum terminal, size_t bytes) {
-        (void)task->completeOnce(terminal, bytes);
-    };
+    operation.complete =
+        [task](TransferStatusEnum terminal, size_t bytes,
+               std::optional<HighPerformanceTcpStatus> remote_status) {
+            (void)task->completeOnce(terminal, bytes, remote_status);
+        };
 
     HighPerformanceTcpWorkers::Command command;
     command.worker_id = owner_worker;
@@ -584,7 +609,42 @@ Status HighPerformanceTcpTransport::getTransferStatus(SubBatchRef batch,
         return Status::InvalidArgument("invalid HP TCP task id" LOC_MARK);
     }
     status = hp_batch->tasks[static_cast<size_t>(task_id)]->snapshot();
+    const auto remote_status =
+        hp_batch->tasks[static_cast<size_t>(task_id)]->remoteStatus();
+    if (remote_status.has_value()) return RemoteWireStatus(*remote_status);
     return Status::OK();
+}
+
+Status HighPerformanceTcpTransport::retryTransferTask(SubBatchRef batch,
+                                                      int task_id,
+                                                      const Request& request) {
+    auto* hp_batch = dynamic_cast<HighPerformanceTcpSubBatch*>(batch);
+    if (hp_batch == nullptr || task_id < 0 ||
+        static_cast<size_t>(task_id) >= hp_batch->tasks.size()) {
+        return Status::InvalidArgument("invalid HP TCP retry task id" LOC_MARK);
+    }
+    if (hp_batch->tasks[static_cast<size_t>(task_id)]->snapshot().s != FAILED) {
+        return Status::InvalidArgument(
+            "HP TCP retry requires a failed attempt" LOC_MARK);
+    }
+
+    TaskPlan plan;
+    CHECK_STATUS(planTask(request, hp_batch, &plan));
+    std::vector<HighPerformanceTcpWorkers::Command> commands;
+    try {
+        commands.push_back(std::move(plan.command));
+    } catch (...) {
+        return Status::InternalError(
+            "unable to allocate HP TCP retry command" LOC_MARK);
+    }
+
+    Status committed = workers_->tryCommitBatch(
+        commands, admission_.get(), 1, request.length, [&] {
+            plan.task->activateReservation(admission_.get(), request.length);
+            hp_batch->tasks[static_cast<size_t>(task_id)] =
+                std::move(plan.task);
+        });
+    return committed;
 }
 
 Status HighPerformanceTcpTransport::cancelTransferTask(SubBatchRef batch,
@@ -618,9 +678,12 @@ Status HighPerformanceTcpTransport::addMemoryBuffer(
         return Status::TooManyRequests(
             "HP TCP transport is shutting down" LOC_MARK);
     }
-    if (Platform::getLoader().getMemoryType(
+    const LocationParser location(desc.location);
+    if ((location.type() != "cpu" && location.type() != kWildcardLocation) ||
+        Platform::getLoader().getMemoryType(
             reinterpret_cast<void*>(desc.addr)) != MTYPE_CPU) {
-        return Status::OK();
+        return Status::InvalidArgument(
+            "HP TCP v1 supports CPU DRAM only" LOC_MARK);
     }
 
     uint64_t registration_id = 0;
@@ -639,6 +702,36 @@ Status HighPerformanceTcpTransport::addMemoryBuffer(
     desc.transport_attrs[TransportType::HP_TCP] = std::move(encoded);
     if (!HasTransport(desc, TransportType::HP_TCP)) {
         desc.transports.push_back(TransportType::HP_TCP);
+    }
+    return Status::OK();
+}
+
+Status HighPerformanceTcpTransport::addMemoryBuffer(
+    std::vector<BufferDesc>& desc_list, const MemoryOptions& options) {
+    std::vector<size_t> created;
+    try {
+        created.reserve(desc_list.size());
+    } catch (...) {
+        return Status::InternalError(
+            "unable to allocate HP TCP registration rollback state" LOC_MARK);
+    }
+
+    for (size_t i = 0; i < desc_list.size(); ++i) {
+        const bool tracked_before =
+            registry_.tracks(desc_list[i].addr, desc_list[i].length);
+        Status status = addMemoryBuffer(desc_list[i], options);
+        if (status.ok()) {
+            if (!tracked_before) created.push_back(i);
+            continue;
+        }
+        for (auto it = created.rbegin(); it != created.rend(); ++it) {
+            const Status rollback = removeMemoryBuffer(desc_list[*it]);
+            if (!rollback.ok()) {
+                LOG(ERROR) << "HP TCP registration rollback failed: "
+                           << rollback.ToString();
+            }
+        }
+        return status;
     }
     return Status::OK();
 }

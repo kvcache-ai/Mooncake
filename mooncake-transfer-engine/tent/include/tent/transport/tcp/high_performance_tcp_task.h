@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <utility>
 
 #include "tent/common/types.h"
@@ -39,8 +40,11 @@ class HighPerformanceTcpTaskState {
         reservation_active_.store(true, std::memory_order_release);
     }
 
-    bool completeOnce(TransferStatusEnum terminal, size_t bytes) noexcept;
+    bool completeOnce(TransferStatusEnum terminal, size_t bytes,
+                      std::optional<HighPerformanceTcpStatus> remote_status =
+                          std::nullopt) noexcept;
     TransferStatus snapshot() const noexcept;
+    std::optional<HighPerformanceTcpStatus> remoteStatus() const noexcept;
 
     const Request& request() const noexcept { return request_; }
 
@@ -63,6 +67,8 @@ class HighPerformanceTcpTaskState {
     Request request_;
     std::atomic<TransferStatusEnum> status_{PENDING};
     std::atomic<size_t> bytes_{0};
+    std::atomic<HighPerformanceTcpStatus> remote_status_{
+        HighPerformanceTcpStatus::kOk};
     std::atomic<bool> completion_claimed_{false};
     std::atomic<bool> cancel_requested_{false};
 

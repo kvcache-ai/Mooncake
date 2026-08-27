@@ -32,6 +32,22 @@ namespace {
 TEST(TaskInfoTest, DefaultFailoverCount) {
     TaskInfo task;
     EXPECT_EQ(task.failover_count, 0);
+    EXPECT_EQ(task.metadata_refresh_retry_count, 0);
+    EXPECT_FALSE(task.suppress_failover);
+}
+
+TEST(TaskInfoTest, MetadataRefreshRetryIsIndependentAndHardBounded) {
+    TaskInfo task;
+    constexpr int kMaxMetadataRefreshRetries = 1;
+    ++task.metadata_refresh_retry_count;
+    EXPECT_EQ(task.metadata_refresh_retry_count, kMaxMetadataRefreshRetries);
+    EXPECT_EQ(task.failover_count, 0);
+    task.suppress_failover = true;
+
+    TaskInfo copy = task;
+    EXPECT_EQ(copy.metadata_refresh_retry_count, kMaxMetadataRefreshRetries);
+    EXPECT_TRUE(copy.suppress_failover);
+    EXPECT_EQ(copy.failover_count, 0);
 }
 
 TEST(TaskInfoTest, FailoverCountIncrement) {

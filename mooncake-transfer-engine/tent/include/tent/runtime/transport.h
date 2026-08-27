@@ -107,6 +107,12 @@ class Transport {
             "getTransferStatus not implemented" LOC_MARK);
     }
 
+    virtual Status retryTransferTask(SubBatchRef batch, int task_id,
+                                     const Request& request) {
+        return Status::NotImplemented(
+            "retryTransferTask not implemented" LOC_MARK);
+    }
+
     // Cancellation is best effort: implementations must prevent work that has
     // not reached the device from being submitted, but work already posted to
     // a device may still complete. Callers must continue polling until the

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -27,11 +28,16 @@ struct Completion {
     std::atomic<bool> done{false};
     TransferStatusEnum status{PENDING};
     size_t bytes{0};
+    std::optional<HighPerformanceTcpStatus> remote_status;
 
-    std::function<void(TransferStatusEnum, size_t)> callback() {
-        return [this](TransferStatusEnum s, size_t n) {
+    std::function<void(TransferStatusEnum, size_t,
+                       std::optional<HighPerformanceTcpStatus>)>
+    callback() {
+        return [this](TransferStatusEnum s, size_t n,
+                      std::optional<HighPerformanceTcpStatus> remote) {
             status = s;
             bytes = n;
+            remote_status = remote;
             done.store(true, std::memory_order_release);
         };
     }
@@ -73,19 +79,20 @@ bool SocketOrderedEqual(const std::array<uint8_t, Size>& left,
 
 class CoreRuntime {
    public:
-    explicit CoreRuntime(size_t max_connections = 32)
+    explicit CoreRuntime(size_t max_connections = 32,
+                         uint64_t progress_timeout_ms = 500)
         : workers({.worker_count = 2, .queue_capacity = 32}),
           client({.max_transfer_bytes = 1 << 20,
                   .chunk_size = 128,
                   .connect_timeout_ms = 500,
-                  .progress_timeout_ms = 500,
+                  .progress_timeout_ms = progress_timeout_ms,
                   .connections_per_peer = 2},
                  &workers),
           server({.bind_address = "127.0.0.1",
                   .port = 0,
                   .max_transfer_bytes = 1 << 20,
                   .chunk_size = 128,
-                  .progress_timeout_ms = 500,
+                  .progress_timeout_ms = progress_timeout_ms,
                   .max_connections = max_connections},
                  &registry, &workers) {}
 
@@ -125,7 +132,10 @@ HighPerformanceTcpClient::Operation MakeOperation(
     void* local, size_t length, uint64_t remote, uint64_t registration,
     uint64_t request_id, uint32_t lane, const std::string& incarnation,
     HighPerformanceTcpOpcode opcode,
-    std::function<void(TransferStatusEnum, size_t)> complete, uint16_t port) {
+    std::function<void(TransferStatusEnum, size_t,
+                       std::optional<HighPerformanceTcpStatus>)>
+        complete,
+    uint16_t port) {
     HighPerformanceTcpClient::Operation op;
     op.peer_id = 7;
     op.peer_name = "peer-seven";
@@ -141,6 +151,32 @@ HighPerformanceTcpClient::Operation MakeOperation(
     op.request_id = request_id;
     op.complete = std::move(complete);
     return op;
+}
+
+void ExpectServerUsable(CoreRuntime& runtime, uint64_t request_id) {
+    std::array<uint8_t, 64> remote{};
+    uint64_t registration = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadOnly, &registration)
+                    .ok());
+    std::array<uint8_t, 64> local{};
+    Completion completion;
+    ASSERT_TRUE(runtime
+                    .submit(MakeOperation(
+                        local.data(), local.size(),
+                        reinterpret_cast<uint64_t>(remote.data()), registration,
+                        request_id, 0, "00112233445566778899aabbccddeeff",
+                        HighPerformanceTcpOpcode::kRead, completion.callback(),
+                        runtime.port))
+                    .ok());
+    ASSERT_TRUE(completion.wait());
+    EXPECT_EQ(completion.status, COMPLETED);
+    EXPECT_FALSE(completion.remote_status.has_value());
+    EXPECT_TRUE(
+        runtime.registry
+            .remove(reinterpret_cast<uint64_t>(remote.data()), remote.size())
+            .ok());
 }
 
 TEST(HighPerformanceTcpSocketTest, WriteAckThenReadAndReuseConnection) {
@@ -352,6 +388,149 @@ TEST(HighPerformanceTcpSocketTest, MalformedFrameGetsErrorAndConnectionCloses) {
     socket.read_some(asio::buffer(extra), error);
     EXPECT_TRUE(error == asio::error::eof ||
                 error == asio::error::connection_reset);
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     EmptyHeaderWaitTimesOutAndReclaimsConnectionSlot) {
+    CoreRuntime runtime(/*max_connections=*/1, /*progress_timeout_ms=*/30);
+    runtime.start();
+
+    asio::io_context io;
+    asio::ip::tcp::socket socket(io);
+    socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+    ASSERT_TRUE(WaitUntil(
+        [&] { return runtime.server.activeSessionsForTest() == 1u; }));
+    ASSERT_TRUE(WaitUntil(
+        [&] { return runtime.server.activeSessionsForTest() == 0u; }));
+
+    ExpectServerUsable(runtime, 40);
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     PartialHeaderWaitTimesOutAndReclaimsConnectionSlot) {
+    CoreRuntime runtime(/*max_connections=*/1, /*progress_timeout_ms=*/30);
+    runtime.start();
+
+    asio::io_context io;
+    asio::ip::tcp::socket socket(io);
+    socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+    std::array<uint8_t, kHighPerformanceTcpRequestSize> partial{};
+    ASSERT_EQ(asio::write(socket, asio::buffer(partial.data(), 1)), 1u);
+    ASSERT_TRUE(WaitUntil(
+        [&] { return runtime.server.activeSessionsForTest() == 1u; }));
+    ASSERT_TRUE(WaitUntil(
+        [&] { return runtime.server.activeSessionsForTest() == 0u; }));
+
+    ExpectServerUsable(runtime, 41);
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     ValidRemoteWireStatusesArePreservedWithoutInventingSuccess) {
+    CoreRuntime runtime;
+    runtime.start();
+
+    std::array<uint8_t, 64> remote{};
+    uint64_t registration_a = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration_a)
+                    .ok());
+    ASSERT_TRUE(
+        runtime.registry
+            .remove(reinterpret_cast<uint64_t>(remote.data()), remote.size())
+            .ok());
+    uint64_t registration_b = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration_b)
+                    .ok());
+    ASSERT_NE(registration_a, registration_b);
+
+    std::array<uint8_t, 64> local{};
+    Completion stale;
+    ASSERT_TRUE(
+        runtime
+            .submit(MakeOperation(local.data(), local.size(),
+                                  reinterpret_cast<uint64_t>(remote.data()),
+                                  registration_a, 42, 0,
+                                  "00112233445566778899aabbccddeeff",
+                                  HighPerformanceTcpOpcode::kRead,
+                                  stale.callback(), runtime.port))
+            .ok());
+    ASSERT_TRUE(stale.wait());
+    EXPECT_EQ(stale.status, FAILED);
+    ASSERT_TRUE(stale.remote_status.has_value());
+    EXPECT_EQ(*stale.remote_status,
+              HighPerformanceTcpStatus::kStaleRegistration);
+
+    Completion refreshed;
+    ASSERT_TRUE(
+        runtime
+            .submit(MakeOperation(local.data(), local.size(),
+                                  reinterpret_cast<uint64_t>(remote.data()),
+                                  registration_b, 43, 0,
+                                  "00112233445566778899aabbccddeeff",
+                                  HighPerformanceTcpOpcode::kRead,
+                                  refreshed.callback(), runtime.port))
+            .ok());
+    ASSERT_TRUE(refreshed.wait());
+    EXPECT_EQ(refreshed.status, COMPLETED);
+    EXPECT_FALSE(refreshed.remote_status.has_value());
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     PermissionDeniedAndShuttingDownRemainDistinctFromStale) {
+    {
+        CoreRuntime runtime;
+        runtime.start();
+        std::array<uint8_t, 64> remote{};
+        uint64_t registration = 0;
+        ASSERT_TRUE(runtime.registry
+                        .add(reinterpret_cast<uint64_t>(remote.data()),
+                             remote.size(), kGlobalReadOnly, &registration)
+                        .ok());
+        std::array<uint8_t, 64> local{};
+        Completion denied;
+        ASSERT_TRUE(
+            runtime
+                .submit(MakeOperation(local.data(), local.size(),
+                                      reinterpret_cast<uint64_t>(remote.data()),
+                                      registration, 44, 0,
+                                      "00112233445566778899aabbccddeeff",
+                                      HighPerformanceTcpOpcode::kWrite,
+                                      denied.callback(), runtime.port))
+                .ok());
+        ASSERT_TRUE(denied.wait());
+        ASSERT_TRUE(denied.remote_status.has_value());
+        EXPECT_EQ(*denied.remote_status,
+                  HighPerformanceTcpStatus::kPermissionDenied);
+    }
+    {
+        CoreRuntime runtime;
+        runtime.start();
+        std::array<uint8_t, 64> remote{};
+        uint64_t registration = 0;
+        ASSERT_TRUE(runtime.registry
+                        .add(reinterpret_cast<uint64_t>(remote.data()),
+                             remote.size(), kGlobalReadOnly, &registration)
+                        .ok());
+        runtime.registry.close();
+        std::array<uint8_t, 64> local{};
+        Completion shutting_down;
+        ASSERT_TRUE(
+            runtime
+                .submit(MakeOperation(local.data(), local.size(),
+                                      reinterpret_cast<uint64_t>(remote.data()),
+                                      registration, 45, 0,
+                                      "00112233445566778899aabbccddeeff",
+                                      HighPerformanceTcpOpcode::kRead,
+                                      shutting_down.callback(), runtime.port))
+                .ok());
+        ASSERT_TRUE(shutting_down.wait());
+        ASSERT_TRUE(shutting_down.remote_status.has_value());
+        EXPECT_EQ(*shutting_down.remote_status,
+                  HighPerformanceTcpStatus::kShuttingDown);
+    }
 }
 
 TEST(HighPerformanceTcpSocketTest,

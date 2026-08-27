@@ -12,21 +12,6 @@
 #include <glog/logging.h>
 
 namespace mooncake::tent {
-namespace {
-
-bool ResponseOk(const HighPerformanceTcpResponseFrame& response,
-                const HighPerformanceTcpClient::Operation& operation,
-                bool write) {
-    if (response.request_id != operation.request_id ||
-        response.status != HighPerformanceTcpStatus::kOk) {
-        return false;
-    }
-    if (write) return response.committed_bytes == operation.length;
-    return response.committed_bytes == operation.length;
-}
-
-}  // namespace
-
 class HighPerformanceTcpClient::Lane
     : public std::enable_shared_from_this<HighPerformanceTcpClient::Lane> {
    public:
@@ -253,10 +238,19 @@ class HighPerformanceTcpClient::Lane
                 const Status decoded = DecodeHighPerformanceTcpResponse(
                     self->response_bytes_.data(), self->response_bytes_.size(),
                     &response);
-                if (!decoded.ok() ||
-                    !ResponseOk(response, *self->current_,
-                                self->current_->opcode ==
-                                    HighPerformanceTcpOpcode::kWrite)) {
+                if (!decoded.ok()) {
+                    self->finishProtocolError();
+                    return;
+                }
+                if (response.request_id != self->current_->request_id) {
+                    self->finishProtocolError();
+                    return;
+                }
+                if (response.status != HighPerformanceTcpStatus::kOk) {
+                    self->finishRemoteError(response.status);
+                    return;
+                }
+                if (response.committed_bytes != self->current_->length) {
                     self->finishProtocolError();
                     return;
                 }
@@ -350,6 +344,11 @@ class HighPerformanceTcpClient::Lane
         finishCurrent(FAILED, 0, false);
     }
 
+    void finishRemoteError(HighPerformanceTcpStatus status) {
+        closeDirty();
+        finishCurrent(FAILED, 0, false, status);
+    }
+
     void finishIoError(const std::error_code&) {
         const TransferStatusEnum terminal = forced_terminal_.value_or(FAILED);
         closeDirty();
@@ -362,22 +361,26 @@ class HighPerformanceTcpClient::Lane
         finishCurrent(COMPLETED, current_->length, true);
     }
 
-    void finishCurrent(TransferStatusEnum terminal, size_t bytes,
-                       bool keep_stream) {
+    void finishCurrent(
+        TransferStatusEnum terminal, size_t bytes, bool keep_stream,
+        std::optional<HighPerformanceTcpStatus> remote_status = std::nullopt) {
         cancelTimer();
         if (!keep_stream) closeDirty();
         Operation operation = std::move(*current_);
         current_.reset();
         ++operation_epoch_;  // invalidate late timer/cancel callbacks
         forced_terminal_.reset();
-        completeStandalone(std::move(operation), terminal, bytes);
+        completeStandalone(std::move(operation), terminal, bytes,
+                           remote_status);
         startNext();
     }
 
-    void completeStandalone(Operation operation, TransferStatusEnum terminal,
-                            size_t bytes) {
+    void completeStandalone(
+        Operation operation, TransferStatusEnum terminal, size_t bytes,
+        std::optional<HighPerformanceTcpStatus> remote_status = std::nullopt) {
         try {
-            if (operation.complete) operation.complete(terminal, bytes);
+            if (operation.complete)
+                operation.complete(terminal, bytes, remote_status);
         } catch (const std::exception& error) {
             LOG(ERROR) << "HP TCP completion callback threw: " << error.what();
         } catch (...) {
@@ -457,7 +460,7 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
         !operation.complete) {
         if (operation.complete) {
             try {
-                operation.complete(FAILED, 0);
+                operation.complete(FAILED, 0, std::nullopt);
             } catch (...) {
                 LOG(ERROR) << "HP TCP rejected-operation callback threw";
             }
@@ -473,7 +476,7 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
             operation.host.empty() || operation.port == 0 ||
             operation.lane_id >= config_.connections_per_peer) {
             try {
-                operation.complete(CANCELED, 0);
+                operation.complete(CANCELED, 0, std::nullopt);
             } catch (...) {
                 LOG(ERROR) << "HP TCP rejected-operation callback threw";
             }
@@ -508,7 +511,7 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
     } catch (const std::exception& error) {
         LOG(ERROR) << "HP TCP lane setup failed: " << error.what();
         try {
-            operation.complete(FAILED, 0);
+            operation.complete(FAILED, 0, std::nullopt);
         } catch (...) {
             LOG(ERROR) << "HP TCP failed-operation callback threw";
         }
@@ -516,7 +519,7 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
     } catch (...) {
         LOG(ERROR) << "HP TCP lane setup failed";
         try {
-            operation.complete(FAILED, 0);
+            operation.complete(FAILED, 0, std::nullopt);
         } catch (...) {
             LOG(ERROR) << "HP TCP failed-operation callback threw";
         }

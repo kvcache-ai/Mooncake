@@ -54,6 +54,7 @@ constexpr uint8_t kRedisDefaultDbIndex = 0;
 // pass or two and a healthy-but-inflight batch reports PENDING (which resets
 // the counter), so only a permanently failing poll or queue retire gets here.
 constexpr size_t kMaxReclaimAttempts = 4096;
+constexpr int kMaxHpTcpMetadataRefreshRetries = 1;
 }  // namespace
 
 struct Batch {
@@ -870,9 +871,16 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 
     auto status = local_segment_tracker_->addInBatch(
         desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
+            const bool hp_tcp_required =
+                options.type == HP_TCP ||
+                (options.type == UNSPEC && transports.size() == 1 &&
+                 transports.front() == HP_TCP);
             for (auto type : transports) {
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
-                if (!s.ok()) LOG(WARNING) << s.ToString();
+                if (!s.ok()) {
+                    if (type == HP_TCP && hp_tcp_required) return s;
+                    LOG(WARNING) << s.ToString();
+                }
             }
             return Status::OK();
         });
@@ -2295,8 +2303,56 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     if (!transport || !sub_batch) {
         return Status::InvalidArgument("Transport not available" LOC_MARK);
     }
-    return transport->getTransferStatus(sub_batch, task.sub_task_id,
-                                        task_status);
+    Status result =
+        transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
+    if (result.ok() || task.type != HP_TCP || task_status.s != FAILED) {
+        return result;
+    }
+
+    if (result.IsNeedsRefreshCache()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+        if (task.metadata_refresh_retry_count >=
+            kMaxHpTcpMetadataRefreshRetries) {
+            task.suppress_failover = true;
+            return Status::OK();
+        }
+        ++task.metadata_refresh_retry_count;
+        Status invalidated = metadata_->segmentManager().invalidateRemote(
+            task.request.target_id);
+        if (!invalidated.ok()) {
+            task.suppress_failover = true;
+            LOG(WARNING) << "HP TCP stale-registration cache invalidation "
+                            "failed: "
+                         << invalidated.ToString();
+            return Status::OK();
+        }
+
+        const auto retry_start = std::chrono::steady_clock::now();
+        startTransportAttempt(task, HP_TCP, retry_start);
+        Status retried = transport->retryTransferTask(
+            sub_batch, task.sub_task_id, task.request);
+        if (!retried.ok()) {
+            finishTransportAttempt(task, FAILED,
+                                   std::chrono::steady_clock::now());
+            task.suppress_failover = true;
+            LOG(WARNING) << "HP TCP stale-registration retry failed: "
+                         << retried.ToString();
+            return Status::OK();
+        }
+        task.status = PENDING;
+        task_status.s = PENDING;
+        task_status.transferred_bytes = 0;
+        return Status::OK();
+    }
+
+    // A valid remote permission/range/protocol rejection is permanent for
+    // this logical request. ShuttingDown maps to TooManyRequests and remains
+    // transient, so the existing failover policy may act on it.
+    if (!result.IsTooManyRequests()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+        task.suppress_failover = true;
+    }
+    return Status::OK();
 }
 
 void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
@@ -2304,8 +2360,8 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
     task.status = task_status.s;
-    if (!allow_failover || task.cancel_requested || task_status.s != FAILED ||
-        task.type == UNSPEC)
+    if (!allow_failover || task.cancel_requested || task.suppress_failover ||
+        task_status.s != FAILED || task.type == UNSPEC)
         return;
 
     // The current physical transport attempt has failed even if the logical

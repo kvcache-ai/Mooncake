@@ -5,8 +5,9 @@
 
 namespace mooncake::tent {
 
-bool HighPerformanceTcpTaskState::completeOnce(TransferStatusEnum terminal,
-                                               size_t bytes) noexcept {
+bool HighPerformanceTcpTaskState::completeOnce(
+    TransferStatusEnum terminal, size_t bytes,
+    std::optional<HighPerformanceTcpStatus> remote_status) noexcept {
     if (terminal == INITIAL || terminal == PENDING || terminal == INVALID) {
         terminal = FAILED;
         bytes = 0;
@@ -24,6 +25,10 @@ bool HighPerformanceTcpTaskState::completeOnce(TransferStatusEnum terminal,
     // a socket). Retire memory ownership and budget before publishing terminal
     // status so teardown observing terminal cannot race unregister/free.
     bytes_.store(bytes, std::memory_order_relaxed);
+    if (remote_status.has_value() &&
+        *remote_status != HighPerformanceTcpStatus::kOk) {
+        remote_status_.store(*remote_status, std::memory_order_relaxed);
+    }
     local_lease_.reset();
 
     if (reservation_active_.exchange(false, std::memory_order_acq_rel)) {
@@ -47,6 +52,13 @@ TransferStatus HighPerformanceTcpTaskState::snapshot() const noexcept {
     result.s = status_.load(std::memory_order_acquire);
     result.transferred_bytes = bytes_.load(std::memory_order_acquire);
     return result;
+}
+
+std::optional<HighPerformanceTcpStatus>
+HighPerformanceTcpTaskState::remoteStatus() const noexcept {
+    const auto status = remote_status_.load(std::memory_order_acquire);
+    if (status == HighPerformanceTcpStatus::kOk) return std::nullopt;
+    return status;
 }
 
 }  // namespace mooncake::tent

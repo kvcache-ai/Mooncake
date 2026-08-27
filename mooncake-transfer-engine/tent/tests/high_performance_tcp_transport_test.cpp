@@ -10,9 +10,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "tent/runtime/control_plane.h"
 #include "tent/transport/tcp/high_performance_tcp_protocol.h"
@@ -141,6 +144,254 @@ TEST(HighPerformanceTcpTransportTest, ExplicitBindFailureIsReturned) {
         transport.install(segment_name, metadata, nullptr, nullptr);
     EXPECT_FALSE(status.ok());
     EXPECT_TRUE(transport.uninstall().ok());
+}
+
+Status PublishBuffers(const std::shared_ptr<ControlService>& metadata,
+                      const std::vector<BufferDesc>& buffers) {
+    return metadata->segmentManager().updateLocal(
+        [&](SegmentDesc& segment) -> Status {
+            std::get<MemorySegmentDesc>(segment.detail).buffers = buffers;
+            return Status::OK();
+        });
+}
+
+Status WaitForTransportResult(HighPerformanceTcpTransport& transport,
+                              Transport::SubBatchRef batch,
+                              TransferStatus& transfer_status) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    Status result = Status::OK();
+    while (std::chrono::steady_clock::now() < deadline) {
+        result = transport.getTransferStatus(batch, 0, transfer_status);
+        if (transfer_status.s != PENDING) return result;
+        std::this_thread::yield();
+    }
+    return Status::InternalError("HP TCP test transfer did not finish");
+}
+
+TEST(HighPerformanceTcpTransportTest,
+     CpuVectorRegistrationSucceedsAndUnsupportedMemoryFails) {
+    auto metadata = MakeLocalMetadata();
+    HighPerformanceTcpTransport transport(MakeParams());
+    std::string segment_name = "hp_transport_test";
+    ASSERT_TRUE(
+        transport.install(segment_name, metadata, nullptr, nullptr).ok());
+
+    std::array<uint8_t, 64> first_storage{};
+    std::array<uint8_t, 64> second_storage{};
+    std::vector<BufferDesc> cpu_descs(2);
+    cpu_descs[0].addr = reinterpret_cast<uint64_t>(first_storage.data());
+    cpu_descs[0].length = first_storage.size();
+    cpu_descs[0].location = "cpu:0";
+    cpu_descs[1].addr = reinterpret_cast<uint64_t>(second_storage.data());
+    cpu_descs[1].length = second_storage.size();
+    cpu_descs[1].location = "cpu:0";
+    MemoryOptions options;
+    options.type = HP_TCP;
+    options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(transport.addMemoryBuffer(cpu_descs, options).ok());
+    for (const auto& desc : cpu_descs) {
+        EXPECT_TRUE(transport.tracksLocalBuffer(desc));
+        EXPECT_TRUE(ContainsTransport(desc, TransportType::HP_TCP));
+        EXPECT_EQ(desc.transport_attrs.count(TransportType::HP_TCP), 1u);
+    }
+
+    std::array<uint8_t, 64> unsupported_storage{};
+    BufferDesc unsupported;
+    unsupported.addr = reinterpret_cast<uint64_t>(unsupported_storage.data());
+    unsupported.length = unsupported_storage.size();
+    unsupported.location = "cuda:0";
+    const Status unsupported_status =
+        transport.addMemoryBuffer(unsupported, options);
+    EXPECT_TRUE(unsupported_status.IsInvalidArgument());
+    EXPECT_FALSE(transport.tracksLocalBuffer(unsupported));
+    EXPECT_FALSE(ContainsTransport(unsupported, TransportType::HP_TCP));
+    EXPECT_EQ(unsupported.transport_attrs.count(TransportType::HP_TCP), 0u);
+
+    for (auto& desc : cpu_descs) {
+        ASSERT_TRUE(transport.removeMemoryBuffer(desc).ok());
+    }
+    ASSERT_TRUE(transport.quiesce().ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(HighPerformanceTcpTransportTest,
+     VectorFailureRollsBackOnlyRegistrationsCreatedByThatCall) {
+    auto metadata = MakeLocalMetadata();
+    HighPerformanceTcpTransport transport(MakeParams());
+    std::string segment_name = "hp_transport_test";
+    ASSERT_TRUE(
+        transport.install(segment_name, metadata, nullptr, nullptr).ok());
+
+    MemoryOptions options;
+    options.type = HP_TCP;
+    options.perm = kGlobalReadWrite;
+    std::array<uint8_t, 64> existing_storage{};
+    BufferDesc existing;
+    existing.addr = reinterpret_cast<uint64_t>(existing_storage.data());
+    existing.length = existing_storage.size();
+    existing.location = "cpu:0";
+    ASSERT_TRUE(transport.addMemoryBuffer(existing, options).ok());
+
+    std::array<uint8_t, 64> new_storage{};
+    std::array<uint8_t, 64> unsupported_storage{};
+    std::vector<BufferDesc> descs(2);
+    descs[0].addr = reinterpret_cast<uint64_t>(new_storage.data());
+    descs[0].length = new_storage.size();
+    descs[0].location = "cpu:0";
+    descs[1].addr = reinterpret_cast<uint64_t>(unsupported_storage.data());
+    descs[1].length = unsupported_storage.size();
+    descs[1].location = "cuda:0";
+
+    const Status status = transport.addMemoryBuffer(descs, options);
+    EXPECT_TRUE(status.IsInvalidArgument());
+    EXPECT_TRUE(transport.tracksLocalBuffer(existing));
+    EXPECT_FALSE(transport.tracksLocalBuffer(descs[0]));
+    EXPECT_FALSE(transport.tracksLocalBuffer(descs[1]));
+    EXPECT_EQ(descs[0].transport_attrs.count(TransportType::HP_TCP), 0u);
+    EXPECT_EQ(descs[1].transport_attrs.count(TransportType::HP_TCP), 0u);
+
+    ASSERT_TRUE(transport.removeMemoryBuffer(existing).ok());
+    ASSERT_TRUE(transport.quiesce().ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(HighPerformanceTcpTransportTest,
+     StaleRegistrationRefreshRetriesSameTransportWithFreshMetadata) {
+    auto server_metadata = MakeLocalMetadata();
+    uint16_t rpc_port = 0;
+    ASSERT_TRUE(server_metadata->start(rpc_port).ok());
+    ASSERT_NE(rpc_port, 0);
+    const std::string server_name = "127.0.0.1:" + std::to_string(rpc_port);
+    ASSERT_TRUE(server_metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) -> Status {
+                        segment.name = server_name;
+                        segment.rpc_server_addr = server_name;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    HighPerformanceTcpTransport server(MakeParams());
+    std::string installed_server_name = server_name;
+    ASSERT_TRUE(
+        server.install(installed_server_name, server_metadata, nullptr, nullptr)
+            .ok());
+    std::array<uint8_t, 64> remote_storage{};
+    BufferDesc registration_a;
+    registration_a.addr = reinterpret_cast<uint64_t>(remote_storage.data());
+    registration_a.length = remote_storage.size();
+    registration_a.location = "cpu:0";
+    MemoryOptions remote_options;
+    remote_options.type = HP_TCP;
+    remote_options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(server.addMemoryBuffer(registration_a, remote_options).ok());
+    HighPerformanceTcpBufferAttr attr_a;
+    ASSERT_TRUE(
+        DecodeHighPerformanceTcpBufferAttr(
+            registration_a.transport_attrs.at(TransportType::HP_TCP), &attr_a)
+            .ok());
+    ASSERT_TRUE(PublishBuffers(server_metadata, {registration_a}).ok());
+
+    auto client_metadata = MakeLocalMetadata();
+    ASSERT_TRUE(client_metadata->segmentManager()
+                    .updateLocal([](SegmentDesc& segment) -> Status {
+                        // Deliberately omit a callback address. The remote
+                        // cache stays on A until this test invalidates it.
+                        segment.rpc_server_addr.clear();
+                        return Status::OK();
+                    })
+                    .ok());
+    HighPerformanceTcpTransport client(MakeParams());
+    std::string client_name = "hp_transport_client";
+    ASSERT_TRUE(
+        client.install(client_name, client_metadata, nullptr, nullptr).ok());
+    SegmentID target = 0;
+    ASSERT_TRUE(
+        client_metadata->segmentManager().openRemote(target, server_name).ok());
+    SegmentDescRef cached_a;
+    ASSERT_TRUE(client_metadata->segmentManager()
+                    .getRemoteCached(cached_a, target)
+                    .ok());
+    const BufferDesc* cached_buffer_a =
+        cached_a->findBuffer(registration_a.addr, registration_a.length);
+    ASSERT_NE(cached_buffer_a, nullptr);
+
+    ASSERT_TRUE(server.removeMemoryBuffer(registration_a).ok());
+    BufferDesc registration_b;
+    registration_b.addr = reinterpret_cast<uint64_t>(remote_storage.data());
+    registration_b.length = remote_storage.size();
+    registration_b.location = "cpu:0";
+    ASSERT_TRUE(server.addMemoryBuffer(registration_b, remote_options).ok());
+    HighPerformanceTcpBufferAttr attr_b;
+    ASSERT_TRUE(
+        DecodeHighPerformanceTcpBufferAttr(
+            registration_b.transport_attrs.at(TransportType::HP_TCP), &attr_b)
+            .ok());
+    ASSERT_NE(attr_a.registration_id, attr_b.registration_id);
+    ASSERT_TRUE(PublishBuffers(server_metadata, {registration_b}).ok());
+
+    std::array<uint8_t, 64> local_storage{};
+    BufferDesc local;
+    local.addr = reinterpret_cast<uint64_t>(local_storage.data());
+    local.length = local_storage.size();
+    local.location = "cpu:0";
+    MemoryOptions local_options;
+    local_options.type = HP_TCP;
+    local_options.perm = kLocalReadWrite;
+    ASSERT_TRUE(client.addMemoryBuffer(local, local_options).ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(client.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::READ;
+    request.source = local_storage.data();
+    request.target_id = target;
+    request.target_offset = registration_b.addr;
+    request.length = registration_b.length;
+    request.transport_hint = HP_TCP;
+    ASSERT_TRUE(client.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer_status;
+    Status first_result =
+        WaitForTransportResult(client, batch, transfer_status);
+    EXPECT_EQ(transfer_status.s, FAILED);
+    EXPECT_TRUE(first_result.IsNeedsRefreshCache()) << first_result.ToString();
+
+    int metadata_refresh_retry_count = 0;
+    ASSERT_LT(metadata_refresh_retry_count, 1);
+    ++metadata_refresh_retry_count;
+    ASSERT_TRUE(
+        client_metadata->segmentManager().invalidateRemote(target).ok());
+    ASSERT_TRUE(client.retryTransferTask(batch, 0, request).ok());
+
+    Status retry_result =
+        WaitForTransportResult(client, batch, transfer_status);
+    EXPECT_TRUE(retry_result.ok()) << retry_result.ToString();
+    EXPECT_EQ(transfer_status.s, COMPLETED);
+    EXPECT_EQ(transfer_status.transferred_bytes, request.length);
+    EXPECT_EQ(metadata_refresh_retry_count, 1);
+
+    SegmentDescRef refreshed;
+    ASSERT_TRUE(client_metadata->segmentManager()
+                    .getRemoteCached(refreshed, target)
+                    .ok());
+    const BufferDesc* refreshed_buffer =
+        refreshed->findBuffer(registration_b.addr, registration_b.length);
+    ASSERT_NE(refreshed_buffer, nullptr);
+    HighPerformanceTcpBufferAttr refreshed_attr;
+    ASSERT_TRUE(DecodeHighPerformanceTcpBufferAttr(
+                    refreshed_buffer->transport_attrs.at(TransportType::HP_TCP),
+                    &refreshed_attr)
+                    .ok());
+    EXPECT_EQ(refreshed_attr.registration_id, attr_b.registration_id);
+
+    ASSERT_TRUE(client.freeSubBatch(batch).ok());
+    ASSERT_TRUE(client.removeMemoryBuffer(local).ok());
+    ASSERT_TRUE(server.removeMemoryBuffer(registration_b).ok());
+    ASSERT_TRUE(client.quiesce().ok());
+    ASSERT_TRUE(server.quiesce().ok());
+    ASSERT_TRUE(client.uninstall().ok());
+    ASSERT_TRUE(server.uninstall().ok());
 }
 
 }  // namespace

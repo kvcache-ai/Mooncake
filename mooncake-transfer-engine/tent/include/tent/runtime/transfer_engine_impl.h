@@ -64,11 +64,13 @@ void waitBeforeNextPoll(uint64_t poll_count);
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
-    bool derived{false};          // merged by other tasks
-    int xport_priority{0};        // transport priority (for fallback)
-    int failover_count{0};        // number of failover attempts
-    uint64_t device_mask{~0ULL};  // Device mask for quota allocation
-    std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
+    bool derived{false};                  // merged by other tasks
+    int xport_priority{0};                // transport priority (for fallback)
+    int failover_count{0};                // number of failover attempts
+    int metadata_refresh_retry_count{0};  // same-transport stale-cache retries
+    bool suppress_failover{false};        // permanent transport result
+    uint64_t device_mask{~0ULL};          // Device mask for quota allocation
+    std::string qp_pool;  // Named QP pool (RFC #2568 step 3), "" = none
     Request request;
     bool staging{false};
     bool cancel_requested{false};
@@ -94,6 +96,8 @@ struct TaskInfo {
           derived(other.derived),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
+          metadata_refresh_retry_count(other.metadata_refresh_retry_count),
+          suppress_failover(other.suppress_failover),
           device_mask(other.device_mask),
           qp_pool(other.qp_pool),
           request(other.request),
@@ -114,6 +118,8 @@ struct TaskInfo {
           derived(other.derived),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
+          metadata_refresh_retry_count(other.metadata_refresh_retry_count),
+          suppress_failover(other.suppress_failover),
           device_mask(other.device_mask),
           qp_pool(std::move(other.qp_pool)),
           request(std::move(other.request)),
@@ -135,6 +141,8 @@ struct TaskInfo {
             derived = other.derived;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
+            metadata_refresh_retry_count = other.metadata_refresh_retry_count;
+            suppress_failover = other.suppress_failover;
             device_mask = other.device_mask;
             qp_pool = other.qp_pool;
             request = other.request;
@@ -161,6 +169,8 @@ struct TaskInfo {
             derived = other.derived;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
+            metadata_refresh_retry_count = other.metadata_refresh_retry_count;
+            suppress_failover = other.suppress_failover;
             device_mask = other.device_mask;
             qp_pool = std::move(other.qp_pool);
             request = std::move(other.request);
