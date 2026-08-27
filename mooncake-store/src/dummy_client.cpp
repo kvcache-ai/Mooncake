@@ -607,9 +607,12 @@ std::optional<BufferHandle> DummyClient::allocate_client_buffer(size_t size) {
 
 bool DummyClient::is_dummy_shm_buffer(void *buffer, size_t size) const {
     if (buffer == nullptr || shm_helper_ == nullptr) return false;
-    if (is_device_buffer(buffer)) return false;
     auto shm = shm_helper_->get_shm(buffer);
     if (!shm) return false;
+    // Only query accelerator pointer attributes after the numeric SHM lookup
+    // hits.  This keeps ordinary external host pointers on the cheap path
+    // while preventing CUDA UVA addresses from being mistaken for SHM.
+    if (is_device_buffer(buffer)) return false;
     const uintptr_t base = reinterpret_cast<uintptr_t>(shm->base_addr);
     const uintptr_t address = reinterpret_cast<uintptr_t>(buffer);
     if (address < base || address - base > shm->size) return false;
@@ -637,12 +640,13 @@ std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
     void *buffer, size_t size, bool copy_to_staging, bool copy_back) {
     if (buffer == nullptr && size != 0) return std::nullopt;
     if (size == 0) return PreparedBuffer{buffer, buffer, 0, nullptr, false};
-    if (!is_device_buffer(buffer) && shm_helper_ != nullptr &&
+    const bool device_buffer = is_device_buffer(buffer);
+    if (!device_buffer && shm_helper_ != nullptr &&
         shm_helper_->get_shm(buffer) != nullptr &&
         !is_dummy_shm_buffer(buffer, size)) {
         return std::nullopt;
     }
-    if (is_dummy_shm_buffer(buffer, size)) {
+    if (!device_buffer && is_dummy_shm_buffer(buffer, size)) {
         return PreparedBuffer{buffer, buffer, size, nullptr, false};
     }
     auto remaining = external_buffer_remaining(buffer);
@@ -777,7 +781,8 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
     }
 #endif
     if (shm_helper_ == nullptr) return -1;
-    auto shm = is_device_buffer(buffer) ? nullptr : shm_helper_->get_shm(buffer);
+    auto shm = shm_helper_->get_shm(buffer);
+    if (shm && is_device_buffer(buffer)) shm = nullptr;
     if (!shm) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(buffer);
         if (size > std::numeric_limits<uintptr_t>::max() - base) return -1;
@@ -848,7 +853,8 @@ int DummyClient::unregister_buffer(void* buffer) {
 #endif
 
     if (shm_helper_ == nullptr) return -1;
-    auto shm = is_device_buffer(buffer) ? nullptr : shm_helper_->get_shm(buffer);
+    auto shm = shm_helper_->get_shm(buffer);
+    if (shm && is_device_buffer(buffer)) shm = nullptr;
     if (!shm) {
         std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
         auto it = registered_external_buffers_.find(
