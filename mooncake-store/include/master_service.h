@@ -80,7 +80,6 @@ struct MetadataStoragePlugin;
 // Forward declarations for test classes
 namespace test {
 class MasterServiceTest;
-class MasterServiceGroupTest;
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
 // Friended so the promotion-on-hit tests can drive a serialize/reset/
@@ -149,7 +148,6 @@ class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::MasterServiceTest;
-    friend class test::MasterServiceGroupTest;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
     friend class test::DynamicReplicationTest;
