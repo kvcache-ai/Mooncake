@@ -207,6 +207,7 @@ class DummyClient : public PyClient {
         bool copy_back = false;
     };
 
+    bool is_device_buffer(void *buffer) const;
     bool is_dummy_shm_buffer(void *buffer, size_t size) const;
     std::optional<size_t> external_buffer_remaining(void *buffer) const;
     std::optional<PreparedBuffer> prepare_buffer(void *buffer, size_t size,
