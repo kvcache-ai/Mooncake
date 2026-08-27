@@ -448,15 +448,15 @@ TEST_F(DummyClientGetBufferTest, ExternalHostRegistrationLifecycle) {
         << "same range registration should be reference counted";
     EXPECT_NE(dummy_client_->register_buffer(source.data(), kSize - 1), 0);
     EXPECT_NE(dummy_client_->register_buffer(source.data() + 1, kSize - 1), 0);
-    EXPECT_NE(dummy_client_->register_buffer(
-                  reinterpret_cast<void *>(std::numeric_limits<uintptr_t>::max() - 3),
-                  8),
-              0);
+    EXPECT_NE(
+        dummy_client_->register_buffer(
+            reinterpret_cast<void *>(std::numeric_limits<uintptr_t>::max() - 3),
+            8),
+        0);
 
     const std::string key = "dummy_external_host_lifecycle";
     ASSERT_EQ(dummy_client_->put_from(key, source.data() + 128, 512), 0);
-    ASSERT_EQ(dummy_client_->get_into(key, destination.data() + 256, 512),
-              512);
+    ASSERT_EQ(dummy_client_->get_into(key, destination.data() + 256, 512), 512);
     EXPECT_TRUE(std::equal(source.begin() + 128, source.begin() + 640,
                            destination.begin() + 256));
 
