@@ -11,9 +11,10 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_service.h"
+#include "common/network.h"
+#include "default_config.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
-#include "default_config.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -243,4 +244,3 @@ TEST_F(HealthCheckTest, MetricsEndpointsReturnCorrectData) {
 
 }  // namespace testing
 }  // namespace mooncake
-#include "common/network.h"

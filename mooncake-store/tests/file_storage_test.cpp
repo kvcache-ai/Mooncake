@@ -10,6 +10,7 @@
 
 #include "allocator.h"
 #include "client_metric.h"
+#include "common/network.h"
 #include "file_storage.h"
 #include "storage_backend.h"
 #include "tenant_id.h"
@@ -870,4 +871,3 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
 }
 
 }  // namespace mooncake
-#include "common/network.h"
