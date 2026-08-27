@@ -50,8 +50,8 @@ add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
 # Regression test for the reconnect storm of issue #3299: repeated local
 # completion faults toward one peer RNIC must pause that path instead of
-# re-handshaking it forever. The rail monitor is plain per-worker-pool state,
-# so this runs on every CI runner without an RDMA device.
+# re-handshaking it forever. The rail monitor is plain per-worker-pool state, so
+# this runs on every CI runner without an RDMA device.
 add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
