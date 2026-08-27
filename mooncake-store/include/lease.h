@@ -13,18 +13,16 @@ namespace mooncake {
 
 class Lease {
    public:
-    // Unless the deadline is already over half a TTL out, extend it (max) to
-    // now + ttl. The early-out keeps hot-group reads lock-free.
+    // Extend the deadline (monotonic max) to now + ttl. The read path
+    // advertises the full ttl to clients, so the server must honor now + ttl
+    // rather than keeping an earlier existing deadline (which would let the
+    // server evict before the client-held lease expires).
     void GrantReadLease(std::chrono::milliseconds ttl) {
         const auto ttl_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(ttl).count();
         const int64_t now = NowNs();
-        const int64_t half_ttl_ns = ttl_ns / 2;
-        int64_t cur = deadline_ns_.load(std::memory_order_relaxed);
-        if (cur > now + half_ttl_ns) {
-            return;  // Far enough; no contention.
-        }
         const int64_t new_deadline = now + ttl_ns;
+        int64_t cur = deadline_ns_.load(std::memory_order_relaxed);
         while (cur < new_deadline &&
                !deadline_ns_.compare_exchange_weak(cur, new_deadline,
                                                    std::memory_order_relaxed)) {

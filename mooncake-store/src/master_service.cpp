@@ -2213,6 +2213,11 @@ void MasterService::RebuildGroupState() {
         GroupDomainAccessorRW group_domain(this);
         group_domain->groups.clear();
     }
+    // Pass 1: aggregate the maximum restored lease deadline per group so a
+    // grouped object is not left with a zero-deadline lease, which would make
+    // it look expired and be dropped by post-restore cleanup.
+    std::unordered_map<std::string, std::chrono::system_clock::time_point>
+        max_deadline_by_group;
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
         MetadataShardAccessorRO shard(this, shard_idx);
         for (const auto& [tenant_id, tenant_state] : shard->tenants) {
@@ -2220,14 +2225,33 @@ void MasterService::RebuildGroupState() {
                 if (!metadata.IsGrouped()) {
                     continue;
                 }
-                // lease_ is mutable, so it can be wired through a const ref;
-                // RegisterGroupMember returns the group's shared lease.
+                const auto scoped = tenant_id.MakeScopedKey(metadata.group_id);
+                const auto deadline = metadata.lease_->ExpiresAt();
+                auto [it, inserted] =
+                    max_deadline_by_group.try_emplace(scoped, deadline);
+                if (!inserted) {
+                    it->second = std::max(it->second, deadline);
+                }
+            }
+        }
+    }
+    // Pass 2: rebuild membership and wire the shared lease, preserving the
+    // group's maximum restored deadline.
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+            for (const auto& [key, metadata] : tenant_state.metadata) {
+                if (!metadata.IsGrouped()) {
+                    continue;
+                }
                 auto lease =
                     RegisterGroupMember(tenant_id, key, metadata.group_id);
+                auto it = max_deadline_by_group.find(
+                    tenant_id.MakeScopedKey(metadata.group_id));
+                if (it != max_deadline_by_group.end()) {
+                    lease->ExtendTo(it->second);
+                }
                 metadata.lease_ = lease;
-                // Group lease is recreated empty on restore; clients
-                // re-establish sessions after restart, so it is unprotected
-                // until read again.
             }
         }
     }
