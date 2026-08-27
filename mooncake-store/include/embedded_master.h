@@ -12,9 +12,10 @@
 
 namespace mooncake {
 
-// In-process master used for standalone single-node deployments and tests.
+// In-process master used by tests and by opt-in enable_embedded_master.
 // When enabled, a store client starts this master in the same process so no
-// external mooncake_master is required.
+// external mooncake_master is required. This is not a user-facing deployment
+// mode.
 class EmbeddedMaster {
    public:
     EmbeddedMaster() = default;

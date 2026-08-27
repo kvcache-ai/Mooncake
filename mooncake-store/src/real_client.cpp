@@ -752,14 +752,14 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
-tl::expected<std::string, ErrorCode> RealClient::StartStandaloneMaster(
+tl::expected<std::string, ErrorCode> RealClient::StartEmbeddedMaster(
     const std::string &master_server_addr, bool enable_ssd_offload) {
     if (embedded_master_) {
         return embedded_master_->master_address();
     }
 
     InProcMasterConfig config;
-    // Standalone clients use P2PHANDSHAKE by default; skip the unused HTTP
+    // In-process master uses P2PHANDSHAKE by default; skip the unused HTTP
     // metadata listener unless an explicit port is requested by tests.
     config.http_metadata_port = 0;
     config.enable_offload = enable_ssd_offload;
@@ -771,11 +771,10 @@ tl::expected<std::string, ErrorCode> RealClient::StartStandaloneMaster(
 
     auto master = std::make_unique<EmbeddedMaster>();
     if (!master->Start(config)) {
-        LOG(ERROR) << "Failed to start embedded master for standalone mode";
+        LOG(ERROR) << "Failed to start in-process master";
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    LOG(INFO) << "Standalone mode enabled; embedded master listening at "
-              << master->master_address();
+    LOG(INFO) << "In-process master listening at " << master->master_address();
     embedded_master_ = std::move(master);
     return embedded_master_->master_address();
 }
@@ -790,14 +789,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
-    bool enable_standalone) {
+    bool enable_embedded_master) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
-    if (!enable_standalone &&
-        Environ::GetBool("MOONCAKE_ENABLE_STANDALONE", false)) {
-        LOG(INFO)
-            << "enable_standalone inferred from MOONCAKE_ENABLE_STANDALONE";
-        enable_standalone = true;
+    if (!enable_embedded_master &&
+        Environ::GetBool("MOONCAKE_ENABLE_EMBEDDED_MASTER", false)) {
+        LOG(INFO) << "enable_embedded_master inferred from "
+                     "MOONCAKE_ENABLE_EMBEDDED_MASTER";
+        enable_embedded_master = true;
     }
     const bool should_use_hugepage =
         use_hugepage_ && this->protocol != "ubshmem";
@@ -832,9 +831,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     std::string resolved_master_server_addr = master_server_addr;
     std::string resolved_metadata_server = metadata_server;
-    if (enable_standalone) {
+    if (enable_embedded_master) {
         auto started =
-            StartStandaloneMaster(master_server_addr, enable_ssd_offload);
+            StartEmbeddedMaster(master_server_addr, enable_ssd_offload);
         if (!started) {
             return tl::unexpected(started.error());
         }
@@ -1299,11 +1298,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string local_hostname = get_config(config, CONFIG_KEY_LOCAL_HOSTNAME);
     std::string metadata_server =
         get_config(config, CONFIG_KEY_METADATA_SERVER);
-    bool enable_standalone =
-        get_config_bool(config, CONFIG_KEY_ENABLE_STANDALONE, false);
-    if (!enable_standalone) {
-        enable_standalone =
-            Environ::GetBool("MOONCAKE_ENABLE_STANDALONE", false);
+    bool enable_embedded_master =
+        get_config_bool(config, CONFIG_KEY_ENABLE_EMBEDDED_MASTER, false);
+    if (!enable_embedded_master) {
+        enable_embedded_master =
+            Environ::GetBool("MOONCAKE_ENABLE_EMBEDDED_MASTER", false);
     }
 
     // Validate required parameters
@@ -1312,7 +1311,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (metadata_server.empty()) {
-        if (enable_standalone) {
+        if (enable_embedded_master) {
             metadata_server = "P2PHANDSHAKE";
         } else {
             LOG(ERROR) << "Missing required config: "
@@ -1339,7 +1338,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
     std::string master_server_addr = get_config(
         config, CONFIG_KEY_MASTER_SERVER_ADDR,
-        enable_standalone ? std::string() : DEFAULT_MASTER_SERVER_ADDR);
+        enable_embedded_master ? std::string() : DEFAULT_MASTER_SERVER_ADDR);
     std::string ipc_socket_path =
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
@@ -1388,7 +1387,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
         50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
-        enable_client_http_server, client_http_port, enable_standalone);
+        enable_client_http_server, client_http_port, enable_embedded_master);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(

@@ -588,7 +588,7 @@ class RealClient : public PyClient {
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-        bool enable_standalone = false);
+        bool enable_embedded_master = false);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -1065,7 +1065,7 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
-    tl::expected<std::string, ErrorCode> StartStandaloneMaster(
+    tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         const std::string &master_server_addr, bool enable_ssd_offload);
 
     std::unique_ptr<class EmbeddedMaster> embedded_master_;

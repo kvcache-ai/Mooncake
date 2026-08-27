@@ -26,7 +26,7 @@ class StandaloneClientTest : public ::testing::Test {
     }
 
     void TearDown() override {
-        unsetenv("MOONCAKE_ENABLE_STANDALONE");
+        unsetenv("MOONCAKE_ENABLE_EMBEDDED_MASTER");
         if (client_) {
             client_->tearDownAll();
             client_.reset();
@@ -55,7 +55,7 @@ TEST_F(StandaloneClientTest, PutGetWithoutExternalMaster) {
         /*tenant_id=*/"default",
         /*enable_client_http_server=*/false,
         /*client_http_port=*/DEFAULT_CLIENT_HTTP_PORT,
-        /*enable_standalone=*/true);
+        /*enable_embedded_master=*/true);
     ASSERT_TRUE(setup.has_value())
         << "Standalone setup should succeed without mooncake_master";
 
@@ -82,12 +82,12 @@ TEST_F(StandaloneClientTest, ConfigDictOmitsMasterAddress) {
     config[CONFIG_KEY_LOCAL_BUFFER_SIZE] = "16MB";
     config[CONFIG_KEY_PROTOCOL] = FLAGS_protocol;
     config[CONFIG_KEY_RDMA_DEVICES] = rdma_devices();
-    config[CONFIG_KEY_ENABLE_STANDALONE] = "true";
+    config[CONFIG_KEY_ENABLE_EMBEDDED_MASTER] = "true";
 
     auto result = client_->setup_internal(config);
     ASSERT_TRUE(result.has_value())
         << "setup_internal should start an embedded master when "
-           "enable_standalone=true";
+           "enable_embedded_master=true";
 
     const std::string key = "standalone_dict_key";
     const std::string test_data = "config-dict-standalone";
@@ -101,7 +101,7 @@ TEST_F(StandaloneClientTest, ConfigDictOmitsMasterAddress) {
 }
 
 TEST_F(StandaloneClientTest, RejectsEmptyMetadataWithoutStandalone) {
-    unsetenv("MOONCAKE_ENABLE_STANDALONE");
+    unsetenv("MOONCAKE_ENABLE_EMBEDDED_MASTER");
     ConfigDict config;
     config[CONFIG_KEY_LOCAL_HOSTNAME] = "localhost";
     config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = "16MB";
@@ -113,14 +113,14 @@ TEST_F(StandaloneClientTest, RejectsEmptyMetadataWithoutStandalone) {
 }
 
 TEST_F(StandaloneClientTest, EnvVarEnablesStandaloneWithoutKwarg) {
-    ASSERT_EQ(setenv("MOONCAKE_ENABLE_STANDALONE", "true", 1), 0);
+    ASSERT_EQ(setenv("MOONCAKE_ENABLE_EMBEDDED_MASTER", "true", 1), 0);
     ASSERT_EQ(
         client_->setup_real("localhost", "P2PHANDSHAKE", 16 * 1024 * 1024,
                             16 * 1024 * 1024, FLAGS_protocol, rdma_devices(),
                             /*master_server_addr=*/"127.0.0.1:50051"),
         0)
-        << "MOONCAKE_ENABLE_STANDALONE should embed master for HiCache-style "
-           "setup() calls that omit enable_standalone";
+        << "MOONCAKE_ENABLE_EMBEDDED_MASTER should embed master for "
+           "setup() calls that omit enable_embedded_master";
 
     const std::string key = "standalone_env_key";
     const std::string test_data = "hello-env-standalone";
@@ -131,7 +131,7 @@ TEST_F(StandaloneClientTest, EnvVarEnablesStandaloneWithoutKwarg) {
     EXPECT_EQ(std::string(static_cast<const char*>(buffer_handle->ptr()),
                           buffer_handle->size()),
               test_data);
-    unsetenv("MOONCAKE_ENABLE_STANDALONE");
+    unsetenv("MOONCAKE_ENABLE_EMBEDDED_MASTER");
 }
 
 }  // namespace testing

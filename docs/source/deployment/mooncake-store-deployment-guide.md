@@ -133,49 +133,6 @@ Limitation: the master is a single point of failure. If it crashes, cluster oper
 
 ---
 
-(standalone-no-external-master)=
-### Standalone (no external master) — Single Process {#standalone-no-external-master}
-
-For a single-machine evaluation or embedding Mooncake Store in one process, enable **standalone mode**. The store client starts an in-process master, so you do **not** run `mooncake_master`. Transfer Engine metadata defaults to `P2PHANDSHAKE`.
-
-Python:
-
-```python
-from mooncake.store import MooncakeDistributedStore
-
-store = MooncakeDistributedStore()
-store.setup(
-    local_hostname="localhost",
-    metadata_server="P2PHANDSHAKE",
-    global_segment_size=512 * 1024 * 1024,
-    local_buffer_size=128 * 1024 * 1024,
-    protocol="tcp",
-    rdma_devices="",
-    master_server_addr="",
-    enable_standalone=True,
-)
-store.put("hello_key", b"Hello, standalone Mooncake Store!")
-print(store.get("hello_key").decode())
-store.close()
-```
-
-Or with a config dict / env (`MOONCAKE_ENABLE_STANDALONE=true` is read by the C++ client during `setup()`, so existing callers do not need a new kwarg):
-
-```python
-store.setup({
-    "local_hostname": "localhost",
-    "metadata_server": "P2PHANDSHAKE",
-    "global_segment_size": "512MB",
-    "local_buffer_size": "128MB",
-    "protocol": "tcp",
-    "enable_standalone": True,
-})
-```
-
-Standalone mode is for a single process that both owns memory and serves KV operations. It is not a substitute for HA or multi-node clusters — those still need an external `mooncake_master`.
-
----
-
 ### High-Availability (etcd) — Production HA
 
 Runs a cluster of master instances coordinated through etcd. If the leader fails, the remaining instances elect a new leader automatically.

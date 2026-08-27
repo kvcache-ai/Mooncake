@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""E2E tests for standalone Mooncake Store (no external mooncake_master).
+"""E2E tests for in-process Mooncake Store master (no external mooncake_master).
 
-These tests start an in-process embedded master via enable_standalone /
-MOONCAKE_ENABLE_STANDALONE. They must not launch the mooncake_master binary.
+These tests start EmbeddedMaster via enable_embedded_master /
+MOONCAKE_ENABLE_EMBEDDED_MASTER. They must not launch the mooncake_master binary.
+This is test plumbing, not a user-facing deployment mode.
 """
 
 from __future__ import annotations
@@ -44,10 +45,10 @@ def _device_name() -> str:
     return os.getenv("DEVICE_NAME", "")
 
 
-def setup_standalone(
+def setup_embedded_master(
     store: MooncakeDistributedStore,
     *,
-    enable_standalone: bool = True,
+    enable_embedded_master: bool = True,
     master_server_addr: str = "",
     metadata_server: str = "P2PHANDSHAKE",
     local_hostname: str = "localhost",
@@ -60,7 +61,7 @@ def setup_standalone(
         _protocol(),
         _device_name(),
         master_server_addr,
-        enable_standalone=enable_standalone,
+        enable_embedded_master=enable_embedded_master,
     )
 
 
@@ -72,9 +73,9 @@ class TestStandaloneStoreE2E(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.store = MooncakeDistributedStore()
-        ret = setup_standalone(cls.store)
+        ret = setup_embedded_master(cls.store)
         if ret != 0:
-            raise RuntimeError(f"standalone setup failed with return code {ret}")
+            raise RuntimeError(f"embedded-master setup failed with return code {ret}")
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -219,7 +220,7 @@ class TestStandaloneConfigDictE2E(unittest.TestCase):
                 "local_buffer_size": "32MB",
                 "protocol": _protocol(),
                 "rdma_devices": _device_name(),
-                "enable_standalone": True,
+                "enable_embedded_master": True,
             }
         )
         self.assertEqual(ret, 0)
@@ -232,13 +233,13 @@ class TestStandaloneConfigDictE2E(unittest.TestCase):
 
 class TestStandaloneEnvVarE2E(unittest.TestCase):
     def tearDown(self) -> None:
-        os.environ.pop("MOONCAKE_ENABLE_STANDALONE", None)
+        os.environ.pop("MOONCAKE_ENABLE_EMBEDDED_MASTER", None)
 
     def test_env_var_enables_standalone_without_kwarg(self) -> None:
-        os.environ["MOONCAKE_ENABLE_STANDALONE"] = "true"
+        os.environ["MOONCAKE_ENABLE_EMBEDDED_MASTER"] = "true"
         store = MooncakeDistributedStore()
         self.addCleanup(store.close)
-        # Omit enable_standalone so HiCache-style setup() still embeds master.
+        # Omit enable_embedded_master so env-only setup still embeds master.
         ret = store.setup(
             "localhost",
             "P2PHANDSHAKE",
@@ -256,7 +257,7 @@ class TestStandaloneEnvVarE2E(unittest.TestCase):
         self.assertEqual(_master_pids(), [])
 
     def test_rejects_empty_metadata_without_standalone(self) -> None:
-        os.environ.pop("MOONCAKE_ENABLE_STANDALONE", None)
+        os.environ.pop("MOONCAKE_ENABLE_EMBEDDED_MASTER", None)
         store = MooncakeDistributedStore()
         self.addCleanup(store.close)
         ret = store.setup(

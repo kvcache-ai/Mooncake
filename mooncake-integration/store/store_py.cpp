@@ -2212,7 +2212,7 @@ PYBIND11_MODULE(store, m) {
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-               bool enable_standalone = false) {
+               bool enable_embedded_master = false) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2226,7 +2226,7 @@ PYBIND11_MODULE(store, m) {
                     master_server_addr, transfer_engine, "", 50052,
                     enable_ssd_offload, true, ssd_offload_path, tenant_id,
                     enable_client_http_server, client_http_port,
-                    enable_standalone);
+                    enable_embedded_master);
                 return result.has_value() ? 0
                                           : static_cast<int>(result.error());
             },
@@ -2238,7 +2238,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
             py::arg("enable_client_http_server") = false,
             py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
-            py::arg("enable_standalone") = false)
+            py::arg("enable_embedded_master") = false)
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2274,8 +2274,9 @@ PYBIND11_MODULE(store, m) {
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
             "  client_http_port: Client HTTP metrics port (default 9300).\n"
-            "  enable_standalone: Start an in-process master so no external "
-            "mooncake_master is required (default false).")
+            "  enable_embedded_master: Start an in-process master so no "
+            "external mooncake_master is required (default false). This is "
+            "test/eval plumbing, not a documented deployment mode.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,

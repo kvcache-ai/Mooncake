@@ -96,7 +96,7 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
-    - name: Run standalone Mooncake Store e2e tests (no master)
+    - name: Run in-process master e2e tests (no mooncake_master)
       run: |
         source test_env/bin/activate
         bash scripts/run_standalone_store_e2e.sh
