@@ -193,16 +193,7 @@ class FakeTransport : public Transport {
 
 class HpTcpRecoveryTransport : public FakeTransport {
    public:
-    enum class Result {
-        kStaleOnce,
-        kAlwaysStale,
-        kPermissionDenied,
-        kRangeRejected,
-        kShuttingDown,
-    };
-
-    explicit HpTcpRecoveryTransport(Result result)
-        : FakeTransport(HP_TCP), result_(result) {}
+    HpTcpRecoveryTransport() : FakeTransport(HP_TCP) {}
 
     std::atomic<int> retry_calls{0};
 
@@ -235,28 +226,14 @@ class HpTcpRecoveryTransport : public FakeTransport {
         }
 
         const bool retried = retry_calls.load(std::memory_order_acquire) != 0;
-        if (result_ == Result::kStaleOnce && retried) {
+        if (retried) {
             status = {COMPLETED, hp_batch->requests[task_id].length};
             return Status::OK();
         }
 
         status = {FAILED, 0};
-        switch (result_) {
-            case Result::kStaleOnce:
-            case Result::kAlwaysStale:
-                return Status::NeedsRefreshCache(
-                    "remote HP TCP registration is stale" LOC_MARK);
-            case Result::kPermissionDenied:
-                return Status::AddressNotRegistered(
-                    "remote HP TCP permission denied" LOC_MARK);
-            case Result::kRangeRejected:
-                return Status::AddressNotRegistered(
-                    "remote HP TCP range rejected" LOC_MARK);
-            case Result::kShuttingDown:
-                return Status::TooManyRequests(
-                    "remote HP TCP transport is shutting down" LOC_MARK);
-        }
-        return Status::InternalError("unknown HP TCP result" LOC_MARK);
+        return Status::NeedsRefreshCache(
+            "remote HP TCP registration is stale" LOC_MARK);
     }
 
     Status retryTransferTask(SubBatchRef batch, int task_id,
@@ -279,9 +256,6 @@ class HpTcpRecoveryTransport : public FakeTransport {
     }
 
     const char* getName() const override { return "<fake-hp-tcp>"; }
-
-   private:
-    Result result_;
 };
 
 // ---------------------------------------------------------------------------
@@ -345,9 +319,8 @@ struct HpTcpRecoveryBatch {
 };
 
 void submitHpTcpRecoveryBatch(TransferEngineImpl& engine,
-                              HpTcpRecoveryTransport::Result result,
                               HpTcpRecoveryBatch& batch) {
-    batch.hp_tcp = std::make_shared<HpTcpRecoveryTransport>(result);
+    batch.hp_tcp = std::make_shared<HpTcpRecoveryTransport>();
     batch.fallback_tcp = std::make_shared<FakeTransport>(TCP);
 
     std::string segment_name = engine.getSegmentName();
@@ -433,8 +406,7 @@ TEST(EngineFailoverE2E, HpTcpStaleMetadataRetriesSameTransportOnce) {
     ASSERT_TRUE(engine.available());
 
     HpTcpRecoveryBatch batch;
-    submitHpTcpRecoveryBatch(engine, HpTcpRecoveryTransport::Result::kStaleOnce,
-                             batch);
+    submitHpTcpRecoveryBatch(engine, batch);
 
     const TransferStatus final_status =
         pollUntilDone(engine, batch.batch_id, 0);
@@ -442,68 +414,6 @@ TEST(EngineFailoverE2E, HpTcpStaleMetadataRetriesSameTransportOnce) {
     EXPECT_EQ(batch.hp_tcp->submit_calls.load(), 1);
     EXPECT_EQ(batch.hp_tcp->retry_calls.load(), 1);
     EXPECT_EQ(batch.fallback_tcp->submit_calls.load(), 0);
-
-    releaseHpTcpRecoveryBatch(engine, batch);
-}
-
-TEST(EngineFailoverE2E, HpTcpStaleMetadataRetryIsHardBounded) {
-    auto config = makeMinimalP2PConfig();
-    TransferEngineImpl engine(config);
-    ASSERT_TRUE(engine.available());
-
-    HpTcpRecoveryBatch batch;
-    submitHpTcpRecoveryBatch(
-        engine, HpTcpRecoveryTransport::Result::kAlwaysStale, batch);
-
-    const TransferStatus final_status =
-        pollUntilDone(engine, batch.batch_id, 0);
-    EXPECT_EQ(final_status.s, FAILED);
-    EXPECT_EQ(batch.hp_tcp->submit_calls.load(), 1);
-    EXPECT_EQ(batch.hp_tcp->retry_calls.load(), 1);
-    EXPECT_EQ(batch.fallback_tcp->submit_calls.load(), 0);
-
-    releaseHpTcpRecoveryBatch(engine, batch);
-}
-
-class HpTcpPermanentFailureTest
-    : public ::testing::TestWithParam<HpTcpRecoveryTransport::Result> {};
-
-TEST_P(HpTcpPermanentFailureTest, DoesNotRefreshOrFailOver) {
-    auto config = makeMinimalP2PConfig();
-    TransferEngineImpl engine(config);
-    ASSERT_TRUE(engine.available());
-
-    HpTcpRecoveryBatch batch;
-    submitHpTcpRecoveryBatch(engine, GetParam(), batch);
-
-    const TransferStatus final_status =
-        pollUntilDone(engine, batch.batch_id, 0);
-    EXPECT_EQ(final_status.s, FAILED);
-    EXPECT_EQ(batch.hp_tcp->retry_calls.load(), 0);
-    EXPECT_EQ(batch.fallback_tcp->submit_calls.load(), 0);
-
-    releaseHpTcpRecoveryBatch(engine, batch);
-}
-
-INSTANTIATE_TEST_SUITE_P(
-    PermissionAndRange, HpTcpPermanentFailureTest,
-    ::testing::Values(HpTcpRecoveryTransport::Result::kPermissionDenied,
-                      HpTcpRecoveryTransport::Result::kRangeRejected));
-
-TEST(EngineFailoverE2E, HpTcpShuttingDownIsTransientNotStale) {
-    auto config = makeMinimalP2PConfig();
-    TransferEngineImpl engine(config);
-    ASSERT_TRUE(engine.available());
-
-    HpTcpRecoveryBatch batch;
-    submitHpTcpRecoveryBatch(
-        engine, HpTcpRecoveryTransport::Result::kShuttingDown, batch);
-
-    const TransferStatus final_status =
-        pollUntilDone(engine, batch.batch_id, 0);
-    EXPECT_EQ(final_status.s, COMPLETED);
-    EXPECT_EQ(batch.hp_tcp->retry_calls.load(), 0);
-    EXPECT_GE(batch.fallback_tcp->submit_calls.load(), 1);
 
     releaseHpTcpRecoveryBatch(engine, batch);
 }

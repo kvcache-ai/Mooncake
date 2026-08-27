@@ -105,8 +105,7 @@ HighPerformanceTcpTransport::~HighPerformanceTcpTransport() {
 }
 
 Status HighPerformanceTcpTransport::validateParams() const {
-    if (params_.worker_count == 0 || params_.queue_capacity_per_worker == 0 ||
-        params_.connections_per_peer == 0 ||
+    if (params_.worker_count == 0 || params_.connections_per_peer == 0 ||
         params_.max_outstanding_tasks == 0 ||
         params_.max_outstanding_bytes == 0 || params_.max_transfer_bytes == 0 ||
         params_.chunk_size == 0 ||
@@ -189,8 +188,7 @@ Status HighPerformanceTcpTransport::install(
     admission_ = std::make_unique<HighPerformanceTcpAdmissionController>(
         params_.max_outstanding_tasks, params_.max_outstanding_bytes);
     workers_ = std::make_unique<HighPerformanceTcpWorkers>(
-        HighPerformanceTcpWorkers::Config{params_.worker_count,
-                                          params_.queue_capacity_per_worker});
+        HighPerformanceTcpWorkers::Config{params_.worker_count});
 
     Status status = workers_->start();
     if (!status.ok()) {
@@ -427,7 +425,6 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
 
     HighPerformanceTcpEndpointAttr endpoint_attr;
     HighPerformanceTcpBufferAttr buffer_attr;
-    std::string peer_name;
     SegmentDescRef pin;
     Status resolved = metadata_->segmentManager().withCachedSegment(
         request.target_id, pin, [&](SegmentDesc* segment) -> Status {
@@ -460,7 +457,6 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
             if (!decoded.ok()) {
                 return NeedsRefresh("HP TCP buffer metadata is incompatible");
             }
-            peer_name = segment->name;
             return Status::OK();
         });
     if (!resolved.ok()) return resolved;
@@ -494,7 +490,6 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
 
     HighPerformanceTcpClient::Operation operation;
     operation.peer_id = request.target_id;
-    operation.peer_name = std::move(peer_name);
     operation.incarnation = endpoint_attr.incarnation;
     operation.host = endpoint_attr.endpoints[0].host;
     operation.port = endpoint_attr.endpoints[0].port;
@@ -579,7 +574,7 @@ Status HighPerformanceTcpTransport::submitTransferTasks(
 
     // SubBatch capacity was reserved at allocateSubBatch(). The callback below
     // therefore performs only noexcept shared_ptr moves and reservation flag
-    // stores while mailbox locks are held.
+    // stores while dispatch ownership is being committed.
     const size_t old_size = hp_batch->tasks.size();
     Status committed = workers_->tryCommitBatch(
         commands, admission_.get(), requests.size(), total_bytes, [&] {
@@ -662,7 +657,7 @@ Status HighPerformanceTcpTransport::cancelTransferTask(SubBatchRef batch,
     if (client_ == nullptr || workers_ == nullptr) return Status::OK();
     const Status canceled =
         client_->cancelRequest(task->ownerWorker(), task->requestId());
-    // A request still in the bounded worker mailbox has no client lane yet;
+    // A request still in the worker dispatch queue has no client lane yet;
     // its command observes cancelRequested() and settles it. Treat inability
     // to find/post a lane cancellation during shutdown as best effort.
     if (canceled.IsInternalError() &&

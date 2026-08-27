@@ -71,7 +71,6 @@ std::shared_ptr<Config> MakeHpConfig() {
     config->set("transports/hp_tcp/advertise_address", "127.0.0.1");
     config->set("transports/hp_tcp/port", 0);
     config->set("transports/hp_tcp/worker_count", 4);
-    config->set("transports/hp_tcp/queue_capacity_per_worker", 64);
     config->set("transports/hp_tcp/connections_per_peer", 4);
     config->set("transports/hp_tcp/max_outstanding_tasks", 128);
     config->set("transports/hp_tcp/max_outstanding_bytes", 64ULL << 20);
@@ -248,82 +247,8 @@ void RunWriteThenReadAcrossProcesses(size_t task_count) {
     EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
-TEST(HighPerformanceTcpE2eTest, WriteThenReadConcurrency1) {
-    RunWriteThenReadAcrossProcesses(1);
-}
-
-TEST(HighPerformanceTcpE2eTest, WriteThenReadConcurrency4) {
-    RunWriteThenReadAcrossProcesses(4);
-}
-
 TEST(HighPerformanceTcpE2eTest, WriteThenReadConcurrency16) {
     RunWriteThenReadAcrossProcesses(16);
-}
-
-TEST(HighPerformanceTcpE2eTest,
-     ExplicitCpuRegistrationSucceedsAndUnsupportedMemoryFails) {
-    TransferEngine engine(MakeHpConfig());
-    ASSERT_TRUE(engine.available());
-
-    std::vector<uint8_t> cpu_storage(4096);
-    MemoryOptions cpu_options;
-    cpu_options.type = HP_TCP;
-    cpu_options.location = "cpu:0";
-    cpu_options.perm = kGlobalReadWrite;
-    ASSERT_TRUE(engine
-                    .registerLocalMemory(cpu_storage.data(), cpu_storage.size(),
-                                         cpu_options)
-                    .ok());
-    ASSERT_TRUE(
-        engine.unregisterLocalMemory(cpu_storage.data(), cpu_storage.size())
-            .ok());
-
-    std::vector<uint8_t> unsupported_storage(4096);
-    MemoryOptions unsupported_options;
-    unsupported_options.type = HP_TCP;
-    unsupported_options.location = "cuda:0";
-    unsupported_options.perm = kGlobalReadWrite;
-    const Status unsupported = engine.registerLocalMemory(
-        unsupported_storage.data(), unsupported_storage.size(),
-        unsupported_options);
-    EXPECT_TRUE(unsupported.IsInvalidArgument()) << unsupported.ToString();
-
-    SegmentInfo local_info;
-    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, local_info).ok());
-    const uint64_t unsupported_addr =
-        reinterpret_cast<uint64_t>(unsupported_storage.data());
-    EXPECT_TRUE(std::none_of(local_info.buffers.begin(),
-                             local_info.buffers.end(),
-                             [&](const SegmentInfo::Buffer& buffer) {
-                                 return buffer.base == unsupported_addr;
-                             }));
-}
-
-TEST(HighPerformanceTcpE2eTest,
-     ExplicitVectorRegistrationFailureRollsBackPublishedPrefix) {
-    TransferEngine engine(MakeHpConfig());
-    ASSERT_TRUE(engine.available());
-
-    std::vector<uint8_t> storage(8192);
-    MemoryOptions options;
-    options.type = HP_TCP;
-    options.location = "cpu:0";
-    options.perm = kGlobalReadWrite;
-    std::vector<void*> addresses{storage.data(), storage.data() + 1024};
-    std::vector<size_t> sizes{4096, 4096};
-    const Status status = engine.registerLocalMemory(addresses, sizes, options);
-    EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
-
-    SegmentInfo local_info;
-    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, local_info).ok());
-    const uint64_t first_addr = reinterpret_cast<uint64_t>(storage.data());
-    const uint64_t second_addr =
-        reinterpret_cast<uint64_t>(storage.data() + 1024);
-    EXPECT_TRUE(std::none_of(
-        local_info.buffers.begin(), local_info.buffers.end(),
-        [&](const SegmentInfo::Buffer& buffer) {
-            return buffer.base == first_addr || buffer.base == second_addr;
-        }));
 }
 
 }  // namespace

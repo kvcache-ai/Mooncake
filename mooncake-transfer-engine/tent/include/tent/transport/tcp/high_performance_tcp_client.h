@@ -38,7 +38,6 @@ class HighPerformanceTcpClient {
 
     struct Operation {
         SegmentID peer_id{0};
-        std::string peer_name;
         std::string incarnation;
         std::string host;
         uint16_t port{0};
@@ -61,8 +60,8 @@ class HighPerformanceTcpClient {
     HighPerformanceTcpClient& operator=(const HighPerformanceTcpClient&) =
         delete;
 
-    // Must execute on owner_worker. The transport reaches this method only via
-    // the owner's bounded mailbox.
+    // Must execute on owner_worker. The transport reaches this method through
+    // the owner's ASIO event queue after global admission succeeds.
     void enqueueOnOwner(size_t owner_worker, Operation operation);
 
     // Non-worker quiesce barrier. Cancels every queued/connecting/in-flight
@@ -70,8 +69,8 @@ class HighPerformanceTcpClient {
     Status cancelAll(TransferStatusEnum terminal = CANCELED);
 
     // Best-effort cancellation for one logical request. If the request is
-    // still in the transport mailbox, the adapter's cancel flag settles it;
-    // if it already reached a lane, this posts cancellation to that owner.
+    // still in the transport dispatch queue, the adapter's cancel flag settles
+    // it; if it already reached a lane, this posts cancellation to that owner.
     Status cancelRequest(size_t owner_worker, uint64_t request_id);
 
     uint64_t connectionsCreatedForTest() const {
@@ -87,7 +86,6 @@ class HighPerformanceTcpClient {
    private:
     struct LaneKey {
         SegmentID peer_id{0};
-        std::string peer_name;
         std::string incarnation;
         std::string host;
         uint16_t port{0};

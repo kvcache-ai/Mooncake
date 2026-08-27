@@ -218,56 +218,29 @@ Status DecodeHighPerformanceTcpEndpointAttr(
     if (attr == nullptr) return InvalidAttr("null endpoint output");
     try {
         const json object = json::parse(encoded);
-        if (!object.is_object()) return InvalidAttr("endpoint must be object");
-        auto protocol = object.find("protocol");
-        auto version = object.find("version");
-        auto incarnation = object.find("incarnation");
-        auto endpoints = object.find("endpoints");
-        if (protocol == object.end() || !protocol->is_string() ||
-            protocol->get<std::string>() != "tent_hp_tcp") {
-            return InvalidAttr("endpoint protocol");
+        if (!object.is_object() ||
+            object.value("protocol", "") != "tent_hp_tcp" ||
+            object.value("version", 0) != kHighPerformanceTcpVersion) {
+            return InvalidAttr("endpoint protocol/version");
         }
-        if (version == object.end() || !version->is_number_integer() ||
-            version->get<int64_t>() != kHighPerformanceTcpVersion) {
-            return InvalidAttr("endpoint version");
-        }
-        if (incarnation == object.end() || !incarnation->is_string() ||
-            !IsHex128(incarnation->get<std::string>())) {
-            return InvalidAttr("endpoint incarnation");
-        }
-        if (endpoints == object.end() || !endpoints->is_array() ||
-            endpoints->size() != 1 || !(*endpoints)[0].is_object()) {
-            return InvalidAttr("v1 requires exactly one endpoint");
-        }
-
+        const std::string incarnation = object.value("incarnation", "");
+        const auto endpoints = object.find("endpoints");
+        if (!IsHex128(incarnation) || endpoints == object.end() ||
+            !endpoints->is_array() || endpoints->size() != 1 ||
+            !(*endpoints)[0].is_object())
+            return InvalidAttr("endpoint identity/list");
         const json& endpoint = (*endpoints)[0];
-        auto host = endpoint.find("host");
-        auto port = endpoint.find("port");
-        if (host == endpoint.end() || !host->is_string() ||
-            host->get<std::string>().empty() || port == endpoint.end() ||
-            (!port->is_number_unsigned() && !port->is_number_integer())) {
-            return InvalidAttr("endpoint host/port");
-        }
-        if (port->is_number_integer() && port->get<int64_t>() <= 0) {
-            return InvalidAttr("endpoint port");
-        }
-        const uint64_t port_value = port->get<uint64_t>();
-        if (port_value == 0 || port_value > 65535) {
-            return InvalidAttr("endpoint port");
-        }
-
+        const std::string host = endpoint.value("host", "");
+        uint64_t port = 0;
         uint64_t max_transfer_bytes = 0;
-        if (!ReadPositiveUint64(object, "max_transfer_bytes",
-                                &max_transfer_bytes)) {
-            return InvalidAttr("endpoint max_transfer_bytes");
-        }
-
-        HighPerformanceTcpEndpointAttr parsed;
-        parsed.incarnation = incarnation->get<std::string>();
-        parsed.endpoints.push_back(
-            {host->get<std::string>(), static_cast<uint16_t>(port_value)});
-        parsed.max_transfer_bytes = max_transfer_bytes;
-        *attr = std::move(parsed);
+        if (host.empty() || !ReadPositiveUint64(endpoint, "port", &port) ||
+            port > 65535 ||
+            !ReadPositiveUint64(object, "max_transfer_bytes",
+                                &max_transfer_bytes))
+            return InvalidAttr("endpoint address/limit");
+        *attr = {incarnation,
+                 {{host, static_cast<uint16_t>(port)}},
+                 max_transfer_bytes};
         return Status::OK();
     } catch (const std::exception& error) {
         return Status::MalformedJson(
@@ -296,37 +269,17 @@ Status DecodeHighPerformanceTcpBufferAttr(const std::string& encoded,
     if (attr == nullptr) return InvalidAttr("null buffer output");
     try {
         const json object = json::parse(encoded);
-        if (!object.is_object()) return InvalidAttr("buffer must be object");
-        auto protocol = object.find("protocol");
-        auto version = object.find("version");
-        auto registration = object.find("registration_id");
-        auto permission = object.find("permission");
-        if (protocol == object.end() || !protocol->is_string() ||
-            protocol->get<std::string>() != "tent_hp_tcp") {
-            return InvalidAttr("buffer protocol");
-        }
-        if (version == object.end() || !version->is_number_integer() ||
-            version->get<int64_t>() != kHighPerformanceTcpVersion) {
-            return InvalidAttr("buffer version");
-        }
-        if (registration == object.end() ||
-            (!registration->is_number_unsigned() &&
-             !registration->is_number_integer()) ||
-            (registration->is_number_integer() &&
-             registration->get<int64_t>() <= 0)) {
-            return InvalidAttr("buffer registration_id");
-        }
-        const uint64_t registration_id = registration->get<uint64_t>();
-        if (registration_id == 0 || permission == object.end() ||
-            !permission->is_string()) {
+        if (!object.is_object() ||
+            object.value("protocol", "") != "tent_hp_tcp" ||
+            object.value("version", 0) != kHighPerformanceTcpVersion)
+            return InvalidAttr("buffer protocol/version");
+        uint64_t registration = 0;
+        const std::string permission = object.value("permission", "");
+        if (!ReadPositiveUint64(object, "registration_id", &registration) ||
+            (permission != "global_read_only" &&
+             permission != "global_read_write"))
             return InvalidAttr("buffer registration/permission");
-        }
-        const std::string permission_value = permission->get<std::string>();
-        if (permission_value != "global_read_only" &&
-            permission_value != "global_read_write") {
-            return InvalidAttr("buffer permission");
-        }
-        *attr = {registration_id, permission_value};
+        *attr = {registration, permission};
         return Status::OK();
     } catch (const std::exception& error) {
         return Status::MalformedJson(

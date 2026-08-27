@@ -186,11 +186,6 @@ Status HighPerformanceTcpBufferRegistry::reopen() {
     return Status::OK();
 }
 
-bool HighPerformanceTcpBufferRegistry::closing() const {
-    std::lock_guard<std::mutex> lock(registry_mutex_);
-    return closing_;
-}
-
 Status HighPerformanceTcpBufferRegistry::acquireLocalLease(uint64_t addr,
                                                            uint64_t length,
                                                            Lease* lease) {
@@ -270,11 +265,6 @@ bool HighPerformanceTcpBufferRegistry::tracks(uint64_t base,
     std::lock_guard<std::mutex> lock(registry_mutex_);
     const auto it = entries_.find(base);
     return it != entries_.end() && it->second->length == length;
-}
-
-size_t HighPerformanceTcpBufferRegistry::size() const {
-    std::lock_guard<std::mutex> lock(registry_mutex_);
-    return entries_.size();
 }
 
 }  // namespace mooncake::tent

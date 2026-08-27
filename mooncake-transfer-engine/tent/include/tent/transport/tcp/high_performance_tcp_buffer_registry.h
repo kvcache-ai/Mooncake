@@ -66,7 +66,6 @@ class HighPerformanceTcpBufferRegistry {
     // remain valid and drain through normal unregister/session completion.
     void close();
     Status reopen();
-    bool closing() const;
 
     // Local access checks lifetime/range only. MemoryOptions::perm is a remote
     // authorization policy and must not reject the local side of a transfer.
@@ -78,7 +77,6 @@ class HighPerformanceTcpBufferRegistry {
                               AcquireFailure* failure = nullptr);
 
     bool tracks(uint64_t base, uint64_t length) const;
-    size_t size() const;
 
    private:
     Status acquire(uint64_t addr, uint64_t length, uint64_t registration_id,

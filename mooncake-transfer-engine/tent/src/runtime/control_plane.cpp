@@ -16,8 +16,6 @@
 #include "tent/runtime/transfer_engine_impl.h"
 
 #include <cassert>
-#include <cstddef>
-#include <cstring>
 #include <set>
 #include <utility>
 
@@ -231,12 +229,8 @@ void ControlClient::unpinStageBufferAsync(const std::string& server_addr,
 
 ControlService::ControlService(const std::string& type,
                                const std::string& servers,
-                               TransferEngineImpl* impl,
-                               bool enable_bulk_data_rpc)
-    : bootstrap_callback_(nullptr),
-      notify_callback_(nullptr),
-      impl_(impl),
-      enable_bulk_data_rpc_(enable_bulk_data_rpc) {
+                               TransferEngineImpl* impl)
+    : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
@@ -418,11 +412,6 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
 
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
-    if (!enable_bulk_data_rpc_) {
-        response =
-            "SendData disabled: high-performance TCP data plane required";
-        return;
-    }
     if (request.size() < sizeof(XferDataDesc)) {
         response = "SendData failed: request too short";
         return;
@@ -447,19 +436,6 @@ void ControlService::onSendData(const std::string_view& request,
 
 void ControlService::onRecvData(const std::string_view& request,
                                 std::string& response) {
-    if (!enable_bulk_data_rpc_) {
-        response =
-            "RecvData disabled: high-performance TCP data plane required";
-        if (request.size() >= sizeof(XferDataDesc)) {
-            uint64_t wire_length = 0;
-            std::memcpy(&wire_length,
-                        request.data() + offsetof(XferDataDesc, length),
-                        sizeof(wire_length));
-            const uint64_t requested_length = le64toh(wire_length);
-            if (requested_length == response.size()) response.push_back('!');
-        }
-        return;
-    }
     if (request.size() < sizeof(XferDataDesc)) {
         response = "RecvData failed: request too short";
         return;

@@ -88,7 +88,6 @@
             "advertise_address": "",
             "port": 0,
             "worker_count": 16,
-            "queue_capacity_per_worker": 256,
             "connections_per_peer": 4,
             "max_outstanding_tasks": 4096,
             "max_outstanding_bytes": 4294967296,

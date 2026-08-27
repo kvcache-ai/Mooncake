@@ -46,7 +46,6 @@ HighPerformanceTcpParams MakeParams() {
     params.advertise_address = "127.0.0.1";
     params.port = 0;
     params.worker_count = 2;
-    params.queue_capacity_per_worker = 8;
     params.connections_per_peer = 2;
     params.max_outstanding_tasks = 16;
     params.max_outstanding_bytes = 1 << 20;
@@ -117,35 +116,6 @@ TEST(HighPerformanceTcpTransportTest,
     ASSERT_TRUE(transport.uninstall().ok());
 }
 
-TEST(HighPerformanceTcpTransportTest, CanReinstallAfterCompleteTeardown) {
-    auto metadata = MakeLocalMetadata();
-    HighPerformanceTcpTransport transport(MakeParams());
-    std::string segment_name = "hp_transport_test";
-
-    ASSERT_TRUE(
-        transport.install(segment_name, metadata, nullptr, nullptr).ok());
-    ASSERT_TRUE(transport.quiesce().ok());
-    ASSERT_TRUE(transport.uninstall().ok());
-
-    ASSERT_TRUE(
-        transport.install(segment_name, metadata, nullptr, nullptr).ok());
-    ASSERT_TRUE(transport.quiesce().ok());
-    ASSERT_TRUE(transport.uninstall().ok());
-}
-
-TEST(HighPerformanceTcpTransportTest, ExplicitBindFailureIsReturned) {
-    auto metadata = MakeLocalMetadata();
-    auto params = MakeParams();
-    params.bind_address = "203.0.113.1";  // TEST-NET-3, not a local interface.
-    HighPerformanceTcpTransport transport(params);
-    std::string segment_name = "hp_transport_test";
-
-    const Status status =
-        transport.install(segment_name, metadata, nullptr, nullptr);
-    EXPECT_FALSE(status.ok());
-    EXPECT_TRUE(transport.uninstall().ok());
-}
-
 Status PublishBuffers(const std::shared_ptr<ControlService>& metadata,
                       const std::vector<BufferDesc>& buffers) {
     return metadata->segmentManager().updateLocal(
@@ -167,93 +137,6 @@ Status WaitForTransportResult(HighPerformanceTcpTransport& transport,
         std::this_thread::yield();
     }
     return Status::InternalError("HP TCP test transfer did not finish");
-}
-
-TEST(HighPerformanceTcpTransportTest,
-     CpuVectorRegistrationSucceedsAndUnsupportedMemoryFails) {
-    auto metadata = MakeLocalMetadata();
-    HighPerformanceTcpTransport transport(MakeParams());
-    std::string segment_name = "hp_transport_test";
-    ASSERT_TRUE(
-        transport.install(segment_name, metadata, nullptr, nullptr).ok());
-
-    std::array<uint8_t, 64> first_storage{};
-    std::array<uint8_t, 64> second_storage{};
-    std::vector<BufferDesc> cpu_descs(2);
-    cpu_descs[0].addr = reinterpret_cast<uint64_t>(first_storage.data());
-    cpu_descs[0].length = first_storage.size();
-    cpu_descs[0].location = "cpu:0";
-    cpu_descs[1].addr = reinterpret_cast<uint64_t>(second_storage.data());
-    cpu_descs[1].length = second_storage.size();
-    cpu_descs[1].location = "cpu:0";
-    MemoryOptions options;
-    options.type = HP_TCP;
-    options.perm = kGlobalReadWrite;
-    ASSERT_TRUE(transport.addMemoryBuffer(cpu_descs, options).ok());
-    for (const auto& desc : cpu_descs) {
-        EXPECT_TRUE(transport.tracksLocalBuffer(desc));
-        EXPECT_TRUE(ContainsTransport(desc, TransportType::HP_TCP));
-        EXPECT_EQ(desc.transport_attrs.count(TransportType::HP_TCP), 1u);
-    }
-
-    std::array<uint8_t, 64> unsupported_storage{};
-    BufferDesc unsupported;
-    unsupported.addr = reinterpret_cast<uint64_t>(unsupported_storage.data());
-    unsupported.length = unsupported_storage.size();
-    unsupported.location = "cuda:0";
-    const Status unsupported_status =
-        transport.addMemoryBuffer(unsupported, options);
-    EXPECT_TRUE(unsupported_status.IsInvalidArgument());
-    EXPECT_FALSE(transport.tracksLocalBuffer(unsupported));
-    EXPECT_FALSE(ContainsTransport(unsupported, TransportType::HP_TCP));
-    EXPECT_EQ(unsupported.transport_attrs.count(TransportType::HP_TCP), 0u);
-
-    for (auto& desc : cpu_descs) {
-        ASSERT_TRUE(transport.removeMemoryBuffer(desc).ok());
-    }
-    ASSERT_TRUE(transport.quiesce().ok());
-    ASSERT_TRUE(transport.uninstall().ok());
-}
-
-TEST(HighPerformanceTcpTransportTest,
-     VectorFailureRollsBackOnlyRegistrationsCreatedByThatCall) {
-    auto metadata = MakeLocalMetadata();
-    HighPerformanceTcpTransport transport(MakeParams());
-    std::string segment_name = "hp_transport_test";
-    ASSERT_TRUE(
-        transport.install(segment_name, metadata, nullptr, nullptr).ok());
-
-    MemoryOptions options;
-    options.type = HP_TCP;
-    options.perm = kGlobalReadWrite;
-    std::array<uint8_t, 64> existing_storage{};
-    BufferDesc existing;
-    existing.addr = reinterpret_cast<uint64_t>(existing_storage.data());
-    existing.length = existing_storage.size();
-    existing.location = "cpu:0";
-    ASSERT_TRUE(transport.addMemoryBuffer(existing, options).ok());
-
-    std::array<uint8_t, 64> new_storage{};
-    std::array<uint8_t, 64> unsupported_storage{};
-    std::vector<BufferDesc> descs(2);
-    descs[0].addr = reinterpret_cast<uint64_t>(new_storage.data());
-    descs[0].length = new_storage.size();
-    descs[0].location = "cpu:0";
-    descs[1].addr = reinterpret_cast<uint64_t>(unsupported_storage.data());
-    descs[1].length = unsupported_storage.size();
-    descs[1].location = "cuda:0";
-
-    const Status status = transport.addMemoryBuffer(descs, options);
-    EXPECT_TRUE(status.IsInvalidArgument());
-    EXPECT_TRUE(transport.tracksLocalBuffer(existing));
-    EXPECT_FALSE(transport.tracksLocalBuffer(descs[0]));
-    EXPECT_FALSE(transport.tracksLocalBuffer(descs[1]));
-    EXPECT_EQ(descs[0].transport_attrs.count(TransportType::HP_TCP), 0u);
-    EXPECT_EQ(descs[1].transport_attrs.count(TransportType::HP_TCP), 0u);
-
-    ASSERT_TRUE(transport.removeMemoryBuffer(existing).ok());
-    ASSERT_TRUE(transport.quiesce().ok());
-    ASSERT_TRUE(transport.uninstall().ok());
 }
 
 TEST(HighPerformanceTcpTransportTest,

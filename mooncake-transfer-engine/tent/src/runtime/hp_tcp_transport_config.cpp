@@ -84,8 +84,6 @@ Status ParseHpTcpTransportConfig(const Config& config,
     CHECK_STATUS(ReadUnsigned(hp_tcp, "port", &parsed.params.port));
     CHECK_STATUS(
         ReadUnsigned(hp_tcp, "worker_count", &parsed.params.worker_count));
-    CHECK_STATUS(ReadUnsigned(hp_tcp, "queue_capacity_per_worker",
-                              &parsed.params.queue_capacity_per_worker));
     CHECK_STATUS(ReadUnsigned(hp_tcp, "connections_per_peer",
                               &parsed.params.connections_per_peer));
     CHECK_STATUS(ReadUnsigned(hp_tcp, "max_outstanding_tasks",
@@ -102,19 +100,15 @@ Status ParseHpTcpTransportConfig(const Config& config,
 
     const auto& hp = parsed.params;
     if (parsed.enabled &&
-        (hp.worker_count == 0 || hp.queue_capacity_per_worker == 0 ||
-         hp.connections_per_peer == 0 || hp.max_outstanding_tasks == 0 ||
-         hp.max_outstanding_bytes == 0 || hp.max_transfer_bytes == 0 ||
-         hp.chunk_size == 0 || hp.chunk_size > hp.max_transfer_bytes ||
-         hp.connect_timeout_ms == 0 || hp.progress_timeout_ms == 0)) {
+        (hp.worker_count == 0 || hp.connections_per_peer == 0 ||
+         hp.max_outstanding_tasks == 0 || hp.max_outstanding_bytes == 0 ||
+         hp.max_transfer_bytes == 0 || hp.chunk_size == 0 ||
+         hp.chunk_size > hp.max_transfer_bytes || hp.connect_timeout_ms == 0 ||
+         hp.progress_timeout_ms == 0)) {
         return Invalid("transports/hp_tcp",
                        "contains zero or inconsistent limits");
     }
 
-    if (parsed.enabled && config.get("transports/tcp/enable", true)) {
-        return Invalid("transports/hp_tcp/enable",
-                       "cannot be true while transports/tcp/enable is true");
-    }
     *out = std::move(parsed);
     return Status::OK();
 }

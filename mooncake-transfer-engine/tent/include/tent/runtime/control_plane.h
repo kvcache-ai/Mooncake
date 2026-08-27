@@ -125,7 +125,7 @@ class ControlClient {
 class ControlService {
    public:
     ControlService(const std::string& type, const std::string& servers,
-                   TransferEngineImpl* impl, bool enable_bulk_data_rpc = true);
+                   TransferEngineImpl* impl);
 
     ~ControlService();
 
@@ -176,7 +176,6 @@ class ControlService {
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
-    const bool enable_bulk_data_rpc_{true};
 
     std::mutex bootstrap_cb_mutex_;
     std::condition_variable bootstrap_cb_cv_;

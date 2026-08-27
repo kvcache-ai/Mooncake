@@ -408,9 +408,8 @@ class HighPerformanceTcpClient::Lane
 };
 
 bool HighPerformanceTcpClient::LaneKey::operator==(const LaneKey& other) const {
-    return peer_id == other.peer_id && peer_name == other.peer_name &&
-           incarnation == other.incarnation && host == other.host &&
-           port == other.port && lane_id == other.lane_id;
+    return peer_id == other.peer_id && incarnation == other.incarnation &&
+           host == other.host && port == other.port && lane_id == other.lane_id;
 }
 
 size_t HighPerformanceTcpClient::LaneKeyHash::operator()(
@@ -420,7 +419,6 @@ size_t HighPerformanceTcpClient::LaneKeyHash::operator()(
         hash ^= value + static_cast<size_t>(0x9e3779b97f4a7c15ULL) +
                 (hash << 6U) + (hash >> 2U);
     };
-    mix(std::hash<std::string>{}(key.peer_name));
     mix(std::hash<std::string>{}(key.incarnation));
     mix(std::hash<std::string>{}(key.host));
     mix(std::hash<uint16_t>{}(key.port));
@@ -487,7 +485,6 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
         auto& lanes = worker_states_[owner_worker].lanes;
         for (auto it = lanes.begin(); it != lanes.end();) {
             if (it->first.peer_id == operation.peer_id &&
-                it->first.peer_name == operation.peer_name &&
                 it->first.incarnation != operation.incarnation) {
                 it->second->cancelAll(CANCELED);
                 it = lanes.erase(it);
@@ -496,9 +493,8 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
             }
         }
 
-        LaneKey key{operation.peer_id,     operation.peer_name,
-                    operation.incarnation, operation.host,
-                    operation.port,        operation.lane_id};
+        LaneKey key{operation.peer_id, operation.incarnation, operation.host,
+                    operation.port, operation.lane_id};
         auto it = lanes.find(key);
         if (it == lanes.end()) {
             auto lane = std::make_shared<Lane>(
@@ -581,8 +577,7 @@ Status HighPerformanceTcpClient::cancelAll(TransferStatusEnum terminal) {
 
     if (workers_->controlContextAvailable()) {
         try {
-            // Control-plane cancellation bypasses the bounded data mailbox:
-            // teardown must remain possible even when every mailbox is full.
+            // Post cancellation to every owner before waiting for active I/O.
             for (size_t i = 0; i < workers_->workerCount(); ++i) {
                 asio::post(workers_->ioContext(i),
                            [this, i, terminal] { cancelWorker(i, terminal); });

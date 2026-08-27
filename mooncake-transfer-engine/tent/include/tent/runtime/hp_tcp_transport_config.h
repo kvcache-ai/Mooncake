@@ -15,7 +15,6 @@ struct HighPerformanceTcpParams {
     std::string advertise_address;
     uint16_t port{0};
     size_t worker_count{16};
-    size_t queue_capacity_per_worker{256};
     size_t connections_per_peer{4};
     uint64_t max_outstanding_tasks{4096};
     uint64_t max_outstanding_bytes{1ULL << 32};
@@ -32,8 +31,6 @@ struct HpTcpTransportConfig {
 
 // This is intentionally the sole parser for transports/hp_tcp. Config::get()
 // silently substitutes defaults for type mismatches and is not suitable here.
-// HP TCP and standard TCP are mutually exclusive in v1 because both data
-// planes currently own the single ControlService notification callback.
 Status ParseHpTcpTransportConfig(const Config& config,
                                  HpTcpTransportConfig* out);
 

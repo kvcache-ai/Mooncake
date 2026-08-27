@@ -392,8 +392,7 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(topology_->loadFromConfig(*conf_, {loader}));
 
     metadata_ =
-        std::make_shared<ControlService>(metadata_type, metadata_servers, this,
-                                         !hp_tcp_transport_config_.enabled);
+        std::make_shared<ControlService>(metadata_type, metadata_servers, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_, rpc_server_threads));
 
