@@ -605,7 +605,7 @@ std::optional<BufferHandle> DummyClient::allocate_client_buffer(size_t size) {
                                             std::move(release));
 }
 
-bool DummyClient::is_dummy_shm_buffer(void *buffer, size_t size) const {
+bool DummyClient::is_dummy_shm_buffer(void* buffer, size_t size) const {
     if (buffer == nullptr || shm_helper_ == nullptr) return false;
     auto shm = shm_helper_->get_shm(buffer);
     if (!shm) return false;
@@ -615,16 +615,17 @@ bool DummyClient::is_dummy_shm_buffer(void *buffer, size_t size) const {
     return size <= shm->size - (address - base);
 }
 
-bool DummyClient::is_device_buffer(void *buffer) const {
+bool DummyClient::is_device_buffer(void* buffer) const {
     return device::GetAcceleratorRegistry()
                .RuntimeAccelerators()
                .FindDeviceForPointer(buffer) != nullptr;
 }
 
-std::optional<size_t> DummyClient::external_buffer_remaining(void *buffer) const {
+std::optional<size_t> DummyClient::external_buffer_remaining(
+    void* buffer) const {
     const uintptr_t address = reinterpret_cast<uintptr_t>(buffer);
     std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
-    for (const auto &[base, registration] : registered_external_buffers_) {
+    for (const auto& [base, registration] : registered_external_buffers_) {
         if (address >= base && address - base <= registration.size) {
             return registration.size - (address - base);
         }
@@ -633,7 +634,7 @@ std::optional<size_t> DummyClient::external_buffer_remaining(void *buffer) const
 }
 
 std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
-    void *buffer, size_t size, bool copy_to_staging, bool copy_back) {
+    void* buffer, size_t size, bool copy_to_staging, bool copy_back) {
     if (buffer == nullptr && size != 0) return std::nullopt;
     if (size == 0) return PreparedBuffer{buffer, buffer, 0, nullptr, false};
     if (shm_helper_ != nullptr) {
@@ -653,40 +654,45 @@ std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
     if (!allocation) return std::nullopt;
     auto staging = std::make_unique<BufferHandle>(std::move(*allocation));
     if (copy_to_staging) {
-        const auto &runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
-        if (!runtime.CopyToHost(staging->ptr(), buffer, size)) return std::nullopt;
+        const auto& runtime =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        if (!runtime.CopyToHost(staging->ptr(), buffer, size))
+            return std::nullopt;
     }
     return PreparedBuffer{buffer, staging->ptr(), size, std::move(staging),
                           copy_back || !copy_to_staging};
 }
 
-bool DummyClient::copy_from_staging(const PreparedBuffer &buffer, size_t size) const {
-    if (!buffer.copy_back || buffer.staging == nullptr || size == 0) return true;
+bool DummyClient::copy_from_staging(const PreparedBuffer& buffer,
+                                    size_t size) const {
+    if (!buffer.copy_back || buffer.staging == nullptr || size == 0)
+        return true;
     if (size > buffer.size) return false;
-    const auto &runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    const auto& runtime =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
     return runtime.CopyFromHost(buffer.original, buffer.staging->ptr(), size);
 }
 
 std::optional<DummyClient::PreparedMultiBuffers>
 DummyClient::prepare_multi_buffers(
-    const std::vector<std::vector<void *>> &all_buffers,
-    const std::vector<std::vector<size_t>> &all_sizes) {
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes) {
     if (all_buffers.size() != all_sizes.size()) return std::nullopt;
 
     PreparedMultiBuffers prepared;
     prepared.dummy_buffers.reserve(all_buffers.size());
     size_t total_buffers = 0;
-    for (const auto &buffers : all_buffers) total_buffers += buffers.size();
+    for (const auto& buffers : all_buffers) total_buffers += buffers.size();
     prepared.buffers.reserve(total_buffers);
     for (size_t i = 0; i < all_buffers.size(); ++i) {
         if (all_buffers[i].size() != all_sizes[i].size()) {
             return std::nullopt;
         }
-        auto &dummy_row = prepared.dummy_buffers.emplace_back();
+        auto& dummy_row = prepared.dummy_buffers.emplace_back();
         dummy_row.reserve(all_buffers[i].size());
         for (size_t j = 0; j < all_buffers[i].size(); ++j) {
-            auto buffer = prepare_buffer(all_buffers[i][j], all_sizes[i][j],
-                                         true);
+            auto buffer =
+                prepare_buffer(all_buffers[i][j], all_sizes[i][j], true);
             if (!buffer) return std::nullopt;
             dummy_row.push_back(reinterpret_cast<uint64_t>(buffer->dummy));
             prepared.buffers.emplace_back(std::move(*buffer));
@@ -812,7 +818,8 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(buffer);
         if (size > std::numeric_limits<uintptr_t>::max() - base) return -1;
         std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
-        for (const auto &[other_base, registration] : registered_external_buffers_) {
+        for (const auto& [other_base, registration] :
+             registered_external_buffers_) {
             if (base < other_base + registration.size &&
                 other_base < base + size &&
                 (base != other_base || size != registration.size)) {
@@ -968,7 +975,8 @@ std::vector<int> DummyClient::batch_upsert_from(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto item = prepare_buffer(buffer_ptrs[i], sizes[i], true);
         if (!item) {
-            return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+            return std::vector<int>(keys.size(),
+                                    toInt(ErrorCode::INVALID_PARAMS));
         }
         buffers.push_back(reinterpret_cast<uint64_t>(item->dummy));
         prepared.push_back(std::move(*item));
@@ -1288,7 +1296,8 @@ std::vector<int> DummyClient::batch_put_from(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto item = prepare_buffer(buffer_ptrs[i], sizes[i], true);
         if (!item) {
-            return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+            return std::vector<int>(keys.size(),
+                                    toInt(ErrorCode::INVALID_PARAMS));
         }
         buffers.push_back(reinterpret_cast<uint64_t>(item->dummy));
         prepared.push_back(std::move(*item));
@@ -1324,7 +1333,8 @@ std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes) {
     if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
-        return std::vector<int64_t>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+        return std::vector<int64_t>(keys.size(),
+                                    toInt(ErrorCode::INVALID_PARAMS));
     }
     if (auto dst_buffers = try_export_cuda_ipc_buffers(buffer_ptrs, sizes);
         dst_buffers && keys.size() == dst_buffers->size()) {
@@ -1348,7 +1358,8 @@ std::vector<int64_t> DummyClient::batch_get_into(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto item = prepare_buffer(buffer_ptrs[i], sizes[i], false, true);
         if (!item) {
-            return std::vector<int64_t>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+            return std::vector<int64_t>(keys.size(),
+                                        toInt(ErrorCode::INVALID_PARAMS));
         }
         buffers.push_back(reinterpret_cast<uint64_t>(item->dummy));
         prepared.push_back(std::move(*item));

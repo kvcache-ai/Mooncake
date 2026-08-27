@@ -111,8 +111,7 @@ std::optional<RawTensorObjectParts> make_raw_tensor_object_parts(
         LOG(ERROR) << operation_name << ": failed to read tensor metadata";
         return std::nullopt;
     }
-    if (metadata.header.data_offset >
-            std::numeric_limits<size_t>::max() ||
+    if (metadata.header.data_offset > std::numeric_limits<size_t>::max() ||
         metadata.header.data_bytes > std::numeric_limits<size_t>::max()) {
         LOG(ERROR) << operation_name << ": tensor object size overflows";
         return std::nullopt;
@@ -123,10 +122,8 @@ std::optional<RawTensorObjectParts> make_raw_tensor_object_parts(
     }
     const size_t metadata_size =
         static_cast<size_t>(metadata.header.data_offset);
-    const size_t payload_size =
-        static_cast<size_t>(metadata.header.data_bytes);
-    if (metadata_size > size ||
-        payload_size > size - metadata_size ||
+    const size_t payload_size = static_cast<size_t>(metadata.header.data_bytes);
+    if (metadata_size > size || payload_size > size - metadata_size ||
         metadata_size > std::numeric_limits<uintptr_t>::max() - buffer_ptr) {
         LOG(ERROR) << operation_name << ": invalid tensor object range";
         return std::nullopt;
@@ -1276,13 +1273,13 @@ class MooncakeStorePyWrapper {
             LOG(ERROR) << "Client is not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        auto parts = make_raw_tensor_object_parts(buffer_ptr, size,
-                                                   "put_tensor_from");
+        auto parts =
+            make_raw_tensor_object_parts(buffer_ptr, size, "put_tensor_from");
         if (!parts.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        std::vector<std::vector<void *>> buffers = {{
-            reinterpret_cast<void *>(parts->metadata_ptr)}};
+        std::vector<std::vector<void *>> buffers = {
+            {reinterpret_cast<void *>(parts->metadata_ptr)}};
         std::vector<std::vector<size_t>> part_sizes = {{parts->metadata_size}};
         if (parts->payload_size > 0) {
             buffers[0].push_back(reinterpret_cast<void *>(parts->payload_ptr));
@@ -1322,8 +1319,8 @@ class MooncakeStorePyWrapper {
         std::vector<RawTensorObjectParts> parts;
         parts.reserve(keys.size());
         for (size_t i = 0; i < sizes.size(); ++i) {
-            auto parsed = make_raw_tensor_object_parts(
-                buffer_ptrs[i], sizes[i], "batch_put_tensor_from");
+            auto parsed = make_raw_tensor_object_parts(buffer_ptrs[i], sizes[i],
+                                                       "batch_put_tensor_from");
             if (!parsed.has_value()) {
                 LOG(ERROR) << "Invalid tensor object at index " << i;
                 return std::vector<int>(keys.size(),
@@ -1714,12 +1711,12 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         auto parts = make_raw_tensor_object_parts(buffer_ptr, size,
-                                                   "upsert_tensor_from");
+                                                  "upsert_tensor_from");
         if (!parts.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        std::vector<std::vector<void *>> buffers = {{
-            reinterpret_cast<void *>(parts->metadata_ptr)}};
+        std::vector<std::vector<void *>> buffers = {
+            {reinterpret_cast<void *>(parts->metadata_ptr)}};
         std::vector<std::vector<size_t>> part_sizes = {{parts->metadata_size}};
         if (parts->payload_size > 0) {
             buffers[0].push_back(reinterpret_cast<void *>(parts->payload_ptr));
