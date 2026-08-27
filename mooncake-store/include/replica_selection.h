@@ -125,6 +125,7 @@ inline const Replica::Descriptor *SelectBestReplica(
     const std::unordered_set<std::string> &local_endpoints) {
     const Replica::Descriptor *first_memory = nullptr;
     const Replica::Descriptor *first_nof = nullptr;
+    const Replica::Descriptor *local_nof = nullptr;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_memory_replica()) {
@@ -138,11 +139,16 @@ inline const Replica::Descriptor *SelectBestReplica(
             if (local_endpoints.count(
                     r.get_nof_descriptor()
                         .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local NOF_SSD — also good
+                // local NOF_SSD — good, but local MEMORY outranks it and may
+                // still appear later, so remember it and keep scanning.
+                if (!local_nof) local_nof = &r;
+                continue;
             }
             if (!first_nof) first_nof = &r;
         }
     }
+    // No local MEMORY replica: a local NOF_SSD still beats every remote one.
+    if (local_nof) return local_nof;
     // No local replica. Among remote MEMORY replicas, optionally pick the
     // best-scoring one instead of the first encountered (issue #2516).
     if (first_memory && RemoteReplicaScoringEnabled()) {
