@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import os
 import shutil
 import sys
@@ -84,14 +85,14 @@ def _cache_root() -> Path:
     return Path.home() / ".cache" / "mooncake" / "pg_jit"
 
 
-def _cache_key(source_dir: Path, core_path: Path, build_path: str) -> str:
+def _cache_key(source_dir: Path, core_path: Path, backend: str) -> str:
     digest = hashlib.sha256()
     digest.update(torch.__version__.encode())
     digest.update(str(torch.version.cuda).encode())
     digest.update(str(getattr(torch.version, "musa", None)).encode())
     digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
     digest.update(str(torch.version.git_version).encode())
-    digest.update(build_path.encode())
+    digest.update(backend.encode())
     digest.update(core_path.read_bytes())
     for name in (*_SOURCE_NAMES, *_HEADER_NAMES):
         digest.update(name.encode())
@@ -108,6 +109,42 @@ def _build_lock(lock_path: Path):
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _adapter_module_name(is_musa: bool) -> str:
+    return "_mooncake_pg_jit_musa" if is_musa else "_mooncake_pg_jit_cuda"
+
+
+def _cached_extension_path(build_dir: Path, is_musa: bool) -> Path | None:
+    matches = sorted(build_dir.glob(f"{_adapter_module_name(is_musa)}*.so"))
+    return matches[0] if matches else None
+
+
+def _load_cached_extension(build_dir: Path, is_musa: bool):
+    extension_path = _cached_extension_path(build_dir, is_musa)
+    if extension_path is None:
+        return None
+    module_name = _adapter_module_name(is_musa)
+    spec = importlib.util.spec_from_file_location(module_name, extension_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load cached Mooncake PG adapter: {extension_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+def _cache_directory(source_dir: Path, core_path: Path, is_musa: bool) -> Path:
+    backend = (
+        f"musa:{os.environ.get('MTGPU_TARGET', 'mp_31')}"
+        if is_musa
+        else "cuda"
+    )
+    return _cache_root() / _cache_key(source_dir, core_path, backend)
 
 
 def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
@@ -190,7 +227,7 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
         source_paths = [_source_path(source_dir, name) for name in _SOURCE_NAMES]
 
     return load(
-        name="_mooncake_pg_jit_musa" if is_musa else "_mooncake_pg_jit_cuda",
+        name=_adapter_module_name(is_musa),
         sources=[str(path) for path in source_paths],
         extra_cflags=extra_cflags,
         extra_cuda_cflags=extra_cuda_cflags,
@@ -204,10 +241,6 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
         verbose=verbose,
         with_cuda=True,
     )
-
-
-def _has_built_extension(build_dir: Path) -> bool:
-    return any(build_dir.glob("*.so"))
 
 
 def _load_jit_adapter():
@@ -227,60 +260,58 @@ def _load_jit_adapter():
             "Mooncake PG JIT source bundle is incomplete: " + ", ".join(missing)
         )
 
-    if shutil.which("ninja") is None:
-        raise ImportError(
-            "Mooncake PG JIT requires Ninja to compile the Torch adapter. "
-            "Install it with `python -m pip install ninja`."
-        )
-
-    if _using_musa():
-        _load_torchada()
-        musa_home = os.environ.get("MUSA_HOME")
-        mcc = _mcc_path()
-        if mcc is None:
-            raise ImportError(
-                "Mooncake PG MUSA JIT requires the MUSA compiler (mcc). "
-                "Set MUSA_HOME or add mcc to PATH."
-            )
-        toolkit_identity = f"musa:{musa_home or 'PATH'}:{mcc.resolve()}"
-    else:
-        from torch.utils.cpp_extension import CUDA_HOME
-
-        if not CUDA_HOME or not (Path(CUDA_HOME) / "bin" / "nvcc").is_file():
-            raise ImportError(
-                "Mooncake PG Torch adapter JIT requires a CUDA toolkit with nvcc; "
-                "install a CUDA toolkit or use a compatible runtime environment"
-            )
-        toolkit_identity = f"cuda:{CUDA_HOME}:{Path(CUDA_HOME) / 'bin' / 'nvcc'}"
-        if not os.environ.get("TORCH_CUDA_ARCH_LIST") and not torch.cuda.is_available():
-            raise ImportError(
-                "Mooncake PG CUDA JIT is running without a visible CUDA device. "
-                "Set TORCH_CUDA_ARCH_LIST to a compatible architecture (for example, 8.0) "
-                "before importing mooncake.pg."
-            )
-    key = _cache_key(source_dir, core_path, toolkit_identity)
-    build_dir = _cache_root() / key
+    is_musa = _using_musa()
+    build_dir = _cache_directory(source_dir, core_path, is_musa)
     build_dir.mkdir(parents=True, exist_ok=True)
     lock_path = build_dir.with_suffix(".lock")
     try:
         with _build_lock(lock_path):
-            cold_build = not _has_built_extension(build_dir)
+            cached = _load_cached_extension(build_dir, is_musa)
+            if cached is not None:
+                return cached
+
+            if shutil.which("ninja") is None:
+                raise ImportError(
+                    "Mooncake PG JIT requires Ninja to compile the Torch adapter. "
+                    "Install it with `python -m pip install ninja`."
+                )
+
+            if is_musa:
+                _load_torchada()
+                if _mcc_path() is None:
+                    raise ImportError(
+                        "Mooncake PG MUSA JIT requires the MUSA compiler (mcc). "
+                        "Set MUSA_HOME or add mcc to PATH."
+                    )
+            else:
+                from torch.utils.cpp_extension import CUDA_HOME
+
+                if not CUDA_HOME or not (Path(CUDA_HOME) / "bin" / "nvcc").is_file():
+                    raise ImportError(
+                        "Mooncake PG Torch adapter JIT requires a CUDA toolkit with nvcc; "
+                        "install a CUDA toolkit or use a compatible runtime environment"
+                    )
+                if not os.environ.get("TORCH_CUDA_ARCH_LIST") and not torch.cuda.is_available():
+                    raise ImportError(
+                        "Mooncake PG CUDA JIT is running without a visible CUDA device. "
+                        "Set TORCH_CUDA_ARCH_LIST to a compatible architecture (for example, 8.0) "
+                        "before importing mooncake.pg."
+                    )
+
             started = time.monotonic()
-            if cold_build:
-                print(
-                    "[mooncake.pg] Building the Torch adapter with JIT; "
-                    "the first import may take a few minutes.",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            print(
+                "[mooncake.pg] Building the Torch adapter with JIT; "
+                "the first import may take a few minutes.",
+                file=sys.stderr,
+                flush=True,
+            )
             module = _build_adapter(source_dir, core_path, build_dir)
-            if cold_build:
-                elapsed = time.monotonic() - started
-                print(
-                    f"[mooncake.pg] Torch adapter JIT build completed in {elapsed:.1f}s.",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            elapsed = time.monotonic() - started
+            print(
+                f"[mooncake.pg] Torch adapter JIT build completed in {elapsed:.1f}s.",
+                file=sys.stderr,
+                flush=True,
+            )
             return module
     except Exception as exc:
         raise ImportError(
@@ -296,14 +327,27 @@ def _compatibility_report() -> int:
     print(f"  backend: {'MUSA' if is_musa else 'CUDA'}")
     print(f"  torch.version.cuda: {torch.version.cuda}")
     print(f"  torch.version.musa: {getattr(torch.version, 'musa', None)}")
+    source_dir = _source_dir()
+    core_path = Path(__file__).with_name("libmooncake_pg.so")
+    source_ready = source_dir.is_dir() and all(
+        _source_path(source_dir, name).is_file()
+        for name in (*_SOURCE_NAMES, *_HEADER_NAMES)
+    )
+    core_ready = core_path.is_file()
+    cache_dir = None
+    cache_ready = False
+    if source_ready and core_ready:
+        cache_dir = _cache_directory(source_dir, core_path, is_musa)
+        cache_ready = _cached_extension_path(cache_dir, is_musa) is not None
+
     ninja = shutil.which("ninja")
     print(f"  ninja: {ninja or 'missing'}")
-    ready &= ninja is not None
+    print(f"  cached adapter: {cache_dir if cache_ready else 'missing'}")
     print(f"  TORCH_CUDA_ARCH_LIST: {os.environ.get('TORCH_CUDA_ARCH_LIST', '<unset>')}")
     if is_musa:
         mcc = _mcc_path()
         print(f"  mcc: {mcc or 'missing'}")
-        ready &= mcc is not None
+        toolchain_ready = mcc is not None
         print(f"  MTGPU_TARGET: {os.environ.get('MTGPU_TARGET', 'mp_31')}")
     else:
         try:
@@ -315,15 +359,12 @@ def _compatibility_report() -> int:
         print(f"  CUDA_HOME: {CUDA_HOME or 'missing'}")
         print(f"  nvcc: {nvcc if nvcc and nvcc.is_file() else 'missing'}")
         print(f"  CUDA available: {cuda_available}")
-        ready &= nvcc is not None and nvcc.is_file()
+        toolchain_ready = nvcc is not None and nvcc.is_file()
         if not cuda_available and not os.environ.get("TORCH_CUDA_ARCH_LIST"):
-            ready = False
-    source_dir = _source_dir()
-    print(f"  source bundle: {source_dir if source_dir.is_dir() else 'missing'}")
-    ready &= source_dir.is_dir()
-    core_path = Path(__file__).with_name("libmooncake_pg.so")
-    print(f"  PG core library: {core_path if core_path.is_file() else 'missing'}")
-    ready &= core_path.is_file()
+            toolchain_ready = False
+    ready &= source_ready and core_ready and (cache_ready or (ninja is not None and toolchain_ready))
+    print(f"  source bundle: {source_dir if source_ready else 'missing'}")
+    print(f"  PG core library: {core_path if core_ready else 'missing'}")
     print(f"  cache: {_cache_root()}")
     print(f"  status: {'ready' if ready else 'not ready'}")
     return 0 if ready else 1
