@@ -365,6 +365,16 @@ jobs:
         sudo -E cmake --install build
       shell: bash
 
+    - name: Run Mooncake Store Rust unit tests
+      env:
+        MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build
+        MOONCAKE_STORE_LIB_DIR: ${{ github.workspace }}/build/mooncake-store/src
+        MOONCAKE_STORE_INCLUDE_DIR: ${{ github.workspace }}/mooncake-store/include
+      run: |
+        export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+        cargo test --manifest-path mooncake-store/rust/Cargo.toml --lib
+      shell: bash
+
     - name: Start Metadata Server
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server-python
@@ -560,6 +570,52 @@ jobs:
         fi
         echo "Comparing against: ${BASE_REF}"
         ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
+      shell: bash
+
+  python-lint:
+    name: Check Python with Ruff
+    if: *run-ci
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Ruff
+      run: python -m pip install --disable-pip-version-check ruff==0.6.9
+
+    - name: Check changed Python files
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          base_ref="origin/${{ github.base_ref }}"
+        elif [ "${{ github.event.before }}" = \
+               "0000000000000000000000000000000000000000" ]; then
+          base_ref="origin/${{ github.event.repository.default_branch }}"
+        elif [ -n "${{ github.event.before }}" ]; then
+          base_ref="${{ github.event.before }}"
+        else
+          base_ref="HEAD^"
+        fi
+
+        mapfile -d '' python_files < <(
+          git diff --name-only --diff-filter=ACMR -z "$base_ref"...HEAD -- \
+            '*.py' \
+            ':(exclude)extern/**' \
+            ':(exclude)FAST25-release/**'
+        )
+        if [ "${#python_files[@]}" -eq 0 ]; then
+          echo "No changed Python files to check."
+          exit 0
+        fi
+
+        ruff check "${python_files[@]}"
+        ruff format --check "${python_files[@]}"
       shell: bash
 
 
@@ -886,6 +942,7 @@ jobs:
     needs:
       - spell-check
       - clang-format
+      - python-lint
       - docs-check
       - reshard-type-check
       - reshard-test
