@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -83,16 +84,24 @@ class MsgChannel : public std::enable_shared_from_this<MsgChannel> {
     // Send DATA_WRITE with payload copied from src. total_chunks is how many
     // chunks the whole task is split into, so the receiver can retire its ACK
     // bookkeeping once it has seen them all. Returns 0 on post success.
-    int sendDataWrite(uint64_t task_id, uint8_t slice_seq, uint64_t dest_addr,
+    int sendDataWrite(uint64_t task_id, uint32_t slice_seq, uint64_t dest_addr,
                       const void *src, uint32_t length, uint32_t total_chunks);
 
     // Send READ_REQ (header only).
-    int sendReadReq(uint64_t task_id, uint8_t slice_seq, uint64_t src_addr,
+    int sendReadReq(uint64_t task_id, uint32_t slice_seq, uint64_t src_addr,
                     uint32_t length);
 
     // Send READ_RESP with payload.
-    int sendReadResp(uint64_t task_id, uint8_t slice_seq, uint64_t dest_addr,
+    int sendReadResp(uint64_t task_id, uint32_t slice_seq, uint64_t dest_addr,
                      const void *src, uint32_t length);
+
+    // Send READ_RESP, or hold it for replay when the bounce pool is momentarily
+    // full. Never drops the response: a dropped READ_RESP would strand the
+    // requester, which waits for that exact slice forever. The payload is read
+    // from `addr` (a validated local managed buffer) at (re)send time. Returns
+    // 0 unless the channel is down.
+    int sendOrQueueReadResp(uint64_t task_id, uint32_t slice_seq, uint64_t addr,
+                            uint32_t length);
 
     int pollCompletions(int max_entries = 16);
     void disconnect();
@@ -108,6 +117,9 @@ class MsgChannel : public std::enable_shared_from_this<MsgChannel> {
     int postSend(const MsgHeader &hdr, const void *payload, uint32_t length);
     void dispatchRecv(size_t idx, size_t byte_len);
     void handleSendComplete(uint64_t wr_id);
+    // Replay READ_RESPs held back by a full bounce pool. Called whenever a send
+    // slot frees up (SEND completion) or the pool grows (expandPool).
+    void drainPendingReadResps();
 
     RdmaTwoSidedTransport &transport_;
     RdmaContext &context_;
@@ -126,6 +138,17 @@ class MsgChannel : public std::enable_shared_from_this<MsgChannel> {
     // wr_id -> send slot index for completion release
     std::mutex inflight_mutex_;
     std::vector<int> inflight_slots_;  // indexed by wr_id % capacity
+
+    // READ_RESP deferred because the bounce pool was full; replayed in order on
+    // the next slot recycle or pool expansion. Guarded by resp_mutex_.
+    struct PendingReadResp {
+        uint64_t task_id;
+        uint64_t addr;
+        uint32_t length;
+        uint32_t slice_seq;
+    };
+    std::mutex resp_mutex_;
+    std::deque<PendingReadResp> pending_resps_;
 
     std::mutex resource_mutex_;
     std::atomic<bool> connected_{false};

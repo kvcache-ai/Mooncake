@@ -20,10 +20,12 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -322,7 +324,11 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     // whole sleep period.
     std::mutex ctrl_idle_mutex_;
     std::condition_variable ctrl_idle_cv_;
-    // Receiver-side cumulative bytes per remote task_id (per-transport).
+    // Receiver-side cumulative bytes per (peer, session, remote task_id).
+    // task_id alone is not unique across senders (each starts next_task_id_ at
+    // 1) nor across a peer's restarts, so two transfers would merge into one
+    // entry and complete each other early; session separates incarnations and
+    // peer_server_name is the channel-verified identity the frame arrived on.
     // Retired as soon as MsgHeader::total_chunks chunks have arrived; the idle
     // sweep in pruneRecvAckLedger() only has to cover tasks that never do.
     struct RecvAckState {
@@ -330,8 +336,10 @@ class RdmaTwoSidedTransport : public RdmaTransport {
         uint64_t chunks = 0;
         uint64_t last_ms = 0;
     };
+    // (peer_server_name, sender session, remote task_id)
+    using RecvAckKey = std::tuple<std::string, uint64_t, uint64_t>;
     std::mutex recv_ack_mutex_;
-    std::unordered_map<uint64_t, RecvAckState> recv_acked_bytes_;
+    std::map<RecvAckKey, RecvAckState> recv_acked_bytes_;
 };
 
 }  // namespace mooncake
