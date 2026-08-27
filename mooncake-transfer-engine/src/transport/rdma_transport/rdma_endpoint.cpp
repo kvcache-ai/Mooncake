@@ -92,6 +92,7 @@ static std::string gidToString(const ibv_gid &gid) {
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
       status_(INITIALIZING),
+      qp_generation_(0),
       has_connected_(false),
       ready_wait_start_ts_(0),
       wr_depth_list_(nullptr),
@@ -153,6 +154,10 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
 }
 
 int RdmaEndPoint::reconstruct() {
+    // Invalidate any handshake that captured the previous QP set, even when
+    // reconstruction fails before fresh QPs can be created.
+    ++qp_generation_;
+
     // Save original construction parameters
     size_t num_qp = qp_list_.size();
     auto max_wr_depth = max_wr_depth_;
@@ -346,6 +351,7 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
 int RdmaEndPoint::setupConnectionsByActive() {
     HandShakeDesc local_desc, peer_desc;
     std::string peer_server_name, peer_nic_name;
+    uint64_t qp_generation = 0;
     bool do_rpc = false;
     int auto_gid_retry_count = 0;
     std::vector<AutoGidSelectionIdentity> attempted_auto_gid_selections;
@@ -356,6 +362,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
             LOG(INFO) << "Connection has been established";
             return 0;
         }
+
+        qp_generation = qp_generation_;
 
         // loopback mode
         if (context_.nicPath() == peer_nic_path_) {
@@ -408,6 +416,12 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 // The QP state on this endpoint may have changed; therefore,
                 // reset the connection so that subsequent callers can retry.
                 RWSpinlock::WriteGuard write_guard(lock_);
+                if (qp_generation != qp_generation_) {
+                    return connected() ? 0 : ERR_ENDPOINT;
+                }
+                auto current_status = status_.load(std::memory_order_relaxed);
+                if (isConnectedStatus(current_status)) return 0;
+                if (current_status != CONNECTING) return ERR_ENDPOINT;
                 resetConnection("wait existing handshake timeout");
                 return ERR_ENDPOINT;
             }
@@ -421,6 +435,14 @@ int RdmaEndPoint::setupConnectionsByActive() {
         std::vector<uint32_t> local_qp_num;
         {
             RWSpinlock::ReadGuard guard(lock_);
+            if (qp_generation != qp_generation_) {
+                return connected() ? 0 : ERR_ENDPOINT;
+            }
+            auto current_status = status_.load(std::memory_order_relaxed);
+            if (current_status != CONNECTING &&
+                !isConnectedStatus(current_status)) {
+                return ERR_ENDPOINT;
+            }
             local_qp_num = qpNum();
         }
         auto local_gid_selection = fillLocalHandshakeDesc(
@@ -434,46 +456,74 @@ int RdmaEndPoint::setupConnectionsByActive() {
         int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                                  peer_desc);
 
-        // We should check the RPC return code before comparing
-        // `peer_qp_num_list_` with `peer_desc.qp_num`, since a failed RPC may
-        // result in an invalid `peer_desc.qp_num`.
-        //
-        // If the RPC failed but simultaneous-open passive setup has already
-        // made this endpoint CONNECTED with the same local QPs used by this
-        // RPC, reuse that connection. Otherwise reset because
-        // `peer_desc.qp_num` is invalid and we cannot safely infer the peer
-        // state.
-        if (rc) {
-            RWSpinlock::WriteGuard write_guard(lock_);
-            if (connected()) {
-                auto current_qp_num = qpNum();
-                if (current_qp_num == local_desc.qp_num) {
-                    LOG(WARNING)
-                        << "Active handshake RPC failed, but simultaneous-open "
-                           "passive setup already connected this endpoint. "
-                           "Reusing existing connection. rc="
-                        << rc << ", local_desc.qp_num="
-                        << qpListToString(local_desc.qp_num)
-                        << ", current_qp_num=" << qpListToString(current_qp_num)
-                        << ", endpoint=" << toString();
-                    return 0;
-                }
-            }
-
-            LOG(ERROR) << "Active handshake RPC failed; resetting endpoint. rc="
-                       << rc << ", local_desc.qp_num="
-                       << qpListToString(local_desc.qp_num)
-                       << ", endpoint=" << toString();
-            resetConnection("handshake RPC failure");
-            return rc;
-        }
-
         bool retry_with_new_gid = false;
         bool should_send_ready_ack = false;
         HandShakeDesc ready_ack_desc;
         {
-            // Re-acquire lock after RPC to finalize state transition
+            // Re-acquire lock before inspecting either the RPC result or
+            // endpoint state. A waiter may have reconstructed this endpoint
+            // with fresh QPs while the RPC was in flight.
             RWSpinlock::WriteGuard guard(lock_);
+            if (qp_generation != qp_generation_) {
+                if (connected()) {
+                    LOG(INFO) << "Discarding stale active handshake reply and "
+                                 "reusing "
+                                 "the newer passive connection: "
+                              << toString();
+                    return 0;
+                }
+                LOG(WARNING)
+                    << "Discarding stale active handshake reply after local "
+                       "QP reconstruction: "
+                    << toString();
+                return ERR_ENDPOINT;
+            }
+
+            auto current_status = status_.load(std::memory_order_relaxed);
+            if (current_status != CONNECTING &&
+                !isConnectedStatus(current_status)) {
+                LOG(WARNING)
+                    << "Discarding active handshake reply for endpoint "
+                       "in state "
+                    << current_status << ": " << toString();
+                return ERR_ENDPOINT;
+            }
+
+            // We should check the RPC return code before comparing
+            // `peer_qp_num_list_` with `peer_desc.qp_num`, since a failed RPC
+            // may result in an invalid `peer_desc.qp_num`.
+            //
+            // If the RPC failed but simultaneous-open passive setup has
+            // already connected this endpoint with the same local QPs used by
+            // this RPC, reuse that connection. Otherwise reset because
+            // `peer_desc.qp_num` is invalid and we cannot safely infer the peer
+            // state.
+            if (rc) {
+                if (connected()) {
+                    auto current_qp_num = qpNum();
+                    if (current_qp_num == local_desc.qp_num) {
+                        LOG(WARNING)
+                            << "Active handshake RPC failed, but "
+                               "simultaneous-open passive setup already "
+                               "connected this endpoint. Reusing existing "
+                               "connection. rc="
+                            << rc << ", local_desc.qp_num="
+                            << qpListToString(local_desc.qp_num)
+                            << ", current_qp_num="
+                            << qpListToString(current_qp_num)
+                            << ", endpoint=" << toString();
+                        return 0;
+                    }
+                }
+
+                LOG(ERROR)
+                    << "Active handshake RPC failed; resetting endpoint. rc="
+                    << rc << ", local_desc.qp_num="
+                    << qpListToString(local_desc.qp_num)
+                    << ", endpoint=" << toString();
+                resetConnection("handshake RPC failure");
+                return rc;
+            }
 
             // Handle simultaneous open: if the peer initiates a connection
             // during our RPC and it is passively established in
@@ -596,6 +646,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                                     : "retry with externally reprobed GID "
                                       "(active)");
                             if (reset_ret) return reset_ret;
+                            qp_generation = qp_generation_;
                             status_.store(CONNECTING,
                                           std::memory_order_relaxed);
                             ++auto_gid_retry_count;
