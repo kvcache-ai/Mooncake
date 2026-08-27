@@ -28,9 +28,10 @@ namespace {
 // task for the barrier.
 constexpr size_t kBarrierDummySize = 1;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
-constexpr size_t kDefaultDeviceCollectiveBufferSize = 256ull * 1024 * 1024;
-// Headroom for other states, e.g. communicator-local signals
-constexpr size_t kDefaultDeviceCollectiveControlReserve = 512ull * 1024 * 1024;
+constexpr size_t kDefaultDeviceCollectiveBufferSize =
+    32ull * 1024 * 1024;  // 32 MiB
+constexpr size_t kDefaultDeviceCollectiveControlReserve =
+    8ull * 1024 * 1024;  // 8 MiB
 
 // Only remotely published resources occupy the eager peer-accessible region.
 // DTS allocates the local staging region lazily if a selected route needs one.

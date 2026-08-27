@@ -14,6 +14,10 @@ inline constexpr uint32_t kRingPipelineSlots = 2;
 static_assert(kRingPipelineSlots >= 2);
 // Keep every dynamically sized payload slot on the 16-byte ValuePack path.
 inline constexpr uint64_t kRingPayloadAlignment = 16;
+// Payload slot size is derived by evenly dividing the shared workspace. An
+// oversized slot reduces Ring pipeline overlap, so a cap is applied here.
+inline constexpr uint64_t kMaxRingPayloadSlotSize = 512ull * 1024;  // 512 KiB
+static_assert(kMaxRingPayloadSlotSize % kRingPayloadAlignment == 0);
 
 // Defines the [kind][channel][signaling rank][slot] byte offsets within one
 // Ring protocol instance's signal slice. The slice belongs to the rank
