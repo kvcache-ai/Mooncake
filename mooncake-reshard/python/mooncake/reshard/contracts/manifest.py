@@ -72,6 +72,15 @@ class RuntimeBindingManifest(ResourceManifest, Protocol):
         ...
 
 
+class StoredResourceManifest(ResourceManifest, Protocol):
+    """Structural contract for persistent reusable-resource metadata."""
+
+    namespace: str
+    group_id: str
+    manifest_key: str
+    created_at: str
+
+
 def validate_resource_binding_identity(
     placement: PlacementManifest,
     binding: RuntimeBindingManifest,

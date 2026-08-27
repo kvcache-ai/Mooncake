@@ -26,10 +26,14 @@
 #include <aws/s3/model/CreateMultipartUploadRequest.h>
 #include <aws/s3/model/CompleteMultipartUploadRequest.h>
 #include <aws/s3/model/AbortMultipartUploadRequest.h>
+#include <aws/s3/model/ChecksumAlgorithm.h>
+#include <aws/s3/model/ChecksumType.h>
 #include <aws/s3/model/UploadPartRequest.h>
 #include <aws/core/client/ClientConfiguration.h>
+#include "crc32c.h"
 #include "environ.h"
 #include "fmt/format.h"
+#include "utils/base64.h"
 
 namespace mooncake {
 
@@ -51,6 +55,15 @@ std::optional<T> ParseChecksumMode(const std::string &value) {
     LOG(WARNING) << "Invalid value: " << value
                  << ", ignoring (keeping AWS SDK default)";
     return std::nullopt;
+}
+
+std::string EncodeCrc32c(uint32_t checksum) {
+    std::string bytes(sizeof(checksum), '\0');
+    bytes[0] = static_cast<char>(checksum >> 24);
+    bytes[1] = static_cast<char>(checksum >> 16);
+    bytes[2] = static_cast<char>(checksum >> 8);
+    bytes[3] = static_cast<char>(checksum);
+    return base64::Encode(bytes);
 }
 
 }  // namespace
@@ -157,6 +170,8 @@ tl::expected<void, std::string> S3Helper::UploadBuffer(
 
     // Set ContentLength correctly (using long long type)
     request.SetContentLength(static_cast<long long>(buffer.size()));
+    request.SetChecksumCRC32C(
+        EncodeCrc32c(Crc32cValue(buffer.data(), buffer.size())));
     const auto buffer_size = static_cast<std::streamsize>(buffer.size());
 
     // Create and write to stream
@@ -178,6 +193,8 @@ tl::expected<void, std::string> S3Helper::UploadString(
     request.SetBucket(bucket_.c_str());
     request.SetKey(key.c_str());
     request.SetContentLength(static_cast<long long>(data.size()));
+    request.SetChecksumCRC32C(
+        EncodeCrc32c(Crc32cValue(data.data(), data.size())));
 
     auto stream = Aws::MakeShared<Aws::StringStream>("UploadString");
     stream->write(data.data(), data.size());
@@ -187,6 +204,47 @@ tl::expected<void, std::string> S3Helper::UploadString(
     if (!outcome.IsSuccess()) {
         return tl::make_unexpected(
             fmt::format("Upload failed: {}", outcome.GetError().GetMessage()));
+    }
+    return {};
+}
+
+tl::expected<void, std::string> S3Helper::InspectObject(
+    const std::string &key, uint64_t &stored_size,
+    std::optional<uint32_t> &crc32c) {
+    Aws::S3::Model::HeadObjectRequest request;
+    request.SetBucket(bucket_.c_str());
+    request.SetKey(key.c_str());
+    request.SetChecksumMode(Aws::S3::Model::ChecksumMode::ENABLED);
+
+    auto outcome = s3_client_.HeadObject(request);
+    if (!outcome.IsSuccess()) {
+        return tl::make_unexpected(fmt::format(
+            "HeadObject failed: {}", outcome.GetError().GetMessage()));
+    }
+    const auto content_length = outcome.GetResult().GetContentLength();
+    if (content_length < 0) {
+        return tl::make_unexpected(
+            fmt::format("Invalid content length: {}", content_length));
+    }
+    stored_size = static_cast<uint64_t>(content_length);
+    crc32c.reset();
+
+    if (outcome.GetResult().GetChecksumType() !=
+        Aws::S3::Model::ChecksumType::FULL_OBJECT) {
+        return {};
+    }
+
+    const std::string encoded = outcome.GetResult().GetChecksumCRC32C();
+    const std::string decoded = base64::Decode(encoded);
+    if (!encoded.empty() && decoded.size() == sizeof(uint32_t) &&
+        base64::Encode(decoded) == encoded) {
+        crc32c = (static_cast<uint32_t>(static_cast<unsigned char>(decoded[0]))
+                  << 24) |
+                 (static_cast<uint32_t>(static_cast<unsigned char>(decoded[1]))
+                  << 16) |
+                 (static_cast<uint32_t>(static_cast<unsigned char>(decoded[2]))
+                  << 8) |
+                 static_cast<uint32_t>(static_cast<unsigned char>(decoded[3]));
     }
     return {};
 }
@@ -444,6 +502,9 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(
     Aws::S3::Model::CreateMultipartUploadRequest create_request;
     create_request.SetBucket(bucket_.c_str());
     create_request.SetKey(key.c_str());
+    create_request.SetChecksumAlgorithm(
+        Aws::S3::Model::ChecksumAlgorithm::CRC32C);
+    create_request.SetChecksumType(Aws::S3::Model::ChecksumType::FULL_OBJECT);
 
     auto create_outcome = s3_client_.CreateMultipartUpload(create_request);
     if (!create_outcome.IsSuccess()) {
@@ -489,6 +550,8 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(
 
                 // Use original buffer pointer directly, avoid copying
                 const uint8_t *part_data = buffer.data() + offset;
+                const std::string part_crc32c =
+                    EncodeCrc32c(Crc32cValue(part_data, current_part_size));
 
                 // Add retry logic
                 const int max_retries = 2;
@@ -503,6 +566,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(
                     part_request.SetPartNumber(static_cast<int>(part_num));
                     part_request.SetContentLength(
                         static_cast<long long>(current_part_size));
+                    part_request.SetChecksumCRC32C(part_crc32c);
 
                     // Use temporary stream
                     auto stream =
@@ -598,6 +662,10 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(
     complete_request.SetBucket(bucket_.c_str());
     complete_request.SetKey(key.c_str());
     complete_request.SetUploadId(upload_id);
+    complete_request.SetChecksumCRC32C(
+        EncodeCrc32c(Crc32cValue(buffer.data(), buffer.size())));
+    complete_request.SetChecksumType(Aws::S3::Model::ChecksumType::FULL_OBJECT);
+    complete_request.SetMpuObjectSize(static_cast<long long>(total_size));
 
     Aws::S3::Model::CompletedMultipartUpload completed_upload;
 

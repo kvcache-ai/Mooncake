@@ -155,6 +155,9 @@ ErrorCode OpLogBatchStorage::ReadDurablePrefix(DurablePrefix& prefix) {
 
 ErrorCode OpLogBatchStorage::ReadProducerView(
     ViewVersionId& producer_view_version) const {
+    if (!IsValidClusterId()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
     std::string value;
     ErrorCode err = backend_.Get(BuildProducerViewKey(cluster_id_), value);
     if (err != ErrorCode::OK) {

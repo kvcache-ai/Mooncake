@@ -272,10 +272,6 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     return cfg;
 }
 
-StorageBackendInterface::StorageBackendInterface(
-    const FileStorageConfig& config)
-    : file_storage_config_(config) {}
-
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
     if (actual_fsdir.rfind("moon_", 0) == 0) {
@@ -2011,16 +2007,22 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
-
 #ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                // Calculate aligned read range
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr) {
+            struct BatchReadPlan {
+                const ReadPlan* plan;
+                size_t offset_in_buffer;
+                size_t min_required;
+            };
+
+            std::vector<UringFile::ReadDesc> read_descs;
+            std::vector<BatchReadPlan> batch_read_plans;
+            read_descs.reserve(read_plans.size());
+            batch_read_plans.reserve(read_plans.size());
+
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
                 int64_t data_end =
@@ -2029,64 +2031,72 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
                 size_t aligned_size =
                     static_cast<size_t>(aligned_end - aligned_offset);
-                int64_t offset_in_buffer = actual_offset - aligned_offset;
+                size_t offset_in_buffer =
+                    static_cast<size_t>(actual_offset - aligned_offset);
 
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
-
-                if (read_res) {
-                    // Verify the aligned read returned enough bytes
-                    // to cover the actual data region.  read_aligned
-                    // reads the full aligned range [aligned_offset,
-                    // aligned_end); the caller-visible data starts at
-                    // offset_in_buffer into that buffer and spans
-                    // plan.dest_slice.size bytes.
-                    size_t min_required =
-                        static_cast<size_t>(offset_in_buffer) +
-                        plan.dest_slice.size;
-                    if (read_res.value() < min_required) {
-                        LOG(ERROR)
-                            << "read_aligned short read for key: " << plan.key
-                            << ", bucket_id=" << plan.bucket_id
-                            << ", expected at least: " << min_required
-                            << " (aligned_size=" << aligned_size
-                            << ", data_size=" << plan.dest_slice.size << ")"
-                            << ", got: " << read_res.value();
-                        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                    }
-                    // Adjust ptr to point to actual data start
-                    // (zero-copy: no memcpy, buffer was oversized by
-                    // AllocateBatch to accommodate the aligned read)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    // Normalize read_res so the common validation
-                    // below passes.  The real short-read check was
-                    // already done above (min_required).
-                    read_res = plan.dest_slice.size;
-                }
-            } else
-#endif
-            {
-                // Fallback to vector_read for non-UringFile
-                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                read_res = file->vector_read(&iov, 1, actual_offset);
+                read_descs.push_back(UringFile::ReadDesc{
+                    plan.dest_slice.ptr, aligned_size, aligned_offset});
+                batch_read_plans.push_back(
+                    BatchReadPlan{&plan, offset_in_buffer,
+                                  offset_in_buffer + plan.dest_slice.size});
             }
 
-            if (!read_res) {
+            auto batch_read_result = uring_file->batch_read(
+                read_descs.data(), static_cast<int>(read_descs.size()));
+            if (!batch_read_result) {
+                for (size_t i = 0; i < read_descs.size(); ++i) {
+                    if (read_descs[i].error == ErrorCode::OK) continue;
+                    LOG(ERROR)
+                        << "batch_read failed for key: "
+                        << batch_read_plans[i].plan->key
+                        << ", bucket_id=" << batch_read_plans[i].plan->bucket_id
+                        << ", error=" << read_descs[i].error;
+                }
+                return tl::make_unexpected(batch_read_result.error());
+            }
+
+            for (size_t i = 0; i < read_descs.size(); ++i) {
+                const auto& desc = read_descs[i];
+                const auto& batch_plan = batch_read_plans[i];
+                const auto& plan = *batch_plan.plan;
+                if (!desc.completed) {
+                    LOG(ERROR)
+                        << "batch_read did not complete for key: " << plan.key
+                        << ", bucket_id=" << plan.bucket_id;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                if (desc.bytes_read < batch_plan.min_required) {
+                    LOG(ERROR)
+                        << "batch_read short read for key: " << plan.key
+                        << ", bucket_id=" << plan.bucket_id
+                        << ", expected at least: " << batch_plan.min_required
+                        << " (aligned_size=" << desc.len
+                        << ", data_size=" << plan.dest_slice.size
+                        << "), got: " << desc.bytes_read;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                batch_object.at(plan.key).ptr =
+                    static_cast<char*>(plan.dest_slice.ptr) +
+                    batch_plan.offset_in_buffer;
+            }
+            continue;
+        }
+#endif
+
+        for (const auto& plan : read_plans) {
+            int64_t actual_offset = plan.offset + plan.key_size;
+            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+            auto read_result = file->vector_read(&iov, 1, actual_offset);
+            if (!read_result) {
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_res.error();
-                return tl::make_unexpected(read_res.error());
+                           << ", error: " << read_result.error();
+                return tl::make_unexpected(read_result.error());
             }
-
-            if (read_res.value() != plan.dest_slice.size) {
+            if (read_result.value() != plan.dest_slice.size) {
                 LOG(ERROR) << "Read size mismatch for key: " << plan.key
                            << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
+                           << ", got: " << read_result.value();
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
         }
@@ -2457,10 +2467,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
+    if (offloading_objects.empty()) {
+        return {};
+    }
     auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
+    auto carryover_objects = std::move(ungrouped_offloading_objects);
+    bool carryover_loaded = false;
     auto it = offloading_objects.cbegin();
-    int64_t residue_count = static_cast<int64_t>(
-        offloading_objects.size() + ungrouped_offloading_objects.size());
+    int64_t residue_count = static_cast<int64_t>(offloading_objects.size() +
+                                                 carryover_objects.size());
     int64_t total_count = residue_count;
 
     auto is_exist_func =
@@ -2473,20 +2488,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         std::unordered_map<std::string, int64_t> bucket_objects;
         int64_t bucket_data_size = 0;
 
-        if (!ungrouped_offloading_objects.empty()) {
-            for (const auto& ungrouped_it : ungrouped_offloading_objects) {
+        if (!carryover_loaded) {
+            for (const auto& ungrouped_it : carryover_objects) {
                 bucket_data_size += ungrouped_it.second;
                 bucket_keys.push_back(ungrouped_it.first);
                 bucket_objects.emplace(ungrouped_it.first, ungrouped_it.second);
             }
             VLOG(1) << "Ungrouped offloading objects have been processed and "
                        "cleared; count="
-                    << ungrouped_offloading_objects.size();
-            ungrouped_offloading_objects.clear();
+                    << carryover_objects.size();
+            carryover_loaded = true;
         }
 
-        for (int64_t i = static_cast<int64_t>(bucket_keys.size());
-             i < bucket_backend_config_.bucket_keys_limit; ++i) {
+        while (static_cast<int64_t>(bucket_keys.size()) <
+               bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
@@ -2496,6 +2511,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                         << "Total ungrouped count: "
                         << ungrouped_offloading_objects.size();
                 return {};
+            }
+
+            if (carryover_objects.find(it->first) != carryover_objects.end()) {
+                ++it;
+                continue;
             }
 
             if (it->second > bucket_backend_config_.bucket_size_limit) {

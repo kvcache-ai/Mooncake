@@ -64,8 +64,9 @@ class CoroRpcAgent {
     using Function = std::function<void(const std::string_view & /* request */,
                                         std::string & /* response */)>;
 
-    // Handlers run on the single io_context (kRpcThreads), so a blocking one
-    // stalls every connection, not just its own.
+    // Handlers run on the server io_context thread pool (the threads
+    // argument of start(), 1 by default), so a blocking one stalls every
+    // connection sharing its thread, not just its own.
     //
     // offload=false (default): inline, no thread hop. Right for anything that
     // returns promptly.
@@ -76,12 +77,21 @@ class CoroRpcAgent {
     Status registerFunction(int func_id, const Function &func,
                             bool offload = false);
 
-    Status start(uint16_t &port, bool ipv6 = false);
+    // threads: number of io_context worker threads (default 1, the
+    // historical behavior). The TCP data-path handlers do full-payload
+    // blocking copies inline, so a single thread caps TCP throughput;
+    // sourced from the rpc_server_threads config key.
+    Status start(uint16_t &port, bool ipv6 = false, size_t threads = 1);
 
     Status stop();
 
     Status call(const std::string &server_addr, int func_id,
                 const std::string_view &request, std::string &response);
+
+    // Same as call(), but moves the request into the coroutine instead of
+    // copying it, for large payloads.
+    Status callOwned(const std::string &server_addr, int func_id,
+                     std::string request, std::string &response);
 
     using AsyncCallback = std::function<void(Status, std::string)>;
     void callAsync(const std::string &server_addr, int func_id,
@@ -110,7 +120,6 @@ class CoroRpcAgent {
     std::unordered_map<int, Handler> func_map_;
 
     std::atomic<bool> running_{false};
-    constexpr static size_t kRpcThreads = 1;
 };
 
 }  // namespace tent

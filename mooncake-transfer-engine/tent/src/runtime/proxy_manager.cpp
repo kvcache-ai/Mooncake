@@ -24,7 +24,11 @@ namespace mooncake {
 namespace tent {
 ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
                            size_t chunk_count)
-    : chunk_size_(chunk_size), chunk_count_(chunk_count), impl_(impl) {
+    : chunk_size_(chunk_size),
+      chunk_count_(chunk_count),
+      impl_(impl),
+      shutdown_drain_timeout_(std::chrono::milliseconds(
+          impl->conf_->get("staging/shutdown_drain_timeout_ms", 30000L))) {
     running_ = true;
     for (size_t i = 0; i < kShards; ++i) {
         shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
@@ -115,13 +119,23 @@ Status ProxyManager::deconstruct() {
     };
 
     flushPendingCleanups(false);
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() + shutdown_drain_timeout_;
     while (has_pending_batches()) {
+        if (std::chrono::steady_clock::now() >= drain_deadline) {
+            LOG(WARNING) << "Timed out waiting for in-flight staging batches "
+                            "to reach a terminal state during shutdown; "
+                            "leaving the remaining cleanups pinned";
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         flushPendingCleanups(false);
     }
 
     flushPendingCleanups(false);
     std::vector<PendingBufferCleanup> remaining;
+    std::vector<BatchID> deferred_batches;
+    std::vector<uint64_t> deferred_local_addrs;
     {
         std::lock_guard<std::mutex> lk(pending_cleanups_mu_);
         remaining = std::move(pending_cleanups_);
@@ -129,26 +143,83 @@ Status ProxyManager::deconstruct() {
         has_pending_cleanups_.store(false, std::memory_order_relaxed);
     }
     for (auto& pending : remaining) {
-        if (!pending.remote_operations.empty()) {
-            LOG(WARNING)
-                << "Leaving " << pending.remote_addrs.size()
-                << " remote stage buffers pinned because "
-                << pending.remote_operations.size()
-                << " remote staging requests have not reached a confirmed "
-                   "terminal state";
+        if (!pending.batches.empty()) {
+            // The drain deadline above makes non-terminal batches reachable
+            // here. A transport worker may still complete these batches and
+            // their slices target the local stage buffers pinned in
+            // local_addrs, so keep the remote pins held (the deferred unpin
+            // path below assumes the batches already drained) and collect
+            // both so they outlive the transports (see below).
+            LOG(WARNING) << "Leaving " << pending.remote_addrs.size()
+                         << " remote stage buffers pinned because "
+                         << pending.remote_operations.size()
+                         << " remote staging requests and "
+                         << pending.batches.size()
+                         << " staging batches have not reached a confirmed "
+                            "terminal state";
+            deferred_batches.insert(deferred_batches.end(),
+                                    pending.batches.begin(),
+                                    pending.batches.end());
+            deferred_local_addrs.insert(deferred_local_addrs.end(),
+                                        pending.local_addrs.begin(),
+                                        pending.local_addrs.end());
             continue;
         }
+        size_t deferred_remote_buffers = 0;
+        for (auto& operation : pending.remote_operations) {
+            if (!operation) continue;
+            operation->abandonForCleanup();
+            ++deferred_remote_buffers;
+        }
+        if (deferred_remote_buffers != 0) {
+            LOG(WARNING)
+                << "Deferring cleanup of " << deferred_remote_buffers
+                << " remote stage buffers until their staging requests "
+                   "reach a terminal state";
+        }
         for (auto& [server, addr] : pending.remote_addrs) {
-            ControlClient::unpinStageBuffer(server, addr);
+            const bool owned_by_pending_operation = std::any_of(
+                pending.remote_operations.begin(),
+                pending.remote_operations.end(), [&](const auto& operation) {
+                    return operation &&
+                           operation->ownsRemoteBuffer(server, addr);
+                });
+            if (!owned_by_pending_operation) {
+                ControlClient::unpinStageBuffer(server, addr);
+            }
         }
     }
+    // Undrained batches and the stage buffer arenas they write into must not
+    // be freed here: the engine releases (or intentionally abandons) them
+    // only after the transports have quiesced. Everything else is freed as
+    // before.
+    TransferEngineImpl::DeferredStageTeardown deferred;
+    deferred.batches = std::move(deferred_batches);
     std::unique_lock<std::shared_mutex> guard(stage_buffers_mutex_);
     for (auto entry : stage_buffers_) {
+        const auto base = reinterpret_cast<uint64_t>(entry.second.chunks);
+        const auto end = base + chunk_size_ * chunk_count_;
+        const bool referenced_by_undrained_batch = std::any_of(
+            deferred_local_addrs.begin(), deferred_local_addrs.end(),
+            [&](uint64_t addr) { return addr >= base && addr < end; });
+        if (referenced_by_undrained_batch) {
+            deferred.stage_buffers.push_back(
+                {entry.first, entry.second.chunks, entry.second.bitmap});
+            continue;
+        }
         impl_->unregisterLocalMemory(entry.second.chunks);
         impl_->freeLocalMemory(entry.second.chunks);
         delete[] entry.second.bitmap;
     }
     stage_buffers_.clear();
+    if (!deferred.empty()) {
+        LOG(WARNING) << "Handing " << deferred.batches.size()
+                     << " undrained staging batches and "
+                     << deferred.stage_buffers.size()
+                     << " local stage buffer arenas to the engine for "
+                        "deferred teardown";
+        impl_->adoptDeferredStageTeardown(std::move(deferred));
+    }
     return Status::OK();
 }
 
@@ -225,10 +296,23 @@ void ProxyManager::submitRemoteStage(
     remote_stage.length = chunk_length;
     remote_stage.target_id = LOCAL_SEGMENT_ID;
     remote_stage.target_offset = request.target_offset + offset;
-    operation = std::make_shared<internal::RemoteStageOperation>();
+    operation = std::make_shared<internal::RemoteStageOperation>(
+        server_addr, remote_stage_buffer, [server_addr, remote_stage_buffer] {
+            ControlClient::unpinStageBufferAsync(
+                server_addr, remote_stage_buffer,
+                [server_addr, remote_stage_buffer](Status status) {
+                    if (!status.ok()) {
+                        LOG(WARNING)
+                            << "Failed to unpin deferred remote stage buffer "
+                            << remote_stage_buffer << " on " << server_addr
+                            << ": " << status;
+                    }
+                });
+        });
     ControlClient::delegateAsync(
-        server_addr, remote_stage,
-        [operation](Status status) { operation->complete(std::move(status)); });
+        server_addr, remote_stage, [operation](Status status, bool confirmed) {
+            operation->complete(std::move(status), confirmed);
+        });
 }
 
 Status ProxyManager::waitCrossStage(const Request& request,
@@ -684,8 +768,13 @@ Status ProxyManager::transferEventLoop(
                 }
                 auto result = operation->tryTakeResult();
                 if (result) {
+                    if (!result->confirmed) {
+                        chunk.state = StageState::FAILED;
+                        event_queue.push(id);
+                        break;
+                    }
                     operation.reset();
-                    if (!result->ok()) {
+                    if (!result->status.ok()) {
                         chunk.state = StageState::FAILED;
                         event_queue.push(id);
                         break;

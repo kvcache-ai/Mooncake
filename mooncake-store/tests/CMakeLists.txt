@@ -1,13 +1,15 @@
+set(MOONCAKE_STORE_TESTS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+
 function(add_store_test name)
   add_executable(${name} ${ARGN})
-  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(${name} PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
-           glog
+           glog::glog
            ibverbs
            gtest
            gtest_main
@@ -17,15 +19,15 @@ endfunction()
 
 function(add_ha_test name)
   add_executable(${name} ${ARGN})
-  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(${name} PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
-           glog
-           gflags
+           glog::glog
+           gflags::gflags
            ibverbs
            gtest
            gtest_main
@@ -49,30 +51,20 @@ add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(background_worker_test background_worker_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
-  find_library(
-    KV_EVENT_TEST_ZMQ_LIBRARY
-    NAMES zmq libzmq
-    PATHS /usr/lib /usr/local/lib /usr/lib64)
-  find_path(
-    KV_EVENT_TEST_ZMQ_INCLUDE_DIR
-    NAMES zmq.h
-    PATHS /usr/include /usr/local/include)
   target_compile_definitions(kv_event_publisher_test
                              PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
-  if(KV_EVENT_TEST_ZMQ_LIBRARY AND KV_EVENT_TEST_ZMQ_INCLUDE_DIR)
-    target_include_directories(kv_event_publisher_test
-                               PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
-    target_link_libraries(kv_event_publisher_test
-                          PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
-  endif()
+  target_link_libraries(kv_event_publisher_test PRIVATE Mooncake::libzmq)
 endif()
+add_subdirectory(master_service)
+
 add_store_test(master_service_test master_service_test.cpp)
-add_ha_test(master_service_evict_scenario_test master_scenario.cpp
+add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
-add_store_test(master_scenario_test master_scenario.cpp
-               master_scenario_test.cpp)
-add_store_test(master_service_scenario_test master_scenario.cpp
-               master_service_scenario_test.cpp)
+target_link_libraries(master_service_evict_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_scenario_test master_service_scenario_test.cpp)
+target_link_libraries(master_service_scenario_test
+                      PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
@@ -179,6 +171,10 @@ add_store_test(master_snapshot_codec_test
                ha/snapshot/master_snapshot_codec_test.cpp)
 add_ha_test(batch_oplog_snapshot_types_test
             ha/snapshot/batch_oplog/metadata_test.cpp)
+add_ha_test(batch_oplog_snapshot_codec_test
+            ha/snapshot/batch_oplog/codec_test.cpp)
+add_ha_test(batch_oplog_snapshot_writer_test
+            ha/snapshot/batch_oplog/writer_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
@@ -188,6 +184,7 @@ add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
+add_store_test(file_storage_config_test file_storage_config_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
@@ -215,29 +212,25 @@ if(STORE_USE_REDIS)
   target_sources(
     high_availability_test
     PRIVATE ha/leadership/backends/redis/high_availability_redis_test.cpp)
-  target_include_directories(high_availability_test
-                             PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
-  target_link_libraries(high_availability_test
-                        PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+  target_link_libraries(high_availability_test PRIVATE Mooncake::hiredis)
 
   add_executable(
     redis_snapshot_catalog_store_test
     ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store_test.cpp)
-  target_include_directories(
-    redis_snapshot_catalog_store_test
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+  target_include_directories(redis_snapshot_catalog_store_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(
     redis_snapshot_catalog_store_test
     PUBLIC mooncake_store
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
-           glog
-           gflags
+           glog::glog
+           gflags::gflags
            ibverbs
            gtest
            pthread
-    PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+    PRIVATE Mooncake::hiredis)
   add_test(NAME redis_snapshot_catalog_store_test
            COMMAND redis_snapshot_catalog_store_test)
 endif()
@@ -252,7 +245,7 @@ target_link_libraries(
          transfer_engine
          cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB}
-         glog
+         glog::glog
          gtest
          gtest_main
          pthread)
@@ -283,8 +276,8 @@ target_link_libraries(
          cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB}
          mooncake_common
-         glog
-         gflags
+         glog::glog
+         gflags::gflags
          pthread)
 
 # HA tests
@@ -311,10 +304,12 @@ endif()
 add_executable(
   oplog_test_failpoint_test ha/oplog/oplog_test_failpoint_test.cpp
                             ../src/ha/oplog/oplog_test_failpoint.cpp)
+target_include_directories(oplog_test_failpoint_test
+                           PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
 target_compile_definitions(oplog_test_failpoint_test
                            PRIVATE MOONCAKE_ENABLE_TEST_FAILPOINTS)
-target_link_libraries(oplog_test_failpoint_test PRIVATE glog gtest gtest_main
-                                                        pthread)
+target_link_libraries(oplog_test_failpoint_test PRIVATE glog::glog gtest
+                                                        gtest_main pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
 add_ha_test(catalog_backed_snapshot_provider_test
@@ -322,8 +317,14 @@ add_ha_test(catalog_backed_snapshot_provider_test
 if(STORE_USE_REDIS)
   foreach(target catalog_backed_snapshot_provider_test
                  hot_standby_snapshot_bootstrap_test)
-    target_include_directories(${target}
-                               PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
-    target_link_libraries(${target} PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+    target_link_libraries(${target} PRIVATE Mooncake::hiredis)
   endforeach()
 endif()
+
+foreach(
+  target
+  hot_standby_service_test oplog_applier_test oplog_batch_codec_test
+  oplog_batch_standby_reader_test oplog_batch_storage_test
+  ordered_oplog_writer_test)
+  target_link_libraries(${target} PRIVATE Mooncake::xxhash)
+endforeach()

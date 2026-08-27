@@ -33,8 +33,9 @@ constexpr size_t kMemAccessDescCount = 1;
 // backed too.
 constexpr uint64_t kReserveHugePageFlag = 1;
 constexpr size_t kBytesPerTB = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
-// HIXL fabric mem defaults to [40TB, 72TB); reserve after that window on A3.
-constexpr uintptr_t kA3ReserveStartAddr = 72ULL * kBytesPerTB;
+// HIXL fabric mem defaults to [40TB, 72TB). Reserve at 78TB on A3 so the
+// shared-segment NoUCMemory window stays past that range.
+constexpr uintptr_t kA3ReserveStartAddr = 78ULL * kBytesPerTB;
 
 static_assert(sizeof(aclrtMemFabricHandle) <= kMaxHandleBytes,
               "Fabric handle must fit into a shared segment blob");
@@ -82,13 +83,27 @@ aclrtPhysicalMemProp BuildHostMemProp() {
 
 // Host pages are only bound to the host by Map; the NPU needs an explicit grant
 // before kernels can touch them. AdxlEngine::MallocMem already does this for
-// the owner.
-Status GrantDeviceAccess(void* addr, uint64_t size, int32_t device_id) {
+// the owner. location.id is a driver logical id; aclrtGetDevice returns a user
+// id (ASCEND_RT_VISIBLE_DEVICES), so convert before SetAccess.
+Status GrantDeviceAccess(void* addr, uint64_t size) {
+    int32_t user_id = -1;
+    int32_t driver_id = -1;
+    auto ret = aclrtGetDevice(&user_id);
+    if (ret != ACL_ERROR_NONE) {
+        return Status::Memory("aclrtGetDevice failed for MemSetAccess, ret " +
+                              std::to_string(ret));
+    }
+    ret = aclrtGetLogicDevIdByUserDevId(user_id, &driver_id);
+    if (ret != ACL_ERROR_NONE) {
+        return Status::Memory(
+            "aclrtGetLogicDevIdByUserDevId failed for MemSetAccess, ret " +
+            std::to_string(ret));
+    }
     aclrtMemAccessDesc desc{};
     desc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
     desc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-    desc.location.id = static_cast<uint32_t>(device_id);
-    auto ret = aclrtMemSetAccess(addr, size, &desc, kMemAccessDescCount);
+    desc.location.id = static_cast<uint32_t>(driver_id);
+    ret = aclrtMemSetAccess(addr, size, &desc, kMemAccessDescCount);
     if (ret != ACL_ERROR_NONE) {
         return Status::Memory(
             "aclrtMemSetAccess failed for the imported shared segment, ret " +
@@ -224,6 +239,7 @@ Status AscendSharedSegmentBackend::ReserveLocal(
 Status AscendSharedSegmentBackend::ImportAndMap(
     uint64_t size, const SharedSegmentOptions& options,
     const std::vector<uint8_t>& handle) {
+    (void)options;
     if (reserved_addr_ == nullptr) {
         return Status::InvalidArgument(
             "Shared segment import needs a reserved address window");
@@ -250,7 +266,7 @@ Status AscendSharedSegmentBackend::ImportAndMap(
             std::to_string(ret));
     }
     mapped_ = true;
-    return GrantDeviceAccess(addr, size, options.device_id);
+    return GrantDeviceAccess(addr, size);
 }
 
 void AscendSharedSegmentBackend::Release() {
