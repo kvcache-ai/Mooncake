@@ -69,6 +69,13 @@ target_include_directories(bw_arbitration_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME bw_arbitration_test COMMAND bw_arbitration_test)
 
+add_executable(direct_path_policy_test direct_path_policy_test.cpp)
+target_link_libraries(direct_path_policy_test PRIVATE tent_common gtest
+                                                      gtest_main)
+target_include_directories(direct_path_policy_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME direct_path_policy_test COMMAND direct_path_policy_test)
+
 # Reproducible hot-path microbenchmark; intentionally not registered with ctest.
 # Run manually when changing deadline promotion partitioning.
 add_executable(deadline_promotion_bench deadline_promotion_bench.cpp

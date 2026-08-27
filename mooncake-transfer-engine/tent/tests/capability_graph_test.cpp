@@ -116,6 +116,74 @@ TEST(CapabilityGraphTest, TransportWeightsCanPreferTcpDirectOverRdma) {
               TCP);
 }
 
+TEST(CapabilityGraphTest, DerivedTransportCostCanPreferTcp) {
+    CapabilityGraphInput input;
+    input.local_memory_type = MTYPE_CPU;
+    input.remote_memory_type = MTYPE_CPU;
+    input.local_location = "cpu:0";
+    input.remote_location = "cpu:1";
+    input.server_addr = "server";
+    enable(input, RDMA, crossDramOnly());
+    enable(input, TCP, crossDramOnly());
+
+    PathSynthesisOptions options;
+    options.transport_cost[RDMA] = 11.0;
+
+    auto path = CapabilityPathSynthesizer::synthesize(input, options);
+
+    ASSERT_TRUE(path.found);
+    EXPECT_TRUE(path.direct);
+    EXPECT_EQ(path.cross_transport, TCP);
+}
+
+TEST(CapabilityGraphTest, BackgroundPrefetchCanPreferTcpFallback) {
+    CapabilityGraphInput input;
+    input.local_memory_type = MTYPE_CPU;
+    input.remote_memory_type = MTYPE_CPU;
+    input.local_location = "cpu:0";
+    input.remote_location = "cpu:1";
+    input.server_addr = "server";
+    enable(input, RDMA, crossDramOnly());
+    enable(input, TCP, crossDramOnly());
+
+    Request request{};
+    request.length = 4096;
+    request.intent_type = IntentType::BACKGROUND_PREFETCH;
+
+    auto options = buildPathSynthesisOptions(request);
+    auto path = CapabilityPathSynthesizer::synthesize(input, options);
+
+    ASSERT_TRUE(path.found);
+    EXPECT_TRUE(path.direct);
+    EXPECT_EQ(path.cross_transport, TCP);
+}
+
+TEST(CapabilityGraphTest, RdmaInflightStateCanPreferTcpFallback) {
+    CapabilityGraphInput input;
+    input.local_memory_type = MTYPE_CPU;
+    input.remote_memory_type = MTYPE_CPU;
+    input.local_location = "cpu:0";
+    input.remote_location = "cpu:1";
+    input.server_addr = "server";
+    enable(input, RDMA, crossDramOnly());
+    enable(input, TCP, crossDramOnly());
+
+    Request request{};
+    request.length = 4096;
+
+    PathScoringState state;
+    state.rdma_available = true;
+    state.rdma_inflight_bytes = 1ULL << 30;
+    state.rdma_ewma_bandwidth_bps = 1e9;
+
+    auto options = buildPathSynthesisOptions(request, state);
+    auto path = CapabilityPathSynthesizer::synthesize(input, options);
+
+    ASSERT_TRUE(path.found);
+    EXPECT_TRUE(path.direct);
+    EXPECT_EQ(path.cross_transport, TCP);
+}
+
 TEST(CapabilityGraphTest, StagesGpuTransferThroughHostWhenRdmaLacksGpuDirect) {
     CapabilityGraphInput input;
     input.local_memory_type = MTYPE_CUDA;

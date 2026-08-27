@@ -52,8 +52,9 @@ struct PathSynthesisOptions {
     PathSynthesisOptions();
 
     // Lower is better. Entries left as infinity use the synthesizer's nominal
-    // default for that transport. Callers can override these costs from an
-    // intent profile, calibrated bandwidth/latency, or live runtime state.
+    // default for that transport. Callers can override or derive these costs
+    // from an intent profile, calibrated bandwidth/latency, or live runtime
+    // state.
     std::array<double, kSupportedTransportTypes> transport_cost;
 
     // Path-shape penalties are additive. They let higher-level policy express
@@ -63,6 +64,26 @@ struct PathSynthesisOptions {
     double staged_path_penalty{0.20};
     double stage_hop_penalty{0.20};
 };
+
+struct PathScoringState {
+    // Generic dispatch pressure in [0, +inf). 0 means idle; 1 means the
+    // configured runtime dispatch window is full.
+    double runtime_queue_pressure{0.0};
+
+    // RDMA load snapshot, if available. These are aggregated across active
+    // rails and let the cost model account for rail inflight and EWMA bandwidth
+    // without exposing RDMA internals to the graph.
+    bool rdma_available{false};
+    uint64_t rdma_inflight_bytes{0};
+    double rdma_ewma_bandwidth_bps{0.0};
+
+    // steady_clock nanoseconds used to compute deadline slack. 0 means the
+    // builder should sample steady_clock itself.
+    uint64_t now_ns{0};
+};
+
+PathSynthesisOptions buildPathSynthesisOptions(
+    const Request& request, const PathScoringState& state = {});
 
 struct CapabilityVertex {
     enum class Side { Local, Remote };

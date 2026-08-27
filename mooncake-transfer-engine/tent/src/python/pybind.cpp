@@ -270,6 +270,7 @@ PYBIND11_MODULE(tent, m) {
     m.attr("kWildcardLocation") = py::str(kWildcardLocation);
 
     // Priority constants
+    m.attr("PRIO_UNSPEC") = py::int_(PRIO_UNSPEC);
     m.attr("PRIO_HIGH") = py::int_(PRIO_HIGH);
     m.attr("PRIO_MEDIUM") = py::int_(PRIO_MEDIUM);
     m.attr("PRIO_LOW") = py::int_(PRIO_LOW);
@@ -362,7 +363,7 @@ PYBIND11_MODULE(tent, m) {
              }),
              py::arg("opcode"), py::arg("source"), py::arg("target_id"),
              py::arg("target_offset"), py::arg("length"),
-             py::arg("priority") = PRIO_HIGH,
+             py::arg("priority") = PRIO_UNSPEC,
              py::arg("transport_hint") = TransportType::UNSPEC,
              py::arg("policy_name") = std::nullopt, py::arg("deadline_ns") = 0,
              py::arg("intent_type") = IntentType::INTENT_UNSPEC)

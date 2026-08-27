@@ -31,6 +31,7 @@
 #include "tent/common/status.h"
 #include "tent/runtime/capability_graph.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/direct_path_policy.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
 #include "tent/runtime/progress_worker.h"
@@ -1202,6 +1203,49 @@ static void addStageCandidate(std::vector<StageCandidate>& candidates,
     if (!duplicate) candidates.push_back({location, memory_type});
 }
 
+PathScoringState TransferEngineImpl::snapshotPathScoringState() const {
+    PathScoringState state;
+    state.now_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+
+    if (runtime_queue_config_.enabled) {
+        double owner_pressure = 0.0;
+        if (runtime_queue_config_.max_dispatch_owners > 0) {
+            owner_pressure =
+                static_cast<double>(dispatch_inflight_owners_) /
+                static_cast<double>(runtime_queue_config_.max_dispatch_owners);
+        }
+        double byte_pressure = 0.0;
+        if (runtime_queue_config_.max_dispatch_bytes > 0) {
+            byte_pressure =
+                static_cast<double>(dispatch_inflight_bytes_) /
+                static_cast<double>(runtime_queue_config_.max_dispatch_bytes);
+        }
+        state.runtime_queue_pressure =
+            std::max(0.0, std::max(owner_pressure, byte_pressure));
+    }
+
+    const auto& rdma = transport_list_[static_cast<int>(RDMA)];
+    if (rdma) {
+        state.rdma_available = true;
+        std::vector<NicLoadStats> stats;
+        if (rdma->getNicLoadStats(stats).ok()) {
+            for (const auto& nic : stats) {
+                state.rdma_inflight_bytes += nic.inflight_bytes;
+                if (nic.ewma_bandwidth_bps > 0.0)
+                    state.rdma_ewma_bandwidth_bps += nic.ewma_bandwidth_bps;
+            }
+        }
+        if (state.rdma_ewma_bandwidth_bps <= 0.0) {
+            const double estimate = rdma->getEstimatedBandwidth();
+            if (estimate > 0.0) state.rdma_ewma_bandwidth_bps = estimate;
+        }
+    }
+    return state;
+}
+
 Status TransferEngineImpl::validateTransportHint(const Request& req,
                                                  size_t request_index) {
     if (req.transport_hint == UNSPEC) return Status::OK();
@@ -1635,7 +1679,9 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
         input.transports[type].caps = caps;
     }
 
-    auto path = CapabilityPathSynthesizer::synthesize(input);
+    const auto scoring_state = snapshotPathScoringState();
+    const auto options = buildPathSynthesisOptions(req, scoring_state);
+    auto path = CapabilityPathSynthesizer::synthesize(input, options);
     if (!path.found) return resolved;
 
     auto selected = std::find_if(
@@ -1679,6 +1725,8 @@ Status TransferEngineImpl::prepareSubmit(
     for (const auto& request : merged.request_list) {
         PreparedSubmit::Owner owner;
         owner.request = request;
+        owner.request.priority =
+            DirectPathPolicy::priorityForRequest(owner.request);
         auto resolved = resolveExecutionRoute(owner.request, 0);
         owner.route = resolved.route;
         owner.staging = resolved.staging;
@@ -1752,17 +1800,8 @@ Status TransferEngineImpl::commitPreparedSubmit(
             continue;
         }
 
-        task.failover_count = 0;
-        task.xport_priority = 0;
-        task.status = PENDING;
-        task.request = merged_request;
-        task.staging = false;
-        task.start_time =
-            prepared.submit_time;  // Record start time for latency tracking
-        task.dispatch_time = prepared.submit_time;  // No queue wait on direct
-        task.type = owner.route.transport;
-        task.device_mask = owner.route.device_mask;
-        if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
+        initializeTaskFromRoute(task, merged_request, owner.route,
+                                prepared.submit_time, prepared.submit_time);
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
@@ -1886,6 +1925,23 @@ Status TransferEngineImpl::commitPreparedSubmit(
     }
 
     return Status::OK();
+}
+
+void TransferEngineImpl::initializeTaskFromRoute(
+    TaskInfo& task, const Request& request, const SelectionResult& route,
+    std::chrono::steady_clock::time_point start_time,
+    std::chrono::steady_clock::time_point dispatch_time) {
+    task.failover_count = 0;
+    task.xport_priority = 0;
+    task.status = PENDING;
+    task.request = request;
+    task.request.priority = DirectPathPolicy::priorityForRequest(request);
+    task.staging = false;
+    task.start_time = start_time;
+    task.dispatch_time = dispatch_time;
+    task.type = route.transport;
+    task.device_mask = route.device_mask;
+    task.qp_pool = route.qp_pool.value_or(std::string());
 }
 
 Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
