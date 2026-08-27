@@ -505,7 +505,7 @@ int RdmaTwoSidedTransport::dispatchTwoSidedTask(TransferTask *task) {
         }
     }
 
-    auto spraySend = [&](uint8_t seq, auto &&send_fn) -> int {
+    auto spraySend = [&](uint32_t seq, auto &&send_fn) -> int {
         const size_t n = rails.size();
         const size_t start = static_cast<size_t>(seq) % n;
         int last_rc = ERR_ENDPOINT;
@@ -544,7 +544,7 @@ int RdmaTwoSidedTransport::dispatchTwoSidedTask(TransferTask *task) {
     if (resume_off)
         twosided_resume_count_.fetch_add(1, std::memory_order_relaxed);
     for (size_t off = resume_off; off < length; off += max_payload) {
-        uint8_t seq = static_cast<uint8_t>(off / max_payload);
+        uint32_t seq = static_cast<uint32_t>(off / max_payload);
         uint32_t chunk =
             static_cast<uint32_t>(std::min(max_payload, length - off));
         int rc = spraySend(seq, [&](const std::shared_ptr<MsgChannel> &msg) {
@@ -703,7 +703,8 @@ void RdmaTwoSidedTransport::onMsgReceived(const std::string &peer_server_name,
         uint64_t cumulative = 0;
         {
             std::lock_guard<std::mutex> lock(recv_ack_mutex_);
-            auto &state = recv_acked_bytes_[hdr.task_id];
+            RecvAckKey key{peer_server_name, hdr.session, hdr.task_id};
+            auto &state = recv_acked_bytes_[key];
             state.bytes += hdr.length;
             state.chunks++;
             state.last_ms = nowMs();
@@ -714,7 +715,7 @@ void RdmaTwoSidedTransport::onMsgReceived(const std::string &peer_server_name,
             // re-creates the entry and its ACK is dropped by the sender, whose
             // task is already gone.
             if (hdr.total_chunks && state.chunks >= hdr.total_chunks)
-                recv_acked_bytes_.erase(hdr.task_id);
+                recv_acked_bytes_.erase(key);
         }
         (void)sendDataAck(peer_server_name, hdr.task_id, cumulative);
         return;
@@ -733,16 +734,14 @@ void RdmaTwoSidedTransport::onMsgReceived(const std::string &peer_server_name,
         }
         // Prefer same rail that received READ_REQ to avoid cross-rail hop.
         if (channel && channel->connected()) {
-            (void)channel->sendReadResp(
-                hdr.task_id, hdr.slice_seq, hdr.dest_addr,
-                reinterpret_cast<const void *>(hdr.dest_addr), hdr.length);
+            (void)channel->sendOrQueueReadResp(hdr.task_id, hdr.slice_seq,
+                                               hdr.dest_addr, hdr.length);
             return;
         }
         auto msg = ensureMsgChannel(peer_server_name);
         if (!msg) return;
-        (void)msg->sendReadResp(hdr.task_id, hdr.slice_seq, hdr.dest_addr,
-                                reinterpret_cast<const void *>(hdr.dest_addr),
-                                hdr.length);
+        (void)msg->sendOrQueueReadResp(hdr.task_id, hdr.slice_seq,
+                                       hdr.dest_addr, hdr.length);
         return;
     }
     if (hdr.type == MsgType::READ_RESP) {
