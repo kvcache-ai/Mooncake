@@ -30,8 +30,6 @@ class HighPerformanceTcpAdmissionController {
     void release(uint64_t tasks, uint64_t bytes);
     void close();
     void waitForZero();
-    uint64_t outstandingTasks() const;
-    uint64_t outstandingBytes() const;
 
    private:
     const uint64_t max_tasks_;
@@ -59,7 +57,6 @@ class HighPerformanceTcpWorkers {
         std::function<void()> cancel;
     };
 
-    HighPerformanceTcpWorkers();
     explicit HighPerformanceTcpWorkers(Config config);
     ~HighPerformanceTcpWorkers();
 
@@ -77,7 +74,6 @@ class HighPerformanceTcpWorkers {
     Status barrier();
     size_t affinityOwner(uint64_t peer, uint32_t lane) const;
     bool running() const { return running_.load(std::memory_order_acquire); }
-    bool controlContextAvailable() const { return !workers_.empty(); }
     size_t workerCount() const { return config_.worker_count; }
     asio::io_context& ioContext(size_t worker_id);
     bool onWorkerThread() const;

@@ -16,27 +16,10 @@
 namespace mooncake::tent {
 
 class HighPerformanceTcpBufferRegistry {
+   private:
+    struct Entry;
+
    public:
-    enum class AcquireFailure {
-        kNone,
-        kRangeRejected,
-        kStaleRegistration,
-        kPermissionDenied,
-        kShuttingDown,
-    };
-
-    struct Entry {
-        uint64_t base{0};
-        uint64_t length{0};
-        uint64_t registration_id{0};
-        Permission permission{kLocalReadWrite};
-
-        std::mutex mutex;
-        std::condition_variable drained;
-        bool closing{false};
-        uint64_t active_leases{0};
-    };
-
     class Lease {
        public:
         Lease() = default;
@@ -49,8 +32,6 @@ class HighPerformanceTcpBufferRegistry {
         void reset();
         void* data() const;
         uint64_t base() const;
-        uint64_t length() const;
-        explicit operator bool() const { return entry_ != nullptr; }
 
        private:
         friend class HighPerformanceTcpBufferRegistry;
@@ -74,23 +55,31 @@ class HighPerformanceTcpBufferRegistry {
     Status acquireRemoteLease(uint64_t addr, uint64_t length,
                               uint64_t registration_id,
                               HighPerformanceTcpOpcode opcode, Lease* lease,
-                              AcquireFailure* failure = nullptr);
+                              HighPerformanceTcpStatus* wire_status = nullptr);
 
     bool tracks(uint64_t base, uint64_t length) const;
 
    private:
+    struct Entry {
+        uint64_t base{0};
+        uint64_t length{0};
+        uint64_t registration_id{0};
+        Permission permission{kLocalReadWrite};
+        std::mutex mutex;
+        std::condition_variable drained;
+        bool closing{false};
+        uint64_t active_leases{0};
+    };
+
     Status acquire(uint64_t addr, uint64_t length, uint64_t registration_id,
                    HighPerformanceTcpOpcode opcode, bool remote, Lease* lease,
-                   AcquireFailure* failure);
+                   HighPerformanceTcpStatus* wire_status);
 
     mutable std::mutex registry_mutex_;
     std::map<uint64_t, std::shared_ptr<Entry>> entries_;
     uint64_t next_registration_id_{1};
     bool closing_{false};
 };
-
-HighPerformanceTcpStatus HighPerformanceTcpWireStatusForAcquireFailure(
-    HighPerformanceTcpBufferRegistry::AcquireFailure failure);
 
 }  // namespace mooncake::tent
 

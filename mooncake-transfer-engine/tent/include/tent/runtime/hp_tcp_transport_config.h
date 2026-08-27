@@ -29,8 +29,10 @@ struct HpTcpTransportConfig {
     HighPerformanceTcpParams params;
 };
 
-// This is intentionally the sole parser for transports/hp_tcp. Config::get()
-// silently substitutes defaults for type mismatches and is not suitable here.
+Status ValidateHpTcpTransportParams(const HighPerformanceTcpParams& params);
+
+// Config::get() silently substitutes defaults for type mismatches. Keep one
+// strict parser, then share parameter validation with direct construction.
 Status ParseHpTcpTransportConfig(const Config& config,
                                  HpTcpTransportConfig* out);
 

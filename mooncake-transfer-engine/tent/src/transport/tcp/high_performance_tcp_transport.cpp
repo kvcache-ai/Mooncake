@@ -83,12 +83,8 @@ Status RemoteWireStatus(HighPerformanceTcpStatus status) {
 
 struct HighPerformanceTcpTransport::TaskPlan {
     std::shared_ptr<HighPerformanceTcpTaskState> task;
-    HighPerformanceTcpClient::Operation operation;
     HighPerformanceTcpWorkers::Command command;
 };
-
-HighPerformanceTcpTransport::HighPerformanceTcpTransport()
-    : HighPerformanceTcpTransport(HighPerformanceTcpParams{}) {}
 
 HighPerformanceTcpTransport::HighPerformanceTcpTransport(
     HighPerformanceTcpParams params)
@@ -102,19 +98,6 @@ HighPerformanceTcpTransport::~HighPerformanceTcpTransport() {
         LOG(ERROR) << "HP TCP destructor uninstall failed: "
                    << status.ToString();
     }
-}
-
-Status HighPerformanceTcpTransport::validateParams() const {
-    if (params_.worker_count == 0 || params_.connections_per_peer == 0 ||
-        params_.max_outstanding_tasks == 0 ||
-        params_.max_outstanding_bytes == 0 || params_.max_transfer_bytes == 0 ||
-        params_.chunk_size == 0 ||
-        params_.chunk_size > params_.max_transfer_bytes ||
-        params_.connect_timeout_ms == 0 || params_.progress_timeout_ms == 0) {
-        return Status::InvalidArgument(
-            "invalid high-performance TCP limits" LOC_MARK);
-    }
-    return Status::OK();
 }
 
 std::string HighPerformanceTcpTransport::makeIncarnation() const {
@@ -162,7 +145,7 @@ Status HighPerformanceTcpTransport::install(
             "HP TCP transport is already installed or was not fully torn "
             "down" LOC_MARK);
     }
-    CHECK_STATUS(validateParams());
+    CHECK_STATUS(ValidateHpTcpTransportParams(params_));
     CHECK_STATUS(registry_.reopen());
     if (!metadata) {
         return Status::InvalidArgument("HP TCP metadata is null" LOC_MARK);
@@ -239,7 +222,7 @@ Status HighPerformanceTcpTransport::install(
         const std::string incarnation = makeIncarnation();
         std::string encoded;
         status = EncodeHighPerformanceTcpEndpointAttr(
-            {incarnation, {{host, bound_port}}, params_.max_transfer_bytes},
+            {incarnation, host, bound_port, params_.max_transfer_bytes},
             &encoded);
         if (status.ok()) {
             status = metadata_->segmentManager().updateLocal(
@@ -457,8 +440,7 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
         });
     if (!resolved.ok()) return resolved;
 
-    if (endpoint_attr.endpoints.size() != 1 ||
-        request.length > endpoint_attr.max_transfer_bytes) {
+    if (request.length > endpoint_attr.max_transfer_bytes) {
         return Status::InvalidArgument(
             "HP TCP request exceeds remote endpoint capability" LOC_MARK);
     }
@@ -480,15 +462,15 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
         workers_->affinityOwner(request.target_id, lane_id);
 
     auto task = std::make_shared<HighPerformanceTcpTaskState>(
-        request, batch->progress_batch_id, batch->notify_progress,
+        batch->progress_batch_id, batch->notify_progress,
         std::move(local_lease));
     task->setDispatchIdentity(owner_worker, request_id);
 
     HighPerformanceTcpClient::Operation operation;
     operation.peer_id = request.target_id;
     operation.incarnation = endpoint_attr.incarnation;
-    operation.host = endpoint_attr.endpoints[0].host;
-    operation.port = endpoint_attr.endpoints[0].port;
+    operation.host = endpoint_attr.host;
+    operation.port = endpoint_attr.port;
     operation.lane_id = lane_id;
     operation.registration_id = buffer_attr.registration_id;
     operation.remote_addr = request.target_offset;
@@ -574,10 +556,10 @@ Status HighPerformanceTcpTransport::submitTransferTasks(
     const size_t old_size = hp_batch->tasks.size();
     Status committed = workers_->tryCommitBatch(
         commands, admission_.get(), requests.size(), total_bytes, [&] {
-            for (auto& plan : plans) {
-                plan.task->activateReservation(admission_.get(),
-                                               plan.task->request().length);
-                hp_batch->tasks.push_back(std::move(plan.task));
+            for (size_t i = 0; i < plans.size(); ++i) {
+                plans[i].task->activateReservation(admission_.get(),
+                                                   requests[i].length);
+                hp_batch->tasks.push_back(std::move(plans[i].task));
             }
         });
     if (!committed.ok()) {

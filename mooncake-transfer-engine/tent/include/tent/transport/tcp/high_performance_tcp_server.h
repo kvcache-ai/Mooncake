@@ -10,9 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
-#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -66,11 +64,7 @@ class HighPerformanceTcpServer {
     HighPerformanceTcpBufferRegistry* registry_{nullptr};
     HighPerformanceTcpWorkers* workers_{nullptr};
 
-    asio::io_context accept_io_;
-    std::optional<asio::executor_work_guard<asio::io_context::executor_type>>
-        accept_guard_;
     std::unique_ptr<asio::ip::tcp::acceptor> acceptor_;
-    std::thread accept_thread_;
     std::atomic<bool> started_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<size_t> next_worker_{0};

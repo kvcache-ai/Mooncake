@@ -59,5 +59,12 @@ TEST(HpTcpTransportConfigTest, DisabledHpTcpIgnoresInactiveLimits) {
     EXPECT_FALSE(parsed.enabled);
 }
 
+TEST(HpTcpTransportConfigTest, DirectParamsShareValidation) {
+    HighPerformanceTcpParams params;
+    params.chunk_size = 2;
+    params.max_transfer_bytes = 1;
+    EXPECT_TRUE(ValidateHpTcpTransportParams(params).IsInvalidArgument());
+}
+
 }  // namespace
 }  // namespace mooncake::tent

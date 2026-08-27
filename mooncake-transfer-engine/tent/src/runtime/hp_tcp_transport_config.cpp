@@ -46,6 +46,19 @@ Status ReadString(const json& object, std::string_view key,
 
 }  // namespace
 
+Status ValidateHpTcpTransportParams(const HighPerformanceTcpParams& params) {
+    if (params.worker_count == 0 || params.connections_per_peer == 0 ||
+        params.max_outstanding_tasks == 0 ||
+        params.max_outstanding_bytes == 0 || params.max_transfer_bytes == 0 ||
+        params.chunk_size == 0 ||
+        params.chunk_size > params.max_transfer_bytes ||
+        params.connect_timeout_ms == 0 || params.progress_timeout_ms == 0) {
+        return Invalid("transports/hp_tcp",
+                       "contains zero or inconsistent limits");
+    }
+    return Status::OK();
+}
+
 Status ParseHpTcpTransportConfig(const Config& config,
                                  HpTcpTransportConfig* out) {
     if (out == nullptr) {
@@ -97,17 +110,8 @@ Status ParseHpTcpTransportConfig(const Config& config,
                               &parsed.params.connect_timeout_ms));
     CHECK_STATUS(ReadUnsigned(hp_tcp, "progress_timeout_ms",
                               &parsed.params.progress_timeout_ms));
-
-    const auto& hp = parsed.params;
-    if (parsed.enabled &&
-        (hp.worker_count == 0 || hp.connections_per_peer == 0 ||
-         hp.max_outstanding_tasks == 0 || hp.max_outstanding_bytes == 0 ||
-         hp.max_transfer_bytes == 0 || hp.chunk_size == 0 ||
-         hp.chunk_size > hp.max_transfer_bytes || hp.connect_timeout_ms == 0 ||
-         hp.progress_timeout_ms == 0)) {
-        return Invalid("transports/hp_tcp",
-                       "contains zero or inconsistent limits");
-    }
+    if (parsed.enabled)
+        CHECK_STATUS(ValidateHpTcpTransportParams(parsed.params));
 
     *out = std::move(parsed);
     return Status::OK();

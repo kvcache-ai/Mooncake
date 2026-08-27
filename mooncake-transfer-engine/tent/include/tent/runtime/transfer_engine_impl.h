@@ -31,9 +31,9 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
+#include "tent/runtime/hp_tcp_transport_config.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
-#include "tent/runtime/hp_tcp_transport_config.h"
 
 namespace mooncake {
 namespace tent {

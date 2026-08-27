@@ -57,7 +57,7 @@ TEST(HighPerformanceTcpWorkersTest, BatchAdmissionHasNoPartialCommit) {
                                     [&] { committed = true; })
                     .IsTooManyRequests());
     EXPECT_FALSE(committed);
-    EXPECT_EQ(admission.outstandingTasks(), 1u);
+    EXPECT_TRUE(admission.tryReserve(1, 1).IsTooManyRequests());
     admission.release(1, 512);
     EXPECT_TRUE(workers.stop().ok());
 }
@@ -79,14 +79,13 @@ TEST(HighPerformanceTcpTaskTest, CompletionReleasesLeaseAndBudgetOnce) {
     HighPerformanceTcpAdmissionController admission(1, memory.size());
     ASSERT_TRUE(admission.tryReserve(1, memory.size()).ok());
 
-    Request request{};
-    request.length = memory.size();
     auto task = std::make_shared<HighPerformanceTcpTaskState>(
-        request, 1, [](BatchID) {}, std::move(lease));
+        1, [](BatchID) {}, std::move(lease));
     task->activateReservation(&admission, memory.size());
     EXPECT_TRUE(task->completeOnce(COMPLETED, memory.size()));
     EXPECT_FALSE(task->completeOnce(FAILED, 0));
-    EXPECT_EQ(admission.outstandingTasks(), 0u);
+    EXPECT_TRUE(admission.tryReserve(1, memory.size()).ok());
+    admission.release(1, memory.size());
     EXPECT_TRUE(
         registry
             .remove(reinterpret_cast<uint64_t>(memory.data()), memory.size())

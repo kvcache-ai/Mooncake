@@ -5,7 +5,6 @@
 #include <array>
 #include <chrono>
 #include <functional>
-#include <future>
 #include <utility>
 
 #include <glog/logging.h>
@@ -82,14 +81,12 @@ class HighPerformanceTcpServer::Session
             return;
         }
 
-        HighPerformanceTcpBufferRegistry::AcquireFailure failure =
-            HighPerformanceTcpBufferRegistry::AcquireFailure::kNone;
+        HighPerformanceTcpStatus wire_status = HighPerformanceTcpStatus::kOk;
         const Status lease_status = registry_->acquireRemoteLease(
             request_.remote_addr, request_.length, request_.registration_id,
-            request_.opcode, &lease_, &failure);
+            request_.opcode, &lease_, &wire_status);
         if (!lease_status.ok()) {
-            sendResponse(HighPerformanceTcpWireStatusForAcquireFailure(failure),
-                         0, false);
+            sendResponse(wire_status, 0, false);
             return;
         }
 
@@ -305,53 +302,57 @@ Status HighPerformanceTcpServer::start(uint16_t* bound_port) {
             "HP TCP server already started" LOC_MARK);
     }
 
+    if (!workers_->running() || workers_->onWorkerThread()) {
+        started_.store(false, std::memory_order_release);
+        return Status::InvalidArgument(
+            "HP TCP server start requires a running external worker" LOC_MARK);
+    }
+
+    Status result = Status::OK();
+    uint16_t port = 0;
+    stopping_.store(false, std::memory_order_release);
+    next_worker_.store(0, std::memory_order_release);
     try {
-        asio::ip::tcp::endpoint endpoint;
-        if (config_.bind_address.empty()) {
-            endpoint =
-                asio::ip::tcp::endpoint(asio::ip::tcp::v4(), config_.port);
-        } else {
-            endpoint = asio::ip::tcp::endpoint(
-                asio::ip::make_address(config_.bind_address), config_.port);
-        }
-        acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(accept_io_);
-        acceptor_->open(endpoint.protocol());
-        acceptor_->set_option(asio::socket_base::reuse_address(true));
-        acceptor_->bind(endpoint);
-        acceptor_->listen(asio::socket_base::max_listen_connections);
-        *bound_port = acceptor_->local_endpoint().port();
-        accept_guard_.emplace(asio::make_work_guard(accept_io_));
-        stopping_.store(false, std::memory_order_release);
-        Status accept_status = startAccept();
-        if (!accept_status.ok()) {
-            std::error_code ignored;
-            acceptor_->close(ignored);
-            accept_guard_->reset();
-            started_.store(false, std::memory_order_release);
-            acceptor_.reset();
-            accept_guard_.reset();
-            return accept_status;
-        }
-        accept_thread_ = std::thread([this] {
+        asio::post(workers_->ioContext(0), [this, &result, &port] {
             try {
-                accept_io_.run();
+                const asio::ip::tcp::endpoint endpoint =
+                    config_.bind_address.empty()
+                        ? asio::ip::tcp::endpoint(asio::ip::tcp::v4(),
+                                                  config_.port)
+                        : asio::ip::tcp::endpoint(
+                              asio::ip::make_address(config_.bind_address),
+                              config_.port);
+                acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(
+                    workers_->ioContext(0));
+                acceptor_->open(endpoint.protocol());
+                acceptor_->set_option(asio::socket_base::reuse_address(true));
+                acceptor_->bind(endpoint);
+                acceptor_->listen(asio::socket_base::max_listen_connections);
+                port = acceptor_->local_endpoint().port();
+                result = startAccept();
             } catch (const std::exception& error) {
-                LOG(ERROR) << "HP TCP accept loop failed: " << error.what();
-                stopping_.store(true, std::memory_order_release);
+                result = Status::InternalError(
+                    std::string("HP TCP listener start failed: ") +
+                    error.what() + LOC_MARK);
             } catch (...) {
-                LOG(ERROR) << "HP TCP accept loop failed";
-                stopping_.store(true, std::memory_order_release);
+                result = Status::InternalError(
+                    "HP TCP listener start failed" LOC_MARK);
             }
         });
-        return Status::OK();
     } catch (const std::exception& error) {
         started_.store(false, std::memory_order_release);
-        acceptor_.reset();
-        accept_guard_.reset();
         return Status::InternalError(
-            std::string("HP TCP listener start failed: ") + error.what() +
+            std::string("HP TCP listener dispatch failed: ") + error.what() +
             LOC_MARK);
     }
+    CHECK_STATUS(workers_->barrier());
+    if (!result.ok()) {
+        acceptor_.reset();
+        started_.store(false, std::memory_order_release);
+        return result;
+    }
+    *bound_port = port;
+    return Status::OK();
 }
 
 Status HighPerformanceTcpServer::startAccept() {
@@ -405,7 +406,6 @@ Status HighPerformanceTcpServer::startAccept() {
                     stopping_.store(true, std::memory_order_release);
                     std::error_code ignored;
                     if (acceptor_) acceptor_->close(ignored);
-                    if (accept_guard_) accept_guard_->reset();
                 }
             }
         });
@@ -430,16 +430,6 @@ void HighPerformanceTcpServer::installAcceptedSocket(
         }
         return;
     }
-    std::error_code error;
-    socket->set_option(asio::ip::tcp::no_delay(true), error);
-    if (error) {
-        socket->close(error);
-        if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            sessions_wait_cv_.notify_all();
-        }
-        return;
-    }
-
     std::shared_ptr<Session> session;
     try {
         session = std::make_shared<Session>(this, worker_id, socket, config_,
@@ -479,33 +469,28 @@ void HighPerformanceTcpServer::onSessionClosed(
 
 Status HighPerformanceTcpServer::stopAccepting() {
     if (!started_.load(std::memory_order_acquire)) return Status::OK();
-    if (stopping_.exchange(true, std::memory_order_acq_rel)) {
-        if (accept_thread_.joinable()) accept_thread_.join();
+    if (!workers_->running() || workers_->onWorkerThread()) {
+        return Status::InvalidArgument(
+            "HP TCP listener stop requires a running external worker" LOC_MARK);
+    }
+    if (stopping_.exchange(true, std::memory_order_acq_rel))
         return Status::OK();
-    }
-
-    if (accept_thread_.joinable()) {
-        auto done = std::make_shared<std::promise<void>>();
-        auto future = done->get_future();
-        try {
-            asio::post(accept_io_, [this, done] {
-                std::error_code ignored;
-                if (acceptor_) {
-                    acceptor_->cancel(ignored);
-                    acceptor_->close(ignored);
-                }
-                if (accept_guard_) accept_guard_->reset();
-                done->set_value();
-            });
-            future.wait();
-        } catch (...) {
+    try {
+        asio::post(workers_->ioContext(0), [this] {
             std::error_code ignored;
-            if (acceptor_) acceptor_->close(ignored);
-            if (accept_guard_) accept_guard_->reset();
-        }
-        accept_thread_.join();
+            if (acceptor_) {
+                acceptor_->cancel(ignored);
+                acceptor_->close(ignored);
+                acceptor_.reset();
+            }
+        });
+    } catch (const std::exception& error) {
+        stopping_.store(false, std::memory_order_release);
+        return Status::InternalError(
+            std::string("HP TCP listener stop dispatch failed: ") +
+            error.what() + LOC_MARK);
     }
-    return Status::OK();
+    return workers_->barrier();
 }
 
 void HighPerformanceTcpServer::cancelWorkerSessions(size_t worker_id) {
@@ -524,7 +509,7 @@ Status HighPerformanceTcpServer::cancelAll() {
         return Status::InvalidArgument(
             "HP TCP server cancelAll cannot block a worker" LOC_MARK);
     }
-    if (!workers_->controlContextAvailable()) {
+    if (!workers_->running()) {
         return active_sessions_.load() == 0
                    ? Status::OK()
                    : Status::InternalError(
@@ -554,8 +539,6 @@ Status HighPerformanceTcpServer::cancelAll() {
 Status HighPerformanceTcpServer::stop() {
     Status first = stopAccepting();
     Status canceled = cancelAll();
-    acceptor_.reset();
-    accept_guard_.reset();
     started_.store(false, std::memory_order_release);
     if (!first.ok()) return first;
     return canceled;

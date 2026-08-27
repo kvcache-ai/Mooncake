@@ -76,9 +76,8 @@ TEST(HighPerformanceTcpTransportTest,
     HighPerformanceTcpEndpointAttr endpoint;
     ASSERT_TRUE(
         DecodeHighPerformanceTcpEndpointAttr(attr_it->second, &endpoint).ok());
-    ASSERT_EQ(endpoint.endpoints.size(), 1U);
-    EXPECT_EQ(endpoint.endpoints[0].host, "127.0.0.1");
-    EXPECT_NE(endpoint.endpoints[0].port, 0);
+    EXPECT_EQ(endpoint.host, "127.0.0.1");
+    EXPECT_NE(endpoint.port, 0);
 
     std::array<uint8_t, 64> local_only_storage{};
     BufferDesc local_only;
@@ -240,9 +239,6 @@ TEST(HighPerformanceTcpTransportTest,
     EXPECT_EQ(transfer_status.s, FAILED);
     EXPECT_TRUE(first_result.IsNeedsRefreshCache()) << first_result.ToString();
 
-    int metadata_refresh_retry_count = 0;
-    ASSERT_LT(metadata_refresh_retry_count, 1);
-    ++metadata_refresh_retry_count;
     ASSERT_TRUE(
         client_metadata->segmentManager().invalidateRemote(target).ok());
     ASSERT_TRUE(client.retryTransferTask(batch, 0, request).ok());
@@ -252,7 +248,6 @@ TEST(HighPerformanceTcpTransportTest,
     EXPECT_TRUE(retry_result.ok()) << retry_result.ToString();
     EXPECT_EQ(transfer_status.s, COMPLETED);
     EXPECT_EQ(transfer_status.transferred_bytes, request.length);
-    EXPECT_EQ(metadata_refresh_retry_count, 1);
 
     SegmentDescRef refreshed;
     ASSERT_TRUE(client_metadata->segmentManager()
