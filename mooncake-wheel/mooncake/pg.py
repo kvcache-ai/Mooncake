@@ -340,6 +340,7 @@ def main(argv=None) -> int:
     if args.prebuild:
         _load_jit_adapter()
         return 0
+    raise AssertionError("argparse accepted no PG JIT action")
 
 
 if __name__ == "__main__":
