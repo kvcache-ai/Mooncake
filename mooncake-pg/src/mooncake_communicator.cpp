@@ -1826,11 +1826,6 @@ void MooncakeCommunicator::applyGroupState(
     bool active_ranks_in_control_update = false;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     if (effective_gpu_collective_backend == GpuCollectiveBackend::New) {
-        if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
-            active_ranks_mirror_device_index_ == device_index_) {
-            active_ranks_in_control_update =
-                device_collective_->hasPendingRecovery();
-        }
         switch (next_mode) {
             case CollectiveExtensionState::Isolated:
             case CollectiveExtensionState::Quiescing:
@@ -1839,6 +1834,14 @@ void MooncakeCommunicator::applyGroupState(
             case CollectiveExtensionState::Normal:
                 PG_ASSERT_OK(device_collective_->applyGroupView(view));
                 break;
+        }
+        if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
+            active_ranks_mirror_device_index_ == device_index_) {
+            // Check after updating the runtime's host state. If recovery is
+            // still pending, its pinned update will now include this view;
+            // otherwise the mirror must follow the normal copy path below.
+            active_ranks_in_control_update =
+                device_collective_->hasPendingRecovery();
         }
     }
 #endif

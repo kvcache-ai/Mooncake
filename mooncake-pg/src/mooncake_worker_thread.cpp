@@ -385,8 +385,8 @@ void MooncakeWorker::startWorker() {
                                 LinkEvent event;
                                 const auto max_world_size =
                                     group->communicator->getMaxWorldSize();
-                                event.events.assign(
-                                    max_world_size, LinkEvent::EventType::None);
+                                event.events.assign(max_world_size,
+                                                    LinkEvent::EventType::None);
                                 event.target_rank_epochs.assign(max_world_size,
                                                                 0);
                                 for (int j = 0; j < group->maxGroupSize; ++j) {
