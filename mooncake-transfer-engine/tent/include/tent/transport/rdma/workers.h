@@ -41,7 +41,7 @@ class Workers {
     friend class RdmaTransportTestPeer;
 
    public:
-    static constexpr size_t kCapacity = 1024 * 8;
+    static constexpr size_t kCapacity = 1024 * 64;
     using BoundedSliceQueue = BoundedMPSCQueue<RdmaSliceList, kCapacity>;
 
    public:
