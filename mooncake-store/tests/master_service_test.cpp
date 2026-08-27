@@ -234,7 +234,8 @@ class MasterServiceTest : public ::testing::Test {
         PutCompletedObject(service, client_id, ungrouped_key, ungrouped_config);
 
         const TenantId tenant = TenantId::Default();
-        const size_t grouped_correct = service.getShardIndex(tenant, grouped_key);
+        const size_t grouped_correct =
+            service.getShardIndex(tenant, grouped_key);
         const size_t wrong = (grouped_correct + 1) %
                              static_cast<size_t>(MasterService::kNumShards);
 
@@ -252,11 +253,13 @@ class MasterServiceTest : public ::testing::Test {
             auto node = tenant_it->second.metadata.extract(obj_it);
             ASSERT_FALSE(node.empty());
             MasterService::MetadataShardAccessorRW dst(&service, wrong);
-            auto& dst_tenant = service.GetOrCreateTenantState(dst.get(), tenant);
+            auto& dst_tenant =
+                service.GetOrCreateTenantState(dst.get(), tenant);
             dst_tenant.metadata.insert(std::move(node));
         }
 
-        // Now unreachable via hash(tenant, key) lookup (the old-snapshot problem).
+        // Now unreachable via hash(tenant, key) lookup (the old-snapshot
+        // problem).
         EXPECT_FALSE(service.ExistKey(grouped_key, tenant).value_or(true));
 
         // Run the migration.
@@ -1425,8 +1428,8 @@ TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
     PutCompletedObject(*service_, client_id, key_a, config);
     PutCompletedObject(*service_, client_id, key_b, config);
 
-    // Both members are reachable purely through hash(tenant, key) routing, which
-    // is decoupled from the group domain.
+    // Both members are reachable purely through hash(tenant, key) routing,
+    // which is decoupled from the group domain.
     EXPECT_TRUE(service_->ExistKey(key_a, TenantId::Default()).value_or(false));
     EXPECT_TRUE(service_->ExistKey(key_b, TenantId::Default()).value_or(false));
     EXPECT_TRUE(
@@ -1915,7 +1918,8 @@ TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
 
-    // The shared group TTL is active, so a non-force remove of key_a is rejected.
+    // The shared group TTL is active, so a non-force remove of key_a is
+    // rejected.
     auto remove_read_member = service_->Remove(key_a, TenantId::Default());
     ASSERT_FALSE(remove_read_member.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_read_member.error());
@@ -1932,8 +1936,7 @@ TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
                     .has_value());
 }
 
-TEST_F(MasterServiceTest,
-       GroupedMembershipChangeStillSharesGroupLeaseOnRead) {
+TEST_F(MasterServiceTest, GroupedMembershipChangeStillSharesGroupLeaseOnRead) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(500).build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
@@ -2290,8 +2293,9 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
 // protected as a whole — without the read path ever touching the group table.
 TEST_F(MasterServiceTest, GroupLeaseIsSharedAndExtendsOnMemberRead) {
     const uint64_t kv_lease_ttl = 1000;
-    auto service_config =
-        MasterServiceConfig::builder().set_default_kv_lease_ttl(kv_lease_ttl).build();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();

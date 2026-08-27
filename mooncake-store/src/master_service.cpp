@@ -2240,11 +2240,11 @@ void MasterService::RebuildGroupState() {
                 auto lease =
                     RegisterGroupMember(tenant_id, key, metadata.group_id);
                 metadata.group_lease_ = lease;
-                // A grouped object's authoritative lease is the shared group TTL,
-                // which is recreated empty on restore — clients re-establish
-                // sessions/leases after a restart, so the group is not protected
-                // until it is read again. The object's own lease_timeout is not
-                // authoritative for grouped objects.
+                // A grouped object's authoritative lease is the shared group
+                // TTL, which is recreated empty on restore — clients
+                // re-establish sessions/leases after a restart, so the group is
+                // not protected until it is read again. The object's own
+                // lease_timeout is not authoritative for grouped objects.
             }
         }
     }
@@ -2255,8 +2255,8 @@ void MasterService::ReRouteRestoredObjectsByKey() {
     // hash(group_id) shards restore those objects to the wrong shard; the
     // rest of this version looks every object up by hash(tenant, key). Move any
     // object whose hash(tenant, key) shard differs from the one it was restored
-    // to. Node handles transfer the storage without moving ObjectMetadata (which
-    // has const members), so no copy/move constructor is required.
+    // to. Node handles transfer the storage without moving ObjectMetadata
+    // (which has const members), so no copy/move constructor is required.
     bool moved = false;
     for (size_t src_idx = 0; src_idx < kNumShards; ++src_idx) {
         MetadataShardAccessorRW src(this, src_idx);
@@ -2279,8 +2279,7 @@ void MasterService::ReRouteRestoredObjectsByKey() {
                     continue;
                 }
                 MetadataShardAccessorRW dst(this, dst_idx);
-                auto& dst_tenant =
-                    GetOrCreateTenantState(dst.get(), tenant_id);
+                auto& dst_tenant = GetOrCreateTenantState(dst.get(), tenant_id);
                 // Restored snapshots have unique (tenant, key) so a collision
                 // here would only happen for a corrupt snapshot; keep the
                 // existing entry in that case.
@@ -3261,9 +3260,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     object.tenant_id, object.user_key));
             (void)inserted;
             if (!standby_meta.group_id.empty()) {
-                it->second.group_lease_ =
-                    RegisterGroupMember(object.tenant_id, object.user_key,
-                                        standby_meta.group_id);
+                it->second.group_lease_ = RegisterGroupMember(
+                    object.tenant_id, object.user_key, standby_meta.group_id);
             }
             tenant_state.processing_keys.erase(object.user_key);
         }
@@ -9793,8 +9791,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         if (group_lease != nullptr && !group_lease->IsExpired(now)) {
             return {};
         }
-        // Fallback for a grouped object whose group entry is not yet registered:
-        // protect on the object's own lease.
+        // Fallback for a grouped object whose group entry is not yet
+        // registered: protect on the object's own lease.
         if (group_lease == nullptr && !metadata.IsLeaseExpired(now)) {
             return {};
         }
@@ -10191,8 +10189,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (group_lease != nullptr && !group_lease->IsExpired(now)) {
             return {};
         }
-        // Fallback for a grouped object whose group entry is not yet registered:
-        // protect on the object's own lease.
+        // Fallback for a grouped object whose group entry is not yet
+        // registered: protect on the object's own lease.
         if (group_lease == nullptr && !metadata.IsLeaseExpired(now)) {
             return {};
         }
@@ -10324,11 +10322,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (it->second.IsHardPinned()) continue;
                         bool has_evictable = can_evict_replicas(it->second);
                         if (has_evictable) shard_evictable_count++;
-                        // Grouped objects are evicted all-or-none, so rank them by
-                        // the shared group TTL (consistent across members) instead
-                        // of each member's own lease; this keeps the candidate
-                        // cutoff aligned with group boundaries and prevents
-                        // over-eviction.
+                        // Grouped objects are evicted all-or-none, so rank them
+                        // by the shared group TTL (consistent across members)
+                        // instead of each member's own lease; this keeps the
+                        // candidate cutoff aligned with group boundaries and
+                        // prevents over-eviction.
                         const auto deadline = it->second.EvictionDeadline();
                         if (now < deadline || !has_evictable) continue;
                         if (!IsSoftPinActive(it->second, now)) {
@@ -10433,15 +10431,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 !can_evict_replicas(metadata)) {
                                 continue;
                             }
-                            // Group-aware eviction deadline (shared group TTL for
-                            // grouped objects) so the cutoff matches eviction.
+                            // Group-aware eviction deadline (shared group TTL
+                            // for grouped objects) so the cutoff matches
+                            // eviction.
                             const auto deadline = metadata.EvictionDeadline();
                             if (now < deadline) continue;
                             if (use_cutoff) {
-                                const bool in_range =
-                                    collect_older_or_equal
-                                        ? deadline <= cutoff
-                                        : deadline > cutoff;
+                                const bool in_range = collect_older_or_equal
+                                                          ? deadline <= cutoff
+                                                          : deadline > cutoff;
                                 if (!in_range) continue;
                             }
                             local_frontier[t].push_back(
@@ -10530,11 +10528,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         long evicted_this_pass = 0;
         auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
             for (auto& c : batch) {
-                // Stop once the target object count is reached. Grouped eviction
-                // is all-or-none, so evicting a group can overshoot evict_num by
-                // at most one group; using evict_num (rather than the per-object
-                // lease cutoff) bounds that overshoot and keeps the eviction
-                // ratio close to the target.
+                // Stop once the target object count is reached. Grouped
+                // eviction is all-or-none, so evicting a group can overshoot
+                // evict_num by at most one group; using evict_num (rather than
+                // the per-object lease cutoff) bounds that overshoot and keeps
+                // the eviction ratio close to the target.
                 if (evicted_this_pass >= evict_num) {
                     no_pin_objects.push_back(c.lease_timeout);
                     continue;
@@ -10640,7 +10638,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                target_evict_num > 0) {
                             if (!it->second.IsHardPinned() &&
                                 now >= it->second.EvictionDeadline() &&
-                                it->second.EvictionDeadline() <= target_timeout &&
+                                it->second.EvictionDeadline() <=
+                                    target_timeout &&
                                 !IsSoftPinActive(it->second, now) &&
                                 can_evict_replicas(it->second)) {
                                 auto evict_result = try_evict_group_or_object(
@@ -11619,7 +11618,8 @@ MasterService::MetadataSerializer::Deserialize(
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
     // Migrate old-format snapshots: re-route objects to their hash(tenant, key)
-    // shards before rebuilding the group domain (which is derived from metadata).
+    // shards before rebuilding the group domain (which is derived from
+    // metadata).
     service_->ReRouteRestoredObjectsByKey();
     service_->RebuildGroupState();
     service_->ClearCandidatesForReload();

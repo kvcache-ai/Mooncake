@@ -161,22 +161,20 @@ class GroupLease {
         const int64_t new_deadline =
             now + static_cast<int64_t>(ttl_ms) * 1000000LL;
         while (cur < new_deadline &&
-               !deadline_ns_.compare_exchange_weak(
-                   cur, new_deadline, std::memory_order_relaxed)) {
+               !deadline_ns_.compare_exchange_weak(cur, new_deadline,
+                                                   std::memory_order_relaxed)) {
         }
     }
 
-    // Merge an externally-derived deadline (used when rebuilding a group's lease
-    // from a snapshot so the group TTL is the max of member deadlines).
+    // Merge an externally-derived deadline (used when rebuilding a group's
+    // lease from a snapshot so the group TTL is the max of member deadlines).
     void ExtendTo(const std::chrono::system_clock::time_point deadline) {
-        const int64_t d =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                deadline.time_since_epoch())
-                .count();
+        const int64_t d = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              deadline.time_since_epoch())
+                              .count();
         int64_t cur = deadline_ns_.load(std::memory_order_relaxed);
-        while (cur < d &&
-               !deadline_ns_.compare_exchange_weak(cur, d,
-                                                   std::memory_order_relaxed)) {
+        while (cur < d && !deadline_ns_.compare_exchange_weak(
+                              cur, d, std::memory_order_relaxed)) {
         }
     }
 
@@ -1164,12 +1162,13 @@ class MasterService {
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
-        // Authoritative lease for ungrouped objects only. Grouped objects do not
-        // maintain it; use the group-aware lease methods instead of this field.
+        // Authoritative lease for ungrouped objects only. Grouped objects do
+        // not maintain it; use the group-aware lease methods instead of this
+        // field.
         mutable std::chrono::system_clock::time_point lease_timeout
             GUARDED_BY(lock);  // hard lease (ungrouped)
-        // Shared group TTL for grouped objects (the authoritative lease); null if
-        // ungrouped. Not persisted; rebuilt from snapshots.
+        // Shared group TTL for grouped objects (the authoritative lease); null
+        // if ungrouped. Not persisted; rebuilt from snapshots.
         mutable std::shared_ptr<GroupLease> group_lease_ GUARDED_BY(lock);
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
@@ -1390,8 +1389,8 @@ class MasterService {
         void GrantReadLease(const uint64_t ttl) const {
             SpinLocker locker(&lock);
             // Grouped: extend the group TTL; this object's own lease is not
-            // authoritative. Guard on ttl > 0 so PutEnd's GrantReadLease(0) does
-            // not mark the whole group as expired.
+            // authoritative. Guard on ttl > 0 so PutEnd's GrantReadLease(0)
+            // does not mark the whole group as expired.
             if (group_lease_ != nullptr) {
                 if (ttl > 0) {
                     group_lease_->GrantReadLease(ttl);
@@ -1405,8 +1404,8 @@ class MasterService {
                 std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
         }
 
-        // Whether the (authoritative) lease needs a refresh. Grouped objects use
-        // the shared group TTL; ungrouped objects use their own lease.
+        // Whether the (authoritative) lease needs a refresh. Grouped objects
+        // use the shared group TTL; ungrouped objects use their own lease.
         bool NeedsReadLeaseRefresh(const uint64_t ttl) const {
             SpinLocker locker(&lock);
             const auto now = std::chrono::system_clock::now();
@@ -1417,11 +1416,13 @@ class MasterService {
         }
 
         // Group-aware lease check: grouped objects use the shared group TTL
-        // (reading any member protects the whole group), ungrouped use their own.
+        // (reading any member protects the whole group), ungrouped use their
+        // own.
         bool IsLeaseExpired() const {
             SpinLocker locker(&lock);
             if (group_lease_ != nullptr) {
-                return group_lease_->IsExpired(std::chrono::system_clock::now());
+                return group_lease_->IsExpired(
+                    std::chrono::system_clock::now());
             }
             return std::chrono::system_clock::now() >= lease_timeout;
         }
@@ -2009,7 +2010,8 @@ class MasterService {
     // Registers a member key under a group and returns the group's shared
     // GroupLease (creating the group/lease on first member). Callers wire the
     // returned lease into the object metadata so the read path can extend the
-    // group TTL without touching this table. Returns nullptr for empty group_id.
+    // group TTL without touching this table. Returns nullptr for empty
+    // group_id.
     std::shared_ptr<GroupLease> RegisterGroupMember(
         const TenantId& tenant_id, const std::string& key,
         const std::string& group_id);
