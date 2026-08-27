@@ -1279,6 +1279,122 @@ TEST(EngineFailoverE2E, QueuedPathSubmitStageFailover) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
+namespace {
+
+// Regression transport for the all-or-nothing submission contract (see
+// Transport::submitTransferTasks): on its first submit call it accepts the
+// first accept_count requests into its sub-batch, then hits an internal
+// error and rolls the appends back before returning the error — what a
+// contract-compliant transport must do when a partial submission fails
+// mid-batch. The engine must recover via submit-stage failover, every
+// request must execute exactly once, and the original attempt must settle
+// cleanly.
+class PartialAcceptThenFailTransport : public FakeTransport {
+   public:
+    PartialAcceptThenFailTransport(TransportType self_type, size_t accept_count)
+        : FakeTransport(self_type), accept_count_(accept_count) {}
+
+    std::atomic<int> rollback_count{0};
+    FakeSubBatch* last_sub_batch = nullptr;
+
+    Status submitTransferTasks(
+        SubBatchRef batch, const std::vector<Request>& request_list) override {
+        ++submit_calls;
+        if (failed_once_) {
+            return FakeTransport::submitTransferTasks(batch, request_list);
+        }
+        failed_once_ = true;
+        auto* fb = static_cast<FakeSubBatch*>(batch);
+        last_sub_batch = fb;
+        const size_t accepted = accept_count_ < request_list.size()
+                                    ? accept_count_
+                                    : request_list.size();
+        // Partially accept a prefix of the batch...
+        for (size_t i = 0; i < accepted; ++i) {
+            fb->requests.push_back(request_list[i]);
+            fb->statuses.push_back(
+                {TransferStatusEnum::COMPLETED, request_list[i].length});
+            fb->poll_counts.push_back(0);
+            fb->task_count++;
+        }
+        // ... then hit an error and roll the prefix back so the failed
+        // submission leaves the sub-batch unchanged.
+        for (size_t i = 0; i < accepted; ++i) {
+            fb->requests.pop_back();
+            fb->statuses.pop_back();
+            fb->poll_counts.pop_back();
+        }
+        fb->task_count -= (int)accepted;
+        rollback_count += (int)accepted;
+        return Status::InternalError("partial submission rolled back" LOC_MARK);
+    }
+
+   private:
+    size_t accept_count_;
+    bool failed_once_ = false;
+};
+
+}  // namespace
+
+TEST(EngineFailoverE2E, SubmitStagePartialAcceptanceExecutesExactlyOnce) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    constexpr size_t kNumRequests = 4;
+    constexpr size_t kAcceptPrefix = 2;
+    auto primary =
+        std::make_shared<PartialAcceptThenFailTransport>(RDMA, kAcceptPrefix);
+    auto secondary = std::make_shared<FakeTransport>(TCP);
+    std::string seg_name = engine.getSegmentName();
+    ASSERT_TRUE(primary->install(seg_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(secondary->install(seg_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, primary);
+    engine.swapTransportForTest(TCP, secondary);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen * kNumRequests, 0x6b);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch_id = engine.allocateBatch(8);
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    std::vector<Request> requests;
+    requests.reserve(kNumRequests);
+    for (size_t i = 0; i < kNumRequests; ++i) {
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = buf.data() + i * kBufLen;
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset =
+            reinterpret_cast<uint64_t>(buf.data() + i * kBufLen);
+        req.length = kBufLen;
+        requests.push_back(req);
+    }
+
+    ASSERT_TRUE(engine.submitTransfer(batch_id, requests).ok());
+
+    for (size_t i = 0; i < kNumRequests; ++i) {
+        auto status = pollUntilDone(engine, batch_id, i);
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    }
+
+    // The failed RDMA submission rolled its accepted prefix back: the
+    // original attempt settled cleanly with no lingering tasks in the
+    // sub-batch.
+    EXPECT_EQ(primary->submit_calls.load(), 1);
+    EXPECT_EQ(primary->rollback_count.load(), (int)kAcceptPrefix);
+    ASSERT_NE(primary->last_sub_batch, nullptr);
+    EXPECT_EQ(primary->last_sub_batch->task_count, 0);
+    EXPECT_TRUE(primary->last_sub_batch->requests.empty());
+
+    // Every request executed exactly once, on the fallback transport.
+    EXPECT_EQ(secondary->submitted_request_count.load(), (int)kNumRequests);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
