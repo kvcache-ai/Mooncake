@@ -667,6 +667,34 @@ bool DummyClient::copy_from_staging(const PreparedBuffer &buffer, size_t size) c
     return runtime.CopyFromHost(buffer.original, buffer.staging->ptr(), size);
 }
 
+std::optional<DummyClient::PreparedMultiBuffers>
+DummyClient::prepare_multi_buffers(
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes) {
+    if (all_buffers.size() != all_sizes.size()) return std::nullopt;
+
+    PreparedMultiBuffers prepared;
+    prepared.dummy_buffers.reserve(all_buffers.size());
+    size_t total_buffers = 0;
+    for (const auto &buffers : all_buffers) total_buffers += buffers.size();
+    prepared.buffers.reserve(total_buffers);
+    for (size_t i = 0; i < all_buffers.size(); ++i) {
+        if (all_buffers[i].size() != all_sizes[i].size()) {
+            return std::nullopt;
+        }
+        auto &dummy_row = prepared.dummy_buffers.emplace_back();
+        dummy_row.reserve(all_buffers[i].size());
+        for (size_t j = 0; j < all_buffers[i].size(); ++j) {
+            auto buffer = prepare_buffer(all_buffers[i][j], all_sizes[i][j],
+                                         true);
+            if (!buffer) return std::nullopt;
+            dummy_row.push_back(reinterpret_cast<uint64_t>(buffer->dummy));
+            prepared.buffers.emplace_back(std::move(*buffer));
+        }
+    }
+    return prepared;
+}
+
 int64_t DummyClient::unregister_shm() {
     LOG(INFO) << "[unregister_shm] client_id=" << client_id_;
 #if defined(USE_ASCEND_DIRECT)
@@ -1379,13 +1407,19 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
     const ReplicateConfig& config) {
-    std::vector<std::vector<uint64_t>> dummy_nested =
-        void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    if (keys.size() != all_buffer_ptrs.size() ||
+        keys.size() != all_sizes.size()) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+    auto prepared = prepare_multi_buffers(all_buffer_ptrs, all_sizes);
+    if (!prepared) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_put_from_multi_buffers_dummy_helper,
-                         void>(keys.size(), keys, dummy_nested, all_sizes,
-                               config, device_id_, client_id_);
+                         void>(keys.size(), keys, prepared->dummy_buffers,
+                               all_sizes, config, device_id_, client_id_);
     auto results = expected_results_to_py<int>(internal_results);
     const size_t successful_bytes =
         sum_successful_nested_sizes(results, all_sizes);
@@ -1438,13 +1472,19 @@ std::vector<int> DummyClient::batch_upsert_from_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
     const ReplicateConfig& config) {
-    std::vector<std::vector<uint64_t>> dummy_nested =
-        void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    if (keys.size() != all_buffer_ptrs.size() ||
+        keys.size() != all_sizes.size()) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+    auto prepared = prepare_multi_buffers(all_buffer_ptrs, all_sizes);
+    if (!prepared) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results = invoke_batch_rpc<
         &RealClient::batch_upsert_from_multi_buffers_dummy_helper, void>(
-        keys.size(), keys, dummy_nested, all_sizes, config, device_id_,
-        client_id_);
+        keys.size(), keys, prepared->dummy_buffers, all_sizes, config,
+        device_id_, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
     for (const auto& result : internal_results) {

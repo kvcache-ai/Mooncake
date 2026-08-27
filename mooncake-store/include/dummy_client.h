@@ -215,6 +215,14 @@ class DummyClient : public PyClient {
                                                  bool copy_back = false);
     bool copy_from_staging(const PreparedBuffer &buffer, size_t size) const;
 
+    struct PreparedMultiBuffers {
+        std::vector<PreparedBuffer> buffers;
+        std::vector<std::vector<uint64_t>> dummy_buffers;
+    };
+    std::optional<PreparedMultiBuffers> prepare_multi_buffers(
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes);
+
     struct ExternalBufferRegistration {
         size_t size = 0;
         size_t references = 0;
