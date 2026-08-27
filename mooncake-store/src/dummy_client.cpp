@@ -716,17 +716,18 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         LOG(ERROR) << "Buffer is not in any registered shared memory";
         return -1;
     }
-    if (shm_helper_->is_hugepage()) {
-        size = align_up(size, get_hugepage_size_from_env());
-    }
-    // Check bounds
+    // Check bounds. The buffer must be the segment base and the size must match
+    // the caller's original request (ShmSegment::requested_size). shm->size may
+    // be padded up to the hugepage/2MB boundary for SPDK registration, so it is
+    // NOT the size the caller should pass here.
     if (reinterpret_cast<uint8_t*>(buffer) !=
             reinterpret_cast<uint8_t*>(shm->base_addr) ||
-        size != shm->size) {
+        size != shm->requested_size) {
         LOG(ERROR) << "Invalid buffer address or size for registration: "
                       "Buffer addr: "
                    << buffer << ", need addr: " << shm->base_addr
-                   << ", buffer size: " << size << ", need size: " << shm->size;
+                   << ", buffer size: " << size
+                   << ", need size: " << shm->requested_size;
         return -1;
     }
 

@@ -23,7 +23,13 @@ class ShmHelper {
     struct ShmSegment {
         int fd = -1;
         void *base_addr = nullptr;
+        // Size of the actual mapping; may be padded up to the hugepage/2MB
+        // boundary when SPDK registration is enabled (MC_STORE_REGISTER_SPDK=1).
         size_t size = 0;
+        // Size the caller requested in allocate(); == size unless padded. Callers
+        // that must match the original request (e.g. DummyClient::register_buffer)
+        // compare against this, not size, so they don't re-derive the alignment.
+        size_t requested_size = 0;
         std::string name;
         bool registered = false;
         bool spdk_registered = false;

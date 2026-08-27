@@ -154,6 +154,7 @@ void* ShmHelper::allocate(size_t size) {
             shm->fd = -1;
             shm->base_addr = base_addr;
             shm->size = alloc_size;
+            shm->requested_size = alloc_size;
             shm->name = MOONCAKE_SHM_NAME;
             shm->registered = false;
             shms_.push_back(shm);
@@ -162,6 +163,12 @@ void* ShmHelper::allocate(size_t size) {
         // ascend_agent_mode && !ascend_use_fabric_mem: fall through to memfd
     }
 #endif
+
+    // Remember the caller-requested size before any alignment padding (hugepage
+    // or 2MB for SPDK registration). shm->size is the padded size; consumers that
+    // must match the original request (e.g. DummyClient::register_buffer) use
+    // requested_size instead of re-deriving the alignment policy.
+    const size_t requested = size;
 
     unsigned int flags = MFD_CLOEXEC;
     if (use_hugepage_) {
@@ -225,6 +232,7 @@ void* ShmHelper::allocate(size_t size) {
     shm->fd = fd;
     shm->base_addr = base_addr;
     shm->size = size;
+    shm->requested_size = requested;
     shm->name = MOONCAKE_SHM_NAME;
     shm->registered = false;
 #ifdef USE_NOF
