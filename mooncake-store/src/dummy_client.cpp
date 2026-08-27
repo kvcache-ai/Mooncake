@@ -638,7 +638,7 @@ std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
         return PreparedBuffer{buffer, buffer, size, nullptr, false};
     }
     auto remaining = external_buffer_remaining(buffer);
-    if (remaining.has_value() && size > *remaining) return std::nullopt;
+    if (!remaining.has_value() || size > *remaining) return std::nullopt;
 
     auto allocation = allocate_client_buffer(size);
     if (!allocation) return std::nullopt;
