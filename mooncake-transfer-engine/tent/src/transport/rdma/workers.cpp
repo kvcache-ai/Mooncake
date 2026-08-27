@@ -735,8 +735,10 @@ void Workers::asyncPollCq() {
                 if (auto* rail = slice->rail_monitor; rail && rail->ready())
                     rail->markRecovered(slice->source_dev_id,
                                         slice->target_dev_id);
-                worker.perf.inflight_lat.add(inflight_lat);
-                worker.perf.enqueue_lat.add(enqueue_lat);
+                if (transport_->params_->workers.show_latency_info) {
+                    worker.perf.inflight_lat.add(inflight_lat);
+                    worker.perf.enqueue_lat.add(enqueue_lat);
+                }
             }
         }
     }

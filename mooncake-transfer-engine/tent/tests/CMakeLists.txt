@@ -213,6 +213,18 @@ if(TARGET tent_xport_uring)
   )
 endif()
 
+# NOT registered via add_test: the test needs a real GPU (it opens a CUDA IPC
+# handle exported by a forked child). Run manually on a GPU box:
+# ./tent_nvlink_transport_test --gtest_filter='NVLinkTransportTest.*' Only built
+# when CUDA is enabled: the test includes CUDA headers directly.
+if(USE_CUDA)
+  add_executable(tent_nvlink_transport_test nvlink_transport_test.cpp)
+  target_link_libraries(tent_nvlink_transport_test PRIVATE gtest gtest_main
+                                                           tent_link_group)
+  target_include_directories(tent_nvlink_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+endif()
+
 add_executable(tent_failover_test failover_test.cpp)
 target_link_libraries(tent_failover_test PRIVATE gtest gtest_main
                                                  tent_link_group)
@@ -521,3 +533,15 @@ if(USE_TPU)
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 endif()
+
+# A peer restart invalidates every connection pooled for it; one failed call
+# must flush the whole pool. Loopback only, no NIC required.
+add_executable(tent_rpc_reconnect_test rpc_reconnect_test.cpp)
+target_link_libraries(tent_rpc_reconnect_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_rpc_reconnect_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_rpc_reconnect_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rpc_reconnect_test COMMAND tent_rpc_reconnect_test)

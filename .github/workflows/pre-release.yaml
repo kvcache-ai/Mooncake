@@ -1,11 +1,8 @@
 name: Pre-Release
 
-# Dry run of the release pipelines: build wheels through the same _build-wheel.yaml
-# the Release / Release Non-CUDA / Release CUDA 13 workflows use, validate the
-# artifacts, but do not create a GitHub Release or publish to PyPI.
-#
-# Trigger by pushing a pre-release tag, for example:
-#   git tag v1.0.0-rc1 && git push origin v1.0.0-rc1
+# Build the same core wheel matrix as the stable release workflows, publish the
+# exact artifacts to TestPyPI, then consume them in smoke and T-one tests.
+# No production PyPI or GitHub Release publication happens here.
 on:
   push:
     tags:
@@ -15,7 +12,40 @@ on:
       - 'v*-pre*'
 
 jobs:
+  version-stamp:
+    name: Normalize pre-release version
+    if: github.repository == 'kvcache-ai/Mooncake'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      package_version: ${{ steps.version.outputs.package_version }}
+    steps:
+      - name: Checkout release gate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install version parser
+        run: python -m pip install packaging
+
+      - name: Normalize tag as a PEP 440 pre-release
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          normalized=$(python scripts/ci/testpypi_wheel_gate.py \
+            normalize-version --tag "$RELEASE_TAG")
+          echo "package_version=${normalized}" >> "$GITHUB_OUTPUT"
+          echo "Normalized ${RELEASE_TAG} to ${normalized}"
+
   build:
+    needs: version-stamp
     strategy:
       fail-fast: false
       matrix:
@@ -43,13 +73,20 @@ jobs:
       variant: ${{ matrix.variant }}
       architecture: ${{ matrix.architecture }}
       artifact-prefix: ${{ matrix.artifact-prefix }}
+      version-override: ${{ needs.version-stamp.outputs.package_version }}
 
-  validate-release:
-    name: Validate release artifacts
-    needs: build
+  publish-testpypi:
+    name: Validate and publish wheels to TestPyPI
+    needs: [version-stamp, build]
     runs-on: ubuntu-22.04
+    environment: nightly
+    concurrency:
+      group: pre-release-testpypi-${{ needs.version-stamp.outputs.package_version }}
+      cancel-in-progress: false
     permissions:
       contents: read
+    env:
+      PACKAGE_VERSION: ${{ needs.version-stamp.outputs.package_version }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -60,42 +97,173 @@ jobs:
           path: mooncake-wheel/dist-all
           pattern: mooncake-wheel*pre-release*
 
-      - name: Prepare wheels for validation
+      - name: Collect wheels for publication
         run: |
           mkdir -p mooncake-wheel/dist-release
-          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          find mooncake-wheel/dist-all -name "*.whl" \
+            -exec cp {} mooncake-wheel/dist-release/ \;
           echo "Pre-release tag: ${GITHUB_REF_NAME}"
+          echo "Package version: ${PACKAGE_VERSION}"
           echo "Collected wheels:"
           ls -la mooncake-wheel/dist-release/
-          wheel_count=$(find mooncake-wheel/dist-release -name "*.whl" | wc -l)
-          echo "wheel_count=${wheel_count}" >> "$GITHUB_ENV"
-          if [ "${wheel_count}" -lt 24 ]; then
-            echo "Expected at least 24 wheels (4 Python versions x 3 variants x 2 architectures), found ${wheel_count}"
-            exit 1
-          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      - name: Install publication tools
+        run: python -m pip install packaging twine
+
+      - name: Require TestPyPI credentials
+        env:
+          TESTPYPI_API_TOKEN: ${{ secrets.TESTPYPI_API_TOKEN }}
+        run: |
+          if [ -z "$TESTPYPI_API_TOKEN" ]; then
+            echo "TESTPYPI_API_TOKEN is required"
+            exit 1
+          fi
+
       - name: Validate wheels with twine
-        run: |
-          pip install twine
-          twine check mooncake-wheel/dist-release/*.whl
+        run: twine check mooncake-wheel/dist-release/*.whl
 
-      - name: Upload validated wheels as workflow artifacts
-        uses: actions/upload-artifact@v4
+      - name: Validate empty or resumable TestPyPI upload state
+        run: |
+          python scripts/ci/testpypi_wheel_gate.py validate-upload-state \
+            --directory mooncake-wheel/dist-release \
+            --version "$PACKAGE_VERSION"
+
+      - name: Publish exact wheels to TestPyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TESTPYPI_API_TOKEN }}
+        run: >-
+          twine upload --repository testpypi --skip-existing
+          mooncake-wheel/dist-release/*.whl
+
+      - name: Verify every published wheel hash
+        run: |
+          python scripts/ci/testpypi_wheel_gate.py wait-upload-state \
+            --directory mooncake-wheel/dist-release \
+            --version "$PACKAGE_VERSION"
+
+  consume-testpypi:
+    name: Consume ${{ matrix.package }} on ${{ matrix.architecture }}
+    needs: [version-stamp, publish-testpypi]
+    runs-on: ${{ matrix.architecture == 'aarch64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - mooncake-transfer-engine
+          - mooncake-transfer-engine-cuda13
+          - mooncake-transfer-engine-non-cuda
+        architecture:
+          - x86_64
+          - aarch64
+    env:
+      PACKAGE_VERSION: ${{ needs.version-stamp.outputs.package_version }}
+      TARGET_PACKAGE: ${{ matrix.package }}
+    steps:
+      - name: Install CUDA runtime and driver stub
+        if: ${{ matrix.package != 'mooncake-transfer-engine-non-cuda' }}
+        env:
+          CUDA_PACKAGE_VERSION: ${{ matrix.package == 'mooncake-transfer-engine-cuda13' && '13-0' || '12-8' }}
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" = x86_64 ]; then
+            repository_architecture=x86_64
+          else
+            repository_architecture=sbsa
+          fi
+          keyring=$(mktemp --suffix=.deb)
+          curl --fail --location --retry 3 \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${repository_architecture}/cuda-keyring_1.1-1_all.deb" \
+            --output "$keyring"
+          sudo dpkg -i "$keyring"
+          sudo apt-get update
+          sudo apt-get install -y \
+            "cuda-cudart-${CUDA_PACKAGE_VERSION}" \
+            "cuda-driver-dev-${CUDA_PACKAGE_VERSION}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          name: mooncake-wheels-pre-release-${{ github.ref_name }}
-          path: mooncake-wheel/dist-release/*.whl
-          retention-days: 14
+          python-version: '3.12'
 
-      - name: Pre-release validation summary
+      - name: Download, install, and smoke the indexed wheel
         run: |
-          echo "## Pre-Release validation passed" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Tag: \`${GITHUB_REF_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Wheels built: ${wheel_count}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- PyPI publish: skipped (pre-release dry run)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- GitHub Release upload: skipped (pre-release dry run)" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
+
+          download_dir=$(mktemp -d)
+
+          python -m pip download \
+            --index-url https://test.pypi.org/simple \
+            --no-cache-dir \
+            --no-deps \
+            --only-binary=:all: \
+            --pre \
+            --dest "$download_dir" \
+            "${TARGET_PACKAGE}==${PACKAGE_VERSION}"
+
+          # Install the wheel downloaded above. Its ordinary dependencies are
+          # resolved from production PyPI, never TestPyPI.
+          python -m pip install \
+            --index-url https://pypi.org/simple \
+            "$download_dir"/*.whl
+
+          if [ "$TARGET_PACKAGE" != mooncake-transfer-engine-non-cuda ]; then
+            cuda_stub=
+            for candidate in /usr/local/cuda*/lib64/stubs/libcuda.so \
+                             /usr/local/cuda*/targets/*/lib/stubs/libcuda.so; do
+              if [ -f "$candidate" ]; then
+                cuda_stub="$candidate"
+                break
+              fi
+            done
+            if [ -z "$cuda_stub" ]; then
+              echo "CUDA driver stub libcuda.so was not found"
+              exit 1
+            fi
+            stub_dir=$(mktemp -d)
+            ln -s "$cuda_stub" "$stub_dir/libcuda.so.1"
+            export LD_LIBRARY_PATH="$stub_dir:${LD_LIBRARY_PATH:-}"
+            for directory in /usr/local/cuda*/lib64 \
+                             /usr/local/cuda*/targets/*/lib; do
+              if [ -d "$directory" ]; then
+                export LD_LIBRARY_PATH="$directory:$LD_LIBRARY_PATH"
+              fi
+            done
+          fi
+
+          python - "$TARGET_PACKAGE" "$PACKAGE_VERSION" <<'PY'
+          import importlib.metadata
+          import sys
+
+          package, expected = sys.argv[1:]
+          installed = importlib.metadata.version(package)
+          if installed != expected:
+              raise SystemExit(
+                  f"installed {package} version {installed}, expected {expected}"
+              )
+
+          import mooncake
+          import mooncake.engine
+          import mooncake.http_metadata_server
+          import mooncake.store
+          PY
+          mooncake_http_metadata_server --help >/dev/null
+          mooncake_master --version
+
+  tone-integration:
+    name: Validate T-one integration with TestPyPI wheel
+    needs: [version-stamp, consume-testpypi]
+    uses: ./.github/workflows/integration-test.yml
+    with:
+      testpypi_version: ${{ needs.version-stamp.outputs.package_version }}
+    secrets: inherit
