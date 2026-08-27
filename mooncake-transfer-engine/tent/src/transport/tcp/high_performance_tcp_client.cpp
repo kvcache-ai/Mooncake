@@ -78,6 +78,17 @@ class HighPerformanceTcpClient::Lane
     }
 
    private:
+    enum class State {
+        kDisconnected,
+        kResolving,
+        kConnecting,
+        kIdle,
+        kWritingHeader,
+        kWritingBody,
+        kReadingResponse,
+        kReadingBody,
+    };
+
     void startNext() {
         if (current_ || queue_.empty()) return;
         current_.emplace(std::move(queue_.front()));
@@ -91,6 +102,7 @@ class HighPerformanceTcpClient::Lane
 
         try {
             if (connected_ && socket_.is_open()) {
+                state_ = State::kIdle;
                 writeHeader(operation_epoch_);
             } else {
                 resolve(operation_epoch_);
@@ -107,6 +119,7 @@ class HighPerformanceTcpClient::Lane
     }
 
     void resolve(uint64_t epoch) {
+        state_ = State::kResolving;
         armTimer(config_.connect_timeout_ms, epoch);
         auto self = shared_from_this();
         resolver_.async_resolve(
@@ -119,6 +132,7 @@ class HighPerformanceTcpClient::Lane
                     self->finishIoError(error);
                     return;
                 }
+                self->state_ = State::kConnecting;
                 self->connect(epoch, std::move(results));
             });
     }
@@ -138,14 +152,24 @@ class HighPerformanceTcpClient::Lane
                                     return;
                                 }
                                 self->cancelTimer();
+                                std::error_code option_error;
+                                self->socket_.set_option(
+                                    asio::ip::tcp::no_delay(true),
+                                    option_error);
+                                if (option_error) {
+                                    self->finishIoError(option_error);
+                                    return;
+                                }
                                 self->connected_ = true;
                                 self->parent_->connections_created_.fetch_add(
                                     1, std::memory_order_relaxed);
+                                self->state_ = State::kIdle;
                                 self->writeHeader(epoch);
                             });
     }
 
     void writeHeader(uint64_t epoch) {
+        state_ = State::kWritingHeader;
         armTimer(config_.progress_timeout_ms, epoch);
         auto self = shared_from_this();
         asio::async_write(
@@ -174,6 +198,7 @@ class HighPerformanceTcpClient::Lane
             readResponse(epoch);
             return;
         }
+        state_ = State::kWritingBody;
         const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
             config_.chunk_size, current_->length - body_offset_));
         auto* data = static_cast<uint8_t*>(current_->local_addr) + body_offset_;
@@ -195,6 +220,7 @@ class HighPerformanceTcpClient::Lane
     }
 
     void readResponse(uint64_t epoch) {
+        state_ = State::kReadingResponse;
         auto self = shared_from_this();
         asio::async_read(
             socket_, asio::buffer(response_bytes_),
@@ -242,6 +268,7 @@ class HighPerformanceTcpClient::Lane
             finishClean();
             return;
         }
+        state_ = State::kReadingBody;
         const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
             config_.chunk_size, current_->length - body_offset_));
         auto* data = static_cast<uint8_t*>(current_->local_addr) + body_offset_;
@@ -308,6 +335,7 @@ class HighPerformanceTcpClient::Lane
             socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
             socket_.close(ignored);
         }
+        state_ = State::kDisconnected;
     }
 
     void finishProtocolError() {
@@ -328,6 +356,7 @@ class HighPerformanceTcpClient::Lane
 
     void finishClean() {
         cancelTimer();
+        state_ = State::kIdle;
         finishCurrent(COMPLETED, current_->length, true);
     }
 
@@ -373,6 +402,7 @@ class HighPerformanceTcpClient::Lane
     uint64_t timer_generation_{0};
     uint64_t body_offset_{0};
     bool connected_{false};
+    State state_{State::kDisconnected};
     std::optional<TransferStatusEnum> forced_terminal_;
 };
 
@@ -402,7 +432,7 @@ HighPerformanceTcpClient::HighPerformanceTcpClient(
 }
 
 HighPerformanceTcpClient::~HighPerformanceTcpClient() {
-    if (workers_ != nullptr && workers_->running() &&
+    if (workers_ != nullptr && workers_->controlContextAvailable() &&
         !workers_->onWorkerThread()) {
         (void)cancelAll(CANCELED);
     }
@@ -519,7 +549,7 @@ Status HighPerformanceTcpClient::cancelRequest(size_t owner_worker,
         return Status::InvalidArgument(
             "invalid HP TCP cancellation request" LOC_MARK);
     }
-    if (!workers_->running()) {
+    if (!workers_->controlContextAvailable()) {
         return Status::InternalError(
             "HP TCP worker contexts are unavailable" LOC_MARK);
     }
@@ -544,7 +574,7 @@ Status HighPerformanceTcpClient::cancelAll(TransferStatusEnum terminal) {
     }
     stopping_.store(true, std::memory_order_release);
 
-    if (workers_->running()) {
+    if (workers_->controlContextAvailable()) {
         try {
             // Post cancellation to every owner before waiting for active I/O.
             for (size_t i = 0; i < workers_->workerCount(); ++i) {

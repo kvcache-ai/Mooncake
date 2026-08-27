@@ -21,9 +21,11 @@ namespace mooncake::tent {
 class HighPerformanceTcpTaskState {
    public:
     HighPerformanceTcpTaskState(
-        BatchID progress_batch_id, std::function<void(BatchID)> notify_progress,
+        Request request, BatchID progress_batch_id,
+        std::function<void(BatchID)> notify_progress,
         HighPerformanceTcpBufferRegistry::Lease local_lease)
-        : progress_batch_id_(progress_batch_id),
+        : request_(std::move(request)),
+          progress_batch_id_(progress_batch_id),
           notify_progress_(std::move(notify_progress)),
           local_lease_(std::move(local_lease)) {}
 
@@ -44,6 +46,8 @@ class HighPerformanceTcpTaskState {
     TransferStatus snapshot() const noexcept;
     std::optional<HighPerformanceTcpStatus> remoteStatus() const noexcept;
 
+    const Request& request() const noexcept { return request_; }
+
     void setDispatchIdentity(size_t owner_worker,
                              uint64_t request_id) noexcept {
         owner_worker_ = owner_worker;
@@ -60,6 +64,7 @@ class HighPerformanceTcpTaskState {
     }
 
    private:
+    Request request_;
     std::atomic<TransferStatusEnum> status_{PENDING};
     std::atomic<size_t> bytes_{0};
     std::atomic<HighPerformanceTcpStatus> remote_status_{

@@ -57,6 +57,19 @@ void HighPerformanceTcpAdmissionController::waitForZero() {
     zero_cv_.wait(lock, [&] { return tasks_ == 0 && bytes_ == 0; });
 }
 
+uint64_t HighPerformanceTcpAdmissionController::outstandingTasks() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return tasks_;
+}
+
+uint64_t HighPerformanceTcpAdmissionController::outstandingBytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return bytes_;
+}
+
+HighPerformanceTcpWorkers::HighPerformanceTcpWorkers()
+    : HighPerformanceTcpWorkers(Config{}) {}
+
 HighPerformanceTcpWorkers::HighPerformanceTcpWorkers(Config config)
     : config_(config) {}
 

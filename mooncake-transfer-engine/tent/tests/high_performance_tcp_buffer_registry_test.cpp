@@ -18,25 +18,29 @@ TEST(HighPerformanceTcpBufferRegistryTest, EnforcesPermissionAndRegistration) {
     ASSERT_TRUE(registry.add(base, data.size(), kGlobalReadOnly, &id).ok());
 
     HighPerformanceTcpBufferRegistry::Lease lease;
-    HighPerformanceTcpStatus wire_status = HighPerformanceTcpStatus::kOk;
+    HighPerformanceTcpBufferRegistry::AcquireFailure failure;
     ASSERT_TRUE(registry
                     .acquireRemoteLease(base, data.size(), id,
                                         HighPerformanceTcpOpcode::kRead, &lease,
-                                        &wire_status)
+                                        &failure)
                     .ok());
     lease.reset();
     EXPECT_FALSE(registry
                      .acquireRemoteLease(base, data.size(), id,
                                          HighPerformanceTcpOpcode::kWrite,
-                                         &lease, &wire_status)
+                                         &lease, &failure)
                      .ok());
-    EXPECT_EQ(wire_status, HighPerformanceTcpStatus::kPermissionDenied);
+    EXPECT_EQ(
+        failure,
+        HighPerformanceTcpBufferRegistry::AcquireFailure::kPermissionDenied);
     EXPECT_FALSE(registry
                      .acquireRemoteLease(base, data.size(), id + 1,
                                          HighPerformanceTcpOpcode::kRead,
-                                         &lease, &wire_status)
+                                         &lease, &failure)
                      .ok());
-    EXPECT_EQ(wire_status, HighPerformanceTcpStatus::kStaleRegistration);
+    EXPECT_EQ(
+        failure,
+        HighPerformanceTcpBufferRegistry::AcquireFailure::kStaleRegistration);
 }
 
 TEST(HighPerformanceTcpBufferRegistryTest, UnregisterWaitsForActiveLease) {

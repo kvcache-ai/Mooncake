@@ -57,10 +57,9 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
 
-    if (hp_tcp_transport_config_.enabled) {
+    if (hp_tcp_transport_config_.enabled)
         transport_list_[HP_TCP] = std::make_shared<HighPerformanceTcpTransport>(
             hp_tcp_transport_config_.params);
-    }
 
     // SHM is opt-in: default false because the current path is not NUMA-aware
     // (see tent/config/transfer-engine.json for an example that enables it).

@@ -171,7 +171,7 @@ add_executable(tent_high_performance_tcp_workers_test
                high_performance_tcp_workers_test.cpp)
 target_link_libraries(tent_high_performance_tcp_workers_test PRIVATE gtest
                                                                     gtest_main
-                                                                    tent_xport_hp_tcp)
+                                                                    tent_xport_tcp_hp_core)
 target_include_directories(
   tent_high_performance_tcp_workers_test
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -181,7 +181,7 @@ add_test(NAME tent_high_performance_tcp_workers_test
 add_executable(tent_high_performance_tcp_protocol_test
                high_performance_tcp_protocol_test.cpp)
 target_link_libraries(tent_high_performance_tcp_protocol_test PRIVATE gtest gtest_main
-                                                                    tent_xport_hp_tcp)
+                                                                    tent_xport_tcp_hp_core)
 target_include_directories(tent_high_performance_tcp_protocol_test
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_high_performance_tcp_protocol_test
@@ -190,7 +190,7 @@ add_test(NAME tent_high_performance_tcp_protocol_test
 add_executable(tent_high_performance_tcp_buffer_registry_test
                high_performance_tcp_buffer_registry_test.cpp)
 target_link_libraries(tent_high_performance_tcp_buffer_registry_test PRIVATE
-                      gtest gtest_main tent_xport_hp_tcp)
+                      gtest gtest_main tent_xport_tcp_hp_core)
 target_include_directories(
   tent_high_performance_tcp_buffer_registry_test
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -200,7 +200,7 @@ add_test(NAME tent_high_performance_tcp_buffer_registry_test
 add_executable(tent_high_performance_tcp_socket_test
                high_performance_tcp_socket_test.cpp)
 target_link_libraries(tent_high_performance_tcp_socket_test PRIVATE gtest gtest_main
-                                                                  tent_xport_hp_tcp)
+                                                                  tent_xport_tcp_hp_core)
 target_include_directories(tent_high_performance_tcp_socket_test
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_high_performance_tcp_socket_test

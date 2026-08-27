@@ -196,7 +196,8 @@ const char* HighPerformanceTcpPermissionName(Permission permission) {
 Status EncodeHighPerformanceTcpEndpointAttr(
     const HighPerformanceTcpEndpointAttr& attr, std::string* encoded) {
     if (encoded == nullptr || !IsHex128(attr.incarnation) ||
-        attr.host.empty() || attr.port == 0 || attr.max_transfer_bytes == 0) {
+        attr.endpoints.size() != 1 || attr.endpoints[0].host.empty() ||
+        attr.endpoints[0].port == 0 || attr.max_transfer_bytes == 0) {
         return InvalidAttr("endpoint");
     }
 
@@ -204,10 +205,8 @@ Status EncodeHighPerformanceTcpEndpointAttr(
         {"protocol", "tent_hp_tcp"},
         {"version", kHighPerformanceTcpVersion},
         {"incarnation", attr.incarnation},
-        // Preserve the v1 metadata shape while keeping the in-process model
-        // honest: v1 supports exactly one endpoint.
-        {"endpoints",
-         json::array({{{"host", attr.host}, {"port", attr.port}}})},
+        {"endpoints", json::array({{{"host", attr.endpoints[0].host},
+                                    {"port", attr.endpoints[0].port}}})},
         {"max_transfer_bytes", attr.max_transfer_bytes},
     };
     *encoded = object.dump();
@@ -239,7 +238,8 @@ Status DecodeHighPerformanceTcpEndpointAttr(
             !ReadPositiveUint64(object, "max_transfer_bytes",
                                 &max_transfer_bytes))
             return InvalidAttr("endpoint address/limit");
-        *attr = {incarnation, host, static_cast<uint16_t>(port),
+        *attr = {incarnation,
+                 {{host, static_cast<uint16_t>(port)}},
                  max_transfer_bytes};
         return Status::OK();
     } catch (const std::exception& error) {

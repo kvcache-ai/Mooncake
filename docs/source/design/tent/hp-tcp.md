@@ -3,8 +3,7 @@
 `hp_tcp` is a standalone TENT transport for CPU DRAM transfers over
 data-center TCP. Standard `tcp` remains the RPC-based compatibility path.
 The first version intentionally excludes GPU memory, TLS, multi-endpoint
-routing, multi-NIC striping, socket tuning, automatic fallback and dynamic
-lane scheduling.
+routing, multi-NIC striping, automatic fallback and dynamic lane scheduling.
 
 ## Architecture
 
@@ -14,11 +13,10 @@ has a configured number of persistent lanes, and operations on a lane are
 FIFO. ASIO provides the event queue; process-wide task and byte admission
 limits bound all accepted work, including callbacks waiting in that queue.
 
-The server uses the same worker pool: worker zero owns the listener, and
-accepted sockets are assigned to workers and stored in worker-owned session
-sets. A global connection limit bounds live sessions; closing a session
-removes it immediately rather than retaining one thread per historical
-connection.
+The server uses the same worker pool. Accepted sockets are assigned to workers
+and stored in worker-owned session sets. A global connection limit bounds live
+sessions; closing a session removes it immediately rather than retaining one
+thread per historical connection.
 
 ```text
 TENT request -> bounded admission -> owner worker -> persistent lane

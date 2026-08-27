@@ -28,6 +28,7 @@ struct HighPerformanceTcpSubBatch : Transport::SubBatch {
 
 class HighPerformanceTcpTransport final : public Transport {
    public:
+    HighPerformanceTcpTransport();
     explicit HighPerformanceTcpTransport(HighPerformanceTcpParams params);
     ~HighPerformanceTcpTransport() override;
 
@@ -70,6 +71,7 @@ class HighPerformanceTcpTransport final : public Transport {
    private:
     struct TaskPlan;
 
+    Status validateParams() const;
     Status planTask(const Request& request, HighPerformanceTcpSubBatch* batch,
                     TaskPlan* plan);
     Status rollbackPublishedEndpoint(
