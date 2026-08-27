@@ -1,5 +1,6 @@
 file(GLOB SOURCES "*.cpp")
 set(PYTHON_PACKAGE_NAME "mooncake")
+set(MOONCAKE_PYTHON_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake")
 if(SKBUILD)
   # scikit-build-core sets CMAKE_INSTALL_PREFIX to its private wheel tree. Keep
   # every Python artifact relative to that prefix.
@@ -152,7 +153,7 @@ endif()
 if(MOONCAKE_HAS_NVLINK_ALLOCATOR)
   message(STATUS "allocator.py will be installed in the Python package")
   install(
-    FILES "${CMAKE_CURRENT_SOURCE_DIR}/allocator.py"
+    FILES "${MOONCAKE_PYTHON_SOURCE_DIR}/allocator.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
     COMPONENT python)
 endif()
@@ -161,7 +162,7 @@ if(USE_UBSHMEM)
   message(
     STATUS "allocator_ascend_npu.py will be installed in the Python package")
   install(
-    FILES "${CMAKE_CURRENT_SOURCE_DIR}/allocator_ascend_npu.py"
+    FILES "${MOONCAKE_PYTHON_SOURCE_DIR}/allocator_ascend_npu.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
     COMPONENT python)
 endif()
@@ -170,7 +171,7 @@ if(MOONCAKE_HAS_NVLINK_ALLOCATOR OR USE_UBSHMEM)
   message(
     STATUS "fabric_allocator_utils.py will be installed in the Python package")
   install(
-    FILES "${CMAKE_CURRENT_SOURCE_DIR}/fabric_allocator_utils.py"
+    FILES "${MOONCAKE_PYTHON_SOURCE_DIR}/fabric_allocator_utils.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
     COMPONENT python)
 endif()

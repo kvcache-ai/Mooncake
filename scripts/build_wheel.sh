@@ -15,6 +15,21 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # their normal CMake output paths before auditwheel, like the PG core library.
 BUILD_DIR="${BUILD_DIR:-build}"
 BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+MIGRATED_ALLOCATOR_SOURCE_DIR="python/mooncake"
+MIGRATED_ALLOCATOR_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+MIGRATED_ALLOCATOR_MODULES=(fabric_allocator_utils.py)
+MIGRATED_ALLOCATOR_ALL_MODULES=(
+    allocator.py
+    allocator_ascend_npu.py
+    fabric_allocator_utils.py
+)
+
+cleanup_allocator_staging() {
+    for module in "${MIGRATED_ALLOCATOR_ALL_MODULES[@]}"; do
+        rm -f "${MIGRATED_ALLOCATOR_STAGING_DIR}/${module}"
+    done
+}
+trap cleanup_allocator_staging EXIT
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
@@ -24,11 +39,7 @@ echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
-
-echo "Creating directory structure..."
-
-# Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
-cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric_allocator_utils.py
+cleanup_allocator_staging
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
@@ -114,8 +125,7 @@ if [ -f ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.
      cp ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
     fi
     echo "Copying allocator libraries..."
-    # Copy allocator.py
-    cp mooncake-integration/allocator.py mooncake-wheel/mooncake/allocator.py
+    MIGRATED_ALLOCATOR_MODULES+=(allocator.py)
 else
     echo "Skipping nvlink_allocator.so (not built - likely ARM64 or non-CUDA build)"
 fi
@@ -125,8 +135,7 @@ if [ -f ${BUILD_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_a
     echo "Copying NPU ubshmem_fabric_allocator.so..."
     cp ${BUILD_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
     echo "Copying NPU allocator libraries..."
-    # Copy allocator_ascend_npu.py
-    cp mooncake-integration/allocator_ascend_npu.py mooncake-wheel/mooncake/allocator_ascend_npu.py
+    MIGRATED_ALLOCATOR_MODULES+=(allocator_ascend_npu.py)
 else
     echo "Skipping ubshmem_fabric_allocator.so (not built - likely CUDA or non-NPU build)"
 fi
@@ -180,15 +189,20 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
-# Stage the reshard Python package for the combined Mooncake wheel. The tracked
-# source of truth remains in the top-level module.
+# Stage migrated allocator modules and the Reshard package for the combined
+# Mooncake wheel. Each tracked source remains in its authoritative tree.
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
-cleanup_reshard_staging() {
+cleanup_python_staging() {
+    cleanup_allocator_staging
     rm -rf "${RESHARD_STAGING_DIR}"
 }
-trap cleanup_reshard_staging EXIT
-rm -rf "${RESHARD_STAGING_DIR}"
+trap cleanup_python_staging EXIT
+cleanup_python_staging
+for module in "${MIGRATED_ALLOCATOR_MODULES[@]}"; do
+    cp "${MIGRATED_ALLOCATOR_SOURCE_DIR}/${module}" \
+       "${MIGRATED_ALLOCATOR_STAGING_DIR}/${module}"
+done
 cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
 
 # Build the wheel package
@@ -204,7 +218,7 @@ WHEEL_DIR="$(pwd)"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
-    cleanup_reshard_staging
+    cleanup_python_staging
 }
 trap cleanup_wheel_metadata_state EXIT
 
