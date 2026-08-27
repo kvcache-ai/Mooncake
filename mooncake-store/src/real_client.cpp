@@ -2414,14 +2414,15 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     void *shm_buffer = nullptr;
 #ifdef USE_NOF
     // Register this receiver-side mapping with SPDK for NoF zero-copy.
-    // spdk_mem_register is per-process: the sender (ShmHelper::allocate) registers
-    // ITS mapping, and in the dummy/real split the NoF submit runs HERE on our
-    // mapping of the shared fd, so it must be registered too. Gated on the same
-    // env as the sender (MC_STORE_REGISTER_SPDK=1). On SPDK < 26.09 the base must
-    // be 2MB-aligned, so when we will register and the sender padded shm_size to a
-    // 2MB multiple, map the fd at a 2MB-aligned address (mmap_shm_2mb_aligned).
-    // If shm_size is not a 2MB multiple (env mismatch: sender didn't pad), fall
-    // back to a plain mmap and let the registration attempt fail non-fatally.
+    // spdk_mem_register is per-process: the sender (ShmHelper::allocate)
+    // registers ITS mapping, and in the dummy/real split the NoF submit runs
+    // HERE on our mapping of the shared fd, so it must be registered too. Gated
+    // on the same env as the sender (MC_STORE_REGISTER_SPDK=1). On SPDK < 26.09
+    // the base must be 2MB-aligned, so when we will register and the sender
+    // padded shm_size to a 2MB multiple, map the fd at a 2MB-aligned address
+    // (mmap_shm_2mb_aligned). If shm_size is not a 2MB multiple (env mismatch:
+    // sender didn't pad), fall back to a plain mmap and let the registration
+    // attempt fail non-fatally.
     const bool register_spdk = ShmHelper::is_register_spdk_enabled();
     if (register_spdk && (shm_size % SZ_2MB == 0)) {
         shm_buffer = mmap_shm_2mb_aligned(shm_size, fd);
@@ -2429,10 +2430,11 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
             // 2MB-aligned MAP_FIXED fails for HugeTLB fds whose base must be
             // hugepage-aligned (e.g. 1GB hugepages): fall back to a plain mmap,
             // which lets the kernel pick a hugepage-aligned base (2MB or 1GB,
-            // both multiples of 2MB). Registration below then succeeds for those
-            // fds; for non-hugetlb fds that fail alignment it degrades non-fatally.
-            shm_buffer =
-                mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            // both multiples of 2MB). Registration below then succeeds for
+            // those fds; for non-hugetlb fds that fail alignment it degrades
+            // non-fatally.
+            shm_buffer = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, fd, 0);
         }
     } else
 #endif
@@ -2483,6 +2485,11 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
             ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
     }
 
+    // Ensure push_back below cannot reallocate and throw bad_alloc after the
+    // SPDK registration succeeded (which would leak the registration and the
+    // mapping). If reserve itself throws it happens before registration.
+    context.mapped_shms.reserve(context.mapped_shms.size() + 1);
+
 #ifdef USE_NOF
     // Register this mapping with SPDK for NoF zero-copy. Non-fatal on failure:
     // the buffer stays usable for all non-NoF paths. Placed after the
@@ -2520,6 +2527,7 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     auto &context = it->second;
     context.client_buffer_allocator.reset();
 
+    bool failed = false;
     for (auto &shm : context.mapped_shms) {
         if (shm.shm_buffer) {
             auto rc = client_->unregisterLocalMemory(shm.shm_buffer, true);
@@ -2538,17 +2546,20 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
             }
 #endif
             if (!rc) {
-                LOG(ERROR) << "Failed to unregister memory";
-                munmap(shm.shm_buffer, shm.shm_size);
-                context.mapped_shms.clear();
-                shm_contexts_.erase(it);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                LOG(ERROR) << "Failed to unregister memory: " << shm.shm_name;
+                failed = true;
             }
+            // munmap every segment (including siblings after a failure) so a
+            // partial unregisterLocalMemory failure does not leak mappings or
+            // their SPDK registrations.
             munmap(shm.shm_buffer, shm.shm_size);
         }
     }
     context.mapped_shms.clear();
     shm_contexts_.erase(it);
+    if (failed) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return {};
 }
 
@@ -2876,11 +2887,6 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
             }
 #endif
             auto rc = client_->unregisterLocalMemory(shm_it->shm_buffer, true);
-            if (!rc) {
-                LOG(ERROR) << "Failed to unregister memory: "
-                           << shm_it->shm_name;
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
 #ifdef USE_NOF
             // Unregister the SPDK registration before munmap (see
             // unmap_shm_internal). Non-fatal on failure.
@@ -2895,6 +2901,11 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
                 shm_it->spdk_registered = false;
             }
 #endif
+            if (!rc) {
+                LOG(ERROR) << "Failed to unregister memory: "
+                           << shm_it->shm_name;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
             if (munmap(shm_it->shm_buffer, shm_it->shm_size) != 0) {
                 LOG(ERROR) << "Failed to munmap shared memory: "
                            << shm_it->shm_name

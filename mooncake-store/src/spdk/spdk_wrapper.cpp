@@ -206,9 +206,10 @@ int SpdkWrapper::UnregisterMemory(void *addr, size_t size) {
     }
     // SPDK env may not be initialized (registration is opt-in) or may already
     // have been finalized by Cleanup() -> spdk_env_fini(). In both cases there
-    // is no registered memory to release; calling spdk_mem_unregister would walk
-    // a torn-down or never-created global mem_map. (With ShmHelper destroyed
-    // before SpdkWrapper, the `initialized` atomic is still alive here.)
+    // is no registered memory to release; calling spdk_mem_unregister would
+    // walk a torn-down or never-created global mem_map. (With ShmHelper
+    // destroyed before SpdkWrapper, the `initialized` atomic is still alive
+    // here.)
     if (!initialized.load(std::memory_order_acquire)) {
         return 0;
     }

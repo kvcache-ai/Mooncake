@@ -47,9 +47,9 @@ ShmHelper::ShmHelper() {
     // before ~SpdkWrapper -> Cleanup() -> spdk_env_fini(). Without this, the
     // first host-pool allocation constructs SpdkWrapper AFTER ShmHelper, so at
     // exit SpdkWrapper is destroyed first and cleanup() would call
-    // spdk_mem_unregister after spdk_env_fini() (UB / NULL-deref on SPDK >= 26.09).
-    // Constructing SpdkWrapper here is side-effect free: its ctor is `= default`
-    // and the env is only initialized lazily via InitializeEnv().
+    // spdk_mem_unregister after spdk_env_fini() (UB / NULL-deref on SPDK
+    // >= 26.09). Constructing SpdkWrapper here is side-effect free: its ctor is
+    // `= default` and the env is only initialized lazily via InitializeEnv().
     SpdkWrapper::GetInstance();
 #endif
     const char* hp = std::getenv("MC_STORE_USE_HUGEPAGE");
@@ -83,8 +83,8 @@ bool ShmHelper::cleanup() {
         if (shm->base_addr) {
 #ifdef USE_NOF
             if (shm->spdk_registered) {
-                if (SpdkWrapper::GetInstance().UnregisterMemory(shm->base_addr,
-                                                                shm->size) != 0) {
+                if (SpdkWrapper::GetInstance().UnregisterMemory(
+                        shm->base_addr, shm->size) != 0) {
                     LOG(WARNING)
                         << "Failed to unregister shared memory from SPDK "
                            "during cleanup: "
@@ -141,9 +141,9 @@ void* ShmHelper::allocate(size_t size) {
 #endif
 
     // Remember the caller-requested size before any alignment padding (hugepage
-    // or 2MB for SPDK registration). shm->size is the padded size; consumers that
-    // must match the original request (e.g. DummyClient::register_buffer) use
-    // requested_size instead of re-deriving the alignment policy.
+    // or 2MB for SPDK registration). shm->size is the padded size; consumers
+    // that must match the original request (e.g. DummyClient::register_buffer)
+    // use requested_size instead of re-deriving the alignment policy.
     const size_t requested = size;
 
     unsigned int flags = MFD_CLOEXEC;
@@ -163,12 +163,14 @@ void* ShmHelper::allocate(size_t size) {
     // pads the tail and does not change the bytes visible to callers. Only
     // applied when SPDK registration is enabled (MC_STORE_REGISTER_SPDK=1) so
     // the default flow keeps the exact previous allocation sizes.
-    // NOTE: SPDK >= 26.09 supports 4KB-aligned registrations, so once the pinned
-    // version is upgraded this 2MB size padding AND the aligned base mapping
-    // (mmap_shm_2mb_aligned, utils.h) can be removed and plain mmap used.
+    // NOTE: SPDK >= 26.09 supports 4KB-aligned registrations, so once the
+    // pinned version is upgraded this 2MB size padding AND the aligned base
+    // mapping (mmap_shm_2mb_aligned, utils.h) can be removed and plain mmap
+    // used.
     if (register_spdk_) {
         const size_t hp_size = get_hugepage_size_from_env();
-        const size_t align = hp_size > 0 ? hp_size : static_cast<size_t>(SZ_2MB);
+        const size_t align =
+            hp_size > 0 ? hp_size : static_cast<size_t>(SZ_2MB);
         size = align_up(size, align);
     }
 #endif
