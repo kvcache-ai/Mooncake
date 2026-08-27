@@ -80,6 +80,7 @@ struct MetadataStoragePlugin;
 // Forward declarations for test classes
 namespace test {
 class MasterServiceTest;
+class MasterServiceGroupTest;
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
 // Friended so the promotion-on-hit tests can drive a serialize/reset/
@@ -148,6 +149,7 @@ class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::MasterServiceTest;
+    friend class test::MasterServiceGroupTest;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
     friend class test::DynamicReplicationTest;
@@ -1917,9 +1919,9 @@ class MasterService {
     // returned lease into the object metadata so the read path can extend the
     // group TTL without touching this table. Returns nullptr for empty
     // group_id.
-    std::shared_ptr<Lease> RegisterGroupMember(
-        const TenantId& tenant_id, const std::string& key,
-        const std::string& group_id);
+    std::shared_ptr<Lease> RegisterGroupMember(const TenantId& tenant_id,
+                                               const std::string& key,
+                                               const std::string& group_id);
     void UnregisterGroupMember(const TenantId& tenant_id,
                                const std::string& key,
                                const std::string& group_id);
