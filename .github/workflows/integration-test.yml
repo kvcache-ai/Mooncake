@@ -31,14 +31,14 @@ jobs:
     env:
       tone_user_name: ${{ secrets.TONE_USER_NAME }}
     steps:
-      - name: Require T-one credentials for the pre-release gate
-        if: ${{ inputs.testpypi_version != '' }}
+      - name: Require T-one credentials for gated integration
+        if: ${{ inputs.testpypi_version != '' || inputs.source_run_id != '' || inputs.artifact_name != '' }}
         env:
           TONE_USER_NAME: ${{ secrets.TONE_USER_NAME }}
           TONE_USER_TOKEN: ${{ secrets.TONE_USER_TOKEN }}
         run: |
           if [ -z "$TONE_USER_NAME" ] || [ -z "$TONE_USER_TOKEN" ]; then
-            echo "TONE_USER_NAME and TONE_USER_TOKEN are required for pre-release validation"
+            echo "TONE_USER_NAME and TONE_USER_TOKEN are required for gated integration"
             exit 1
           fi
 

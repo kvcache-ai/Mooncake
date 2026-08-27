@@ -408,14 +408,62 @@ jobs:
 
       - name: Run RPC Communicator Bandwidth Test
         run: |
-          python mooncake-transfer-engine/tests/rpc_communicator_test.py \
-            server --url 127.0.0.1:9004 --data-size 1 &
-          server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
-          sleep 5
-          timeout 10 python \
+          rpc_server_pid=""
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ -n "$rpc_server_pid" ]; then
+              kill "$rpc_server_pid" 2>/dev/null || true
+              wait "$rpc_server_pid" 2>/dev/null || true
+            fi
+            if [ "$status" -ne 0 ]; then
+              cat "$RUNNER_TEMP/rpc-server.log" 2>/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          python -u mooncake-transfer-engine/tests/rpc_communicator_test.py \
+            server --url 127.0.0.1:9004 --data-size 1 \
+            >"$RUNNER_TEMP/rpc-server.log" 2>&1 &
+          rpc_server_pid=$!
+
+          rpc_ready=false
+          for _ in {1..50}; do
+            if ! kill -0 "$rpc_server_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/rpc-server.log"
+              echo "::error::RPC communicator server exited before becoming ready"
+              exit 1
+            fi
+            if ss -H -ltn 'sport = :9004' | grep -q .; then
+              rpc_ready=true
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$rpc_ready" != true ]; then
+            cat "$RUNNER_TEMP/rpc-server.log"
+            echo "::error::RPC communicator server did not become ready within 5 seconds"
+            exit 1
+          fi
+
+          client_rc=0
+          timeout 10 python -u \
             mooncake-transfer-engine/tests/rpc_communicator_test.py \
-            client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
+            client --url 127.0.0.1:9004 --threads 2 --data-size 1 \
+            >"$RUNNER_TEMP/rpc-client.log" 2>&1 || \
+            client_rc=$?
+          cat "$RUNNER_TEMP/rpc-client.log"
+          if [ "$client_rc" -ne 0 ] && [ "$client_rc" -ne 124 ]; then
+            echo "::error::RPC communicator client failed with exit code $client_rc"
+            exit "$client_rc"
+          fi
+          if ! grep -q '^bandwidth:' "$RUNNER_TEMP/rpc-client.log"; then
+            cat "$RUNNER_TEMP/rpc-server.log"
+            echo "::error::RPC communicator did not complete a successful transfer"
+            exit 1
+          fi
+        shell: bash
 
   nightly-coverage:
     runs-on: ubuntu-22.04
