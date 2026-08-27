@@ -1011,7 +1011,7 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id);
-    std::vector<SegmentUpdateResult> MountNewSegments(
+    tl::expected<std::vector<SegmentUpdateResult>, ErrorCode> MountNewSegments(
         const std::vector<Segment>& segments, const UUID& client_id);
 
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
