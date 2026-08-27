@@ -80,6 +80,18 @@ ShmHelper* ShmHelper::getInstance() {
 }
 
 ShmHelper::ShmHelper() {
+#ifdef USE_NOF
+    // Force SpdkWrapper to complete construction before ShmHelper does, so that
+    // at process exit ShmHelper is destroyed FIRST: its cleanup() (which calls
+    // SpdkWrapper::UnregisterMemory) runs while the SPDK env is still alive,
+    // before ~SpdkWrapper -> Cleanup() -> spdk_env_fini(). Without this, the
+    // first host-pool allocation constructs SpdkWrapper AFTER ShmHelper, so at
+    // exit SpdkWrapper is destroyed first and cleanup() would call
+    // spdk_mem_unregister after spdk_env_fini() (UB / NULL-deref on SPDK >= 26.09).
+    // Constructing SpdkWrapper here is side-effect free: its ctor is `= default`
+    // and the env is only initialized lazily via InitializeEnv().
+    SpdkWrapper::GetInstance();
+#endif
     const char* hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
     // Read once at construction (ShmHelper is a singleton). Opt-in only: with
