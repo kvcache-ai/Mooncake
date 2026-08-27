@@ -5539,12 +5539,16 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
                 continue;
             }
-            // start cached a single complete memory replica via
-            // FilterQueryResult.
+            // start cached a single complete replica via FilterQueryResult.
+            // SelectBestReplica may return a MEMORY or NOF replica; both
+            // support range reads via RDMA. Extract the object size from
+            // whichever descriptor is present so overflow detection works.
             const auto &replica = it->second.replicas.front();
             const size_t replica_limit =
                 replica.is_memory_replica()
                     ? replica.get_memory_descriptor().buffer_descriptor.size_
+                : replica.is_nof_replica()
+                    ? replica.get_nof_descriptor().buffer_descriptor.size_
                     : 0;
             bool overflow = false;
             std::vector<Slice> entry_slices;
