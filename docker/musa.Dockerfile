@@ -50,6 +50,11 @@ RUN mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
 # Build the Python wheel from local sources
 RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
 
+# Warm the runtime JIT cache in the builder image. The cache is copied into the
+# runtime image below, so importing mooncake.pg there does not require mcc.
+RUN python${PYTHON_VERSION} -m pip install --no-cache-dir dist/*.whl && \
+    python${PYTHON_VERSION} -m mooncake.pg --prebuild
+
 ###############################################################################
 # Stage 2: install the freshly built wheel into a runtime image
 ###############################################################################
@@ -77,6 +82,7 @@ RUN apt-get update && \
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
+COPY --from=builder /root/.cache/mooncake/pg_jit /root/.cache/mooncake/pg_jit
 RUN PIP_INDEX_URL=${PYPI_INDEX_URL} python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]

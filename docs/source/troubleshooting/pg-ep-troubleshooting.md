@@ -5,6 +5,24 @@ Mooncake PG and Mooncake EP.
 
 ## PG JIT import fails
 
+The Torch-facing PG adapter is compiled for the installed PyTorch at first
+import. To check the local toolchain without compiling, run:
+
+```bash
+python -m mooncake.pg --report
+```
+
+To compile it before starting an application (for example, in a Docker build),
+run:
+
+```bash
+python -m mooncake.pg --prebuild
+```
+
+The prebuild command uses the same cache and compiler path as a normal import.
+It validates the image at build time; the runtime image must still provide the
+compiler unless the resulting JIT cache is deliberately carried into it.
+
 Symptoms:
 
 ```text
@@ -34,6 +52,12 @@ Fixes:
    ```bash
    python -m pip install ninja
    ```
+
+   On a headless CUDA host, set `TORCH_CUDA_ARCH_LIST` to an architecture
+   supported by the target GPUs before running the prebuild or importing PG.
+   MUSA PyTorch builds are detected automatically from `torch.version.musa`;
+   `MOONCAKE_EP_USE_MUSA=1` remains available when an explicit override is
+   needed.
 
 3. Re-import `mooncake.pg`; it will rebuild into the local JIT cache.
 

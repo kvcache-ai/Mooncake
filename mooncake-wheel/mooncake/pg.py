@@ -1,5 +1,6 @@
 """Mooncake ProcessGroup Torch adapter loaded through runtime JIT."""
 
+import argparse
 import contextlib
 import fcntl
 import hashlib
@@ -7,7 +8,6 @@ import os
 import shutil
 import sys
 import time
-import traceback
 from pathlib import Path
 
 import torch
@@ -28,7 +28,13 @@ def _env_enabled(name: str) -> bool:
 
 
 def _using_musa() -> bool:
-    return _env_enabled("MOONCAKE_EP_USE_MUSA")
+    configured = os.environ.get("MOONCAKE_EP_USE_MUSA")
+    if configured is not None:
+        return _env_enabled("MOONCAKE_EP_USE_MUSA")
+    # MUSA PyTorch builds expose a version while regular CUDA builds do not.
+    # Prefer this runtime signal so MUSA wheels work without a packaging-only
+    # environment variable.
+    return bool(getattr(getattr(torch, "version", None), "musa", None))
 
 
 def _load_torchada() -> None:
@@ -42,6 +48,15 @@ def _load_torchada() -> None:
             "Mooncake PG MUSA JIT requires torchada. "
             "Install it with `python -m pip install torchada`."
         ) from exc
+
+
+def _mcc_path() -> Path | None:
+    musa_home = os.environ.get("MUSA_HOME")
+    if musa_home:
+        candidate = Path(musa_home) / "bin" / "mcc"
+        return candidate if candidate.is_file() else None
+    mcc = shutil.which("mcc")
+    return Path(mcc) if mcc else None
 
 
 def _source_dir() -> Path:
@@ -191,26 +206,8 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
     )
 
 
-def _failure_marker(build_dir: Path) -> Path:
-    return build_dir / ".failed"
-
-
-def _read_failure(build_dir: Path):
-    marker = _failure_marker(build_dir)
-    if marker.is_file():
-        return marker.read_text(errors="replace")
-    return None
-
-
 def _has_built_extension(build_dir: Path) -> bool:
     return any(build_dir.glob("*.so"))
-
-
-def _write_failure(build_dir: Path, exc: BaseException):
-    _failure_marker(build_dir).write_text(
-        "The previous Mooncake PG JIT attempt failed.\n"
-        + "".join(traceback.format_exception(exc)),
-    )
 
 
 def _load_jit_adapter():
@@ -239,17 +236,13 @@ def _load_jit_adapter():
     if _using_musa():
         _load_torchada()
         musa_home = os.environ.get("MUSA_HOME")
-        mcc = (
-            Path(musa_home) / "bin" / "mcc"
-            if musa_home
-            else shutil.which("mcc")
-        )
-        if not mcc or not Path(mcc).is_file():
+        mcc = _mcc_path()
+        if mcc is None:
             raise ImportError(
                 "Mooncake PG MUSA JIT requires the MUSA compiler (mcc). "
                 "Set MUSA_HOME or add mcc to PATH."
             )
-        toolkit_identity = f"musa:{musa_home or 'PATH'}:{Path(mcc).resolve()}"
+        toolkit_identity = f"musa:{musa_home or 'PATH'}:{mcc.resolve()}"
     else:
         from torch.utils.cpp_extension import CUDA_HOME
 
@@ -259,15 +252,18 @@ def _load_jit_adapter():
                 "install a CUDA toolkit or use a compatible runtime environment"
             )
         toolkit_identity = f"cuda:{CUDA_HOME}:{Path(CUDA_HOME) / 'bin' / 'nvcc'}"
+        if not os.environ.get("TORCH_CUDA_ARCH_LIST") and not torch.cuda.is_available():
+            raise ImportError(
+                "Mooncake PG CUDA JIT is running without a visible CUDA device. "
+                "Set TORCH_CUDA_ARCH_LIST to a compatible architecture (for example, 8.0) "
+                "before importing mooncake.pg."
+            )
     key = _cache_key(source_dir, core_path, toolkit_identity)
     build_dir = _cache_root() / key
     build_dir.mkdir(parents=True, exist_ok=True)
     lock_path = build_dir.with_suffix(".lock")
     try:
         with _build_lock(lock_path):
-            previous_failure = _read_failure(build_dir)
-            if previous_failure:
-                raise RuntimeError(previous_failure)
             cold_build = not _has_built_extension(build_dir)
             started = time.monotonic()
             if cold_build:
@@ -287,16 +283,70 @@ def _load_jit_adapter():
                 )
             return module
     except Exception as exc:
-        with _build_lock(lock_path):
-            if not _failure_marker(build_dir).exists():
-                _write_failure(build_dir, exc)
         raise ImportError(
             "Mooncake PG Torch adapter JIT compilation failed: " + str(exc)
         ) from exc
 
 
-backend_module = _load_jit_adapter()
-globals().update(
-    {key: value for key, value in backend_module.__dict__.items()
-     if not key.startswith("_")}
-)
+def _compatibility_report() -> int:
+    is_musa = _using_musa()
+    ready = True
+    print("Mooncake PG JIT compatibility report")
+    print(f"  torch: {torch.__version__}")
+    print(f"  backend: {'MUSA' if is_musa else 'CUDA'}")
+    print(f"  torch.version.cuda: {torch.version.cuda}")
+    print(f"  torch.version.musa: {getattr(torch.version, 'musa', None)}")
+    ninja = shutil.which("ninja")
+    print(f"  ninja: {ninja or 'missing'}")
+    ready &= ninja is not None
+    print(f"  TORCH_CUDA_ARCH_LIST: {os.environ.get('TORCH_CUDA_ARCH_LIST', '<unset>')}")
+    if is_musa:
+        mcc = _mcc_path()
+        print(f"  mcc: {mcc or 'missing'}")
+        ready &= mcc is not None
+        print(f"  MTGPU_TARGET: {os.environ.get('MTGPU_TARGET', 'mp_31')}")
+    else:
+        try:
+            from torch.utils.cpp_extension import CUDA_HOME
+        except Exception:
+            CUDA_HOME = None
+        nvcc = Path(CUDA_HOME) / "bin" / "nvcc" if CUDA_HOME else None
+        cuda_available = torch.cuda.is_available()
+        print(f"  CUDA_HOME: {CUDA_HOME or 'missing'}")
+        print(f"  nvcc: {nvcc if nvcc and nvcc.is_file() else 'missing'}")
+        print(f"  CUDA available: {cuda_available}")
+        ready &= nvcc is not None and nvcc.is_file()
+        if not cuda_available and not os.environ.get("TORCH_CUDA_ARCH_LIST"):
+            ready = False
+    source_dir = _source_dir()
+    print(f"  source bundle: {source_dir if source_dir.is_dir() else 'missing'}")
+    ready &= source_dir.is_dir()
+    core_path = Path(__file__).with_name("libmooncake_pg.so")
+    print(f"  PG core library: {core_path if core_path.is_file() else 'missing'}")
+    ready &= core_path.is_file()
+    print(f"  cache: {_cache_root()}")
+    print(f"  status: {'ready' if ready else 'not ready'}")
+    return 0 if ready else 1
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Mooncake PG Torch JIT utility")
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--prebuild", action="store_true", help="build the PG adapter now")
+    action.add_argument("--report", action="store_true", help="print JIT compatibility information")
+    args = parser.parse_args(argv)
+    if args.report:
+        return _compatibility_report()
+    if args.prebuild:
+        _load_jit_adapter()
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+else:
+    backend_module = _load_jit_adapter()
+    globals().update(
+        {key: value for key, value in backend_module.__dict__.items()
+         if not key.startswith("_")}
+    )

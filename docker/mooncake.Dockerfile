@@ -73,6 +73,8 @@ RUN mkdir -p build && \
     bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
     cd /workspace && \
     OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
+    python${PYTHON_VERSION} -m pip install --no-cache-dir dist/*.whl && \
+    python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
     if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
         rm -rf build; \
     fi
@@ -117,6 +119,7 @@ RUN apt-get update && \
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
+COPY --from=builder /root/.cache/mooncake/pg_jit /root/.cache/mooncake/pg_jit
 COPY --chmod=755 scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
 RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
