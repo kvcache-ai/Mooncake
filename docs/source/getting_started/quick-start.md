@@ -72,11 +72,8 @@ startup and connector configuration for each path.
 ## Optional Python Smoke Test
 
 If you want to verify the Store Python API without a serving framework, run this
-single-node `put`/`get` example. The default path starts `mooncake_master`
-separately. To skip the master process entirely, pass `enable_standalone=True`
-as shown in the {ref}`standalone deployment <standalone-no-external-master>`
-section. The example uses `P2PHANDSHAKE`, so no separate Transfer Engine
-metadata service is required.
+single-node `put`/`get` example after starting `mooncake_master`. It uses
+`P2PHANDSHAKE`, so no separate Transfer Engine metadata service is required.
 
 ```python
 from mooncake.store import MooncakeDistributedStore

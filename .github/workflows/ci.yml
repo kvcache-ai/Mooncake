@@ -114,7 +114,7 @@ jobs:
         # TIME_WAIT+bind conflict for same-IP or loopback).
         sudo sysctl -w net.ipv4.ip_local_reserved_ports=50052
         source test_env/bin/activate
-        MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true SKIP_STANDALONE_STORE_E2E=1 ./scripts/run_tests.sh
+        MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
         rm -rf /tmp/mooncake_test_ssd
         deactivate
       shell: bash

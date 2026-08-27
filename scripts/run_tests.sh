@@ -4,8 +4,6 @@
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
@@ -125,13 +123,6 @@ MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python trans
 TARGET_PID=$!
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_initiator_test.py
 kill $TARGET_PID || true
-
-if [ -z "${SKIP_STANDALONE_STORE_E2E:-}" ]; then
-    echo "Running standalone Mooncake Store e2e tests (no mooncake_master)..."
-    bash "$SCRIPT_DIR/run_standalone_store_e2e.sh"
-else
-    echo "Skipping standalone Mooncake Store e2e tests (SKIP_STANDALONE_STORE_E2E is set)"
-fi
 
 echo "Running master tests..."
 

@@ -159,16 +159,17 @@ print(store.get("hello_key").decode())
 store.close()
 ```
 
-Or with a config dict / env:
+Or with a config dict / env (`MOONCAKE_ENABLE_STANDALONE=true` is read by the C++ client during `setup()`, so existing callers do not need a new kwarg):
 
-```bash
-export MOONCAKE_ENABLE_STANDALONE=true
-export MOONCAKE_PROTOCOL=tcp
-python -m mooncake.mooncake_store_service --enable-standalone
-```
-
-```bash
-mooncake_client --enable_standalone=true --global_segment_size="1GB"
+```python
+store.setup({
+    "local_hostname": "localhost",
+    "metadata_server": "P2PHANDSHAKE",
+    "global_segment_size": "512MB",
+    "local_buffer_size": "128MB",
+    "protocol": "tcp",
+    "enable_standalone": True,
+})
 ```
 
 Standalone mode is for a single process that both owns memory and serves KV operations. It is not a substitute for HA or multi-node clusters — those still need an external `mooncake_master`.
@@ -1088,7 +1089,6 @@ mooncake_client \
 | `--threads` | `1` | Client worker thread count |
 | `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
-| `--enable_standalone` | `false` | Start an in-process master; no external `mooncake_master` is required. When true, the default metadata server is `P2PHANDSHAKE` |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 | `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |

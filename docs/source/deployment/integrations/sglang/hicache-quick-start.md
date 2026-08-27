@@ -39,8 +39,6 @@ grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
 mooncake_master --enable_http_metadata_server=true
 ```
 
-For a **single-node** trial that does not start `mooncake_master`, skip this step and set `MOONCAKE_ENABLE_STANDALONE=true` when launching SGLang. Mooncake then embeds the master in the SGLang process. This is for evaluation and embedding only; multi-node and HA deployments still need an external master.
-
 ### 3. Launch SGLang with Mooncake L3 storage
 
 ```bash
@@ -49,21 +47,6 @@ export MC_STORE_HUGEPAGE_SIZE="2MB"
 export MOONCAKE_GLOBAL_SEGMENT_SIZE="8gb"
 export MC_MMAP_ARENA_POOL_SIZE="56gb"
 
-MOONCAKE_MASTER=127.0.0.1:50051 python -m sglang.launch_server \
-    --model-path [model_path] \
-    --page-size 64 \
-    --enable-hierarchical-cache \
-    --hicache-storage-prefetch-policy timeout \
-    --hicache-storage-backend mooncake
-```
-
-Single-node without `mooncake_master` (SGLang still expects `MOONCAKE_MASTER` to be set; the address is unused):
-
-```bash
-export MOONCAKE_ENABLE_STANDALONE=true
-export MOONCAKE_PROTOCOL=tcp
-export MOONCAKE_TE_META_DATA_SERVER=P2PHANDSHAKE
-export MOONCAKE_GLOBAL_SEGMENT_SIZE=1gb
 MOONCAKE_MASTER=127.0.0.1:50051 python -m sglang.launch_server \
     --model-path [model_path] \
     --page-size 64 \

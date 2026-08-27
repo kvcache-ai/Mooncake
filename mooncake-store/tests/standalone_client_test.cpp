@@ -42,19 +42,21 @@ class StandaloneClientTest : public ::testing::Test {
 };
 
 TEST_F(StandaloneClientTest, PutGetWithoutExternalMaster) {
-    ASSERT_EQ(
-        client_->setup_real("localhost", "P2PHANDSHAKE", 16 * 1024 * 1024,
-                            16 * 1024 * 1024, FLAGS_protocol, rdma_devices(),
-                            /*master_server_addr=*/"",
-                            /*transfer_engine=*/nullptr,
-                            /*ipc_socket_path=*/"",
-                            /*enable_ssd_offload=*/false,
-                            /*ssd_offload_path=*/"",
-                            /*tenant_id=*/"default",
-                            /*enable_client_http_server=*/false,
-                            /*client_http_port=*/DEFAULT_CLIENT_HTTP_PORT,
-                            /*enable_standalone=*/true),
-        0)
+    auto setup = client_->setup_internal(
+        "localhost", "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+        FLAGS_protocol, rdma_devices(),
+        /*master_server_addr=*/"",
+        /*transfer_engine=*/nullptr,
+        /*ipc_socket_path=*/"",
+        /*local_rpc_port=*/50052,
+        /*enable_ssd_offload=*/false,
+        /*start_offload_rpc_server=*/true,
+        /*ssd_offload_path=*/"",
+        /*tenant_id=*/"default",
+        /*enable_client_http_server=*/false,
+        /*client_http_port=*/DEFAULT_CLIENT_HTTP_PORT,
+        /*enable_standalone=*/true);
+    ASSERT_TRUE(setup.has_value())
         << "Standalone setup should succeed without mooncake_master";
 
     const std::string key = "standalone_key";

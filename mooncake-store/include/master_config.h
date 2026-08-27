@@ -1409,8 +1409,7 @@ inline MasterServiceConfigBuilder MasterServiceConfig::builder() {
     return MasterServiceConfigBuilder();
 }
 
-// Configuration for EmbeddedMaster / InProcMaster (in-process master used by
-// standalone single-node deployments and tests)
+// Configuration for InProcMaster (in-process master server for testing)
 struct InProcMasterConfig {
     std::optional<int> rpc_port;
     std::optional<int> http_metrics_port;

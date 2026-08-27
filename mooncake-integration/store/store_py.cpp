@@ -2220,12 +2220,15 @@ PYBIND11_MODULE(store, m) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                return real_client->setup_real(
+                auto result = real_client->setup_internal(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine, "", enable_ssd_offload,
-                    ssd_offload_path, tenant_id, enable_client_http_server,
-                    client_http_port, enable_standalone);
+                    master_server_addr, transfer_engine, "", 50052,
+                    enable_ssd_offload, true, ssd_offload_path, tenant_id,
+                    enable_client_http_server, client_http_port,
+                    enable_standalone);
+                return result.has_value() ? 0
+                                          : static_cast<int>(result.error());
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),

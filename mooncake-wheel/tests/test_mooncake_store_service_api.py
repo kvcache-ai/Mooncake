@@ -49,7 +49,6 @@ from mooncake.mooncake_store_service import (
     _install_shutdown_signal_handlers,
     _shm_name_to_path,
     main as store_service_main,
-    parse_arguments,
 )
 
 
@@ -148,7 +147,6 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             tenant_id="tenant-a",
             enable_client_http_server=False,
             client_http_port=9300,
-            enable_standalone=False,
         )
 
         with patch(
@@ -175,7 +173,6 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
                         "tenant_id": "tenant-a",
                         "enable_client_http_server": False,
                         "client_http_port": 9300,
-                        "enable_standalone": False,
                     },
                 )
             ],
@@ -197,42 +194,6 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(service.config.tenant_id, "tenant-from-cli")
-
-    async def test_start_store_service_passes_enable_standalone_to_setup(self):
-        fake_store = FakeStore()
-        self.service.config = SimpleNamespace(
-            local_hostname="localhost",
-            metadata_server="P2PHANDSHAKE",
-            global_segment_size=1024,
-            local_buffer_size=2048,
-            protocol="tcp",
-            device_name="",
-            master_server_address="",
-            enable_ssd_offload=False,
-            ssd_offload_path="",
-            tenant_id="tenant-a",
-            enable_client_http_server=False,
-            client_http_port=9300,
-            enable_standalone=True,
-        )
-
-        with patch(
-            "mooncake.mooncake_store_service.MooncakeDistributedStore",
-            return_value=fake_store,
-        ):
-            result = await self.service.start_store_service(max_wait_time=1)
-
-        self.assertTrue(result)
-        self.assertEqual(fake_store.setup_calls[0][0]["enable_standalone"], True)
-
-    def test_parse_arguments_enable_standalone_flag(self):
-        with mock.patch.object(
-            sys,
-            "argv",
-            ["mooncake_store_service", "--enable-standalone"],
-        ):
-            args = parse_arguments()
-        self.assertTrue(args.enable_standalone)
 
     async def test_mount_shm_then_unmount_shm_api(self):
         mount_resp = await self.service.handle_mount_shm(
@@ -358,9 +319,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         # subsequent same-path detection keeps working.
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/old")
 
-    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(
-        self,
-    ):
+    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(self):
         # A remount to the SAME path that fails to mount must not destroy the
         # still-healthy previous segments: the node keeps serving from them and
         # stays in decode mode (make-before-break). Same-path MBB is safe here
@@ -438,9 +397,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.current_mode, "decode")
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/new")
 
-    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(
-        self,
-    ):
+    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(self):
         # New mount succeeds, but retiring the previous segments only PARTIALLY
         # fails. unmount_segment reports the first error for a batch, so the old
         # ids must be unmounted individually; mounted_segment_ids must then hold
@@ -1051,9 +1008,6 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             enable_ssd_offload=False,
             ssd_offload_path="",
             tenant_id="",
-            enable_client_http_server=False,
-            client_http_port=9300,
-            enable_standalone=False,
         )
 
     async def test_shutdown_event_stops_startup_retry_sleep(self):
@@ -1123,7 +1077,9 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             await self.service.stop()
 
         self.assertIsNone(self.service.store)
-        self.assertTrue(any("close returned 7" in message for message in logs.output))
+        self.assertTrue(
+            any("close returned 7" in message for message in logs.output)
+        )
         await self.service.stop()
         store.close.assert_called_once_with()
 
@@ -1147,7 +1103,6 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             define=[],
             max_wait_time=60,
             port=8080,
-            enable_standalone=False,
         )
         service = mock.Mock()
         service.start_store_service = mock.AsyncMock(return_value=False)
