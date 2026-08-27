@@ -5,6 +5,8 @@ try:
 except ModuleNotFoundError:
     raise ImportError(
         "Mooncake EP was not built. Please rebuild Mooncake with WITH_EP=ON.\n"
-        f"Open an issue at https://github.com/kvcache-ai/Mooncake/issues."
+        "Open an issue at https://github.com/kvcache-ai/Mooncake/issues."
     )
-globals().update({k: v for k, v in backend_module.__dict__.items() if not k.startswith("_")})
+globals().update(
+    {k: v for k, v in backend_module.__dict__.items() if not k.startswith("_")}
+)

@@ -25,6 +25,14 @@ elseif(USE_MUSA OR USE_MACA)
       "${_pg_device_depfile}"
       "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
       "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include")
+  # mcc/mxcc run outside a CMake compile target, so linked target usage
+  # requirements do not reach this custom command automatically.
+  get_target_property(_pg_ylt_include_dirs yalantinglibs
+                      INTERFACE_INCLUDE_DIRECTORIES)
+  foreach(_pg_ylt_include_dir IN LISTS _pg_ylt_include_dirs)
+    list(APPEND _pg_device_flags
+         "$<$<BOOL:${_pg_ylt_include_dir}>:-I${_pg_ylt_include_dir}>")
+  endforeach()
   set(_pg_device_dependencies
       "${_pg_device_source}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../include/mooncake_worker_kernels.cuh"

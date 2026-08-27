@@ -328,6 +328,27 @@ jobs:
         bash scripts/check_reshard_types.sh
       shell: bash
 
+  release-gate-tests:
+    name: Test TestPyPI release gate
+    if: *run-ci
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Run focused release gate tests
+      run: |
+        python -m pip install --disable-pip-version-check \
+          packaging pytest==8.3.5
+        python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
+      shell: bash
+
   clang-format:
     name: Check code format
     if: *run-ci
@@ -702,6 +723,7 @@ jobs:
       - clang-format
       - docs-check
       - reshard-type-check
+      - release-gate-tests
       - reshard-test
       - build-wheel
       - build-flags

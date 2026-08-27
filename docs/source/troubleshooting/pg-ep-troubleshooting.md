@@ -181,7 +181,7 @@ python mooncake-pg/benchmark/pgbench.py \
   --collective all_reduce --backend mooncake --device cuda -g 2 -b 8 -e 1M -f 2
 
 # EP grid test
-python mooncake-ep/tests/test_ep_grid.py
+python python/tests/ep/test_ep_grid.py
 ```
 
 Adapt process counts, device filters, and launchers to the target cluster.

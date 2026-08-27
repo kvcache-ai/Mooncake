@@ -431,8 +431,8 @@ capacity consistent when propagating committed PG membership into EP.
 - PG collectives: `mooncake-pg/tests/test_pg_collectives.py`
 - PG elastic recovery and subgroup extension: `mooncake-pg/tests/test_pg_elastic.py`
 - PG benchmark harness: `mooncake-pg/benchmark/README.md`
-- EP correctness and failure simulation: `mooncake-ep/tests/test_ep_grid.py`
-- Wheel-level EP example: `mooncake-wheel/tests/test_mooncake_ep.py`
+- EP correctness and failure simulation: `python/tests/ep/test_ep_grid.py`
+- EP wrapper example: `python/tests/ep/test_mooncake_ep.py`
 
 See [PG/EP troubleshooting](../../troubleshooting/pg-ep-troubleshooting.md) for
 common setup and runtime issues.
