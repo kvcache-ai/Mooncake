@@ -86,6 +86,11 @@ class Workers {
     // DeviceSelector id, so port events can flip that device's availability.
     int handleContextEvents(int dev_id, std::shared_ptr<RdmaContext>& context);
 
+    // Re-read the link speed after a port event and re-seed the selector if
+    // it changed; a link that returns at the same speed keeps what it
+    // learned.
+    void refreshLinkSpeed(int dev_id, RdmaContext& context);
+
     Status generatePostPath(RdmaSlice* slice);
 
    private:

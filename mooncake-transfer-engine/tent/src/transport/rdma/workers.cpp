@@ -853,11 +853,36 @@ int Workers::handleContextEvents(int dev_id,
         LOG(WARNING) << "Action: " << context->name() << " down";
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
         context->resume();
+        // The link may have renegotiated while down: re-seed before the
+        // device becomes selectable so no worker scores it on the old rate.
+        refreshLinkSpeed(dev_id, *context);
         device_selector_->setDeviceAvailable(dev_id, true);
         LOG(WARNING) << "Action: " << context->name() << " up";
+#ifdef HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE
+    } else if (event.event_type == IBV_EVENT_DEVICE_SPEED_CHANGE) {
+        // rdma-core >= 62: a port speed changed without a link flap (e.g. a
+        // VF over LAG losing a PF). Device-level, so the event names no
+        // port; each context opens exactly one, so re-query that one.
+        refreshLinkSpeed(dev_id, *context);
+#endif
     }
     ibv_ack_async_event(&event);
     return 0;
+}
+
+void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {
+    if (!device_selector_) return;
+    const double before = context.linkSpeedGbps();
+    if (context.refreshPortAttributes() != 0) return;  // already logged
+    const double after = context.linkSpeedGbps();
+    // Both values decode from the same integer encodings, so exact
+    // comparison is meaningful. A speed that can no longer be read (0)
+    // counts as a change: setDeviceBandwidth() then falls back to the
+    // configured default and warns, the same as at startup.
+    if (after == before) return;
+    LOG(WARNING) << context.name() << " link speed " << before << " -> "
+                 << after << " Gbps, re-seeding its bandwidth estimate";
+    device_selector_->setDeviceBandwidth(dev_id, after);
 }
 
 void Workers::reclaimEndpoints() {

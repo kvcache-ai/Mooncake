@@ -281,6 +281,11 @@ All slice spraying parameters are configurable via the configuration file:
   admission queue's deadline predictor reads. The default speed applies
   only to a usable NIC whose speed could not be determined. `PORT_ERR`
   marks a device unavailable and `PORT_ACTIVE` restores it
+- The link speed is re-read on `IBV_EVENT_PORT_ACTIVE`, and on
+  `IBV_EVENT_DEVICE_SPEED_CHANGE` where rdma-core (>= 62) provides it. If
+  the speed changed -- a 400G link returning at 100G, or a VF over LAG
+  losing a PF -- the device's EWMA is re-seeded and its clamp re-derived; a
+  link that returns at the same speed keeps its learned estimate
 
 ## Usage Examples
 

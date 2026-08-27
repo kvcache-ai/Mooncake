@@ -331,6 +331,17 @@ TEST(RdmaNicIndexAlignmentTest, FailedContextIsUnavailableToSelector) {
     EXPECT_LT(selector->getAggregateEwmaBandwidth(), 0.0);
 }
 
+// refreshPortAttributes() is called from the monitor thread on port events.
+// On a slot that never opened a device it must fail cleanly and leave the
+// (zero) speed alone rather than touch a null ibv_context.
+TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {
+    RdmaTransport transport;
+    RdmaContext context(transport);
+    ASSERT_EQ(context.status(), RdmaContext::DEVICE_UNINIT);
+    EXPECT_EQ(context.refreshPortAttributes(), -1);
+    EXPECT_DOUBLE_EQ(context.linkSpeedGbps(), 0.0);
+}
+
 TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
     if (!hasRdmaDevice()) GTEST_SKIP() << "no RDMA device detected";
 
