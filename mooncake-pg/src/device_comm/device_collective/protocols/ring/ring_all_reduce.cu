@@ -217,15 +217,16 @@ __global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
     PG_DEVICE_ASSERT(transfer_handle->peer_accessible_region.contains(
         plan.signal_ptr, signal_bytes));
 
-    // Use the whole common buffer prefix modulo the small tail needed to keep
-    // every channel's two payload slots 16-byte aligned for ValuePack loads
-    // and stores. All ranks derive the same layout from the published Plan.
     static_assert(kRingPayloadAlignment == alignof(ValuePack<T>));
     const uint64_t unaligned_payload_slot_size =
         plan.buffer_size / channel_count / kRingPipelineSlots;
-    const uint64_t payload_slot_size =
+    const uint64_t aligned_payload_slot_size =
         unaligned_payload_slot_size -
         unaligned_payload_slot_size % kRingPayloadAlignment;
+    // Bound the handoff granularity independently of the shared workspace
+    // capacity. All ranks derive the same layout from the published Plan.
+    const uint64_t payload_slot_size =
+        minimum(aligned_payload_slot_size, kMaxRingPayloadSlotSize);
     PG_DEVICE_ASSERT(payload_slot_size >= sizeof(T));
     const uint64_t channel_buffer_size = payload_slot_size * kRingPipelineSlots;
     PG_DEVICE_ASSERT(channel_buffer_size * channel_count <= plan.buffer_size);
