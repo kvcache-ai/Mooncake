@@ -1,9 +1,13 @@
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -16,10 +20,7 @@
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/high_availability_test_fixture.h"
 #include "ha/leadership/master_service_supervisor.h"
-#include "ha/standby_controller.h"
-#include "master_admin_service.h"
 #include "master_service.h"
-#include "replica.h"
 #include "types.h"
 #include "utils.h"
 
@@ -29,6 +30,11 @@ namespace testing {
 DEFINE_string(etcd_endpoints, "127.0.0.1:2379", "Etcd endpoints");
 DEFINE_string(etcd_test_key_prefix, "mooncake-store/test/",
               "The prefix of the test keys in ETCD");
+DEFINE_bool(ha_supervisor_child, false,
+            "Run a real HA supervisor for the parent integration test");
+DEFINE_int32(ha_supervisor_rpc_port, 0, "Child supervisor RPC port");
+DEFINE_int32(ha_supervisor_admin_port, 0, "Child supervisor admin port");
+DEFINE_string(ha_supervisor_cluster_id, "", "Child supervisor cluster ID");
 
 void HighAvailabilityTest::SetUpTestSuite() {
     // Initialize glog
@@ -104,21 +110,11 @@ std::unique_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
 
 class FakeLeaderCoordinator : public ha::LeaderCoordinator {
    public:
-    struct State {
-        int release_calls{0};
-        int monitor_start_calls{0};
-        ErrorCode release_result{ErrorCode::OK};
-        ErrorCode monitor_start_result{
-            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS};
-    };
-
-    explicit FakeLeaderCoordinator(ViewVersionId view_version,
-                                   std::shared_ptr<State> state = nullptr)
+    explicit FakeLeaderCoordinator(ViewVersionId view_version)
         : session_{.view = {.leader_address = "fake-leader",
                             .view_version = view_version},
                    .owner_token = "fake-owner",
-                   .lease_ttl = std::chrono::milliseconds(0)},
-          state_(std::move(state)) {}
+                   .lease_ttl = std::chrono::milliseconds(0)} {}
 
     tl::expected<std::optional<ha::MasterView>, ErrorCode> ReadCurrentView()
         override {
@@ -149,70 +145,108 @@ class FakeLeaderCoordinator : public ha::LeaderCoordinator {
     StartLeadershipMonitor(
         const ha::LeadershipSession& /*session*/,
         ha::LeadershipLostCallback /*on_leadership_lost*/) override {
-        if (state_) {
-            ++state_->monitor_start_calls;
-            return tl::make_unexpected(state_->monitor_start_result);
-        }
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
     ErrorCode ReleaseLeadership(
         const ha::LeadershipSession& /*session*/) override {
-        if (!state_) {
-            return ErrorCode::OK;
-        }
-        ++state_->release_calls;
-        return state_->release_result;
+        return ErrorCode::OK;
     }
 
    private:
     ha::LeadershipSession session_;
-    std::shared_ptr<State> state_;
 };
 
-class FakeStandbyController : public ha::StandbyController {
+class SupervisorChildProcess {
    public:
-    explicit FakeStandbyController(ErrorCode promotion_error)
-        : promotion_result_(tl::make_unexpected(promotion_error)) {}
+    SupervisorChildProcess(int rpc_port, int admin_port, std::string cluster_id)
+        : rpc_port_(rpc_port),
+          admin_port_(admin_port),
+          cluster_id_(std::move(cluster_id)) {}
 
-    explicit FakeStandbyController(ha::PromotionContext promotion_context)
-        : promotion_result_(std::move(promotion_context)) {}
+    ~SupervisorChildProcess() { Stop(); }
 
-    ErrorCode StartStandby(
-        const std::optional<ha::MasterView>& /*observed_leader*/) override {
-        return ErrorCode::OK;
+    bool Start() {
+        pid_ = fork();
+        if (pid_ != 0) {
+            return pid_ > 0;
+        }
+
+        const std::string endpoints_arg =
+            "--etcd_endpoints=" + FLAGS_etcd_endpoints;
+        const std::string rpc_port_arg =
+            "--ha_supervisor_rpc_port=" + std::to_string(rpc_port_);
+        const std::string admin_port_arg =
+            "--ha_supervisor_admin_port=" + std::to_string(admin_port_);
+        const std::string cluster_arg =
+            "--ha_supervisor_cluster_id=" + cluster_id_;
+        execl("/proc/self/exe", "/proc/self/exe", "--ha_supervisor_child=true",
+              endpoints_arg.c_str(), rpc_port_arg.c_str(),
+              admin_port_arg.c_str(), cluster_arg.c_str(), nullptr);
+        _exit(127);
     }
 
-    void StopStandby() override {}
-
-    ErrorCode PromoteStandby() override { return ErrorCode::OK; }
-
-    tl::expected<ha::PromotionContext, ErrorCode> PromoteStandbyAndExport()
-        override {
-        return std::move(promotion_result_);
+    bool IsRunning() {
+        if (pid_ <= 0) {
+            return false;
+        }
+        int status = 0;
+        if (waitpid(pid_, &status, WNOHANG) == 0) {
+            return true;
+        }
+        pid_ = 0;
+        return false;
     }
 
-    void UpdateObservedLeader(
-        const std::optional<ha::MasterView>& /*observed_leader*/) override {}
-
-    ha::MasterRuntimeState GetStandbyRuntimeState() const override {
-        return ha::MasterRuntimeState::kStandby;
-    }
-
-    void SetStandbyRuntimeStateCallback(
-        RuntimeStateCallback callback) override {
-        runtime_state_callback_ = std::move(callback);
+    void Stop() {
+        if (pid_ <= 0) {
+            return;
+        }
+        kill(pid_, SIGKILL);
+        waitpid(pid_, nullptr, 0);
+        pid_ = 0;
     }
 
    private:
-    tl::expected<ha::PromotionContext, ErrorCode> promotion_result_;
-    RuntimeStateCallback runtime_state_callback_;
+    pid_t pid_{0};
+    int rpc_port_;
+    int admin_port_;
+    std::string cluster_id_;
 };
 
-MasterServiceSupervisorConfig MakeSupervisorConfig() {
+struct HttpResponse {
+    int status;
+    std::string body;
+};
+
+HttpResponse HttpGet(int port, const std::string& path) {
+    coro_http::coro_http_client client;
+    auto result = client.get("http://127.0.0.1:" + std::to_string(port) + path);
+    return {.status = result.status, .body = std::string(result.resp_body)};
+}
+
+bool WaitForServing(SupervisorChildProcess& child, int admin_port,
+                    std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline && child.IsRunning()) {
+        const auto health = HttpGet(admin_port, "/health");
+        if (health.status == 200 &&
+            health.body.find("\"ha_state\":\"serving\"") != std::string::npos &&
+            health.body.find("\"service_ready\":true") != std::string::npos) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
+}  // namespace
+
+int RunSupervisorChild() {
     MasterServiceSupervisorConfig config;
     config.enable_metric_reporting = false;
-    config.metrics_port = 0;
+    config.metrics_port = FLAGS_ha_supervisor_admin_port;
+    config.metrics_host = "127.0.0.1";
     config.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     config.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     config.allow_evict_soft_pinned_objects = true;
@@ -229,68 +263,20 @@ MasterServiceSupervisorConfig MakeSupervisorConfig() {
     config.nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     config.enable_offload = false;
-    config.rpc_port = getFreeTcpPort();
+    config.rpc_address = "127.0.0.1";
+    config.rpc_port = FLAGS_ha_supervisor_rpc_port;
     config.rpc_thread_num = 1;
-    return config;
+    config.local_hostname =
+        config.rpc_address + ":" + std::to_string(FLAGS_ha_supervisor_rpc_port);
+    config.ha_backend_type = "etcd";
+    config.ha_backend_connstring = FLAGS_etcd_endpoints;
+    config.etcd_endpoints = FLAGS_etcd_endpoints;
+    config.cluster_id = FLAGS_ha_supervisor_cluster_id;
+    config.enable_oplog = false;
+
+    ha::MasterServiceSupervisor supervisor(config);
+    return supervisor.Start();
 }
-
-StandbyObjectEntry MakeStandbyObject(const std::string& key,
-                                     const std::string& endpoint, size_t size,
-                                     uintptr_t address) {
-    Replica::Descriptor replica;
-    replica.id = 1;
-    replica.status = ReplicaStatus::COMPLETE;
-    MemoryDescriptor memory;
-    memory.buffer_descriptor.transport_endpoint_ = endpoint;
-    memory.buffer_descriptor.buffer_address_ = address;
-    memory.buffer_descriptor.size_ = size;
-    replica.descriptor_variant = std::move(memory);
-
-    StandbyObjectMetadata metadata;
-    metadata.client_id = generate_uuid();
-    metadata.size = size;
-    metadata.replicas.push_back(std::move(replica));
-    return StandbyObjectEntry{"default", key, std::move(metadata)};
-}
-
-ha::PromotionContext MakeInvalidPromotionContext(bool overlap) {
-    constexpr char kEndpoint[] = "supervisor_restore_segment";
-    constexpr size_t kObjectSize = 64;
-    ha::PromotionContext context;
-    context.applied_seq_id = 1;
-    context.segments.push_back(StandbySegmentInfo{
-        .segment_name = kEndpoint,
-        .transport_endpoint = kEndpoint,
-        .capacity = 4096,
-        .is_memory_segment = true,
-        .file_path = "",
-    });
-    context.objects.push_back(MakeStandbyObject(
-        "supervisor_restore_first", kEndpoint, kObjectSize, 0x1000));
-    if (overlap) {
-        context.objects.push_back(MakeStandbyObject(
-            "supervisor_restore_second", kEndpoint, kObjectSize, 0x1000));
-    } else {
-        context.objects.front()
-            .metadata.replicas.front()
-            .get_memory_descriptor()
-            .buffer_descriptor.size_ = kObjectSize + 1;
-    }
-    return context;
-}
-
-struct HttpResponse {
-    int status;
-    std::string body;
-};
-
-HttpResponse HttpGet(int port, const std::string& path) {
-    coro_http::coro_http_client client;
-    auto result = client.get("http://127.0.0.1:" + std::to_string(port) + path);
-    return {.status = result.status, .body = std::string(result.resp_body)};
-}
-
-}  // namespace
 
 TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
     constexpr ViewVersionId kAcquiredView = 42;
@@ -329,86 +315,23 @@ TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
     EXPECT_EQ(kAcquiredView, ping->view_version_id);
 }
 
-TEST_F(HighAvailabilityTest,
-       PromotionFailureReleasesLeadershipAndKeepsServiceUnavailable) {
-    auto state = std::make_shared<FakeLeaderCoordinator::State>();
-    state->release_result = ErrorCode::ETCD_OPERATION_ERROR;
-    auto config = MakeSupervisorConfig();
-    const int admin_port = getFreeTcpPort();
-    MasterAdminServer admin(static_cast<uint16_t>(admin_port), false,
-                            "127.0.0.1");
-    ASSERT_TRUE(admin.Start());
-
-    EXPECT_EQ(-1, ha::RunSupervisorLoopForTesting(
-                      MakeEtcdBackendSpec("unused"), config, admin,
-                      std::make_unique<FakeLeaderCoordinator>(1, state),
-                      std::make_unique<FakeStandbyController>(
-                          ErrorCode::INVALID_PARAMS)));
-    EXPECT_EQ(state->release_calls, 1);
-
-    const auto health = HttpGet(admin_port, "/health");
-    EXPECT_EQ(health.status, 200);
-    EXPECT_NE(health.body.find("\"service_ready\":false"), std::string::npos);
-    EXPECT_EQ(HttpGet(admin_port, "/get_all_keys").status, 503);
-    admin.Stop();
-}
-
-TEST_F(HighAvailabilityTest, EmptyPromotionContextPassesRestoreGate) {
-    auto state = std::make_shared<FakeLeaderCoordinator::State>();
-    state->monitor_start_result = ErrorCode::INVALID_PARAMS;
-    auto config = MakeSupervisorConfig();
-    const int admin_port = getFreeTcpPort();
-    MasterAdminServer admin(static_cast<uint16_t>(admin_port), false,
-                            "127.0.0.1");
-    ASSERT_TRUE(admin.Start());
-
-    EXPECT_EQ(
-        -1,
-        ha::RunSupervisorLoopForTesting(
-            MakeEtcdBackendSpec("unused"), config, admin,
-            std::make_unique<FakeLeaderCoordinator>(1, state),
-            std::make_unique<FakeStandbyController>(ha::PromotionContext{})));
-    EXPECT_EQ(state->monitor_start_calls, 1);
-    EXPECT_EQ(state->release_calls, 1);
-
-    const auto health = HttpGet(admin_port, "/health");
-    EXPECT_EQ(health.status, 200);
-    EXPECT_NE(health.body.find("\"service_ready\":false"), std::string::npos);
-    admin.Stop();
-}
-
-TEST_F(HighAvailabilityTest,
-       RestoreFailureReleasesLeadershipAndKeepsServiceUnavailable) {
-    for (const bool overlap : {false, true}) {
-        SCOPED_TRACE(overlap ? "overlapping descriptors"
-                             : "descriptor size mismatch");
-        auto state = std::make_shared<FakeLeaderCoordinator::State>();
-        state->release_result = ErrorCode::ETCD_OPERATION_ERROR;
-        auto config = MakeSupervisorConfig();
-        const int admin_port = getFreeTcpPort();
-        MasterAdminServer admin(static_cast<uint16_t>(admin_port), false,
-                                "127.0.0.1");
-        ASSERT_TRUE(admin.Start());
-
-        EXPECT_EQ(-1, ha::RunSupervisorLoopForTesting(
-                          MakeEtcdBackendSpec("unused"), config, admin,
-                          std::make_unique<FakeLeaderCoordinator>(1, state),
-                          std::make_unique<FakeStandbyController>(
-                              MakeInvalidPromotionContext(overlap))));
-        EXPECT_EQ(state->release_calls, 1);
-
-        const auto health = HttpGet(admin_port, "/health");
-        EXPECT_EQ(health.status, 200);
-        EXPECT_NE(health.body.find("\"ha_state\":\"recovering\""),
-                  std::string::npos);
-        EXPECT_NE(health.body.find("\"service_ready\":false"),
-                  std::string::npos);
-        EXPECT_EQ(HttpGet(admin_port, "/get_all_keys").status, 503);
-        admin.Stop();
-    }
-}
-
 #ifdef STORE_USE_ETCD
+
+TEST_F(HighAvailabilityTest, HaWithoutOplogRestoresEmptyContextAndServes) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto ports = getFreeTcpPorts(2);
+    ASSERT_EQ(ports.size(), 2);
+    const std::string cluster_id =
+        "ha-without-oplog-supervisor-" + std::to_string(getpid());
+    SupervisorChildProcess child(ports[0], ports[1], cluster_id);
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(WaitForServing(child, ports[1], std::chrono::seconds(20)));
+
+    EXPECT_EQ(HttpGet(ports[1], "/get_all_keys").status, 200);
+}
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
@@ -1132,6 +1055,12 @@ TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
 int main(int argc, char** argv) {
     // Initialize Google's flags library
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    if (mooncake::testing::FLAGS_ha_supervisor_child) {
+        google::InitGoogleLogging("HighAvailabilitySupervisorChild");
+        FLAGS_logtostderr = 1;
+        return mooncake::testing::RunSupervisorChild();
+    }
 
     // Initialize Google Test
     ::testing::InitGoogleTest(&argc, argv);

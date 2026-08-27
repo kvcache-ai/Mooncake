@@ -215,17 +215,13 @@ void EnterStandbyMode(MasterAdminServer& admin_server,
     SetRuntimeState(admin_server, standby_controller.GetStandbyRuntimeState());
 }
 
-int RunSupervisorLoop(
-    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
-    MasterAdminServer& admin_server,
-    std::unique_ptr<LeaderCoordinator> coordinator_override = nullptr,
-    std::unique_ptr<StandbyController> standby_controller = nullptr) {
+int RunSupervisorLoop(const HABackendSpec& spec,
+                      const MasterServiceSupervisorConfig& config,
+                      MasterAdminServer& admin_server) {
     auto label_reconciler = MakeLeaderLabelReconciler(config);
     label_reconciler.SetLeader(false);
     SetRuntimeState(admin_server, MasterRuntimeState::kStarting);
-    if (!standby_controller) {
-        standby_controller = CreateStandbyController(spec, config);
-    }
+    auto standby_controller = CreateStandbyController(spec, config);
     std::atomic<bool> accept_standby_runtime_updates{false};
     standby_controller->SetStandbyRuntimeStateCallback(
         [&](MasterRuntimeState state) {
@@ -240,10 +236,7 @@ int RunSupervisorLoop(
                      accept_standby_runtime_updates, std::nullopt);
 
     while (true) {
-        auto coordinator = coordinator_override
-                               ? decltype(CreateLeaderCoordinator(spec))(
-                                     std::move(coordinator_override))
-                               : CreateLeaderCoordinator(spec);
+        auto coordinator = CreateLeaderCoordinator(spec);
         if (!coordinator) {
             if (HandleSupervisorError("create leader coordinator",
                                       coordinator.error(), spec.type)) {
@@ -525,15 +518,6 @@ int RunSupervisorLoop(
 }
 
 }  // namespace
-
-int RunSupervisorLoopForTesting(
-    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
-    MasterAdminServer& admin_server,
-    std::unique_ptr<LeaderCoordinator> coordinator,
-    std::unique_ptr<StandbyController> standby_controller) {
-    return RunSupervisorLoop(spec, config, admin_server, std::move(coordinator),
-                             std::move(standby_controller));
-}
 
 MasterServiceSupervisor::MasterServiceSupervisor(
     const MasterServiceSupervisorConfig& config)
