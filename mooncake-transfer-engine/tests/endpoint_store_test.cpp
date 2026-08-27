@@ -180,6 +180,7 @@ TEST_F(EndpointStoreTest, ReclaimDoesNotRequireActiveMap) {
 TEST_F(EndpointStoreTest,
        StaleRawPointerLookupAndDeleteStressDoesNotDereference) {
     SIEVEEndpointStore store(4);
+    auto sentinel = makeQuiescentEndpoint(*ctx_);
     std::vector<RdmaEndPoint*> stale_ptrs;
     stale_ptrs.reserve(1000);
 
@@ -194,7 +195,6 @@ TEST_F(EndpointStoreTest,
 
     EXPECT_EQ(store.getSize(), 0u);
     EXPECT_EQ(store.waitingListSize(), 1000u);
-    auto sentinel = makeQuiescentEndpoint(*ctx_);
     store.testOnlyInsertEndpoint("sentinel@peer", sentinel);
     store.reclaimEndpoint();
     EXPECT_EQ(store.waitingListSize(), 0u);

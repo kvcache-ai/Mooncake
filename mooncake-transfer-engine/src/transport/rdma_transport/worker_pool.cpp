@@ -31,8 +31,6 @@
 
 namespace mooncake {
 
-const static int kTransferWorkerCount = globalConfig().workers_per_ctx;
-
 static std::string resolveBufferLocation(
     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
     std::string location = buffer.name;
@@ -98,15 +96,16 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
 WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
+      worker_count_(context.transferWorkerCount()),
       workers_running_(true),
       parked_worker_count_(0),
       redispatch_counter_(0),
-      worker_slice_queue_(kTransferWorkerCount),
-      worker_slice_queue_lock_(kTransferWorkerCount),
+      worker_slice_queue_(worker_count_),
+      worker_slice_queue_lock_(worker_count_),
       submitted_slice_count_(0),
       processed_slice_count_(0) {
-    collective_slice_queue_.resize(kTransferWorkerCount);
-    for (int i = 0; i < kTransferWorkerCount; ++i)
+    collective_slice_queue_.resize(worker_count_);
+    for (int i = 0; i < worker_count_; ++i)
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
     worker_thread_.emplace_back(
@@ -114,19 +113,22 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
 }
 
 int WorkerPool::postingThreadForPeer(const std::string &peer_nic_path) const {
-    return static_cast<int>(std::hash<std::string>{}(peer_nic_path) %
-                            static_cast<size_t>(kTransferWorkerCount));
+    return context_.postingThreadForPeer(peer_nic_path);
 }
 
 int WorkerPool::cqIndexForPostingThread(int thread_id) const {
-    const int cq_count = context_.cqCount();
-    if (cq_count <= 0) return 0;
-    if (thread_id >= 0 && thread_id < cq_count) return thread_id;
-    return thread_id >= 0 ? thread_id % cq_count : 0;
+    return context_.cqIndexForPostingThread(thread_id);
 }
 
 void WorkerPool::enqueueSliceToOwner(Transport::Slice *slice) {
     const int owner_thread = postingThreadForPeer(slice->peer_nic_path);
+    if (owner_thread < 0 || owner_thread >= worker_count_) {
+        LOG(ERROR) << "Invalid RDMA worker owner " << owner_thread
+                   << " for peer " << slice->peer_nic_path;
+        slice->markFailed();
+        processed_slice_count_.fetch_add(1);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(
             worker_slice_queue_lock_[owner_thread]);
@@ -415,6 +417,8 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
+        auto endpoint_lifecycle_lock =
+            context_.lockEndpointLifecycle(entry.first);
 #ifdef CONFIG_CACHE_ENDPOINT
         auto &endpoint = endpoint_map[entry.first];
         if (endpoint == nullptr || !endpoint->active())
@@ -522,6 +526,7 @@ void WorkerPool::performPostSend(int thread_id) {
 
 void WorkerPool::performPollCq(int thread_id) {
     if (context_.cqCount() <= 0) return;
+    if (thread_id < 0 || thread_id >= worker_count_) return;
 
     const uint64_t poll_ts = getCurrentTimeInNano();
     const uint64_t previous_poll_ts =
@@ -541,6 +546,7 @@ void WorkerPool::performPollCq(int thread_id) {
     std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     std::vector<ibv_wc> wc_list;
     const int cq_index = cqIndexForPostingThread(thread_id);
+    if (cq_index < 0) return;
     ibv_wc wc[kPollCount];
     int nr_poll = context_.poll(kPollCount, wc, cq_index);
     if (nr_poll < 0) {
@@ -639,6 +645,9 @@ void WorkerPool::processCompletions(int thread_id,
                 continue;
             }
 
+            auto endpoint_lifecycle_lock =
+                context_.lockEndpointLifecycle(slice->peer_nic_path);
+
             // Completion errors are split by local context health. Local faults
             // hand off to another local RNIC; remote/default faults keep this
             // local context and switch peer rails.
@@ -657,17 +666,18 @@ void WorkerPool::processCompletions(int thread_id,
             const bool local_wc_failure = isLocalWcFailure(wc);
             if (!context_.active() || local_wc_failure) {
                 // A local completion fault retires the endpoint, and the slice
-                // is handed to another local RNIC that rebuilds its own endpoint
-                // to the same peer NIC. If the fault keeps recurring nothing
-                // throttles that cycle: the rail is deliberately not paused on
-                // the local path, and the context failure counter is cleared by
-                // any concurrent success, so both RNICs re-handshake the same
-                // peer as fast as the workers spin. Charge the path an error
-                // instead -- without an immediate pause, so a one-off fault
-                // still costs nothing -- and let kRailErrorThreshold stop the
-                // rebuild loop from this context. See issue #3299.
+                // is handed to another local RNIC that rebuilds its own
+                // endpoint to the same peer NIC. If the fault keeps recurring
+                // nothing throttles that cycle: the rail is deliberately not
+                // paused on the local path, and the context failure counter is
+                // cleared by any concurrent success, so both RNICs re-handshake
+                // the same peer as fast as the workers spin. Charge the path an
+                // error instead -- without an immediate pause, so a one-off
+                // fault still costs nothing -- and let kRailErrorThreshold stop
+                // the rebuild loop from this context. See issue #3299.
                 if (local_wc_failure &&
-                    local_failed_peer_paths.insert(slice->peer_nic_path).second) {
+                    local_failed_peer_paths.insert(slice->peer_nic_path)
+                        .second) {
                     markRailFailed(slice->peer_nic_path);
                 }
                 if (!recorded_local_context_failure) {
@@ -922,8 +932,10 @@ bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
 
 bool WorkerPool::hasOutstandingCq(int thread_id) {
     if (context_.cqCount() <= 0) return false;
-    return context_.cqOutstandingCount(cqIndexForPostingThread(thread_id))
-               ->load(std::memory_order_relaxed) > 0;
+    const int cq_index = cqIndexForPostingThread(thread_id);
+    if (cq_index < 0) return false;
+    return context_.cqOutstandingCount(cq_index)->load(
+               std::memory_order_relaxed) > 0;
 }
 
 void WorkerPool::transferWorker(int thread_id) {
@@ -982,6 +994,7 @@ int WorkerPool::doProcessContextEvents() {
                      << context_.deviceName();
         if (event.event_type == IBV_EVENT_QP_FATAL) {
             auto endpoint_ptr = (RdmaEndPoint *)event.element.qp->qp_context;
+            auto endpoint = context_.getEndpointByPtr(endpoint_ptr);
 
             /**
              * There might be a deadlock if we call endpoint->set_active(false)
@@ -999,13 +1012,17 @@ int WorkerPool::doProcessContextEvents() {
             event_acked = true;
 
             /**
-             * After ack the event, the endpoint might be destroyed if it
-             * happened to be destroying event.element.qp. Therefore, we cannot
-             * just dereference endpoint_ptr. Instead, we need to get the
-             * shared_ptr of the endpoint from context_ and use that shared_ptr
-             * to access the endpoint.
+             * After ack the event, use the tracked endpoint's peer path to
+             * serialize deletion with the same lifecycle gate as post/send and
+             * passive setup.
              */
-            context_.deleteEndpointByPtr(endpoint_ptr);
+            if (endpoint) {
+                auto endpoint_lifecycle_lock =
+                    context_.lockEndpointLifecycle(endpoint->peerNicPath());
+                context_.deleteEndpointByPtr(endpoint.get());
+            } else {
+                LOG(WARNING) << "QP fatal event endpoint is no longer tracked";
+            }
         } else if (handleContextEvent(event.event_type, false, &event)) {
             event_acked = true;
         }
@@ -1049,6 +1066,7 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
          */
         if (event != nullptr) ibv_ack_async_event(event);
 
+        auto endpoint_lifecycle_locks = context_.lockAllEndpointLifecycles();
         context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now inactive due to "
@@ -1060,6 +1078,8 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
         if (event != nullptr) ibv_ack_async_event(event);
 
         if (gid_refresh_result != GidRefreshResult::UNCHANGED) {
+            auto endpoint_lifecycle_locks =
+                context_.lockAllEndpointLifecycles();
             context_.disconnectAllEndpoints();
             LOG(INFO) << "Worker: Context " << context_.deviceName()
                       << (injected_for_test ? " injected GID refresh result="
@@ -1114,6 +1134,7 @@ void WorkerPool::maybeActivateRecoveredContext() {
         return;
     }
     if (gid_refresh_result == GidRefreshResult::CHANGED) {
+        auto endpoint_lifecycle_locks = context_.lockAllEndpointLifecycles();
         context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " GID changed during recovery, disconnected all endpoints";

@@ -167,7 +167,6 @@ RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
           [] { return static_cast<uint64_t>(getCurrentTimeInNano()); }),
       next_comp_channel_index_(0),
       next_comp_vector_index_(0),
-      next_cq_list_index_(0),
       worker_pool_(nullptr),
       active_(true) {
     static std::once_flag g_once_flag;
@@ -196,6 +195,23 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 
     // Create endpoint store based on configuration
     auto &config = globalConfig();
+    if (config.workers_per_ctx <= 0) {
+        LOG(ERROR) << "Invalid workers_per_ctx=" << config.workers_per_ctx
+                   << " for device " << device_name_;
+        return ERR_INVALID_ARGUMENT;
+    }
+    transfer_worker_count_ = config.workers_per_ctx;
+    if (num_cq_list < static_cast<size_t>(transfer_worker_count_)) {
+        LOG(INFO) << "Increasing RDMA CQ count for " << device_name_ << " from "
+                  << num_cq_list << " to " << transfer_worker_count_
+                  << " to keep each transfer worker on a dedicated CQ";
+        num_cq_list = static_cast<size_t>(transfer_worker_count_);
+    }
+    endpoint_lifecycle_locks_.clear();
+    endpoint_lifecycle_locks_.reserve(
+        static_cast<size_t>(transfer_worker_count_));
+    for (int i = 0; i < transfer_worker_count_; ++i)
+        endpoint_lifecycle_locks_.push_back(std::make_unique<std::mutex>());
     switch (config.endpoint_store_type) {
         case EndpointStoreType::FIFO:
             endpoint_store_ =
@@ -725,21 +741,8 @@ RdmaContext::findMemoryRegionContaining(uintptr_t addr) const {
 
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     const std::string &peer_nic_path) {
-    if (cq_list_.empty()) {
-        LOG(ERROR) << "No CQ available for endpoint on " << deviceName();
-        return nullptr;
-    }
-
-    const auto &config = globalConfig();
-    if (config.workers_per_ctx <= 0) {
-        LOG(ERROR) << "Invalid workers_per_ctx=" << config.workers_per_ctx
-                   << " for endpoint on " << deviceName();
-        return nullptr;
-    }
-    int owner_thread =
-        static_cast<int>(std::hash<std::string>{}(peer_nic_path) %
-                         static_cast<size_t>(config.workers_per_ctx));
-    int cq_index = owner_thread % static_cast<int>(cq_list_.size());
+    int cq_index = cqIndexForPeer(peer_nic_path);
+    if (cq_index < 0) return nullptr;
     return endpoint(peer_nic_path, cq_index);
 }
 
@@ -849,15 +852,52 @@ int RdmaContext::gidIndex() const {
     return gid_index_;
 }
 
-ibv_cq *RdmaContext::cq() {
-    int index = (next_cq_list_index_++) % cq_list_.size();
-    return cq_list_[index].native;
-}
-
 ibv_cq *RdmaContext::cq(int cq_index) {
     if (cq_list_.empty()) return nullptr;
-    if (cq_index < 0) return cq();
+    if (cq_index < 0) return nullptr;
     return cq_list_[static_cast<size_t>(cq_index) % cq_list_.size()].native;
+}
+
+int RdmaContext::postingThreadForPeer(const std::string &peer_nic_path) const {
+    if (transfer_worker_count_ <= 0) {
+        LOG(ERROR) << "Invalid transfer_worker_count_=" << transfer_worker_count_
+                   << " for endpoint on " << deviceName();
+        return -1;
+    }
+    return static_cast<int>(std::hash<std::string>{}(peer_nic_path) %
+                            static_cast<size_t>(transfer_worker_count_));
+}
+
+int RdmaContext::cqIndexForPostingThread(int thread_id) const {
+    const int cq_count = cqCount();
+    if (cq_count <= 0 || thread_id < 0) return -1;
+    if (thread_id < cq_count) return thread_id;
+    return thread_id % cq_count;
+}
+
+int RdmaContext::cqIndexForPeer(const std::string &peer_nic_path) const {
+    return cqIndexForPostingThread(postingThreadForPeer(peer_nic_path));
+}
+
+std::unique_lock<std::mutex> RdmaContext::lockEndpointLifecycle(
+    const std::string &peer_nic_path) const {
+    const int owner_thread = postingThreadForPeer(peer_nic_path);
+    if (owner_thread < 0 ||
+        static_cast<size_t>(owner_thread) >= endpoint_lifecycle_locks_.size()) {
+        return std::unique_lock<std::mutex>();
+    }
+    return std::unique_lock<std::mutex>(
+        *endpoint_lifecycle_locks_[owner_thread]);
+}
+
+std::vector<std::unique_lock<std::mutex>>
+RdmaContext::lockAllEndpointLifecycles() const {
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(endpoint_lifecycle_locks_.size());
+    for (auto &lifecycle_lock : endpoint_lifecycle_locks_) {
+        locks.emplace_back(*lifecycle_lock);
+    }
+    return locks;
 }
 
 ibv_comp_channel *RdmaContext::compChannel() {

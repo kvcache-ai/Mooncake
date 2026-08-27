@@ -354,6 +354,11 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     peer_nic_path_ = peer_nic_path;
 }
 
+std::string RdmaEndPoint::peerNicPath() const {
+    RWSpinlock::ReadGuard guard(lock_);
+    return peer_nic_path_;
+}
+
 int RdmaEndPoint::setupConnectionsByActive() {
     HandShakeDesc local_desc, peer_desc;
     std::string peer_server_name, peer_nic_name;

@@ -71,6 +71,7 @@ class RdmaEndPoint {
 
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
+    std::string peerNicPath() const;
 
     int setupConnectionsByActive();
 
@@ -211,7 +212,7 @@ class RdmaEndPoint {
     RdmaContext &context_;
     std::atomic<Status> status_;
 
-    RWSpinlock lock_;
+    mutable RWSpinlock lock_;
     std::vector<ibv_qp *> qp_list_;
     uint64_t qp_generation_;
 

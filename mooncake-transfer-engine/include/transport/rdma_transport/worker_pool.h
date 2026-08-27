@@ -138,6 +138,7 @@ class WorkerPool {
    private:
     RdmaContext &context_;
     const int numa_socket_id_;
+    const int worker_count_;
 
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;

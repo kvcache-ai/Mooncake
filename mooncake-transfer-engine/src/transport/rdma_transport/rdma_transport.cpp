@@ -1069,6 +1069,8 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     }
 
     // Use existing endpoint or create new one.
+    auto endpoint_lifecycle_lock =
+        context->lockEndpointLifecycle(peer_desc.local_nic_path);
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) {
         local_desc.reply_msg = "Local RDMA endpoint unavailable for " +
