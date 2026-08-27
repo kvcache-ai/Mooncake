@@ -162,6 +162,11 @@ class RdmaTransport : public Transport {
     void unregisterNotifyQp(uint32_t qp_num);
     std::shared_ptr<RdmaEndPoint> getEndpoint(SegmentID target_id,
                                               int device_id);
+    std::shared_ptr<RdmaEndPoint> getEndpointForContextIndex(
+        int context_index, SegmentID target_id, int remote_device_id);
+    int contextIndexForDevice(int device_id) const;
+    bool trySubmitDirect(RdmaSubBatch* rdma_batch, const Request& request);
+    void pollDirectCompletions(int context_index);
 
     // Notification worker thread
     void notifyWorkerThread();

@@ -50,11 +50,12 @@ struct BootstrapDesc {
     std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
+    uint32_t direct_qp_num = 0;  // Foreground direct QP number (0 = unsupported)
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
                                    qp_num, local_lid, local_gid, reply_msg,
-                                   notify_qp_num);
+                                   notify_qp_num, direct_qp_num);
 };
 
 struct XferDataDesc {
