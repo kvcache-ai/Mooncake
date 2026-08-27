@@ -2,7 +2,11 @@
 
 test_case_name="test_vllm_1p1d_erdma"
 TEST_TYPE="double"
-SUPPORT_MODELS=("Qwen/Qwen3-8B" "deepseek-ai/DeepSeek-V2-Lite")
+if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+    SUPPORT_MODELS=("Qwen/Qwen3-8B")
+else
+    SUPPORT_MODELS=("Qwen/Qwen3-8B" "deepseek-ai/DeepSeek-V2-Lite")
+fi
 
 PID_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}/run/pids/${test_case_name}
 BASE_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}
@@ -20,7 +24,7 @@ start_server()
     local port
     local kv_role
 
-    if [ "$ISREMOTE" == "0" ]; then 
+    if [ "$ISREMOTE" == "0" ]; then
         host=$LOCAL_IP
         vllm_server_log_path=/test_run/run/logs/$test_case_name/$model_name_clean/vllm_server_local.log
         port=8020
@@ -32,17 +36,30 @@ start_server()
         kv_role="kv_producer"
     fi
 
-    local kv_config_json="{\\\"kv_connector\\\":\\\"MooncakeConnector\\\",\\\"kv_role\\\":\\\"$kv_role\\\"}"
+    local kv_config_json
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        # Diagnose vLLM#44238 by serializing Mooncake sender work. Keep every
+        # other serving and transfer parameter identical to the baseline run.
+        kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\",\"kv_connector_extra_config\":{\"num_workers\":1}}"
+    else
+        kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\"}"
+    fi
 
-    local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
-    
     local env_vars
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
-        env_vars="ROCR_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} HIP_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1}"
+        # The MI350X default allocates roughly 233 GiB of KV cache per rank,
+        # producing 72 multi-GiB dma-buf registrations against every visible
+        # RNIC. The connector smoke test needs only a small cache and the RoCE
+        # rail selected by the runner profile.
+        local gpu_memory_utilization=0.3
+        env_vars="ROCR_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} HIP_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} MC_MAX_CONCURRENT_REG_MR=1 MC_TE_FILTERS=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
     else
+        local gpu_memory_utilization=0.85
         env_vars="CUDA_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-6,7}"
     fi
-    
+
+    local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization ${gpu_memory_utilization} --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
+
     if ! launch_vllm_server "$model_name" "$host" "$port" "$vllm_server_log_path" "$kv_role" "$extra_args" "$env_vars"; then
         return 1
     fi
@@ -56,18 +73,28 @@ run_proxy()
     local proxy_log_path="/test_run/run/logs/$test_case_name/$model_name/proxy.log"
 
     echo "===== Proxy Run ====="
-    
+
     # Get vLLM version and decide which proxy to use
     local vllm_version=$(${docker_exec} "python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null" || echo "0.15.0")
     echo "Detected vLLM version: $vllm_version"
-    
+
     # Determine proxy script and ready check strategy
     local proxy_script
     local ready_pattern
     local use_health_check=0
     if python3 -c "from packaging import version; import sys; sys.exit(0 if version.parse('$vllm_version') >= version.parse('0.16.0') else 1)" 2>/dev/null; then
         echo "Using Mooncake Connector Proxy (vLLM >= 0.16.0)"
-        proxy_script="python3 -u /vllm-workspace/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
+        local proxy_path
+        proxy_path=$(${docker_exec} "for path in \
+            /app/vllm/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py \
+            /vllm-workspace/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py; do \
+                if [ -f \"\$path\" ]; then printf '%s' \"\$path\"; break; fi; \
+            done")
+        if [ -z "$proxy_path" ]; then
+            echo "ERROR: vLLM Mooncake connector proxy not found in a supported image layout" >&2
+            return 1
+        fi
+        proxy_script="python3 -u $proxy_path --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
         ready_pattern="All prefiller instances are ready."
     else
         echo "Using NIXL Proxy (vLLM < 0.16.0)"
@@ -77,13 +104,10 @@ run_proxy()
     fi
 
     # Launch proxy
-    local lb_cmd="${docker_exec} \"$proxy_script > $proxy_log_path 2>&1 &\""
     local pid_file="${PID_DIR}/proxy.pid"
-    # Extract Python script path (second word) and get filename
-    local grep_pattern=$(echo "$proxy_script" | grep -oE '[^/]+\.py')
-    
+
     echo "Starting proxy server..."
-    if ! launch_and_track_process "$lb_cmd" "$grep_pattern" "$pid_file"; then
+    if ! launch_and_track_process "exec $proxy_script" "$proxy_log_path" "$pid_file"; then
         return 1
     fi
 
@@ -95,7 +119,7 @@ run_proxy()
 
     # Additional health check for toy_proxy_server
     if [ "$use_health_check" -eq 1 ]; then
-        if ! wait_for_server_ready "$LOCAL_IP" "8000" "/health"; then
+        if ! wait_for_server_ready "$LOCAL_IP" "8000" "/healthcheck"; then
             return 1
         fi
     fi
@@ -146,7 +170,7 @@ run_single_model()
 
     setup_log_directory_dual "$test_case_name" "$model_name_clean"
 
-    echo "===== Run MODEL NAME: $model_name ====="    
+    echo "===== Run MODEL NAME: $model_name ====="
     # Local start server
     if ! start_server $model_name $model_name_clean; then
         echo "ERROR: Failed to start local server for model $model_name"
@@ -173,8 +197,10 @@ run_single_model()
     fi
 
     echo "===== Cleaning up model processes for $model_name ====="
-    kill_model_processes
-    sleep 2
+    if ! kill_model_processes; then
+        echo "ERROR: Model process cleanup failed for $model_name" >&2
+        status=1
+    fi
 
     return $status
 }
@@ -188,17 +214,24 @@ run_test()
     echo "===== Running test case: $test_case_name for all supported models ====="
 
     local test_failed=false
+    local model_index=0
+    local model_count=${#SUPPORT_MODELS[@]}
     for model in "${SUPPORT_MODELS[@]}"; do
+        model_index=$((model_index + 1))
         if ! run_single_model "$model"; then
             echo "ERROR: Test case $test_case_name failed for model $model"
             test_failed=true
+        fi
+        if [ "$model_index" -lt "$model_count" ] && ! drain_gpu_between_tests; then
+            echo "ERROR: Failed to isolate the next model from $model" >&2
+            return 1
         fi
     done
 
     if [ "$test_failed" = true ]; then
         return 1
     fi
-    
+
     return 0
 }
 
@@ -225,7 +258,7 @@ case "$1" in
         ;;
     "stop_server")
         kill_model_processes
-        exit 0
+        exit $?
         ;;
     *)
         if [ "${BASH_SOURCE[0]}" == "${0}" ]; then

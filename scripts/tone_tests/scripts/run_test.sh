@@ -5,18 +5,24 @@ MODEL_CACHE=${MODEL_CACHE:-"/root/.cache"}
 HF_TOKEN_FILE=${HF_TOKEN_FILE:-"/etc/mooncake-ci/huggingface.token"}
 CI_ACCELERATOR=${CI_ACCELERATOR:-"cuda"}
 if [ "$CI_ACCELERATOR" = "rocm" ]; then
-    REGISTRY_ADDR_SGLANG=${REGISTRY_ADDR_SGLANG:-"lmsysorg/sglang:v0.5.13.post1-rocm720-mi35x@sha256:552e7038a9309796ad0cd6c62e80568eca4f88ef1e1eb42db2f7ffaafcd79693"}
-    REGISTRY_ADDR_VLLM=${REGISTRY_ADDR_VLLM:-"vllm/vllm-openai-rocm:v0.21.0@sha256:98a77b20df03adeb1cfc0ced009b4df6dd52b0a994ab99a32421f30876a9ae0c"}
-    MOONCAKE_SGLANG_BASE_GPU_ID=${MOONCAKE_SGLANG_BASE_GPU_ID:-0}
-    MOONCAKE_EPD_ENCODER_GPU_ID=${MOONCAKE_EPD_ENCODER_GPU_ID:-0}
-    MOONCAKE_EPD_PREFILL_GPU_ID=${MOONCAKE_EPD_PREFILL_GPU_ID:-2}
-    MOONCAKE_EPD_DECODE_GPU_ID=${MOONCAKE_EPD_DECODE_GPU_ID:-0}
-    MOONCAKE_VLLM_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1}
-    MOONCAKE_SGLANG_MEM_FRACTION_STATIC=${MOONCAKE_SGLANG_MEM_FRACTION_STATIC:-0.5}
-    MOONCAKE_CI_TIER=${MOONCAKE_CI_TIER:-"core-4gpu"}
-    MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES:-"ionic_0,ionic_1,ionic_2,ionic_3"}
-    MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS:-"eth2,eth3,eth4,eth5"}
-    MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX:-1}
+    : "${REGISTRY_ADDR_SGLANG:?REGISTRY_ADDR_SGLANG is required for ROCm}"
+    : "${REGISTRY_ADDR_VLLM:?REGISTRY_ADDR_VLLM is required for ROCm}"
+    : "${MOONCAKE_CI_TIER:?MOONCAKE_CI_TIER is required for ROCm}"
+    : "${MOONCAKE_RENDER_DEVICES:?MOONCAKE_RENDER_DEVICES is required for ROCm}"
+    : "${MOONCAKE_GPU_INDICES:?MOONCAKE_GPU_INDICES is required for ROCm}"
+    : "${MOONCAKE_CPUSET_CPUS:?MOONCAKE_CPUSET_CPUS is required for ROCm}"
+    : "${MOONCAKE_CPUSET_MEMS:?MOONCAKE_CPUSET_MEMS is required for ROCm}"
+    : "${MOONCAKE_RDMA_DEVICES:?MOONCAKE_RDMA_DEVICES is required for ROCm}"
+    : "${MOONCAKE_RDMA_NETDEVS:?MOONCAKE_RDMA_NETDEVS is required for ROCm}"
+    : "${MOONCAKE_TRANSFER_DEVICE:?MOONCAKE_TRANSFER_DEVICE is required for ROCm}"
+    : "${MOONCAKE_GID_INDEX:?MOONCAKE_GID_INDEX is required for ROCm}"
+    : "${MOONCAKE_SGLANG_BASE_GPU_ID:?MOONCAKE_SGLANG_BASE_GPU_ID is required for ROCm}"
+    : "${MOONCAKE_EPD_ENCODER_GPU_ID:?MOONCAKE_EPD_ENCODER_GPU_ID is required for ROCm}"
+    : "${MOONCAKE_EPD_PREFILL_GPU_ID:?MOONCAKE_EPD_PREFILL_GPU_ID is required for ROCm}"
+    : "${MOONCAKE_EPD_DECODE_GPU_ID:?MOONCAKE_EPD_DECODE_GPU_ID is required for ROCm}"
+    : "${MOONCAKE_VLLM_VISIBLE_DEVICES:?MOONCAKE_VLLM_VISIBLE_DEVICES is required for ROCm}"
+    : "${MOONCAKE_SGLANG_MEM_FRACTION_STATIC:?MOONCAKE_SGLANG_MEM_FRACTION_STATIC is required for ROCm}"
+    : "${AINIC_VERSION:?AINIC_VERSION is required for ROCm}"
     USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-false}
 else
     REGISTRY_ADDR_SGLANG=${REGISTRY_ADDR_SGLANG:-"lmsysorg/sglang:latest"}
@@ -30,13 +36,15 @@ else
     MOONCAKE_CI_TIER=${MOONCAKE_CI_TIER:-"full"}
     MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES:-}
     MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS:-}
+    MOONCAKE_TRANSFER_DEVICE=${MOONCAKE_TRANSFER_DEVICE:-}
     MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX:-}
     USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-true}
 fi
-MOONCAKE_RENDER_DEVICES=${MOONCAKE_RENDER_DEVICES:-"/dev/dri/renderD129 /dev/dri/renderD137 /dev/dri/renderD145 /dev/dri/renderD153"}
-MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES:-"0,1,2,3"}
-MOONCAKE_CPUSET_CPUS=${MOONCAKE_CPUSET_CPUS:-"0-95"}
-MOONCAKE_CPUSET_MEMS=${MOONCAKE_CPUSET_MEMS:-"0"}
+MOONCAKE_RENDER_DEVICES=${MOONCAKE_RENDER_DEVICES:-}
+MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES:-}
+MOONCAKE_CPUSET_CPUS=${MOONCAKE_CPUSET_CPUS:-}
+MOONCAKE_CPUSET_MEMS=${MOONCAKE_CPUSET_MEMS:-}
+AINIC_VERSION=${AINIC_VERSION:-}
 HUGGINGFACE_MIRROR=${HUGGINGFACE_MIRROR:-"https://hf-mirror.com"}
 USE_MODELSCOPE=${USE_MODELSCOPE:-false}
 REMOTE_TEST_DIR=${REMOTE_TEST_DIR:-"/tmp/Mooncake_tone/mooncake_ci_test"}
@@ -52,14 +60,12 @@ GIT_REPO=${GIT_REPO:-}
 
 if [ "$MOONCAKE_CI_TIER" = "core-4gpu" ]; then
     # The upstream heterogeneous-TP test starts TP4 and TP2 workers on the
-    # same host and therefore needs eight GPUs. Keep the permanent 4+4 ROCm
-    # allocation honest: all other SGLang and vLLM external-PD cases run here,
-    # while this one remains an explicitly reported capacity exception.
+    # same host and therefore needs eight GPUs. Mooncake Elastic EP is also
+    # CUDA-only, so neither test belongs in the permanent 4+4 ROCm tier.
     All_TEST_SCRIPTS_SGLANG=(
         "test_hicache_storage_mooncake_backend.sh"
         "test_1p1d_erdma.sh"
         "test_epd_sglang.sh"
-        "test_moe_mooncake.sh"
     )
 elif [ "$MOONCAKE_CI_TIER" = "full" ]; then
     All_TEST_SCRIPTS_SGLANG=(
@@ -81,8 +87,8 @@ All_TEST_SCRIPTS_VLLM=(
 if [ "$CI_ACCELERATOR" = "rocm" ]; then
     # The ROCm cluster uses a dedicated CI identity and pinned host key. Keep
     # the serving/RDMA address separate from the SSH management endpoint.
-    REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-"mooncake-worker"}
-    MOONCAKE_SSH_CONFIG=${MOONCAKE_SSH_CONFIG:-"/etc/mooncake-ci/ssh_config"}
+    : "${REMOTE_SSH_TARGET:?REMOTE_SSH_TARGET is required for ROCm}"
+    : "${MOONCAKE_SSH_CONFIG:?MOONCAKE_SSH_CONFIG is required for ROCm}"
     SSH_CMD=${SSH_CMD:-"ssh -F ${MOONCAKE_SSH_CONFIG}"}
     RSYNC_RSH=${RSYNC_RSH:-"ssh -F ${MOONCAKE_SSH_CONFIG}"}
     SCP_CMD=${SCP_CMD:-"scp -F ${MOONCAKE_SSH_CONFIG}"}
@@ -101,26 +107,26 @@ RUN_DIR="$TONE_TESTS_DIR/run"
 
 get_test_type() {
     local test_name=$1
-    
+
     if [ ! -f "$TONE_TESTS_DIR/scripts/$test_name" ]; then
         echo "unknown"
         return 1
     fi
-    
+
     local test_type=$(grep "^TEST_TYPE=" "$TONE_TESTS_DIR/scripts/$test_name" | head -n 1 | cut -d'"' -f2)
-    
+
     if [ -z "$test_type" ]; then
         echo "unknown"
         return 1
     fi
-    
+
     echo "$test_type"
     return 0
 }
 
 get_framework_from_test_array() {
     local test_array_name=$1
-    
+
     case $test_array_name in
         "All_TEST_SCRIPTS_SGLANG")
             echo "SGLANG"
@@ -136,14 +142,14 @@ get_framework_from_test_array() {
 
 get_framework_from_test_name() {
     local test_name=$1
-    
+
     for vllm_test in "${All_TEST_SCRIPTS_VLLM[@]}"; do
         if [ "$test_name" = "$vllm_test" ]; then
             echo "VLLM"
             return 0
         fi
     done
-    
+
     # default SGLANG
     echo "SGLANG"
 }
@@ -184,7 +190,7 @@ is_base_env_prepared() {
 }
 
 prepare_single_env(){
-    local registry_addr=$1 
+    local registry_addr=$1
     local framework_type=$2
 
     if is_base_env_prepared; then
@@ -193,7 +199,7 @@ prepare_single_env(){
     fi
 
     echo "===== Preparing environment for $framework_type (registry: $registry_addr) ====="
-    
+
     setup_directory $RUN_DIR
     setup_directory $RUN_DIR/logs
 
@@ -230,7 +236,9 @@ export MOONCAKE_VLLM_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES}
 export MOONCAKE_SGLANG_MEM_FRACTION_STATIC=${MOONCAKE_SGLANG_MEM_FRACTION_STATIC}
 export MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES}
 export MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS}
+export MOONCAKE_TRANSFER_DEVICE=${MOONCAKE_TRANSFER_DEVICE}
 export MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX}
+export AINIC_VERSION=${AINIC_VERSION}
 EOF
 
     echo "===== Preparing local machine ====="
@@ -263,17 +271,17 @@ prepare_double_env(){
 
     echo "Preparing remote machine $REMOTE_IP..."
     ${SSH_CMD} "$REMOTE_SSH_TARGET" "rm -rf ${REMOTE_TEST_DIR} && mkdir -p ${REMOTE_TEST_DIR}"
-    
+
     rsync -av -e "$RSYNC_RSH" ${TONE_TESTS_DIR}/ "$REMOTE_SSH_TARGET:${REMOTE_TEST_DIR}/"
     if [ $? -ne 0 ]; then
         echo "Failed to sync files to remote server"
         return 1
     fi
-    
+
     ${SSH_CMD} "$REMOTE_SSH_TARGET" "sed -i 's|^export BASE_DIR=.*$|export BASE_DIR=${REMOTE_TEST_DIR}|' ${REMOTE_TEST_DIR}/run/.shrc && \
                             sed -i 's|^export TEST_RUN_DIR=.*$|export TEST_RUN_DIR=${REMOTE_TEST_DIR}/run|' ${REMOTE_TEST_DIR}/run/.shrc && \
                             sed -i 's|^export TEST_RESULT_DIR=.*$|export TEST_RESULT_DIR=${REMOTE_TEST_DIR}/logs|' ${REMOTE_TEST_DIR}/run/.shrc"
-    
+
     echo "Remote preparation completed successfully"
 
     return 0
@@ -319,7 +327,7 @@ setup_env_for_test() {
             setup_node_env '${registry_addr}'
         " || { echo "ERROR: Remote setup failed"; return 1; }
     fi
-    
+
     echo "All environments are ready."
 }
 
@@ -330,9 +338,9 @@ run_single_test(){
 
     local framework_type=$(get_framework_from_test_name "$test_name")
     echo "Test $test_name will use framework: $framework_type"
-    
+
     setup_env_for_test "$test_name" "$framework_type" || return 1
-    
+
     source "$RUN_DIR/.shrc"
     cd "$TONE_TESTS_DIR/scripts"
     source "./$test_name"
@@ -342,7 +350,7 @@ run_single_test(){
 
     local exit_code=0
     run_test "$@" || exit_code=1
-    
+
     if declare -f parse >/dev/null 2>&1; then
         parse "$exit_code" || exit_code=1
     fi
@@ -363,12 +371,12 @@ run_all_tests(){
 
     local framework_type=$(get_framework_from_test_array "$input_tests")
     echo "===== Running All Tests for $framework_type Framework (Double Machine Mode) ====="
-    
+
     setup_env_for_test "all" "$framework_type" || return 1
-    
+
     source "$RUN_DIR/.shrc"
     cd "$TONE_TESTS_DIR/scripts"
-    
+
     local all_passed=true
     local test_index=0
     local test_count=${#tests[@]}
@@ -386,11 +394,11 @@ run_all_tests(){
         source "./$test_name"
         local exit_code=0
         run_test || exit_code=1
-        
+
         if declare -f parse >/dev/null 2>&1; then
             parse "$exit_code" || exit_code=1
         fi
-        
+
         [ $exit_code -ne 0 ] && all_passed=false
 
         # Container is shared across cases in run-all. Do not schedule another
@@ -403,7 +411,7 @@ run_all_tests(){
             break
         fi
     done
-    
+
     cleanup_test_env "double"
     $all_passed && return 0 || return 1
 }
@@ -429,11 +437,13 @@ case "$1" in
     shift
     if [ -z "$1" ]; then
         # No parameter specified, run both SGLANG and VLLM tests
+        all_frameworks_passed=true
         echo "No framework specified, running all SGLANG tests..."
-        run_all_tests "All_TEST_SCRIPTS_SGLANG"
-        
+        run_all_tests "All_TEST_SCRIPTS_SGLANG" || all_frameworks_passed=false
+
         echo "Running all VLLM tests..."
-        run_all_tests "All_TEST_SCRIPTS_VLLM"
+        run_all_tests "All_TEST_SCRIPTS_VLLM" || all_frameworks_passed=false
+        $all_frameworks_passed
     else
         FRAMEWORK=$1
         if [ "$FRAMEWORK" = "VLLM" ]; then

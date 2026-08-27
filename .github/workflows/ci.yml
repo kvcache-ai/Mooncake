@@ -548,6 +548,17 @@ jobs:
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
 
+  rocm-integration-test:
+    needs: [build-wheel-rocm, check-paths]
+    if: >-
+      needs.build-wheel-rocm.result == 'success' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/integration-test-rocm.yml
+    with:
+      checkout_ref: ${{ github.sha }}
+    secrets: inherit
+
   tent-ci:
     needs: [spell-check, clang-format, check-paths]
     if: >-

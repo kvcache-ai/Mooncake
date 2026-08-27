@@ -12,13 +12,13 @@ detect_remote_mode
 mkdir -p "$PID_DIR"
 
 start_server()
-{   
+{
     local host
     local model_name=$1
     local model_name_clean=$2
     local sglang_server_log_path
     local mode_name
-    if [ "$ISREMOTE" == "0" ]; then 
+    if [ "$ISREMOTE" == "0" ]; then
         host=$LOCAL_IP
         sglang_server_log_path=/test_run/run/logs/$test_case_name/$model_name_clean/sglang_server_local.log
         mode_name=prefill
@@ -29,6 +29,9 @@ start_server()
     fi
 
     local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}"
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        extra_args="${extra_args} --disaggregation-ib-device=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
+    fi
     if ! launch_sglang_server "$model_name" "$host" "30001" "$sglang_server_log_path" "$mode_name" "$extra_args"; then
         return 1
     fi
@@ -44,7 +47,7 @@ run_proxy(){
         echo "ERROR: Failed to start SGLang Router"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -84,9 +87,9 @@ run_single_model()
     local model_name_clean=$(sanitize_model_name "$model_name")
     local status=0
 
-    setup_log_directory_dual "$test_case_name" "$model_name_clean"   
+    setup_log_directory_dual "$test_case_name" "$model_name_clean"
 
-    echo "===== Run MODEL NAME: $model_name ====="    
+    echo "===== Run MODEL NAME: $model_name ====="
     # Local start server
     if ! start_server $model_name $model_name_clean; then
         echo "ERROR: Failed to start local server for model $model_name"
@@ -113,8 +116,10 @@ run_single_model()
     fi
 
     echo "===== Cleaning up model processes for $model_name ====="
-    kill_model_processes
-    sleep 2
+    if ! kill_model_processes; then
+        echo "ERROR: Model process cleanup failed for $model_name" >&2
+        status=1
+    fi
 
     return $status
 }
@@ -132,24 +137,31 @@ run_test()
     fi
 
     local test_failed=false
+    local model_index=0
+    local model_count=${#SUPPORT_MODELS[@]}
     for model in "${SUPPORT_MODELS[@]}"; do
+        model_index=$((model_index + 1))
         if ! run_single_model "$model"; then
             echo "ERROR: Test case $test_case_name failed for model $model"
             test_failed=true
+        fi
+        if [ "$model_index" -lt "$model_count" ] && ! drain_gpu_between_tests; then
+            echo "ERROR: Failed to isolate the next model from $model" >&2
+            return 1
         fi
     done
 
     if [ "$test_failed" = true ]; then
         return 1
     fi
-    
+
     return 0
 }
 
 parse()
 {
     echo "===== Parsing test results ====="
-    
+
     if collect_and_validate_model_results "SUPPORT_MODELS" "sglang_server_remote.log" "$test_case_name"; then
         save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
         echo "✓ Test PASSED"
@@ -169,7 +181,7 @@ case "$1" in
         ;;
     "stop_server")
         kill_model_processes
-        exit 0
+        exit $?
         ;;
     *)
         if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
