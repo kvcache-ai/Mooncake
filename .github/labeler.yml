@@ -5,7 +5,11 @@ run-ci:
 
 store:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-store/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-store/**/*'
+      - 'python/mooncake/mooncake_ssd_*.py'
+      - 'python/mooncake/spdk_tgt_create.py'
+      - 'python/tests/ssd/**/*'
 
 Transfer Engine:
   - changed-files:
@@ -57,6 +61,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/ssd/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:
