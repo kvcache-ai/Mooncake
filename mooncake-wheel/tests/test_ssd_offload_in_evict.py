@@ -207,6 +207,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         """ 
         VALUE_SIZE = 1024 * 1024 
         MAX_REQUESTS = 1000
+        KEY_PREFIX = "put_get_k_"
         reference = {}
         
         # Initialize statistics
@@ -219,7 +220,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         put_stats.start_timer()
         index = 0
         while index < MAX_REQUESTS:
-            key = "k_" + str(index)
+            key = KEY_PREFIX + str(index)
             value = os.urandom(VALUE_SIZE)
             
             # Record operation start time
@@ -254,7 +255,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         failed_keys = []
         index = 0
         while index < MAX_REQUESTS:
-            key = "k_" + str(index)
+            key = KEY_PREFIX + str(index)
             
             op_start = time.perf_counter()
             retrieved = self.store.get(key)
@@ -288,7 +289,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         time.sleep(default_kv_lease_ttl / 1000)
         index = 0
         while index < MAX_REQUESTS:
-            key = "k_" + str(index)
+            key = KEY_PREFIX + str(index)
             self.store.remove(key)
             index = index + 1
         print("Cleanup completed")  
@@ -308,6 +309,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         NUM_THREADS = 4
         VALUE_SIZE = 1024 * 1024
         OPERATIONS_PER_THREAD = 1000
+        KEY_PREFIX = "concurrent_k_"
 
         thread_exceptions = []
         references = {}
@@ -322,7 +324,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         
         index = 0
         while index < OPERATIONS_PER_THREAD:
-            key = "k_" + str(index)
+            key = KEY_PREFIX + str(index)
             value = os.urandom(VALUE_SIZE)
             references[key] = value
             index = index + 1
@@ -335,7 +337,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 put_start = time.perf_counter()
                 index = 0
                 while index < OPERATIONS_PER_THREAD:
-                    key = "k_" + str(index)
+                    key = KEY_PREFIX + str(index)
                     test_data = references[key]
                     
                     op_start = time.perf_counter()
@@ -352,7 +354,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 get_start = time.perf_counter()
                 index = 0
                 while index < OPERATIONS_PER_THREAD:
-                    key = "k_" + str(index)
+                    key = KEY_PREFIX + str(index)
                     
                     op_start = time.perf_counter()
                     retrieved_data = self.store.get(key)
@@ -422,7 +424,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         time.sleep(default_kv_lease_ttl / 1000)
         index = 0
         while index < OPERATIONS_PER_THREAD:
-            key = "k_" + str(index)
+            key = KEY_PREFIX + str(index)
             self.store.remove(key)
             index += 1
         print("Cleanup completed")  
@@ -437,6 +439,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         VALUE_SIZE = 1024 * 1024 
         MAX_REQUESTS = 1000
         BATCH_SIZE = 4
+        KEY_PREFIX = "batch_get_k_"
         reference = {}
         
         # Initialize statistics
@@ -449,7 +452,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         put_stats.start_timer()
         index = 0
         while index < MAX_REQUESTS:
-            key = "k_" + str(index)
+            key = KEY_PREFIX + str(index)
             value = os.urandom(VALUE_SIZE)
             
             op_start = time.perf_counter()
@@ -502,7 +505,7 @@ class TestDistributedObjectStore(unittest.TestCase):
             for _ in range(BATCH_SIZE):
                 if index >= MAX_REQUESTS:
                     break
-                key = "k_" + str(index)
+                key = KEY_PREFIX + str(index)
                 batch_keys.append(key)
                 index += 1
                 
@@ -571,7 +574,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         index = 0
         while index < MAX_REQUESTS:
-            key = "k_" + str(index)
+            key = KEY_PREFIX + str(index)
             self.store.remove(key)
             index += 1
         print("Cleanup completed")
