@@ -5,8 +5,8 @@ Minimal CLI module for transfer_engine_bench.
 
 import os
 import stat
-import sys
 import subprocess
+import sys
 
 
 def main():
