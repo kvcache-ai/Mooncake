@@ -10045,16 +10045,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return 0;
     };
 
-    // HA strong-consistency: persist the post-eviction state BEFORE the
-    // helper mutates `metadata`. Returns true on success (or when HA is
-    // disabled). On false, the caller must NOT call try_evict_or_offload
-    // and must NOT erase the metadata entry — local state must stay in
-    // sync with what was published.
+    // HA strong-consistency: persist the post-eviction state before the
+    // helper mutates metadata. Keep the removed IDs local until submission
+    // succeeds so a consumed reservation cannot strand REMOVED replicas.
     auto persist_evict_oplog_or_skip =
         [&, this](const TenantId& tenant_id, const std::string& key,
-                  ObjectMetadata& metadata) -> bool {
-        if (!enable_oplog_ || !ordered_oplog_writer_) {
-            return true;
+                  ObjectMetadata& metadata) -> tl::expected<void, ErrorCode> {
+        if (!enable_oplog_) {
+            return {};
         }
 
         // Predict the descriptor list after evict_replicas() runs:
@@ -10063,76 +10061,61 @@ void MasterService::BatchEvict(double evict_ratio_target,
         auto remaining = BuildRemainingReplicaDescriptors(
             metadata, is_evictable_memory_replica);
 
-        if (enable_oplog_) {
-            auto reservation = ReserveBatchOpLogSlot();
-            if (!reservation) {
-                LOG(WARNING)
-                    << "BatchEvict: OpLog reservation failed for key=" << key
-                    << ", err=" << static_cast<int>(reservation.error())
-                    << ", skipping eviction";
-                return false;
-            }
-            std::vector<ReplicaID> removed_ids;
-            metadata.VisitReplicas(is_evictable_memory_replica,
-                                   [&removed_ids](Replica& replica) {
-                                       removed_ids.push_back(replica.id());
-                                       replica.mark_removed();
-                                   });
-            tl::expected<OpLogEntry, ErrorCode> persist_result;
-            if (remaining.empty()) {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
-                    std::move(reservation.value()), OpType::REMOVE,
-                    tenant_id.value(), key, {},
-                    [this, removed_ids = std::move(removed_ids)](
-                        const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, QuotaEraseMode::kFull);
-                    });
-            } else {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
-                    std::move(reservation.value()), OpType::PUT_END,
-                    tenant_id.value(), key,
-                    SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
-                                                                    remaining),
-                    [this, removed_ids = std::move(removed_ids)](
-                        const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, QuotaEraseMode::kFull);
-                    });
-            }
-            if (!persist_result) {
-                LOG(WARNING)
-                    << "BatchEvict: OpLog persist failed for key=" << key
-                    << ", err=" << static_cast<int>(persist_result.error())
-                    << ", skipping eviction";
-                return false;
-            }
-            return true;
+        auto reservation = ReserveBatchOpLogSlot();
+        if (!reservation) {
+            LOG(WARNING) << "BatchEvict: OpLog reservation failed for key="
+                         << key
+                         << ", err=" << static_cast<int>(reservation.error())
+                         << ", stopping eviction scan";
+            return tl::make_unexpected(reservation.error());
         }
-
+        std::vector<ReplicaID> removed_ids;
+        metadata.VisitReplicas(is_evictable_memory_replica,
+                               [&removed_ids](Replica& replica) {
+                                   removed_ids.push_back(replica.id());
+                                   replica.mark_removed();
+                               });
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
-            persist_result = AppendOpLogWithDurableFinalize(
-                OpType::REMOVE, tenant_id.value(), key, {}, nullptr);
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::REMOVE,
+                tenant_id.value(), key, {},
+                [this, removed_ids](const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(
+                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                });
         } else {
-            persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, tenant_id.value(), key,
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::PUT_END,
+                tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                 remaining),
-                nullptr);
+                [this, removed_ids](const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(
+                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                });
         }
         if (!persist_result) {
+            const ErrorCode error = persist_result.error();
+            for (const auto& id : removed_ids) {
+                if (auto* replica = metadata.GetReplicaByID(id);
+                    replica != nullptr) {
+                    replica->cancel_remove();
+                }
+            }
             LOG(WARNING) << "BatchEvict: OpLog persist failed for key=" << key
-                         << ", err=" << static_cast<int>(persist_result.error())
-                         << ", skipping eviction";
-            return false;
+                         << ", err=" << static_cast<int>(error)
+                         << ", stopping eviction scan";
+            return tl::make_unexpected(error);
         }
-        return true;
+        return {};
     };
 
     struct EvictionResult {
         uint64_t freed_bytes{0};
         long evicted_objects{0};
+        bool stop_scan{false};
+        ErrorCode error{ErrorCode::OK};
     };
 
     auto try_evict_group_or_object =
@@ -10142,21 +10125,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
                   std::vector<std::vector<Replica>>& deferred_replicas,
                   bool allow_soft_pinned) -> EvictionResult {
         if (!metadata.IsGrouped()) {
-            if (!persist_evict_oplog_or_skip(tenant_id, key, metadata)) {
-                return {};
+            auto submission =
+                persist_evict_oplog_or_skip(tenant_id, key, metadata);
+            if (!submission) {
+                return {.stop_scan = true, .error = submission.error()};
             }
             uint64_t freed = try_evict_or_offload(
                 tenant_id, key, metadata, tenant_state, deferred_replicas);
             return {.freed_bytes = freed, .evicted_objects = freed > 0 ? 1 : 0};
         }
 
-        // Grouped object: the group is evicted all-or-none at the group level
-        // (either the whole group is protected or it is a candidate), based on
-        // the shared group TTL. Within an evicted group, member-level
-        // best-effort safety still applies below (hard pins, soft pins, active
-        // writes, busy replicas are skipped). Object routing is decoupled from
-        // groups, so members live in different metadata shards; membership is
-        // read from group_domain_ (keyed by scoped(tenant, group_id)).
         std::vector<std::string> member_keys =
             GetGroupMemberKeys(tenant_id, metadata.group_id);
         if (member_keys.empty()) {
@@ -10191,9 +10169,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     !can_evict_replicas(member_metadata)) {
                     continue;
                 }
-                if (!persist_evict_oplog_or_skip(tenant_id, member_key,
-                                                 member_metadata)) {
-                    continue;
+                auto submission = persist_evict_oplog_or_skip(
+                    tenant_id, member_key, member_metadata);
+                if (!submission) {
+                    result.stop_scan = true;
+                    result.error = submission.error();
+                    return;
                 }
                 const uint64_t freed =
                     try_evict_or_offload(tenant_id, member_key, member_metadata,
@@ -10218,16 +10199,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
         for (const auto& [shard_idx, keys] : members_by_shard) {
             if (shard_idx == trigger_shard_idx) {
                 evict_members(keys, tenant_state, shard);
-                continue;
+            } else {
+                MetadataShardAccessorRW other(this, shard_idx);
+                auto tenant_it = other->tenants.find(tenant_id);
+                if (tenant_it == other->tenants.end()) {
+                    continue;
+                }
+                evict_members(keys, tenant_it->second, other);
+                if (tenant_it->second.Empty()) {
+                    other->tenants.erase(tenant_id);
+                }
             }
-            MetadataShardAccessorRW other(this, shard_idx);
-            auto tenant_it = other->tenants.find(tenant_id);
-            if (tenant_it == other->tenants.end()) {
-                continue;
-            }
-            evict_members(keys, tenant_it->second, other);
-            if (tenant_it->second.Empty()) {
-                other->tenants.erase(tenant_id);
+            // An OpLog persist failure stops the scan so a broken oplog does
+            // not leave the group partially evicted.
+            if (result.stop_scan) {
+                break;
             }
         }
         return result;
@@ -10479,6 +10465,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
+    bool stop_eviction_scan = false;
+    ErrorCode oplog_failure{ErrorCode::OK};
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
     // Shards that actually evicted this cycle; their metadata maps are
@@ -10501,6 +10489,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         long evicted_this_pass = 0;
         auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
             for (auto& c : batch) {
+                if (stop_eviction_scan) break;
                 // Stop once the target object count is reached. Grouped
                 // eviction is all-or-none, so evicting a group can overshoot
                 // evict_num by at most one group; using evict_num (rather than
@@ -10553,6 +10542,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     if (evict_result.evicted_objects > 0) {
                         evicted_shards.set(c.shard_idx);
                     }
+                    if (evict_result.stop_scan) {
+                        stop_eviction_scan = true;
+                        oplog_failure = evict_result.error;
+                    }
                 }
                 deferred_replicas.clear();
             }
@@ -10565,7 +10558,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // remainder of the current no-soft-pin population. This recovery
         // scan is paid only on churn and preserves the behavior of
         // continuing past the cutoff until evict_num is reached.
-        if (compact_frontier_used && evicted_this_pass < evict_num) {
+        if (!stop_eviction_scan && compact_frontier_used &&
+            evicted_this_pass < evict_num) {
             auto refill_candidates = collect_candidates(
                 /*use_cutoff=*/true, reserve_cutoff,
                 /*collect_older_or_equal=*/false);
@@ -10589,7 +10583,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Do second pass eviction only if 1). there are candidates that can be
     // evicted AND 2). The evicted number in the first pass is less than
     // evict_ratio_lowerbound.
-    if (target_evict_num > 0) {
+    if (!stop_eviction_scan && target_evict_num > 0) {
         if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
             // Second pass A: only evict objects without soft pin.
             std::nth_element(no_pin_objects.begin(),
@@ -10598,17 +10592,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto target_timeout = no_pin_objects[target_evict_num - 1];
 
             // Evict via key lookup — avoid full metadata traversal
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+            for (size_t i = 0;
+                 i < kNumShards && target_evict_num > 0 && !stop_eviction_scan;
+                 i++) {
                 const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
                     MetadataShardAccessorRW shard(this, shard_idx);
                     for (auto tenant_it = shard->tenants.begin();
                          tenant_it != shard->tenants.end() &&
-                         target_evict_num > 0;) {
+                         target_evict_num > 0 && !stop_eviction_scan;) {
                         auto& tenant_state = tenant_it->second;
                         auto it = tenant_state.metadata.begin();
                         while (it != tenant_state.metadata.end() &&
-                               target_evict_num > 0) {
+                               target_evict_num > 0 && !stop_eviction_scan) {
                             if (!it->second.IsHardPinned() &&
                                 now >= it->second.EvictionDeadline() &&
                                 it->second.EvictionDeadline() <=
@@ -10638,6 +10634,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 if (evict_result.evicted_objects > 0) {
                                     evicted_shards.set(shard_idx);
                                 }
+                                if (evict_result.stop_scan) {
+                                    stop_eviction_scan = true;
+                                    oplog_failure = evict_result.error;
+                                }
                             } else {
                                 ++it;
                             }
@@ -10662,18 +10662,20 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 soft_pin_objects.end());
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+            for (size_t i = 0;
+                 i < kNumShards && target_evict_num > 0 && !stop_eviction_scan;
+                 i++) {
                 const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
                     MetadataShardAccessorRW shard(this, shard_idx);
 
                     for (auto tenant_it = shard->tenants.begin();
                          tenant_it != shard->tenants.end() &&
-                         target_evict_num > 0;) {
+                         target_evict_num > 0 && !stop_eviction_scan;) {
                         auto& tenant_state = tenant_it->second;
                         auto it = tenant_state.metadata.begin();
                         while (it != tenant_state.metadata.end() &&
-                               target_evict_num > 0) {
+                               target_evict_num > 0 && !stop_eviction_scan) {
                             if (it->second.IsHardPinned() ||
                                 now < it->second.EvictionDeadline() ||
                                 !can_evict_replicas(it->second)) {
@@ -10705,6 +10707,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     evict_result.evicted_objects;
                                 if (evict_result.evicted_objects > 0) {
                                     evicted_shards.set(shard_idx);
+                                }
+                                if (evict_result.stop_scan) {
+                                    stop_eviction_scan = true;
+                                    oplog_failure = evict_result.error;
                                 }
                             } else {
                                 ++it;
@@ -10745,20 +10751,23 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
-    if (evicted_count > 0 || released_discarded_cnt > 0) {
+    const bool made_progress = evicted_count > 0 || released_discarded_cnt > 0;
+    const bool success = made_progress || offload_deferred_count > 0;
+    if (stop_eviction_scan) {
+        need_mem_eviction_ =
+            oplog_failure == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+    } else if (success) {
         need_mem_eviction_ = false;
+    } else if (total_eviction_base == 0) {
+        need_mem_eviction_ = false;
+    }
+
+    if (success) {
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
         MasterMetricManager::instance().inc_mem_eviction_success(
             evicted_count, total_freed_size);
-    } else if (offload_deferred_count > 0) {
-        need_mem_eviction_ = false;
-        MasterMetricManager::instance().inc_eviction_success(0, 0);
-        MasterMetricManager::instance().inc_mem_eviction_success(0, 0);
     } else {
-        if (total_eviction_base == 0) {
-            need_mem_eviction_ = false;
-        }
         MasterMetricManager::instance().inc_eviction_fail();
         MasterMetricManager::instance().inc_mem_eviction_fail();
     }

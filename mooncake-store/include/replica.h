@@ -538,6 +538,14 @@ class Replica {
         }
     }
 
+    void cancel_remove() {
+        if (status_ == ReplicaStatus::REMOVED) {
+            status_ = ReplicaStatus::COMPLETE;
+        } else {
+            LOG(ERROR) << "Cannot cancel_remove from status: " << status_;
+        }
+    }
+
     void inc_refcnt() { refcnt_.fetch_add(1); }
 
     void dec_refcnt() { refcnt_.fetch_sub(1); }
