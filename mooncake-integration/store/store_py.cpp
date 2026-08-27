@@ -334,67 +334,8 @@ bool tensor_destination_matches_metadata(const PyTensorInfo &target,
                                stored.metadata.header.ndim);
 }
 
-// Read a complete serialized tensor with the regular client and copy only its
-// payload into the caller-provided destination tensor.  The regular client
-// may return a device-backed BufferHandle depending on its allocator, so the
-// serialized object is first normalized into host memory before metadata is
-// parsed or the payload is copied to the destination.
-std::optional<int64_t> read_tensor_into_cuda_real(
-    const std::shared_ptr<PyClient> &store, const std::string &key,
-    const py::object &tensor, const std::string &context) {
-    PyTensorInfo target = extract_tensor_destination_info(tensor, key);
-    if (!target.valid()) {
-        return std::nullopt;
-    }
-
-    std::shared_ptr<BufferHandle> source_handle;
-    {
-        py::gil_scoped_release release_gil;
-        source_handle = store->get_buffer(key);
-    }
-    if (!source_handle) {
-        LOG(ERROR) << context << ": failed to read tensor object for key "
-                   << key;
-        return std::nullopt;
-    }
-
-    std::vector<char> host_data(source_handle->size());
-    auto runtime_accelerator =
-        mooncake::device::GetAcceleratorRegistry().RuntimeAccelerators();
-    if (!runtime_accelerator.CopyToHost(host_data.data(), source_handle->ptr(),
-                                        host_data.size())) {
-        LOG(ERROR) << context
-                   << ": failed to copy tensor object to host for key " << key;
-        return std::nullopt;
-    }
-
-    auto stored = ParseTensorMetadata(host_data.data(), host_data.size());
-    if (!stored.has_value()) {
-        LOG(ERROR) << context << ": invalid tensor metadata for key " << key;
-        return std::nullopt;
-    }
-    if (!tensor_destination_matches_metadata(target, *stored, key, context)) {
-        return std::nullopt;
-    }
-    if (stored->data_offset > host_data.size() ||
-        stored->data_bytes > host_data.size() - stored->data_offset) {
-        LOG(ERROR) << context << ": tensor payload exceeds object for key "
-                   << key;
-        return std::nullopt;
-    }
-
-    if (stored->data_bytes != 0 &&
-        !runtime_accelerator.CopyFromHost(
-            reinterpret_cast<void *>(target.data_ptr),
-            host_data.data() + stored->data_offset, stored->data_bytes)) {
-        LOG(ERROR) << context
-                   << ": failed to copy tensor payload to destination"
-                   << " for key " << key;
-        return std::nullopt;
-    }
-    return static_cast<int64_t>(stored->data_bytes);
-}
-
+// Read tensor payloads directly into caller-owned CUDA buffers.  Metadata is
+// fetched separately so no complete-object host staging buffer is needed.
 template <typename ResultType>
 bool apply_indexed_results(const char *context,
                            const std::vector<ResultType> &op_results,
@@ -875,16 +816,66 @@ class MooncakeStorePyWrapper {
         }
 
         if (!use_dummy_client_) {
-            // RealClient reads into its own allocator-backed buffer and then
-            // performs an explicit H2D copy.  This keeps the public CUDA
-            // tensor API independent of whether the caller pre-registered the
-            // destination pointer with TransferEngine.
+            auto metadata = batch_get_tensor_metadata_prefixes(keys, context);
+            std::vector<void *> buffers;
+            std::vector<std::vector<std::string>> all_keys;
+            std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+            std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+            std::vector<std::vector<std::vector<size_t>>> all_sizes;
+            std::vector<size_t> original_indices;
+            buffers.reserve(keys.size());
+            all_keys.reserve(keys.size());
+            all_dst_offsets.reserve(keys.size());
+            all_src_offsets.reserve(keys.size());
+            all_sizes.reserve(keys.size());
+            original_indices.reserve(keys.size());
+
             for (size_t i = 0; i < keys.size(); ++i) {
-                auto bytes = read_tensor_into_cuda_real(
-                    store_, keys[i], tensors_list[i].cast<py::object>(),
-                    context);
-                if (bytes.has_value()) {
-                    results[i] = *bytes;
+                PyTensorInfo target = extract_tensor_destination_info(
+                    tensors_list[i].cast<py::object>(), keys[i]);
+                if (!target.valid() || !metadata[i].has_value() ||
+                    !tensor_destination_matches_metadata(target, *metadata[i],
+                                                         keys[i], context)) {
+                    continue;
+                }
+                const auto &stored = *metadata[i];
+                if (stored.data_offset >
+                    std::numeric_limits<size_t>::max() - stored.data_bytes) {
+                    LOG(ERROR)
+                        << context << " : tensor range overflows for key "
+                        << keys[i];
+                    continue;
+                }
+                if (stored.data_bytes == 0) {
+                    results[i] = 0;
+                    continue;
+                }
+
+                buffers.push_back(reinterpret_cast<void *>(target.data_ptr));
+                all_keys.push_back({keys[i]});
+                all_dst_offsets.push_back({{0}});
+                all_src_offsets.push_back({{stored.data_offset}});
+                all_sizes.push_back({{stored.data_bytes}});
+                original_indices.push_back(i);
+            }
+
+            if (buffers.empty()) return results;
+
+            std::vector<std::vector<std::vector<int64_t>>> range_results;
+            {
+                py::gil_scoped_release release_gil;
+                range_results = store_->get_into_ranges(
+                    buffers, all_keys, all_dst_offsets, all_src_offsets,
+                    all_sizes, nullptr);
+            }
+            for (size_t i = 0; i < original_indices.size(); ++i) {
+                const size_t original_index = original_indices[i];
+                if (i < range_results.size() && range_results[i].size() == 1 &&
+                    range_results[i][0].size() == 1 &&
+                    range_results[i][0][0] >= 0 &&
+                    static_cast<size_t>(range_results[i][0][0]) ==
+                        metadata[original_index]->data_bytes) {
+                    results[original_index] = range_results[i][0][0];
                 }
             }
             return results;

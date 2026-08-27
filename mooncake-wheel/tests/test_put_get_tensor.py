@@ -169,15 +169,22 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.equal(self.store.get_tensor(put_key), tensor.cpu()))
         self.assertTrue(torch.equal(self.store.get_tensor(upsert_key), tensor.cpu()))
 
-        # RealClient must support the CUDA-destination tensor API without
-        # requiring callers to register the destination pointer first.
+        # RealClient writes directly to a registered CUDA destination.
         cuda_destination = torch.empty_like(tensor)
+        destination_bytes = tensor.numel() * tensor.element_size()
         self.assertEqual(
-            self.store.get_tensor_into_cuda(put_key, cuda_destination),
-            tensor.numel() * tensor.element_size(),
+            self.store.register_buffer(cuda_destination.data_ptr(), destination_bytes),
+            0,
         )
-        torch.cuda.synchronize()
-        self.assertTrue(torch.equal(cuda_destination, tensor))
+        try:
+            self.assertEqual(
+                self.store.get_tensor_into_cuda(put_key, cuda_destination),
+                destination_bytes,
+            )
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(cuda_destination, tensor))
+        finally:
+            self.store.unregister_buffer(cuda_destination.data_ptr())
 
         batch_put_keys = [f"{prefix}_batch_put_{i}" for i in range(2)]
         batch_upsert_keys = [f"{prefix}_batch_upsert_{i}" for i in range(2)]
@@ -194,15 +201,22 @@ class TestDistributedObjectStore(unittest.TestCase):
             [0, 0],
         )
         batch_destinations = [torch.empty_like(value) for value in batch_tensors]
-        self.assertEqual(
-            self.store.batch_get_tensor_into_cuda(
-                batch_put_keys, batch_destinations
-            ),
-            [value.numel() * value.element_size() for value in batch_tensors],
-        )
-        torch.cuda.synchronize()
-        for destination, expected in zip(batch_destinations, batch_tensors):
-            self.assertTrue(torch.equal(destination, expected))
+        destination_bytes = [value.numel() * value.element_size() for value in batch_tensors]
+        for destination, size in zip(batch_destinations, destination_bytes):
+            self.assertEqual(self.store.register_buffer(destination.data_ptr(), size), 0)
+        try:
+            self.assertEqual(
+                self.store.batch_get_tensor_into_cuda(
+                    batch_put_keys, batch_destinations
+                ),
+                destination_bytes,
+            )
+            torch.cuda.synchronize()
+            for destination, expected in zip(batch_destinations, batch_tensors):
+                self.assertTrue(torch.equal(destination, expected))
+        finally:
+            for destination in batch_destinations:
+                self.store.unregister_buffer(destination.data_ptr())
         for key, expected_tensor in zip(batch_put_keys, batch_tensors):
             self.assertTrue(
                 torch.equal(self.store.get_tensor(key), expected_tensor.cpu())
