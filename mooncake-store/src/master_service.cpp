@@ -902,8 +902,9 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
     return GetTenantQuotaSnapshot(tenant_id);
 }
 
-std::vector<SegmentUpdateResult> MasterService::MountNewSegments(
-    const std::vector<Segment>& segments, const UUID& client_id) {
+tl::expected<std::vector<SegmentUpdateResult>, ErrorCode>
+MasterService::MountNewSegments(const std::vector<Segment>& segments,
+                                const UUID& client_id) {
     std::vector<SegmentUpdateResult> results;
     results.reserve(segments.size());
     if (segments.empty()) {
@@ -920,10 +921,7 @@ std::vector<SegmentUpdateResult> MasterService::MountNewSegments(
         if (!client_ping_queue_.push(pod_client_id)) {
             LOG(ERROR) << "client_id=" << client_id
                        << ", error=client_ping_queue_full";
-            for (const auto& segment : segments) {
-                results.push_back({segment.id, ErrorCode::INTERNAL_ERROR});
-            }
-            return results;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
         for (const auto& segment : segments) {
@@ -978,7 +976,11 @@ auto MasterService::UpdateSegments(const UpdateSegmentsRequest& request)
             segments.push_back(update.segment);
         }
 
-        response.results = MountNewSegments(segments, request.client_id);
+        auto mount_result = MountNewSegments(segments, request.client_id);
+        if (!mount_result) {
+            return tl::make_unexpected(mount_result.error());
+        }
+        response.results = std::move(mount_result.value());
         {
             std::shared_lock<std::shared_mutex> lock(client_mutex_);
             response.client_status = ok_client_.contains(request.client_id)
@@ -1007,11 +1009,14 @@ auto MasterService::UpdateSegments(const UpdateSegmentsRequest& request)
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     auto results = MountNewSegments({segment}, client_id);
-    if (results.size() != 1) {
+    if (!results) {
+        return tl::make_unexpected(results.error());
+    }
+    if (results->size() != 1) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    if (results.front().error_code != ErrorCode::OK) {
-        return tl::make_unexpected(results.front().error_code);
+    if (results->front().error_code != ErrorCode::OK) {
+        return tl::make_unexpected(results->front().error_code);
     }
     return {};
 }
