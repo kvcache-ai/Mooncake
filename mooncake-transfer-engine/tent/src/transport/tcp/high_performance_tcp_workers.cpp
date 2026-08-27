@@ -144,6 +144,9 @@ size_t HighPerformanceTcpWorkers::affinityOwner(uint64_t peer,
         hash ^= value + static_cast<size_t>(0x9e3779b97f4a7c15ULL) +
                 (hash << 6U) + (hash >> 2U);
     };
+    // HP TCP v1 has one endpoint. Keep its zero index in the hash so this
+    // interface simplification does not change the existing worker mapping.
+    mix(std::hash<uint32_t>{}(0));
     mix(std::hash<uint32_t>{}(lane));
     return config_.worker_count == 0 ? 0 : hash % config_.worker_count;
 }
