@@ -188,16 +188,34 @@ Workers::Workers(RdmaTransport* transport)
 
     device_selector_->setSchedulingParams(params);
 
-    // Seed each device's bandwidth from the speed its port negotiated.
-    // context_set_ is indexed by NicID, the same id the selector uses; an
-    // inert slot (NIC skipped at init) has no port to read, so leave it on
-    // the configured default without logging a second warning for it.
+    // Seed each device from its context. context_set_ is indexed by NicID,
+    // the same id the selector uses. Three cases:
+    //   - no usable context (DEVICE_UNINIT: initializeContexts() replaced a
+    //     failed construct() with an inert slot; DEVICE_DISABLED handled the
+    //     same way defensively): the NIC cannot carry traffic, so it gets no
+    //     bandwidth at all -- not the default -- and leaves candidate
+    //     selection and the aggregate.
+    //   - port down at open (DEVICE_PAUSED): seeded from whatever the port
+    //     reports (possibly 0, i.e. the default), but unavailable until
+    //     IBV_EVENT_PORT_ACTIVE.
+    //   - DEVICE_ENABLED: seeded from the negotiated speed, or the configured
+    //     default (with a warning) when the speed could not be read.
     for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
          ++dev_id) {
+        const auto* nic = transport_->local_topology_->getNicEntry(dev_id);
+        // Only NIC_RDMA entries have a selector slot (see loadTopology()).
+        if (!nic || nic->type != Topology::NIC_RDMA) continue;
         const auto& context = transport_->context_set_[dev_id];
-        if (!context || context->status() == RdmaContext::DEVICE_UNINIT)
+        const auto status =
+            context ? context->status() : RdmaContext::DEVICE_UNINIT;
+        if (status == RdmaContext::DEVICE_UNINIT ||
+            status == RdmaContext::DEVICE_DISABLED) {
+            device_selector_->setDeviceAvailable(dev_id, false);
             continue;
+        }
         device_selector_->setDeviceBandwidth(dev_id, context->linkSpeedGbps());
+        device_selector_->setDeviceAvailable(
+            dev_id, status == RdmaContext::DEVICE_ENABLED);
     }
 
     // ============================================================
@@ -811,7 +829,8 @@ void Workers::workerThread(int thread_id) {
     }
 }
 
-int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
+int Workers::handleContextEvents(int dev_id,
+                                 std::shared_ptr<RdmaContext>& context) {
     ibv_async_event event;
     if (ibv_get_async_event(context->nativeContext(), &event) < 0) return -1;
     LOG(WARNING) << "Received context async event "
@@ -828,9 +847,13 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
     } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
                event.event_type == IBV_EVENT_PORT_ERR) {
         context->pause();
+        // Out of selection and out of the aggregate until the port returns;
+        // its EWMA cannot learn anything while no traffic flows.
+        device_selector_->setDeviceAvailable(dev_id, false);
         LOG(WARNING) << "Action: " << context->name() << " down";
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
         context->resume();
+        device_selector_->setDeviceAvailable(dev_id, true);
         LOG(WARNING) << "Action: " << context->name() << " up";
     }
     ibv_ack_async_event(&event);
@@ -863,7 +886,9 @@ void Workers::monitorThread() {
             last_reclaim_time = current_time;
         }
 
-        for (auto& context : transport_->context_set_) {
+        for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
+             ++dev_id) {
+            auto& context = transport_->context_set_[dev_id];
             struct epoll_event event;
             if (context->eventFd() < 0) continue;
             int num_events = epoll_wait(context->eventFd(), &event, 1, 100);
@@ -874,7 +899,7 @@ void Workers::monitorThread() {
             if (num_events == 0) continue;
             if (!(event.events & EPOLLIN)) continue;
             if (event.data.fd == context->nativeContext()->async_fd)
-                handleContextEvents(context);
+                handleContextEvents(static_cast<int>(dev_id), context);
         }
     }
 }

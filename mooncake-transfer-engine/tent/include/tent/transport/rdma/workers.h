@@ -82,7 +82,9 @@ class Workers {
     // failure load.
     void reclaimEndpoints();
 
-    int handleContextEvents(std::shared_ptr<RdmaContext>& context);
+    // dev_id is the NicID (context_set_ index), which is also the
+    // DeviceSelector id, so port events can flip that device's availability.
+    int handleContextEvents(int dev_id, std::shared_ptr<RdmaContext>& context);
 
     Status generatePostPath(RdmaSlice* slice);
 

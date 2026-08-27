@@ -33,7 +33,7 @@ Status DeviceSelector::loadTopology(std::shared_ptr<Topology>& local_topology) {
         if (!entry || entry->type != Topology::NIC_RDMA) continue;
         DeviceInfo& info = devices_[dev_id];
         info.dev_id = dev_id;
-        info.bw_gbps = 0.0;  // unknown until setDeviceBandwidth
+        info.bw_gbps.store(0.0, std::memory_order_relaxed);  // unknown
         info.numa_id = entry->numa_node;
         info.ewma_bandwidth_bps.store(theoreticalBandwidth(info),
                                       std::memory_order_relaxed);
@@ -45,7 +45,7 @@ Status DeviceSelector::loadTopology(std::shared_ptr<Topology>& local_topology) {
 
 double DeviceSelector::theoreticalBandwidth(const DeviceInfo& dev) const {
     const auto& p = sched_params_;
-    double gbps = dev.bw_gbps;
+    double gbps = dev.bw_gbps.load(std::memory_order_relaxed);
     if (gbps < p.min_bandwidth_gbps || gbps > p.max_bandwidth_gbps)
         gbps = p.default_bandwidth_gbps;
     return gbps * 1e9 / 8.0;
@@ -63,10 +63,24 @@ Status DeviceSelector::setDeviceBandwidth(int dev_id, double gbps) {
                      << (gbps <= 0.0 ? "unknown" : "outside the valid range")
                      << ", assuming " << p.default_bandwidth_gbps << " Gbps";
     }
-    dev.bw_gbps = gbps;
+    dev.bw_gbps.store(gbps, std::memory_order_relaxed);
+    // A worker completing between these two stores clamps the old EWMA
+    // against the new rate once; the seed below overwrites it.
     dev.ewma_bandwidth_bps.store(theoreticalBandwidth(dev),
                                  std::memory_order_relaxed);
     return Status::OK();
+}
+
+Status DeviceSelector::setDeviceAvailable(int dev_id, bool available) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end())
+        return Status::InvalidArgument("device not found");
+    it->second.available.store(available, std::memory_order_relaxed);
+    return Status::OK();
+}
+
+bool DeviceSelector::isDeviceAvailable(int dev_id) const {
+    return usable(dev_id);
 }
 
 Status DeviceSelector::enableSharedQuota(const std::string& shm_name) {
@@ -113,7 +127,7 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
             thread_local std::vector<int> tl_eligible;
             tl_eligible.clear();
             for (int dev_id : entry->device_list[rank]) {
-                if (!devices_.count(dev_id)) continue;
+                if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
                 tl_eligible.push_back(dev_id);
             }
@@ -195,7 +209,7 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
     // First pass: filter by device priority (QoS filtering)
     for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
         for (int dev_id : entry->device_list[rank]) {
-            if (!devices_.count(dev_id)) continue;
+            if (!usable(dev_id)) continue;
             if ((device_mask & (1ULL << dev_id)) == 0) continue;
             // QoS: Get device's current priority slot (local, per-process)
             // Device accepts request if dev_priority >= request_priority
@@ -208,11 +222,12 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         }
     }
 
-    // If no devices after filtering, fallback to all devices
+    // If no devices after priority filtering, fall back to every usable
+    // device. Availability is not a QoS filter and is never relaxed here.
     if (candidates.empty()) {
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             for (int dev_id : entry->device_list[rank]) {
-                if (!devices_.count(dev_id)) continue;
+                if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
                 add_candidate(dev_id, rank);
             }
@@ -430,6 +445,7 @@ int DeviceSelector::getDevicePriority(int dev_id) const {
 double DeviceSelector::getAggregateEwmaBandwidth() const {
     double total = 0.0;
     for (const auto& [id, dev] : devices_) {
+        if (!dev.available.load(std::memory_order_relaxed)) continue;
         total += dev.getEwmaBandwidth();
     }
     return total > 0.0 ? total : -1.0;

@@ -61,6 +61,12 @@ class RdmaTransportTestPeer {
         return transport.initializeContexts();
     }
 
+    // Constructs Workers (which seeds the DeviceSelector from context_set_)
+    // without starting any threads.
+    static std::unique_ptr<Workers> makeWorkers(RdmaTransport& transport) {
+        return std::make_unique<Workers>(&transport);
+    }
+
     static const RdmaContextSet& contextSet(const RdmaTransport& transport) {
         return transport.context_set_;
     }
@@ -297,6 +303,32 @@ TEST(RdmaNicIndexAlignmentTest, ContextSetKeepsOneSlotWhenConstructFails) {
               static_cast<size_t>(0));
     expectInertContextPerNic(RdmaTransportTestPeer::contextSet(transport),
                              topology->getNicCount());
+}
+
+// A NIC whose construct() failed is still an RDMA entry in the topology, so
+// loadTopology() gives it a DeviceSelector slot. Workers must mark it
+// unavailable: it can carry no traffic, so it must be neither a selection
+// candidate nor part of the aggregate bandwidth the admission queue reads --
+// the configured default speed is for usable NICs only.
+TEST(RdmaNicIndexAlignmentTest, FailedContextIsUnavailableToSelector) {
+    auto topology = std::make_shared<Topology>();
+    ASSERT_TRUE(topology
+                    ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                    .ok());
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport),
+              static_cast<size_t>(0));
+
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    auto* selector = workers->getDeviceSelector();
+    ASSERT_NE(selector, nullptr);
+    EXPECT_FALSE(selector->isDeviceAvailable(1));
+    // Nothing usable: no bandwidth to predict with, rather than 400G of it.
+    EXPECT_LT(selector->getAggregateEwmaBandwidth(), 0.0);
 }
 
 TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {

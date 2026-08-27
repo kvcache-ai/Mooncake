@@ -275,6 +275,12 @@ All slice spraying parameters are configurable via the configuration file:
   `[ewma_min_multiplier, ewma_max_multiplier]` times that rate
 - If a device's port speed cannot be read or is outside [min, max],
   `default_bandwidth_gbps` is used and a warning is logged
+- A NIC that cannot carry traffic -- its context was never constructed,
+  `construct()` failed, or its port is down -- is marked unavailable: it is
+  excluded from device selection and from the aggregate bandwidth the
+  admission queue's deadline predictor reads. The default speed applies
+  only to a usable NIC whose speed could not be determined. `PORT_ERR`
+  marks a device unavailable and `PORT_ACTIVE` restores it
 
 ## Usage Examples
 

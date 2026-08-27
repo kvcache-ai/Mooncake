@@ -63,8 +63,17 @@ class DeviceSelector {
 
     struct DeviceInfo {
         int dev_id;
-        double bw_gbps;
+        // Negotiated link speed in Gbps. setDeviceBandwidth() may rewrite it
+        // after traffic has started while workers read it in release(), so
+        // it is atomic.
+        std::atomic<double> bw_gbps{0.0};
         int numa_id;
+        // False for a NIC that cannot carry traffic: context never
+        // constructed, or port down. Excluded from candidate construction
+        // and from every aggregate; the bandwidth fields are meaningless
+        // while false. Fits the alignment hole after numa_id, so the padding
+        // below still puts inflight_bytes on its own cache line.
+        std::atomic<bool> available{true};
         uint64_t padding0[5];
         std::atomic<uint64_t> inflight_bytes{0};
         uint64_t padding1[7];
@@ -100,10 +109,20 @@ class DeviceSelector {
     Status loadTopology(std::shared_ptr<Topology> &local_topology);
 
     // Record the link speed ibv_query_port reported for dev_id and re-seed
-    // its EWMA from it. A value outside [min, max]_bandwidth_gbps (including
-    // 0 = unknown) falls back to default_bandwidth_gbps. Call after
-    // setSchedulingParams and before any traffic.
+    // its EWMA from it, replacing whatever was learned and re-deriving the
+    // clamp. A value outside [min, max]_bandwidth_gbps (including 0 =
+    // unknown) falls back to default_bandwidth_gbps. Call after
+    // setSchedulingParams; may be called again at runtime when the link
+    // renegotiates.
     Status setDeviceBandwidth(int dev_id, double gbps);
+
+    // Mark dev_id able (or unable) to carry traffic. Unavailable devices are
+    // never selected and do not count toward the aggregate bandwidth. May be
+    // called from the monitor thread while workers allocate; readers see the
+    // flag on their next allocate/aggregate.
+    Status setDeviceAvailable(int dev_id, bool available);
+    // False for an unknown device.
+    bool isDeviceAvailable(int dev_id) const;
 
     std::shared_ptr<Topology> getTopology() const { return local_topology_; }
 
@@ -213,6 +232,13 @@ class DeviceSelector {
     // Bytes/s the device is rated for: bw_gbps when it is inside the
     // configured [min, max], default_bandwidth_gbps otherwise.
     double theoreticalBandwidth(const DeviceInfo &dev) const;
+
+    // Known to the selector and currently able to carry traffic.
+    bool usable(int dev_id) const {
+        auto it = devices_.find(dev_id);
+        return it != devices_.end() &&
+               it->second.available.load(std::memory_order_relaxed);
+    }
 
     Status buildCandidates(const Topology::MemEntry *entry,
                            uint64_t slice_bytes, uint64_t device_mask,
