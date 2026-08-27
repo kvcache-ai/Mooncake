@@ -251,6 +251,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Phase 2: Data verification
         # --------------------------
         get_stats.start_timer()
+        failed_keys = []
         index = 0
         while index < MAX_REQUESTS:
             key = "k_" + str(index)
@@ -265,8 +266,10 @@ class TestDistributedObjectStore(unittest.TestCase):
                 success = (retrieved == expected)
                 get_stats.record_operation(success, ADD_OPERATION_COUNT_ONE, latency, VALUE_SIZE)
                 if not success:
+                    failed_keys.append(key)
                     print(f"Data mismatch for key: {key}")
             else:
+                failed_keys.append(key)
                 get_stats.record_operation(False, ADD_OPERATION_COUNT_ONE, latency, VALUE_SIZE, -1)
             
             index = index + 1
@@ -289,6 +292,11 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.store.remove(key)
             index = index + 1
         print("Cleanup completed")  
+        self.assertEqual(
+            get_stats.failure_count,
+            0,
+            f"{get_stats.failure_count} read(s) failed; first failed keys: {failed_keys[:10]}",
+        )
 
     def test_concurrent_stress(self):
         """Multi-threaded stress test for Put/Get operations
@@ -485,6 +493,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(result, 0, "Buffer registration should succeed")
 
         get_stats.start_timer()
+        failed_keys = []
         index = 0
         while index < MAX_REQUESTS:
             batch_keys = []
@@ -532,10 +541,13 @@ class TestDistributedObjectStore(unittest.TestCase):
                         success = (read_data == expected)
                         get_stats.record_operation(success, ADD_OPERATION_COUNT_ONE, NO_ADD_LATENCY, VALUE_SIZE)
                         if not success:
+                            failed_keys.append(current_key)
                             print(f"Data mismatch for key {current_key}")
                     else:
+                        failed_keys.append(current_key)
                         get_stats.record_operation(False, ADD_OPERATION_COUNT_ONE, NO_ADD_LATENCY, VALUE_SIZE, result)
                 else:
+                    failed_keys.append(current_key)
                     get_stats.record_operation(False, ADD_OPERATION_COUNT_ONE, NO_ADD_LATENCY, VALUE_SIZE, -2)
 
             if success_counter == BATCH_SIZE:
@@ -563,6 +575,11 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.store.remove(key)
             index += 1
         print("Cleanup completed")
+        self.assertEqual(
+            get_stats.failure_count,
+            0,
+            f"{get_stats.failure_count} batch read(s) failed; first failed keys: {failed_keys[:10]}",
+        )
     
 
 if __name__ == "__main__":
