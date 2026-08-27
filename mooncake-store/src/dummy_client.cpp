@@ -791,7 +791,13 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         return 0;
     }
     if (shm_helper_->is_hugepage()) {
-        size = align_up(size, get_hugepage_size_from_env());
+        const size_t alignment = get_hugepage_size_from_env();
+        if (alignment != 0 &&
+            size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
+            LOG(ERROR) << "Buffer size overflows hugepage alignment";
+            return -1;
+        }
+        size = align_up(size, alignment);
     }
     // Check bounds
     if (reinterpret_cast<uint8_t*>(buffer) !=
