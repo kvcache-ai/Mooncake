@@ -33,14 +33,6 @@ if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
     cp -R "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" mooncake-wheel/mooncake/
 fi
 
-# The runtime PG JIT source bundle is staged by CMake from the authoritative
-# mooncake-pg/torch tree.  Consume that staging output instead of maintaining a
-# second package-tree copy here.
-if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
-    rm -rf mooncake-wheel/mooncake/_pg_jit
-    cp -R "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" mooncake-wheel/mooncake/
-fi
-
 echo "Creating directory structure..."
 
 # Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
