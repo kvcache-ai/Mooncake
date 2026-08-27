@@ -202,6 +202,99 @@ jobs:
         fi
       shell: bash
 
+    - name: Run SSD offload and promotion end-to-end tests
+      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
+      run: |
+        source test_env/bin/activate
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+
+        metadata_pid=""
+        master_pid=""
+        cleanup() {
+          status=$?
+          trap - EXIT
+          if [ -n "$master_pid" ]; then
+            kill "$master_pid" 2>/dev/null || true
+            wait "$master_pid" 2>/dev/null || true
+          fi
+          if [ -n "$metadata_pid" ]; then
+            kill "$metadata_pid" 2>/dev/null || true
+            wait "$metadata_pid" 2>/dev/null || true
+          fi
+          if [ "$status" -ne 0 ]; then
+            cat "$RUNNER_TEMP/mooncake-ssd-master.log" 2>/dev/null || true
+            cat "$RUNNER_TEMP/mooncake-promotion-master.log" 2>/dev/null || true
+            cat "$RUNNER_TEMP/mooncake-metadata.log" 2>/dev/null || true
+          fi
+          rm -rf /tmp/mooncake_ci_ssd_offload \
+            /tmp/mooncake_ci_promotion
+          exit "$status"
+        }
+        trap cleanup EXIT
+
+        wait_for_port() {
+          local pid=$1
+          local port=$2
+          local label=$3
+          for _ in {1..50}; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::$label exited before listening on port $port"
+              return 1
+            fi
+            if ss -H -ltn "sport = :$port" | grep -q .; then
+              return 0
+            fi
+            sleep 0.1
+          done
+          echo "::error::$label did not listen on port $port within 5 seconds"
+          return 1
+        }
+
+        stop_master() {
+          kill "$master_pid" 2>/dev/null || true
+          wait "$master_pid" 2>/dev/null || true
+          master_pid=""
+        }
+
+        mooncake_http_metadata_server --port 8080 \
+          >"$RUNNER_TEMP/mooncake-metadata.log" 2>&1 &
+        metadata_pid=$!
+        wait_for_port "$metadata_pid" 8080 "metadata server"
+
+        mkdir -p /tmp/mooncake_ci_ssd_offload
+        mooncake_master \
+          --default_kv_lease_ttl=500 \
+          --root_fs_dir=/tmp/mooncake_ci_ssd_offload \
+          >"$RUNNER_TEMP/mooncake-ssd-master.log" 2>&1 &
+        master_pid=$!
+        wait_for_port "$master_pid" 50051 "SSD offload master"
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+          python mooncake-wheel/tests/test_ssd_offload_in_evict.py
+        stop_master
+
+        mkdir -p /tmp/mooncake_ci_promotion
+        mooncake_master \
+          --default_kv_lease_ttl=500 \
+          --root_fs_dir=/tmp/mooncake_ci_promotion \
+          --enable_offload=true \
+          --offload_on_evict=true \
+          --promotion_on_hit=true \
+          --promotion_admission_threshold=1 \
+          --promotion_max_per_heartbeat=16 \
+          >"$RUNNER_TEMP/mooncake-promotion-master.log" 2>&1 &
+        master_pid=$!
+        wait_for_port "$master_pid" 50051 "promotion master"
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+          MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_ci_promotion \
+          MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=2 \
+          MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT=10 \
+          MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
+          python mooncake-wheel/tests/test_promotion_on_hit.py
+        stop_master
+      shell: bash
+
   test-pg-cpu:
     name: Test PG CPU (Python 3.12, latest PyTorch)
     needs: [build-wheel]
