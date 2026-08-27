@@ -48,6 +48,18 @@ class Platform;
 class ProxyManager;
 class ProgressWorker;
 
+// How long a poll loop should pause before polling again. Zero means poll
+// immediately.
+//
+// progressBatch takes progress_mutex_ every call, so an unthrottled loop does
+// not just burn a core -- it contends with every other thread's submit and
+// poll path. Hot for the first iterations so short transfers keep their
+// latency, then exponential backoff to a cap.
+std::chrono::microseconds nextPollDelay(uint64_t poll_count);
+
+// One backoff step: yields while nextPollDelay is zero, sleeps after that.
+void waitBeforeNextPoll(uint64_t poll_count);
+
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
@@ -60,7 +72,7 @@ struct TaskInfo {
     bool staging{false};
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
-    volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
+    std::atomic<TransferStatusEnum> staging_status{TransferStatusEnum::PENDING};
     std::chrono::steady_clock::time_point start_time{};     // Request submit
     std::chrono::steady_clock::time_point dispatch_time{};  // Initial dispatch
     std::chrono::steady_clock::time_point post_time{};      // Initial post
@@ -72,6 +84,100 @@ struct TaskInfo {
     std::chrono::steady_clock::time_point attempt_post_time{};
     TransportType attempt_type{UNSPEC};
     bool attempt_active{false};
+
+    TaskInfo() = default;
+
+    TaskInfo(const TaskInfo& other)
+        : type(other.type),
+          sub_task_id(other.sub_task_id),
+          derived(other.derived),
+          xport_priority(other.xport_priority),
+          failover_count(other.failover_count),
+          device_mask(other.device_mask),
+          qp_pool(other.qp_pool),
+          request(other.request),
+          staging(other.staging),
+          cancel_requested(other.cancel_requested),
+          status(other.status),
+          staging_status(other.staging_status.load(std::memory_order_relaxed)),
+          start_time(other.start_time),
+          dispatch_time(other.dispatch_time),
+          post_time(other.post_time),
+          attempt_post_time(other.attempt_post_time),
+          attempt_type(other.attempt_type),
+          attempt_active(other.attempt_active) {}
+
+    TaskInfo(TaskInfo&& other) noexcept
+        : type(other.type),
+          sub_task_id(other.sub_task_id),
+          derived(other.derived),
+          xport_priority(other.xport_priority),
+          failover_count(other.failover_count),
+          device_mask(other.device_mask),
+          qp_pool(std::move(other.qp_pool)),
+          request(std::move(other.request)),
+          staging(other.staging),
+          cancel_requested(other.cancel_requested),
+          status(other.status),
+          staging_status(other.staging_status.load(std::memory_order_relaxed)),
+          start_time(other.start_time),
+          dispatch_time(other.dispatch_time),
+          post_time(other.post_time),
+          attempt_post_time(other.attempt_post_time),
+          attempt_type(other.attempt_type),
+          attempt_active(other.attempt_active) {}
+
+    TaskInfo& operator=(const TaskInfo& other) {
+        if (this != &other) {
+            type = other.type;
+            sub_task_id = other.sub_task_id;
+            derived = other.derived;
+            xport_priority = other.xport_priority;
+            failover_count = other.failover_count;
+            device_mask = other.device_mask;
+            qp_pool = other.qp_pool;
+            request = other.request;
+            staging = other.staging;
+            cancel_requested = other.cancel_requested;
+            status = other.status;
+            staging_status.store(
+                other.staging_status.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            start_time = other.start_time;
+            dispatch_time = other.dispatch_time;
+            post_time = other.post_time;
+            attempt_post_time = other.attempt_post_time;
+            attempt_type = other.attempt_type;
+            attempt_active = other.attempt_active;
+        }
+        return *this;
+    }
+
+    TaskInfo& operator=(TaskInfo&& other) noexcept {
+        if (this != &other) {
+            type = other.type;
+            sub_task_id = other.sub_task_id;
+            derived = other.derived;
+            xport_priority = other.xport_priority;
+            failover_count = other.failover_count;
+            device_mask = other.device_mask;
+            qp_pool = std::move(other.qp_pool);
+            request = std::move(other.request);
+            staging = other.staging;
+            cancel_requested = other.cancel_requested;
+            status = other.status;
+            staging_status.store(
+                other.staging_status.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            start_time = other.start_time;
+            dispatch_time = other.dispatch_time;
+            post_time = other.post_time;
+            attempt_post_time = other.attempt_post_time;
+            attempt_type = other.attempt_type;
+            attempt_active = other.attempt_active;
+        }
+        return *this;
+    }
 };
 
 class TransferEngineImpl {
@@ -96,6 +202,9 @@ class TransferEngineImpl {
     const std::string getRpcServerAddress() const;
 
     uint16_t getRpcServerPort() const;
+
+    // Local topology discovered (or loaded from custom matrix) at construct.
+    std::shared_ptr<Topology> getLocalTopology() const;
 
    public:
     Status exportLocalSegment(std::string& shared_handle);
@@ -191,6 +300,26 @@ class TransferEngineImpl {
         }
     }
 
+    // Test-only hook: how many batches are still alive. Lets a test assert
+    // that a failed transfer released its batch rather than leaking it.
+    size_t aliveBatchCountForTest() {
+        size_t count = 0;
+        for (auto& shard : batch_shards_) {
+            std::lock_guard<std::recursive_mutex> lk(shard.mtx);
+            count += shard.alive_batches.size();
+        }
+        return count;
+    }
+
+    // Test-only hook: how many undrained staging batches the ProxyManager
+    // handed over for deferred teardown. Lets a regression test assert the
+    // ownership-transfer path ran instead of freeing memory the transport
+    // workers could still touch.
+    size_t deferredStageTeardownBatchCountForTest() {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        return deferred_stage_teardown_.batches.size();
+    }
+
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
     // enable_progress_worker is false. Transport completion paths use this as
     // an idempotent "maybe ready" signal.
@@ -218,6 +347,16 @@ class TransferEngineImpl {
     Status retainBatch(BatchID batch_id, Batch*& batch);
 
     Status releaseBatch(Batch* batch);
+
+    // Called by ProxyManager when its shutdown drain deadline expires: takes
+    // ownership of the batches (and the local stage buffers they target) that
+    // never reached a terminal state, detaching them from batch_set_ /
+    // alive_batches_ so deconstruct() does not hand their SubBatch/Slice
+    // objects back to the Slab while transport workers may still complete
+    // them. Released only after the transports quiesce.
+    struct DeferredStageTeardown;
+
+    void adoptDeferredStageTeardown(DeferredStageTeardown&& deferred);
 
     class BatchRef;
 
@@ -310,9 +449,19 @@ class TransferEngineImpl {
         MemoryOptions options;
     };
 
-    struct BatchSet {
-        std::unordered_set<Batch*> active;
-        std::vector<Batch*> freelist;
+    // Staging resources that ProxyManager could not drain before its shutdown
+    // deadline. Their slices may still be written by transport workers, so
+    // nothing here may be freed before transport_list_ is reset (which joins
+    // the workers and drains the completion queues).
+    struct DeferredStageTeardown {
+        struct StageBuffers {
+            std::string location;
+            void* chunks{nullptr};
+            std::atomic_flag* bitmap{nullptr};
+        };
+        std::vector<BatchID> batches;
+        std::vector<StageBuffers> stage_buffers;
+        bool empty() const { return batches.empty() && stage_buffers.empty(); }
     };
 
     struct RuntimeQueueConfig {
@@ -342,8 +491,6 @@ class TransferEngineImpl {
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
 
-    BatchSet batch_set_;
-
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;
 
@@ -364,13 +511,67 @@ class TransferEngineImpl {
     size_t dispatch_inflight_bytes_{0};
     uint64_t next_batch_token_{1};
 
-    // Guards alive_batches_ and serializes pollTaskStatus /
-    // updateTaskStatusAfterPoll / lazyFreeBatch against the optional
-    // ProgressWorker thread. Recursive because freeBatch -> lazyFreeBatch ->
-    // getTransferStatus can re-enter on the same thread. See issue #2116.
+    // Serializes engine-global progress: runtime queue, lazyFreeBatch
+    // freelist, and ProgressWorker. Recursive because freeBatch ->
+    // lazyFreeBatch -> getTransferStatus can re-enter. See issue #2116.
     std::recursive_mutex progress_mutex_;
-    std::unordered_set<BatchID> alive_batches_;
+    // Guarded by progress_mutex_. Emptied (abandoned on purpose) at the end of
+    // deconstruct(), after the transports have been destroyed.
+    DeferredStageTeardown deferred_stage_teardown_;
     std::unique_ptr<ProgressWorker> progress_worker_;
+
+    // Per-batch hot paths (poll / free / retain) lock only the shard for
+    // that BatchID instead of progress_mutex_, so N threads polling N
+    // independent batches do not serialize.
+    //
+    // Exception: enable_runtime_queue=true keeps those paths on
+    // progress_mutex_ because queued_owners_ / dispatch window are
+    // engine-global. The runtime queue is off by default.
+    //
+    // The batch registry (alive / active membership) lives INSIDE the same
+    // shard: membership changes and lookups are O(1) set ops taken while
+    // already holding the shard lock, so no separate global registry lock
+    // sits on the poll/alloc/free hot path.
+    //
+    // Lock order (never reversed):
+    //   progress_mutex_ -> shard
+    // With the runtime queue enabled, hot paths hold progress_mutex_ and
+    // take the shard only for membership ops:
+    //   progress_mutex_ -> shard (membership only)
+    static constexpr size_t kBatchLockShards = 64;
+    struct BatchShard {
+        std::recursive_mutex mtx;
+        std::unordered_set<Batch*> active_batches;
+        std::unordered_set<BatchID> alive_batches;
+    };
+    BatchShard& batchShard(BatchID batch_id) {
+        return batch_shards_[reinterpret_cast<uintptr_t>(batch_id) %
+                             kBatchLockShards];
+    }
+    std::recursive_mutex& batchShardMutex(BatchID batch_id) {
+        return batchShard(batch_id).mtx;
+    }
+    std::recursive_mutex& progressLockFor(BatchID batch_id) {
+        if (runtime_queue_config_.enabled) return progress_mutex_;
+        return batchShardMutex(batch_id);
+    }
+    // Caller must hold progressLockFor(batch_id). In default mode that is
+    // the shard itself, so the membership check is a lock-free read under
+    // an already-held lock. In queue mode the caller holds progress_mutex_
+    // and we take the shard briefly (progress -> shard order is allowed).
+    bool isBatchAlive(BatchID batch_id) {
+        BatchShard& shard = batchShard(batch_id);
+        if (runtime_queue_config_.enabled) {
+            std::lock_guard<std::recursive_mutex> lk(shard.mtx);
+            return shard.alive_batches.count(batch_id) != 0;
+        }
+        return shard.alive_batches.count(batch_id) != 0;
+    }
+    std::array<BatchShard, kBatchLockShards> batch_shards_;
+    // Deferred-free queue, guarded by progress_mutex_. Only used when the
+    // fast path cannot free inline (tasks still in flight, runtime refs,
+    // or runtime queue enabled).
+    std::vector<Batch*> batch_freelist_;
 };
 }  // namespace tent
 }  // namespace mooncake

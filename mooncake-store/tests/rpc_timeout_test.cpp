@@ -117,4 +117,47 @@ TEST(RpcTimeoutTest, RpcTimesOutAgainstUnresponsiveMaster) {
                                 "timeout still active?)";
 }
 
+// The offload data path (store->store) builds its own client pool, separate
+// from the master pool, and used to ignore these variables entirely: its
+// connect timeout stayed at the built-in 30s, so a read that picked a peer
+// which had gone away blocked for connect_retry_count * 30s plus the waits
+// between retries with no way to configure it down. Both pools now go through
+// one helper, so cover the helper itself: an unset variable must leave the
+// built-in default alone, and a set one must be applied.
+TEST(RpcTimeoutTest, TimeoutEnvOverridesAreOptIn) {
+    struct StubClientConfig {
+        std::chrono::milliseconds request_timeout_duration{
+            std::chrono::seconds(30)};
+        std::chrono::milliseconds connect_timeout_duration{
+            std::chrono::seconds(30)};
+    };
+
+    ::unsetenv("MC_RPC_TIMEOUT_MS");
+    ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+
+    StubClientConfig defaults;
+    detail::ApplyRpcTimeoutEnvOverrides(defaults);
+    EXPECT_EQ(defaults.request_timeout_duration, std::chrono::seconds(30));
+    EXPECT_EQ(defaults.connect_timeout_duration, std::chrono::seconds(30));
+
+    ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS", "1500", /*overwrite=*/1), 0);
+    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "1000", /*overwrite=*/1),
+              0);
+
+    StubClientConfig overridden;
+    detail::ApplyRpcTimeoutEnvOverrides(overridden);
+    EXPECT_EQ(overridden.request_timeout_duration,
+              std::chrono::milliseconds(1500));
+    EXPECT_EQ(overridden.connect_timeout_duration,
+              std::chrono::milliseconds(1000));
+
+    // The master pool is built from the same helper, so it sees them too.
+    auto master_config = detail::MakeMasterRpcClientPoolConfig();
+    EXPECT_EQ(master_config.client_config.connect_timeout_duration,
+              std::chrono::milliseconds(1000));
+
+    ::unsetenv("MC_RPC_TIMEOUT_MS");
+    ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+}
+
 }  // namespace mooncake

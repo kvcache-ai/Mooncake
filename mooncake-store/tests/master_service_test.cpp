@@ -88,6 +88,36 @@ class MasterServiceTest : public ::testing::Test {
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
 
+    void PauseReplicaCleanup(MasterService& service) {
+        service.replica_cleanup_worker_.Stop();
+    }
+
+    void ResumeReplicaCleanup(MasterService& service) {
+        service.replica_cleanup_worker_.Start();
+        service.replica_cleanup_worker_.Schedule();
+    }
+
+    void ExpectKeyHiddenFromReadApis(MasterService& service,
+                                     const std::string& key) {
+        auto get = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get.has_value());
+        EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get.error());
+
+        auto exists = service.ExistKey(key, TenantId::Default());
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(*exists);
+
+        auto batch_exists = service.BatchExistKey({key}, TenantId::Default());
+        ASSERT_EQ(1u, batch_exists.size());
+        ASSERT_TRUE(batch_exists[0].has_value());
+        EXPECT_FALSE(*batch_exists[0]);
+
+        auto all_keys = service.GetAllKeys(TenantId::Default());
+        ASSERT_TRUE(all_keys.has_value());
+        EXPECT_EQ(all_keys->end(),
+                  std::find(all_keys->begin(), all_keys->end(), key));
+    }
+
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService& service, const std::string& key,
         const std::string& tenant_id = "default") {
@@ -111,6 +141,21 @@ class MasterServiceTest : public ::testing::Test {
         MasterService& service,
         const std::chrono::system_clock::time_point& now) {
         service.CleanupExpiredSoftPins(now);
+    }
+
+    size_t MetadataShardIndex(MasterService& service, const std::string& key,
+                              const TenantId& tenant_id = TenantId::Default()) {
+        return service.getShardIndex(tenant_id, key);
+    }
+
+    size_t MetadataBucketCount(
+        MasterService& service, size_t shard_idx,
+        const TenantId& tenant_id = TenantId::Default()) {
+        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
+        const auto tenant_it = shard->tenants.find(tenant_id);
+        return tenant_it == shard->tenants.end()
+                   ? 0
+                   : tenant_it->second.metadata.bucket_count();
     }
 
     void SetSoftPinDeadlineForTest(
@@ -137,6 +182,26 @@ class MasterServiceTest : public ::testing::Test {
 
     size_t SoftPinRegistrationCount(MasterService& service) {
         return service.soft_pin_deadline_index_.RegistrationCountForTest();
+    }
+
+    std::optional<uint32_t> GetReplicaRefcntBySegmentName(
+        MasterService& service, const std::string& key,
+        const std::string& segment_name) {
+        MasterService::MetadataAccessorRO accessor(
+            &service,
+            service.MakeObjectIdentityForRequest(key, TenantId::Default()));
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            for (const auto& name : replica.get_segment_names()) {
+                if (name.has_value() && *name == segment_name) {
+                    return replica.get_refcnt();
+                }
+            }
+        }
+        return std::nullopt;
     }
 
     void UpsertSoftPinDeadlineIndexForTest(
@@ -406,42 +471,6 @@ class MasterServiceTest : public ::testing::Test {
     }
 };
 
-TEST_F(MasterServiceTest, ObjectChecksumIsStoredAndClearedByUpsert) {
-    MasterService service;
-    const auto segment = PrepareSimpleSegment(service, "checksum_segment");
-    const std::string key = "checksum_key";
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.preferred_segment = "checksum_segment";
-
-    ASSERT_TRUE(
-        service
-            .PutStart(segment.client_id, key, TenantId::Default(), 1024, config)
-            .has_value());
-    constexpr uint64_t kChecksum = 0;
-    ASSERT_TRUE(service
-                    .PutEnd(segment.client_id, ObjectMeta{key, kChecksum},
-                            TenantId::Default(), ReplicaType::MEMORY)
-                    .has_value());
-
-    auto query = service.GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(query.has_value());
-    ASSERT_TRUE(query->object_checksum.has_value());
-    EXPECT_EQ(*query->object_checksum, kChecksum);
-
-    ASSERT_TRUE(service
-                    .UpsertStart(segment.client_id, key, TenantId::Default(),
-                                 1024, config)
-                    .has_value());
-    ASSERT_TRUE(service
-                    .UpsertEnd(segment.client_id, ObjectMeta{key, std::nullopt},
-                               TenantId::Default(), ReplicaType::MEMORY)
-                    .has_value());
-    query = service.GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(query.has_value());
-    EXPECT_FALSE(query->object_checksum.has_value());
-}
-
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
         TenantId("tenant:with:colon").MakeScopedKey("path/key:with:colon");
@@ -708,39 +737,7 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
     EXPECT_GT(success_count, 0);
 }
 
-TEST_F(MasterServiceTest, PutStartInvalidParams) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    std::string key = "test_key";
-    ReplicateConfig config;
-
-    // Test invalid replica config
-    config.replica_num = 0;
-    config.nof_replica_num = 0;
-    auto put_result1 =
-        service_->PutStart(client_id, key, TenantId::Default(), 1024, config);
-    EXPECT_FALSE(put_result1.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result1.error());
-
-    // Test zero slice_length
-    config.replica_num = 1;
-    auto put_result2 =
-        service_->PutStart(client_id, key, TenantId::Default(), 0, config);
-    EXPECT_FALSE(put_result2.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
-
-    // Test prefer_alloc_in_same_node with nof replicas
-    config.nof_replica_num = 1;
-    config.prefer_alloc_in_same_node = true;
-    auto put_result3 =
-        service_->PutStart(client_id, key, TenantId::Default(), 1024, config);
-    EXPECT_FALSE(put_result3.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result3.error());
-}
-
-TEST_F(MasterServiceTest, SoftPinRequestValidation) {
+TEST_F(MasterServiceTest, SoftPinZeroTtlSkipsSoftPinRegistration) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_soft_pin_ttl(50)
                               .set_max_kv_soft_pin_ttl(100)
@@ -750,32 +747,6 @@ TEST_F(MasterServiceTest, SoftPinRequestValidation) {
     const UUID client_id = generate_uuid();
 
     ReplicateConfig config;
-    config.soft_pin_ttl_ms = 10;
-    auto preserve_with_ttl = service->PutStart(
-        client_id, "preserve_with_ttl", TenantId::Default(), 1024, config);
-    ASSERT_FALSE(preserve_with_ttl.has_value());
-    EXPECT_EQ(preserve_with_ttl.error(), ErrorCode::INVALID_PARAMS);
-
-    config.soft_pin_action = SoftPinAction::DISABLE;
-    auto disable_with_ttl = service->PutStart(
-        client_id, "disable_with_ttl", TenantId::Default(), 1024, config);
-    ASSERT_FALSE(disable_with_ttl.has_value());
-    EXPECT_EQ(disable_with_ttl.error(), ErrorCode::INVALID_PARAMS);
-
-    config.soft_pin_action = SoftPinAction::ENABLE;
-    config.soft_pin_ttl_ms = 101;
-    auto over_limit = service->PutStart(client_id, "over_limit",
-                                        TenantId::Default(), 1024, config);
-    ASSERT_FALSE(over_limit.has_value());
-    EXPECT_EQ(over_limit.error(), ErrorCode::INVALID_PARAMS);
-
-    config.soft_pin_action = static_cast<SoftPinAction>(255);
-    config.soft_pin_ttl_ms.reset();
-    auto invalid_action = service->PutStart(client_id, "invalid_action",
-                                            TenantId::Default(), 1024, config);
-    ASSERT_FALSE(invalid_action.has_value());
-    EXPECT_EQ(invalid_action.error(), ErrorCode::INVALID_PARAMS);
-
     const int64_t baseline =
         MasterMetricManager::instance().get_soft_pin_key_count();
     config.soft_pin_action = SoftPinAction::ENABLE;
@@ -1174,109 +1145,6 @@ TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
              {std::nullopt, std::nullopt, size_t{1}, size_t{1}}, true);
 }
 
-TEST_F(MasterServiceTest, PutStartGroupIdsValidation) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    config.group_ids = std::vector<std::string>{};
-    auto empty_group_ids = service_->PutStart(
-        client_id, "empty_group_ids", TenantId::Default(), 1024, config);
-    EXPECT_FALSE(empty_group_ids.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, empty_group_ids.error());
-
-    config.group_ids = std::vector<std::string>{"g0", "g1"};
-    auto too_many_group_ids = service_->PutStart(
-        client_id, "too_many_group_ids", TenantId::Default(), 1024, config);
-    EXPECT_FALSE(too_many_group_ids.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, too_many_group_ids.error());
-
-    config.group_ids = std::vector<std::string>{""};
-    auto ungrouped = service_->PutStart(client_id, "explicit_ungrouped",
-                                        TenantId::Default(), 1024, config);
-    ASSERT_TRUE(ungrouped.has_value());
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, "explicit_ungrouped",
-                             TenantId::Default(), ReplicaType::MEMORY)
-                    .has_value());
-    auto exists = service_->ExistKey("explicit_ungrouped", TenantId::Default());
-    ASSERT_TRUE(exists.has_value());
-    EXPECT_TRUE(exists.value());
-}
-
-TEST_F(MasterServiceTest, GroupedObjectRoutesKeyLevelLookupAndRemove) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::string key = "grouped_route_key";
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
-
-    PutCompletedObject(*service_, client_id, key, config);
-
-    auto exists = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exists.has_value());
-    EXPECT_TRUE(exists.value());
-    EXPECT_TRUE(service_->GetReplicaList(key, TenantId::Default()).has_value());
-
-    ASSERT_TRUE(
-        service_->Remove(key, TenantId::Default(), /*force=*/true).has_value());
-    auto exists_after_remove = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exists_after_remove.has_value());
-    EXPECT_FALSE(exists_after_remove.value());
-}
-
-TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
-    const std::string key = "tenant_grouped_shared_user_key";
-    const TenantId tenant_a("tenant_group_route_a");
-    const TenantId tenant_b("tenant_group_route_b");
-    auto service_ = std::make_unique<MasterService>(
-        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::string group_a = FindGroupIdOnDifferentShard(key);
-    std::string group_b;
-    for (int i = 0; i < 10000; ++i) {
-        group_b = key + "_tenant_b_group_" + std::to_string(i);
-        if (std::hash<std::string>{}(group_b) % 1024 !=
-            std::hash<std::string>{}(group_a) % 1024) {
-            break;
-        }
-    }
-
-    ReplicateConfig config_a;
-    config_a.replica_num = 1;
-    config_a.group_ids = std::vector<std::string>{group_a};
-    ReplicateConfig config_b;
-    config_b.replica_num = 1;
-    config_b.group_ids = std::vector<std::string>{group_b};
-
-    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_a, 1024, config_a)
-                    .has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
-                    .has_value());
-    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_b, 2048, config_b)
-                    .has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
-                    .has_value());
-
-    EXPECT_TRUE(service_->ExistKey(key, tenant_a).value_or(false));
-    EXPECT_TRUE(service_->ExistKey(key, tenant_b).value_or(false));
-    EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
-    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
-
-    ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
-    EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
-    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
-}
-
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     const TenantId tenant_a("tenant_restore_a");
     const TenantId tenant_b("tenant_restore_b");
@@ -1291,101 +1159,15 @@ TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     metadata.size = 128;
     metadata.replicas.push_back(replica.get_descriptor());
 
-    service.RestoreFromStandbySnapshot({{tenant_a.value(), key, metadata}},
-                                       /*initial_oplog_sequence_id=*/0, {});
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({{tenant_a.value(), key, metadata}},
+                                        /*initial_oplog_sequence_id=*/0, {})
+            .has_value());
 
     EXPECT_TRUE(service.ExistKey(key, tenant_a).value_or(false));
     EXPECT_FALSE(service.ExistKey(key, tenant_b).value_or(true));
     EXPECT_FALSE(service.ExistKey(key, TenantId::Default()).value_or(true));
-}
-
-TEST_F(MasterServiceTest, BatchGetReplicaListPreservesOrderWithGroupedKeys) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::string grouped_key_a = "batch_get_grouped_a";
-    const std::string missing_key = "batch_get_missing";
-    const std::string ungrouped_key = "batch_get_ungrouped";
-    const std::string grouped_key_b = "batch_get_grouped_b";
-    const std::string pending_key = "batch_get_pending";
-
-    ReplicateConfig grouped_config_a;
-    grouped_config_a.replica_num = 1;
-    grouped_config_a.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(grouped_key_a)};
-    PutCompletedObject(*service_, client_id, grouped_key_a, grouped_config_a);
-
-    ReplicateConfig ungrouped_config;
-    ungrouped_config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, ungrouped_key, ungrouped_config);
-
-    ReplicateConfig grouped_config_b;
-    grouped_config_b.replica_num = 1;
-    grouped_config_b.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(grouped_key_b)};
-    PutCompletedObject(*service_, client_id, grouped_key_b, grouped_config_b);
-
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, pending_key, TenantId::Default(),
-                               1024, ungrouped_config)
-                    .has_value());
-
-    const std::vector<std::string> keys = {
-        grouped_key_a, missing_key, ungrouped_key, grouped_key_b, pending_key};
-    auto results = service_->BatchGetReplicaList(keys, TenantId::Default());
-
-    ASSERT_EQ(results.size(), keys.size());
-    ASSERT_TRUE(results[0].has_value());
-    EXPECT_FALSE(results[0]->replicas.empty());
-    ASSERT_FALSE(results[1].has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, results[1].error());
-    ASSERT_TRUE(results[2].has_value());
-    EXPECT_FALSE(results[2]->replicas.empty());
-    ASSERT_TRUE(results[3].has_value());
-    EXPECT_FALSE(results[3]->replicas.empty());
-    ASSERT_FALSE(results[4].has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, results[4].error());
-}
-
-TEST_F(MasterServiceTest, BatchGetReplicaListKeepsTenantIsolation) {
-    const std::string key = "batch_get_tenant_shared_key";
-    const TenantId tenant_a("batch_get_tenant_a");
-    const TenantId tenant_b("batch_get_tenant_b");
-    auto service_ = std::make_unique<MasterService>(
-        MakeStrictTenantConfig({std::string(TenantId::kDefaultValue),
-                                tenant_a.value(), tenant_b.value()}));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    ReplicateConfig config_a;
-    config_a.replica_num = 1;
-    config_a.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
-    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_a, 1024, config_a)
-                    .has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
-                    .has_value());
-
-    ReplicateConfig config_b;
-    config_b.replica_num = 1;
-    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_b, 2048, config_b)
-                    .has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
-                    .has_value());
-
-    auto tenant_a_results = service_->BatchGetReplicaList({key}, tenant_a);
-    auto tenant_b_results = service_->BatchGetReplicaList({key}, tenant_b);
-    auto default_results =
-        service_->BatchGetReplicaList({key}, TenantId::Default());
-
-    ASSERT_EQ(tenant_a_results.size(), 1u);
-    ASSERT_EQ(tenant_b_results.size(), 1u);
-    ASSERT_EQ(default_results.size(), 1u);
-    EXPECT_TRUE(tenant_a_results[0].has_value());
-    EXPECT_TRUE(tenant_b_results[0].has_value());
-    ASSERT_FALSE(default_results[0].has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, default_results[0].error());
 }
 
 TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
@@ -1452,6 +1234,37 @@ TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
     EXPECT_EQ(
         std::find(tenant_keys->begin(), tenant_keys->end(), default_only_key),
         tenant_keys->end());
+}
+
+TEST_F(MasterServiceTest, TenantScopedPutsAndRemovesUpdateGlobalKeyCount) {
+    const std::string key = "shared_user_key";
+    const TenantId tenant_a("tenant_key_count_a");
+    const TenantId tenant_b("tenant_key_count_b");
+    auto service_ = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    EXPECT_EQ(service_->GetKeyCount(), 0u);
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_b, 2048, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 2u);
+
+    ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 1u);
+
+    ASSERT_TRUE(service_->Remove(key, tenant_b, /*force=*/true).has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 0u);
 }
 
 TEST_F(MasterServiceTest,
@@ -1584,86 +1397,6 @@ TEST_F(MasterServiceTest,
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value());
 }
 
-TEST_F(MasterServiceTest, ExpiredGroupedPutCanBeReplacedByUngroupedPut) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_put_start_discard_timeout_sec(0)
-                              .set_put_start_release_timeout_sec(1)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = context.client_id;
-
-    const std::string key = "expired_grouped_put_to_ungrouped";
-    ReplicateConfig grouped_config;
-    grouped_config.replica_num = 1;
-    grouped_config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
-
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, key, TenantId::Default(), 1024,
-                               grouped_config)
-                    .has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-
-    ReplicateConfig ungrouped_config;
-    ungrouped_config.replica_num = 1;
-    auto put_start = service_->PutStart(client_id, key, TenantId::Default(),
-                                        1024, ungrouped_config);
-    ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-    ASSERT_TRUE(
-        service_
-            ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-            .has_value());
-    EXPECT_TRUE(service_->ExistKey(key, TenantId::Default()).value_or(false));
-}
-
-TEST_F(MasterServiceTest, BatchRemoveUnregistersGroupedRoute) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::string key = "batch_remove_grouped_route";
-    ReplicateConfig grouped_config;
-    grouped_config.replica_num = 1;
-    grouped_config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
-    PutCompletedObject(*service_, client_id, key, grouped_config);
-
-    auto remove_results = service_->BatchRemove(
-        std::vector<std::string>{key}, TenantId::Default(), /*force=*/true);
-    ASSERT_EQ(remove_results.size(), 1u);
-    ASSERT_TRUE(remove_results[0].has_value());
-
-    ReplicateConfig ungrouped_config;
-    ungrouped_config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, key, ungrouped_config);
-    EXPECT_TRUE(service_->GetReplicaList(key, TenantId::Default()).has_value());
-}
-
-TEST_F(MasterServiceTest, RemoveByRegexUnregistersGroupedRoute) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::string key = "regex_remove_grouped_route";
-    ReplicateConfig grouped_config;
-    grouped_config.replica_num = 1;
-    grouped_config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
-    PutCompletedObject(*service_, client_id, key, grouped_config);
-
-    auto removed = service_->RemoveByRegex("^regex_remove_grouped_route$",
-                                           TenantId::Default(),
-                                           /*force=*/true);
-    ASSERT_TRUE(removed.has_value());
-    EXPECT_EQ(removed.value(), 1);
-
-    ReplicateConfig ungrouped_config;
-    ungrouped_config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, key, ungrouped_config);
-    EXPECT_TRUE(service_->GetReplicaList(key, TenantId::Default()).has_value());
-}
-
 TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(200).build();
@@ -1738,131 +1471,6 @@ TEST_F(MasterServiceTest,
                     .has_value());
     EXPECT_TRUE(service_->Remove(key_b, TenantId::Default(), /*force=*/true)
                     .has_value());
-}
-
-TEST_F(MasterServiceTest, RemoveGroupedMemberPreservesOtherMembers) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::string key_a = "remove_group_key_a";
-    const std::string key_b = "remove_group_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.group_ids = std::vector<std::string>{group_id};
-    PutCompletedObject(*service_, client_id, key_a, config);
-    PutCompletedObject(*service_, client_id, key_b, config);
-
-    ASSERT_TRUE(service_->Remove(key_a, TenantId::Default(), /*force=*/true)
-                    .has_value());
-
-    auto removed_exists = service_->ExistKey(key_a, TenantId::Default());
-    ASSERT_TRUE(removed_exists.has_value());
-    EXPECT_FALSE(removed_exists.value());
-    EXPECT_TRUE(
-        service_->GetReplicaList(key_b, TenantId::Default()).has_value());
-
-    ASSERT_TRUE(service_->Remove(key_b, TenantId::Default(), /*force=*/true)
-                    .has_value());
-    auto group_empty = service_->ExistKey(key_b, TenantId::Default());
-    ASSERT_TRUE(group_empty.has_value());
-    EXPECT_FALSE(group_empty.value());
-}
-
-TEST_F(MasterServiceTest, UpsertPreservesGroupMembership) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::string key = "upsert_group_key";
-    const std::string group_id = FindGroupIdOnDifferentShard(key);
-
-    ReplicateConfig grouped_config;
-    grouped_config.replica_num = 1;
-    grouped_config.group_ids = std::vector<std::string>{group_id};
-    PutCompletedObject(*service_, client_id, key, grouped_config);
-
-    ReplicateConfig unset_group_config;
-    unset_group_config.replica_num = 1;
-    auto preserve_result = service_->UpsertStart(
-        client_id, key, TenantId::Default(), 1024, unset_group_config);
-    ASSERT_TRUE(preserve_result.has_value())
-        << "Unset group_ids should preserve existing group membership";
-    ASSERT_TRUE(service_
-                    ->UpsertEnd(client_id, key, TenantId::Default(),
-                                ReplicaType::MEMORY)
-                    .has_value());
-    EXPECT_TRUE(service_->GetReplicaList(key, TenantId::Default()).has_value());
-
-    ReplicateConfig different_group_config;
-    different_group_config.replica_num = 1;
-    different_group_config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(key + "_other")};
-    auto different_group_result = service_->UpsertStart(
-        client_id, key, TenantId::Default(), 1024, different_group_config);
-    ASSERT_FALSE(different_group_result.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, different_group_result.error());
-
-    ReplicateConfig explicit_ungrouped_config;
-    explicit_ungrouped_config.replica_num = 1;
-    explicit_ungrouped_config.group_ids = std::vector<std::string>{""};
-    auto explicit_ungrouped_result = service_->UpsertStart(
-        client_id, key, TenantId::Default(), 1024, explicit_ungrouped_config);
-    ASSERT_FALSE(explicit_ungrouped_result.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, explicit_ungrouped_result.error());
-}
-
-TEST_F(MasterServiceTest, IncompleteGroupedUpsertCanBecomeUngrouped) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = context.client_id;
-
-    const std::string key = "incomplete_grouped_upsert_to_ungrouped";
-    ReplicateConfig grouped_config;
-    grouped_config.replica_num = 1;
-    grouped_config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
-
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, key, TenantId::Default(), 1024,
-                               grouped_config)
-                    .has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-
-    ReplicateConfig ungrouped_config;
-    ungrouped_config.replica_num = 1;
-    auto upsert_start = service_->UpsertStart(
-        client_id, key, TenantId::Default(), 1024, ungrouped_config);
-    ASSERT_TRUE(upsert_start.has_value()) << toString(upsert_start.error());
-    ASSERT_TRUE(service_
-                    ->UpsertEnd(client_id, key, TenantId::Default(),
-                                ReplicaType::MEMORY)
-                    .has_value());
-    EXPECT_TRUE(service_->ExistKey(key, TenantId::Default()).value_or(false));
-}
-
-TEST_F(MasterServiceTest, UpsertRejectsExistingUngroupedToGrouped) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::string key = "upsert_ungrouped_to_grouped";
-    ReplicateConfig ungrouped_config;
-    ungrouped_config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, key, ungrouped_config);
-
-    ReplicateConfig grouped_config;
-    grouped_config.replica_num = 1;
-    grouped_config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
-    auto upsert_start = service_->UpsertStart(
-        client_id, key, TenantId::Default(), 2048, grouped_config);
-    ASSERT_FALSE(upsert_start.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, upsert_start.error());
-
-    EXPECT_TRUE(service_->GetReplicaList(key, TenantId::Default()).has_value());
 }
 
 TEST_F(MasterServiceTest,
@@ -1990,54 +1598,6 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
             .has_value());
 }
 
-TEST_F(MasterServiceTest, BatchUpsertStartMixedGroupIdsPreservesOrder) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::vector<std::string> keys = {
-        "batch_grouped_a",
-        "batch_ungrouped",
-        "batch_grouped_b",
-    };
-    const std::vector<uint64_t> sizes = {1024, 2048, 4096};
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(keys[0]), "",
-                                 FindGroupIdOnDifferentShard(keys[2])};
-
-    auto results = service_->BatchUpsertStart(
-        client_id, keys, TenantId::Default(), sizes, config);
-    ASSERT_EQ(results.size(), keys.size());
-    for (const auto& result : results) {
-        ASSERT_TRUE(result.has_value());
-    }
-
-    auto end_results = service_->BatchUpsertEnd(
-        client_id, MakeObjectMetas(keys), TenantId::Default());
-    ASSERT_EQ(end_results.size(), keys.size());
-    for (const auto& result : end_results) {
-        ASSERT_TRUE(result.has_value());
-    }
-
-    for (const auto& key : keys) {
-        EXPECT_TRUE(
-            service_->GetReplicaList(key, TenantId::Default()).has_value());
-    }
-
-    ReplicateConfig invalid_config = config;
-    invalid_config.group_ids = std::vector<std::string>{"only_one"};
-    auto invalid_results = service_->BatchUpsertStart(
-        client_id, keys, TenantId::Default(), sizes, invalid_config);
-    ASSERT_EQ(invalid_results.size(), keys.size());
-    for (const auto& result : invalid_results) {
-        ASSERT_FALSE(result.has_value());
-        EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
-    }
-}
-
 TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = 100;
@@ -2096,233 +1656,6 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
     }
-}
-
-TEST_F(MasterServiceTest, TenantPutGetRemoveIsolatesSameUserKey) {
-    const std::string key = "shared_user_key";
-    const TenantId tenant_a("tenant_a");
-    const TenantId tenant_b("tenant_b");
-    auto service_ = std::make_unique<MasterService>(
-        MakeStrictTenantConfig({std::string(TenantId::kDefaultValue),
-                                tenant_a.value(), tenant_b.value()}));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
-                    .has_value());
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, tenant_b, 2048, config).has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
-                    .has_value());
-
-    EXPECT_FALSE(
-        service_->GetReplicaList(key, TenantId::Default()).has_value());
-    EXPECT_FALSE(service_->ExistKey(key, TenantId::Default()).value());
-    EXPECT_TRUE(service_->ExistKey(key, tenant_a).value());
-    EXPECT_TRUE(service_->ExistKey(key, tenant_b).value());
-    EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
-    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
-    EXPECT_EQ(service_->GetKeyCount(), 2u);
-
-    ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
-    EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
-    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
-    EXPECT_EQ(service_->GetKeyCount(), 1u);
-}
-
-TEST_F(MasterServiceTest, RegexOperationsAreTenantScoped) {
-    const std::string key = "regex_shared_key";
-    const TenantId tenant_a("tenant_regex_a");
-    const TenantId tenant_b("tenant_regex_b");
-    auto service_ = std::make_unique<MasterService>(
-        MakeStrictTenantConfig({std::string(TenantId::kDefaultValue),
-                                tenant_a.value(), tenant_b.value()}));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, TenantId::Default(), 1024, config)
-            .has_value());
-    ASSERT_TRUE(
-        service_
-            ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-            .has_value());
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
-                    .has_value());
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, tenant_b, 1024, config).has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
-                    .has_value());
-
-    auto default_matches =
-        service_->GetReplicaListByRegex("^regex_shared", TenantId::Default());
-    ASSERT_TRUE(default_matches.has_value());
-    EXPECT_EQ(default_matches->size(), 1);
-
-    auto remove_default = service_->RemoveByRegex(
-        "^regex_shared", TenantId::Default(), /*force=*/true);
-    ASSERT_TRUE(remove_default.has_value());
-    EXPECT_EQ(remove_default.value(), 1);
-    EXPECT_FALSE(
-        service_->GetReplicaList(key, TenantId::Default()).has_value());
-    EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
-    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
-
-    auto remove_tenant_a =
-        service_->RemoveByRegex("^regex_shared", tenant_a, /*force=*/true);
-    ASSERT_TRUE(remove_tenant_a.has_value());
-    EXPECT_EQ(remove_tenant_a.value(), 1);
-    EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
-    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
-}
-
-TEST_F(MasterServiceTest, TenantBatchUpsertAndRevokeAreScoped) {
-    const std::vector<std::string> keys = {"tenant_batch_upsert_key_a",
-                                           "tenant_batch_upsert_key_b"};
-    const std::vector<uint64_t> sizes = {1024, 2048};
-    const TenantId tenant_a("tenant_batch_upsert_a");
-    const TenantId tenant_b("tenant_batch_upsert_b");
-    auto svc = std::make_unique<MasterService>(
-        MakeStrictTenantConfig({std::string(TenantId::kDefaultValue),
-                                tenant_a.value(), tenant_b.value()}));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
-    const UUID client_id = generate_uuid();
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    auto tenant_a_results =
-        svc->BatchUpsertStart(client_id, keys, tenant_a, sizes, config);
-    ASSERT_EQ(tenant_a_results.size(), keys.size());
-    for (const auto& result : tenant_a_results) {
-        ASSERT_TRUE(result.has_value());
-    }
-    auto tenant_a_end =
-        svc->BatchUpsertEnd(client_id, MakeObjectMetas(keys), tenant_a);
-    ASSERT_EQ(tenant_a_end.size(), keys.size());
-    for (const auto& result : tenant_a_end) {
-        ASSERT_TRUE(result.has_value());
-    }
-
-    auto tenant_b_results =
-        svc->BatchUpsertStart(client_id, keys, tenant_b, sizes, config);
-    ASSERT_EQ(tenant_b_results.size(), keys.size());
-    for (const auto& result : tenant_b_results) {
-        ASSERT_TRUE(result.has_value());
-    }
-    auto tenant_b_end =
-        svc->BatchUpsertEnd(client_id, MakeObjectMetas(keys), tenant_b);
-    ASSERT_EQ(tenant_b_end.size(), keys.size());
-    for (const auto& result : tenant_b_end) {
-        ASSERT_TRUE(result.has_value());
-    }
-
-    for (const auto& key : keys) {
-        EXPECT_FALSE(svc->GetReplicaList(key, TenantId::Default()).has_value());
-        EXPECT_TRUE(svc->GetReplicaList(key, tenant_a).has_value());
-        EXPECT_TRUE(svc->GetReplicaList(key, tenant_b).has_value());
-    }
-
-    const std::string revoke_key = "tenant_batch_upsert_revoke_key";
-    auto revoke_start =
-        svc->UpsertStart(client_id, revoke_key, tenant_a, 1024, config);
-    ASSERT_TRUE(revoke_start.has_value());
-    ASSERT_TRUE(
-        svc->UpsertRevoke(client_id, revoke_key, tenant_a, ReplicaType::MEMORY)
-            .has_value());
-    EXPECT_FALSE(svc->GetReplicaList(revoke_key, tenant_a).has_value());
-}
-
-TEST_F(MasterServiceTest, TenantBatchRemoveAndRemoveAllAreScoped) {
-    const std::string shared_key = "tenant_batch_remove_shared_key";
-    const TenantId tenant_a("tenant_batch_remove_a");
-    const TenantId tenant_b("tenant_batch_remove_b");
-    auto svc = std::make_unique<MasterService>(
-        MakeStrictTenantConfig({std::string(TenantId::kDefaultValue),
-                                tenant_a.value(), tenant_b.value()}));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
-    const UUID client_id = generate_uuid();
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    ASSERT_TRUE(
-        svc->PutStart(client_id, shared_key, TenantId::Default(), 1024, config)
-            .has_value());
-    ASSERT_TRUE(svc->PutEnd(client_id, shared_key, TenantId::Default(),
-                            ReplicaType::MEMORY)
-                    .has_value());
-    ASSERT_TRUE(svc->PutStart(client_id, shared_key, tenant_a, 1024, config)
-                    .has_value());
-    ASSERT_TRUE(
-        svc->PutEnd(client_id, shared_key, tenant_a, ReplicaType::MEMORY)
-            .has_value());
-    ASSERT_TRUE(svc->PutStart(client_id, shared_key, tenant_b, 1024, config)
-                    .has_value());
-    ASSERT_TRUE(
-        svc->PutEnd(client_id, shared_key, tenant_b, ReplicaType::MEMORY)
-            .has_value());
-
-    auto remove_a = svc->BatchRemove({shared_key}, tenant_a, /*force=*/true);
-    ASSERT_EQ(remove_a.size(), 1u);
-    ASSERT_TRUE(remove_a[0].has_value());
-    EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_a).has_value());
-    EXPECT_TRUE(
-        svc->GetReplicaList(shared_key, TenantId::Default()).has_value());
-    EXPECT_TRUE(svc->GetReplicaList(shared_key, tenant_b).has_value());
-
-    EXPECT_EQ(svc->RemoveAll(tenant_b, /*force=*/true), 1);
-    EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_b).has_value());
-    EXPECT_TRUE(
-        svc->GetReplicaList(shared_key, TenantId::Default()).has_value());
-
-    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 1);
-    EXPECT_FALSE(
-        svc->GetReplicaList(shared_key, TenantId::Default()).has_value());
-}
-
-TEST_F(MasterServiceTest, LegacyRemoveAllRemovesAllTenants) {
-    const std::string key = "legacy_remove_all_shared_key";
-    const TenantId tenant_a("legacy_remove_all_a");
-    const TenantId tenant_b("legacy_remove_all_b");
-    auto svc = std::make_unique<MasterService>(
-        MakeStrictTenantConfig({std::string(TenantId::kDefaultValue),
-                                tenant_a.value(), tenant_b.value()}));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
-    const UUID client_id = generate_uuid();
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    ASSERT_TRUE(svc->PutStart(client_id, key, TenantId::Default(), 1024, config)
-                    .has_value());
-    ASSERT_TRUE(
-        svc->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-            .has_value());
-    ASSERT_TRUE(
-        svc->PutStart(client_id, key, tenant_a, 1024, config).has_value());
-    ASSERT_TRUE(
-        svc->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY).has_value());
-    ASSERT_TRUE(
-        svc->PutStart(client_id, key, tenant_b, 1024, config).has_value());
-    ASSERT_TRUE(
-        svc->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY).has_value());
-
-    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 3);
-    EXPECT_FALSE(svc->GetReplicaList(key, TenantId::Default()).has_value());
-    EXPECT_FALSE(svc->GetReplicaList(key, tenant_a).has_value());
-    EXPECT_FALSE(svc->GetReplicaList(key, tenant_b).has_value());
-    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 0);
 }
 
 TEST_F(MasterServiceTest, PutWithPreferredSegment) {
@@ -2454,6 +1787,30 @@ TEST_F(MasterServiceTest, LocalFirstPutPrefersWriterHost) {
     config.host_id = "host1";
 
     auto put_start = service.PutStart(writer_client_id, "local_first_key",
+                                      TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
+}
+
+TEST_F(MasterServiceTest, PreferSameNodeUsesHostAwareLocalFirstPlacement) {
+    MasterService service;
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host1 = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.prefer_alloc_in_same_node = true;
+    config.host_id = "host1";
+
+    auto put_start = service.PutStart(writer_client_id, "prefer_same_node_key",
                                       TenantId::Default(), 1024, config);
     ASSERT_TRUE(put_start.has_value());
     ASSERT_EQ(put_start->size(), 1u);
@@ -2600,229 +1957,6 @@ TEST_F(MasterServiceTest, ExplicitPreferredSegmentFallsBackToLocalFirst) {
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               "segment_host1");
-}
-
-TEST_F(MasterServiceTest, GetReplicaListByRegex) {
-    const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    const UUID client_id = generate_uuid();
-    // Test getting non-existent key
-    auto get_result =
-        service_->GetReplicaList(".*non_existent.*", TenantId::Default());
-    EXPECT_FALSE(get_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
-
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-
-    int times = 10;
-    while (times--) {
-        std::string key = "test_key" + std::to_string(times);
-        uint64_t value_length = 1024;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), value_length, config);
-        ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(
-            client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-        ASSERT_TRUE(put_end_result.has_value());
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-    }
-    // wait for all the lease to expire
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-
-    // Test getting existing key
-    auto get_result2 =
-        service_->GetReplicaListByRegex("^test_key", TenantId::Default());
-    EXPECT_TRUE(get_result2.has_value());
-    auto replica_list_local = get_result2.value();
-    EXPECT_EQ(10, replica_list_local.size());
-}
-
-// Helper function to put an object, making the test cleaner
-void put_object(MasterService& service, const UUID& client_id,
-                const std::string& key) {
-    uint64_t value_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-    auto put_start_result = service.PutStart(
-        client_id, key, TenantId::Default(), value_length, config);
-    ASSERT_TRUE(put_start_result.has_value())
-        << "Failed to PutStart for key: " << key;
-    auto put_end_result = service.PutEnd(client_id, key, TenantId::Default(),
-                                         ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end_result.has_value())
-        << "Failed to PutEnd for key: " << key;
-    auto exist_result = service.ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exist_result.has_value())
-        << "Key does not exist after put: " << key;
-}
-
-TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
-    const uint64_t kv_lease_ttl = 100;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    auto service_ = std::make_unique<MasterService>(service_config);
-    const UUID client_id = generate_uuid();
-
-    // 1. Mount segment
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-
-    // 2. Prepare a diverse set of keys
-    std::vector<std::string> keys_to_put = {
-        // Basic keys for prefix matching
-        "test_key_01", "test_key_02", "test_key_10",
-        // Keys with different prefixes
-        "prod_key_alpha", "prod_key_beta",
-        // Keys with numbers in the middle
-        "data_part_1_chunk_a", "data_part_2_chunk_b",
-        // Keys with special characters (if your system supports them)
-        "config/user/settings.json", "logs/app-2025-08-13.log",
-        // Keys with varying lengths
-        "short", "a_very_very_very_long_key_that_tests_length_limits",
-        // Keys that look similar but should not match certain regex
-        "test-key-extra", "another_key"};
-
-    for (const auto& key : keys_to_put) {
-        put_object(*service_, client_id, key);
-    }
-
-    // Wait for all leases to be written to the underlying KV store.
-    // In a real system, you might not need this if PutEnd is synchronous.
-    // For this test, let's assume it's needed for consistency.
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-
-    // 3. Run a series of regex tests
-
-    // Test 3.1: Simple prefix matching
-    {
-        auto result =
-            service_->GetReplicaListByRegex("^test_key_", TenantId::Default());
-        ASSERT_TRUE(result.has_value());
-        EXPECT_EQ(result.value().size(),
-                  3);  // Matches test_key_01, test_key_02, test_key_10
-    }
-
-    // Test 3.2: Matching with a wildcard for any number
-    {
-        auto result = service_->GetReplicaListByRegex("^test_key_\\d+$",
-                                                      TenantId::Default());
-        ASSERT_TRUE(result.has_value());
-        EXPECT_EQ(result.value().size(), 3);
-    }
-
-    // Test 3.3: Matching a specific pattern with wildcards
-    {
-        // Matches "data_part_1_chunk_a" and "data_part_2_chunk_b"
-        auto result = service_->GetReplicaListByRegex("^data_part_\\d_chunk_.$",
-                                                      TenantId::Default());
-        ASSERT_TRUE(result.has_value());
-        EXPECT_EQ(result.value().size(), 2);
-    }
-
-    // Test 3.4: Matching keys containing a specific substring
-    {
-        // Matches all keys with "key" in them
-        auto result =
-            service_->GetReplicaListByRegex("key", TenantId::Default());
-        ASSERT_TRUE(result.has_value());
-        // Expected: test_key_01, test_key_02, test_key_10,
-        //           prod_key_alpha, prod_key_beta,
-        //           a_very_very_very_long_key_that_tests_length_limits,
-        //           test-key-extra, another_key
-        EXPECT_EQ(result.value().size(), 8);
-    }
-
-    // Test 3.5: Matching based on file-like paths
-    {
-        // Match all .log files
-        auto result =
-            service_->GetReplicaListByRegex("\\.log$", TenantId::Default());
-        ASSERT_TRUE(result.has_value());
-        EXPECT_EQ(result.value().size(), 1);
-        EXPECT_EQ(result.value().begin()->first, "logs/app-2025-08-13.log");
-    }
-
-    // Test 3.6: OR condition using |
-    {
-        // Match keys starting with "prod" OR ending with "json"
-        auto result = service_->GetReplicaListByRegex("^prod|\\.json$",
-                                                      TenantId::Default());
-        ASSERT_TRUE(result.has_value());
-        // Expected: prod_key_alpha, prod_key_beta, config/user/settings.json
-        EXPECT_EQ(result.value().size(), 3);
-    }
-
-    // Test 3.7: Regex that should not match anything
-    {
-        auto result = service_->GetReplicaListByRegex("^non_existent_prefix_",
-                                                      TenantId::Default());
-        // This should succeed but return an empty map.
-        ASSERT_TRUE(result.has_value());
-        EXPECT_TRUE(result.value().empty());
-    }
-
-    // Test 3.8: Exact match regex
-    {
-        auto result =
-            service_->GetReplicaListByRegex("^short$", TenantId::Default());
-        ASSERT_TRUE(result.has_value());
-        EXPECT_EQ(result.value().size(), 1);
-        EXPECT_EQ(result.value().begin()->first, "short");
-    }
-
-    // Test 3.9: Initial test for non-existent key (as a sanity check)
-    {
-        auto get_result = service_->GetReplicaListByRegex(
-            ".*absolutely_non_existent.*", TenantId::Default());
-        // Depending on implementation, this could return an empty map or an
-        // error. Let's assume it returns an empty map for a valid regex with no
-        // matches.
-        ASSERT_TRUE(get_result.has_value());
-        EXPECT_TRUE(get_result.value().empty());
-    }
-}
-
-TEST_F(MasterServiceTest, RemoveByRegex) {
-    const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-    int times = 10;
-    while (times--) {
-        std::string key = "test_key" + std::to_string(times);
-        uint64_t value_length = 1024;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), value_length, config);
-        ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(
-            client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-        ASSERT_TRUE(put_end_result.has_value());
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-    }
-    // wait for all the lease to expire
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto res = service_->RemoveByRegex("^test_key", TenantId::Default());
-    ASSERT_TRUE(res.has_value());
-    ASSERT_EQ(10, res.value());
-    times = 10;
-    while (times--) {
-        std::string key = "test_key" + std::to_string(times);
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-        ASSERT_FALSE(exist_result.value());
-    }
 }
 
 TEST_F(MasterServiceTest, CopyStart) {
@@ -3407,6 +2541,61 @@ TEST_F(MasterServiceTest, MoveEnd) {
     move_end_result = service_->MoveEnd(client_id, key, TenantId::Default());
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, move_end_result.error());
+
+    // Remount segment_2 for target-gone test.
+    const auto remounted_context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+
+    // Put another object with 1 replica on segment_1 for target-gone test.
+    std::string target_gone_key = "target_gone_key";
+    config.preferred_segment = "segment_1";
+    put_start_result = service_->PutStart(
+        client_id, target_gone_key, TenantId::Default(), slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    put_end_result = service_->PutEnd(client_id, target_gone_key,
+                                      TenantId::Default(), ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // MoveStart the object from segment_1 to segment_2, then unmount
+    // segment_2
+    move_start_result =
+        service_->MoveStart(client_id, target_gone_key, TenantId::Default(),
+                            "segment_1", "segment_2");
+    ASSERT_TRUE(move_start_result.has_value());
+
+    // Unmount segment_2 to simulate target gone
+    unmount_result = service_->UnmountSegment(remounted_context2.segment_id,
+                                              remounted_context2.client_id);
+    ASSERT_TRUE(unmount_result.has_value());
+
+    // Test Case 7: MoveEnd, should fail because the target is gone, but the
+    // source refcnt must be released before the move task is erased.
+    move_end_result =
+        service_->MoveEnd(client_id, target_gone_key, TenantId::Default());
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, move_end_result.error());
+
+    const auto source_refcnt =
+        GetReplicaRefcntBySegmentName(*service_, target_gone_key, "segment_1");
+    ASSERT_TRUE(source_refcnt.has_value());
+    EXPECT_EQ(0, source_refcnt.value());
+
+    auto upsert_start_result = service_->UpsertStart(
+        client_id, target_gone_key, TenantId::Default(), slice_length, config);
+    EXPECT_TRUE(upsert_start_result.has_value());
+
+    auto move_revoke_result =
+        service_->MoveRevoke(client_id, target_gone_key, TenantId::Default());
+    EXPECT_FALSE(move_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK,
+              move_revoke_result.error());
+
+    if (upsert_start_result.has_value()) {
+        EXPECT_TRUE(service_
+                        ->UpsertRevoke(client_id, target_gone_key,
+                                       TenantId::Default(), ReplicaType::MEMORY)
+                        .has_value());
+    }
 }
 
 TEST_F(MasterServiceTest, MoveRevoke) {
@@ -3670,225 +2859,6 @@ TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
         service_->MoveEnd(client_id, move_key, TenantId::Default());
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(move_end_result.error(), ErrorCode::OBJECT_NOT_FOUND);
-}
-
-TEST_F(MasterServiceTest, RemoveByRegexComplex) {
-    const uint64_t kv_lease_ttl = 100;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    auto service_ = std::make_unique<MasterService>(service_config);
-    const UUID client_id = generate_uuid();
-
-    // 1. Mount segment
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "test_segment_remove");
-
-    // A helper lambda to repopulate the store for each test case
-    auto populate_store = [&]() {
-        std::vector<std::string> keys_to_put = {
-            "test_key_01",
-            "test_key_02",
-            "test_key_10",
-            "prod_key_alpha",
-            "prod_key_beta",
-            "data_part_1_chunk_a",
-            "data_part_2_chunk_b",
-            "config/user/settings.json",
-            "logs/app-2025-08-13.log",
-            "short",
-            "a_very_very_very_long_key_that_tests_length_limits",
-            "test-key-extra",
-            "another_key"};
-        for (const auto& key : keys_to_put) {
-            put_object(*service_, client_id, key);
-        }
-        // Wait for potential lease propagation
-        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    };
-
-    // --- Test Case 1: Remove a specific subset and verify ---
-    {
-        SCOPED_TRACE("Test Case 1: Removing keys with prefix 'test_key_'");
-        populate_store();
-
-        // Action: Remove keys starting with "test_key_"
-        auto remove_result =
-            service_->RemoveByRegex("^test_key_", TenantId::Default());
-        ASSERT_TRUE(remove_result.has_value());
-        EXPECT_EQ(remove_result.value(), 3);  // Should remove 3 keys
-
-        // Verification: Check which keys were deleted and which remain
-        std::vector<std::string> deleted_keys = {"test_key_01", "test_key_02",
-                                                 "test_key_10"};
-        for (const auto& key : deleted_keys) {
-            auto exist_result = service_->ExistKey(key, TenantId::Default());
-            ASSERT_TRUE(exist_result.has_value());
-            EXPECT_FALSE(exist_result.value())
-                << "Key " << key << " should have been deleted.";
-        }
-
-        std::vector<std::string> remaining_keys = {
-            "prod_key_alpha", "short", "test-key-extra"};  // Sample a few
-        for (const auto& key : remaining_keys) {
-            auto exist_result = service_->ExistKey(key, TenantId::Default());
-            ASSERT_TRUE(exist_result.has_value());
-            EXPECT_TRUE(exist_result.value())
-                << "Key " << key << " should NOT have been deleted.";
-        }
-    }
-
-    // --- Test Case 2: Remove everything ---
-    {
-        SCOPED_TRACE("Test Case 2: Removing all keys with '.*'");
-        // Store is already populated from the previous (failed) test run, or we
-        // can repopulate For isolation, let's assume we start fresh
-        auto service_config = MasterServiceConfig::builder()
-                                  .set_default_kv_lease_ttl(kv_lease_ttl)
-                                  .build();
-        service_ = std::make_unique<MasterService>(service_config);
-        [[maybe_unused]] const auto context_reset =
-            PrepareSimpleSegment(*service_, "test_segment_remove");
-        populate_store();
-
-        size_t total_keys = 13;  // Count from the keys_to_put vector
-
-        // Action: Remove all keys
-        auto remove_result = service_->RemoveByRegex(".*", TenantId::Default());
-        ASSERT_TRUE(remove_result.has_value());
-        EXPECT_EQ(remove_result.value(), total_keys);
-
-        // Verification: Check that no keys remain
-        auto get_all_result =
-            service_->GetReplicaListByRegex(".*", TenantId::Default());
-        ASSERT_TRUE(get_all_result.has_value());
-        EXPECT_TRUE(get_all_result.value().empty());
-    }
-
-    // --- Test Case 3: Attempt to remove with a non-matching pattern ---
-    {
-        SCOPED_TRACE("Test Case 3: Removing with a non-matching pattern");
-        auto service_config = MasterServiceConfig::builder()
-                                  .set_default_kv_lease_ttl(kv_lease_ttl)
-                                  .build();
-        service_ = std::make_unique<MasterService>(
-            service_config);  // Reset the service
-        [[maybe_unused]] const auto context_reset =
-            PrepareSimpleSegment(*service_, "test_segment_remove");
-        populate_store();
-
-        size_t total_keys_before_remove = 13;
-
-        // Action: Attempt to remove using a pattern that matches nothing
-        auto remove_result = service_->RemoveByRegex("^nonexistent-pattern-",
-                                                     TenantId::Default());
-        ASSERT_TRUE(remove_result.has_value());
-        EXPECT_EQ(remove_result.value(), 0);  // Should remove 0 keys
-
-        // Verification: Check that all keys still exist
-        auto get_all_result =
-            service_->GetReplicaListByRegex(".*", TenantId::Default());
-        ASSERT_TRUE(get_all_result.has_value());
-        EXPECT_EQ(get_all_result.value().size(), total_keys_before_remove);
-    }
-
-    // --- Test Case 4: Remove based on a complex pattern and verify ---
-    {
-        SCOPED_TRACE(
-            "Test Case 4: Removing based on file paths or containing digits");
-        auto service_config = MasterServiceConfig::builder()
-                                  .set_default_kv_lease_ttl(kv_lease_ttl)
-                                  .build();
-        service_ = std::make_unique<MasterService>(service_config);  // Reset
-        [[maybe_unused]] const auto context_reset =
-            PrepareSimpleSegment(*service_, "test_segment_remove");
-        populate_store();
-
-        // Action: Remove all keys that contain a slash '/' OR end with a number
-        auto remove_result =
-            service_->RemoveByRegex("/|\\d$", TenantId::Default());
-        ASSERT_TRUE(remove_result.has_value());
-        // Matches: "config/user/settings.json", "logs/app-2025-08-13.log",
-        //          "test_key_01", "test_key_02", "test_key_10"
-        // Note: logs/app-2025-08-13.log matches both, but is counted once.
-        EXPECT_EQ(remove_result.value(),
-                  5);  // The two paths + test_key_01 and test_key_02.
-                       // (test_key_10 ends with 0) wait, no, 10 ends with 0.
-        // Ah, \d$ matches a single digit at the end. So test_key_01,
-        // test_key_02. test_key_10 does NOT match \d$. Let's refine the regex.
-    }
-
-    // --- Test Case 4 ---
-    {
-        SCOPED_TRACE(
-            "Test Case 4 (Corrected): Removing based on complex pattern");
-        auto service_config = MasterServiceConfig::builder()
-                                  .set_default_kv_lease_ttl(kv_lease_ttl)
-                                  .build();
-        service_ = std::make_unique<MasterService>(service_config);  // Reset
-        [[maybe_unused]] const auto context_reset =
-            PrepareSimpleSegment(*service_, "test_segment_remove");
-        populate_store();
-
-        // Action: Remove all keys that contain "chunk" OR "config"
-        auto remove_result =
-            service_->RemoveByRegex("chunk|config", TenantId::Default());
-        ASSERT_TRUE(remove_result.has_value());
-        // Matches: "data_part_1_chunk_a", "data_part_2_chunk_b",
-        // "config/user/settings.json"
-        EXPECT_EQ(remove_result.value(), 3);
-
-        // Verification
-        auto exist_result_chunk =
-            service_->ExistKey("data_part_1_chunk_a", TenantId::Default());
-        ASSERT_TRUE(exist_result_chunk.has_value());
-        EXPECT_FALSE(exist_result_chunk.value());
-
-        auto exist_result_config = service_->ExistKey(
-            "config/user/settings.json", TenantId::Default());
-        ASSERT_TRUE(exist_result_config.has_value());
-        EXPECT_FALSE(exist_result_config.value());
-
-        auto exist_result_untouched =
-            service_->ExistKey("prod_key_alpha", TenantId::Default());
-        ASSERT_TRUE(exist_result_untouched.has_value());
-        EXPECT_TRUE(exist_result_untouched.value());
-    }
-}
-
-TEST_F(MasterServiceTest, RemoveAll) {
-    const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-    int times = 10;
-    while (times--) {
-        std::string key = "test_key" + std::to_string(times);
-        uint64_t value_length = 1024;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), value_length, config);
-        ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(
-            client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-        ASSERT_TRUE(put_end_result.has_value());
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-    }
-    // wait for all the lease to expire
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    ASSERT_EQ(10, service_->RemoveAll());
-    times = 10;
-    while (times--) {
-        std::string key = "test_key" + std::to_string(times);
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-        ASSERT_FALSE(exist_result.value());
-    }
 }
 
 TEST_F(MasterServiceTest, SingleSliceMultiReplicaFlow) {
@@ -4245,7 +3215,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     }
 }
 
-TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
+TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount two segments for testing
@@ -4270,19 +3240,53 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    // Unmount segment1
+    PauseReplicaCleanup(*service_);
+
+    // Unmount segment1. The allocator becomes unavailable synchronously while
+    // physical metadata cleanup runs on the background worker.
     auto unmount_result1 = service_->UnmountSegment(segment1.id, client_id);
     ASSERT_TRUE(unmount_result1.has_value());
-    // Umount will remove all objects in the segment, include the key1
-    ASSERT_EQ(1, service_->GetKeyCount());
-    // Verify objects in segment1 is gone
+
+    // Query paths must not expose the unavailable replica while its physical
+    // metadata is still waiting for background cleanup.
+    ASSERT_EQ(2u, service_->GetKeyCount());
     auto get_result1 = service_->GetReplicaList(key1, TenantId::Default());
     ASSERT_FALSE(get_result1.has_value());
-    ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+
+    auto exists1 = service_->ExistKey(key1, TenantId::Default());
+    ASSERT_TRUE(exists1.has_value());
+    EXPECT_FALSE(*exists1);
+    auto exists2 = service_->ExistKey(key2, TenantId::Default());
+    ASSERT_TRUE(exists2.has_value());
+    EXPECT_TRUE(*exists2);
+
+    auto batch_exists =
+        service_->BatchExistKey({key1, key2}, TenantId::Default());
+    ASSERT_EQ(2u, batch_exists.size());
+    ASSERT_TRUE(batch_exists[0].has_value());
+    EXPECT_FALSE(*batch_exists[0]);
+    ASSERT_TRUE(batch_exists[1].has_value());
+    EXPECT_TRUE(*batch_exists[1]);
+
+    auto all_keys = service_->GetAllKeys(TenantId::Default());
+    ASSERT_TRUE(all_keys.has_value());
+    EXPECT_EQ(all_keys->end(),
+              std::find(all_keys->begin(), all_keys->end(), key1));
+    EXPECT_NE(all_keys->end(),
+              std::find(all_keys->begin(), all_keys->end(), key2));
 
     // Verify objects in segment2 is still there
     auto get_result2 = service_->GetReplicaList(key2, TenantId::Default());
     ASSERT_TRUE(get_result2.has_value());
+
+    // The worker eventually removes the old physical metadata, after which
+    // the same key can be inserted again.
+    ResumeReplicaCleanup(*service_);
+    for (size_t i = 0; i < 100 && service_->GetKeyCount() != 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(1u, service_->GetKeyCount());
 
     // Verify put key1 will put into segment2 rather than segment1
     auto put_start_result = service_->PutStart(
@@ -4299,6 +3303,79 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               segment2.name);
+    EXPECT_EQ(2u, service_->GetKeyCount());
+}
+
+TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
+    auto config = MasterServiceConfig::builder().set_enable_ha(true).build();
+    auto service = std::make_unique<MasterService>(config);
+
+    auto segment = MakeSegment("ha_sync_segment");
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    const auto key = GenerateKeyForSegment(client_id, service, segment.name);
+    auto exists = service->ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    ASSERT_TRUE(exists.value());
+
+    ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
+    EXPECT_EQ(0u, service->GetKeyCount());
+}
+
+TEST_F(MasterServiceTest, CopyInProgressDoesNotKeepUnmountedSourceVisible) {
+    auto service = std::make_unique<MasterService>();
+    const auto source =
+        PrepareSimpleSegment(*service, "copy_source", kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "copy_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "copy_source";
+    PutCompletedObject(*service, client_id, "copy_key", config);
+    ASSERT_TRUE(service
+                    ->CopyStart(client_id, "copy_key", TenantId::Default(),
+                                "copy_source", {"copy_target"})
+                    .has_value());
+
+    PauseReplicaCleanup(*service);
+    ASSERT_TRUE(service->UnmountSegment(source.segment_id, source.client_id)
+                    .has_value());
+
+    ExpectKeyHiddenFromReadApis(*service, "copy_key");
+
+    ASSERT_TRUE(service->CopyRevoke(client_id, "copy_key", TenantId::Default())
+                    .has_value());
+    ResumeReplicaCleanup(*service);
+}
+
+TEST_F(MasterServiceTest, MoveInProgressDoesNotKeepUnmountedSourceVisible) {
+    auto service = std::make_unique<MasterService>();
+    const auto source =
+        PrepareSimpleSegment(*service, "move_source", kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "move_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "move_source";
+    PutCompletedObject(*service, client_id, "move_key", config);
+    ASSERT_TRUE(service
+                    ->MoveStart(client_id, "move_key", TenantId::Default(),
+                                "move_source", "move_target")
+                    .has_value());
+
+    PauseReplicaCleanup(*service);
+    ASSERT_TRUE(service->UnmountSegment(source.segment_id, source.client_id)
+                    .has_value());
+
+    ExpectKeyHiddenFromReadApis(*service, "move_key");
+
+    ASSERT_TRUE(service->MoveRevoke(client_id, "move_key", TenantId::Default())
+                    .has_value());
+    ResumeReplicaCleanup(*service);
 }
 
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
@@ -4355,6 +3432,10 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     auto get_after_unmount = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(get_after_unmount.has_value())
         << "Object should remain accessible with surviving replica";
+    ASSERT_EQ(1u, get_after_unmount->replicas.size());
+    EXPECT_EQ(segment2.name, get_after_unmount->replicas[0]
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.transport_endpoint_);
 }
 
 TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
@@ -4454,136 +3535,6 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
               << "Unmount time: " << unmount_duration.count() << "ms\n";
 }
 
-TEST_F(MasterServiceTest, RemoveLeasedObject) {
-    const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    std::string key = "test_key";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // Verify lease is granted on ExistsKey
-    auto put_start_result = service_->PutStart(
-        client_id, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, TenantId::Default(),
-                                           ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end_result.has_value());
-    auto exist_result = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exist_result.has_value());
-    auto remove_result = service_->Remove(key, TenantId::Default());
-    EXPECT_FALSE(remove_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result.error());
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto remove_result2 = service_->Remove(key, TenantId::Default());
-    EXPECT_TRUE(remove_result2.has_value());
-
-    // Verify lease is extended on successive ExistsKey
-    auto put_start_result2 = service_->PutStart(
-        client_id, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(put_start_result2.has_value());
-    auto put_end_result2 = service_->PutEnd(client_id, key, TenantId::Default(),
-                                            ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end_result2.has_value());
-    auto exist_result2 = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exist_result2.has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto exist_result3 = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exist_result3.has_value());
-    auto remove_result3 = service_->Remove(key, TenantId::Default());
-    EXPECT_FALSE(remove_result3.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result3.error());
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto remove_result4 = service_->Remove(key, TenantId::Default());
-    EXPECT_TRUE(remove_result4.has_value());
-
-    // Verify lease is granted on GetReplicaList
-    auto put_start_result3 = service_->PutStart(
-        client_id, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(put_start_result3.has_value());
-    auto put_end_result3 = service_->PutEnd(client_id, key, TenantId::Default(),
-                                            ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end_result3.has_value());
-    auto get_result = service_->GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(get_result.has_value());
-    auto remove_result5 = service_->Remove(key, TenantId::Default());
-    EXPECT_FALSE(remove_result5.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result5.error());
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto remove_result6 = service_->Remove(key, TenantId::Default());
-    EXPECT_TRUE(remove_result6.has_value());
-
-    // Verify lease is extended on successive GetReplicaList
-    auto put_start_result4 = service_->PutStart(
-        client_id, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(put_start_result4.has_value());
-    auto put_end_result4 = service_->PutEnd(client_id, key, TenantId::Default(),
-                                            ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end_result4.has_value());
-    auto get_result2 = service_->GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(get_result2.has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto get_result3 = service_->GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(get_result3.has_value());
-    auto remove_result7 = service_->Remove(key, TenantId::Default());
-    EXPECT_FALSE(remove_result7.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result7.error());
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto remove_result8 = service_->Remove(key, TenantId::Default());
-    EXPECT_TRUE(remove_result8.has_value());
-
-    // Verify object is removed
-    auto get_result4 = service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_FALSE(get_result4.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result4.error());
-}
-
-TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
-    const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-    for (int i = 0; i < 10; ++i) {
-        std::string key = "test_key" + std::to_string(i);
-        uint64_t slice_length = 1024;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
-        ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(
-            client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-        ASSERT_TRUE(put_end_result.has_value());
-        if (i >= 5) {
-            auto exist_result = service_->ExistKey(key, TenantId::Default());
-            ASSERT_TRUE(exist_result.has_value());
-        }
-    }
-    ASSERT_EQ(5, service_->RemoveAll());
-    for (int i = 0; i < 5; ++i) {
-        std::string key = "test_key" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_FALSE(exist_result.value());
-    }
-    // wait for all the lease to expire
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    ASSERT_EQ(5, service_->RemoveAll());
-    for (int i = 5; i < 10; ++i) {
-        std::string key = "test_key" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_FALSE(exist_result.value());
-    }
-}
-
 TEST_F(MasterServiceTest, EvictObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 2000;
@@ -4624,6 +3575,94 @@ TEST_F(MasterServiceTest, EvictObject) {
     ASSERT_GT(success_puts, 1024 * 16);
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, ShrinkBucketsIfSparseThresholds) {
+    // Small containers stay untouched regardless of sparsity: their bucket
+    // memory is negligible and rehash churn is not worth it.
+    std::unordered_map<std::string, int> small;
+    small.emplace("small_key", 0);
+    const size_t small_buckets = small.bucket_count();
+    ASSERT_LE(small_buckets, kShrinkMinBucketCount);
+    ShrinkBucketsIfSparse(small);
+    EXPECT_EQ(small.bucket_count(), small_buckets);
+
+    // Grow a map well past the bucket floor, then erase most entries: the
+    // bucket array keeps its high-water size until explicitly shrunk.
+    std::unordered_map<std::string, int> map;
+    for (size_t i = 0; i < 4 * kShrinkMinBucketCount; ++i) {
+        map.emplace("key" + std::to_string(i), 0);
+    }
+    const size_t high_water = map.bucket_count();
+    ASSERT_GT(high_water, kShrinkMinBucketCount);
+
+    // At exactly a quarter full there is nothing to shrink yet.
+    while (map.size() > high_water / 4) {
+        map.erase(map.begin());
+    }
+    ShrinkBucketsIfSparse(map);
+    EXPECT_EQ(map.bucket_count(), high_water);
+
+    // One more erase crosses the threshold and triggers the shrink.
+    map.erase(map.begin());
+    ShrinkBucketsIfSparse(map);
+    EXPECT_LT(map.bucket_count(), high_water);
+    EXPECT_GE(map.bucket_count(), map.size());
+}
+
+TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
+    // Zero lease TTL so every committed object is immediately evictable.
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t object_size = 1024;
+    constexpr size_t object_count = 2 * kShrinkMinBucketCount;
+    // Size the segment with ample headroom so the background eviction
+    // thread never fires; only the explicit call below evicts.
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(
+        *service_, "test_segment", buffer, object_size * object_count * 16);
+
+    // Pick keys that all hash to one shard so its metadata map grows past
+    // the shrink floor; random keys would spread these objects thinly
+    // across all 1024 shards.
+    const size_t target_shard = MetadataShardIndex(*service_, "shrink_key_0");
+    std::vector<std::string> keys;
+    for (size_t i = 0; keys.size() < object_count; ++i) {
+        std::string key = "shrink_key_" + std::to_string(i);
+        if (MetadataShardIndex(*service_, key) != target_shard) continue;
+        keys.push_back(std::move(key));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& key : keys) {
+        // Hard-pin the first object: it is excluded from eviction, so the
+        // tenant (and its metadata map) deterministically survives the
+        // full eviction below and the shrunk bucket count stays
+        // observable.
+        config.with_hard_pin = (&key == &keys.front());
+        ASSERT_TRUE(service_
+                        ->PutStart(client_id, key, TenantId::Default(),
+                                   object_size, config)
+                        .has_value());
+        ASSERT_TRUE(service_
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value());
+    }
+
+    const size_t buckets_before = MetadataBucketCount(*service_, target_shard);
+    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
+
+    service_->RunBatchEvictForTesting(1.0, 1.0);
+
+    const size_t buckets_after = MetadataBucketCount(*service_, target_shard);
+    ASSERT_GT(buckets_after, 0u);
+    // Without the post-eviction shrink the bucket array would still sit at
+    // its high-water mark and this assertion would fail.
+    EXPECT_LT(buckets_after, buckets_before / 2);
 }
 
 TEST_F(MasterServiceTest, TryEvictLeasedObject) {
@@ -5345,141 +4384,6 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
     auto mem_desc = replicas[0].get_memory_descriptor();
     EXPECT_EQ("single_segment", mem_desc.buffer_descriptor.transport_endpoint_);
     EXPECT_EQ(1024u, mem_desc.buffer_descriptor.size_);
-}
-
-TEST_F(MasterServiceTest, BatchExistKeyTest) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    const UUID client_id = generate_uuid();
-
-    // Mount a segment
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 128;
-    constexpr size_t value_size = 1024;
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "test_segment", buffer, size);
-
-    int test_object_num = 10;
-    std::vector<std::string> test_keys;
-    for (int i = 0; i < test_object_num; ++i) {
-        test_keys.push_back("test_key" + std::to_string(i));
-        ReplicateConfig config;
-        config.replica_num = 1;
-        uint64_t slice_length = value_size;
-        auto put_start_result = service_->PutStart(
-            client_id, test_keys[i], TenantId::Default(), slice_length, config);
-        ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(
-            client_id, test_keys[i], TenantId::Default(), ReplicaType::MEMORY);
-        ASSERT_TRUE(put_end_result.has_value());
-    }
-
-    // Test individual ExistKey calls to verify the underlying functionality
-    for (int i = 0; i < test_object_num; ++i) {
-        auto exist_result =
-            service_->ExistKey(test_keys[i], TenantId::Default());
-        EXPECT_TRUE(exist_result.value());
-    }
-
-    // Tets batch
-    test_keys.push_back("non_existent_key");
-    auto exist_resp = service_->BatchExistKey(test_keys, TenantId::Default());
-    for (int i = 0; i < test_object_num; ++i) {
-        ASSERT_TRUE(exist_resp[i].value());
-    }
-    ASSERT_FALSE(exist_resp[test_object_num].value());
-}
-
-TEST_F(MasterServiceTest, BatchExistKeyGroupedAndIncompletePreservesOrder) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    const UUID client_id = generate_uuid();
-
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 128;
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "test_segment", buffer, size);
-
-    const std::string grouped_key_a = "batch_grouped_key_a";
-    const std::string grouped_key_b = "batch_grouped_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(grouped_key_a);
-    ReplicateConfig grouped_config;
-    grouped_config.replica_num = 1;
-    grouped_config.group_ids = std::vector<std::string>{group_id};
-    PutCompletedObject(*service_, client_id, grouped_key_a, grouped_config);
-    PutCompletedObject(*service_, client_id, grouped_key_b, grouped_config);
-
-    const std::string completed_key = "batch_completed_key";
-    ReplicateConfig config;
-    config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, completed_key, config);
-
-    const std::string incomplete_key = "batch_incomplete_key";
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, incomplete_key, TenantId::Default(),
-                               1024, config)
-                    .has_value());
-
-    const std::string missing_key = "batch_missing_key";
-    std::vector<std::string> keys = {grouped_key_a, completed_key,
-                                     incomplete_key, missing_key,
-                                     grouped_key_b};
-
-    auto resp = service_->BatchExistKey(keys, TenantId::Default());
-    ASSERT_EQ(resp.size(), keys.size());
-    ASSERT_TRUE(resp[0].has_value());
-    ASSERT_TRUE(resp[1].has_value());
-    ASSERT_TRUE(resp[2].has_value());
-    ASSERT_TRUE(resp[3].has_value());
-    ASSERT_TRUE(resp[4].has_value());
-    EXPECT_TRUE(resp[0].value());
-    EXPECT_TRUE(resp[1].value());
-    EXPECT_FALSE(resp[2].value());
-    EXPECT_FALSE(resp[3].value());
-    EXPECT_TRUE(resp[4].value());
-}
-
-TEST_F(MasterServiceTest, BatchExistKeyTenantAwarePreservesOrder) {
-    const TenantId tenant_id("tenant_batch_exist");
-    auto service_ = std::make_unique<MasterService>(MakeStrictTenantConfig(
-        {std::string(TenantId::kDefaultValue), tenant_id.value()}));
-    const UUID client_id = generate_uuid();
-
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 128;
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "test_segment", buffer, size);
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    const std::string tenant_only_key = "batch_tenant_only";
-    const std::string default_only_key = "batch_default_only";
-    const std::string incomplete_key = "batch_tenant_incomplete";
-    const std::string missing_key = "batch_tenant_missing";
-
-    PutCompletedObject(*service_, client_id, tenant_only_key, tenant_id,
-                       config);
-    PutCompletedObject(*service_, client_id, default_only_key, config);
-    ASSERT_TRUE(
-        service_->PutStart(client_id, incomplete_key, tenant_id, 1024, config)
-            .has_value());
-
-    std::vector<std::string> tenant_keys = {tenant_only_key, default_only_key,
-                                            missing_key, incomplete_key,
-                                            tenant_only_key};
-    auto tenant_resp = service_->BatchExistKey(tenant_keys, tenant_id);
-    ASSERT_EQ(tenant_resp.size(), tenant_keys.size());
-    EXPECT_TRUE(tenant_resp[0].value());
-    EXPECT_FALSE(tenant_resp[1].value());
-    EXPECT_FALSE(tenant_resp[2].value());
-    EXPECT_FALSE(tenant_resp[3].value());
-    EXPECT_TRUE(tenant_resp[4].value());
-
-    std::vector<std::string> default_keys = {tenant_only_key, default_only_key};
-    auto default_resp =
-        service_->BatchExistKey(default_keys, TenantId::Default());
-    ASSERT_EQ(default_resp.size(), default_keys.size());
-    EXPECT_FALSE(default_resp[0].value());
-    EXPECT_TRUE(default_resp[1].value());
 }
 
 TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
@@ -7196,332 +6100,6 @@ TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
     EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
 }
 
-TEST_F(MasterServiceTest, ForceRemoveLeasedObject) {
-    // Set a long lease TTL so objects will have active leases
-    const uint64_t kv_lease_ttl = 10000;  // 10 seconds
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    // Put an object
-    std::string key = "leased_key";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-    auto put_start_result = service_->PutStart(
-        client_id, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, TenantId::Default(),
-                                           ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end_result.has_value());
-
-    // Verify object exists
-    auto exist_result = service_->ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exist_result.has_value());
-    ASSERT_TRUE(exist_result.value());
-
-    // Normal remove should fail because object has active lease
-    auto remove_result_no_force =
-        service_->Remove(key, TenantId::Default(), false);
-    EXPECT_FALSE(remove_result_no_force.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result_no_force.error());
-
-    // Force remove should succeed even with active lease
-    auto remove_result_force = service_->Remove(key, TenantId::Default(), true);
-    EXPECT_TRUE(remove_result_force.has_value());
-
-    // Verify object is removed
-    auto get_result = service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_FALSE(get_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
-}
-
-// Test force RemoveByRegex - should bypass lease check
-TEST_F(MasterServiceTest, ForceRemoveByRegexLeasedObjects) {
-    // Set a long lease TTL so objects will have active leases
-    const uint64_t kv_lease_ttl = 10000;  // 10 seconds
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    // Put 5 objects and grant them active leases by reading
-    for (int i = 0; i < 5; ++i) {
-        std::string key = "force_regex_key_" + std::to_string(i);
-        uint64_t slice_length = 1024;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
-        ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(
-            client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-        ASSERT_TRUE(put_end_result.has_value());
-        // Grant lease by reading the object
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-        ASSERT_TRUE(exist_result.value());
-    }
-
-    // Normal RemoveByRegex should remove 0 because all objects have active
-    // leases
-    auto remove_result_no_force = service_->RemoveByRegex(
-        "^force_regex_key_", TenantId::Default(), false);
-    ASSERT_TRUE(remove_result_no_force.has_value());
-    EXPECT_EQ(0, remove_result_no_force.value());
-
-    // All objects should still exist
-    for (int i = 0; i < 5; ++i) {
-        std::string key = "force_regex_key_" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-        ASSERT_TRUE(exist_result.value());
-    }
-
-    // Force RemoveByRegex should remove all 5 objects
-    auto remove_result_force =
-        service_->RemoveByRegex("^force_regex_key_", TenantId::Default(), true);
-    ASSERT_TRUE(remove_result_force.has_value());
-    EXPECT_EQ(5, remove_result_force.value());
-
-    // All objects should be removed
-    for (int i = 0; i < 5; ++i) {
-        std::string key = "force_regex_key_" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-        ASSERT_FALSE(exist_result.value());
-    }
-}
-
-// Test force RemoveAll - should bypass lease check
-TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
-    // Set a long lease TTL so objects will have active leases
-    const uint64_t kv_lease_ttl = 10000;  // 10 seconds
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    // Put 10 objects and grant them active leases by reading
-    for (int i = 0; i < 10; ++i) {
-        std::string key = "force_all_key_" + std::to_string(i);
-        uint64_t slice_length = 1024;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
-        ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(
-            client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-        ASSERT_TRUE(put_end_result.has_value());
-        // Grant lease by reading the object
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-        ASSERT_TRUE(exist_result.value());
-    }
-
-    // Normal RemoveAll should remove 0 because all objects have active leases
-    EXPECT_EQ(0, service_->RemoveAll(false));
-
-    // All objects should still exist
-    for (int i = 0; i < 10; ++i) {
-        std::string key = "force_all_key_" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-        ASSERT_TRUE(exist_result.value());
-    }
-
-    // Force RemoveAll should remove all 10 objects
-    EXPECT_EQ(10, service_->RemoveAll(true));
-
-    // All objects should be removed
-    for (int i = 0; i < 10; ++i) {
-        std::string key = "force_all_key_" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key, TenantId::Default());
-        ASSERT_TRUE(exist_result.has_value());
-        ASSERT_FALSE(exist_result.value());
-    }
-}
-// ===================== Upsert Tests =====================
-
-TEST_F(MasterServiceTest, UpsertSameSize) {
-    // Case B: key exists with same size — in-place update
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    std::string key = "upsert_same_size";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // First: PutStart + PutEnd to create the object
-    auto put_result = service_->PutStart(client_id, key, TenantId::Default(),
-                                         slice_length, config);
-    ASSERT_TRUE(put_result.has_value());
-    auto original_replicas = put_result.value();
-    auto put_end = service_->PutEnd(client_id, key, TenantId::Default(),
-                                    ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end.has_value());
-
-    // UpsertStart with same size — should reuse buffers
-    const UUID new_client_id = generate_uuid();
-    auto upsert_result = service_->UpsertStart(
-        new_client_id, key, TenantId::Default(), slice_length, config);
-    ASSERT_TRUE(upsert_result.has_value());
-    auto upsert_replicas = upsert_result.value();
-    EXPECT_EQ(1, upsert_replicas.size());
-    EXPECT_EQ(ReplicaStatus::PROCESSING, upsert_replicas[0].status);
-
-    // Verify same buffer address (in-place reuse)
-    EXPECT_EQ(original_replicas[0]
-                  .get_memory_descriptor()
-                  .buffer_descriptor.buffer_address_,
-              upsert_replicas[0]
-                  .get_memory_descriptor()
-                  .buffer_descriptor.buffer_address_);
-
-    // UpsertEnd with the new client_id
-    auto end_result = service_->UpsertEnd(
-        new_client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-    ASSERT_TRUE(end_result.has_value());
-
-    // Verify replica is COMPLETE again
-    auto final_result = service_->GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(final_result.has_value());
-    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
-}
-
-TEST_F(MasterServiceTest, UpsertDifferentSize) {
-    // Case C: key exists with different size — delete and reallocate
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    std::string key = "upsert_diff_size";
-    uint64_t original_size = 1024;
-    uint64_t new_size = 2048;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // Create object with original_size
-    auto put_result = service_->PutStart(client_id, key, TenantId::Default(),
-                                         original_size, config);
-    ASSERT_TRUE(put_result.has_value());
-    auto original_replicas = put_result.value();
-    auto put_end = service_->PutEnd(client_id, key, TenantId::Default(),
-                                    ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end.has_value());
-
-    // UpsertStart with different size
-    auto upsert_result = service_->UpsertStart(
-        client_id, key, TenantId::Default(), new_size, config);
-    ASSERT_TRUE(upsert_result.has_value());
-    auto new_replicas = upsert_result.value();
-    EXPECT_EQ(1, new_replicas.size());
-    EXPECT_EQ(ReplicaStatus::PROCESSING, new_replicas[0].status);
-
-    // Buffer address should be different (reallocated)
-    EXPECT_NE(original_replicas[0]
-                  .get_memory_descriptor()
-                  .buffer_descriptor.buffer_address_,
-              new_replicas[0]
-                  .get_memory_descriptor()
-                  .buffer_descriptor.buffer_address_);
-
-    // UpsertEnd
-    auto end_result = service_->UpsertEnd(client_id, key, TenantId::Default(),
-                                          ReplicaType::MEMORY);
-    ASSERT_TRUE(end_result.has_value());
-
-    // Verify the object is complete
-    auto final_result = service_->GetReplicaList(key, TenantId::Default());
-    ASSERT_TRUE(final_result.has_value());
-    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
-}
-
-TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
-    // Upsert should fail if Copy is in progress
-    const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-
-    [[maybe_unused]] const auto ctx1 =
-        PrepareSimpleSegment(*service_, "segment_1");
-    [[maybe_unused]] const auto ctx2 =
-        PrepareSimpleSegment(*service_, "segment_2");
-    UUID client_id = generate_uuid();
-
-    std::string key = "upsert_conflict_copy";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.preferred_segment = "segment_1";
-
-    // Create object
-    auto put_result = service_->PutStart(client_id, key, TenantId::Default(),
-                                         slice_length, config);
-    ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id, key, TenantId::Default(),
-                                    ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end.has_value());
-
-    // Start a Copy
-    auto copy_result = service_->CopyStart(client_id, key, TenantId::Default(),
-                                           "segment_1", {"segment_2"});
-    ASSERT_TRUE(copy_result.has_value());
-
-    // UpsertStart should fail with OBJECT_HAS_REPLICATION_TASK
-    auto upsert_result = service_->UpsertStart(
-        client_id, key, TenantId::Default(), slice_length, config);
-    EXPECT_FALSE(upsert_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, upsert_result.error());
-}
-
-TEST_F(MasterServiceTest, BatchUpsertStart) {
-    // Test batch upsert with a mix of new and existing keys
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    // Create key_1 with size 1024
-    auto put_result = service_->PutStart(client_id, "key_1",
-                                         TenantId::Default(), 1024, config);
-    ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id, "key_1", TenantId::Default(),
-                                    ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end.has_value());
-
-    // BatchUpsertStart: key_1 (same size), key_2 (new)
-    std::vector<std::string> keys = {"key_1", "key_2"};
-    std::vector<uint64_t> slice_lengths = {1024, 2048};
-
-    auto results = service_->BatchUpsertStart(
-        client_id, keys, TenantId::Default(), slice_lengths, config);
-    ASSERT_EQ(2, results.size());
-    EXPECT_TRUE(results[0].has_value());  // key_1: Case B (in-place)
-    EXPECT_TRUE(results[1].has_value());  // key_2: Case A (new)
-
-    // Complete both
-    auto end_results = service_->BatchUpsertEnd(
-        client_id, MakeObjectMetas(keys), TenantId::Default());
-    ASSERT_EQ(2, end_results.size());
-    EXPECT_TRUE(end_results[0].has_value());
-    EXPECT_TRUE(end_results[1].has_value());
-}
-
 // ===================== Hard Pin Tests =====================
 
 TEST_F(MasterServiceTest, HardPinObjectNotEvicted) {
@@ -7661,52 +6239,6 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
         << "Hard-pinned object was evicted";
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    service_->RemoveAll();
-}
-
-TEST_F(MasterServiceTest, HardPinDefaultIsFalse) {
-    // Objects created without with_hard_pin should not be hard-pinned
-    auto service_config =
-        MasterServiceConfig::builder().set_default_kv_lease_ttl(5000).build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    const UUID client_id = generate_uuid();
-
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t segment_size = 1024 * 1024 * 16;
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
-
-    // Put without hard_pin (default)
-    ReplicateConfig config;
-    config.replica_num = 1;
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, "normal_key", TenantId::Default(),
-                               1024, config)
-                    .has_value());
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, "normal_key", TenantId::Default(),
-                             ReplicaType::MEMORY)
-                    .has_value());
-
-    // Put with hard_pin
-    ReplicateConfig hp_config;
-    hp_config.replica_num = 1;
-    hp_config.with_hard_pin = true;
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, "hp_key", TenantId::Default(), 1024,
-                               hp_config)
-                    .has_value());
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, "hp_key", TenantId::Default(),
-                             ReplicaType::MEMORY)
-                    .has_value());
-
-    // Both should exist
-    ASSERT_TRUE(service_->GetReplicaList("normal_key", TenantId::Default())
-                    .has_value());
-    ASSERT_TRUE(
-        service_->GetReplicaList("hp_key", TenantId::Default()).has_value());
-
     service_->RemoveAll();
 }
 

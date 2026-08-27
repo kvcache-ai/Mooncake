@@ -72,6 +72,7 @@ class WorkerPool {
     struct RailState {
         int error_count = 0;
         uint64_t pause_until_ns = 0;  // Timestamp (ns) when pause expires
+        uint64_t last_error_ns = 0;   // Timestamp (ns) of the last error
     };
 
     void markRailFailed(const std::string &peer_nic_path,
@@ -166,6 +167,10 @@ class WorkerPool {
 
     // Rail monitor configuration
     const static int kRailErrorThreshold = 5;  // Errors before pause
+    // Errors further apart than this are not consecutive, so error_count is
+    // restarted. Without it a long-lived process accumulates isolated failures
+    // until an otherwise healthy rail is paused.
+    const static uint64_t kRailErrorWindowNs = 5000000000ull;  // 5 seconds
     const static uint64_t kContextRecoveryDelayNs =
         30000000000ull;  // 30 seconds before a recovered local RNIC is reused
 

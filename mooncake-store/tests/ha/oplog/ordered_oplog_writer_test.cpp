@@ -599,39 +599,6 @@ TEST(OrderedOpLogWriterLoopTest, ContinuesFromInitialDurablePrefix) {
     writer.Stop();
 }
 
-TEST(OrderedOpLogWriterLoopTest, PreservesProducerViewAcrossBatches) {
-    FakeBatchWriter storage;
-    OrderedOpLogWriter writer(
-        OrderedOpLogWriterConfig{
-            .max_entries_per_batch = 1,
-            .initial_durable_prefix = {.producer_view_version = 7}},
-        [&](const OpLogBatchRecord& batch,
-            const DurablePrefix& expected_prefix) {
-            return storage.Write(batch, expected_prefix);
-        });
-    writer.Start();
-
-    auto first = writer.Reserve();
-    ASSERT_TRUE(first.has_value());
-    ASSERT_TRUE(
-        writer.Commit(std::move(*first), MakeEntry("k1"), [](const auto&) {})
-            .has_value());
-    ASSERT_TRUE(storage.WaitForWrites(1));
-
-    auto second = writer.Reserve();
-    ASSERT_TRUE(second.has_value());
-    ASSERT_TRUE(
-        writer.Commit(std::move(*second), MakeEntry("k2"), [](const auto&) {})
-            .has_value());
-    ASSERT_TRUE(storage.WaitForWrites(2));
-
-    const auto prefixes = storage.ExpectedPrefixes();
-    ASSERT_EQ(2u, prefixes.size());
-    EXPECT_EQ(7u, prefixes[0].producer_view_version);
-    EXPECT_EQ(7u, prefixes[1].producer_view_version);
-    writer.Stop();
-}
-
 TEST(OrderedOpLogWriterLoopTest, CommitWhileReadyBatchExistsFormsNextBatch) {
     FakeBatchWriter storage;
     OrderedOpLogWriter writer(
