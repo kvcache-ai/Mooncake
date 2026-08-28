@@ -575,7 +575,7 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     // Friend access to MasterService::metadata_shards_ and
-    // getMetadataShardIndex, which are otherwise private.
+    // getShardIndex, which are otherwise private.
     // MasterServiceHATest is friended; TEST_F-generated subclasses are not,
     // hence this static funnel. Seeds an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
@@ -585,7 +585,7 @@ class MasterServiceHATest : public ::testing::Test {
     static void SeedPromotionTaskForTesting(
         MasterService* service, const TenantId& tenant, const std::string& key,
         const UUID& holder_id, ReplicaID alloc_id, uint64_t object_size) {
-        const size_t shard_idx = service->getMetadataShardIndex(tenant, key);
+        const size_t shard_idx = service->getShardIndex(tenant, key);
         auto shard_access =
             MasterService::MetadataShardAccessorRW(service, shard_idx);
         auto& tenant_state =
@@ -730,7 +730,7 @@ class MasterServiceHATest : public ::testing::Test {
             &service, MasterService::ObjectIdentity{tenant_id, key});
         ASSERT_TRUE(accessor.Exists());
         SpinLocker locker(&accessor.Get().lock);
-        accessor.Get().lease_timeout = deadline;
+        accessor.Get().lease_->SetDeadline(deadline);
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
@@ -743,7 +743,7 @@ class MasterServiceHATest : public ::testing::Test {
             return {};
         }
         SpinLocker locker(&accessor.Get().lock);
-        return accessor.Get().lease_timeout;
+        return accessor.Get().lease_->ExpiresAt();
     }
 
     static uint64_t EvictTenantMemoryForQuotaForTesting(
@@ -761,7 +761,7 @@ class MasterServiceHATest : public ::testing::Test {
     static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
+        const size_t shard_idx = service.getShardIndex(tenant_id, key);
         return std::unique_lock<SharedMutex>(
             service.metadata_shards_[shard_idx].mutex);
     }
@@ -1070,7 +1070,7 @@ TEST_F(MasterServiceHATest,
 }
 
 TEST_F(MasterServiceHATest,
-       RestoreRejectsGroupedObjectDuplicatedIntoAnotherGroupShard) {
+       RestoreRejectsGroupedObjectDuplicatedIntoAnotherGroupDomain) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
