@@ -117,6 +117,10 @@ ErrorCode BatchOpLogSnapshotPublisher::PublishImpl(
     txn.compares.push_back({.key = maintenance_key,
                             .kind = KvCompareKind::kValueEquals,
                             .expected_value = std::string(owner_token)});
+    txn.compares.push_back({.key = maintenance_key,
+                            .kind = KvCompareKind::kCreateRevisionEquals,
+                            .expected_value = "",
+                            .expected_revision = lease.lock_create_revision()});
     txn.compares.push_back({.key = latest_key,
                             .kind = latest_exists
                                         ? KvCompareKind::kValueEquals

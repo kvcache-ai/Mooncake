@@ -29,7 +29,11 @@ class FakeBackend final : public HaKvBackend {
     }
 
     ErrorCode Put(std::string_view key, std::string_view value) override {
-        values[std::string(key)] = std::string(value);
+        const std::string owned_key(key);
+        values[owned_key] = std::string(value);
+        if (!create_revisions.contains(owned_key)) {
+            create_revisions[owned_key] = next_create_revision++;
+        }
         return ErrorCode::OK;
     }
 
@@ -55,20 +59,33 @@ class FakeBackend final : public HaKvBackend {
             const auto it = values.find(compare.key);
             if (compare.kind == KvCompareKind::kKeyNotExists) {
                 if (it != values.end()) return ErrorCode::ETCD_TRANSACTION_FAIL;
+            } else if (compare.kind == KvCompareKind::kCreateRevisionEquals) {
+                auto revision = create_revisions.find(compare.key);
+                if (revision == create_revisions.end() ||
+                    revision->second != compare.expected_revision) {
+                    return ErrorCode::ETCD_TRANSACTION_FAIL;
+                }
             } else if (it == values.end() ||
                        it->second != compare.expected_value) {
                 return ErrorCode::ETCD_TRANSACTION_FAIL;
             }
         }
-        for (const auto& put : txn.puts) values[put.key] = put.value;
+        for (const auto& put : txn.puts) {
+            values[put.key] = put.value;
+            if (!create_revisions.contains(put.key)) {
+                create_revisions[put.key] = next_create_revision++;
+            }
+        }
         return ErrorCode::OK;
     }
 
     std::map<std::string, std::string> values;
+    std::map<std::string, EtcdRevisionId> create_revisions;
     ErrorCode next_txn_error{ErrorCode::OK};
     std::string mutate_key;
     std::string mutate_value;
     size_t txn_count{0};
+    EtcdRevisionId next_create_revision{1};
 };
 
 std::string MakeDescriptor(uint64_t batch_id, int64_t lease_id = 101,
@@ -277,6 +294,20 @@ TEST(BatchOpLogSnapshotPublisherTest, LockOwnerRaceCannotPublish) {
     BatchOpLogSnapshotPublisher publisher(backend, "cluster");
     backend.mutate_key = ha::BuildBatchOpLogSnapshotMaintenanceKey("cluster");
     backend.mutate_value = "102";
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
+              publisher.Publish(*lease, MakeDescriptor(1)));
+    EXPECT_FALSE(backend.values.contains(
+        ha::BuildBatchOpLogSnapshotLatestKey("cluster")));
+}
+
+TEST(BatchOpLogSnapshotPublisherTest, FencesOldMaintenanceLockIncarnation) {
+    FakeBackend backend;
+    auto lease = SnapshotMaintenanceLease::MakeForTesting("cluster", "101", 1);
+    const auto lock_key = ha::BuildBatchOpLogSnapshotMaintenanceKey("cluster");
+    ASSERT_EQ(ErrorCode::OK, backend.Put(lock_key, "101"));
+    backend.create_revisions[lock_key] = 2;
+    BatchOpLogSnapshotPublisher publisher(backend, "cluster");
+
     EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
               publisher.Publish(*lease, MakeDescriptor(1)));
     EXPECT_FALSE(backend.values.contains(
