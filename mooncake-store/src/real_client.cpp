@@ -6121,8 +6121,6 @@ RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     bool prefer_alloc_in_same_node) {
-    const auto start_time = std::chrono::steady_clock::now();
-
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -6149,13 +6147,10 @@ RealClient::batch_get_into_multi_buffers_internal(
     const auto query_results = client_->BatchQuery(keys);
     const uint64_t metadata_us = elapsed_us_since(query_start_time);
     // Split the call into its metadata and data phases so that a slow batch
-    // get can be attributed to the master RPC or to the data path.
-    auto record_timings = [&](uint64_t data_us) {
-        RecordBatchGetTimings(BatchGetTimings{
-            .metadata_us = metadata_us,
-            .data_us = data_us,
-            .total_us = elapsed_us_since(start_time),
-        });
+    // get can be attributed to the master RPC or to the data path. Reported
+    // directly as cumulative histograms; no per-call shared state is kept.
+    auto observe_breakdown = [&](uint64_t data_us) {
+        client_->ObserveBatchGetBreakdown(metadata_us, data_us);
     };
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
@@ -6267,7 +6262,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     }
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_ops.empty()) {
-        record_timings(/*data_us=*/0);
+        observe_breakdown(/*data_us=*/0);
         return results;
     }
 
@@ -6471,23 +6466,8 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
-    record_timings(elapsed_us_since(data_start_time));
+    observe_breakdown(elapsed_us_since(data_start_time));
     return results;
-}
-
-void RealClient::RecordBatchGetTimings(const BatchGetTimings &timings) {
-    {
-        std::lock_guard<std::mutex> lock(last_batch_get_timings_mutex_);
-        last_batch_get_timings_ = timings;
-    }
-    if (client_) {
-        client_->ObserveBatchGetBreakdown(timings.metadata_us, timings.data_us);
-    }
-}
-
-RealClient::BatchGetTimings RealClient::getLastBatchGetTimings() const {
-    std::lock_guard<std::mutex> lock(last_batch_get_timings_mutex_);
-    return last_batch_get_timings_;
 }
 
 tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {

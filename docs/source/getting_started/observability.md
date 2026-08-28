@@ -221,13 +221,3 @@ without correlating several mixed metrics.
 | `mooncake_transfer_batch_get_latency` | End-to-end batch get latency |
 | `mooncake_transfer_batch_get_metadata_latency` | Time spent in the metadata query (master RPC) |
 | `mooncake_transfer_batch_get_data_latency` | Time spent in the data transfer (RDMA / disk read) |
-
-The same breakdown for the most recent call is also available from Python,
-which lets a KV-cache connector report per-request metadata and data latency
-separately instead of a single mixed load metric:
-
-```python
-store.batch_get_into_multi_buffers(keys, all_buffer_ptrs, all_sizes)
-timings = store.get_last_batch_get_timings()
-# {'metadata_us': 412, 'data_us': 1893, 'total_us': 2340}
-```

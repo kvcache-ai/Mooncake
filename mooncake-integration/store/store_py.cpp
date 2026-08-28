@@ -3027,29 +3027,6 @@ PYBIND11_MODULE(store, m) {
             "multiple "
             "keys")
         .def(
-            "get_last_batch_get_timings",
-            [](MooncakeStorePyWrapper &self) -> py::dict {
-                py::dict result;
-                result["metadata_us"] = 0;
-                result["data_us"] = 0;
-                result["total_us"] = 0;
-
-                auto real_client = self.get_real_client();
-                if (!real_client) {
-                    LOG(ERROR)
-                        << "get_last_batch_get_timings requires RealClient";
-                    return result;
-                }
-                const auto timings = real_client->getLastBatchGetTimings();
-                result["metadata_us"] = timings.metadata_us;
-                result["data_us"] = timings.data_us;
-                result["total_us"] = timings.total_us;
-                return result;
-            },
-            "Return the latency breakdown (us) of the most recent "
-            "batch_get_into_multi_buffers call: metadata_us (master RPC), "
-            "data_us (data transfer) and total_us")
-        .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {

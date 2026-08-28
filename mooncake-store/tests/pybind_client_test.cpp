@@ -1073,15 +1073,6 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     EXPECT_EQ(dst_data, upsert_data)
         << "Retrieved data should match upserted data";
 
-    // The latency breakdown of the last batch get should be populated and
-    // consistent: each phase is part of the total.
-    const auto timings = py_client_->getLastBatchGetTimings();
-    EXPECT_GT(timings.total_us, 0u) << "Total latency should be recorded";
-    EXPECT_GT(timings.metadata_us, 0u)
-        << "Metadata query latency should be recorded";
-    EXPECT_LE(timings.metadata_us + timings.data_us, timings.total_us)
-        << "Phase latencies should not exceed the total latency";
-
     // Unregister buffers
     int unreg_result_test = py_client_->unregister_buffer(test_data.data());
     ASSERT_EQ(unreg_result_test, 0)
