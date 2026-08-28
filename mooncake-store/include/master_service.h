@@ -27,13 +27,15 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "allocation_strategy.h"
 #include "background_worker.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "segment.h"
+#include "nof_segment_manager.h"
+#include "placement/domain.h"
+#include "segment/pool.h"
+#include "segment/pool_write_access.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
 #include "tenant_quota_sharded.h"
@@ -68,7 +70,6 @@ class EtcdOpLogStore;
 class DfsGlobalAllocator;
 
 // Forward declarations
-class AllocationStrategy;
 class EvictionStrategy;
 class HaKvBackend;
 class HttpMetadataServer;
@@ -92,7 +93,7 @@ class MasterServiceTenantQuotaTest;
 class MasterScenario;
 class MasterServiceHATest;
 // Friended so the processing_keys double-erase reproduction test can
-// invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
+// invalidate a segment allocator via PrepareUnmount WITHOUT the
 // ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
 class MasterServiceProcessingKeyDoubleEraseTest;
 // Friended so the LOCAL_DISK deregistration interleaving tests can run the
@@ -132,7 +133,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * 3. snapshot_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
  * 5. tenant_quota_recompute_mutex_
- * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
+ * 6. ShardedTenantQuotaTable internal mutex or pool_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
  * Strict tenant admission and policy mutation paths that need both
@@ -808,7 +809,7 @@ class MasterService {
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
-     * DRAM via the existing AllocationStrategy, optionally biased toward the
+     * DRAM via SegmentPool placement, optionally biased toward the
      * caller's local memory segment via preferred_segments. The new replica is
      * invisible to readers until NotifyPromotionSuccess flips it to COMPLETE.
      *
@@ -993,6 +994,8 @@ class MasterService {
 
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
+    std::string ResolveWriterHostId(const UUID& client_id,
+                                    const ReplicateConfig& config);
 
     void ClearInvalidHandles();
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
@@ -2678,12 +2681,12 @@ class MasterService {
     std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
 
     // Segment management
-    SegmentManager segment_manager_;
+    SegmentPool segment_pool_;
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
-    const AllocationStrategyType allocation_strategy_type_;
-    std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    ReplicaPlacement<SegmentPool> memory_placement_;
+    ReplicaPlacement<NoFSegmentManager> nof_placement_;
 
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
@@ -2771,7 +2774,7 @@ class MasterService {
     tl::expected<void, ErrorCode> ValidateDrainRequest(
         const CreateDrainJobRequest& request);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
-        ScopedSegmentAccess& segment_access,
+        ScopedSegmentPoolWriteAccess& segment_access,
         const CreateDrainJobRequest& request);
     void ProcessDrainJobs();
     void RefreshDrainJobTasks(DrainJob& job);

@@ -34,8 +34,7 @@ std::unique_ptr<MasterService> CreateSsdAwareOffloadService() {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.default_kv_lease_ttl = 0;
-    config.allocation_strategy_type =
-        AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+    config.allocation_strategy_type = PlacementPolicyType::SSD_FREE_RATIO_FIRST;
     return std::make_unique<MasterService>(config);
 }
 
@@ -842,7 +841,7 @@ TEST_F(MasterServiceSSDTest,
     // Build a MasterService with kNumNodes segments. with_ssd=true also
     // mounts LocalDisk and reports varied SSD capacity per node.
     auto buildAndMount =
-        [&](AllocationStrategyType strategy, bool with_ssd, size_t base_start,
+        [&](PlacementPolicyType strategy, bool with_ssd, size_t base_start,
             const std::string& tag) -> std::unique_ptr<MasterService> {
         MasterServiceConfig config;
         config.enable_offload = with_ssd;
@@ -893,20 +892,20 @@ TEST_F(MasterServiceSSDTest,
     };
 
     // (A) RANDOM, no offload – baseline
-    auto svc_a = buildAndMount(AllocationStrategyType::RANDOM, false,
-                               0xc00000000ULL, "A");
+    auto svc_a =
+        buildAndMount(PlacementPolicyType::RANDOM, false, 0xc00000000ULL, "A");
     (void)runBenchmark(*svc_a, "ms_A_wu_", kWarmupRounds);
     auto elapsed_a = runBenchmark(*svc_a, "ms_A_bm_", kBenchmarkRounds);
 
     // (B) RANDOM, with offload – quantify disk-replica overhead alone
-    auto svc_b = buildAndMount(AllocationStrategyType::RANDOM, true,
-                               0xd00000000ULL, "B");
+    auto svc_b =
+        buildAndMount(PlacementPolicyType::RANDOM, true, 0xd00000000ULL, "B");
     (void)runBenchmark(*svc_b, "ms_B_wu_", kWarmupRounds);
     auto elapsed_b = runBenchmark(*svc_b, "ms_B_bm_", kBenchmarkRounds);
 
     // (C) SSD_FREE_RATIO_FIRST, with offload – full new feature
-    auto svc_c = buildAndMount(AllocationStrategyType::SSD_FREE_RATIO_FIRST,
-                               true, 0xe00000000ULL, "C");
+    auto svc_c = buildAndMount(PlacementPolicyType::SSD_FREE_RATIO_FIRST, true,
+                               0xe00000000ULL, "C");
     (void)runBenchmark(*svc_c, "ms_C_wu_", kWarmupRounds);
     auto elapsed_c = runBenchmark(*svc_c, "ms_C_bm_", kBenchmarkRounds);
 

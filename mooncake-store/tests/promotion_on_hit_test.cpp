@@ -3,6 +3,7 @@
 // layer.
 
 #include "master_service.h"
+#include "segment/pool_read_access.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -150,8 +151,8 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService* service, const UUID& segment_id, size_t size) {
         std::shared_ptr<BufferAllocatorBase> allocator;
         {
-            auto segment_access = service->segment_manager_.getSegmentAccess();
-            allocator = segment_access.GetAllocator(segment_id);
+            auto segment_access = service->segment_pool_.AcquireReadAccess();
+            allocator = segment_access.Resources().GetAllocator(segment_id);
         }
         if (!allocator) {
             return nullptr;
