@@ -11648,12 +11648,12 @@ MasterService::MetadataSerializer::Deserialize(
 
         const msgpack::object& shard_obj = shard_oh.get();
 
-        // Objects are restored to the shard index recorded in the snapshot (not
-        // re-routed to hash(tenant, key)). Snapshots produced by a router that
-        // placed grouped objects on hash(group_id) shards therefore leave those
-        // objects on a stale shard after an upgrade and become unreachable by
-        // the hash(tenant, key) lookups used by this version; such snapshots
-        // must be regenerated. See docs/source/design/store/mooncake-store.md.
+        // Objects are restored to the shard index recorded in the snapshot and
+        // then re-routed to their hash(tenant, key) shard by
+        // ReRouteRestoredObjectsByKey() below. Snapshots produced by a router
+        // that placed grouped objects on hash(group_id) shards are therefore
+        // migrated automatically and need not be regenerated. See
+        // docs/source/design/store/mooncake-store.md.
         auto& shard = service_->metadata_shards_[shard_idx];
         auto result = DeserializeShard(shard_obj, shard);
         if (!result) {
