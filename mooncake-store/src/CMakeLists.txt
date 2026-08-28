@@ -296,12 +296,13 @@ check_pie_supported(LANGUAGES CXX)
 
 string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 
-# Store Client sources call GPU runtime APIs directly. Detect the available
-# runtime independently from the Transfer Engine feature flags so that each
-# target below can declare its own compile and link requirements.
-find_package(CUDAToolkit QUIET)
-if(NOT CUDAToolkit_FOUND)
-  find_package(hip QUIET)
+# Store Client accelerator staging follows the explicitly selected build
+# backend. In particular, non-CUDA wheels are built in a CUDA toolchain image,
+# so SDK presence must not enable CUDA support by itself.
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+elseif(USE_HIP)
+  find_package(hip REQUIRED)
 endif()
 
 # Sources used by both the Master and Client sides of Store.
@@ -410,13 +411,13 @@ endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_client_objects build_etcd_wrapper)
 endif()
-if(CUDAToolkit_FOUND)
-  message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
+if(USE_CUDA)
+  message(STATUS "mooncake_store: CUDA enabled, enabling D2H staging")
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_CUDA)
   target_include_directories(mooncake_store_client_objects
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-elseif(hip_FOUND)
-  message(STATUS "mooncake_store: HIP detected, enabling D2H staging")
+elseif(USE_HIP)
+  message(STATUS "mooncake_store: HIP enabled, enabling D2H staging")
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_HIP)
 endif()
 if(USE_ASCEND
@@ -490,9 +491,9 @@ if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_link_libraries(mooncake_store PUBLIC Mooncake::liburing)
 endif()
-if(CUDAToolkit_FOUND)
+if(USE_CUDA)
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
-elseif(hip_FOUND)
+elseif(USE_HIP)
   target_link_libraries(mooncake_store PRIVATE hip::host)
 endif()
 if(USE_ASCEND
@@ -546,12 +547,12 @@ set_target_properties(mooncake_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   mooncake_client PRIVATE mooncake_store transfer_engine asio_shared
                           gflags::gflags yalantinglibs::yalantinglibs)
-if(CUDAToolkit_FOUND)
+if(USE_CUDA)
   target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
   target_include_directories(mooncake_client
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(mooncake_client PRIVATE CUDA::cudart)
-elseif(hip_FOUND)
+elseif(USE_HIP)
   target_compile_definitions(mooncake_client PRIVATE USE_HIP)
   target_link_libraries(mooncake_client PRIVATE hip::host)
 endif()
