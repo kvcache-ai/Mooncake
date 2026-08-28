@@ -1421,6 +1421,12 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         lid_ = attr.lid;
         active_mtu_ = attr.active_mtu;
         active_speed_ = attr.active_speed;
+#ifdef HAVE_IBV_ACTIVE_SPEED_EX
+        // XDR (encoding 256) overflows the uint8_t field above, which then
+        // reads 0; the extended field carries it on rdma-core builds that
+        // have one.
+        if (attr.active_speed_ex) active_speed_ = attr.active_speed_ex;
+#endif
         active_width_ = attr.active_width;
         {
             std::lock_guard<std::mutex> guard(gid_lock_);
