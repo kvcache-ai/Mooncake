@@ -216,8 +216,8 @@ struct BucketBackendConfig {
 
     // Optional hard physical cap for container quotas where fs::space() reports
     // the host filesystem instead of the volume sizeLimit / cgroup quota.
-    // When > 0, eviction also treats (max_physical_bytes - total_size_) as
-    // available space. 0 = disabled (rely on fs::space only).
+    // When > 0, eviction also caps available space using logical used bytes
+    // (total + pending eviction/write). 0 = disabled (rely on fs::space only).
     int64_t max_physical_bytes = 0;
 
     bool Validate() const;
