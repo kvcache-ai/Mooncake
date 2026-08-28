@@ -262,6 +262,46 @@ TEST_F(StorageBackendTest, CreateAcceptsValidConfig) {
     EXPECT_NE(result.value(), nullptr);
 }
 
+TEST_F(StorageBackendTest, RemoveFileSerializesWithConcurrentStore) {
+    StorageBackend backend(data_path, "unused", false);
+    const std::string value(256 * 1024, 'x');
+
+    for (size_t i = 0; i < 100; ++i) {
+        const std::string path =
+            data_path + "/concurrent_remove_" + std::to_string(i);
+        std::atomic<bool> start{false};
+        std::optional<tl::expected<std::vector<std::string>, ErrorCode>>
+            store_result;
+
+        std::thread writer([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            store_result = backend.StoreObject(path, value);
+        });
+        std::thread remover([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            backend.RemoveFile(path);
+        });
+
+        start.store(true, std::memory_order_release);
+        writer.join();
+        remover.join();
+
+        ASSERT_TRUE(store_result.has_value());
+        ASSERT_TRUE(store_result->has_value());
+        if (fs::exists(path)) {
+            std::string loaded;
+            ASSERT_TRUE(backend.LoadObject(path, loaded, value.size()));
+            EXPECT_EQ(loaded, value);
+            backend.RemoveFile(path);
+        }
+        EXPECT_FALSE(fs::exists(path));
+    }
+}
+
 class OffsetAllocatorEnvironmentTest : public StorageBackendTest {
    protected:
     OffsetAllocatorEnvironment env;
