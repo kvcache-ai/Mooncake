@@ -16,43 +16,14 @@
 #include "allocator.h"
 #include "local_ssd/persisted_state.h"
 #include "rpc_types.h"
+#include "segment/status.h"
+#include "segment/usage.h"
 #include "storage_usage.h"
 #include "types.h"
 
 namespace mooncake {
 using HostSegmentIndex =
     std::map<std::string, std::map<std::string, std::set<UUID>>>;
-
-/**
- * @brief Status of a mounted segment in master
- */
-enum class SegmentStatus {
-    UNDEFINED = 0,  // Uninitialized
-    OK,             // Segment is mounted and available for allocation
-    DRAINING,       // Segment remains readable but accepts no new allocations
-    DRAINED,        // Segment has been drained and awaits unmount
-    GRACEFULLY_UNMOUNTING,  // Readable, no new allocations, timer running
-    UNMOUNTING,             // Segment is under unmounting
-};
-
-/**
- * @brief Stream operator for SegmentStatus
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const SegmentStatus& status) noexcept {
-    static const std::unordered_map<SegmentStatus, std::string_view>
-        status_strings{
-            {SegmentStatus::UNDEFINED, "UNDEFINED"},
-            {SegmentStatus::OK, "OK"},
-            {SegmentStatus::DRAINING, "DRAINING"},
-            {SegmentStatus::DRAINED, "DRAINED"},
-            {SegmentStatus::GRACEFULLY_UNMOUNTING, "GRACEFULLY_UNMOUNTING"},
-            {SegmentStatus::UNMOUNTING, "UNMOUNTING"}};
-
-    os << (status_strings.count(status) ? status_strings.at(status)
-                                        : "UNKNOWN");
-    return os;
-}
 
 struct MountedSegment {
     Segment segment;
@@ -377,15 +348,6 @@ class SegmentSerializer {
 
    private:
     SegmentManager* segment_manager_;
-};
-
-struct StorageUsageSnapshot : StorageUsage {
-    std::map<std::string, StorageUsage> segments;
-};
-
-struct TieredStorageUsageSnapshot {
-    StorageUsageSnapshot memory;
-    StorageUsageSnapshot nof;
 };
 
 class SegmentManager {
