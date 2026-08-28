@@ -366,11 +366,12 @@ TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
 
 TEST_F(HotStandbyServiceTest, TestStart_InvalidEtcdEndpoints) {
 #ifdef STORE_USE_ETCD
+    // Empty endpoints fail synchronously in NewStoreEtcdClient (no dial).
+    // Unreachable hosts such as 127.0.0.1:1 only fail later on Get/watch.
     config_.enable_oplog_following = true;
     service_ = std::make_unique<HotStandbyService>(config_);
 
-    const ErrorCode err =
-        service_->Start("primary", "http://127.0.0.1:1", cluster_id_);
+    const ErrorCode err = service_->Start("primary", "", cluster_id_);
     EXPECT_NE(ErrorCode::OK, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #else
@@ -416,37 +417,46 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
-#ifdef STORE_USE_ETCD
+    // Live etcd dial failures are asynchronous (client construction succeeds
+    // before the first RPC). Cover the resulting FAILED transition with an
+    // injected backend that fails Get after Start returns OK.
+    auto backend = std::make_shared<FakeHaKvBackend>();
+    backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
     config_.enable_oplog_following = true;
-    service_ = std::make_unique<HotStandbyService>(config_);
+    config_.oplog_poll_interval_ms = 1;
+    config_.batch_oplog_retry_timeout_sec = 0;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
 
-    const ErrorCode err =
-        service_->Start("primary", "http://127.0.0.1:1", cluster_id_);
-    EXPECT_NE(ErrorCode::OK, err);
-    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
-#else
-    GTEST_SKIP()
-        << "CONNECTION_FAILED path requires STORE_USE_ETCD connect attempt";
-#endif
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForState(*service_, StandbyState::FAILED));
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              service_->GetSyncStatus().last_error);
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
-    config_.enable_snapshot_bootstrap = true;
+    // Start successfully, then publish an unreadable batch so the replication
+    // loop (not snapshot restore) drives the FAILED transition.
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
     config_.enable_oplog_following = true;
     config_.oplog_poll_interval_ms = 1;
-    service_ = std::make_unique<HotStandbyService>(config_);
+    config_.batch_oplog_retry_timeout_sec = 0;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
 
-    auto snapshot = MakeSnapshot("snapshot", 42, "key", 1);
-    snapshot.metadata.push_back(snapshot.metadata.front());
-    snapshot.metadata.back().metadata.size = 2;
-    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        std::optional<LoadedSnapshot>(std::move(snapshot))));
-    service_->SetCatchUpBatchKvBackendForTesting(
-        std::make_shared<FakeHaKvBackend>());
-
-    EXPECT_EQ(ErrorCode::DESERIALIZE_FAIL,
+    ASSERT_EQ(ErrorCode::OK,
               service_->Start("primary", oplog_endpoints_, cluster_id_));
-    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id_, 2),
+                           "not-a-valid-batch-record"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey(cluster_id_),
+                           EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+
+    ASSERT_TRUE(WaitForState(*service_, StandbyState::FAILED));
+    EXPECT_NE(ErrorCode::OK, service_->GetSyncStatus().last_error);
 }
 
 // ========== 6.1.3 Sync status tests ==========
@@ -860,21 +870,26 @@ TEST_F(HotStandbyServiceTest, TestReplicationLoop_UpdatesMetrics) {
     config_.oplog_poll_interval_ms = 1;
     service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
 
-    std::atomic<uint64_t> observed_applied{0};
-    service_->SetSyncStatusCallback([&](const StandbySyncStatus& status) {
-        observed_applied.store(status.applied_seq_id,
-                               std::memory_order_relaxed);
-    });
+    // Shared so Stop()/TearDown callbacks cannot outlive a stack atomic.
+    auto observed_applied = std::make_shared<std::atomic<uint64_t>>(0);
+    service_->SetSyncStatusCallback(
+        [observed_applied](const StandbySyncStatus& status) {
+            observed_applied->store(status.applied_seq_id,
+                                    std::memory_order_relaxed);
+        });
 
     ASSERT_EQ(ErrorCode::OK,
               service_->Start("primary", oplog_endpoints_, cluster_id_));
     ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
     EXPECT_EQ(static_cast<int64_t>(StandbyState::WATCHING),
               HAMetricManager::instance().get_standby_state());
-    for (int i = 0; i < 100 && observed_applied.load() < 1; ++i) {
+    for (int i = 0; i < 100 && observed_applied->load() < 1; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    EXPECT_GE(observed_applied.load(), 1u);
+    EXPECT_GE(observed_applied->load(), 1u);
+    service_->Stop();
+    service_->SetSyncStatusCallback({});
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
 }
 
 TEST_F(HotStandbyServiceTest, TestReplicationLoop_HandlesDisconnect) {
@@ -892,9 +907,13 @@ TEST_F(HotStandbyServiceTest, TestReplicationLoop_HandlesDisconnect) {
               service_->GetSyncStatus().last_error);
 }
 
-// ========== 6.1.8 Verification loop tests ==========
+// ========== 6.1.8 Verification thread lifecycle ==========
+// Production verification is not implemented yet (loop only VLOG-skips).
+// These tests cover thread start/stop only; checksum verification remains
+// skipped until the feature has observable side effects.
 
-TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenEnabled) {
+TEST_F(HotStandbyServiceTest,
+       TestVerificationThread_StartsAndStopsCleanlyWhenEnabled) {
     auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
     config_.enable_oplog_following = true;
     config_.enable_verification = true;
@@ -913,7 +932,8 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenEnabled) {
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
 }
 
-TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
+TEST_F(HotStandbyServiceTest,
+       TestVerificationThread_StopsCleanlyWhenDisabled) {
     auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
     config_.enable_oplog_following = true;
     config_.enable_verification = false;
@@ -1121,11 +1141,7 @@ TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
               batch_backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
                                   EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
 
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state; "
-                        "skipping promotion test";
-    }
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", oplog_endpoints_, cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
 
     StandbySnapshot out;
@@ -1213,11 +1229,8 @@ TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
     }
     service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
 
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state; "
-                        "skipping promotion test";
-    }
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", oplog_endpoints_, cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
 
     StandbySnapshot out;
     ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
