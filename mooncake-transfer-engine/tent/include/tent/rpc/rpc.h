@@ -37,16 +37,16 @@ namespace tent {
 
 enum RpcFuncID {
     GetSegmentDesc = 1,
-    BootstrapRdma,
-    SendData,
-    RecvData,
-    Notify,
-    Probe,
-    Delegate,
-    Pin,
-    Unpin,
-    SubscribeSegmentUpdate,
-    NotifySegmentUpdated,
+    BootstrapRdma = 2,
+    SendData = 3,
+    RecvData = 4,
+    Notify = 5,
+    Delegate = 6,
+    Pin = 7,
+    Unpin = 8,
+    Probe = 9,
+    SubscribeSegmentUpdate = 10,
+    NotifySegmentUpdated = 11,
 };
 
 class ClientPool;
