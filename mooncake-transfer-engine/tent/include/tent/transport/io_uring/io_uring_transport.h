@@ -39,7 +39,7 @@ struct IOUringTask {
     void *buffer = nullptr;
     // The kernel may read the iovec asynchronously at execution time, so it
     // must live as long as the task (i.e. until the completion is reaped).
-    struct iovec iov {};
+    struct iovec iov{};
 
     ~IOUringTask() {
         if (buffer) free(buffer);
