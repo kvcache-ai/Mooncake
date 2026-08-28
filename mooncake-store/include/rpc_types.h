@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <string>
+#include <ylt/struct_pack/compatible.hpp>
 
 #include "types.h"
 #include "replica.h"
@@ -34,11 +35,10 @@ struct GetReplicaListRequestConfig {
     size_t max_candidates = RETURN_ALL_CANDIDATES;
     std::optional<P2PGetReplicaListConfigExtra> p2p_config;
     // Per-request correlation id propagated store -> master (read path).
-    // Filled by the client from the thread-local RequestContext; read by the
-    // master for tracing/logging. Note: changes the struct_pack wire schema,
-    // so client and master must be built together (non-gray; attachment-based
-    // propagation is reserved for Phase 2 in plan.md).
-    std::string request_id;
+    // Carried as a struct_pack::compatible field: forward/backward compatible
+    // on the wire (old peers ignore the extra field; new peers see it null
+    // when absent), so client and master can be upgraded independently (gray).
+    struct_pack::compatible<std::string> request_id;
 };
 YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config, request_id);
 

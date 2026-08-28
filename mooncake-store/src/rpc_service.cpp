@@ -305,7 +305,7 @@ WrappedMasterService::GetReplicaList(
     return execute_rpc(
         "GetReplicaList",
         [&] { return GetMasterService().GetReplicaList(key, config); },
-        [&](auto& timer) { timer.LogRequest("key=", key, ", request_id=", config.request_id); },
+        [&](auto& timer) { timer.LogRequest("key=", key, ", request_id=", config.request_id.value_or("")); },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
         [] {
             MasterMetricManager::instance().inc_get_replica_list_failures();
@@ -318,7 +318,7 @@ WrappedMasterService::BatchGetReplicaList(
     const GetReplicaListRequestConfig& config) {
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_requests = keys.size();
-    timer.LogRequest("requests_count=", total_requests, ", request_id=", config.request_id);
+    timer.LogRequest("requests_count=", total_requests, ", request_id=", config.request_id.value_or(""));
     MasterMetricManager::instance().inc_batch_get_replica_list_requests(
         total_requests);
 
