@@ -202,6 +202,17 @@ if(STORE_USE_K8S_LEASE)
       "${CMAKE_BINARY_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.h")
 endif()
 
+# NoF support code that is SPDK-free (page-registration bookkeeping and
+# probe-context pooling). Built in every configuration so unit tests can
+# exercise it without SPDK; both mooncake_store and mooncake_nof_spdk link
+# it (the latter cannot link mooncake_store — that would be a cycle).
+add_library(mooncake_nof_core STATIC nof/page_registry.cpp
+                                     nof/probe_context_pool.cpp)
+target_include_directories(mooncake_nof_core
+                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(mooncake_nof_core PUBLIC glog::glog
+                                               yalantinglibs::yalantinglibs)
+
 if(USE_NOF)
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
@@ -284,8 +295,9 @@ if(USE_NOF)
     mooncake_nof_spdk
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include
     PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
-  target_link_libraries(mooncake_nof_spdk PRIVATE ${SPDK_STATIC_LIBS}
-                                                   glog::glog)
+  target_link_libraries(mooncake_nof_spdk
+                        PRIVATE ${SPDK_STATIC_LIBS} glog::glog
+                                mooncake_nof_core yalantinglibs::yalantinglibs)
 
   # spdk_mem_register (SPDK >= 22.05) compile-time probe.
   # CMAKE_TRY_COMPILE_TARGET_TYPE was added in CMake 3.6 (project requires
@@ -346,6 +358,7 @@ target_link_libraries(
          yaml-cpp
          asio_shared
          mooncake_common
+         mooncake_nof_core
          yalantinglibs::yalantinglibs
   PRIVATE transfer_engine JsonCpp::JsonCpp)
 if(STORE_USE_ETCD)
