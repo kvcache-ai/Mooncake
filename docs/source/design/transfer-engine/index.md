@@ -557,6 +557,14 @@ kunpeng_ub_transport
 sunrise_link_transport
 :::
 
+## FlagOS FlagCX Transport Component
+
+:::{toctree}
+:maxdepth: 1
+
+flagcx_transport
+:::
+
 ## MPComm Transport Component
 
 ::::{toctree}

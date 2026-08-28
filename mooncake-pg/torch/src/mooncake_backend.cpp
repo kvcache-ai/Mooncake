@@ -446,8 +446,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::launchCollective(
     const bool is_captured = captureStatus != cudaStreamCaptureStatusNone ||
                              at::cuda::currentStreamCaptureStatus() !=
                                  c10::cuda::CaptureStatus::None;
-    work_tracker_->notifyCapture(is_captured);
-    if (!is_captured) {
+    if (is_captured) {
+        work_tracker_->notifyCapture(true);
+    } else {
         work_tracker_->evictCompleted();
     }
     return c10::make_intrusive<MooncakeWorkCuda>(
