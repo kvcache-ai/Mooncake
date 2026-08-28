@@ -223,11 +223,20 @@ jobs:
           if [ "${VARIANT_FLAG:-}" = "NON_CUDA_BUILD" ]; then
             site_packages=$("$smoke_venv/bin/python" -c \
               'import sysconfig; print(sysconfig.get_paths()["purelib"])')
-            master="$site_packages/mooncake/mooncake_master"
-            if readelf -d "$master" | grep -Eq \
-              'Shared library: \[(libcuda|libcudart)\.so'; then
-              echo "Non-CUDA mooncake_master depends on CUDA"
-              readelf -d "$master" | grep 'Shared library:'
+            cuda_dependency_found=false
+            for package_path in "$site_packages"/mooncake*; do
+              [ -e "$package_path" ] || continue
+              while IFS= read -r -d '' file; do
+                cuda_dependencies=$(readelf -d "$file" 2>/dev/null | grep -E \
+                  'Shared library: \[(libcuda|libcudart|libcublas|libcufft|libcurand|libcusolver|libcusparse|libcufile|libcupti|libnvrtc|libnvJitLink|libnvToolsExt|libnvfatbin|libnvidia|libnccl)\.so' || true)
+                if [ -n "$cuda_dependencies" ]; then
+                  echo "::error file=$file::Non-CUDA wheel artifact depends on CUDA"
+                  echo "$cuda_dependencies"
+                  cuda_dependency_found=true
+                fi
+              done < <(find "$package_path" -type f -print0)
+            done
+            if [ "$cuda_dependency_found" = true ]; then
               exit 1
             fi
           fi
