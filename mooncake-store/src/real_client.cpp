@@ -102,6 +102,12 @@ bool ReleasePinnedRegionsForFree(
     return safe_to_free;
 }
 
+// Backing slot for RealClient::SetNofRuntimeFactoryForTesting.
+std::function<NofRuntime()> &NofRuntimeFactoryForTestingSlot() {
+    static std::function<NofRuntime()> factory;
+    return factory;
+}
+
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
@@ -604,6 +610,11 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+void RealClient::SetNofRuntimeFactoryForTesting(
+    std::function<NofRuntime()> factory) {
+    NofRuntimeFactoryForTestingSlot() = std::move(factory);
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -629,8 +640,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
-    // Env 首次使用时惰性初始化,setup 不再快速失败(兼容性 C-1)。
-    nof_runtime_ = CreateNofRuntime();
+    // The SPDK env initializes lazily on first use, so setup no longer
+    // fail-fasts.
+    auto &nof_factory = NofRuntimeFactoryForTestingSlot();
+    nof_runtime_ = nof_factory ? nof_factory() : CreateNofRuntime();
 
     std::optional<std::string> device_name =
         ((rdma_devices.empty() || rdma_devices == "auto-discovery")
@@ -722,9 +735,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    // 评审 #2:仅当 NoF 真正可用时才注入 SPDK DMA allocator;否则传 nullptr,
-    // 让 allocate_buffer_allocator_memory 落到与今天 use_spdk_dma=false
-    // 完全相同的路径(协议专用分配 → VRAM → aligned_alloc)。
+    // Inject the SPDK DMA allocator only when NoF is actually available;
+    // otherwise pass nullptr so allocate_buffer_allocator_memory falls
+    // through to exactly the same path as use_spdk_dma=false today
+    // (protocol-specific allocation -> VRAM -> aligned_alloc).
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
         nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
@@ -1195,6 +1209,24 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
     // Reset all resources
     client_.reset();
+    // NoF I/O is drained by now: destroying client_ destroys the transfer
+    // engine, and NofWorkerPool workers only exit once every outstanding
+    // sub-I/O has completed. Release this client's SPDK registrations so a
+    // closed client never leaves orphan entries in the process-global page
+    // registry — its buffers may be freed or remapped afterwards, and
+    // another client could otherwise reuse stale translation state.
+    if (nof_runtime_.initiator) {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        for (const auto &[buffer, size] : registered_buffer_sizes_) {
+            auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
+            if (rc != ErrorCode::OK) {
+                LOG(WARNING) << "Failed to release NoF registration for "
+                                "buffer "
+                             << buffer << " on teardown: " << toString(rc);
+            }
+        }
+        registered_buffer_sizes_.clear();
+    }
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -3217,9 +3249,10 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     if (!result) {
         return result;
     }
-    // #3131: SPDK 的 RDMA 传输维护独立的 translation table,TE 注册对它
-    // 不可见。TE 注册成功后,向 initiator 注册;失败则回滚 TE 注册,
-    // 不留半注册状态。
+    // #3131: SPDK's RDMA transport keeps its own translation table, which TE
+    // registration does not cover. Once TE registration succeeds, register
+    // with the initiator; on failure roll back the TE registration so no
+    // half-registered state is left behind.
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->RegisterMemory(buffer, size);
         if (rc != ErrorCode::OK) {
@@ -3260,7 +3293,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
         if (rc != ErrorCode::OK) {
-            // 已无法回滚 TE 注销;告警并继续(与既有 unregister 失败同级)。
+            // The TE unregistration can no longer be rolled back; warn and
+            // continue (same severity as existing unregister failures).
             LOG(WARNING) << "Initiator memory unregistration failed: "
                          << toString(rc);
         }
