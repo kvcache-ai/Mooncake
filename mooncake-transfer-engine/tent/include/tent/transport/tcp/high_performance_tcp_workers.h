@@ -44,7 +44,7 @@ class HighPerformanceTcpAdmissionController {
     uint64_t tasks_{0};
     uint64_t bytes_{0};
     bool accepting_{true};
-    bool failed_{false};
+    std::atomic<bool> failed_{false};
 };
 
 // Thin owner-thread pool for sockets. ASIO is the queue; this class adds

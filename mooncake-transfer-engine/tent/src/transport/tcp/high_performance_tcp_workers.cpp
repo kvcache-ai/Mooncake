@@ -16,7 +16,7 @@ Status HighPerformanceTcpAdmissionController::tryReserve(uint64_t tasks,
             "HP TCP admission reservation must be non-zero" LOC_MARK);
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    if (failed_) {
+    if (failed_.load(std::memory_order_acquire)) {
         return Status::InternalError(
             "HP TCP admission accounting is failed" LOC_MARK);
     }
@@ -43,7 +43,7 @@ void HighPerformanceTcpAdmissionController::release(uint64_t tasks,
             // Do not manufacture a drained state. A double release is a
             // lifecycle invariant violation; preserving the counters keeps
             // shutdown from treating live work as retired.
-            failed_ = true;
+            failed_.store(true, std::memory_order_release);
             notify_waiters = true;
         } else {
             tasks_ -= tasks;
@@ -61,9 +61,11 @@ void HighPerformanceTcpAdmissionController::close() {
 
 Status HighPerformanceTcpAdmissionController::waitForZero() {
     std::unique_lock<std::mutex> lock(mutex_);
-    zero_cv_.wait(lock,
-                  [&] { return failed_ || (tasks_ == 0 && bytes_ == 0); });
-    if (failed_) {
+    zero_cv_.wait(lock, [&] {
+        return failed_.load(std::memory_order_acquire) ||
+               (tasks_ == 0 && bytes_ == 0);
+    });
+    if (failed_.load(std::memory_order_acquire)) {
         return Status::InternalError(
             "HP TCP admission accounting is failed" LOC_MARK);
     }
@@ -71,8 +73,7 @@ Status HighPerformanceTcpAdmissionController::waitForZero() {
 }
 
 bool HighPerformanceTcpAdmissionController::failed() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return failed_;
+    return failed_.load(std::memory_order_acquire);
 }
 
 uint64_t HighPerformanceTcpAdmissionController::outstandingTasks() const {
