@@ -182,6 +182,28 @@ TEST(DeviceSelectorAvailabilityTest, UnavailableDeviceLeavesAggregate) {
     EXPECT_DOUBLE_EQ(sel->getAggregateEwmaBandwidth(), 25e9);
 }
 
+// getNicLoadStats() is the load signal upper layers score NICs with
+// (#2996, for #2516). A NIC that cannot carry traffic must not appear in it
+// at all: its seed is meaningless and, with zero inflight, would look like
+// the best NIC of the lot -- the same bad pick the aggregate avoids.
+TEST(DeviceSelectorAvailabilityTest, UnavailableDeviceLeavesLoadStats) {
+    auto sel = makeTwoNicSelector();
+    std::vector<NicLoadStats> stats;
+    ASSERT_TRUE(sel->getNicLoadStats(stats).ok());
+    ASSERT_EQ(stats.size(), 2u);
+
+    ASSERT_TRUE(sel->setDeviceAvailable(kDev1, false).ok());
+    stats.clear();
+    ASSERT_TRUE(sel->getNicLoadStats(stats).ok());
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_EQ(stats[0].device_name, "mlx5_0");
+
+    ASSERT_TRUE(sel->setDeviceAvailable(kDev1, true).ok());
+    stats.clear();
+    ASSERT_TRUE(sel->getNicLoadStats(stats).ok());
+    EXPECT_EQ(stats.size(), 2u);
+}
+
 TEST(DeviceSelectorAvailabilityTest, UnavailableDeviceIsNeverAllocated) {
     auto sel = makeTwoNicSelector();
     auto both = countAllocations(*sel, 64);

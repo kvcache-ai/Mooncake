@@ -391,6 +391,10 @@ Status DeviceSelector::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     // devices_ is populated during topology load and remains stable while
     // transfers update the per-device atomic counters below.
     for (const auto& [dev_id, dev] : devices_) {
+        // Same rule as the aggregate: a NIC that cannot carry traffic has
+        // no meaningful load or bandwidth to report, and with zero inflight
+        // it would score as the best NIC of the lot.
+        if (!dev.available.load(std::memory_order_relaxed)) continue;
         std::string device_name = local_topology_->getNicName(dev_id);
         if (device_name.empty()) device_name = std::to_string(dev_id);
         stats.push_back(NicLoadStats{
