@@ -8,12 +8,12 @@ dynamic lane scheduling.
 
 ## Architecture
 
-Each worker owns one `asio::io_context` and one thread. Each peer advances its
-own round-robin cursor across a configured number of persistent lanes. A stable
-hash of peer and lane selects the owner; socket state never moves between
-workers, and operations on a lane are FIFO. ASIO provides the event queue;
-process-wide task and byte admission limits bound all accepted work, including
-callbacks waiting in that queue.
+Each worker owns one `asio::io_context` and one thread. Each peer has a
+configured number of persistent lanes, and request IDs distribute operations
+across them. A stable hash of peer and lane selects the owner; socket state
+never moves between workers, and operations on a lane are FIFO. ASIO provides
+the event queue; process-wide task and byte admission limits bound all accepted
+work, including callbacks waiting in that queue.
 
 The server uses the same worker pool. Accepted sockets are assigned to workers
 and stored in worker-owned session sets. A global connection limit bounds live
@@ -38,10 +38,9 @@ and a monotonic sequence, plus a remote permission. This prevents a stale ID
 from a previous server incarnation from becoming valid after restart. The
 target validates the ID, range and permission before access. An operation holds
 a lease until its final I/O callback retires; unregister hides the range from
-new work and waits for existing leases. Stale registration metadata, or an
-endpoint failure proven to occur before any request byte was written, causes
-one bounded metadata refresh and retry on the same transport. Permission and
-range failures are terminal.
+new work and waits for existing leases. Stale registration metadata causes one
+bounded metadata refresh and retry on the same transport. Permission and range
+failures are terminal.
 
 If a WRITE request may have reached the peer but no valid acknowledgement is
 received, the remote outcome is unknown. That failure is terminal and is not
@@ -83,7 +82,7 @@ The transport is configured under `transports.hp_tcp`:
 
 | Field | Meaning |
 | --- | --- |
-| `enable` | Enable `hp_tcp`. It may coexist with standard `tcp`; their data paths remain separate and notification delivery is aggregated by the engine. |
+| `enable` | Enable `hp_tcp`; set `transports.tcp.enable` to `false`. The two transports cannot be enabled together because control-plane notification ownership is singular. |
 | `bind_address`, `advertise_address`, `port` | Listener and published endpoint. |
 | `worker_count` | ASIO event-loop threads. |
 | `connections_per_peer` | Persistent lanes per peer. |
@@ -92,6 +91,5 @@ The transport is configured under `transports.hp_tcp`:
 | `connect_timeout_ms`, `progress_timeout_ms` | Connection and I/O deadlines. |
 
 Tests cover wire validation, admission, buffer leases, connection reuse,
-session reaping, client/server timeout, stale-registration and endpoint
-recovery, notification routing, ambiguous WRITE completion and a two-process
-READ/WRITE smoke test.
+session reaping, client/server timeout, stale-registration recovery, ambiguous
+WRITE completion and a two-process READ/WRITE smoke test.

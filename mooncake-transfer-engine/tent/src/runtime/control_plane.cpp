@@ -340,13 +340,6 @@ void ControlService::setNotifyCallback(const OnNotify& callback) {
     notify_callback_ = callback;
 }
 
-void ControlService::drainNotifications(
-    std::vector<Notification>& notifications) {
-    std::lock_guard<std::mutex> guard(notify_cb_mutex_);
-    notifications.clear();
-    notifications.swap(pending_notifications_);
-}
-
 void ControlService::finishBootstrapCallback() {
     std::lock_guard<std::mutex> guard(bootstrap_cb_mutex_);
     --bootstrap_callbacks_in_flight_;
@@ -477,25 +470,23 @@ void ControlService::onRecvData(const std::string_view& request,
 void ControlService::onNotify(const std::string_view& request,
                               std::string& response) {
     (void)response;
+    OnNotify callback;
+    {
+        std::lock_guard<std::mutex> guard(notify_cb_mutex_);
+        if (!notify_callback_) return;
+        callback = notify_callback_;
+        ++notify_callbacks_in_flight_;
+    }
+
+    const ControlService* previous_service = active_notify_service_;
+    active_notify_service_ = this;
+    CallbackInvocationGuard invocation_guard([this, previous_service] {
+        active_notify_service_ = previous_service;
+        finishNotifyCallback();
+    });
+
     try {
         Notification message = json::parse(request).get<Notification>();
-        OnNotify callback;
-        {
-            std::lock_guard<std::mutex> guard(notify_cb_mutex_);
-            if (!notify_callback_) {
-                pending_notifications_.push_back(std::move(message));
-                return;
-            }
-            callback = notify_callback_;
-            ++notify_callbacks_in_flight_;
-        }
-
-        const ControlService* previous_service = active_notify_service_;
-        active_notify_service_ = this;
-        CallbackInvocationGuard invocation_guard([this, previous_service] {
-            active_notify_service_ = previous_service;
-            finishNotifyCallback();
-        });
         callback(message);
     } catch (const std::exception& e) {
         LOG(ERROR) << "onNotify failed: " << e.what();

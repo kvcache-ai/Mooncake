@@ -7,9 +7,7 @@ namespace mooncake::tent {
 
 bool HighPerformanceTcpTaskState::completeOnce(
     TransferStatusEnum terminal, size_t bytes,
-    std::optional<HighPerformanceTcpStatus> remote_status,
-    bool pre_request_endpoint_failure,
-    bool remote_write_outcome_unknown) noexcept {
+    std::optional<HighPerformanceTcpStatus> remote_status) noexcept {
     if (terminal == INITIAL || terminal == PENDING || terminal == INVALID) {
         terminal = FAILED;
         bytes = 0;
@@ -31,10 +29,6 @@ bool HighPerformanceTcpTaskState::completeOnce(
         *remote_status != HighPerformanceTcpStatus::kOk) {
         remote_status_.store(*remote_status, std::memory_order_relaxed);
     }
-    pre_request_endpoint_failure_.store(pre_request_endpoint_failure,
-                                        std::memory_order_relaxed);
-    remote_write_outcome_unknown_.store(remote_write_outcome_unknown,
-                                        std::memory_order_relaxed);
     local_lease_.reset();
 
     if (reservation_active_.exchange(false, std::memory_order_acq_rel)) {

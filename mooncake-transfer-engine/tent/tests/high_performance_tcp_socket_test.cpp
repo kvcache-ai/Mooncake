@@ -21,17 +21,14 @@ struct Completion {
     std::atomic<bool> done{false};
     TransferStatusEnum status{PENDING};
     size_t bytes{0};
-    bool pre_request_endpoint_failure{false};
-    bool remote_write_outcome_unknown{false};
+    std::optional<HighPerformanceTcpStatus> protocol_status;
 
     auto callback() {
         return [this](TransferStatusEnum value, size_t count,
-                      std::optional<HighPerformanceTcpStatus>,
-                      bool endpoint_failure, bool write_outcome_unknown) {
+                      std::optional<HighPerformanceTcpStatus> result) {
             status = value;
             bytes = count;
-            pre_request_endpoint_failure = endpoint_failure;
-            remote_write_outcome_unknown = write_outcome_unknown;
+            protocol_status = result;
             done.store(true, std::memory_order_release);
         };
     }
@@ -132,7 +129,7 @@ HighPerformanceTcpClient::Operation Operation(
 }
 
 TEST(HighPerformanceTcpSocketTest, WriteReadAndReuseConnection) {
-    Runtime runtime;
+    Runtime runtime(/*max_connections=*/16, /*timeout_ms=*/100);
     runtime.start();
     std::array<uint8_t, 1024> remote{};
     std::array<uint8_t, 1024> source{};
@@ -156,6 +153,9 @@ TEST(HighPerformanceTcpSocketTest, WriteReadAndReuseConnection) {
     EXPECT_EQ(write.status, COMPLETED);
     EXPECT_TRUE(SocketOrderedEqual(remote, source));
 
+    std::this_thread::sleep_for(300ms);
+    ASSERT_EQ(runtime.server.activeSessionsForTest(), 1u);
+
     Completion read;
     ASSERT_TRUE(
         runtime
@@ -167,49 +167,6 @@ TEST(HighPerformanceTcpSocketTest, WriteReadAndReuseConnection) {
     ASSERT_TRUE(read.wait());
     EXPECT_EQ(read.status, COMPLETED);
     EXPECT_TRUE(SocketOrderedEqual(destination, source));
-    EXPECT_EQ(runtime.client.connectionsCreatedForTest(), 1u);
-}
-
-TEST(HighPerformanceTcpSocketTest, IdlePersistentConnectionRemainsReusable) {
-    Runtime runtime(/*max_connections=*/16, /*timeout_ms=*/100);
-    runtime.start();
-    std::array<uint8_t, 8> remote{};
-    std::array<uint8_t, 8> first{};
-    std::array<uint8_t, 8> second{};
-    remote.fill(0x5a);
-    uint64_t registration = 0;
-    ASSERT_TRUE(runtime.registry
-                    .add(reinterpret_cast<uint64_t>(remote.data()),
-                         remote.size(), kGlobalReadOnly, &registration)
-                    .ok());
-
-    Completion first_completion;
-    ASSERT_TRUE(
-        runtime
-            .submit(Operation(first.data(), first.size(),
-                              reinterpret_cast<uint64_t>(remote.data()),
-                              registration, 10, HighPerformanceTcpOpcode::kRead,
-                              &first_completion, runtime.port))
-            .ok());
-    ASSERT_TRUE(first_completion.wait());
-    ASSERT_EQ(first_completion.status, COMPLETED);
-    ASSERT_EQ(runtime.client.connectionsCreatedForTest(), 1u);
-
-    std::this_thread::sleep_for(300ms);
-    ASSERT_EQ(runtime.server.activeSessionsForTest(), 1u);
-
-    Completion second_completion;
-    ASSERT_TRUE(
-        runtime
-            .submit(Operation(second.data(), second.size(),
-                              reinterpret_cast<uint64_t>(remote.data()),
-                              registration, 11, HighPerformanceTcpOpcode::kRead,
-                              &second_completion, runtime.port))
-            .ok());
-    ASSERT_TRUE(second_completion.wait());
-    EXPECT_EQ(second_completion.status, COMPLETED);
-    EXPECT_TRUE(SocketOrderedEqual(first, remote));
-    EXPECT_TRUE(SocketOrderedEqual(second, remote));
     EXPECT_EQ(runtime.client.connectionsCreatedForTest(), 1u);
 }
 
@@ -309,7 +266,7 @@ TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
     ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());
     EXPECT_EQ(completion.status, TIMEOUT);
-    EXPECT_FALSE(completion.pre_request_endpoint_failure);
+    EXPECT_FALSE(completion.protocol_status.has_value());
     EXPECT_TRUE(client.cancelAll().ok());
     EXPECT_TRUE(workers.stop().ok());
     peer.join();
@@ -347,42 +304,11 @@ TEST(HighPerformanceTcpSocketTest,
     ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());
     EXPECT_EQ(completion.status, FAILED);
-    EXPECT_FALSE(completion.pre_request_endpoint_failure);
-    EXPECT_TRUE(completion.remote_write_outcome_unknown);
+    EXPECT_EQ(completion.protocol_status,
+              HighPerformanceTcpStatus::kInternalError);
     EXPECT_TRUE(client.cancelAll().ok());
     EXPECT_TRUE(workers.stop().ok());
     peer.join();
-}
-
-TEST(HighPerformanceTcpSocketTest,
-     ConnectFailureIsMarkedAsPreRequestEndpointFailure) {
-    asio::io_context peer_io;
-    asio::ip::tcp::acceptor unused(peer_io, {asio::ip::tcp::v4(), 0});
-    const uint16_t unused_port = unused.local_endpoint().port();
-    unused.close();
-
-    HighPerformanceTcpWorkers workers({.worker_count = 1});
-    ASSERT_TRUE(workers.start().ok());
-    HighPerformanceTcpClient client({4096, 128, 100, 100, 1}, &workers);
-    std::array<uint8_t, 64> local{};
-    Completion completion;
-    auto operation =
-        Operation(local.data(), local.size(), 0x1000, 1, 30,
-                  HighPerformanceTcpOpcode::kRead, &completion, unused_port);
-    std::vector<HighPerformanceTcpWorkers::Command> commands;
-    commands.push_back({.worker_id = 0,
-                        .run =
-                            [&](size_t) mutable {
-                                client.enqueueOnOwner(0, std::move(operation));
-                            },
-                        .cancel = {}});
-    ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
-    ASSERT_TRUE(completion.wait());
-    EXPECT_EQ(completion.status, FAILED);
-    EXPECT_TRUE(completion.pre_request_endpoint_failure);
-    EXPECT_FALSE(completion.remote_write_outcome_unknown);
-    EXPECT_TRUE(client.cancelAll().ok());
-    EXPECT_TRUE(workers.stop().ok());
 }
 
 TEST(HighPerformanceTcpSocketTest, EmptyAndPartialHeadersReleaseSlot) {

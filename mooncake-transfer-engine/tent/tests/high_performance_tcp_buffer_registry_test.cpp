@@ -18,7 +18,7 @@ TEST(HighPerformanceTcpBufferRegistryTest, EnforcesPermissionAndRegistration) {
     ASSERT_TRUE(registry.add(base, data.size(), kGlobalReadOnly, &id).ok());
 
     HighPerformanceTcpBufferRegistry::Lease lease;
-    HighPerformanceTcpBufferRegistry::AcquireFailure failure;
+    HighPerformanceTcpStatus failure;
     ASSERT_TRUE(registry
                     .acquireRemoteLease(base, data.size(), id,
                                         HighPerformanceTcpOpcode::kRead, &lease,
@@ -30,17 +30,13 @@ TEST(HighPerformanceTcpBufferRegistryTest, EnforcesPermissionAndRegistration) {
                                          HighPerformanceTcpOpcode::kWrite,
                                          &lease, &failure)
                      .ok());
-    EXPECT_EQ(
-        failure,
-        HighPerformanceTcpBufferRegistry::AcquireFailure::kPermissionDenied);
+    EXPECT_EQ(failure, HighPerformanceTcpStatus::kPermissionDenied);
     EXPECT_FALSE(registry
                      .acquireRemoteLease(base, data.size(), id + 1,
                                          HighPerformanceTcpOpcode::kRead,
                                          &lease, &failure)
                      .ok());
-    EXPECT_EQ(
-        failure,
-        HighPerformanceTcpBufferRegistry::AcquireFailure::kStaleRegistration);
+    EXPECT_EQ(failure, HighPerformanceTcpStatus::kStaleRegistration);
 }
 
 TEST(HighPerformanceTcpBufferRegistryTest,
@@ -62,15 +58,13 @@ TEST(HighPerformanceTcpBufferRegistryTest,
     ASSERT_NE(stale_id, current_id);
 
     HighPerformanceTcpBufferRegistry::Lease lease;
-    HighPerformanceTcpBufferRegistry::AcquireFailure failure;
+    HighPerformanceTcpStatus failure;
     EXPECT_FALSE(current
                      .acquireRemoteLease(base, data.size(), stale_id,
                                          HighPerformanceTcpOpcode::kRead,
                                          &lease, &failure)
                      .ok());
-    EXPECT_EQ(
-        failure,
-        HighPerformanceTcpBufferRegistry::AcquireFailure::kStaleRegistration);
+    EXPECT_EQ(failure, HighPerformanceTcpStatus::kStaleRegistration);
     EXPECT_TRUE(current
                     .acquireRemoteLease(base, data.size(), current_id,
                                         HighPerformanceTcpOpcode::kRead, &lease,

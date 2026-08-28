@@ -21,40 +21,29 @@ namespace mooncake::tent {
 class HighPerformanceTcpTaskState {
    public:
     HighPerformanceTcpTaskState(
-        Request request, BatchID progress_batch_id,
+        uint64_t reserved_bytes, BatchID progress_batch_id,
         std::function<void(BatchID)> notify_progress,
         HighPerformanceTcpBufferRegistry::Lease local_lease)
-        : request_(std::move(request)),
-          progress_batch_id_(progress_batch_id),
+        : progress_batch_id_(progress_batch_id),
           notify_progress_(std::move(notify_progress)),
-          local_lease_(std::move(local_lease)) {}
+          local_lease_(std::move(local_lease)),
+          reserved_bytes_(reserved_bytes) {}
 
     HighPerformanceTcpTaskState(const HighPerformanceTcpTaskState&) = delete;
     HighPerformanceTcpTaskState& operator=(const HighPerformanceTcpTaskState&) =
         delete;
 
-    void activateReservation(HighPerformanceTcpAdmissionController* admission,
-                             uint64_t bytes) noexcept {
+    void activateReservation(
+        HighPerformanceTcpAdmissionController* admission) noexcept {
         admission_ = admission;
-        reserved_bytes_ = bytes;
         reservation_active_.store(true, std::memory_order_release);
     }
 
-    bool completeOnce(
-        TransferStatusEnum terminal, size_t bytes,
-        std::optional<HighPerformanceTcpStatus> remote_status = std::nullopt,
-        bool pre_request_endpoint_failure = false,
-        bool remote_write_outcome_unknown = false) noexcept;
+    bool completeOnce(TransferStatusEnum terminal, size_t bytes,
+                      std::optional<HighPerformanceTcpStatus> remote_status =
+                          std::nullopt) noexcept;
     TransferStatus snapshot() const noexcept;
     std::optional<HighPerformanceTcpStatus> remoteStatus() const noexcept;
-    bool preRequestEndpointFailure() const noexcept {
-        return pre_request_endpoint_failure_.load(std::memory_order_acquire);
-    }
-    bool remoteWriteOutcomeUnknown() const noexcept {
-        return remote_write_outcome_unknown_.load(std::memory_order_acquire);
-    }
-
-    const Request& request() const noexcept { return request_; }
 
     void setDispatchIdentity(size_t owner_worker,
                              uint64_t request_id) noexcept {
@@ -72,13 +61,10 @@ class HighPerformanceTcpTaskState {
     }
 
    private:
-    Request request_;
     std::atomic<TransferStatusEnum> status_{PENDING};
     std::atomic<size_t> bytes_{0};
     std::atomic<HighPerformanceTcpStatus> remote_status_{
         HighPerformanceTcpStatus::kOk};
-    std::atomic<bool> pre_request_endpoint_failure_{false};
-    std::atomic<bool> remote_write_outcome_unknown_{false};
     std::atomic<bool> completion_claimed_{false};
     std::atomic<bool> cancel_requested_{false};
 

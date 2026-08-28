@@ -7,7 +7,6 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "tent/runtime/hp_tcp_transport_config.h"
@@ -75,12 +74,11 @@ class HighPerformanceTcpTransport final : public Transport {
     struct TaskPlan;
 
     Status validateParams() const;
-    Status selectLaneForPeer(SegmentID peer_id, uint32_t* lane_id);
     Status planTask(const Request& request, HighPerformanceTcpSubBatch* batch,
                     TaskPlan* plan);
     Status rollbackPublishedEndpoint(
         const std::optional<std::string>& previous_attr);
-    Status stopRuntime(bool close_registry);
+    Status stopRuntime();
     std::string makeIncarnation() const;
 
     HighPerformanceTcpParams params_;
@@ -93,11 +91,12 @@ class HighPerformanceTcpTransport final : public Transport {
     HighPerformanceTcpBufferRegistry registry_;
 
     std::atomic<uint64_t> next_request_id_{1};
-    std::mutex lane_cursor_mutex_;
-    std::unordered_map<SegmentID, size_t> next_lane_by_peer_;
     std::atomic<bool> installed_{false};
     std::atomic<bool> stopping_{false};
     mutable std::mutex lifecycle_mutex_;
+
+    RWSpinlock notify_lock_;
+    std::vector<Notification> notifications_;
 };
 
 }  // namespace mooncake::tent

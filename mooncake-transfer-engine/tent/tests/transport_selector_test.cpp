@@ -171,32 +171,6 @@ TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
         << "Should use first in buffer_transports";
 }
 
-TEST(TransportSelectorTest, ExplicitMemoryPolicyCanSelectHpTcp) {
-    auto conf = std::make_shared<Config>();
-    ASSERT_TRUE(
-        conf->load(
-                R"({"policy":[{"name":"hp_tcp_memory","segment_type":"memory","transports":["hp_tcp"]}]})")
-            .ok());
-    TransportSelector selector(conf);
-
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
-        transports{};
-    transports[HP_TCP] = std::make_shared<FakeTransport>(HP_TCP);
-    static_cast<FakeTransport*>(transports[HP_TCP].get())->setDramToDram(true);
-
-    const std::vector<TransportType> buffer_transports = {HP_TCP};
-    SelectionContext ctx;
-    ctx.segment_type = SegmentType::Memory;
-    ctx.same_machine = false;
-    ctx.local_memory_type = MTYPE_CPU;
-    ctx.remote_memory_type = MTYPE_CPU;
-    ctx.buffer_transports = &buffer_transports;
-    ctx.transfer_size = 4096;
-    ctx.priority_level = 0;
-
-    EXPECT_EQ(selector.select(ctx, transports).transport, HP_TCP);
-}
-
 // ---------------------------------------------------------------------------
 // Test transport type name parsing
 // ---------------------------------------------------------------------------
@@ -650,34 +624,18 @@ TEST(TransportSelectorTest, RocmMemoryTypeSupported) {
 
 TEST(TransportSelectorTest, ConfigBasedPolicySelection) {
     auto conf = std::make_shared<Config>();
-
-    // Set up a custom policy via JSON config
-    conf->set("policy", json::array());
-    auto policies = conf->getArray<json>("policy");
-
-    json policy;
-    policy["name"] = "test_memory_policy";
-    policy["segment_type"] = "memory";
-    policy["transports"] = {"tcp", "rdma"};  // Prefer TCP over RDMA
-
-    // We can't easily modify the config's internal JSON structure,
-    // so this test verifies the selector at least loads without error
-
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"hp_tcp_memory","segment_type":"memory","transports":["hp_tcp"]}]})")
+            .ok());
     TransportSelector selector(conf);
 
-    // Default behavior should still work
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transports{};
-    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
-    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    transports[HP_TCP] = std::make_shared<FakeTransport>(HP_TCP);
+    static_cast<FakeTransport*>(transports[HP_TCP].get())->setDramToDram(true);
 
-    auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->setDramToDram(true);
-    auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
-    tcp->setDramToDram(true);
-
-    std::vector<TransportType> buffer_transports = {RDMA, TCP};
-
+    const std::vector<TransportType> buffer_transports = {HP_TCP};
     SelectionContext ctx;
     ctx.segment_type = SegmentType::Memory;
     ctx.same_machine = false;
@@ -685,9 +643,7 @@ TEST(TransportSelectorTest, ConfigBasedPolicySelection) {
     ctx.remote_memory_type = MTYPE_CPU;
     ctx.buffer_transports = &buffer_transports;
 
-    auto result = selector.select(ctx, transports);
-    // With default policies, should use buffer_transports order (RDMA first)
-    EXPECT_EQ(result.transport, RDMA);
+    EXPECT_EQ(selector.select(ctx, transports).transport, HP_TCP);
 }
 
 // ---------------------------------------------------------------------------

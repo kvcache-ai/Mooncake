@@ -114,6 +114,11 @@ Status ParseHpTcpTransportConfig(const Config& config,
                        "contains zero or inconsistent limits");
     }
 
+    if (parsed.enabled && config.get("transports/tcp/enable", true)) {
+        return Invalid("transports",
+                       "tcp and hp_tcp cannot be enabled together");
+    }
+
     *out = std::move(parsed);
     return Status::OK();
 }

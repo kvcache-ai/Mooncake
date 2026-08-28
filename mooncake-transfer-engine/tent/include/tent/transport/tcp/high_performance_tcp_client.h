@@ -48,12 +48,8 @@ class HighPerformanceTcpClient {
         uint64_t length{0};
         HighPerformanceTcpOpcode opcode{HighPerformanceTcpOpcode::kRead};
         uint64_t request_id{0};
-        // The fourth argument is true only when the endpoint failed before any
-        // request byte was written. The fifth is true when a WRITE may have
-        // reached the peer without a valid completion ACK; such a WRITE must
-        // never be replayed through another transport.
         std::function<void(TransferStatusEnum, size_t,
-                           std::optional<HighPerformanceTcpStatus>, bool, bool)>
+                           std::optional<HighPerformanceTcpStatus>)>
             complete;
     };
 

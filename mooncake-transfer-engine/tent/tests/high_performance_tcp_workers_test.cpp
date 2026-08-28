@@ -125,11 +125,9 @@ TEST(HighPerformanceTcpTaskTest, CompletionReleasesLeaseAndBudgetOnce) {
     HighPerformanceTcpAdmissionController admission(1, memory.size());
     ASSERT_TRUE(admission.tryReserve(1, memory.size()).ok());
 
-    Request request{};
-    request.length = memory.size();
     auto task = std::make_shared<HighPerformanceTcpTaskState>(
-        request, 1, [](BatchID) {}, std::move(lease));
-    task->activateReservation(&admission, memory.size());
+        memory.size(), 1, [](BatchID) {}, std::move(lease));
+    task->activateReservation(&admission);
     EXPECT_TRUE(task->completeOnce(COMPLETED, memory.size()));
     EXPECT_FALSE(task->completeOnce(FAILED, 0));
     EXPECT_EQ(admission.outstandingTasks(), 0u);

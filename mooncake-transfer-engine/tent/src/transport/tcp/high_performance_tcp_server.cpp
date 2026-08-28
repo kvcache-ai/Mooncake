@@ -69,7 +69,7 @@ class HighPerformanceTcpServer::Session
         // deadline so an empty connection cannot hold a bounded session slot.
         // Once a request has completed, waiting for the next request is
         // connection-pool idle time rather than stalled I/O.
-        if (!completed_request_) armProgressTimer(request_epoch_);
+        if (request_epoch_ == 1) armProgressTimer(request_epoch_);
         readHeaderChunk();
     }
 
@@ -109,7 +109,8 @@ class HighPerformanceTcpServer::Session
             request_bytes_.data(), request_bytes_.size(), &request_,
             &wire_error);
         if (!decoded.ok()) {
-            sendErrorAndClose(wire_error);
+            request_.request_id = 0;
+            sendResponse(wire_error, 0, true);
             return;
         }
         if (request_.length > config_.max_transfer_bytes) {
@@ -117,14 +118,12 @@ class HighPerformanceTcpServer::Session
             return;
         }
 
-        HighPerformanceTcpBufferRegistry::AcquireFailure failure =
-            HighPerformanceTcpBufferRegistry::AcquireFailure::kNone;
+        HighPerformanceTcpStatus wire_status =
+            HighPerformanceTcpStatus::kInternalError;
         const Status lease_status = registry_->acquireRemoteLease(
             request_.remote_addr, request_.length, request_.registration_id,
-            request_.opcode, &lease_, &failure);
+            request_.opcode, &lease_, &wire_status);
         if (!lease_status.ok()) {
-            const HighPerformanceTcpStatus wire_status =
-                HighPerformanceTcpWireStatusForAcquireFailure(failure);
             if (request_.opcode == HighPerformanceTcpOpcode::kWrite) {
                 // The client sends the complete WRITE body before reading the
                 // response. Consume exactly this rejected frame under the
@@ -187,7 +186,7 @@ class HighPerformanceTcpServer::Session
     void writeReadBodyChunk() {
         if (body_offset_ == request_.length) {
             lease_.reset();
-            completeRequest();
+            readHeader();
             return;
         }
         const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
@@ -218,9 +217,8 @@ class HighPerformanceTcpServer::Session
             // destination DRAM and no socket callback can touch the range.
             lease_.reset();
             armProgressTimer(request_epoch_);
-            sendResponse(
-                HighPerformanceTcpStatus::kOk, request_.length, false,
-                [self = shared_from_this()] { self->completeRequest(); });
+            sendResponse(HighPerformanceTcpStatus::kOk, request_.length, false,
+                         [self = shared_from_this()] { self->readHeader(); });
             return;
         }
         const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
@@ -243,16 +241,6 @@ class HighPerformanceTcpServer::Session
                     self->readWriteBodyChunk();
                 });
             });
-    }
-
-    void completeRequest() {
-        completed_request_ = true;
-        readHeader();
-    }
-
-    void sendErrorAndClose(HighPerformanceTcpStatus status) {
-        request_.request_id = 0;
-        sendResponse(status, 0, true);
     }
 
     void sendResponse(HighPerformanceTcpStatus status, uint64_t committed,
@@ -285,7 +273,7 @@ class HighPerformanceTcpServer::Session
                     if (continuation) {
                         continuation();
                     } else {
-                        self->completeRequest();
+                        self->readHeader();
                     }
                 });
             });
@@ -347,7 +335,6 @@ class HighPerformanceTcpServer::Session
     uint64_t body_offset_{0};
     uint64_t request_epoch_{0};
     uint64_t timer_generation_{0};
-    bool completed_request_{false};
     bool forced_close_{false};
     bool closed_{false};
 };
@@ -516,16 +503,6 @@ void HighPerformanceTcpServer::installAcceptedSocket(
         }
         return;
     }
-    std::error_code error;
-    socket->set_option(asio::ip::tcp::no_delay(true), error);
-    if (error) {
-        socket->close(error);
-        if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            sessions_wait_cv_.notify_all();
-        }
-        return;
-    }
-
     std::shared_ptr<Session> session;
     try {
         session = std::make_shared<Session>(this, worker_id, socket, config_,

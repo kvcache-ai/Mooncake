@@ -26,48 +26,25 @@ uint64_t MakeRegistrationNamespace() {
     return random();
 }
 
-Status LeaseError(HighPerformanceTcpBufferRegistry::AcquireFailure failure,
-                  const char* message) {
+Status LeaseError(HighPerformanceTcpStatus failure, const char* message) {
     switch (failure) {
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::
-            kStaleRegistration:
+        case HighPerformanceTcpStatus::kStaleRegistration:
             return Status::NeedsRefreshCache(std::string(message) + LOC_MARK);
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::kShuttingDown:
+        case HighPerformanceTcpStatus::kShuttingDown:
             return Status::TooManyRequests(std::string(message) + LOC_MARK);
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::
-            kPermissionDenied:
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::kRangeRejected:
+        case HighPerformanceTcpStatus::kPermissionDenied:
+        case HighPerformanceTcpStatus::kRangeRejected:
             return Status::AddressNotRegistered(std::string(message) +
                                                 LOC_MARK);
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::kNone:
-            break;
+        default:
+            return Status::InternalError(std::string(message) + LOC_MARK);
     }
-    return Status::InternalError(std::string(message) + LOC_MARK);
 }
 
 }  // namespace
 
 HighPerformanceTcpBufferRegistry::HighPerformanceTcpBufferRegistry()
     : registration_namespace_(MakeRegistrationNamespace()) {}
-
-HighPerformanceTcpStatus HighPerformanceTcpWireStatusForAcquireFailure(
-    HighPerformanceTcpBufferRegistry::AcquireFailure failure) {
-    switch (failure) {
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::kRangeRejected:
-            return HighPerformanceTcpStatus::kRangeRejected;
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::
-            kStaleRegistration:
-            return HighPerformanceTcpStatus::kStaleRegistration;
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::
-            kPermissionDenied:
-            return HighPerformanceTcpStatus::kPermissionDenied;
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::kShuttingDown:
-            return HighPerformanceTcpStatus::kShuttingDown;
-        case HighPerformanceTcpBufferRegistry::AcquireFailure::kNone:
-            return HighPerformanceTcpStatus::kOk;
-    }
-    return HighPerformanceTcpStatus::kInternalError;
-}
 
 HighPerformanceTcpBufferRegistry::Lease::Lease(std::shared_ptr<Entry> entry)
     : entry_(std::move(entry)) {}
@@ -177,10 +154,6 @@ Status HighPerformanceTcpBufferRegistry::remove(uint64_t base,
                 "HP TCP buffer not registered" LOC_MARK);
         }
         entry = it->second;
-        {
-            std::lock_guard<std::mutex> entry_lock(entry->mutex);
-            entry->closing = true;
-        }
         // Hide the range before waiting so no new lease can race in.
         entries_.erase(it);
     }
@@ -215,15 +188,16 @@ Status HighPerformanceTcpBufferRegistry::acquireLocalLease(uint64_t addr,
 
 Status HighPerformanceTcpBufferRegistry::acquireRemoteLease(
     uint64_t addr, uint64_t length, uint64_t registration_id,
-    HighPerformanceTcpOpcode opcode, Lease* lease, AcquireFailure* failure) {
+    HighPerformanceTcpOpcode opcode, Lease* lease,
+    HighPerformanceTcpStatus* failure) {
     return acquire(addr, length, registration_id, opcode, true, lease, failure);
 }
 
 Status HighPerformanceTcpBufferRegistry::acquire(
     uint64_t addr, uint64_t length, uint64_t registration_id,
     HighPerformanceTcpOpcode opcode, bool remote, Lease* lease,
-    AcquireFailure* failure) {
-    if (failure != nullptr) *failure = AcquireFailure::kNone;
+    HighPerformanceTcpStatus* failure) {
+    if (failure != nullptr) *failure = HighPerformanceTcpStatus::kOk;
     if (lease == nullptr) {
         return Status::InvalidArgument("HP TCP lease output is null" LOC_MARK);
     }
@@ -231,47 +205,48 @@ Status HighPerformanceTcpBufferRegistry::acquire(
 
     uint64_t end = 0;
     if (!RangeEnd(addr, length, &end)) {
-        if (failure != nullptr) *failure = AcquireFailure::kRangeRejected;
+        if (failure != nullptr)
+            *failure = HighPerformanceTcpStatus::kRangeRejected;
         return Status::InvalidArgument("invalid HP TCP lease range" LOC_MARK);
     }
 
     std::lock_guard<std::mutex> registry_lock(registry_mutex_);
     if (closing_) {
-        if (failure != nullptr) *failure = AcquireFailure::kShuttingDown;
-        return LeaseError(AcquireFailure::kShuttingDown,
+        if (failure != nullptr)
+            *failure = HighPerformanceTcpStatus::kShuttingDown;
+        return LeaseError(HighPerformanceTcpStatus::kShuttingDown,
                           "HP TCP buffer registry is shutting down");
     }
     const auto next = entries_.upper_bound(addr);
     if (next == entries_.begin()) {
-        if (failure != nullptr) *failure = AcquireFailure::kRangeRejected;
-        return LeaseError(AcquireFailure::kRangeRejected,
+        if (failure != nullptr)
+            *failure = HighPerformanceTcpStatus::kRangeRejected;
+        return LeaseError(HighPerformanceTcpStatus::kRangeRejected,
                           "HP TCP range not registered");
     }
     const auto entry = std::prev(next)->second;
     uint64_t entry_end = 0;
     if (!RangeEnd(entry->base, entry->length, &entry_end) ||
         addr < entry->base || end > entry_end) {
-        if (failure != nullptr) *failure = AcquireFailure::kRangeRejected;
-        return LeaseError(AcquireFailure::kRangeRejected,
+        if (failure != nullptr)
+            *failure = HighPerformanceTcpStatus::kRangeRejected;
+        return LeaseError(HighPerformanceTcpStatus::kRangeRejected,
                           "HP TCP range not registered");
     }
 
     std::lock_guard<std::mutex> entry_lock(entry->mutex);
-    if (entry->closing) {
-        if (failure != nullptr) *failure = AcquireFailure::kShuttingDown;
-        return LeaseError(AcquireFailure::kShuttingDown,
-                          "HP TCP buffer is closing");
-    }
     if (remote && entry->registration_id != registration_id) {
-        if (failure != nullptr) *failure = AcquireFailure::kStaleRegistration;
-        return LeaseError(AcquireFailure::kStaleRegistration,
+        if (failure != nullptr)
+            *failure = HighPerformanceTcpStatus::kStaleRegistration;
+        return LeaseError(HighPerformanceTcpStatus::kStaleRegistration,
                           "stale HP TCP registration");
     }
     if (remote && (entry->permission == kLocalReadWrite ||
                    (opcode == HighPerformanceTcpOpcode::kWrite &&
                     entry->permission != kGlobalReadWrite))) {
-        if (failure != nullptr) *failure = AcquireFailure::kPermissionDenied;
-        return LeaseError(AcquireFailure::kPermissionDenied,
+        if (failure != nullptr)
+            *failure = HighPerformanceTcpStatus::kPermissionDenied;
+        return LeaseError(HighPerformanceTcpStatus::kPermissionDenied,
                           "HP TCP permission denied");
     }
 

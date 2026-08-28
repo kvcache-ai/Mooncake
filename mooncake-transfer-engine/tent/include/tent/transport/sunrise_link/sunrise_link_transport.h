@@ -84,6 +84,8 @@ class SunriseLinkTransport : public Transport {
 
     const char* getName() const override { return "sunrise_link"; }
 
+    bool supportNotification() const override { return true; }
+
    private:
     Status startTransfer(SunriseLinkTask* task, SunriseLinkSubBatch* batch);
 

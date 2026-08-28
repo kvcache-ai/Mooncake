@@ -193,12 +193,8 @@ class FakeTransport : public Transport {
 
 class HpTcpRecoveryTransport : public FakeTransport {
    public:
-    explicit HpTcpRecoveryTransport(
-        TransferStatusEnum initial_terminal = FAILED,
-        bool completes_after_retry = true)
-        : FakeTransport(HP_TCP),
-          initial_terminal_(initial_terminal),
-          completes_after_retry_(completes_after_retry) {}
+    explicit HpTcpRecoveryTransport(bool permanent_failure = false)
+        : FakeTransport(HP_TCP), permanent_failure_(permanent_failure) {}
 
     std::atomic<int> retry_calls{0};
 
@@ -230,13 +226,17 @@ class HpTcpRecoveryTransport : public FakeTransport {
             return Status::InvalidArgument("bad HP TCP task_id" LOC_MARK);
         }
 
-        const bool retried = retry_calls.load(std::memory_order_acquire) != 0;
-        if (retried && completes_after_retry_) {
+        if (permanent_failure_) {
+            status = {FAILED, 0};
+            return Status::InvalidArgument(
+                "HP TCP WRITE outcome is unknown" LOC_MARK);
+        }
+        if (retry_calls.load(std::memory_order_acquire) != 0) {
             status = {COMPLETED, hp_batch->requests[task_id].length};
             return Status::OK();
         }
 
-        status = {initial_terminal_, 0};
+        status = {FAILED, 0};
         return Status::NeedsRefreshCache(
             "remote HP TCP metadata is stale" LOC_MARK);
     }
@@ -263,8 +263,7 @@ class HpTcpRecoveryTransport : public FakeTransport {
     const char* getName() const override { return "<fake-hp-tcp>"; }
 
    private:
-    TransferStatusEnum initial_terminal_;
-    bool completes_after_retry_;
+    bool permanent_failure_;
 };
 
 class HpTcpStatusErrorOnceTransport : public FakeTransport {
@@ -348,10 +347,8 @@ struct HpTcpRecoveryBatch {
 
 void submitHpTcpRecoveryBatch(TransferEngineImpl& engine,
                               HpTcpRecoveryBatch& batch,
-                              TransferStatusEnum initial_terminal = FAILED,
-                              bool completes_after_retry = true) {
-    batch.hp_tcp = std::make_shared<HpTcpRecoveryTransport>(
-        initial_terminal, completes_after_retry);
+                              bool permanent_failure = false) {
+    batch.hp_tcp = std::make_shared<HpTcpRecoveryTransport>(permanent_failure);
     batch.fallback_tcp = std::make_shared<FakeTransport>(TCP);
 
     std::string segment_name = engine.getSegmentName();
@@ -449,39 +446,19 @@ TEST(EngineFailoverE2E, HpTcpStaleMetadataRetriesSameTransportOnce) {
     releaseHpTcpRecoveryBatch(engine, batch);
 }
 
-TEST(EngineFailoverE2E, HpTcpPreRequestTimeoutRefreshesEndpointOnce) {
+TEST(EngineFailoverE2E, HpTcpPermanentFailureDoesNotFailOver) {
     auto config = makeMinimalP2PConfig();
     TransferEngineImpl engine(config);
     ASSERT_TRUE(engine.available());
 
     HpTcpRecoveryBatch batch;
-    submitHpTcpRecoveryBatch(engine, batch, TIMEOUT);
+    submitHpTcpRecoveryBatch(engine, batch, /*permanent_failure=*/true);
 
     const TransferStatus final_status =
         pollUntilDone(engine, batch.batch_id, 0);
-    EXPECT_EQ(final_status.s, COMPLETED);
+    EXPECT_EQ(final_status.s, FAILED);
     EXPECT_EQ(batch.hp_tcp->submit_calls.load(), 1);
-    EXPECT_EQ(batch.hp_tcp->retry_calls.load(), 1);
-    EXPECT_EQ(batch.fallback_tcp->submit_calls.load(), 0);
-
-    releaseHpTcpRecoveryBatch(engine, batch);
-}
-
-TEST(EngineFailoverE2E, HpTcpRepeatedEndpointTimeoutStopsAfterSingleRefresh) {
-    auto config = makeMinimalP2PConfig();
-    TransferEngineImpl engine(config);
-    ASSERT_TRUE(engine.available());
-
-    HpTcpRecoveryBatch batch;
-    submitHpTcpRecoveryBatch(engine, batch, TIMEOUT,
-                             /*completes_after_retry=*/false);
-
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch.batch_id, 0, status).ok());
-    EXPECT_EQ(status.s, PENDING);
-    ASSERT_TRUE(engine.getTransferStatus(batch.batch_id, 0, status).ok());
-    EXPECT_EQ(status.s, TIMEOUT);
-    EXPECT_EQ(batch.hp_tcp->retry_calls.load(), 1);
+    EXPECT_EQ(batch.hp_tcp->retry_calls.load(), 0);
     EXPECT_EQ(batch.fallback_tcp->submit_calls.load(), 0);
 
     releaseHpTcpRecoveryBatch(engine, batch);

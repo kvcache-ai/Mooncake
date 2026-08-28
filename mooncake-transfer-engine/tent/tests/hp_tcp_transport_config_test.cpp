@@ -74,7 +74,7 @@ TEST(HpTcpTransportConfigTest, DisabledHpTcpIgnoresInactiveLimits) {
     EXPECT_FALSE(parsed.enabled);
 }
 
-TEST(HpTcpTransportConfigTest, AllowsTcpAndHpTcpTogether) {
+TEST(HpTcpTransportConfigTest, RejectsTcpAndHpTcpTogether) {
     Config config;
     ASSERT_TRUE(
         config
@@ -82,8 +82,7 @@ TEST(HpTcpTransportConfigTest, AllowsTcpAndHpTcpTogether) {
                 R"({"transports":{"tcp":{"enable":true},"hp_tcp":{"enable":true}}})")
             .ok());
     HpTcpTransportConfig parsed;
-    ASSERT_TRUE(ParseHpTcpTransportConfig(config, &parsed).ok());
-    EXPECT_TRUE(parsed.enabled);
+    EXPECT_TRUE(ParseHpTcpTransportConfig(config, &parsed).IsInvalidArgument());
 }
 
 }  // namespace

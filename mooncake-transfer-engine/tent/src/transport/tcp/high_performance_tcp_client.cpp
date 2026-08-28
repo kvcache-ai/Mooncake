@@ -86,28 +86,15 @@ class HighPerformanceTcpClient::Lane
         } catch (const std::exception& error) {
             LOG(ERROR) << "HP TCP client handler failed: " << error.what();
             if (matches(epoch)) {
-                closeDirty();
                 finishCurrent(FAILED, 0, false);
             }
         } catch (...) {
             LOG(ERROR) << "HP TCP client handler failed";
             if (matches(epoch)) {
-                closeDirty();
                 finishCurrent(FAILED, 0, false);
             }
         }
     }
-
-    enum class State {
-        kDisconnected,
-        kResolving,
-        kConnecting,
-        kIdle,
-        kWritingHeader,
-        kWritingBody,
-        kReadingResponse,
-        kReadingBody,
-    };
 
     void startNext() {
         if (current_ || queue_.empty()) return;
@@ -122,25 +109,21 @@ class HighPerformanceTcpClient::Lane
              current_->remote_addr, current_->length});
 
         try {
-            if (connected_ && socket_.is_open()) {
-                state_ = State::kIdle;
+            if (socket_.is_open()) {
                 writeHeader(operation_epoch_);
             } else {
                 resolve(operation_epoch_);
             }
         } catch (const std::exception& error) {
             LOG(ERROR) << "HP TCP async initiation failed: " << error.what();
-            closeDirty();
             finishCurrent(FAILED, 0, false);
         } catch (...) {
             LOG(ERROR) << "HP TCP async initiation failed";
-            closeDirty();
             finishCurrent(FAILED, 0, false);
         }
     }
 
     void resolve(uint64_t epoch) {
-        state_ = State::kResolving;
         armTimer(config_.connect_timeout_ms, epoch);
         auto self = shared_from_this();
         resolver_.async_resolve(
@@ -148,12 +131,11 @@ class HighPerformanceTcpClient::Lane
             [self, epoch](const std::error_code& error,
                           asio::ip::tcp::resolver::results_type results) {
                 self->runHandler(epoch, [&] {
-                    if (self->finishForcedIfAny(true)) return;
+                    if (self->finishForcedIfAny()) return;
                     if (error) {
-                        self->finishIoError(error, true);
+                        self->finishIoError(error);
                         return;
                     }
-                    self->state_ = State::kConnecting;
                     self->connect(epoch, std::move(results));
                 });
             });
@@ -169,30 +151,20 @@ class HighPerformanceTcpClient::Lane
             [self, epoch](const std::error_code& error,
                           const asio::ip::tcp::endpoint&) {
                 self->runHandler(epoch, [&] {
-                    if (self->finishForcedIfAny(true)) return;
+                    if (self->finishForcedIfAny()) return;
                     if (error) {
-                        self->finishIoError(error, true);
+                        self->finishIoError(error);
                         return;
                     }
                     self->cancelTimer();
-                    std::error_code option_error;
-                    self->socket_.set_option(asio::ip::tcp::no_delay(true),
-                                             option_error);
-                    if (option_error) {
-                        self->finishIoError(option_error);
-                        return;
-                    }
-                    self->connected_ = true;
                     self->parent_->connections_created_.fetch_add(
                         1, std::memory_order_relaxed);
-                    self->state_ = State::kIdle;
                     self->writeHeader(epoch);
                 });
             });
     }
 
     void writeHeader(uint64_t epoch) {
-        state_ = State::kWritingHeader;
         armTimer(config_.progress_timeout_ms, epoch);
         auto self = shared_from_this();
         asio::async_write(
@@ -205,11 +177,10 @@ class HighPerformanceTcpClient::Lane
                         // the peer may subsequently observe a complete request.
                         self->remote_write_outcome_unknown_ = bytes > 0;
                     }
-                    if (self->finishForcedIfAny(bytes == 0)) return;
+                    if (self->finishForcedIfAny()) return;
                     if (error || bytes != kHighPerformanceTcpRequestSize) {
                         self->finishIoError(
-                            error ? error : asio::error::operation_aborted,
-                            bytes == 0);
+                            error ? error : asio::error::operation_aborted);
                         return;
                     }
                     self->armTimer(self->config_.progress_timeout_ms, epoch);
@@ -229,7 +200,6 @@ class HighPerformanceTcpClient::Lane
             readResponse(epoch);
             return;
         }
-        state_ = State::kWritingBody;
         const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
             config_.chunk_size, current_->length - body_offset_));
         auto* data = static_cast<uint8_t*>(current_->local_addr) + body_offset_;
@@ -252,7 +222,6 @@ class HighPerformanceTcpClient::Lane
     }
 
     void readResponse(uint64_t epoch) {
-        state_ = State::kReadingResponse;
         auto self = shared_from_this();
         asio::async_read(
             socket_, asio::buffer(response_bytes_),
@@ -301,7 +270,6 @@ class HighPerformanceTcpClient::Lane
             finishClean();
             return;
         }
-        state_ = State::kReadingBody;
         const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
             config_.chunk_size, current_->length - body_offset_));
         auto* data = static_cast<uint8_t*>(current_->local_addr) + body_offset_;
@@ -353,79 +321,67 @@ class HighPerformanceTcpClient::Lane
         return current_.has_value() && epoch == operation_epoch_;
     }
 
-    bool finishForcedIfAny(bool pre_request_endpoint_failure = false) {
+    bool finishForcedIfAny() {
         if (!forced_terminal_.has_value()) return false;
         const TransferStatusEnum terminal = *forced_terminal_;
-        closeDirty();
-        finishCurrent(terminal, 0, false, std::nullopt,
-                      terminal == TIMEOUT && pre_request_endpoint_failure);
+        finishCurrent(terminal, 0, false);
         return true;
     }
 
     void closeDirty() {
-        connected_ = false;
         std::error_code ignored;
         if (socket_.is_open()) {
             socket_.cancel(ignored);
             socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
             socket_.close(ignored);
         }
-        state_ = State::kDisconnected;
     }
 
-    void finishProtocolError() {
-        closeDirty();
-        finishCurrent(FAILED, 0, false);
-    }
+    void finishProtocolError() { finishCurrent(FAILED, 0, false); }
 
     void finishRemoteError(HighPerformanceTcpStatus status) {
-        closeDirty();
         finishCurrent(FAILED, 0, false, status);
     }
 
-    void finishIoError(const std::error_code&,
-                       bool pre_request_endpoint_failure = false) {
+    void finishIoError(const std::error_code&) {
         const TransferStatusEnum terminal = forced_terminal_.value_or(FAILED);
-        closeDirty();
-        finishCurrent(terminal, 0, false, std::nullopt,
-                      pre_request_endpoint_failure);
+        finishCurrent(terminal, 0, false);
     }
 
     void finishClean() {
         cancelTimer();
-        state_ = State::kIdle;
         remote_write_outcome_unknown_ = false;
         finishCurrent(COMPLETED, current_->length, true);
     }
 
     void finishCurrent(
         TransferStatusEnum terminal, size_t bytes, bool keep_stream,
-        std::optional<HighPerformanceTcpStatus> remote_status = std::nullopt,
-        bool pre_request_endpoint_failure = false) {
+        std::optional<HighPerformanceTcpStatus> remote_status = std::nullopt) {
         cancelTimer();
         if (!keep_stream) closeDirty();
         Operation operation = std::move(*current_);
-        const bool remote_write_outcome_unknown = remote_write_outcome_unknown_;
+        if (terminal == FAILED && remote_write_outcome_unknown_ &&
+            !remote_status.has_value()) {
+            // A WRITE may have reached the peer without a valid ACK. Reuse the
+            // existing terminal protocol classification so it cannot be
+            // replayed through another transport.
+            remote_status = HighPerformanceTcpStatus::kInternalError;
+        }
         current_.reset();
         ++operation_epoch_;  // invalidate late timer/cancel callbacks
         forced_terminal_.reset();
         remote_write_outcome_unknown_ = false;
-        completeStandalone(std::move(operation), terminal, bytes, remote_status,
-                           pre_request_endpoint_failure,
-                           remote_write_outcome_unknown);
+        completeStandalone(std::move(operation), terminal, bytes,
+                           remote_status);
         startNext();
     }
 
     void completeStandalone(
         Operation operation, TransferStatusEnum terminal, size_t bytes,
-        std::optional<HighPerformanceTcpStatus> remote_status = std::nullopt,
-        bool pre_request_endpoint_failure = false,
-        bool remote_write_outcome_unknown = false) {
+        std::optional<HighPerformanceTcpStatus> remote_status = std::nullopt) {
         try {
             if (operation.complete)
-                operation.complete(terminal, bytes, remote_status,
-                                   pre_request_endpoint_failure,
-                                   remote_write_outcome_unknown);
+                operation.complete(terminal, bytes, remote_status);
         } catch (const std::exception& error) {
             LOG(ERROR) << "HP TCP completion callback threw: " << error.what();
         } catch (...) {
@@ -447,9 +403,7 @@ class HighPerformanceTcpClient::Lane
     uint64_t operation_epoch_{0};
     uint64_t timer_generation_{0};
     uint64_t body_offset_{0};
-    bool connected_{false};
     bool remote_write_outcome_unknown_{false};
-    State state_{State::kDisconnected};
     std::optional<TransferStatusEnum> forced_terminal_;
 };
 
@@ -507,7 +461,7 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
         !operation.complete) {
         if (operation.complete) {
             try {
-                operation.complete(FAILED, 0, std::nullopt, false, false);
+                operation.complete(FAILED, 0, std::nullopt);
             } catch (...) {
                 LOG(ERROR) << "HP TCP rejected-operation callback threw";
             }
@@ -523,7 +477,7 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
             operation.host.empty() || operation.port == 0 ||
             operation.lane_id >= config_.connections_per_peer) {
             try {
-                operation.complete(CANCELED, 0, std::nullopt, false, false);
+                operation.complete(CANCELED, 0, std::nullopt);
             } catch (...) {
                 LOG(ERROR) << "HP TCP rejected-operation callback threw";
             }
@@ -556,7 +510,7 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
     } catch (const std::exception& error) {
         LOG(ERROR) << "HP TCP lane setup failed: " << error.what();
         try {
-            operation.complete(FAILED, 0, std::nullopt, false, false);
+            operation.complete(FAILED, 0, std::nullopt);
         } catch (...) {
             LOG(ERROR) << "HP TCP failed-operation callback threw";
         }
@@ -564,7 +518,7 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
     } catch (...) {
         LOG(ERROR) << "HP TCP lane setup failed";
         try {
-            operation.complete(FAILED, 0, std::nullopt, false, false);
+            operation.complete(FAILED, 0, std::nullopt);
         } catch (...) {
             LOG(ERROR) << "HP TCP failed-operation callback threw";
         }

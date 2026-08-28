@@ -402,17 +402,6 @@ target_include_directories(tent_engine_failover_e2e_test
 add_test(NAME tent_engine_failover_e2e_test
          COMMAND tent_engine_failover_e2e_test)
 
-add_executable(tent_notification_routing_test notification_routing_test.cpp)
-target_link_libraries(tent_notification_routing_test PRIVATE gtest gtest_main
-                                                             tent_link_group)
-if(TARGET asio_shared)
-  target_link_libraries(tent_notification_routing_test PRIVATE asio_shared)
-endif()
-target_include_directories(tent_notification_routing_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-add_test(NAME tent_notification_routing_test
-         COMMAND tent_notification_routing_test)
-
 # Per-request transport_hint: validates submitTransfer parameter, routing,
 # disabled-transport rejection, out-of-range rejection, mixed-hint batches.
 add_executable(tent_transport_hint_test transport_hint_test.cpp)
