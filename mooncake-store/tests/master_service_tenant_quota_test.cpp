@@ -78,18 +78,6 @@ class BlockingAllocationStrategy final : public AllocationStrategy {
                                   replica_type);
     }
 
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        const AllocatorManager& allocator_manager, const size_t slice_length,
-        const size_t replica_num,
-        const std::vector<std::string>& preferred_segments,
-        const std::set<std::string>& excluded_segments,
-        const ReplicaType replica_type,
-        const SsdMetricsProvider* ssd_provider) override {
-        (void)ssd_provider;
-        return Allocate(allocator_manager, slice_length, replica_num,
-                        preferred_segments, excluded_segments, replica_type);
-    }
-
     tl::expected<Replica, ErrorCode> AllocateFrom(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const std::string& segment_name) override {
@@ -216,14 +204,12 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     }
 
     int64_t LocalDiskUsedBytes(MasterService& service, const UUID& client_id) {
-        auto access = service.segment_manager_.getLocalDiskSegmentAccess();
-        auto& segments = access.getClientLocalDiskSegment();
-        auto it = segments.find(client_id);
-        EXPECT_TRUE(it != segments.end());
-        if (it == segments.end()) {
+        auto usage = service.local_ssd_manager_.GetUsage(client_id);
+        EXPECT_TRUE(usage.has_value());
+        if (!usage) {
             return -1;
         }
-        return it->second->ssd_used_bytes.load(std::memory_order_relaxed);
+        return usage->used_bytes;
     }
 
 #ifdef USE_NOF
@@ -262,7 +248,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void DiscardExpiredProcessingForTest(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
+        const size_t shard_idx = service.getShardIndex(tenant_id, key);
         MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::time_point::max());

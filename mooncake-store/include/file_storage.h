@@ -21,6 +21,30 @@ class FileStorage {
     void RemoveAll();
 
     /**
+     * @brief Deregisters this store's disk tier from the master, then waits out
+     * a grace period so offload reads already in flight can finish.
+     *
+     * Meant for a shutdown hook that runs before the process is signalled. Once
+     * this returns, the master no longer names this store as the owner of any
+     * offloaded key, so a reader gets a clean miss instead of a peer that is
+     * about to disappear. Unlike a memory replica, which the NIC serves without
+     * the process, a disk replica is read and pushed by this process -- hence
+     * the grace period rather than an immediate exit.
+     *
+     * Latches offloading off first: the heartbeat re-mounts the segment
+     * whenever the master answers SEGMENT_NOT_FOUND, which would otherwise
+     * undo this within one heartbeat interval. The latch and the
+     * deregistration happen under offloading_mutex_, the lock the heartbeat
+     * holds across its master RPCs, so a tick that read the latch before it
+     * was set cannot resume after the deregistration and re-mount: it either
+     * finished before the drain latched, or it re-checks the latch when it
+     * acquires the lock. The latch is not reversible on success; the process
+     * is expected to exit.
+     */
+    tl::expected<void, ErrorCode> DrainLocalDiskSegment(
+        uint64_t grace_period_ms);
+
+    /**
      * @brief Result of BatchGet operation containing batch_id and buffer
      * pointers.
      */
@@ -196,6 +220,13 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
+    // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the
+    // heartbeat -- which would otherwise re-mount the segment the drain just
+    // deregistered -- and aborts an in-flight metadata rescan. Checked at
+    // Heartbeat entry (fast path, also guards the rescan-retry block) and
+    // again under offloading_mutex_ before the heartbeat RPC, because a tick
+    // parked on that lock passed the entry check before the drain latched.
+    std::atomic<bool> draining_{false};
 };
 
 }  // namespace mooncake

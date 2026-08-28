@@ -324,6 +324,30 @@ LocalFileSnapshotObjectStore::ListObjectsWithPrefix(
     return {};
 }
 
+tl::expected<SnapshotObjectInspection, std::string>
+LocalFileSnapshotObjectStore::InspectObject(const std::string& key) {
+    fs::path full_path = KeyToPath(key);
+    if (!IsPathWithinBase(full_path)) {
+        return tl::make_unexpected(
+            fmt::format("Security error: Path {} is outside base directory {}",
+                        full_path.string(), base_path_.string()));
+    }
+    if (!fs::exists(full_path)) {
+        return tl::make_unexpected(
+            fmt::format("File not found: {}", full_path.string()));
+    }
+
+    std::error_code ec;
+    const auto size = fs::file_size(full_path, ec);
+    if (ec) {
+        return tl::make_unexpected(
+            fmt::format("Failed to get file size: {}, error: {}",
+                        full_path.string(), ec.message()));
+    }
+    return SnapshotObjectInspection{.stored_size = size,
+                                    .crc32c = std::nullopt};
+}
+
 bool LocalFileSnapshotObjectStore::IsNotFoundError(
     const std::string& error) const {
     return error.starts_with("File not found:");

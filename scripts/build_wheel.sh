@@ -10,14 +10,15 @@ set -x
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
-# CMake build directory (default: build).  EP/PG extensions are staged under
-# ${BUILD_DIR}/ep_pg_staging when the project was built with -DWITH_EP=ON.
+# CMake build directory (default: build).  EP/PG device extensions are staged
+# under ${BUILD_DIR}/ep_pg_staging. Host extensions are copied directly from
+# their normal CMake output paths before auditwheel, like the PG core library.
 BUILD_DIR="${BUILD_DIR:-build}"
 BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:${BUILD_DIR_ABS}/mooncake-common/etcd:${BUILD_DIR_ABS}/mooncake-common/k8s-lease:/usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:${BUILD_DIR_ABS}/mooncake-common/etcd:${BUILD_DIR_ABS}/mooncake-common/k8s-lease:${BUILD_DIR_ABS}/ep_pg_staging:/usr/local/lib
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
@@ -37,6 +38,18 @@ if [ -f "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" ]; then
     echo "Copying libmooncake_pg.so..."
     cp "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" mooncake-wheel/mooncake/libmooncake_pg.so
 fi
+
+# Copy the native EP host binding to mooncake directory before auditwheel.
+# CUDA EP device libraries remain in the shared EP/PG staging directory and
+# are injected after auditwheel, matching the existing PG packaging flow.
+EP_HOST_SO=$(compgen -G "${BUILD_DIR}/mooncake-ep/src/_ep.*.so" | head -1 || true)
+if [ -n "$EP_HOST_SO" ]; then
+    echo "Copying native EP host extension..."
+    cp "$EP_HOST_SO" mooncake-wheel/mooncake/
+fi
+
+# Copy the shared segment wrapper, which builds on engine.so
+cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment.py
 
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
@@ -129,10 +142,10 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
-# EP/PG CUDA extensions are built during the cmake/make process when the
-# project is configured with -DWITH_EP=ON.  The resulting .so files land in
-# ${BUILD_DIR}/ep_pg_staging and are injected into the wheel AFTER auditwheel
-# so that patchelf never touches CUDA fatbins (see injection step below).
+# EP/PG extensions are built during the cmake/make process when the project is
+# configured with -DWITH_EP=ON. Host extensions are repaired by auditwheel;
+# CUDA device libraries and PG extensions remain in the post-repair staging
+# directory so patchelf never touches CUDA fatbins.
 # Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
@@ -155,6 +168,10 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     fi
 fi
 
+# Make the post-repair device library discoverable while auditwheel resolves
+# the host extension.  It is explicitly excluded below and injected later.
+export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${LD_LIBRARY_PATH}"
+
 if [ "$NPU_BUILD" = "1" ]; then
     echo "Stripping shared libraries to reduce wheel size..."
     find mooncake-wheel/mooncake -name "*.so" -exec strip --strip-unneeded {} \;
@@ -163,6 +180,31 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
+# Stage migrated EP modules and the legacy Reshard package for the combined
+# wheel builder. Each tracked source remains in its authoritative tree.
+MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
+MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+MIGRATED_PYTHON_MODULES=(
+    ep.py
+    mooncake_ep_buffer.py
+    mooncake_elastic_buffer.py
+)
+RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
+RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
+cleanup_migrated_python_staging() {
+    for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+    done
+    rm -rf "${RESHARD_STAGING_DIR}"
+}
+trap cleanup_migrated_python_staging EXIT
+cleanup_migrated_python_staging
+for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+    cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
+       "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+done
+cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
+
 # Build the wheel package
 cd mooncake-wheel
 
@@ -176,6 +218,7 @@ WHEEL_DIR="$(pwd)"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
+    cleanup_migrated_python_staging
 }
 trap cleanup_wheel_metadata_state EXIT
 
@@ -291,6 +334,11 @@ rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
+# patchelf is installed from PyPI alongside auditwheel: auditwheel >= 6.8
+# requires patchelf >= 0.14.5, but the distro package on Ubuntu 22.04 (and the
+# rocm/musa CI images built on it) is 0.14.3, which makes `auditwheel repair`
+# abort. The PyPI wheel lands ahead of /usr/bin on PATH and works everywhere
+# the Python toolchain does.
 if [ "$NPU_BUILD" = "1" ]; then
     PYTHON_CMD="python${PYTHON_VERSION}"
     if ! command -v "$PYTHON_CMD" &>/dev/null; then
@@ -300,7 +348,7 @@ if [ "$NPU_BUILD" = "1" ]; then
     max_attempts=3
     attempt=1
     while [ $attempt -le $max_attempts ]; do
-        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel numpy; then
+        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel patchelf numpy; then
             break
         fi
         echo "pip install attempt $attempt/$max_attempts failed, retrying in 5s..."
@@ -312,10 +360,10 @@ if [ "$NPU_BUILD" = "1" ]; then
         exit 1
     fi
 elif command -v pip &>/dev/null; then
-    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
+    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel patchelf
 elif command -v uv &>/dev/null; then
     uv pip install --upgrade pip
-    uv pip install build setuptools wheel auditwheel
+    uv pip install build setuptools wheel auditwheel patchelf
 else
     echo "Error: Neither python${PYTHON_VERSION}, pip nor uv found"
     exit 1
@@ -388,6 +436,15 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 
+# `--exclude libmpcomm.so*` below is deliberate, not an oversight. MPComm ships
+# its own wheel / CMake install and is upgraded independently of Mooncake, so
+# engine.so keeps its DT_NEEDED on libmpcomm.so.<N> and the dynamic linker
+# resolves it at run time (e.g. LD_LIBRARY_PATH=$MPCOMM_ROOT/lib). Vendoring it
+# would: (a) freeze one MPComm build inside the wheel, where the RPATH injected
+# by auditwheel outranks LD_LIBRARY_PATH and would silently shadow any newer
+# libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
+# (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
+# corruption risk the EP/PG extensions are kept away from below.
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
@@ -432,6 +489,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libmooncake_ep_device.so* \
     --exclude libmooncake_pg_device.so* \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
@@ -479,6 +537,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
+    --exclude libmpcomm.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
@@ -497,6 +556,15 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
                 cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
             fi
         done
+        # The host EP extension is repaired before the device library is
+        # injected.  auditwheel therefore only adds its vendored .libs path;
+        # add the package directory as well so the sibling device library is
+        # found at runtime.
+        for ep_host_so in "$UNPACKED_PKG_DIR"/mooncake/_ep*.so; do
+            if [ -f "$ep_host_so" ]; then
+                patchelf --add-rpath '$ORIGIN' "$ep_host_so"
+            fi
+        done
         rm "$REPAIRED_WHEEL"
         python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
         rm -rf "$WHEEL_UNPACK_DIR"
@@ -509,7 +577,6 @@ fi
 if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
     rm -rf "$CUDA_EP_STAGING_TEMP"
 fi
-
 # NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
 # on all ELF files so everything resolves from a single directory.
 if [ "$NPU_BUILD" = "1" ]; then

@@ -1216,7 +1216,15 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentRemoveAllOperations) {
 }
 
 TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
-    service_.reset(new MasterService());
+    // Snapshot mode keeps the invalid-handle sweep synchronous inside
+    // UnmountSegment. A default-configured MasterService would instead defer
+    // it to the replica cleanup worker, making the key-count assertion below
+    // race with that worker.
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
 
     // Mount two segments for testing
     constexpr size_t buffer1 = 0x300000000;
@@ -1272,7 +1280,11 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
 }
 
 TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
-    service_.reset(new MasterService());
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
 
     // Mount two large segments
     constexpr size_t buffer1 = 0x300000000;
@@ -1328,7 +1340,11 @@ TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
 }
 
 TEST_F(MasterServiceSnapshotTest, UnmountSegmentPerformance) {
-    service_.reset(new MasterService());
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 256;  // 256MB
     std::string segment_name = "perf_test_segment";
@@ -2406,19 +2422,30 @@ TEST_F(MasterServiceSnapshotTest, PutStartExpiringTest) {
 
     // Put key_2 again, should fail because eviction has not been triggered. And
     // this PutStart should trigger the eviction.
+    const int64_t eviction_attempts_before =
+        MasterMetricManager::instance().get_mem_eviction_attempts();
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
-    EXPECT_FALSE(put_start_result.has_value());
+    ASSERT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    // Wait a moment for the eviction to complete.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (MasterMetricManager::instance().get_mem_eviction_attempts() <=
+               eviction_attempts_before &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_GT(MasterMetricManager::instance().get_mem_eviction_attempts(),
+              eviction_attempts_before)
+        << "Timed out waiting for asynchronous eviction";
 
     // Put key_2 again, should success because the previous one has been
     // discarded and released.
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
-    EXPECT_TRUE(put_start_result.has_value());
+    ASSERT_TRUE(put_start_result.has_value())
+        << toString(put_start_result.error());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
     for (size_t i = 0; i < kReplicaCnt; i++) {

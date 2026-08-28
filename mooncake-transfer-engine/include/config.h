@@ -128,6 +128,26 @@ struct GlobalConfig {
     // + 1. num_lag_ports is queried from hardware; if the device is not in LAG
     // mode the setting is a no-op. Requires USE_MLX5DV.
     bool mlx5_qp_lag_port_balance = false;
+    // Install RdmaTwoSidedTransport (CtrlChannel notify) instead of classic
+    // one-sided RdmaTransport. MC_USE_RDMA_TWOSIDED.
+    bool use_rdma_twosided = false;
+    // RDMA CtrlChannel notify path. MC_RDMA_NOTIFY_ENABLED.
+    bool rdma_notify_enabled = true;
+    // Ctrl recv/send slot count and slot size. MC_RDMA_NOTIFY_RECV_COUNT /
+    // MC_RDMA_NOTIFY_BUFFER_SIZE.
+    size_t rdma_notify_recv_count = 64;
+    size_t rdma_notify_buffer_size = 4096;
+    // Local pending SEND cap; actual cap is min(this, peer notify_rq_depth).
+    // MC_RDMA_NOTIFY_MAX_PENDING_SENDS.
+    size_t rdma_notify_max_pending_sends = 64;
+    // Fall back to OOB RPC notify when CtrlChannel is unavailable.
+    // MC_RDMA_NOTIFY_OOB_FALLBACK.
+    bool rdma_notify_oob_fallback = true;
+    // Upper bound for waiting on an in-flight CtrlChannel connect to the same
+    // peer. On expiry the notify falls back to OOB instead of blocking on a
+    // handshake that may never complete.
+    // MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS.
+    uint32_t rdma_notify_connect_timeout_ms = 10000;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
     int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;

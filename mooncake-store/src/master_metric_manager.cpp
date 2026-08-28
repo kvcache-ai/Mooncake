@@ -7,6 +7,7 @@
 #include <vector>   // Required by histogram serialization
 #include <cmath>
 
+#include "segment.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -360,6 +361,11 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_failed_total",
           "Total promotion tasks aborted by holder via "
           "NotifyPromotionFailure (holder reported a downstream failure)"),
+      promotion_execution_gave_up_(
+          "master_promotion_execution_gave_up_total",
+          "Total promotion admission chains permanently abandoned after "
+          "kMaxPromotionExecutionFailures consecutive execution failures "
+          "(self-sustaining cycle stopped; reads can still re-admit)"),
       promotion_cancelled_(
           "master_promotion_cancelled_total",
           "Total promotion tasks removed because the prerequisite went "
@@ -504,6 +510,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_completed_bytes_.inc(0);
     promotion_expired_.inc(0);
     promotion_failed_.inc(0);
+    promotion_execution_gave_up_.inc(0);
     promotion_cancelled_.inc(0);
     promotion_rejected_frequency_.inc(0);
     promotion_rejected_watermark_.inc(0);
@@ -676,15 +683,6 @@ int64_t MasterMetricManager::get_total_mem_capacity() {
     return mem_total_capacity_.value();
 }
 
-double MasterMetricManager::get_global_mem_used_ratio(void) {
-    double allocated = mem_allocated_size_.value();
-    double capacity = mem_total_capacity_.value();
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
-}
-
 int64_t MasterMetricManager::get_segment_allocated_mem_size(
     const std::string& segment) {
     return mem_allocated_size_per_segment_.value({segment});
@@ -708,16 +706,6 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
-}
-
-double MasterMetricManager::get_segment_mem_used_ratio(
-    const std::string& segment) {
-    double allocated = get_segment_allocated_mem_size(segment);
-    double capacity = get_segment_total_mem_capacity(segment);
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
 }
 
 // NoF segment Metrics
@@ -761,13 +749,44 @@ int64_t MasterMetricManager::get_total_nof_capacity() {
     return nof_total_capacity_.value();
 }
 
-double MasterMetricManager::get_global_nof_used_ratio(void) {
-    double allocated = nof_allocated_size_.value();
-    double capacity = nof_total_capacity_.value();
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
+void MasterMetricManager::project_storage_usage(
+    const TieredStorageUsageSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(storage_projection_mutex_);
+
+    auto project_tier = [](const StorageUsageSnapshot& tier,
+                           ylt::metric::gauge_t& allocated,
+                           ylt::metric::gauge_t& capacity,
+                           ylt::metric::dynamic_gauge_1t& allocated_by_segment,
+                           ylt::metric::dynamic_gauge_1t& capacity_by_segment,
+                           std::set<std::string>& projected_segments) {
+        allocated.update(static_cast<int64_t>(tier.used_bytes));
+        capacity.update(static_cast<int64_t>(tier.capacity_bytes));
+
+        std::set<std::string> current_segments;
+        for (const auto& [segment_name, usage] : tier.segments) {
+            current_segments.insert(segment_name);
+            allocated_by_segment.update({segment_name},
+                                        static_cast<int64_t>(usage.used_bytes));
+            capacity_by_segment.update(
+                {segment_name}, static_cast<int64_t>(usage.capacity_bytes));
+        }
+        for (const auto& segment_name : projected_segments) {
+            if (!current_segments.contains(segment_name)) {
+                allocated_by_segment.remove_label_value(
+                    {{"segment", segment_name}});
+                capacity_by_segment.remove_label_value(
+                    {{"segment", segment_name}});
+            }
+        }
+        projected_segments = std::move(current_segments);
+    };
+
+    project_tier(snapshot.memory, mem_allocated_size_, mem_total_capacity_,
+                 mem_allocated_size_per_segment_,
+                 mem_total_capacity_per_segment_, projected_mem_segments_);
+    project_tier(snapshot.nof, nof_allocated_size_, nof_total_capacity_,
+                 nof_allocated_size_per_segment_,
+                 nof_total_capacity_per_segment_, projected_nof_segments_);
 }
 
 int64_t MasterMetricManager::get_segment_allocated_nof_size(
@@ -784,16 +803,6 @@ void MasterMetricManager::remove_nof_segment_metrics(
     const std::string& segment) {
     nof_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     nof_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
-}
-
-double MasterMetricManager::get_segment_nof_used_ratio(
-    const std::string& segment) {
-    double allocated = get_segment_allocated_nof_size(segment);
-    double capacity = get_segment_total_nof_capacity(segment);
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
 }
 
 // File Storage Metrics
@@ -1179,6 +1188,9 @@ void MasterMetricManager::inc_promotion_expired(int64_t val) {
 }
 void MasterMetricManager::inc_promotion_failed(int64_t val) {
     promotion_failed_.inc(val);
+}
+void MasterMetricManager::inc_promotion_execution_gave_up(int64_t val) {
+    promotion_execution_gave_up_.inc(val);
 }
 void MasterMetricManager::inc_promotion_cancelled(int64_t val) {
     promotion_cancelled_.inc(val);
@@ -1599,6 +1611,9 @@ int64_t MasterMetricManager::get_promotion_expired() {
 }
 int64_t MasterMetricManager::get_promotion_failed() {
     return promotion_failed_.value();
+}
+int64_t MasterMetricManager::get_promotion_execution_gave_up() {
+    return promotion_execution_gave_up_.value();
 }
 int64_t MasterMetricManager::get_promotion_cancelled() {
     return promotion_cancelled_.value();

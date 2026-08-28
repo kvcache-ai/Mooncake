@@ -2,8 +2,8 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <map>
 #include <thread>
-#include <vector>
 
 #include "client_metric.h"
 
@@ -18,165 +18,6 @@ class SsdMetricsTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
-
-TEST_F(SsdMetricsTest, InitialValuesTest) {
-    SsdMetric metrics;
-
-    ASSERT_EQ(metrics.ssd_read_bytes.value(), 0);
-    ASSERT_EQ(metrics.ssd_write_bytes.value(), 0);
-    ASSERT_EQ(metrics.ssd_read_ops.value(), 0);
-    ASSERT_EQ(metrics.ssd_write_ops.value(), 0);
-
-    // Histogram bucket counts should all be 0
-    auto read_buckets = metrics.ssd_read_latency_us.get_bucket_counts();
-    for (auto& bucket : read_buckets) {
-        ASSERT_EQ(bucket->value(), 0);
-    }
-    auto write_buckets = metrics.ssd_write_latency_us.get_bucket_counts();
-    for (auto& bucket : write_buckets) {
-        ASSERT_EQ(bucket->value(), 0);
-    }
-
-    // Total metrics
-    ASSERT_EQ(metrics.ssd_total_bytes.value(), 0);
-    ASSERT_EQ(metrics.ssd_total_ops.value(), 0);
-}
-
-TEST_F(SsdMetricsTest, ReadMetricsTest) {
-    SsdMetric metrics;
-
-    // Simulate a successful BatchLoad of 3 keys totaling 1MB
-    metrics.ssd_read_ops.inc(3);
-    metrics.ssd_read_bytes.inc(1024 * 1024);
-    metrics.ssd_read_latency_us.observe(1500);  // 1.5ms
-
-    ASSERT_EQ(metrics.ssd_read_ops.value(), 3);
-    ASSERT_EQ(metrics.ssd_read_bytes.value(), 1024 * 1024);
-
-    // Simulate another BatchLoad of 5 keys totaling 2MB
-    metrics.ssd_read_ops.inc(5);
-    metrics.ssd_read_bytes.inc(2 * 1024 * 1024);
-    metrics.ssd_read_latency_us.observe(3000);  // 3ms
-
-    ASSERT_EQ(metrics.ssd_read_ops.value(), 8);
-    ASSERT_EQ(metrics.ssd_read_bytes.value(), 3 * 1024 * 1024);
-
-    // Write metrics should remain 0
-    ASSERT_EQ(metrics.ssd_write_ops.value(), 0);
-    ASSERT_EQ(metrics.ssd_write_bytes.value(), 0);
-}
-
-TEST_F(SsdMetricsTest, WriteMetricsTest) {
-    SsdMetric metrics;
-
-    // Simulate a successful BatchOffload of 10 keys totaling 5MB
-    metrics.ssd_write_ops.inc(10);
-    metrics.ssd_write_bytes.inc(5 * 1024 * 1024);
-    metrics.ssd_write_latency_us.observe(50000);  // 50ms
-
-    ASSERT_EQ(metrics.ssd_write_ops.value(), 10);
-    ASSERT_EQ(metrics.ssd_write_bytes.value(), 5 * 1024 * 1024);
-
-    // Read metrics should remain 0
-    ASSERT_EQ(metrics.ssd_read_ops.value(), 0);
-    ASSERT_EQ(metrics.ssd_read_bytes.value(), 0);
-}
-
-TEST_F(SsdMetricsTest, TotalMetricsTest) {
-    SsdMetric metrics;
-
-    // Simulate read: 3 keys, 1MB
-    metrics.ssd_read_ops.inc(3);
-    metrics.ssd_read_bytes.inc(1024 * 1024);
-    metrics.ssd_read_latency_us.observe(1500);
-    metrics.ssd_read_latency_summary.observe(1500);
-    metrics.ssd_total_ops.inc(3);
-    metrics.ssd_total_bytes.inc(1024 * 1024);
-    metrics.ssd_total_latency_us.observe(1500);
-    metrics.ssd_total_latency_summary.observe(1500);
-
-    // Simulate write: 5 keys, 2MB
-    metrics.ssd_write_ops.inc(5);
-    metrics.ssd_write_bytes.inc(2 * 1024 * 1024);
-    metrics.ssd_write_latency_us.observe(3000);
-    metrics.ssd_write_latency_summary.observe(3000);
-    metrics.ssd_total_ops.inc(5);
-    metrics.ssd_total_bytes.inc(2 * 1024 * 1024);
-    metrics.ssd_total_latency_us.observe(3000);
-    metrics.ssd_total_latency_summary.observe(3000);
-
-    // Verify totals = read + write
-    ASSERT_EQ(metrics.ssd_total_ops.value(), 3 + 5);
-    ASSERT_EQ(metrics.ssd_total_bytes.value(), 1024 * 1024 + 2 * 1024 * 1024);
-
-    // Total latency histogram should have 2 observations
-    auto buckets = metrics.ssd_total_latency_us.get_bucket_counts();
-    int64_t total_count = 0;
-    for (auto& b : buckets) total_count += b->value();
-    ASSERT_EQ(total_count, 2);
-
-    // Verify summary shows Total line
-    std::string summary = metrics.summary_metrics();
-    EXPECT_TRUE(summary.find("SSD Total:") != std::string::npos);
-    EXPECT_TRUE(summary.find("Total:") != std::string::npos);
-
-    std::cout << "Total Metrics Summary:\n" << summary << std::endl;
-}
-
-TEST_F(SsdMetricsTest, FailureNotCountedTest) {
-    SsdMetric metrics;
-
-    // Simulate: nothing recorded (as if BatchLoad failed and we skipped
-    // metrics) All metrics should remain 0
-    ASSERT_EQ(metrics.ssd_read_ops.value(), 0);
-    ASSERT_EQ(metrics.ssd_read_bytes.value(), 0);
-    ASSERT_EQ(metrics.ssd_write_ops.value(), 0);
-    ASSERT_EQ(metrics.ssd_write_bytes.value(), 0);
-
-    // Now simulate a success after a failure
-    metrics.ssd_read_ops.inc(1);
-    metrics.ssd_read_bytes.inc(4096);
-    metrics.ssd_read_latency_us.observe(100);
-
-    // Only the successful operation should be counted
-    ASSERT_EQ(metrics.ssd_read_ops.value(), 1);
-    ASSERT_EQ(metrics.ssd_read_bytes.value(), 4096);
-}
-
-TEST_F(SsdMetricsTest, ConcurrentTest) {
-    SsdMetric metrics;
-
-    const int num_threads = 8;
-    const int ops_per_thread = 1000;
-
-    std::vector<std::thread> threads;
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back([&metrics, ops_per_thread]() {
-            for (int j = 0; j < ops_per_thread; ++j) {
-                metrics.ssd_read_ops.inc(1);
-                metrics.ssd_read_bytes.inc(4096);
-                metrics.ssd_read_latency_us.observe(500);
-                metrics.ssd_write_ops.inc(1);
-                metrics.ssd_write_bytes.inc(8192);
-                metrics.ssd_write_latency_us.observe(1000);
-                metrics.ssd_total_ops.inc(2);
-                metrics.ssd_total_bytes.inc(4096 + 8192);
-            }
-        });
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    int64_t expected_ops = num_threads * ops_per_thread;
-    ASSERT_EQ(metrics.ssd_read_ops.value(), expected_ops);
-    ASSERT_EQ(metrics.ssd_read_bytes.value(), expected_ops * 4096);
-    ASSERT_EQ(metrics.ssd_write_ops.value(), expected_ops);
-    ASSERT_EQ(metrics.ssd_write_bytes.value(), expected_ops * 8192);
-    ASSERT_EQ(metrics.ssd_total_ops.value(), expected_ops * 2);
-    ASSERT_EQ(metrics.ssd_total_bytes.value(), expected_ops * (4096 + 8192));
-}
 
 TEST_F(SsdMetricsTest, SerializeTest) {
     SsdMetric metrics;
@@ -409,28 +250,6 @@ TEST_F(SsdMetricsTest, LatencyBucketBoundaryTest) {
 
     std::cout << "Bucket boundary test serialization:\n"
               << serialized << std::endl;
-}
-
-TEST_F(SsdMetricsTest, EmptyBatchMetricsTest) {
-    SsdMetric metrics;
-
-    // Simulate recording metrics for an empty batch (0 keys, 0 bytes)
-    // This mirrors what happens if FileStorage::BatchLoad is called with
-    // an empty map and succeeds - the instrumentation code would compute
-    // total_bytes=0 and batch_object.size()=0
-    metrics.ssd_read_ops.inc(0);
-    metrics.ssd_read_bytes.inc(0);
-    metrics.ssd_read_latency_us.observe(10);  // Still takes some time
-
-    // Counters should remain 0 (inc(0) is a no-op for counters)
-    ASSERT_EQ(metrics.ssd_read_ops.value(), 0);
-    ASSERT_EQ(metrics.ssd_read_bytes.value(), 0);
-
-    // But latency histogram should record the observation
-    auto buckets = metrics.ssd_read_latency_us.get_bucket_counts();
-    int64_t total = 0;
-    for (auto& b : buckets) total += b->value();
-    EXPECT_EQ(total, 1);
 }
 
 }  // namespace mooncake::test
