@@ -2035,8 +2035,14 @@ bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
     std::vector<Slice> probe_slice{Slice{&probe, 1}};
     const ErrorCode probe_err =
         TransferReadRange(*local_disk, probe_slice, object_size - 1);
+    // The offload read path reports a wiped SSD file as INVALID_KEY (the
+    // storage key is gone from the backend), while other backends surface
+    // OBJECT_NOT_FOUND / FILE_OPEN_FAIL. All three prove the file is gone;
+    // transport/config failures come back as different codes, so a healthy
+    // replica still can never be evicted by mistake.
     if (probe_err != ErrorCode::OBJECT_NOT_FOUND &&
-        probe_err != ErrorCode::FILE_OPEN_FAIL) {
+        probe_err != ErrorCode::FILE_OPEN_FAIL &&
+        probe_err != ErrorCode::INVALID_KEY) {
         return false;
     }
     auto evicted =

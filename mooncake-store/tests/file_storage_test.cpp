@@ -876,9 +876,13 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
 // for the same key must not report success while storing nothing: the client
 // evicts the dangling replica and retries PutStart, so the new data is
 // actually written.
-TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
+namespace {
+
+void RunPutHealWipeScenario(const std::string& data_path,
+                            StorageBackendType backend_type,
+                            const std::string& suffix) {
     std::filesystem::path master_root =
-        std::filesystem::path(data_path) / "heal_master";
+        std::filesystem::path(data_path) / ("heal_master" + suffix);
     std::filesystem::create_directories(master_root);
 
     testing::InProcMaster master;
@@ -909,8 +913,8 @@ TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
                     .has_value());
 
     FileStorageConfig config = FileStorageConfig::FromEnvironment();
-    config.storage_backend_type = StorageBackendType::kFilePerKey;
-    config.storage_filepath = data_path + "/heal_ssd";
+    config.storage_backend_type = backend_type;
+    config.storage_filepath = data_path + "/heal_ssd" + suffix;
     config.local_buffer_size = 4 * 1024 * 1024;
     fs::create_directories(config.storage_filepath);
     FileStorage file_storage(config, client.value(), local_rpc_addr);
@@ -922,7 +926,7 @@ TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
 
     // Offload one key so master tracks a LOCAL_DISK replica backed by a real
     // file on the client SSD.
-    const std::string key = "heal_key";
+    const std::string key = "heal_key" + suffix;
     std::string original(512, 'x');
     std::unordered_map<std::string, std::vector<Slice>> batch_object;
     batch_object.emplace(key, std::vector<Slice>{Slice{original.data(), 512}});
@@ -983,6 +987,22 @@ TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
     auto unmount = client.value()->UnmountSegment(seg_ptr, kSegSize);
     EXPECT_TRUE(unmount.has_value());
     std::free(seg_ptr);
+}
+
+}  // namespace
+
+TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
+    // The per-key file backend reports the wiped file as OBJECT_NOT_FOUND /
+    // FILE_OPEN_FAIL, the original proof set.
+    RunPutHealWipeScenario(data_path, StorageBackendType::kFilePerKey,
+                           "_per_key");
+}
+
+TEST_F(FileStorageTest,
+       PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket) {
+    // The bucket backend's BatchLoad reports a missing key as INVALID_KEY
+    // (fanganpai's production trace in #3709); the heal must still fire.
+    RunPutHealWipeScenario(data_path, StorageBackendType::kBucket, "_bucket");
 }
 
 }  // namespace mooncake
