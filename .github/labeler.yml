@@ -17,7 +17,12 @@ PyTorch Backend:
 
 Mooncake EP:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-ep/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-ep/**/*'
+      - 'python/mooncake/ep.py'
+      - 'python/mooncake/mooncake_elastic_buffer.py'
+      - 'python/mooncake/mooncake_ep_buffer.py'
+      - 'python/tests/ep/**/*'
 
 Installation:
   - changed-files:
@@ -60,8 +65,7 @@ Tests:
     - any-glob-to-any-file:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
-      - 'python/tests/reshard/**/*'
-      - 'python/tests/typecheck/reshard/**/*'
+      - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:

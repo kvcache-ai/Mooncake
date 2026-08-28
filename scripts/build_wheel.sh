@@ -180,15 +180,29 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
-# Stage the reshard Python package for the combined Mooncake wheel. The tracked
-# source of truth remains in the root Python package.
+# Stage migrated Python sources for the combined Mooncake wheel. The tracked
+# sources of truth remain in the root Python package.
+MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
+MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+MIGRATED_PYTHON_MODULES=(
+    ep.py
+    mooncake_ep_buffer.py
+    mooncake_elastic_buffer.py
+)
 RESHARD_SOURCE_DIR="python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
-cleanup_reshard_staging() {
+cleanup_migrated_python_staging() {
+    for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+    done
     rm -rf "${RESHARD_STAGING_DIR}"
 }
-trap cleanup_reshard_staging EXIT
-rm -rf "${RESHARD_STAGING_DIR}"
+trap cleanup_migrated_python_staging EXIT
+cleanup_migrated_python_staging
+for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+    cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
+       "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+done
 cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
 
 # Build the wheel package
@@ -204,7 +218,7 @@ WHEEL_DIR="$(pwd)"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
-    cleanup_reshard_staging
+    cleanup_migrated_python_staging
 }
 trap cleanup_wheel_metadata_state EXIT
 

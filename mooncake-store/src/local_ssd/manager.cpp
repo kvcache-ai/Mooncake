@@ -48,8 +48,13 @@ bool LocalSsdTaskMailbox::RemoveOffload(const TenantId& tenant_id,
 ErrorCode LocalSsdTaskMailbox::EnqueuePromotion(PromotionTaskItem task) {
     MutexLocker lock(&mutex_);
     auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
-    if (!pending_promotions_.emplace(std::move(index), std::move(task))
-             .second) {
+    const uint64_t seq = ++promotion_seq_;
+    auto [it, inserted] = pending_promotions_.emplace(
+        std::move(index), PromotionEntry{std::move(task), seq});
+    if (!inserted) {
+        // Already queued: keep the dedup contract but refresh recency, so a
+        // repeated admission moves ahead of stale entries.
+        it->second.seq = seq;
         return ErrorCode::OBJECT_ALREADY_EXISTS;
     }
     return ErrorCode::OK;
@@ -59,10 +64,25 @@ std::vector<PromotionTaskItem> LocalSsdTaskMailbox::TakePromotions(
     size_t max_items) {
     MutexLocker lock(&mutex_);
     std::vector<PromotionTaskItem> tasks;
-    tasks.reserve(std::min(max_items, pending_promotions_.size()));
-    while (!pending_promotions_.empty() && tasks.size() < max_items) {
-        auto node = pending_promotions_.extract(pending_promotions_.begin());
-        tasks.push_back(std::move(node.mapped()));
+    const size_t count = std::min(max_items, pending_promotions_.size());
+    if (count == 0) {
+        return tasks;
+    }
+    // Global recency order: rank every entry by seq and take the top
+    // |count|. Entries left behind stay recency-ordered for the next tick —
+    // a backlog larger than max_items never degrades to hash order.
+    std::vector<std::pair<uint64_t, std::string>> ranked;
+    ranked.reserve(pending_promotions_.size());
+    for (const auto& [scoped_key, entry] : pending_promotions_) {
+        ranked.emplace_back(entry.seq, scoped_key);
+    }
+    std::partial_sort(
+        ranked.begin(), ranked.begin() + count, ranked.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+    tasks.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto node = pending_promotions_.extract(ranked[i].second);
+        tasks.push_back(std::move(node.mapped().task));
     }
     return tasks;
 }
@@ -71,6 +91,17 @@ bool LocalSsdTaskMailbox::RemovePromotion(const TenantId& tenant_id,
                                           std::string_view key) {
     MutexLocker lock(&mutex_);
     return pending_promotions_.erase(tenant_id.MakeScopedKey(key)) != 0;
+}
+
+bool LocalSsdTaskMailbox::TouchPromotion(const TenantId& tenant_id,
+                                         std::string_view key) {
+    MutexLocker lock(&mutex_);
+    auto it = pending_promotions_.find(tenant_id.MakeScopedKey(key));
+    if (it == pending_promotions_.end()) {
+        return false;
+    }
+    it->second.seq = ++promotion_seq_;
+    return true;
 }
 
 void LocalSsdTaskMailbox::RequestRemoveAll() {
@@ -271,6 +302,13 @@ LocalSsdManager::TakePromotions(const UUID& client_id, size_t max_items) {
         return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     return client->record->mailbox.TakePromotions(max_items);
+}
+
+bool LocalSsdManager::TouchPromotion(const UUID& client_id,
+                                     const TenantId& tenant_id,
+                                     std::string_view key) {
+    auto client = FindClient(client_id);
+    return client && client->record->mailbox.TouchPromotion(tenant_id, key);
 }
 
 bool LocalSsdManager::RemovePromotion(const UUID& client_id,

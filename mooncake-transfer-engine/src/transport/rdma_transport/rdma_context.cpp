@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -640,9 +641,20 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     if (iter == memory_region_map_.end()) {
         return 0;
     }
+    // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
+    // reading mr->length (or the cached region length) afterwards is a use-
+    // after-free. We restore fork state on the same range to undo the
+    // MADV_DONTFORK applied at register time (see issue #3639).
+    void *region_addr = iter->second.addr;
+    size_t region_length = iter->second.mr->length;
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
+    }
+    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
+        PLOG(WARNING) << "Failed to restore fork state for memory region at "
+                      << region_addr << " (" << region_length
+                      << " bytes), deregister already succeeded";
     }
     memory_region_map_.erase(iter);
     return 0;

@@ -1,8 +1,13 @@
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <ylt/coro_http/coro_http_client.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -14,8 +19,10 @@
 #endif
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/high_availability_test_fixture.h"
+#include "ha/leadership/master_service_supervisor.h"
 #include "master_service.h"
 #include "types.h"
+#include "utils.h"
 
 namespace mooncake {
 namespace testing {
@@ -23,6 +30,11 @@ namespace testing {
 DEFINE_string(etcd_endpoints, "127.0.0.1:2379", "Etcd endpoints");
 DEFINE_string(etcd_test_key_prefix, "mooncake-store/test/",
               "The prefix of the test keys in ETCD");
+DEFINE_bool(ha_supervisor_child, false,
+            "Run a real HA supervisor for the parent integration test");
+DEFINE_int32(ha_supervisor_rpc_port, 0, "Child supervisor RPC port");
+DEFINE_int32(ha_supervisor_admin_port, 0, "Child supervisor admin port");
+DEFINE_string(ha_supervisor_cluster_id, "", "Child supervisor cluster ID");
 
 void HighAvailabilityTest::SetUpTestSuite() {
     // Initialize glog
@@ -145,7 +157,126 @@ class FakeLeaderCoordinator : public ha::LeaderCoordinator {
     ha::LeadershipSession session_;
 };
 
+class SupervisorChildProcess {
+   public:
+    SupervisorChildProcess(int rpc_port, int admin_port, std::string cluster_id)
+        : rpc_port_(rpc_port),
+          admin_port_(admin_port),
+          cluster_id_(std::move(cluster_id)) {}
+
+    ~SupervisorChildProcess() { Stop(); }
+
+    bool Start() {
+        pid_ = fork();
+        if (pid_ != 0) {
+            return pid_ > 0;
+        }
+
+        const std::string endpoints_arg =
+            "--etcd_endpoints=" + FLAGS_etcd_endpoints;
+        const std::string rpc_port_arg =
+            "--ha_supervisor_rpc_port=" + std::to_string(rpc_port_);
+        const std::string admin_port_arg =
+            "--ha_supervisor_admin_port=" + std::to_string(admin_port_);
+        const std::string cluster_arg =
+            "--ha_supervisor_cluster_id=" + cluster_id_;
+        execl("/proc/self/exe", "/proc/self/exe", "--ha_supervisor_child=true",
+              endpoints_arg.c_str(), rpc_port_arg.c_str(),
+              admin_port_arg.c_str(), cluster_arg.c_str(), nullptr);
+        _exit(127);
+    }
+
+    bool IsRunning() {
+        if (pid_ <= 0) {
+            return false;
+        }
+        int status = 0;
+        if (waitpid(pid_, &status, WNOHANG) == 0) {
+            return true;
+        }
+        pid_ = 0;
+        return false;
+    }
+
+    void Stop() {
+        if (pid_ <= 0) {
+            return;
+        }
+        kill(pid_, SIGKILL);
+        waitpid(pid_, nullptr, 0);
+        pid_ = 0;
+    }
+
+   private:
+    pid_t pid_{0};
+    int rpc_port_;
+    int admin_port_;
+    std::string cluster_id_;
+};
+
+struct HttpResponse {
+    int status;
+    std::string body;
+};
+
+HttpResponse HttpGet(int port, const std::string& path) {
+    coro_http::coro_http_client client;
+    auto result = client.get("http://127.0.0.1:" + std::to_string(port) + path);
+    return {.status = result.status, .body = std::string(result.resp_body)};
+}
+
+bool WaitForServing(SupervisorChildProcess& child, int admin_port,
+                    std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline && child.IsRunning()) {
+        const auto health = HttpGet(admin_port, "/health");
+        if (health.status == 200 &&
+            health.body.find("\"ha_state\":\"serving\"") != std::string::npos &&
+            health.body.find("\"service_ready\":true") != std::string::npos) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
 }  // namespace
+
+int RunSupervisorChild() {
+    MasterServiceSupervisorConfig config;
+    config.enable_metric_reporting = false;
+    config.metrics_port = FLAGS_ha_supervisor_admin_port;
+    config.metrics_host = "127.0.0.1";
+    config.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
+    config.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    config.allow_evict_soft_pinned_objects = true;
+    config.eviction_ratio = DEFAULT_EVICTION_RATIO;
+    config.eviction_high_watermark_ratio =
+        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    config.nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
+    config.nof_eviction_high_watermark_ratio =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    config.client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    config.nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    config.nof_heartbeat_probe_timeout_ms =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    config.nof_heartbeat_failures_threshold =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
+    config.enable_offload = false;
+    config.rpc_address = "127.0.0.1";
+    config.rpc_port = FLAGS_ha_supervisor_rpc_port;
+    config.rpc_thread_num = 1;
+    config.local_hostname =
+        config.rpc_address + ":" + std::to_string(FLAGS_ha_supervisor_rpc_port);
+    config.ha_backend_type = "etcd";
+    config.ha_backend_connstring = FLAGS_etcd_endpoints;
+    config.etcd_endpoints = FLAGS_etcd_endpoints;
+    config.cluster_id = FLAGS_ha_supervisor_cluster_id;
+    config.enable_oplog = false;
+
+    ha::MasterServiceSupervisor supervisor(config);
+    return supervisor.Start();
+}
 
 TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
     constexpr ViewVersionId kAcquiredView = 42;
@@ -185,6 +316,22 @@ TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
 }
 
 #ifdef STORE_USE_ETCD
+
+TEST_F(HighAvailabilityTest, HaWithoutOplogRestoresEmptyContextAndServes) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto ports = getFreeTcpPorts(2);
+    ASSERT_EQ(ports.size(), 2);
+    const std::string cluster_id =
+        "ha-without-oplog-supervisor-" + std::to_string(getpid());
+    SupervisorChildProcess child(ports[0], ports[1], cluster_id);
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(WaitForServing(child, ports[1], std::chrono::seconds(20)));
+
+    EXPECT_EQ(HttpGet(ports[1], "/get_all_keys").status, 200);
+}
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
@@ -908,6 +1055,12 @@ TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
 int main(int argc, char** argv) {
     // Initialize Google's flags library
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    if (mooncake::testing::FLAGS_ha_supervisor_child) {
+        google::InitGoogleLogging("HighAvailabilitySupervisorChild");
+        FLAGS_logtostderr = 1;
+        return mooncake::testing::RunSupervisorChild();
+    }
 
     // Initialize Google Test
     ::testing::InitGoogleTest(&argc, argv);

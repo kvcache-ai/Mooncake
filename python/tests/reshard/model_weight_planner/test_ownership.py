@@ -92,7 +92,10 @@ def test_target_dp_replicas_on_distinct_devices_are_not_deduplicated() -> None:
     plan = plan_transfer(source, target)
 
     assert len(plan.operations) == 2
-    assert {operation.target.rank.dp for operation in plan.operations} == {0, 1}
+    assert {operation.target.device for operation in plan.operations} == {
+        "cuda:0",
+        "cuda:1",
+    }
     assert all(
         plan.operation_indices_for_executor(executor, "target")
         for executor in plan.target_executors

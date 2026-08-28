@@ -8,7 +8,8 @@
     "mooncake/reshard/weight/runtime.py",
     "mooncake/reshard/weight/validation.py",
     "mooncake/reshard/weight/binding.py",
-    "mooncake/reshard/weight/serde.py"
+    "mooncake/reshard/weight/serde.py",
+    "mooncake/reshard/weight/_planner"
   ],
   "extraPaths": ["."],
   "pythonVersion": "3.10",
