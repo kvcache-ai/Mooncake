@@ -836,38 +836,71 @@ int Workers::handleContextEvents(int dev_id,
     LOG(WARNING) << "Received context async event "
                  << ibv_event_type_str(event.event_type) << " for context "
                  << context->name();
-    if (event.event_type == IBV_EVENT_QP_FATAL ||
-        event.event_type == IBV_EVENT_WQ_FATAL) {
-        auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
-        context->endpointStore()->remove(endpoint);
-    } else if (event.event_type == IBV_EVENT_CQ_ERR) {
-        context->pause();
-        context->resume();
-        LOG(WARNING) << "Action: " << context->name() << " restarted";
-    } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
-               event.event_type == IBV_EVENT_PORT_ERR) {
-        context->pause();
-        // Out of selection and out of the aggregate until the port returns;
-        // its EWMA cannot learn anything while no traffic flows.
-        device_selector_->setDeviceAvailable(dev_id, false);
-        LOG(WARNING) << "Action: " << context->name() << " down";
-    } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
-        context->resume();
-        // The link may have renegotiated while down: re-seed before the
-        // device becomes selectable so no worker scores it on the old rate.
-        refreshLinkSpeed(dev_id, *context);
-        device_selector_->setDeviceAvailable(dev_id, true);
-        LOG(WARNING) << "Action: " << context->name() << " up";
-#ifdef HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE
-    } else if (event.event_type == IBV_EVENT_DEVICE_SPEED_CHANGE) {
-        // rdma-core >= 62: a port speed changed without a link flap (e.g. a
-        // VF over LAG losing a PF). Device-level, so the event names no
-        // port; each context opens exactly one, so re-query that one.
-        refreshLinkSpeed(dev_id, *context);
-#endif
-    }
+    applyContextEvent(dev_id, *context, event);
     ibv_ack_async_event(&event);
     return 0;
+}
+
+void Workers::applyContextEvent(int dev_id, RdmaContext& context,
+                                const ibv_async_event& event) {
+    switch (event.event_type) {
+        case IBV_EVENT_QP_FATAL:
+        case IBV_EVENT_WQ_FATAL: {
+            auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
+            context.endpointStore()->remove(endpoint);
+            break;
+        }
+        case IBV_EVENT_CQ_ERR:
+            context.pause();
+            context.resume();
+            LOG(WARNING) << "Action: " << context.name() << " restarted";
+            break;
+        case IBV_EVENT_DEVICE_FATAL:
+            // Device-scoped: every port is gone.
+            context.pause();
+            device_selector_->setDeviceAvailable(dev_id, false);
+            LOG(WARNING) << "Action: " << context.name() << " down";
+            break;
+        case IBV_EVENT_PORT_ERR:
+        case IBV_EVENT_PORT_ACTIVE: {
+            if (event.element.port_num != context.portNum()) {
+                LOG(INFO) << context.name() << ": ignoring "
+                          << ibv_event_type_str(event.event_type)
+                          << " for port " << event.element.port_num
+                          << " (this context uses port "
+                          << static_cast<int>(context.portNum()) << ")";
+                break;
+            }
+            if (event.event_type == IBV_EVENT_PORT_ERR) {
+                context.pause();
+                // Out of selection and out of the aggregate until the port
+                // returns; its EWMA cannot learn anything while no traffic
+                // flows.
+                device_selector_->setDeviceAvailable(dev_id, false);
+                LOG(WARNING) << "Action: " << context.name() << " down";
+            } else {
+                context.resume();
+                // The link may have renegotiated while down: re-seed before
+                // the device becomes selectable so no worker scores it on
+                // the old rate.
+                refreshLinkSpeed(dev_id, context);
+                device_selector_->setDeviceAvailable(dev_id, true);
+                LOG(WARNING) << "Action: " << context.name() << " up";
+            }
+            break;
+        }
+#ifdef HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE
+        case IBV_EVENT_DEVICE_SPEED_CHANGE:
+            // rdma-core >= 62: a port speed changed without a link flap
+            // (e.g. a VF over LAG losing a PF). Device-level, so the event
+            // names no port; each context opens exactly one, so re-query
+            // that one.
+            refreshLinkSpeed(dev_id, context);
+            break;
+#endif
+        default:
+            break;
+    }
 }
 
 void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {

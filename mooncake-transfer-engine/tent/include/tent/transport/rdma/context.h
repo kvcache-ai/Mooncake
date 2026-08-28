@@ -110,7 +110,8 @@ class RdmaContext {
 
     ibv_pd *nativePD() const { return native_pd_; }
 
-    uint8_t portNum() const { return params_->device.port; }
+    // The one port this context opened; 0 for a slot that never constructed.
+    uint8_t portNum() const { return params_ ? params_->device.port : 0; }
 
     // Negotiated port speed in Gbps, 0 when it could not be determined.
     double linkSpeedGbps() const;
