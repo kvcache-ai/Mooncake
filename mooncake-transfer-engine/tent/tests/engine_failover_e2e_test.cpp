@@ -546,6 +546,71 @@ TEST(EngineFailoverE2E, ProgressBatchKeepsOverallPendingWithMixedOutcomes) {
     EXPECT_TRUE(engine.unregisterLocalMemory(pending_buf.data(), kBufLen).ok());
 }
 
+// A terminal TIMEOUT plus a COMPLETED sibling must report TIMEOUT overall,
+// not a generic FAILED. The old aggregation collapsed every non-success
+// terminal status into FAILED.
+TEST(EngineFailoverE2E, OverallStatusUsesWorstFailureNotGenericFailed) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    cfg->set("max_failover_attempts", 0);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> timeout_buf(kBufLen, 0xB1);
+    std::vector<uint8_t> completed_buf(kBufLen, 0xB2);
+    const uint64_t timeout_addr =
+        reinterpret_cast<uint64_t>(timeout_buf.data());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [timeout_addr](const Request& req) {
+            if (reinterpret_cast<uint64_t>(req.source) == timeout_addr) {
+                return TransferStatus{TransferStatusEnum::TIMEOUT, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED, req.length};
+        });
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+
+    std::string seg_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    ASSERT_TRUE(engine.registerLocalMemory(timeout_buf.data(), kBufLen).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(completed_buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(2);
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    Request timeout_req;
+    timeout_req.opcode = Request::WRITE;
+    timeout_req.source = timeout_buf.data();
+    timeout_req.target_id = LOCAL_SEGMENT_ID;
+    timeout_req.target_offset = timeout_addr;
+    timeout_req.length = kBufLen;
+
+    Request completed_req;
+    completed_req.opcode = Request::WRITE;
+    completed_req.source = completed_buf.data();
+    completed_req.target_id = LOCAL_SEGMENT_ID;
+    completed_req.target_offset =
+        reinterpret_cast<uint64_t>(completed_buf.data());
+    completed_req.length = kBufLen;
+
+    ASSERT_TRUE(
+        engine.submitTransfer(batch_id, {timeout_req, completed_req}).ok());
+
+    TransferStatus overall_status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, overall_status).ok());
+    EXPECT_EQ(overall_status.s, TransferStatusEnum::TIMEOUT);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(timeout_buf.data(), kBufLen).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(completed_buf.data(), kBufLen).ok());
+}
+
 TEST(EngineFailoverE2E,
      WaitTransferCompletionUsesProgressBatchWhenPollDisabled) {
     auto cfg = makeMinimalP2PConfig();
