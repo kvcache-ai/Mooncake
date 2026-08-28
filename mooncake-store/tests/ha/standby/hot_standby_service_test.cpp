@@ -305,7 +305,8 @@ class LiveUnreachableEtcdIntegrationFixture {
             EtcdHelper::ResetEtcdStoreClient(kUnreachableEndpoints);
         if (err != ErrorCode::OK) {
             return std::string(
-                       "Unable to acquire LiveUnreachableEtcdIntegrationFixture: ") +
+                       "Unable to acquire "
+                       "LiveUnreachableEtcdIntegrationFixture: ") +
                    toString(err);
         }
         out->reset(new LiveUnreachableEtcdIntegrationFixture());
@@ -539,12 +540,12 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
     ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
 
-    ASSERT_EQ(ErrorCode::OK,
-              backend->Put(BuildBatchRecordKey(cluster_id_, 2),
-                           "not-a-valid-batch-record"));
-    ASSERT_EQ(ErrorCode::OK,
-              backend->Put(BuildDurablePrefixKey(cluster_id_),
-                           EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    ASSERT_EQ(ErrorCode::OK, backend->Put(BuildBatchRecordKey(cluster_id_, 2),
+                                          "not-a-valid-batch-record"));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
 
     ASSERT_TRUE(WaitForState(*service_, StandbyState::FAILED));
     EXPECT_NE(ErrorCode::OK, service_->GetSyncStatus().last_error);
@@ -1207,7 +1208,8 @@ TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
               batch_backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
                                   EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
 
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
 
     StandbySnapshot out;
@@ -1295,7 +1297,8 @@ TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
     }
     service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
 
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
 
     StandbySnapshot out;
