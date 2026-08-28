@@ -214,6 +214,12 @@ struct BucketBackendConfig {
     int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
                                  // exceeds this threshold (bytes)
 
+    // Optional hard physical cap for container quotas where fs::space() reports
+    // the host filesystem instead of the volume sizeLimit / cgroup quota.
+    // When > 0, eviction also caps available space using logical used bytes
+    // (total + pending eviction/write). 0 = disabled (rely on fs::space only).
+    int64_t max_physical_bytes = 0;
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
