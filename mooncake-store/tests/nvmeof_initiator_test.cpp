@@ -14,8 +14,9 @@
 namespace mooncake {
 namespace {
 
-// 按接口契约实现的 Mock:回调在 PollCompletion 内同步触发,与 SpdkInitiator
-// 的线程契约一致 —— 测试因此是有效的。
+// Mock implementing the interface contract: callbacks fire synchronously
+// inside PollCompletion, matching SpdkInitiator's threading contract — which
+// is what makes the tests valid.
 class MockInitiator : public NVMeoFInitiator {
    public:
     NofSegmentHandle* OpenSegment(const std::string& ep) override {
@@ -23,9 +24,11 @@ class MockInitiator : public NVMeoFInitiator {
         if (it != handles_.end()) {
             return it->second;
         }
-        // Opaque handle 是前向声明类型(完整定义只在 spdk_initiator.cpp 内),
-        // 接口从不解引用它 —— 用 aligned 存储的稳定地址作为每 endpoint 唯一
-        // 的 sentinel 指针(key 用)。绝不 new/delete NofSegmentHandle。
+        // The opaque handle is a forward-declared type (its full definition
+        // lives only in spdk_initiator.cpp) and the interface never
+        // dereferences it — use the stable address of aligned storage as a
+        // unique per-endpoint sentinel pointer (map key). Never new/delete
+        // NofSegmentHandle.
         NofSegmentHandle* h = reinterpret_cast<NofSegmentHandle*>(
             &sentinels_[handles_.size() % sentinels_.size()]);
         handles_[ep] = h;

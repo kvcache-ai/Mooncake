@@ -4,9 +4,9 @@
 
 namespace {
 std::shared_ptr<mooncake::DmaBufferAllocator> DefaultDmaAllocator() {
-    // CreateDefaultDmaAllocator():按需只构造 DMA allocator,不为这里
-    // 白造一个用不到的 initiator(评审 #10);非 USE_NOF 返回 nullptr,
-    // 保持历史行为。
+    // CreateDefaultDmaAllocator(): build only the DMA allocator on demand,
+    // without constructing an initiator this path would never use; returns
+    // nullptr in non-USE_NOF builds, preserving the historical behavior.
     static std::shared_ptr<mooncake::DmaBufferAllocator> allocator =
         mooncake::CreateDefaultDmaAllocator();
     return allocator;

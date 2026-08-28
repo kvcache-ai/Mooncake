@@ -71,7 +71,7 @@ class ClientBufferAllocator
 
     std::string protocol;
     bool is_external_memory_ = false;
-    std::shared_ptr<DmaBufferAllocator> dma_allocator_;  // 替换 use_spdk_dma_
+    std::shared_ptr<DmaBufferAllocator> dma_allocator_;  // was use_spdk_dma_
 };
 
 /**

@@ -979,7 +979,7 @@ void Client::InitTransferSubmitter() {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
-    // Unconditional; nof_initiator_ 为空时 NofWorkerPool 不创建。
+    // Unconditional; no NofWorkerPool is created when nof_initiator_ is null.
     int numa_socket_id =
         GetConfiguredNumaSocketId().value_or(GetCurrentNumaSocketId());
     transfer_submitter_ = std::make_unique<TransferSubmitter>(

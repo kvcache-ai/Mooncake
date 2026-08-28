@@ -68,8 +68,8 @@ namespace {
 #ifdef USE_NOF
 // Shared NoF probe default, used by both the constructor and the test-seam
 // reset. A single function-static initiator keeps the probe path aligned with
-// the process-global NofPageRegistry (R-2) and avoids duplicating the lambda
-// body in two places.
+// the process-global NofPageRegistry and avoids duplicating the lambda body
+// in two places.
 bool DefaultProbeNofSegment(const std::string& te_endpoint, uint32_t timeout_ms,
                             std::string* error_reason) {
     static const std::shared_ptr<NVMeoFInitiator> initiator =

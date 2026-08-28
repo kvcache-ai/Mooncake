@@ -8,9 +8,8 @@ namespace mooncake {
 // SPDK serves Mooncake as two things: an NVMe-oF initiator and a hugepage
 // DMA allocator. The call sites never overlap, so the roles get separate
 // interfaces. An allocator object remembers who it is — the alloc/free
-// mirror contract (former C5) and the static-destruction-order hazard
-// (former C7) disappear by construction: users hold a shared_ptr and the
-// allocator outlives them.
+// mirror contract and the static-destruction-order hazard disappear by
+// construction: users hold a shared_ptr and the allocator outlives them.
 class DmaBufferAllocator {
    public:
     virtual ~DmaBufferAllocator() = default;

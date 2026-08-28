@@ -53,7 +53,7 @@ class SpdkDmaAllocator : public DmaBufferAllocator {
     // Type-erased SpdkEnvGuard reference; keeps the SPDK env alive.
     std::shared_ptr<void> env_guard_;
     // Guards lazy env acquisition: the Python-ABI path
-    // (hugepage_memory_alloc) can call Alloc concurrently (评审 #4).
+    // (hugepage_memory_alloc) can call Alloc concurrently.
     std::mutex env_mutex_;
 };
 

@@ -590,7 +590,7 @@ void free_memory(const std::string &protocol, void *ptr,
     // Mirror allocate_buffer_allocator_memory(): a buffer taken from a
     // DMA-specialized allocator (spdk_zmalloc) must be released by that same
     // allocator (spdk_free), never glibc free(). The mirror contract is now
-    // guaranteed by the allocator object identity (former C5).
+    // guaranteed by the allocator object identity.
     if (dma_allocator) {
         dma_allocator->Free(ptr);
         return;

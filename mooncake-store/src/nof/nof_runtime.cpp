@@ -81,12 +81,13 @@ NofRuntime CreateNofRuntime() {
 std::shared_ptr<DmaBufferAllocator> CreateDefaultDmaAllocator() {
 #ifdef USE_NOF
     if (ResolveNofBackend() == NofBackend::kNone) {
-        // 服从 none:返回 nullptr,与 "NoF 不可用" 的历史信号一致。
+        // Honor "none": return nullptr, matching the historical
+        // "NoF unavailable" signal.
         return nullptr;
     }
     return std::make_shared<SpdkDmaAllocator>();
 #else
-    return nullptr;  // 保持 hugepage_memory_alloc 的历史行为
+    return nullptr;  // preserve hugepage_memory_alloc's historical behavior
 #endif
 }
 

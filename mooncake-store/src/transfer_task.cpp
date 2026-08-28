@@ -144,7 +144,7 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
         task->remaining_bytes = 0;
         task->failed = true;
         if (task->error_detail.empty()) {
-            task->error_detail = c.error_string;  // 保留首个错误详情
+            task->error_detail = c.error_string;  // keep the first error detail
         }
     }
 
@@ -405,7 +405,8 @@ void NofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
     VLOG(2) << "NofWorkerPool worker thread started";
 
-    // C2 fix: 不再是栈变量地址;worker 与 task 共享所有权。
+    // No longer a stack-variable address: the worker and the task share
+    // ownership.
     auto total_outstanding_io = std::make_shared<std::atomic<int64_t>>(0);
     std::map<NofSegmentHandle*, std::unique_ptr<NofQos>> seg_to_qos;
     std::stack<NofSubTask*> sub_task_pool;
@@ -480,7 +481,8 @@ void NofWorkerPool::workerThread(int work_idx) {
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
-            // block_size 取自 QoS 缓存;热循环不再查询 initiator。
+            // block_size comes from the QoS cache; the hot loop no longer
+            // queries the initiator.
             const uint32_t block_size = nof_qos->block_size;
             const uint64_t chunk_bytes =
                 static_cast<uint64_t>(nof_qos->blocks_per_chunk) * block_size;
@@ -522,8 +524,10 @@ void NofWorkerPool::workerThread(int work_idx) {
                         if (ret != 0) {
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle << " submit io fail";
-                            // 归还池槽位(评审 #3):取出后提交失败若不归还,
-                            // 重复失败会耗尽 4096 槽并无界分配新 chunk。
+                            // Return the pool slot: a sub-task taken out
+                            // and then failing to submit must be returned,
+                            // or repeated failures would exhaust the 4096
+                            // slots and allocate new chunks unboundedly.
                             sub_task->sub_task_pool->push(sub_task);
                             task->failed = true;
                             task->remaining_bytes = 0;
@@ -1398,8 +1402,8 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
     const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
     const TransferRequest::OpCode op_code) {
     if (!nof_pool_) {
-        // 原 "NoF transfer requested while USE_NOF is disabled" 的等价
-        // 运行期形式。
+        // Runtime form of the former "NoF transfer requested while USE_NOF
+        // is disabled" error.
         LOG(ERROR) << "NoF transfer requested but NoF is unavailable "
                       "(no initiator in this process)";
         return std::nullopt;
@@ -1421,9 +1425,10 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
     }
 
     uint32_t block_size = nof_initiator_->GetBlockSize(seg_handle);
-    // dma_alignment 的消费点(评审 #7):无 SGL 时 ptr 仍须块对齐
-    // (RFC §5.3 的现状前置条件);#3251 的 SGL 落地后 supports_sgl=true,
-    // ptr 对齐自动放宽到 DWORD,接口不变。
+    // Consumer of dma_alignment: without SGL, ptr must still be
+    // block-aligned (the existing precondition from RFC §5.3); once #3251
+    // lands SGL with supports_sgl=true, the ptr requirement relaxes to DWORD
+    // automatically, with no interface change.
     const auto caps = nof_initiator_->GetCapabilities();
     const uint64_t ptr_alignment =
         caps.supports_sgl ? caps.dma_alignment : block_size;
