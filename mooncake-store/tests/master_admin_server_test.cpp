@@ -830,6 +830,16 @@ TEST_F(MasterAdminServerWithServiceTest, GetSegmentsDetailReturnsDetailedInfo) {
     EXPECT_NE(resp.body.find("\"allocator_used_bytes\""), std::string::npos);
     EXPECT_NE(resp.body.find("\"allocator_capacity_bytes\""),
               std::string::npos);
+    EXPECT_NE(resp.body.find("\"admission_tracked\":true"), std::string::npos);
+    EXPECT_NE(resp.body.find("\"admission_mode\":\"observe\""),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("\"admission_state\":\"ACTIVE\""),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("\"admission_ratio\":"), std::string::npos);
+    EXPECT_NE(resp.body.find("\"inflight_remote_write_ops\":"),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("\"inflight_remote_write_bytes\":"),
+              std::string::npos);
 }
 
 // -----------------------------------------------------------------------

@@ -135,6 +135,33 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_put_start_discarded_staging_size(), 0);
 }
 
+TEST_F(MasterMetricsTest, SegmentAdmissionMetricsArePublishedAndRemoved) {
+    auto& metrics = MasterMetricManager::instance();
+    const std::string segment =
+        "admission_metric_segment_" + UuidToString(generate_uuid());
+
+    metrics.update_segment_admission_metrics(segment, 0, 0.25, 3, 4096);
+    const auto published = metrics.serialize_metrics();
+    EXPECT_NE(published.find("mooncake_segment_admission_state{segment=\"" +
+                             segment + "\"}"),
+              std::string::npos);
+    EXPECT_NE(published.find("mooncake_segment_admission_ratio{segment=\"" +
+                             segment + "\"}"),
+              std::string::npos);
+    EXPECT_NE(
+        published.find("mooncake_segment_inflight_remote_write_ops{segment=\"" +
+                       segment + "\"}"),
+        std::string::npos);
+    EXPECT_NE(published.find(
+                  "mooncake_segment_inflight_remote_write_bytes{segment=\"" +
+                  segment + "\"}"),
+              std::string::npos);
+
+    metrics.remove_segment_admission_metrics(segment);
+    EXPECT_EQ(metrics.serialize_metrics().find("segment=\"" + segment + "\""),
+              std::string::npos);
+}
+
 TEST_F(MasterMetricsTest, BasicRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();

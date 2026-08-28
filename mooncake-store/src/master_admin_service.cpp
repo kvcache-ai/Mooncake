@@ -698,11 +698,25 @@ struct HttpSegmentDetailItem {
     uint64_t allocator_used_bytes{0};
     uint64_t allocator_capacity_bytes{0};
     double allocator_usage_percent{0.0};
+    bool admission_tracked{false};
+    std::string admission_mode;
+    std::string admission_state;
+    double admission_ratio{0.0};
+    uint64_t inflight_remote_write_ops{0};
+    uint64_t inflight_remote_write_bytes{0};
+    uint64_t admission_observed_remote_writes{0};
+    uint64_t admission_observed_would_reject{0};
+    int64_t admission_quarantine_remaining_ms{0};
+    int64_t admission_owner_heartbeat_age_ms{0};
 };
 YLT_REFL(HttpSegmentDetailItem, segment_name, segment_id, client_id,
          base_address, size_bytes, size_human, te_endpoint, protocol, status,
          allocator_used_bytes, allocator_capacity_bytes,
-         allocator_usage_percent);
+         allocator_usage_percent, admission_tracked, admission_mode,
+         admission_state, admission_ratio, inflight_remote_write_ops,
+         inflight_remote_write_bytes, admission_observed_remote_writes,
+         admission_observed_would_reject, admission_quarantine_remaining_ms,
+         admission_owner_heartbeat_age_ms);
 
 struct HttpSegmentsDetailResponse {
     uint64_t total_segments{0};
@@ -748,6 +762,20 @@ void MasterAdminServer::HandleGetSegmentsDetail(
                     ? (static_cast<double>(info.allocator_used_bytes) /
                        info.allocator_capacity_bytes * 100.0)
                     : 0.0;
+            item.admission_tracked = info.admission_tracked;
+            item.admission_mode = info.admission_mode;
+            item.admission_state = info.admission_state;
+            item.admission_ratio = info.admission_ratio;
+            item.inflight_remote_write_ops = info.inflight_remote_write_ops;
+            item.inflight_remote_write_bytes = info.inflight_remote_write_bytes;
+            item.admission_observed_remote_writes =
+                info.admission_observed_remote_writes;
+            item.admission_observed_would_reject =
+                info.admission_observed_would_reject;
+            item.admission_quarantine_remaining_ms =
+                info.admission_quarantine_remaining_ms;
+            item.admission_owner_heartbeat_age_ms =
+                info.admission_owner_heartbeat_age_ms;
             payload.segments.push_back(std::move(item));
         }
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);

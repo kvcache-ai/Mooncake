@@ -3,10 +3,12 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include <glog/logging.h>
 
 #include "config_helper.h"
+#include "segment_admission_config.h"
 #include "types.h"
 
 namespace mooncake {
@@ -68,6 +70,19 @@ struct MasterConfig {
     int64_t global_file_segment_size;
     std::string memory_allocator;
     std::string allocation_strategy;
+
+    // Volatile admission state for mounted memory segments. PR1 evaluates
+    // decisions in observe mode without changing allocation results.
+    std::string segment_write_admission_mode = "observe";
+    uint64_t segment_ramp_up_duration_sec = 60;
+    double segment_ramp_initial_ratio = 0.05;
+    uint64_t segment_ramp_min_successful_remote_writes = 16;
+    uint64_t segment_max_inflight_remote_write_ops = 64;
+    uint64_t segment_max_inflight_remote_write_bytes = 0;
+    uint64_t segment_failure_window_sec = 5;
+    uint64_t segment_failure_threshold = 3;
+    uint64_t segment_quarantine_duration_sec = 10;
+    uint64_t segment_result_retention_sec = 30;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
@@ -211,6 +226,7 @@ class MasterServiceSupervisorConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
+    SegmentAdmissionConfig segment_admission_config;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -378,6 +394,17 @@ class MasterServiceSupervisorConfig {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
+        segment_admission_config = BuildSegmentAdmissionConfig(
+            config.segment_write_admission_mode,
+            config.segment_ramp_up_duration_sec,
+            config.segment_ramp_initial_ratio,
+            config.segment_ramp_min_successful_remote_writes,
+            config.segment_max_inflight_remote_write_ops,
+            config.segment_max_inflight_remote_write_bytes,
+            config.segment_failure_window_sec, config.segment_failure_threshold,
+            config.segment_quarantine_duration_sec,
+            config.segment_result_retention_sec);
+
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
@@ -533,6 +560,7 @@ class WrappedMasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
+    SegmentAdmissionConfig segment_admission_config;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -663,6 +691,17 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
+        segment_admission_config = BuildSegmentAdmissionConfig(
+            config.segment_write_admission_mode,
+            config.segment_ramp_up_duration_sec,
+            config.segment_ramp_initial_ratio,
+            config.segment_ramp_min_successful_remote_writes,
+            config.segment_max_inflight_remote_write_ops,
+            config.segment_max_inflight_remote_write_bytes,
+            config.segment_failure_window_sec, config.segment_failure_threshold,
+            config.segment_quarantine_duration_sec,
+            config.segment_result_retention_sec);
+
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
@@ -754,6 +793,7 @@ class WrappedMasterServiceConfig {
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
         allocation_strategy_type = config.allocation_strategy_type;
+        segment_admission_config = config.segment_admission_config;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
@@ -823,6 +863,7 @@ class MasterServiceConfigBuilder {
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type_ =
         AllocationStrategyType::RANDOM;
+    SegmentAdmissionConfig segment_admission_config_;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     bool enable_multi_tenants_ = false;
@@ -986,6 +1027,13 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allocation_strategy_type(
         AllocationStrategyType type) {
         allocation_strategy_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_segment_admission_config(
+        SegmentAdmissionConfig config) {
+        config.Validate();
+        segment_admission_config_ = std::move(config);
         return *this;
     }
 
@@ -1210,6 +1258,7 @@ class MasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
+    SegmentAdmissionConfig segment_admission_config;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -1302,6 +1351,7 @@ class MasterServiceConfig {
         memory_allocator =
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
         allocation_strategy_type = config.allocation_strategy_type;
+        segment_admission_config = config.segment_admission_config;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
@@ -1370,6 +1420,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
     config.allocation_strategy_type = allocation_strategy_type_;
+    config.segment_admission_config = segment_admission_config_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;

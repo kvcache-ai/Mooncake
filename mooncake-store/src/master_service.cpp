@@ -211,6 +211,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
+      segment_admission_controller_(config.segment_admission_config),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
@@ -230,6 +231,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
               return std::make_unique<OrderedOpLogWriter>(
                   std::move(writer_config), std::move(write_batch));
           }) {
+    LOG(INFO) << "segment_write_admission_mode="
+              << ToString(segment_admission_controller_.mode())
+              << ", action=initialize_segment_admission_controller";
+    if (segment_admission_controller_.mode() ==
+        SegmentWriteAdmissionMode::ENFORCE) {
+        LOG(WARNING) << "segment_write_admission_mode=enforce was configured, "
+                        "but PR1 is observe-only; allocation results will not "
+                        "be changed";
+    }
     if (default_kv_soft_pin_ttl_ > max_kv_soft_pin_ttl_) {
         LOG(ERROR) << "Invalid soft-pin TTL configuration: default="
                    << default_kv_soft_pin_ttl_
@@ -283,6 +293,22 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (config.enable_snapshot_restore) {
         RestoreState();
+        std::vector<std::pair<Segment, UUID>> restored_segments;
+        {
+            auto segment_access = segment_manager_.getSegmentAccess();
+            if (segment_access.GetAllSegments(restored_segments) !=
+                ErrorCode::OK) {
+                throw std::runtime_error(
+                    "Failed to initialize admission state for restored "
+                    "segments");
+            }
+        }
+        for (const auto& [segment, owner_client_id] : restored_segments) {
+            if (auto snapshot = segment_admission_controller_.OnMount(
+                    segment, owner_client_id, true)) {
+                PublishSegmentAdmissionSnapshot(*snapshot);
+            }
+        }
     }
     if (enable_multi_tenants_) {
         LoadTenantQuotaPoliciesFromStoreOrThrow();
@@ -692,6 +718,10 @@ MasterService::~MasterService() {
             segment, static_cast<int64_t>(bytes));
         MasterMetricManager::instance().remove_segment_metrics(segment);
     }
+    for (const auto& admission : segment_admission_controller_.GetSnapshots()) {
+        MasterMetricManager::instance().remove_segment_admission_metrics(
+            admission.segment_name);
+    }
 
     // Segments still mounted here never went through CommitUnmountSegment;
     // release their capacity contribution so the process-lifetime
@@ -927,6 +957,12 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                                        std::string(bytes.begin(), bytes.end()));
     }
     UpdateClientHostId(client_id, segment.host_id);
+    if (mount_result == ErrorCode::OK) {
+        if (auto snapshot =
+                segment_admission_controller_.OnMount(segment, client_id)) {
+            PublishSegmentAdmissionSnapshot(*snapshot);
+        }
+    }
     if (mount_result == ErrorCode::OK) {
         RecomputeTenantEffectiveQuotas();
     }
@@ -1264,6 +1300,12 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         // Change the client status to OK
         ok_client_.insert(client_id);
         MasterMetricManager::instance().inc_active_clients();
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (auto snapshot = segment_admission_controller_.OnMount(
+                    segments[i], client_id, segment_existed[i])) {
+                PublishSegmentAdmissionSnapshot(*snapshot);
+            }
+        }
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -1328,6 +1370,48 @@ std::string MasterService::GetClientHostId(const UUID& client_id) const {
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
     auto it = client_host_id_.find(client_id);
     return it == client_host_id_.end() ? std::string() : it->second;
+}
+
+void MasterService::PublishSegmentAdmissionSnapshot(
+    const SegmentAdmissionSnapshot& snapshot) {
+    MasterMetricManager::instance().update_segment_admission_metrics(
+        snapshot.segment_name, SegmentAdmissionStateMetricValue(snapshot.state),
+        snapshot.effective_ratio,
+        static_cast<int64_t>(snapshot.inflight_remote_write_ops),
+        static_cast<int64_t>(snapshot.inflight_remote_write_bytes));
+}
+
+void MasterService::ObserveAllocatedMemoryReplicas(
+    const std::vector<Replica>& replicas, const std::string& writer_host_id,
+    uint64_t value_length) {
+    if (segment_admission_controller_.mode() ==
+        SegmentWriteAdmissionMode::DISABLED) {
+        return;
+    }
+    for (const auto& replica : replicas) {
+        if (!replica.is_memory_replica()) {
+            continue;
+        }
+        for (const auto& segment_name : replica.get_segment_names()) {
+            if (!segment_name) {
+                continue;
+            }
+            auto observation = segment_admission_controller_.ObserveRemoteWrite(
+                *segment_name, writer_host_id, value_length);
+            PublishSegmentAdmissionSnapshot(observation.snapshot);
+            if (!observation.would_admit) {
+                MasterMetricManager::instance()
+                    .inc_segment_admission_observe_reject(
+                        *segment_name,
+                        std::string(ToString(observation.reason)));
+                VLOG(1) << "segment_name=" << *segment_name
+                        << ", writer_host_id=" << writer_host_id
+                        << ", value_length=" << value_length
+                        << ", admission_reason=" << ToString(observation.reason)
+                        << ", action=observe_segment_admission_reject";
+            }
+        }
+    }
 }
 
 size_t MasterService::getMetadataShardIndex(const TenantId& tenant_id,
@@ -2636,6 +2720,11 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             // Return OK because this is an idempotent operation
+            if (auto removed =
+                    segment_admission_controller_.OnUnmount(segment_id)) {
+                MasterMetricManager::instance()
+                    .remove_segment_admission_metrics(removed->segment_name);
+            }
             return {};
         }
         if (err != ErrorCode::OK) {
@@ -2677,6 +2766,10 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         PersistSegmentOpForHAOrEnqueue("UnmountSegment",
                                        OpType::SEGMENT_UNMOUNT, te_endpoint,
                                        std::string(bytes.begin(), bytes.end()));
+    }
+    if (auto removed = segment_admission_controller_.OnUnmount(segment_id)) {
+        MasterMetricManager::instance().remove_segment_admission_metrics(
+            removed->segment_name);
     }
     RecomputeTenantEffectiveQuotas();
     return {};
@@ -2947,6 +3040,30 @@ auto MasterService::GetSegmentsDetail()
         segment_access.QuerySegments(segment.name, used, capacity);
         info.allocator_used_bytes = used;
         info.allocator_capacity_bytes = capacity;
+
+        info.admission_mode =
+            std::string(ToString(segment_admission_controller_.mode()));
+        if (auto admission =
+                segment_admission_controller_.GetSnapshot(segment.id)) {
+            info.admission_tracked = true;
+            info.admission_state = std::string(ToString(admission->state));
+            info.admission_ratio = admission->effective_ratio;
+            info.inflight_remote_write_ops =
+                admission->inflight_remote_write_ops;
+            info.inflight_remote_write_bytes =
+                admission->inflight_remote_write_bytes;
+            info.admission_observed_remote_writes =
+                admission->observed_remote_writes;
+            info.admission_observed_would_reject =
+                admission->observed_would_reject;
+            info.admission_quarantine_remaining_ms =
+                admission->quarantine_remaining_ms;
+            info.admission_owner_heartbeat_age_ms =
+                admission->owner_heartbeat_age_ms;
+            PublishSegmentAdmissionSnapshot(*admission);
+        } else {
+            info.admission_state = "UNTRACKED";
+        }
 
         result.push_back(std::move(info));
     }
@@ -4196,6 +4313,10 @@ auto MasterService::AllocateAndInsertMetadata(
                      << ", requested_nof_replicas=" << config.nof_replica_num
                      << ", allocated_nof_replicas=" << allocated_nof_replicas;
     }
+
+    // Evaluate the targets selected by the existing allocation strategy. PR1
+    // only emits state/metrics and never feeds this result back into placement.
+    ObserveAllocatedMemoryReplicas(replicas, writer_host_id, value_length);
 
     if (use_disk_replica_) {
         std::string file_path =
@@ -11040,6 +11161,10 @@ void MasterService::ClientMonitorFunc() {
             UUID client_id = {pod_client_id.first, pod_client_id.second};
             client_ttl[client_id] =
                 now + std::chrono::seconds(client_live_ttl_sec_);
+            for (const auto& snapshot :
+                 segment_admission_controller_.OnOwnerHeartbeat(client_id)) {
+                PublishSegmentAdmissionSnapshot(snapshot);
+            }
         }
 
         // Find out expired clients
@@ -11127,8 +11252,19 @@ void MasterService::ClientMonitorFunc() {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
-                    segment_access.CommitUnmountSegment(
-                        unmount_segments[i], client_ids[i], dec_capacities[i]);
+                    const auto commit_result =
+                        segment_access.CommitUnmountSegment(unmount_segments[i],
+                                                            client_ids[i],
+                                                            dec_capacities[i]);
+                    if (commit_result == ErrorCode::OK) {
+                        if (auto removed =
+                                segment_admission_controller_.OnUnmount(
+                                    unmount_segments[i])) {
+                            MasterMetricManager::instance()
+                                .remove_segment_admission_metrics(
+                                    removed->segment_name);
+                        }
+                    }
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
                               << ", action=unmount_expired_mem_segment";

@@ -133,6 +133,8 @@ add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(segment_test segment_test.cpp)
+add_store_test(segment_admission_controller_test
+               segment_admission_controller_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest

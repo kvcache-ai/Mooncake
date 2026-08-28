@@ -33,6 +33,26 @@ MasterMetricManager::MasterMetricManager()
       mem_total_capacity_per_segment_(
           "segment_total_capacity_bytes",
           "Total memory capacity of the mounted segment", {"segment"}),
+      segment_admission_state_(
+          "mooncake_segment_admission_state",
+          "Memory segment admission state: 0=RAMPING, 1=ACTIVE, "
+          "2=QUARANTINED",
+          {"segment"}),
+      segment_admission_ratio_(
+          "mooncake_segment_admission_ratio",
+          "Effective memory segment remote-write admission ratio", {"segment"}),
+      segment_inflight_remote_write_ops_(
+          "mooncake_segment_inflight_remote_write_ops",
+          "Current in-flight remote-write operations for the memory segment",
+          {"segment"}),
+      segment_inflight_remote_write_bytes_(
+          "mooncake_segment_inflight_remote_write_bytes",
+          "Current in-flight remote-write bytes for the memory segment",
+          {"segment"}),
+      put_start_admission_observe_rejected_total_(
+          "mooncake_put_start_admission_observe_rejected_total",
+          "PutStart targets that admission would reject in observe mode",
+          {"segment", "reason"}),
       nof_allocated_size_(
           "master_nof_allocated_bytes",
           "Total nof ssd bytes currently allocated across all segments"),
@@ -706,6 +726,33 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
+}
+
+void MasterMetricManager::update_segment_admission_metrics(
+    const std::string& segment, int64_t state, double ratio,
+    int64_t inflight_ops, int64_t inflight_bytes) {
+    if (segment.empty()) {
+        return;
+    }
+    segment_admission_state_.update({segment}, state);
+    segment_admission_ratio_.update({segment}, ratio);
+    segment_inflight_remote_write_ops_.update({segment}, inflight_ops);
+    segment_inflight_remote_write_bytes_.update({segment}, inflight_bytes);
+}
+
+void MasterMetricManager::remove_segment_admission_metrics(
+    const std::string& segment) {
+    segment_admission_state_.remove_label_value({{"segment", segment}});
+    segment_admission_ratio_.remove_label_value({{"segment", segment}});
+    segment_inflight_remote_write_ops_.remove_label_value(
+        {{"segment", segment}});
+    segment_inflight_remote_write_bytes_.remove_label_value(
+        {{"segment", segment}});
+}
+
+void MasterMetricManager::inc_segment_admission_observe_reject(
+    const std::string& segment, const std::string& reason, int64_t val) {
+    put_start_admission_observe_rejected_total_.inc({segment, reason}, val);
 }
 
 // NoF segment Metrics
@@ -1818,6 +1865,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mem_total_capacity_);
     serialize_metric(mem_allocated_size_per_segment_);
     serialize_metric(mem_total_capacity_per_segment_);
+    serialize_metric(segment_admission_state_);
+    serialize_metric(segment_admission_ratio_);
+    serialize_metric(segment_inflight_remote_write_ops_);
+    serialize_metric(segment_inflight_remote_write_bytes_);
+    serialize_metric(put_start_admission_observe_rejected_total_);
     serialize_metric(nof_allocated_size_);
     serialize_metric(nof_total_capacity_);
     serialize_metric(nof_allocated_size_per_segment_);

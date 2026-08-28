@@ -32,6 +32,14 @@ class MasterMetricManager {
     void inc_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_mem_capacity();
+    void update_segment_admission_metrics(const std::string& segment,
+                                          int64_t state, double ratio,
+                                          int64_t inflight_ops,
+                                          int64_t inflight_bytes);
+    void remove_segment_admission_metrics(const std::string& segment);
+    void inc_segment_admission_observe_reject(const std::string& segment,
+                                              const std::string& reason,
+                                              int64_t val = 1);
 
     void inc_mem_cache_hit_nums(int64_t val = 1);
     void inc_file_cache_hit_nums(int64_t val = 1);
@@ -553,6 +561,11 @@ class MasterMetricManager {
     ylt::metric::dynamic_gauge_1t
         mem_total_capacity_per_segment_;  // Segment memory capacity update for
                                           // gauge
+    ylt::metric::dynamic_gauge_1t segment_admission_state_;
+    ylt::metric::basic_dynamic_gauge<double, 1> segment_admission_ratio_;
+    ylt::metric::dynamic_gauge_1t segment_inflight_remote_write_ops_;
+    ylt::metric::dynamic_gauge_1t segment_inflight_remote_write_bytes_;
+    ylt::metric::dynamic_counter_2t put_start_admission_observe_rejected_total_;
 
     // NoF Segment Metrics
     ylt::metric::gauge_t

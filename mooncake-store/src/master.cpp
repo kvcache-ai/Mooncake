@@ -323,6 +323,32 @@ DEFINE_string(
     allocation_strategy, "random",
     "Allocation strategy for segments, random | free_ratio_first | cxl | "
     "ssd_free_ratio_first | local_first");
+DEFINE_string(segment_write_admission_mode, "observe",
+              "Memory segment write admission mode: disabled, observe, or "
+              "enforce. PR1 records decisions only and never changes "
+              "placement");
+DEFINE_uint64(segment_ramp_up_duration_sec, 60,
+              "Minimum seconds for a new memory segment to ramp to full "
+              "remote-write budget");
+DEFINE_double(segment_ramp_initial_ratio, 0.05,
+              "Initial remote-write budget ratio for a ramping segment");
+DEFINE_uint64(segment_ramp_min_successful_remote_writes, 16,
+              "Successful remote writes required to finish segment ramp-up");
+DEFINE_uint64(segment_max_inflight_remote_write_ops, 64,
+              "Full-state per-segment remote-write operation budget; 0 "
+              "disables the operation limit");
+DEFINE_uint64(segment_max_inflight_remote_write_bytes, 0,
+              "Full-state per-segment remote-write byte budget; 0 derives "
+              "the budget from segment capacity");
+DEFINE_uint64(segment_failure_window_sec, 5,
+              "Sliding window in seconds for remote-write failures");
+DEFINE_uint64(segment_failure_threshold, 3,
+              "Failures in the sliding window required to quarantine a "
+              "segment");
+DEFINE_uint64(segment_quarantine_duration_sec, 10,
+              "Minimum segment quarantine duration in seconds");
+DEFINE_uint64(segment_result_retention_sec, 30,
+              "Retention in seconds for completed admission reservations");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -631,6 +657,39 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("allocation_strategy",
                              &master_config.allocation_strategy,
                              FLAGS_allocation_strategy);
+    default_config.GetString("segment_write_admission_mode",
+                             &master_config.segment_write_admission_mode,
+                             FLAGS_segment_write_admission_mode);
+    default_config.GetUInt64("segment_ramp_up_duration_sec",
+                             &master_config.segment_ramp_up_duration_sec,
+                             FLAGS_segment_ramp_up_duration_sec);
+    default_config.GetDouble("segment_ramp_initial_ratio",
+                             &master_config.segment_ramp_initial_ratio,
+                             FLAGS_segment_ramp_initial_ratio);
+    default_config.GetUInt64(
+        "segment_ramp_min_successful_remote_writes",
+        &master_config.segment_ramp_min_successful_remote_writes,
+        FLAGS_segment_ramp_min_successful_remote_writes);
+    default_config.GetUInt64(
+        "segment_max_inflight_remote_write_ops",
+        &master_config.segment_max_inflight_remote_write_ops,
+        FLAGS_segment_max_inflight_remote_write_ops);
+    default_config.GetUInt64(
+        "segment_max_inflight_remote_write_bytes",
+        &master_config.segment_max_inflight_remote_write_bytes,
+        FLAGS_segment_max_inflight_remote_write_bytes);
+    default_config.GetUInt64("segment_failure_window_sec",
+                             &master_config.segment_failure_window_sec,
+                             FLAGS_segment_failure_window_sec);
+    default_config.GetUInt64("segment_failure_threshold",
+                             &master_config.segment_failure_threshold,
+                             FLAGS_segment_failure_threshold);
+    default_config.GetUInt64("segment_quarantine_duration_sec",
+                             &master_config.segment_quarantine_duration_sec,
+                             FLAGS_segment_quarantine_duration_sec);
+    default_config.GetUInt64("segment_result_retention_sec",
+                             &master_config.segment_result_retention_sec,
+                             FLAGS_segment_result_retention_sec);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -1143,6 +1202,73 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
+    }
+    if ((google::GetCommandLineFlagInfo("segment_write_admission_mode",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_write_admission_mode =
+            FLAGS_segment_write_admission_mode;
+    }
+    if ((google::GetCommandLineFlagInfo("segment_ramp_up_duration_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_ramp_up_duration_sec =
+            FLAGS_segment_ramp_up_duration_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("segment_ramp_initial_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_ramp_initial_ratio =
+            FLAGS_segment_ramp_initial_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "segment_ramp_min_successful_remote_writes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_ramp_min_successful_remote_writes =
+            FLAGS_segment_ramp_min_successful_remote_writes;
+    }
+    if ((google::GetCommandLineFlagInfo("segment_max_inflight_remote_write_ops",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_max_inflight_remote_write_ops =
+            FLAGS_segment_max_inflight_remote_write_ops;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "segment_max_inflight_remote_write_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_max_inflight_remote_write_bytes =
+            FLAGS_segment_max_inflight_remote_write_bytes;
+    }
+    if ((google::GetCommandLineFlagInfo("segment_failure_window_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_failure_window_sec =
+            FLAGS_segment_failure_window_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("segment_failure_threshold", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_failure_threshold =
+            FLAGS_segment_failure_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo("segment_quarantine_duration_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_quarantine_duration_sec =
+            FLAGS_segment_quarantine_duration_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("segment_result_retention_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.segment_result_retention_sec =
+            FLAGS_segment_result_retention_sec;
     }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||

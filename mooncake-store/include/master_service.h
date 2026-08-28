@@ -34,6 +34,7 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
+#include "segment_admission_controller.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
 #include "tenant_quota_sharded.h"
@@ -342,6 +343,16 @@ class MasterService {
         SegmentStatus status{SegmentStatus::UNDEFINED};
         uint64_t allocator_used_bytes{0};
         uint64_t allocator_capacity_bytes{0};
+        bool admission_tracked{false};
+        std::string admission_mode;
+        std::string admission_state;
+        double admission_ratio{0.0};
+        uint64_t inflight_remote_write_ops{0};
+        uint64_t inflight_remote_write_bytes{0};
+        uint64_t admission_observed_remote_writes{0};
+        uint64_t admission_observed_would_reject{0};
+        int64_t admission_quarantine_remaining_ms{0};
+        int64_t admission_owner_heartbeat_age_ms{0};
     };
 
     /**
@@ -1995,6 +2006,11 @@ class MasterService {
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    void ObserveAllocatedMemoryReplicas(const std::vector<Replica>& replicas,
+                                        const std::string& writer_host_id,
+                                        uint64_t value_length);
+    void PublishSegmentAdmissionSnapshot(
+        const SegmentAdmissionSnapshot& snapshot);
 
     /**
      * @brief Helper to discard expired processing keys.
@@ -2678,6 +2694,7 @@ class MasterService {
     std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
 
     // Segment management
+    SegmentAdmissionController segment_admission_controller_;
     SegmentManager segment_manager_;
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
