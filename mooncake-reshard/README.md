@@ -1,9 +1,10 @@
 # Mooncake Reshard
 
-`mooncake-reshard` defines framework-neutral contracts and address-free N-D
-logical planning for reusable runtime resources. This change adds the
-model-weight manifest and logical reshard planner; physical runtime binding,
-storage lifecycle, and transfer execution are separate phases.
+`mooncake-reshard` defines framework-neutral contracts, address-free N-D
+logical planning, and runtime binding for reusable runtime resources. This
+change adds the model-weight manifest, logical reshard planner, and an
+attested bound-plan contract; storage lifecycle and transfer execution remain
+separate phases.
 
 Framework-owned adapters inspect framework runtime objects, normalize
 framework-specific values, and construct typed canonical manifests. Mooncake
@@ -43,10 +44,8 @@ splits.
 
 Framework adapters first construct address-free `WeightPlacementPart` values.
 A collection barrier assembles the complete participant set and validates
-logical tensor coverage. A later runtime phase may attach
-`WeightRuntimeBindingManifest` values with physical fragments, generations, and
-leases, but the logical planner does not consume GPU addresses or allocation
-metadata.
+logical tensor coverage. The logical planner does not consume GPU addresses or
+allocation metadata.
 
 An alias group may span placement parts. `WeightPlacementManifest` performs the
 global check after collection: every alias member must be in the complete
@@ -79,6 +78,19 @@ turn a compact N-D plan into an unbounded number of operations.
 The logical planner is copy-only. It does not infer model semantics from tensor
 names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 
+## Runtime Binding
+
+`bind_logical_transfer_plan` attaches selected typed
+`WeightRuntimeBindingManifest` values to a `LogicalTransferPlan`. It rechecks
+placement identity and digest, runtime fragment geometry, address/allocation
+bounds, generation, lease, target coverage, and alias scope before returning a
+bound `TransferPlan`.
+
+This plan records runtime evidence but neither submits a copy nor retains the
+underlying allocation. A Transfer Engine executor must acquire allocation
+guards and revalidate bindings atomically with the submission that consumes
+the plan.
+
 ## Module Responsibilities
 
 - `types.py` defines tensor and logical-fragment contracts.
@@ -88,8 +100,11 @@ names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 - `runtime.py` defines typed physical-binding input contracts for later phases.
 - `validation.py` validates manifest-level geometry, coverage, aliases, and
   runtime-binding shape contracts.
-- `_planner/` computes N-D logical overlap regions and logical coverage.
-- `planner.py` exposes the address-free public planning API.
+- `_planner/contracts.py` computes N-D logical overlap regions and logical
+  coverage.
+- `_planner/binding.py`, `bound_contracts.py`, and `bound_validation.py` bind
+  a logical plan to typed runtime snapshots and validate physical evidence.
+- `planner.py` exposes both logical planning and runtime-binding APIs.
 - `manifest.py` preserves the public import surface.
 
 `kv_cache` remains reserved as a resource discriminator. This change does not
@@ -101,7 +116,7 @@ public JSON APIs. Their wire format contains only canonical fields, and
 deserialization rejects alternate field names rather than translating
 framework-specific input.
 
-Run the logical planner tests from the repository root:
+Run the reshard tests from the repository root:
 
 ```bash
 PYTHONPATH=mooncake-reshard/python \
