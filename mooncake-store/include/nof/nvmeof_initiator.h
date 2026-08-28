@@ -14,7 +14,7 @@ namespace mooncake {
 // Identity contract: repeated OpenSegment() with the same transport string
 // returns handles bound to the same underlying queue pair, and the returned
 // pointer is stable for the lifetime of the initiator. The pointer value is
-// used as the worker-affinity / QoS map key (former C10).
+// used as the worker-affinity / QoS map key.
 class NofSegmentHandle;
 
 enum class NofIOOp : int {
@@ -80,12 +80,12 @@ class NVMeoFInitiator {
     // @pre buffer/byte_offset/byte_length are block-size aligned (interface
     //      precondition; implementations reject violations with -EINVAL).
     // @pre Must be called from the thread that polls this handle
-    //      (qpair single-thread constraint, former C1).
+    //      (qpair single-thread constraint).
     // @pre adaptor must remain valid until its callback runs.
     // Callback contract: invoked synchronously on the polling thread inside
-    // PollCompletion, never from a background thread (former C2 threading
-    // half). Any scratch DMA buffers the implementation needs are released
-    // before the callback returns.
+    // PollCompletion, never from a background thread. Any scratch DMA
+    // buffers the implementation needs are released before the callback
+    // returns.
     virtual int SubmitIO(NofSegmentHandle* handle, void* buffer,
                          uint64_t byte_offset, uint64_t byte_length, NofIOOp op,
                          NofIOAdaptor* adaptor) = 0;
@@ -98,15 +98,23 @@ class NVMeoFInitiator {
     // Closes #3131: register a user buffer with the initiator's DMA
     // translation table. No-op (OK) for initiators without one.
     //
-    // Contract: idempotent for the same ptr. SPDK requires BOTH vaddr and
-    // len to be 2MB-aligned and fails with -EBUSY on already-registered
-    // pages (verified against v23.01.1 lib/env_dpdk/memory.c), so
-    // implementations normalize the range to whole 2MB pages and keep a
-    // per-page refcount — adjacent/overlapping buffers sharing a page must
-    // neither double-register it nor unregister it early. Normalization
-    // registers whole pages containing the buffer; this grants no extra
-    // DMA reach beyond the buffer's own pages. In the common deployment the
-    // same set of buffers is registered by exactly one initiator instance.
+    // Contract: registrations are tracked per (initiator instance, ptr).
+    // Re-registering a ptr whose existing range already covers the request
+    // is an idempotent no-op; a larger size extends coverage to the newly
+    // covered pages. Two instances registering the same ptr each hold an
+    // independent reference, so one instance's UnregisterMemory never unmaps
+    // pages the other still relies on. Destroying an initiator releases any
+    // registrations it still holds, but callers should pair every
+    // RegisterMemory with an UnregisterMemory (or let client teardown walk
+    // them) — the bookkeeping is process-global and outlives any instance.
+    //
+    // SPDK requires BOTH vaddr and len to be 2MB-aligned and fails with
+    // -EBUSY on already-registered pages (verified against v23.01.1
+    // lib/env_dpdk/memory.c), so implementations normalize the range to
+    // whole 2MB pages and keep a per-page refcount — adjacent/overlapping
+    // buffers sharing a page must neither double-register it nor unregister
+    // it early. Normalization registers whole pages containing the buffer;
+    // this grants no extra DMA reach beyond the buffer's own pages.
     virtual ErrorCode RegisterMemory(void* ptr, size_t size) = 0;
     virtual ErrorCode UnregisterMemory(void* ptr) = 0;
 

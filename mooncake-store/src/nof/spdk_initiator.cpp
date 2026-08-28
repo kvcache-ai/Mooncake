@@ -9,12 +9,14 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
-#include <stack>
 #include <thread>
 #include <vector>
 
 #include <spdk/env.h>
 #include <spdk/nvme.h>
+
+#include "nof/page_registry.h"
+#include "nof/probe_context_pool.h"
 
 namespace mooncake {
 namespace {
@@ -166,140 +168,39 @@ class SpdkEnvGuard {
 };
 
 // ---------------------------------------------------------------------------
-// Process-global 2MB-page registration registry (#3131, 评审 R-2).
+// Process-global page registry singleton (#3131).
 //
 // SPDK's translation table is process-global, so the bookkeeping must be
 // too: per-instance refcounts would let one initiator instance unmap pages
-// another instance still uses ("No translation" I/O failures). All
-// SpdkInitiator instances in the process share this registry.
+// another instance still uses ("No translation" I/O failures). The
+// bookkeeping itself (per-owner ranges, per-page refcounts) lives in the
+// SPDK-free NofPageRegistry so it is unit-testable; this TU only owns the
+// singleton and the env pin. Each SpdkInitiator::Impl registers under its
+// own `this` as the owner token.
 //
-// SPDK v23.01.1 semantics (lib/env_dpdk/memory.c) this mirrors:
-//   - register/unregister require (vaddr, len) 2MB-aligned, else -EINVAL;
-//   - registering an already-registered page fails with -EBUSY (e.g. DPDK
-//     memseg memory from spdk_zmalloc, registered by the memseg walk);
-//   - unmapping a sub-range of a region fails with -ERANGE — we always
-//     register/unregister single pages, each its own region.
-//
-// The registry owns no SPDK resources and calls SPDK only inside
-// Register/Unregister. From its first successful registration it holds an
-// env-guard reference (env_ref_), pinning the SPDK env for the registry's own
-// (process) lifetime: an UnregisterMemory call can never run against an env
-// whose translation table has been finalized, even if every initiator/allocator
-// instance in the process is torn down. This turns the "env outlives the
-// registry" assumption into a constructive fact. Same-TU static-destruction
-// order is safe (Acquire() always constructs RegistryMutex before the first
-// GetInstance() constructs this registry, so the mutex outlives the registry),
-// and the pinned env keeps SPDK alive until process exit — matching baseline
-// SpdkWrapper's teardown-at-exit behavior.
+// The bundle pins the SPDK env from first use until process exit: an
+// UnregisterMemory can never run against a translation table that has
+// already been finalized, even if every initiator/allocator instance in the
+// process is torn down first (matches baseline SpdkWrapper's
+// teardown-at-exit behavior). SpdkEnvGuard::Acquire() always constructs the
+// guard registry mutex before this static is constructed, so that mutex
+// outlives the bundle during static destruction.
 // ---------------------------------------------------------------------------
 
 #ifdef HAVE_SPDK_MEM_REGISTER
-class NofPageRegistry {
-   public:
-    static NofPageRegistry& GetInstance() {
-        static NofPageRegistry registry;
-        return registry;
-    }
+struct NofRegistryBundle {
+    std::shared_ptr<SpdkEnvGuard> env;
+    NofPageRegistry registry;
 
-    ErrorCode Register(void* ptr, size_t size) {
-        constexpr uintptr_t kHugepageSize = 2ULL << 20;
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
-        const uintptr_t first_page = begin & ~(kHugepageSize - 1);
-        const uintptr_t end_page =
-            (begin + size + kHugepageSize - 1) & ~(kHugepageSize - 1);
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (registered_sizes_.count(ptr) != 0) {
-            return ErrorCode::OK;  // idempotent for the same ptr
-        }
-
-        std::vector<uintptr_t> touched;  // pages whose count we bumped
-        for (uintptr_t page = first_page; page < end_page;
-             page += kHugepageSize) {
-            auto& reg = page_regs_[page];
-            if (reg.count == 0 && !reg.external) {
-                int rc = spdk_mem_register(reinterpret_cast<void*>(page),
-                                           kHugepageSize);
-                if (rc == -EBUSY) {
-                    // Already registered via DPDK's memseg walk — not
-                    // ours to unregister.
-                    reg.external = true;
-                } else if (rc != 0) {
-                    LOG(ERROR) << "spdk_mem_register failed: page="
-                               << reinterpret_cast<void*>(page) << " rc=" << rc;
-                    // Roll back the pages this call bumped.
-                    for (uintptr_t p : touched) {
-                        auto& r = page_regs_[p];
-                        if (--r.count == 0) {
-                            spdk_mem_unregister(reinterpret_cast<void*>(p),
-                                                kHugepageSize);
-                            page_regs_.erase(p);
-                        }
-                    }
-                    return ErrorCode::INTERNAL_ERROR;
-                }
-            }
-            if (!reg.external) {
-                reg.count++;
-                touched.push_back(page);
-            }
-        }
-        registered_sizes_[ptr] = size;
-        if (!env_ref_) {
-            // Pin the env for the registry's (process) lifetime from the
-            // first successful registration, so a later UnregisterMemory can
-            // never hit an already-fini'd translation table.
-            env_ref_ = SpdkEnvGuard::Acquire();
-        }
-        return ErrorCode::OK;
-    }
-
-    ErrorCode Unregister(void* ptr) {
-        constexpr uintptr_t kHugepageSize = 2ULL << 20;
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = registered_sizes_.find(ptr);
-        if (it == registered_sizes_.end()) {
-            return ErrorCode::OK;  // not registered: no-op
-        }
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
-        const uintptr_t first_page = begin & ~(kHugepageSize - 1);
-        const uintptr_t end_page =
-            (begin + it->second + kHugepageSize - 1) & ~(kHugepageSize - 1);
-        for (uintptr_t page = first_page; page < end_page;
-             page += kHugepageSize) {
-            auto pit = page_regs_.find(page);
-            if (pit == page_regs_.end() || pit->second.external) {
-                continue;
-            }
-            if (--pit->second.count == 0) {
-                // Single-page region == legal single-page unmap
-                // (NOTIFY_START semantics).
-                int rc = spdk_mem_unregister(reinterpret_cast<void*>(page),
-                                             kHugepageSize);
-                if (rc != 0) {
-                    LOG(ERROR) << "spdk_mem_unregister failed: page="
-                               << reinterpret_cast<void*>(page) << " rc=" << rc;
-                }
-                page_regs_.erase(pit);
-            }
-        }
-        registered_sizes_.erase(it);
-        return ErrorCode::OK;
-    }
-
-   private:
-    struct PageReg {
-        uint32_t count = 0;
-        bool external = false;  // DPDK memseg-registered: never unregister
-    };
-
-    std::map<uint64_t, PageReg> page_regs_;     // key: 2MB-aligned page base
-    std::map<void*, size_t> registered_sizes_;  // user ptr -> original size
-    std::mutex mutex_;
-    // Keeps the SPDK env alive for the registry's lifetime (acquired on the
-    // first successful registration).
-    std::shared_ptr<SpdkEnvGuard> env_ref_;
+    NofRegistryBundle()
+        : env(SpdkEnvGuard::Acquire()),
+          registry(&spdk_mem_register, &spdk_mem_unregister) {}
 };
+
+NofRegistryBundle& GetNofRegistryBundle() {
+    static NofRegistryBundle bundle;
+    return bundle;
+}
 #endif  // HAVE_SPDK_MEM_REGISTER
 
 // ---------------------------------------------------------------------------
@@ -340,6 +241,11 @@ class SpdkInitiator::Impl {
         if (!env_guard_) {
             return;
         }
+        // A probe that timed out leaves its NVMe command in flight on the
+        // probe qpair, and SPDK requires a qpair to have no outstanding I/O
+        // when freed below. Give such stale commands a bounded grace period
+        // to complete.
+        DrainQuarantinedProbes();
         {
             std::lock_guard<std::mutex> lock(ctrlrs_mutex_);
             for (auto& [_, info] : connected_ctrlrs_) {
@@ -367,6 +273,14 @@ class SpdkInitiator::Impl {
             }
             probe_buffers_.clear();
         }
+#ifdef HAVE_SPDK_MEM_REGISTER
+        // Backstop, after all I/O teardown above: release every page
+        // registration this instance still holds. The real-client teardown
+        // path unregisters its buffers explicitly; this covers anything that
+        // path misses. The singleton registry outlives this instance and its
+        // env pin keeps the translation table alive.
+        GetNofRegistryBundle().registry.UnregisterAll(this);
+#endif
         // env_guard_ released after all qpair/ctrlr teardown above;
         // spdk_env_fini runs inside ~SpdkEnvGuard.
     }
@@ -392,7 +306,7 @@ class SpdkInitiator::Impl {
             // Connect OUTSIDE the mutex: spdk_nvme_probe establishes an
             // NVMe-oF connection and may block for seconds; holding
             // ctrlrs_mutex_ across it (baseline spdk_wrapper.cpp:313-329)
-            // stalls first-time opens of every other endpoint (评审 #6).
+            // stalls first-time opens of every other endpoint.
             auto new_info = std::make_unique<ctrlr_info>();
             if (ConnectController(&tr.trid, new_info.get()) != 0) {
                 return nullptr;
@@ -500,7 +414,7 @@ class SpdkInitiator::Impl {
             return ErrorCode::INTERNAL_ERROR;
         }
 #ifdef HAVE_SPDK_MEM_REGISTER
-        // R-1: a non-aligned ptr is floored to its 2MB page, which assumes
+        // A non-aligned ptr is floored to its 2MB page, which assumes
         // the whole containing page is mapped. True for hugepage-backed
         // buffers (hugetlb maps aligned 2MB extents; LMCache/vLLM pool
         // slices land here); 4KB-backed malloc memory fails later inside
@@ -513,7 +427,10 @@ class SpdkInitiator::Impl {
                             "containing 2MB pages, which must be mapped "
                             "and hugepage-backed";
         }
-        return NofPageRegistry::GetInstance().Register(ptr, size);
+        // `this` is the owner token: registrations are charged per
+        // initiator instance, so two clients registering the same buffer
+        // each hold an independent page reference.
+        return GetNofRegistryBundle().registry.Register(this, ptr, size);
 #else
         LOG(WARNING) << "SPDK build lacks spdk_mem_register; NoF over RDMA "
                         "will fail for unregistered user buffers (#3131)";
@@ -523,7 +440,7 @@ class SpdkInitiator::Impl {
 
     ErrorCode UnregisterMemory(void* ptr) {
 #ifdef HAVE_SPDK_MEM_REGISTER
-        return NofPageRegistry::GetInstance().Unregister(ptr);
+        return GetNofRegistryBundle().registry.Unregister(this, ptr);
 #else
         (void)ptr;
         return ErrorCode::OK;
@@ -561,14 +478,16 @@ class SpdkInitiator::Impl {
             return false;
         }
 
-        ProbeRequestContext* probe_ctx = AcquireProbeRequestContext();
+        NofProbeContext* probe_ctx = probe_pool_.Acquire();
         // The probe reuses the normal submit path with an embedded adaptor,
         // exactly like the worker pool's pooled sub-tasks.
         probe_ctx->adaptor = {&ProbeReadComplete, probe_ctx};
+        probe_ctx->seg = seg_handle;
         int ret = SubmitIO(seg_handle, probe_buffer->ptr, 0, block_size,
                            NofIOOp::kRead, &probe_ctx->adaptor);
         if (ret != 0) {
-            RecycleProbeRequestContext(probe_ctx);
+            // Nothing was submitted, so no completion can arrive.
+            probe_pool_.Recycle(probe_ctx);
             if (error_reason) {
                 *error_reason = "submit_fail";
             }
@@ -583,10 +502,11 @@ class SpdkInitiator::Impl {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        bool ok = probe_ctx->done.load(std::memory_order_acquire) &&
-                  probe_ctx->success.load(std::memory_order_acquire);
+        const bool done = probe_ctx->done.load(std::memory_order_acquire);
+        const bool ok =
+            done && probe_ctx->success.load(std::memory_order_acquire);
         if (!ok && error_reason) {
-            if (!probe_ctx->done.load(std::memory_order_acquire)) {
+            if (!done) {
                 *error_reason = "completion_timeout";
             } else {
                 std::lock_guard<std::mutex> lock(probe_ctx->error_mutex);
@@ -596,9 +516,19 @@ class SpdkInitiator::Impl {
             }
         }
 
-        // Ride-along fix (former probe-ctx recycle race): recycle only AFTER
-        // the caller has read all results, never inside the callback.
-        RecycleProbeRequestContext(probe_ctx);
+        if (done) {
+            // The completion callback already ran: safe to reuse the
+            // context. (Recycle only AFTER the caller has read all results,
+            // never inside the callback.)
+            probe_pool_.Recycle(probe_ctx);
+        } else {
+            // completion_timeout only stops this thread from waiting; it
+            // does not cancel or drain the submitted NVMe command, which
+            // still retains &probe_ctx->adaptor. Keep the context out of the
+            // pool until the stale callback runs — recycling it would let a
+            // later poll write the old completion into the next probe.
+            probe_pool_.Quarantine(probe_ctx);
+        }
         return ok;
     }
 
@@ -614,26 +544,11 @@ class SpdkInitiator::Impl {
         ProbeBuffer& operator=(ProbeBuffer&&) = delete;
     };
 
-    struct ProbeRequestContext {
-        std::atomic<bool> done{false};
-        std::atomic<bool> success{false};
-        std::mutex error_mutex;
-        std::string error_reason;
-        NofIOAdaptor adaptor{};
-
-        void Reset() {
-            std::lock_guard<std::mutex> lock(error_mutex);
-            done.store(false, std::memory_order_release);
-            success.store(false, std::memory_order_release);
-            error_reason.clear();
-            adaptor = {};
-        }
-    };
-
     bool EnsureEnv() {
-        // Lock first, then check (评审 #4 二轮):对 shared_ptr 成员做
-        // 锁外读 + 锁内写是撕裂读 UB,双检模式在这里不成立。冷路径,
-        // 一次互斥锁开销可忽略。
+        // Lock first, then check: an unlocked read of a shared_ptr member
+        // paired with a locked write is a torn-read UB, so the
+        // double-checked pattern does not apply here. Cold path; one
+        // mutex acquisition is negligible.
         std::lock_guard<std::mutex> lock(env_mutex_);
         if (!env_guard_) {
             env_guard_ = SpdkEnvGuard::Acquire();
@@ -658,7 +573,7 @@ class SpdkInitiator::Impl {
     }
 
     static void ProbeReadComplete(void* ctx, const NofIOCompletion& c) {
-        auto* probe_ctx = reinterpret_cast<ProbeRequestContext*>(ctx);
+        auto* probe_ctx = reinterpret_cast<NofProbeContext*>(ctx);
         if (!c.success) {
             {
                 std::lock_guard<std::mutex> lock(probe_ctx->error_mutex);
@@ -772,31 +687,33 @@ class SpdkInitiator::Impl {
         return probe_buffer.get();
     }
 
-    void ReplenishProbeRequestContextPoolLocked(size_t count) {
-        for (size_t i = 0; i < count; ++i) {
-            auto probe_ctx = std::make_unique<ProbeRequestContext>();
-            probe_request_context_pool_.push(probe_ctx.get());
-            probe_request_contexts_.push_back(std::move(probe_ctx));
-        }
-    }
-
-    ProbeRequestContext* AcquireProbeRequestContext() {
-        std::lock_guard<std::mutex> lock(probe_request_context_pool_mutex_);
-        if (probe_request_context_pool_.empty()) {
-            ReplenishProbeRequestContextPoolLocked(8);
-        }
-        auto* probe_ctx = probe_request_context_pool_.top();
-        probe_request_context_pool_.pop();
-        probe_ctx->Reset();
-        return probe_ctx;
-    }
-
-    void RecycleProbeRequestContext(ProbeRequestContext* ctx) {
-        if (ctx == nullptr) {
+    // Bounded grace period for timed-out probes at teardown: their commands
+    // are still outstanding on the probe qpairs, and SPDK requires a qpair
+    // to have no outstanding I/O when it is freed. Completions are only
+    // processed by polling, so poll each affected qpair until the stale
+    // callback runs or the budget is exhausted.
+    void DrainQuarantinedProbes() {
+        const auto stale = probe_pool_.QuarantinedSnapshot();
+        if (stale.empty()) {
             return;
         }
-        std::lock_guard<std::mutex> lock(probe_request_context_pool_mutex_);
-        probe_request_context_pool_.push(ctx);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        bool pending = true;
+        while (pending && std::chrono::steady_clock::now() < deadline) {
+            pending = false;
+            for (auto* ctx : stale) {
+                if (ctx->done.load(std::memory_order_acquire) || !ctx->seg) {
+                    continue;
+                }
+                PollCompletion(ctx->seg, 0);
+                pending = pending || !ctx->done.load(std::memory_order_acquire);
+            }
+        }
+        if (pending) {
+            LOG(WARNING) << "Timed-out probe command(s) still outstanding at "
+                            "initiator teardown; dropped with the qpair";
+        }
     }
 
     // Member order matters: env_guard_ is declared FIRST so it is destroyed
@@ -807,9 +724,7 @@ class SpdkInitiator::Impl {
     std::mutex ctrlrs_mutex_;
     std::map<std::string, std::unique_ptr<ProbeBuffer>> probe_buffers_;
     std::mutex probe_buffers_mutex_;
-    std::vector<std::unique_ptr<ProbeRequestContext>> probe_request_contexts_;
-    std::stack<ProbeRequestContext*> probe_request_context_pool_;
-    std::mutex probe_request_context_pool_mutex_;
+    NofProbeContextPool probe_pool_;
 };
 
 // ---------------------------------------------------------------------------
@@ -856,7 +771,7 @@ NofCapabilities SpdkInitiator::GetCapabilities() const {
     NofCapabilities caps;
     caps.supports_sgl = false;  // flips when PR #3251's SGL path lands here
     caps.dma_alignment = 4;
-    // Upper bound (评审 #8): registration capability exists in this build;
+    // Upper bound: registration capability exists in this build;
     // not transport-specific. RegisterMemory on TCP NVMe-oF is harmless,
     // callers must not skip it based on this flag.
 #ifdef HAVE_SPDK_MEM_REGISTER
@@ -876,9 +791,10 @@ SpdkDmaAllocator::~SpdkDmaAllocator() = default;
 
 void* SpdkDmaAllocator::Alloc(size_t size, size_t align, int socket_id) {
     {
-        // Lock first, then check (评审 #4 二轮):对 shared_ptr 成员的
-        // 锁外读与锁内写构成撕裂读 UB,双检模式在这里不成立。
-        // Alloc 是冷路径,一次互斥锁开销可忽略。
+        // Lock first, then check: an unlocked read of a shared_ptr member
+        // paired with a locked write is a torn-read UB, so the
+        // double-checked pattern does not apply here. Alloc is a cold path;
+        // one mutex acquisition is negligible.
         std::lock_guard<std::mutex> lock(env_mutex_);
         if (!env_guard_) {
             env_guard_ = SpdkEnvGuard::Acquire();
