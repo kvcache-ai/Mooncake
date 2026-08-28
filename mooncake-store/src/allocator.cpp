@@ -13,9 +13,11 @@ namespace mooncake {
 namespace {
 
 bool IsValidCachelibLayout(size_t base, size_t size) noexcept {
+    const size_t slab_count = size / sizeof(facebook::cachelib::Slab);
     return base != 0 && base % facebook::cachelib::Slab::kSize == 0 &&
            size >= facebook::cachelib::Slab::kSize &&
            size % facebook::cachelib::Slab::kSize == 0 &&
+           slab_count <= std::numeric_limits<unsigned int>::max() &&
            base <= std::numeric_limits<size_t>::max() - size;
 }
 
@@ -139,6 +141,9 @@ CachelibBufferAllocator::Create(std::string segment_name, size_t base,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // CacheLib's parameter-dependent constructor failures are covered by the
+    // layout validation above. Do not catch allocation failures here: metadata
+    // exhaustion follows the process-level fail-fast policy.
     return std::shared_ptr<CachelibBufferAllocator>(new CachelibBufferAllocator(
         std::move(segment_name), base, size, std::move(transport_endpoint),
         replica_type));
@@ -160,6 +165,8 @@ CreateBufferAllocator(BufferAllocatorType allocator_type,
             return std::shared_ptr<BufferAllocatorBase>(std::move(*allocator));
         }
         case BufferAllocatorType::OFFSET:
+            // Offset construction has no parameter-dependent throwing path;
+            // metadata allocation failures intentionally follow fail-fast.
             return std::shared_ptr<BufferAllocatorBase>(
                 std::make_shared<OffsetBufferAllocator>(
                     std::move(segment_name), base, size,

@@ -271,6 +271,14 @@ TEST_F(BufferAllocatorTest, CachelibCreateRejectsInvalidMemoryLayout) {
     expect_invalid(kBase, kSlabSize + 1);
     expect_invalid(std::numeric_limits<size_t>::max() - kSlabSize,
                    2 * kSlabSize);
+    if constexpr (std::numeric_limits<size_t>::max() / kSlabSize >
+                  std::numeric_limits<unsigned int>::max()) {
+        const size_t too_many_slabs =
+            (static_cast<size_t>(std::numeric_limits<unsigned int>::max()) +
+             1) *
+            kSlabSize;
+        expect_invalid(kBase, too_many_slabs);
+    }
 }
 
 TEST_F(BufferAllocatorTest, ImportCachelibAllocationsAtOriginalAddresses) {
