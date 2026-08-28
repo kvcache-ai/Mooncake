@@ -42,6 +42,19 @@ class HighPerformanceTcpServer::Session
     }
 
    private:
+    template <typename Function>
+    void runHandler(Function&& function) noexcept {
+        try {
+            function();
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "HP TCP server handler failed: " << error.what();
+            finishClosed();
+        } catch (...) {
+            LOG(ERROR) << "HP TCP server handler failed";
+            finishClosed();
+        }
+    }
+
     void readHeader() {
         if (forced_close_) {
             finishClosed();
@@ -49,21 +62,43 @@ class HighPerformanceTcpServer::Session
         }
         lease_.reset();
         body_offset_ = 0;
+        header_offset_ = 0;
         ++request_epoch_;
-        armProgressTimer(request_epoch_);
+        cancelTimer();
+        // A newly accepted peer must send its first byte within the progress
+        // deadline so an empty connection cannot hold a bounded session slot.
+        // Once a request has completed, waiting for the next request is
+        // connection-pool idle time rather than stalled I/O.
+        if (!completed_request_) armProgressTimer(request_epoch_);
+        readHeaderChunk();
+    }
+
+    void readHeaderChunk() {
         auto self = shared_from_this();
-        asio::async_read(
-            *socket_, asio::buffer(request_bytes_),
+        socket_->async_read_some(
+            asio::buffer(request_bytes_.data() + header_offset_,
+                         request_bytes_.size() - header_offset_),
             [self](const std::error_code& error, size_t bytes) {
-                if (self->forced_close_) {
-                    self->finishClosed();
-                    return;
-                }
-                if (error || bytes != kHighPerformanceTcpRequestSize) {
-                    self->finishClosed();
-                    return;
-                }
-                self->handleHeader();
+                self->runHandler([&] {
+                    if (self->forced_close_) {
+                        self->finishClosed();
+                        return;
+                    }
+                    if (error || bytes == 0) {
+                        self->finishClosed();
+                        return;
+                    }
+                    self->header_offset_ += bytes;
+                    // A reused stream may remain idle indefinitely. Once any
+                    // byte of its next frame arrives, each partial read must
+                    // make progress before the deadline.
+                    if (self->header_offset_ == self->request_bytes_.size()) {
+                        self->handleHeader();
+                    } else {
+                        self->armProgressTimer(self->request_epoch_);
+                        self->readHeaderChunk();
+                    }
+                });
             });
     }
 
@@ -88,8 +123,17 @@ class HighPerformanceTcpServer::Session
             request_.remote_addr, request_.length, request_.registration_id,
             request_.opcode, &lease_, &failure);
         if (!lease_status.ok()) {
-            sendResponse(HighPerformanceTcpWireStatusForAcquireFailure(failure),
-                         0, false);
+            const HighPerformanceTcpStatus wire_status =
+                HighPerformanceTcpWireStatusForAcquireFailure(failure);
+            if (request_.opcode == HighPerformanceTcpOpcode::kWrite) {
+                // The client sends the complete WRITE body before reading the
+                // response. Consume exactly this rejected frame under the
+                // normal progress deadline, then reply and close the stream.
+                body_offset_ = 0;
+                discardRejectedWriteBody(wire_status);
+            } else {
+                sendResponse(wire_status, 0, true);
+            }
             return;
         }
 
@@ -108,6 +152,33 @@ class HighPerformanceTcpServer::Session
         }
     }
 
+    void discardRejectedWriteBody(HighPerformanceTcpStatus status) {
+        if (body_offset_ == request_.length) {
+            sendResponse(status, 0, true);
+            return;
+        }
+        const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
+            discard_bytes_.size(), request_.length - body_offset_));
+        armProgressTimer(request_epoch_);
+        auto self = shared_from_this();
+        asio::async_read(
+            *socket_, asio::buffer(discard_bytes_.data(), chunk),
+            [self, status, chunk](const std::error_code& error, size_t bytes) {
+                self->runHandler([&] {
+                    if (self->forced_close_) {
+                        self->finishClosed();
+                        return;
+                    }
+                    if (error || bytes != chunk) {
+                        self->finishClosed();
+                        return;
+                    }
+                    self->body_offset_ += bytes;
+                    self->discardRejectedWriteBody(status);
+                });
+            });
+    }
+
     uint8_t* remoteDataAt(uint64_t offset) {
         return static_cast<uint8_t*>(lease_.data()) +
                (request_.remote_addr - lease_.base()) + offset;
@@ -116,8 +187,7 @@ class HighPerformanceTcpServer::Session
     void writeReadBodyChunk() {
         if (body_offset_ == request_.length) {
             lease_.reset();
-            cancelTimer();
-            readHeader();
+            completeRequest();
             return;
         }
         const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
@@ -126,17 +196,19 @@ class HighPerformanceTcpServer::Session
         asio::async_write(
             *socket_, asio::buffer(remoteDataAt(body_offset_), chunk),
             [self, chunk](const std::error_code& error, size_t bytes) {
-                if (self->forced_close_) {
-                    self->finishClosed();
-                    return;
-                }
-                if (error || bytes != chunk) {
-                    self->finishClosed();
-                    return;
-                }
-                self->body_offset_ += bytes;
-                self->armProgressTimer(self->request_epoch_);
-                self->writeReadBodyChunk();
+                self->runHandler([&] {
+                    if (self->forced_close_) {
+                        self->finishClosed();
+                        return;
+                    }
+                    if (error || bytes != chunk) {
+                        self->finishClosed();
+                        return;
+                    }
+                    self->body_offset_ += bytes;
+                    self->armProgressTimer(self->request_epoch_);
+                    self->writeReadBodyChunk();
+                });
             });
     }
 
@@ -146,11 +218,9 @@ class HighPerformanceTcpServer::Session
             // destination DRAM and no socket callback can touch the range.
             lease_.reset();
             armProgressTimer(request_epoch_);
-            sendResponse(HighPerformanceTcpStatus::kOk, request_.length, false,
-                         [self = shared_from_this()] {
-                             self->cancelTimer();
-                             self->readHeader();
-                         });
+            sendResponse(
+                HighPerformanceTcpStatus::kOk, request_.length, false,
+                [self = shared_from_this()] { self->completeRequest(); });
             return;
         }
         const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
@@ -159,18 +229,25 @@ class HighPerformanceTcpServer::Session
         asio::async_read(
             *socket_, asio::buffer(remoteDataAt(body_offset_), chunk),
             [self, chunk](const std::error_code& error, size_t bytes) {
-                if (self->forced_close_) {
-                    self->finishClosed();
-                    return;
-                }
-                if (error || bytes != chunk) {
-                    self->finishClosed();
-                    return;
-                }
-                self->body_offset_ += bytes;
-                self->armProgressTimer(self->request_epoch_);
-                self->readWriteBodyChunk();
+                self->runHandler([&] {
+                    if (self->forced_close_) {
+                        self->finishClosed();
+                        return;
+                    }
+                    if (error || bytes != chunk) {
+                        self->finishClosed();
+                        return;
+                    }
+                    self->body_offset_ += bytes;
+                    self->armProgressTimer(self->request_epoch_);
+                    self->readWriteBodyChunk();
+                });
             });
+    }
+
+    void completeRequest() {
+        completed_request_ = true;
+        readHeader();
     }
 
     void sendErrorAndClose(HighPerformanceTcpStatus status) {
@@ -191,25 +268,26 @@ class HighPerformanceTcpServer::Session
             *socket_, asio::buffer(response_bytes_),
             [self, close_after, continuation = std::move(continuation)](
                 const std::error_code& error, size_t bytes) mutable {
-                if (self->forced_close_) {
-                    self->finishClosed();
-                    return;
-                }
-                if (error || bytes != kHighPerformanceTcpResponseSize) {
-                    self->finishClosed();
-                    return;
-                }
-                if (close_after) {
-                    self->finishClosed();
-                    return;
-                }
-                self->armProgressTimer(self->request_epoch_);
-                if (continuation) {
-                    continuation();
-                } else {
-                    self->cancelTimer();
-                    self->readHeader();
-                }
+                self->runHandler([&] {
+                    if (self->forced_close_) {
+                        self->finishClosed();
+                        return;
+                    }
+                    if (error || bytes != kHighPerformanceTcpResponseSize) {
+                        self->finishClosed();
+                        return;
+                    }
+                    if (close_after) {
+                        self->finishClosed();
+                        return;
+                    }
+                    self->armProgressTimer(self->request_epoch_);
+                    if (continuation) {
+                        continuation();
+                    } else {
+                        self->completeRequest();
+                    }
+                });
             });
     }
 
@@ -262,11 +340,14 @@ class HighPerformanceTcpServer::Session
 
     std::array<uint8_t, kHighPerformanceTcpRequestSize> request_bytes_{};
     std::array<uint8_t, kHighPerformanceTcpResponseSize> response_bytes_{};
+    std::array<uint8_t, 4096> discard_bytes_{};
     HighPerformanceTcpRequestFrame request_;
     HighPerformanceTcpBufferRegistry::Lease lease_;
+    size_t header_offset_{0};
     uint64_t body_offset_{0};
     uint64_t request_epoch_{0};
     uint64_t timer_generation_{0};
+    bool completed_request_{false};
     bool forced_close_{false};
     bool closed_{false};
 };

@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -2286,6 +2287,10 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
 
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
                                           TransferStatus& task_status) {
+    // A transport error does not promise to populate its output. Initialize
+    // it before polling so HP TCP error classification never reads stale
+    // caller storage (or an uninitialized local TransferStatus).
+    task_status = {PENDING, 0};
     auto& task = batch->task_list[task_id];
     if (task.staging) {
         return staging_proxy_->getStatus(&task, task_status);
@@ -2304,12 +2309,12 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     }
     Status result =
         transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
-    if (result.ok() || task.type != HP_TCP || task_status.s != FAILED) {
-        return result;
-    }
+    if (result.ok() || task.type != HP_TCP) return result;
 
-    if (result.IsNeedsRefreshCache()) {
-        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+    if (result.IsNeedsRefreshCache() &&
+        (task_status.s == FAILED || task_status.s == TIMEOUT)) {
+        finishTransportAttempt(task, task_status.s,
+                               std::chrono::steady_clock::now());
         if (task.metadata_refresh_retry_count >=
             kMaxHpTcpMetadataRefreshRetries) {
             task.suppress_failover = true;
@@ -2320,8 +2325,7 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
             task.request.target_id);
         if (!invalidated.ok()) {
             task.suppress_failover = true;
-            LOG(WARNING) << "HP TCP stale-registration cache invalidation "
-                            "failed: "
+            LOG(WARNING) << "HP TCP metadata cache invalidation failed: "
                          << invalidated.ToString();
             return Status::OK();
         }
@@ -2334,7 +2338,7 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
             finishTransportAttempt(task, FAILED,
                                    std::chrono::steady_clock::now());
             task.suppress_failover = true;
-            LOG(WARNING) << "HP TCP stale-registration retry failed: "
+            LOG(WARNING) << "HP TCP metadata refresh retry failed: "
                          << retried.ToString();
             return Status::OK();
         }
@@ -2344,7 +2348,10 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
         return Status::OK();
     }
 
-    // A valid remote permission/range/protocol rejection is permanent for
+    if (task_status.s != FAILED) return result;
+
+    // A valid remote permission/range/protocol rejection, or a WRITE whose
+    // remote outcome is unknown because its ACK was lost, is permanent for
     // this logical request. ShuttingDown maps to TooManyRequests and remains
     // transient, so the existing failover policy may act on it.
     if (!result.IsTooManyRequests()) {
@@ -2375,10 +2382,45 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
 
 Status TransferEngineImpl::sendNotification(SegmentID target_id,
                                             const Notification& notifi) {
+    if (!metadata_) {
+        return Status::InternalError(
+            "Notification metadata is unavailable" LOC_MARK);
+    }
+    bool rdma_failed_before_post = false;
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         auto& transport = transport_list_[type];
         if (!transport || !transport->supportNotification()) continue;
-        return transport->sendNotification(target_id, notifi);
+
+        const Status status = transport->sendNotification(target_id, notifi);
+        if (status.ok()) return status;
+
+        if (type == RDMA) {
+            // Production RDMA either fails to create/find the endpoint or
+            // RdmaEndPoint::sendNotification returns false before its one WR
+            // is accepted by ibv_post_send. No post-completion error is
+            // returned here, so this slot alone is safe to cross-fallback.
+            rdma_failed_before_post = true;
+            continue;
+        }
+
+        // TCP-family RPC errors can mean the remote handler ran but the reply
+        // was lost. Never cross-fallback after that ambiguous point.
+        return status;
+    }
+
+    if (rdma_failed_before_post) {
+        return metadata_->segmentManager().withCachedSegment(
+            target_id, [&](SegmentDesc* segment) {
+                const std::string& rpc_server_addr = segment->rpc_server_addr;
+                if (rpc_server_addr.empty()) {
+                    return Status::NeedsRefreshCache(
+                        "Empty RPC server addr" LOC_MARK);
+                }
+                // The RDMA attempt above was known not to post. This Control
+                // RPC is the sole delivery attempt; an RPC error after issue is
+                // ambiguous and must not be converted into a metadata retry.
+                return ControlClient::notify(rpc_server_addr, notifi);
+            });
     }
     return Status::InvalidArgument("Notification not supported" LOC_MARK);
 }
@@ -2404,12 +2446,33 @@ Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
 
 Status TransferEngineImpl::receiveNotification(
     std::vector<Notification>& notifi_list) {
+    notifi_list.clear();
+    if (!metadata_) {
+        return Status::InternalError(
+            "Notification metadata is unavailable" LOC_MARK);
+    }
+    std::vector<Notification> drained;
+    metadata_->drainNotifications(drained);
+    notifi_list.insert(notifi_list.end(),
+                       std::make_move_iterator(drained.begin()),
+                       std::make_move_iterator(drained.end()));
+
+    Status first_error = Status::OK();
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         auto& transport = transport_list_[type];
         if (!transport || !transport->supportNotification()) continue;
-        return transport->receiveNotification(notifi_list);
+
+        drained.clear();
+        const Status status = transport->receiveNotification(drained);
+        if (!status.ok()) {
+            if (first_error.ok()) first_error = status;
+            continue;
+        }
+        notifi_list.insert(notifi_list.end(),
+                           std::make_move_iterator(drained.begin()),
+                           std::make_move_iterator(drained.end()));
     }
-    return Status::InvalidArgument("Notification not supported" LOC_MARK);
+    return first_error;
 }
 
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,

@@ -1,6 +1,8 @@
 // Copyright 2026 KVCache.AI
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "tent/transport/tcp/high_performance_tcp_protocol.h"
 
 namespace mooncake::tent {
@@ -72,6 +74,16 @@ TEST(HighPerformanceTcpProtocolTest, MetadataAttributesRoundTrip) {
         DecodeHighPerformanceTcpBufferAttr(encoded, &decoded_buffer).ok());
     EXPECT_EQ(decoded_buffer.registration_id, 42u);
     EXPECT_EQ(decoded_buffer.permission, "global_read_write");
+
+    const uint64_t max_registration_id = std::numeric_limits<uint64_t>::max();
+    ASSERT_TRUE(EncodeHighPerformanceTcpBufferAttr(
+                    {max_registration_id, "global_read_only"}, &encoded)
+                    .ok());
+    ASSERT_TRUE(
+        DecodeHighPerformanceTcpBufferAttr(encoded, &decoded_buffer).ok());
+    EXPECT_EQ(decoded_buffer.registration_id, max_registration_id);
+    EXPECT_EQ(decoded_buffer.permission, "global_read_only");
+
     EXPECT_FALSE(
         DecodeHighPerformanceTcpEndpointAttr("not-json", &decoded_endpoint)
             .ok());

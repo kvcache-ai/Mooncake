@@ -21,12 +21,17 @@ struct Completion {
     std::atomic<bool> done{false};
     TransferStatusEnum status{PENDING};
     size_t bytes{0};
+    bool pre_request_endpoint_failure{false};
+    bool remote_write_outcome_unknown{false};
 
     auto callback() {
         return [this](TransferStatusEnum value, size_t count,
-                      std::optional<HighPerformanceTcpStatus>) {
+                      std::optional<HighPerformanceTcpStatus>,
+                      bool endpoint_failure, bool write_outcome_unknown) {
             status = value;
             bytes = count;
+            pre_request_endpoint_failure = endpoint_failure;
+            remote_write_outcome_unknown = write_outcome_unknown;
             done.store(true, std::memory_order_release);
         };
     }
@@ -165,6 +170,116 @@ TEST(HighPerformanceTcpSocketTest, WriteReadAndReuseConnection) {
     EXPECT_EQ(runtime.client.connectionsCreatedForTest(), 1u);
 }
 
+TEST(HighPerformanceTcpSocketTest, IdlePersistentConnectionRemainsReusable) {
+    Runtime runtime(/*max_connections=*/16, /*timeout_ms=*/100);
+    runtime.start();
+    std::array<uint8_t, 8> remote{};
+    std::array<uint8_t, 8> first{};
+    std::array<uint8_t, 8> second{};
+    remote.fill(0x5a);
+    uint64_t registration = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadOnly, &registration)
+                    .ok());
+
+    Completion first_completion;
+    ASSERT_TRUE(
+        runtime
+            .submit(Operation(first.data(), first.size(),
+                              reinterpret_cast<uint64_t>(remote.data()),
+                              registration, 10, HighPerformanceTcpOpcode::kRead,
+                              &first_completion, runtime.port))
+            .ok());
+    ASSERT_TRUE(first_completion.wait());
+    ASSERT_EQ(first_completion.status, COMPLETED);
+    ASSERT_EQ(runtime.client.connectionsCreatedForTest(), 1u);
+
+    std::this_thread::sleep_for(300ms);
+    ASSERT_EQ(runtime.server.activeSessionsForTest(), 1u);
+
+    Completion second_completion;
+    ASSERT_TRUE(
+        runtime
+            .submit(Operation(second.data(), second.size(),
+                              reinterpret_cast<uint64_t>(remote.data()),
+                              registration, 11, HighPerformanceTcpOpcode::kRead,
+                              &second_completion, runtime.port))
+            .ok());
+    ASSERT_TRUE(second_completion.wait());
+    EXPECT_EQ(second_completion.status, COMPLETED);
+    EXPECT_TRUE(SocketOrderedEqual(first, remote));
+    EXPECT_TRUE(SocketOrderedEqual(second, remote));
+    EXPECT_EQ(runtime.client.connectionsCreatedForTest(), 1u);
+}
+
+TEST(HighPerformanceTcpSocketTest, RejectedWriteBodyCannotBecomeNextFrame) {
+    Runtime runtime;
+    runtime.start();
+    std::array<uint8_t, 64> remote{};
+    uint64_t registration = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration)
+                    .ok());
+
+    asio::io_context io;
+    asio::ip::tcp::socket socket(io);
+    socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+    const auto rejected = EncodeHighPerformanceTcpRequest(
+        {HighPerformanceTcpOpcode::kWrite, 20, registration + 1,
+         reinterpret_cast<uint64_t>(remote.data()),
+         kHighPerformanceTcpRequestSize + 1});
+    const auto hidden = EncodeHighPerformanceTcpRequest(
+        {HighPerformanceTcpOpcode::kWrite, 21, registration,
+         reinterpret_cast<uint64_t>(remote.data()), 1});
+    const uint8_t hidden_body = 0x5a;
+    asio::write(socket, asio::buffer(rejected));
+    asio::write(socket, asio::buffer(hidden));
+    asio::write(socket, asio::buffer(&hidden_body, 1));
+
+    std::array<uint8_t, kHighPerformanceTcpResponseSize> response_bytes{};
+    ASSERT_EQ(asio::read(socket, asio::buffer(response_bytes)),
+              response_bytes.size());
+    HighPerformanceTcpResponseFrame response;
+    ASSERT_TRUE(DecodeHighPerformanceTcpResponse(
+                    response_bytes.data(), response_bytes.size(), &response)
+                    .ok());
+    EXPECT_EQ(response.status, HighPerformanceTcpStatus::kStaleRegistration);
+    EXPECT_EQ(response.request_id, 20u);
+    EXPECT_EQ(response.committed_bytes, 0u);
+    EXPECT_EQ(remote[0], 0u);
+    EXPECT_TRUE(
+        WaitUntil([&] { return runtime.server.activeSessionsForTest() == 0; }));
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     RejectedWritePartialPayloadTimesOutAndReleasesSlot) {
+    Runtime runtime(/*max_connections=*/1, /*timeout_ms=*/100);
+    runtime.start();
+    std::array<uint8_t, 1> remote{};
+    uint64_t registration = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration)
+                    .ok());
+
+    asio::io_context io;
+    asio::ip::tcp::socket socket(io);
+    socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+    const auto rejected = EncodeHighPerformanceTcpRequest(
+        {HighPerformanceTcpOpcode::kWrite, 22, registration + 1,
+         reinterpret_cast<uint64_t>(remote.data()), 1024});
+    const uint8_t one_body_byte = 0;
+    asio::write(socket, asio::buffer(rejected));
+    asio::write(socket, asio::buffer(&one_body_byte, 1));
+    ASSERT_TRUE(
+        WaitUntil([&] { return runtime.server.activeSessionsForTest() == 1; }));
+    EXPECT_TRUE(
+        WaitUntil([&] { return runtime.server.activeSessionsForTest() == 0; }));
+    EXPECT_EQ(remote[0], 0u);
+}
+
 TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
     asio::io_context peer_io;
     asio::ip::tcp::acceptor acceptor(peer_io, {asio::ip::tcp::v4(), 0});
@@ -194,23 +309,104 @@ TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
     ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());
     EXPECT_EQ(completion.status, TIMEOUT);
+    EXPECT_FALSE(completion.pre_request_endpoint_failure);
     EXPECT_TRUE(client.cancelAll().ok());
     EXPECT_TRUE(workers.stop().ok());
     peer.join();
 }
 
-TEST(HighPerformanceTcpSocketTest, PartialHeaderTimesOutAndReleasesSlot) {
-    Runtime runtime(/*max_connections=*/1, /*timeout_ms=*/30);
+TEST(HighPerformanceTcpSocketTest,
+     WriteWithoutCompletionAckMarksRemoteOutcomeUnknown) {
+    asio::io_context peer_io;
+    asio::ip::tcp::acceptor acceptor(peer_io, {asio::ip::tcp::v4(), 0});
+    std::thread peer([&] {
+        asio::ip::tcp::socket socket(peer_io);
+        acceptor.accept(socket);
+        std::array<uint8_t, kHighPerformanceTcpRequestSize> request{};
+        std::array<uint8_t, 64> body{};
+        asio::read(socket, asio::buffer(request));
+        asio::read(socket, asio::buffer(body));
+        socket.close();  // The payload arrived, but no completion ACK did.
+    });
+
+    HighPerformanceTcpWorkers workers({.worker_count = 1});
+    ASSERT_TRUE(workers.start().ok());
+    HighPerformanceTcpClient client({4096, 128, 100, 100, 1}, &workers);
+    std::array<uint8_t, 64> local{};
+    Completion completion;
+    auto operation = Operation(local.data(), local.size(), 0x1000, 1, 31,
+                               HighPerformanceTcpOpcode::kWrite, &completion,
+                               acceptor.local_endpoint().port());
+    std::vector<HighPerformanceTcpWorkers::Command> commands;
+    commands.push_back({.worker_id = 0,
+                        .run =
+                            [&](size_t) mutable {
+                                client.enqueueOnOwner(0, std::move(operation));
+                            },
+                        .cancel = {}});
+    ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
+    ASSERT_TRUE(completion.wait());
+    EXPECT_EQ(completion.status, FAILED);
+    EXPECT_FALSE(completion.pre_request_endpoint_failure);
+    EXPECT_TRUE(completion.remote_write_outcome_unknown);
+    EXPECT_TRUE(client.cancelAll().ok());
+    EXPECT_TRUE(workers.stop().ok());
+    peer.join();
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     ConnectFailureIsMarkedAsPreRequestEndpointFailure) {
+    asio::io_context peer_io;
+    asio::ip::tcp::acceptor unused(peer_io, {asio::ip::tcp::v4(), 0});
+    const uint16_t unused_port = unused.local_endpoint().port();
+    unused.close();
+
+    HighPerformanceTcpWorkers workers({.worker_count = 1});
+    ASSERT_TRUE(workers.start().ok());
+    HighPerformanceTcpClient client({4096, 128, 100, 100, 1}, &workers);
+    std::array<uint8_t, 64> local{};
+    Completion completion;
+    auto operation =
+        Operation(local.data(), local.size(), 0x1000, 1, 30,
+                  HighPerformanceTcpOpcode::kRead, &completion, unused_port);
+    std::vector<HighPerformanceTcpWorkers::Command> commands;
+    commands.push_back({.worker_id = 0,
+                        .run =
+                            [&](size_t) mutable {
+                                client.enqueueOnOwner(0, std::move(operation));
+                            },
+                        .cancel = {}});
+    ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
+    ASSERT_TRUE(completion.wait());
+    EXPECT_EQ(completion.status, FAILED);
+    EXPECT_TRUE(completion.pre_request_endpoint_failure);
+    EXPECT_FALSE(completion.remote_write_outcome_unknown);
+    EXPECT_TRUE(client.cancelAll().ok());
+    EXPECT_TRUE(workers.stop().ok());
+}
+
+TEST(HighPerformanceTcpSocketTest, EmptyAndPartialHeadersReleaseSlot) {
+    Runtime runtime(/*max_connections=*/1, /*timeout_ms=*/100);
     runtime.start();
     asio::io_context io;
-    asio::ip::tcp::socket socket(io);
-    socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
-    const uint8_t byte = 0;
-    asio::write(socket, asio::buffer(&byte, 1));
-    ASSERT_TRUE(
-        WaitUntil([&] { return runtime.server.activeSessionsForTest() == 1; }));
-    ASSERT_TRUE(
-        WaitUntil([&] { return runtime.server.activeSessionsForTest() == 0; }));
+    {
+        asio::ip::tcp::socket socket(io);
+        socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+        ASSERT_TRUE(WaitUntil(
+            [&] { return runtime.server.activeSessionsForTest() == 1; }));
+        ASSERT_TRUE(WaitUntil(
+            [&] { return runtime.server.activeSessionsForTest() == 0; }));
+    }
+    {
+        asio::ip::tcp::socket socket(io);
+        socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+        const uint8_t byte = 0;
+        asio::write(socket, asio::buffer(&byte, 1));
+        ASSERT_TRUE(WaitUntil(
+            [&] { return runtime.server.activeSessionsForTest() == 1; }));
+        ASSERT_TRUE(WaitUntil(
+            [&] { return runtime.server.activeSessionsForTest() == 0; }));
+    }
 
     std::array<uint8_t, 8> remote{};
     std::array<uint8_t, 8> local{};

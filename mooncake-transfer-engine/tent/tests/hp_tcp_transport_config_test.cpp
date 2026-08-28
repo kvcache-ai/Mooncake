@@ -1,4 +1,6 @@
 // Copyright 2026 KVCache.AI
+#include <limits>
+
 #include <gtest/gtest.h>
 
 #include "tent/common/config.h"
@@ -47,6 +49,19 @@ TEST(HpTcpTransportConfigTest, ParsesAndValidatesLimits) {
     EXPECT_TRUE(ParseHpTcpTransportConfig(config, &parsed).IsInvalidArgument());
 }
 
+TEST(HpTcpTransportConfigTest, AcceptsFullWidthUnsignedLimit) {
+    Config config;
+    ASSERT_TRUE(
+        config
+            .load(
+                R"({"transports":{"tcp":{"enable":false},"hp_tcp":{"enable":true,"max_outstanding_bytes":18446744073709551615}}})")
+            .ok());
+    HpTcpTransportConfig parsed;
+    ASSERT_TRUE(ParseHpTcpTransportConfig(config, &parsed).ok());
+    EXPECT_EQ(parsed.params.max_outstanding_bytes,
+              std::numeric_limits<uint64_t>::max());
+}
+
 TEST(HpTcpTransportConfigTest, DisabledHpTcpIgnoresInactiveLimits) {
     Config config;
     ASSERT_TRUE(
@@ -59,7 +74,7 @@ TEST(HpTcpTransportConfigTest, DisabledHpTcpIgnoresInactiveLimits) {
     EXPECT_FALSE(parsed.enabled);
 }
 
-TEST(HpTcpTransportConfigTest, RejectsTcpAndHpTcpTogether) {
+TEST(HpTcpTransportConfigTest, AllowsTcpAndHpTcpTogether) {
     Config config;
     ASSERT_TRUE(
         config
@@ -67,14 +82,7 @@ TEST(HpTcpTransportConfigTest, RejectsTcpAndHpTcpTogether) {
                 R"({"transports":{"tcp":{"enable":true},"hp_tcp":{"enable":true}}})")
             .ok());
     HpTcpTransportConfig parsed;
-    EXPECT_TRUE(ParseHpTcpTransportConfig(config, &parsed).IsInvalidArgument());
-
-    ASSERT_TRUE(
-        config
-            .load(
-                R"({"transports":{"tcp":{"enable":false},"hp_tcp":{"enable":true}}})")
-            .ok());
-    EXPECT_TRUE(ParseHpTcpTransportConfig(config, &parsed).ok());
+    ASSERT_TRUE(ParseHpTcpTransportConfig(config, &parsed).ok());
     EXPECT_TRUE(parsed.enabled);
 }
 

@@ -17,6 +17,8 @@ namespace mooncake::tent {
 
 class HighPerformanceTcpBufferRegistry {
    public:
+    HighPerformanceTcpBufferRegistry();
+
     enum class AcquireFailure {
         kNone,
         kRangeRejected,
@@ -85,7 +87,10 @@ class HighPerformanceTcpBufferRegistry {
 
     mutable std::mutex registry_mutex_;
     std::map<uint64_t, std::shared_ptr<Entry>> entries_;
-    uint64_t next_registration_id_{1};
+    // Fence stale capabilities from an earlier registry incarnation while the
+    // sequence prevents reuse within this incarnation.
+    const uint64_t registration_namespace_;
+    uint64_t next_registration_sequence_{1};
     bool closing_{false};
 };
 

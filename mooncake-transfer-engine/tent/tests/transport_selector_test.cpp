@@ -171,6 +171,32 @@ TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
         << "Should use first in buffer_transports";
 }
 
+TEST(TransportSelectorTest, ExplicitMemoryPolicyCanSelectHpTcp) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"hp_tcp_memory","segment_type":"memory","transports":["hp_tcp"]}]})")
+            .ok());
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[HP_TCP] = std::make_shared<FakeTransport>(HP_TCP);
+    static_cast<FakeTransport*>(transports[HP_TCP].get())->setDramToDram(true);
+
+    const std::vector<TransportType> buffer_transports = {HP_TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = 0;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, HP_TCP);
+}
+
 // ---------------------------------------------------------------------------
 // Test transport type name parsing
 // ---------------------------------------------------------------------------

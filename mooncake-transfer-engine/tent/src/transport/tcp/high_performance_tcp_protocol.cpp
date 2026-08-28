@@ -72,11 +72,16 @@ Status InvalidAttr(const std::string& detail) {
 bool ReadPositiveUint64(const json& object, const char* key, uint64_t* out) {
     auto it = object.find(key);
     if (it == object.end()) return false;
-    if (!it->is_number_unsigned() && !it->is_number_integer()) return false;
-    if (it->is_number_integer() && it->get<int64_t>() <= 0) return false;
-    const auto value = it->get<uint64_t>();
-    if (value == 0) return false;
-    *out = value;
+    if (it->is_number_unsigned()) {
+        const auto value = it->get<uint64_t>();
+        if (value == 0) return false;
+        *out = value;
+        return true;
+    }
+    if (!it->is_number_integer()) return false;
+    const auto value = it->get<int64_t>();
+    if (value <= 0) return false;
+    *out = static_cast<uint64_t>(value);
     return true;
 }
 

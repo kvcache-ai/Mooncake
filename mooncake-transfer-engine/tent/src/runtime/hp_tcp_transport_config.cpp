@@ -15,15 +15,20 @@ template <typename T>
 Status ReadUnsigned(const json& object, std::string_view key, T* output) {
     auto it = object.find(std::string(key));
     if (it == object.end()) return Status::OK();
-    if (!it->is_number_unsigned() && !it->is_number_integer()) {
+    uint64_t value = 0;
+    if (it->is_number_unsigned()) {
+        value = it->get<uint64_t>();
+    } else if (it->is_number_integer()) {
+        const auto signed_value = it->get<int64_t>();
+        if (signed_value < 0) {
+            return Invalid("transports/hp_tcp/" + std::string(key),
+                           "must be non-negative");
+        }
+        value = static_cast<uint64_t>(signed_value);
+    } else {
         return Invalid("transports/hp_tcp/" + std::string(key),
                        "must be an integer");
     }
-    if (it->is_number_integer() && it->get<int64_t>() < 0) {
-        return Invalid("transports/hp_tcp/" + std::string(key),
-                       "must be non-negative");
-    }
-    const auto value = it->get<uint64_t>();
     if (value > std::numeric_limits<T>::max()) {
         return Invalid("transports/hp_tcp/" + std::string(key),
                        "is out of range");
@@ -41,37 +46,6 @@ Status ReadString(const json& object, std::string_view key,
                        "must be a string");
     }
     *output = it->get<std::string>();
-    return Status::OK();
-}
-
-Status ReadTransportEnabled(const Config& config, std::string_view transport,
-                            bool default_value, bool* enabled) {
-    std::string subtree;
-    const std::string path = "transports/" + std::string(transport);
-    if (!config.dumpSubtree(path, &subtree)) {
-        *enabled = default_value;
-        return Status::OK();
-    }
-
-    json config_object;
-    try {
-        config_object = json::parse(subtree);
-    } catch (const std::exception& error) {
-        return Status::MalformedJson(
-            "Invalid " + path + " configuration: " + error.what() + LOC_MARK);
-    }
-    if (!config_object.is_object()) {
-        return Invalid(path, "must be an object");
-    }
-    const auto it = config_object.find("enable");
-    if (it == config_object.end()) {
-        *enabled = default_value;
-        return Status::OK();
-    }
-    if (!it->is_boolean()) {
-        return Invalid(path + "/enable", "must be a boolean");
-    }
-    *enabled = it->get<bool>();
     return Status::OK();
 }
 
@@ -138,16 +112,6 @@ Status ParseHpTcpTransportConfig(const Config& config,
          hp.progress_timeout_ms == 0)) {
         return Invalid("transports/hp_tcp",
                        "contains zero or inconsistent limits");
-    }
-
-    if (parsed.enabled) {
-        bool tcp_enabled = true;
-        CHECK_STATUS(ReadTransportEnabled(config, "tcp", true, &tcp_enabled));
-        if (tcp_enabled) {
-            return Invalid("transports",
-                           "tcp and hp_tcp cannot be enabled together: "
-                           "notification ownership would be ambiguous");
-        }
     }
 
     *out = std::move(parsed);

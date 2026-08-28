@@ -29,6 +29,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 #include "tent/runtime/metastore.h"
 #include "tent/runtime/segment.h"
@@ -138,6 +139,10 @@ class ControlService {
 
     void setNotifyCallback(const OnNotify& callback);
 
+    // Drains notifications that arrived while no transport-owned callback was
+    // installed. Each queued notification is returned at most once.
+    void drainNotifications(std::vector<Notification>& notifications);
+
     Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
 
    private:
@@ -188,6 +193,7 @@ class ControlService {
     std::condition_variable notify_cb_cv_;
     size_t notify_callbacks_in_flight_ = 0;
     OnNotify notify_callback_;
+    std::vector<Notification> pending_notifications_;
     static thread_local const ControlService* active_notify_service_;
 
     TransferEngineImpl* impl_;

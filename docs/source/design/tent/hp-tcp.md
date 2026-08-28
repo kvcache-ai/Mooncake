@@ -3,15 +3,17 @@
 `hp_tcp` is a standalone TENT transport for CPU DRAM transfers over
 data-center TCP. Standard `tcp` remains the RPC-based compatibility path.
 The first version intentionally excludes GPU memory, TLS, multi-endpoint
-routing, multi-NIC striping, automatic fallback and dynamic lane scheduling.
+routing, multi-NIC striping, transparent replay after an ambiguous WRITE and
+dynamic lane scheduling.
 
 ## Architecture
 
-Each worker owns one `asio::io_context` and one thread. A stable hash of peer
-and lane selects the owner; socket state never moves between workers. Each peer
-has a configured number of persistent lanes, and operations on a lane are
-FIFO. ASIO provides the event queue; process-wide task and byte admission
-limits bound all accepted work, including callbacks waiting in that queue.
+Each worker owns one `asio::io_context` and one thread. Each peer advances its
+own round-robin cursor across a configured number of persistent lanes. A stable
+hash of peer and lane selects the owner; socket state never moves between
+workers, and operations on a lane are FIFO. ASIO provides the event queue;
+process-wide task and byte admission limits bound all accepted work, including
+callbacks waiting in that queue.
 
 The server uses the same worker pool. Accepted sockets are assigned to workers
 and stored in worker-owned session sets. A global connection limit bounds live
@@ -31,19 +33,31 @@ byte count. A WRITE completes only after the target has copied the full payload
 and returned an acknowledgement. A READ completes after the full response
 payload arrives.
 
-Every registered buffer has a monotonically increasing registration ID and a
-remote permission. The target validates the ID, range and permission before
-access. An operation holds a lease until its final I/O callback retires;
-unregister hides the range from new work and waits for existing leases.
-Stale registration metadata causes one bounded metadata refresh and retry on
-the same transport. Permission and range failures are terminal.
+Every registered buffer has an ID formed from a per-registry random namespace
+and a monotonic sequence, plus a remote permission. This prevents a stale ID
+from a previous server incarnation from becoming valid after restart. The
+target validates the ID, range and permission before access. An operation holds
+a lease until its final I/O callback retires; unregister hides the range from
+new work and waits for existing leases. Stale registration metadata, or an
+endpoint failure proven to occur before any request byte was written, causes
+one bounded metadata refresh and retry on the same transport. Permission and
+range failures are terminal.
+
+If a WRITE request may have reached the peer but no valid acknowledgement is
+received, the remote outcome is unknown. That failure is terminal and is not
+replayed through another transport; otherwise a committed WRITE whose ACK was
+lost could execute twice.
 
 ## Timeouts and shutdown
 
 Resolve/connect use `connect_timeout_ms`. Header, payload and response progress
-use `progress_timeout_ms` on both client and server, including an empty or
-partial request header. A timeout cancels the resolver or socket; terminal
-completion is published only after the corresponding callback retires.
+use `progress_timeout_ms` on both client and server. A newly accepted connection
+must send its first header byte before the deadline, and every partial header
+or payload must continue to make progress. After a valid request completes,
+pure idle time on its persistent connection is not treated as stalled I/O; the
+deadline resumes as soon as the next header begins. A timeout cancels the
+resolver or socket; terminal completion is published only after the
+corresponding callback retires.
 
 Shutdown closes admission and the listener, drains queued dispatch callbacks,
 cancels every client lane and server session on its owner, waits for operations
@@ -69,7 +83,7 @@ The transport is configured under `transports.hp_tcp`:
 
 | Field | Meaning |
 | --- | --- |
-| `enable` | Enable `hp_tcp`; set `transports.tcp.enable` to `false`. The two transports cannot be enabled together because control-plane notification ownership is singular. |
+| `enable` | Enable `hp_tcp`. It may coexist with standard `tcp`; their data paths remain separate and notification delivery is aggregated by the engine. |
 | `bind_address`, `advertise_address`, `port` | Listener and published endpoint. |
 | `worker_count` | ASIO event-loop threads. |
 | `connections_per_peer` | Persistent lanes per peer. |
@@ -78,5 +92,6 @@ The transport is configured under `transports.hp_tcp`:
 | `connect_timeout_ms`, `progress_timeout_ms` | Connection and I/O deadlines. |
 
 Tests cover wire validation, admission, buffer leases, connection reuse,
-session reaping, client/server timeout, stale-registration recovery and a
-two-process READ/WRITE smoke test.
+session reaping, client/server timeout, stale-registration and endpoint
+recovery, notification routing, ambiguous WRITE completion and a two-process
+READ/WRITE smoke test.

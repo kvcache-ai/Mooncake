@@ -193,7 +193,12 @@ class FakeTransport : public Transport {
 
 class HpTcpRecoveryTransport : public FakeTransport {
    public:
-    HpTcpRecoveryTransport() : FakeTransport(HP_TCP) {}
+    explicit HpTcpRecoveryTransport(
+        TransferStatusEnum initial_terminal = FAILED,
+        bool completes_after_retry = true)
+        : FakeTransport(HP_TCP),
+          initial_terminal_(initial_terminal),
+          completes_after_retry_(completes_after_retry) {}
 
     std::atomic<int> retry_calls{0};
 
@@ -226,14 +231,14 @@ class HpTcpRecoveryTransport : public FakeTransport {
         }
 
         const bool retried = retry_calls.load(std::memory_order_acquire) != 0;
-        if (retried) {
+        if (retried && completes_after_retry_) {
             status = {COMPLETED, hp_batch->requests[task_id].length};
             return Status::OK();
         }
 
-        status = {FAILED, 0};
+        status = {initial_terminal_, 0};
         return Status::NeedsRefreshCache(
-            "remote HP TCP registration is stale" LOC_MARK);
+            "remote HP TCP metadata is stale" LOC_MARK);
     }
 
     Status retryTransferTask(SubBatchRef batch, int task_id,
@@ -256,6 +261,29 @@ class HpTcpRecoveryTransport : public FakeTransport {
     }
 
     const char* getName() const override { return "<fake-hp-tcp>"; }
+
+   private:
+    TransferStatusEnum initial_terminal_;
+    bool completes_after_retry_;
+};
+
+class HpTcpStatusErrorOnceTransport : public FakeTransport {
+   public:
+    HpTcpStatusErrorOnceTransport() : FakeTransport(HP_TCP) {}
+
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus& status) override {
+        if (poll_count_.fetch_add(1, std::memory_order_relaxed) == 0) {
+            // Deliberately leave status untouched: Transport does not promise
+            // a valid output when it returns an error.
+            return Status::InternalError(
+                "injected HP TCP status poll failure" LOC_MARK);
+        }
+        return FakeTransport::getTransferStatus(batch, task_id, status);
+    }
+
+   private:
+    std::atomic<int> poll_count_{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -319,8 +347,11 @@ struct HpTcpRecoveryBatch {
 };
 
 void submitHpTcpRecoveryBatch(TransferEngineImpl& engine,
-                              HpTcpRecoveryBatch& batch) {
-    batch.hp_tcp = std::make_shared<HpTcpRecoveryTransport>();
+                              HpTcpRecoveryBatch& batch,
+                              TransferStatusEnum initial_terminal = FAILED,
+                              bool completes_after_retry = true) {
+    batch.hp_tcp = std::make_shared<HpTcpRecoveryTransport>(
+        initial_terminal, completes_after_retry);
     batch.fallback_tcp = std::make_shared<FakeTransport>(TCP);
 
     std::string segment_name = engine.getSegmentName();
@@ -416,6 +447,83 @@ TEST(EngineFailoverE2E, HpTcpStaleMetadataRetriesSameTransportOnce) {
     EXPECT_EQ(batch.fallback_tcp->submit_calls.load(), 0);
 
     releaseHpTcpRecoveryBatch(engine, batch);
+}
+
+TEST(EngineFailoverE2E, HpTcpPreRequestTimeoutRefreshesEndpointOnce) {
+    auto config = makeMinimalP2PConfig();
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    HpTcpRecoveryBatch batch;
+    submitHpTcpRecoveryBatch(engine, batch, TIMEOUT);
+
+    const TransferStatus final_status =
+        pollUntilDone(engine, batch.batch_id, 0);
+    EXPECT_EQ(final_status.s, COMPLETED);
+    EXPECT_EQ(batch.hp_tcp->submit_calls.load(), 1);
+    EXPECT_EQ(batch.hp_tcp->retry_calls.load(), 1);
+    EXPECT_EQ(batch.fallback_tcp->submit_calls.load(), 0);
+
+    releaseHpTcpRecoveryBatch(engine, batch);
+}
+
+TEST(EngineFailoverE2E, HpTcpRepeatedEndpointTimeoutStopsAfterSingleRefresh) {
+    auto config = makeMinimalP2PConfig();
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    HpTcpRecoveryBatch batch;
+    submitHpTcpRecoveryBatch(engine, batch, TIMEOUT,
+                             /*completes_after_retry=*/false);
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch.batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    ASSERT_TRUE(engine.getTransferStatus(batch.batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TIMEOUT);
+    EXPECT_EQ(batch.hp_tcp->retry_calls.load(), 1);
+    EXPECT_EQ(batch.fallback_tcp->submit_calls.load(), 0);
+
+    releaseHpTcpRecoveryBatch(engine, batch);
+}
+
+TEST(EngineFailoverE2E, HpTcpPollErrorDoesNotInspectStaleStatusOutput) {
+    auto config = makeMinimalP2PConfig();
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    auto hp_tcp = std::make_shared<HpTcpStatusErrorOnceTransport>();
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(hp_tcp->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(HP_TCP, hp_tcp);
+
+    std::vector<uint8_t> buffer(4096, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.transport_hint = HP_TCP;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {request}).ok());
+
+    TransferStatus status{FAILED, 123};
+    const Status first = engine.getTransferStatus(batch_id, 0, status);
+    EXPECT_TRUE(first.IsInternalError()) << first.ToString();
+    EXPECT_EQ(status.s, PENDING);
+    EXPECT_EQ(status.transferred_bytes, 0U);
+
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, request.length);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(EngineFailoverE2E, StatusCorruptionTriggersFailoverToSecondary) {

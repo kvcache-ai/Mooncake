@@ -2,6 +2,7 @@
 #include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
 
 #include <limits>
+#include <random>
 #include <string>
 #include <utility>
 
@@ -15,6 +16,14 @@ bool RangeEnd(uint64_t base, uint64_t length, uint64_t* end) {
     }
     *end = base + length;
     return true;
+}
+
+uint64_t MakeRegistrationNamespace() {
+    std::random_device device;
+    std::seed_seq seed{device(), device(), device(), device(),
+                       device(), device(), device(), device()};
+    std::mt19937_64 random(seed);
+    return random();
 }
 
 Status LeaseError(HighPerformanceTcpBufferRegistry::AcquireFailure failure,
@@ -37,6 +46,9 @@ Status LeaseError(HighPerformanceTcpBufferRegistry::AcquireFailure failure,
 }
 
 }  // namespace
+
+HighPerformanceTcpBufferRegistry::HighPerformanceTcpBufferRegistry()
+    : registration_namespace_(MakeRegistrationNamespace()) {}
 
 HighPerformanceTcpStatus HighPerformanceTcpWireStatusForAcquireFailure(
     HighPerformanceTcpBufferRegistry::AcquireFailure failure) {
@@ -129,12 +141,20 @@ Status HighPerformanceTcpBufferRegistry::add(uint64_t base, uint64_t length,
         }
     }
 
-    if (next_registration_id_ == 0 ||
-        next_registration_id_ == std::numeric_limits<uint64_t>::max()) {
+    if (next_registration_sequence_ == 0 ||
+        next_registration_sequence_ == std::numeric_limits<uint64_t>::max()) {
         return Status::InternalError(
             "HP TCP registration id space exhausted" LOC_MARK);
     }
-    const uint64_t id = next_registration_id_++;
+    uint64_t id = registration_namespace_ ^ next_registration_sequence_++;
+    if (id == 0) {
+        if (next_registration_sequence_ ==
+            std::numeric_limits<uint64_t>::max()) {
+            return Status::InternalError(
+                "HP TCP registration id space exhausted" LOC_MARK);
+        }
+        id = registration_namespace_ ^ next_registration_sequence_++;
+    }
 
     auto entry = std::make_shared<Entry>();
     entry->base = base;

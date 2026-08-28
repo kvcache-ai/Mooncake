@@ -40,11 +40,19 @@ class HighPerformanceTcpTaskState {
         reservation_active_.store(true, std::memory_order_release);
     }
 
-    bool completeOnce(TransferStatusEnum terminal, size_t bytes,
-                      std::optional<HighPerformanceTcpStatus> remote_status =
-                          std::nullopt) noexcept;
+    bool completeOnce(
+        TransferStatusEnum terminal, size_t bytes,
+        std::optional<HighPerformanceTcpStatus> remote_status = std::nullopt,
+        bool pre_request_endpoint_failure = false,
+        bool remote_write_outcome_unknown = false) noexcept;
     TransferStatus snapshot() const noexcept;
     std::optional<HighPerformanceTcpStatus> remoteStatus() const noexcept;
+    bool preRequestEndpointFailure() const noexcept {
+        return pre_request_endpoint_failure_.load(std::memory_order_acquire);
+    }
+    bool remoteWriteOutcomeUnknown() const noexcept {
+        return remote_write_outcome_unknown_.load(std::memory_order_acquire);
+    }
 
     const Request& request() const noexcept { return request_; }
 
@@ -69,6 +77,8 @@ class HighPerformanceTcpTaskState {
     std::atomic<size_t> bytes_{0};
     std::atomic<HighPerformanceTcpStatus> remote_status_{
         HighPerformanceTcpStatus::kOk};
+    std::atomic<bool> pre_request_endpoint_failure_{false};
+    std::atomic<bool> remote_write_outcome_unknown_{false};
     std::atomic<bool> completion_claimed_{false};
     std::atomic<bool> cancel_requested_{false};
 

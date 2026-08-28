@@ -43,6 +43,41 @@ TEST(HighPerformanceTcpBufferRegistryTest, EnforcesPermissionAndRegistration) {
         HighPerformanceTcpBufferRegistry::AcquireFailure::kStaleRegistration);
 }
 
+TEST(HighPerformanceTcpBufferRegistryTest,
+     RejectsRegistrationFromPreviousRegistryIncarnation) {
+    std::array<uint8_t, 64> data{};
+    const uint64_t base = reinterpret_cast<uint64_t>(data.data());
+
+    uint64_t stale_id = 0;
+    {
+        HighPerformanceTcpBufferRegistry previous;
+        ASSERT_TRUE(
+            previous.add(base, data.size(), kGlobalReadWrite, &stale_id).ok());
+    }
+
+    HighPerformanceTcpBufferRegistry current;
+    uint64_t current_id = 0;
+    ASSERT_TRUE(
+        current.add(base, data.size(), kGlobalReadWrite, &current_id).ok());
+    ASSERT_NE(stale_id, current_id);
+
+    HighPerformanceTcpBufferRegistry::Lease lease;
+    HighPerformanceTcpBufferRegistry::AcquireFailure failure;
+    EXPECT_FALSE(current
+                     .acquireRemoteLease(base, data.size(), stale_id,
+                                         HighPerformanceTcpOpcode::kRead,
+                                         &lease, &failure)
+                     .ok());
+    EXPECT_EQ(
+        failure,
+        HighPerformanceTcpBufferRegistry::AcquireFailure::kStaleRegistration);
+    EXPECT_TRUE(current
+                    .acquireRemoteLease(base, data.size(), current_id,
+                                        HighPerformanceTcpOpcode::kRead, &lease,
+                                        &failure)
+                    .ok());
+}
+
 TEST(HighPerformanceTcpBufferRegistryTest, UnregisterWaitsForActiveLease) {
     HighPerformanceTcpBufferRegistry registry;
     std::array<uint8_t, 64> data{};

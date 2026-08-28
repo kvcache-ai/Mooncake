@@ -7,10 +7,13 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 #include <gtest/gtest.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -27,36 +30,124 @@ namespace mooncake::tent {
 namespace {
 
 constexpr size_t kDataLength = 256 * 1024;
+constexpr auto kChildReadyTimeout = std::chrono::seconds(10);
+constexpr auto kChildExitTimeout = std::chrono::seconds(10);
+
+bool ReadExactlyWithTimeout(int fd, void* buffer, size_t length,
+                            std::string* failure) {
+    auto* cursor = static_cast<uint8_t*>(buffer);
+    size_t received = 0;
+    const auto deadline = std::chrono::steady_clock::now() + kChildReadyTimeout;
+
+    while (received < length) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            *failure = "timed out waiting for the HP TCP server";
+            return false;
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                  now);
+        pollfd descriptor{fd, POLLIN, 0};
+        const int poll_result =
+            poll(&descriptor, 1, static_cast<int>(remaining.count() + 1));
+        if (poll_result < 0 && errno == EINTR) continue;
+        if (poll_result == 0) {
+            *failure = "timed out waiting for the HP TCP server";
+            return false;
+        }
+        if (poll_result < 0) {
+            *failure = std::string(
+                           "poll failed while waiting for the HP TCP "
+                           "server: ") +
+                       std::strerror(errno);
+            return false;
+        }
+
+        ssize_t read_result;
+        do {
+            read_result = read(fd, cursor + received, length - received);
+        } while (read_result < 0 && errno == EINTR);
+        if (read_result == 0) {
+            *failure = "HP TCP server exited before reporting readiness";
+            return false;
+        }
+        if (read_result < 0) {
+            *failure = std::string(
+                           "read failed while waiting for the HP TCP "
+                           "server: ") +
+                       std::strerror(errno);
+            return false;
+        }
+        received += static_cast<size_t>(read_result);
+    }
+    return true;
+}
 
 class ChildProcessGuard {
    public:
+    enum class FinishResult { kExited, kTimedOutAndKilled, kWaitError };
+
     ChildProcessGuard(pid_t pid, int stop_fd) : pid_(pid), stop_fd_(stop_fd) {}
 
     ~ChildProcessGuard() {
         if (pid_ <= 0) return;
-        close(stop_fd_);
-        (void)waitpid(pid_, nullptr, 0);
+        int status = 0;
+        (void)finish(&status);
     }
 
-    int finish() {
-        close(stop_fd_);
-        int status = 0;
-        (void)waitpid(pid_, &status, 0);
+    FinishResult finish(int* status) {
+        signalStop();
+        const WaitResult wait_result = waitForExit(status);
+        FinishResult finish_result = FinishResult::kWaitError;
+        if (wait_result == WaitResult::kExited) {
+            finish_result = FinishResult::kExited;
+        } else if (wait_result == WaitResult::kTimedOut &&
+                   killAndReap(status)) {
+            finish_result = FinishResult::kTimedOutAndKilled;
+        }
         pid_ = -1;
-        stop_fd_ = -1;
-        return status;
-    }
-
-    int reap() {
-        int status = 0;
-        (void)waitpid(pid_, &status, 0);
-        close(stop_fd_);
-        pid_ = -1;
-        stop_fd_ = -1;
-        return status;
+        return finish_result;
     }
 
    private:
+    enum class WaitResult { kExited, kTimedOut, kError };
+
+    void signalStop() {
+        if (stop_fd_ < 0) return;
+        close(stop_fd_);
+        stop_fd_ = -1;
+    }
+
+    WaitResult waitForExit(int* status) const {
+        const auto deadline =
+            std::chrono::steady_clock::now() + kChildExitTimeout;
+        for (;;) {
+            const pid_t result = waitpid(pid_, status, WNOHANG);
+            if (result == pid_) return WaitResult::kExited;
+            if (result < 0) {
+                if (errno == EINTR) {
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        return WaitResult::kTimedOut;
+                    continue;
+                }
+                return WaitResult::kError;
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                return WaitResult::kTimedOut;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    bool killAndReap(int* status) const {
+        if (kill(pid_, SIGKILL) != 0 && errno != ESRCH) return false;
+        pid_t result;
+        do {
+            result = waitpid(pid_, status, 0);
+        } while (result < 0 && errno == EINTR);
+        return result == pid_;
+    }
+
     pid_t pid_;
     int stop_fd_;
 };
@@ -136,7 +227,11 @@ void RunWriteThenReadAcrossProcesses(size_t task_count) {
                         exit_code = 5;
                     } else {
                         char stop = 0;
-                        (void)read(stop_pipe[0], &stop, 1);
+                        ssize_t stop_result = 0;
+                        do {
+                            stop_result = read(stop_pipe[0], &stop, 1);
+                        } while (stop_result < 0 && errno == EINTR);
+                        if (stop_result < 0) exit_code = 7;
                     }
                     if (!server
                              .unregisterLocalMemory(remote.data(),
@@ -158,16 +253,36 @@ void RunWriteThenReadAcrossProcesses(size_t task_count) {
     ChildProcessGuard child_guard(child, stop_pipe[1]);
 
     uint32_t segment_length = 0;
-    const ssize_t received =
-        read(ready_pipe[0], &segment_length, sizeof(segment_length));
-    if (received != static_cast<ssize_t>(sizeof(segment_length))) {
-        const int status = child_guard.reap();
-        GTEST_SKIP() << "HP TCP server initialization failed, child status "
-                     << status;
+    std::string ready_failure;
+    bool ready = ReadExactlyWithTimeout(ready_pipe[0], &segment_length,
+                                        sizeof(segment_length), &ready_failure);
+    std::string server_segment;
+    if (ready) {
+        server_segment.resize(segment_length);
+        ready = ReadExactlyWithTimeout(ready_pipe[0], server_segment.data(),
+                                       segment_length, &ready_failure);
     }
-    std::string server_segment(segment_length, '\0');
-    ASSERT_EQ(read(ready_pipe[0], server_segment.data(), segment_length),
-              static_cast<ssize_t>(segment_length));
+    if (!ready) {
+        close(ready_pipe[0]);
+        int status = 0;
+        const auto finish_result = child_guard.finish(&status);
+        if (finish_result ==
+            ChildProcessGuard::FinishResult::kTimedOutAndKilled) {
+            FAIL() << ready_failure
+                   << "; child did not exit before timeout and was killed";
+        }
+        if (finish_result == ChildProcessGuard::FinishResult::kWaitError) {
+            FAIL() << ready_failure << "; failed to wait for child safely";
+        }
+        if (WIFEXITED(status)) {
+            FAIL() << ready_failure << "; child exit code "
+                   << WEXITSTATUS(status);
+        }
+        if (WIFSIGNALED(status)) {
+            FAIL() << ready_failure << "; child signal " << WTERMSIG(status);
+        }
+        FAIL() << ready_failure << "; unexpected child status " << status;
+    }
     close(ready_pipe[0]);
 
     TransferEngine client(MakeHpConfig());
@@ -242,7 +357,13 @@ void RunWriteThenReadAcrossProcesses(size_t task_count) {
     EXPECT_TRUE(client.closeSegment(segment).ok());
     EXPECT_TRUE(client.unregisterLocalMemory(local.data(), local.size()).ok());
 
-    const int status = child_guard.finish();
+    int status = 0;
+    const auto finish_result = child_guard.finish(&status);
+    ASSERT_TRUE(finish_result == ChildProcessGuard::FinishResult::kExited)
+        << (finish_result == ChildProcessGuard::FinishResult::kTimedOutAndKilled
+                ? "HP TCP server did not shut down before timeout and was "
+                  "killed"
+                : "failed to wait for HP TCP server safely");
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
 }

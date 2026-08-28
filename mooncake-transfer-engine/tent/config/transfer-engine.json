@@ -112,7 +112,7 @@
             "name": "default_memory",
             "segment_type": "memory",
             "devices": ["mlx5_0", "mlx5_2"],
-            "transports": ["nvlink", "rdma", "shm"]
+            "transports": ["nvlink", "rdma", "shm", "hp_tcp"]
         },
         {
             "name": "file_storage",

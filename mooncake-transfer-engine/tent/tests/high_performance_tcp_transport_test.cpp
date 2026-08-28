@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,7 +23,36 @@
 #include "tent/transport/tcp/high_performance_tcp_transport.h"
 
 namespace mooncake::tent {
+
+class HighPerformanceTcpTransportTestPeer {
+   public:
+    static Status selectLane(HighPerformanceTcpTransport& transport,
+                             SegmentID peer_id, uint32_t* lane_id) {
+        return transport.selectLaneForPeer(peer_id, lane_id);
+    }
+
+    static void failWorker(HighPerformanceTcpTransport& transport) {
+        asio::post(transport.workers_->ioContext(0), [] {
+            throw std::runtime_error("injected HP TCP worker failure");
+        });
+    }
+
+    static bool hasFailedWorker(const HighPerformanceTcpTransport& transport) {
+        return transport.workers_->hasFailedWorker();
+    }
+};
+
 namespace {
+
+template <class Predicate>
+bool WaitUntil(Predicate predicate) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return predicate();
+}
 
 std::shared_ptr<ControlService> MakeLocalMetadata() {
     auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
@@ -59,6 +89,111 @@ HighPerformanceTcpParams MakeParams() {
 bool ContainsTransport(const BufferDesc& desc, TransportType type) {
     return std::find(desc.transports.begin(), desc.transports.end(), type) !=
            desc.transports.end();
+}
+
+TEST(HighPerformanceTcpTransportTest,
+     InterleavedPeersAdvanceIndependentLaneCursors) {
+    HighPerformanceTcpParams params = MakeParams();
+    params.connections_per_peer = 4;
+    HighPerformanceTcpTransport transport(params);
+
+    constexpr SegmentID kPeerA = 11;
+    constexpr SegmentID kPeerB = 29;
+    for (uint32_t expected_lane = 0; expected_lane < 4; ++expected_lane) {
+        uint32_t lane_a = 0;
+        uint32_t lane_b = 0;
+        ASSERT_TRUE(HighPerformanceTcpTransportTestPeer::selectLane(
+                        transport, kPeerA, &lane_a)
+                        .ok());
+        ASSERT_TRUE(HighPerformanceTcpTransportTestPeer::selectLane(
+                        transport, kPeerB, &lane_b)
+                        .ok());
+        EXPECT_EQ(lane_a, expected_lane);
+        EXPECT_EQ(lane_b, expected_lane);
+    }
+
+    uint32_t wrapped_lane = 4;
+    ASSERT_TRUE(HighPerformanceTcpTransportTestPeer::selectLane(
+                    transport, kPeerA, &wrapped_lane)
+                    .ok());
+    EXPECT_EQ(wrapped_lane, 0U);
+}
+
+TEST(HighPerformanceTcpTransportTest,
+     WorkerFailureDoesNotHideCommittedTerminalStatus) {
+    auto metadata = MakeLocalMetadata();
+    HighPerformanceTcpTransport transport(MakeParams());
+    std::string segment_name = "hp_transport_test";
+    ASSERT_TRUE(
+        transport.install(segment_name, metadata, nullptr, nullptr).ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    auto* hp_batch = dynamic_cast<HighPerformanceTcpSubBatch*>(batch);
+    ASSERT_NE(hp_batch, nullptr);
+
+    Request request{};
+    request.length = 37;
+    auto task = std::make_shared<HighPerformanceTcpTaskState>(
+        request, 0, [](BatchID) {}, HighPerformanceTcpBufferRegistry::Lease{});
+    ASSERT_TRUE(task->completeOnce(COMPLETED, request.length));
+    hp_batch->tasks.push_back(std::move(task));
+
+    HighPerformanceTcpTransportTestPeer::failWorker(transport);
+    ASSERT_TRUE(WaitUntil([&] {
+        return HighPerformanceTcpTransportTestPeer::hasFailedWorker(transport);
+    }));
+
+    TransferStatus status{FAILED, 0};
+    const Status result = transport.getTransferStatus(batch, 0, status);
+    EXPECT_TRUE(result.ok()) << result.ToString();
+    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, request.length);
+
+    EXPECT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.quiesce().IsInternalError());
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+TEST(HighPerformanceTcpTransportTest,
+     CompletionReasonControlsRefreshAndUnsafeWriteReplay) {
+    HighPerformanceTcpTransport transport(MakeParams());
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 3).ok());
+    auto* hp_batch = dynamic_cast<HighPerformanceTcpSubBatch*>(batch);
+    ASSERT_NE(hp_batch, nullptr);
+
+    Request request{};
+    for (bool pre_request_endpoint_failure : {false, true}) {
+        auto task = std::make_shared<HighPerformanceTcpTaskState>(
+            request, 0, [](BatchID) {},
+            HighPerformanceTcpBufferRegistry::Lease{});
+        ASSERT_TRUE(task->completeOnce(TIMEOUT, 0, std::nullopt,
+                                       pre_request_endpoint_failure));
+        hp_batch->tasks.push_back(std::move(task));
+    }
+
+    request.opcode = Request::WRITE;
+    auto uncertain_write = std::make_shared<HighPerformanceTcpTaskState>(
+        request, 0, [](BatchID) {}, HighPerformanceTcpBufferRegistry::Lease{});
+    ASSERT_TRUE(
+        uncertain_write->completeOnce(FAILED, 0, std::nullopt, false, true));
+    hp_batch->tasks.push_back(std::move(uncertain_write));
+
+    TransferStatus status{};
+    EXPECT_TRUE(transport.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, TIMEOUT);
+
+    const Status endpoint_failure =
+        transport.getTransferStatus(batch, 1, status);
+    EXPECT_TRUE(endpoint_failure.IsNeedsRefreshCache())
+        << endpoint_failure.ToString();
+    EXPECT_EQ(status.s, TIMEOUT);
+
+    const Status unsafe_replay = transport.getTransferStatus(batch, 2, status);
+    EXPECT_TRUE(unsafe_replay.IsInvalidArgument()) << unsafe_replay.ToString();
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_TRUE(transport.freeSubBatch(batch).ok());
 }
 
 TEST(HighPerformanceTcpTransportTest,
@@ -137,6 +272,162 @@ Status WaitForTransportResult(HighPerformanceTcpTransport& transport,
         std::this_thread::yield();
     }
     return Status::InternalError("HP TCP test transfer did not finish");
+}
+
+TEST(HighPerformanceTcpTransportTest,
+     StaleEndpointLimitRefreshesBeforeLocalRejection) {
+    auto server_metadata = MakeLocalMetadata();
+    uint16_t rpc_port = 0;
+    ASSERT_TRUE(server_metadata->start(rpc_port).ok());
+    ASSERT_NE(rpc_port, 0);
+    const std::string server_name = "127.0.0.1:" + std::to_string(rpc_port);
+    ASSERT_TRUE(server_metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) -> Status {
+                        segment.name = server_name;
+                        segment.rpc_server_addr = server_name;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    HighPerformanceTcpTransport server(MakeParams());
+    std::string installed_server_name = server_name;
+    ASSERT_TRUE(
+        server.install(installed_server_name, server_metadata, nullptr, nullptr)
+            .ok());
+    std::array<uint8_t, 64> remote_storage{};
+    std::fill(remote_storage.begin(), remote_storage.end(), 0xA5);
+    BufferDesc remote;
+    remote.addr = reinterpret_cast<uint64_t>(remote_storage.data());
+    remote.length = remote_storage.size();
+    remote.location = "cpu:0";
+    MemoryOptions remote_options;
+    remote_options.type = HP_TCP;
+    remote_options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(server.addMemoryBuffer(remote, remote_options).ok());
+    ASSERT_TRUE(PublishBuffers(server_metadata, {remote}).ok());
+
+    const SegmentDescRef published =
+        server_metadata->segmentManager().getLocal();
+    const auto endpoint_it = published->getMemory().transport_attrs.find(
+        static_cast<int>(TransportType::HP_TCP));
+    ASSERT_NE(endpoint_it, published->getMemory().transport_attrs.end());
+    HighPerformanceTcpEndpointAttr fresh_endpoint;
+    ASSERT_TRUE(DecodeHighPerformanceTcpEndpointAttr(endpoint_it->second,
+                                                     &fresh_endpoint)
+                    .ok());
+    HighPerformanceTcpEndpointAttr stale_endpoint = fresh_endpoint;
+    stale_endpoint.max_transfer_bytes = remote_storage.size() / 2;
+    std::string stale_encoded;
+    ASSERT_TRUE(
+        EncodeHighPerformanceTcpEndpointAttr(stale_endpoint, &stale_encoded)
+            .ok());
+    ASSERT_TRUE(
+        server_metadata->segmentManager()
+            .updateLocal([&](SegmentDesc& segment) -> Status {
+                std::get<MemorySegmentDesc>(segment.detail)
+                    .transport_attrs[static_cast<int>(TransportType::HP_TCP)] =
+                    stale_encoded;
+                return Status::OK();
+            })
+            .ok());
+    ASSERT_TRUE(server_metadata->segmentManager().synchronizeLocal().ok());
+
+    auto client_metadata = MakeLocalMetadata();
+    ASSERT_TRUE(client_metadata->segmentManager()
+                    .updateLocal([](SegmentDesc& segment) -> Status {
+                        // Keep the deliberately stale snapshot cached until
+                        // planTask requests its one bounded refresh.
+                        segment.rpc_server_addr.clear();
+                        return Status::OK();
+                    })
+                    .ok());
+    HighPerformanceTcpTransport client(MakeParams());
+    std::string client_name = "hp_transport_limit_refresh_client";
+    ASSERT_TRUE(
+        client.install(client_name, client_metadata, nullptr, nullptr).ok());
+    SegmentID target = 0;
+    ASSERT_TRUE(
+        client_metadata->segmentManager().openRemote(target, server_name).ok());
+    SegmentDescRef stale_cached;
+    ASSERT_TRUE(client_metadata->segmentManager()
+                    .getRemoteCached(stale_cached, target)
+                    .ok());
+
+    std::string fresh_encoded;
+    ASSERT_TRUE(
+        EncodeHighPerformanceTcpEndpointAttr(fresh_endpoint, &fresh_encoded)
+            .ok());
+    ASSERT_TRUE(
+        server_metadata->segmentManager()
+            .updateLocal([&](SegmentDesc& segment) -> Status {
+                std::get<MemorySegmentDesc>(segment.detail)
+                    .transport_attrs[static_cast<int>(TransportType::HP_TCP)] =
+                    fresh_encoded;
+                return Status::OK();
+            })
+            .ok());
+    ASSERT_TRUE(server_metadata->segmentManager().synchronizeLocal().ok());
+
+    std::array<uint8_t, 64> local_storage{};
+    BufferDesc local;
+    local.addr = reinterpret_cast<uint64_t>(local_storage.data());
+    local.length = local_storage.size();
+    local.location = "cpu:0";
+    MemoryOptions local_options;
+    local_options.type = HP_TCP;
+    local_options.perm = kLocalReadWrite;
+    ASSERT_TRUE(client.addMemoryBuffer(local, local_options).ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(client.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::READ;
+    request.source = local_storage.data();
+    request.target_id = target;
+    request.target_offset = remote.addr;
+    request.length = remote.length;
+    request.transport_hint = HP_TCP;
+    ASSERT_TRUE(client.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer_status{};
+    const Status result =
+        WaitForTransportResult(client, batch, transfer_status);
+    EXPECT_TRUE(result.ok()) << result.ToString();
+    EXPECT_EQ(transfer_status.s, COMPLETED);
+    EXPECT_EQ(local_storage, remote_storage);
+
+    ASSERT_TRUE(client.freeSubBatch(batch).ok());
+
+    // A capability that is still too small after the one refresh retains the
+    // original terminal classification instead of becoming refreshable
+    // forever or falling through to another transport.
+    ASSERT_TRUE(
+        server_metadata->segmentManager()
+            .updateLocal([&](SegmentDesc& segment) -> Status {
+                std::get<MemorySegmentDesc>(segment.detail)
+                    .transport_attrs[static_cast<int>(TransportType::HP_TCP)] =
+                    stale_encoded;
+                return Status::OK();
+            })
+            .ok());
+    ASSERT_TRUE(server_metadata->segmentManager().synchronizeLocal().ok());
+    ASSERT_TRUE(
+        client_metadata->segmentManager().invalidateRemote(target).ok());
+
+    Transport::SubBatchRef rejected_batch = nullptr;
+    ASSERT_TRUE(client.allocateSubBatch(rejected_batch, 1).ok());
+    const Status rejected =
+        client.submitTransferTasks(rejected_batch, {request});
+    EXPECT_TRUE(rejected.IsInvalidArgument()) << rejected.ToString();
+    EXPECT_EQ(rejected_batch->size(), 0U);
+    ASSERT_TRUE(client.freeSubBatch(rejected_batch).ok());
+
+    ASSERT_TRUE(client.removeMemoryBuffer(local).ok());
+    ASSERT_TRUE(server.removeMemoryBuffer(remote).ok());
+    ASSERT_TRUE(client.quiesce().ok());
+    ASSERT_TRUE(server.quiesce().ok());
+    ASSERT_TRUE(client.uninstall().ok());
+    ASSERT_TRUE(server.uninstall().ok());
 }
 
 TEST(HighPerformanceTcpTransportTest,
@@ -275,6 +566,70 @@ TEST(HighPerformanceTcpTransportTest,
     ASSERT_TRUE(server.quiesce().ok());
     ASSERT_TRUE(client.uninstall().ok());
     ASSERT_TRUE(server.uninstall().ok());
+}
+
+TEST(HighPerformanceTcpTransportTest,
+     NotificationRefreshesStaleEmptyRpcEndpointOnce) {
+    auto server_metadata = MakeLocalMetadata();
+    uint16_t rpc_port = 0;
+    ASSERT_TRUE(server_metadata->start(rpc_port).ok());
+    ASSERT_NE(rpc_port, 0);
+    const std::string server_name = "127.0.0.1:" + std::to_string(rpc_port);
+    ASSERT_TRUE(server_metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) -> Status {
+                        segment.name = server_name;
+                        segment.rpc_server_addr.clear();
+                        return Status::OK();
+                    })
+                    .ok());
+    ASSERT_TRUE(server_metadata->segmentManager().synchronizeLocal().ok());
+
+    auto client_metadata = MakeLocalMetadata();
+    HighPerformanceTcpTransport client(MakeParams());
+    std::string client_name = "hp_notification_refresh_client";
+    ASSERT_TRUE(
+        client.install(client_name, client_metadata, nullptr, nullptr).ok());
+
+    SegmentID target = 0;
+    ASSERT_TRUE(
+        client_metadata->segmentManager().openRemote(target, server_name).ok());
+    SegmentDescRef stale;
+    ASSERT_TRUE(
+        client_metadata->segmentManager().getRemoteCached(stale, target).ok());
+    ASSERT_TRUE(stale->rpc_server_addr.empty());
+
+    ASSERT_TRUE(server_metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) -> Status {
+                        segment.rpc_server_addr = server_name;
+                        return Status::OK();
+                    })
+                    .ok());
+    ASSERT_TRUE(server_metadata->segmentManager().synchronizeLocal().ok());
+
+    ASSERT_TRUE(client.sendNotification(target, {"refresh", "delivered"}).ok());
+    std::vector<Notification> notifications;
+    server_metadata->drainNotifications(notifications);
+    ASSERT_EQ(notifications.size(), 1U);
+    EXPECT_EQ(notifications[0].name, "refresh");
+    EXPECT_EQ(notifications[0].msg, "delivered");
+
+    // If the refetched endpoint is still empty, withCachedSegment performs no
+    // further retry and reports the stable invalid metadata.
+    ASSERT_TRUE(server_metadata->segmentManager()
+                    .updateLocal([](SegmentDesc& segment) -> Status {
+                        segment.rpc_server_addr.clear();
+                        return Status::OK();
+                    })
+                    .ok());
+    ASSERT_TRUE(server_metadata->segmentManager().synchronizeLocal().ok());
+    ASSERT_TRUE(
+        client_metadata->segmentManager().invalidateRemote(target).ok());
+    const Status still_empty =
+        client.sendNotification(target, {"refresh", "not-delivered"});
+    EXPECT_TRUE(still_empty.IsInvalidEntry()) << still_empty.ToString();
+
+    ASSERT_TRUE(client.quiesce().ok());
+    ASSERT_TRUE(client.uninstall().ok());
 }
 
 }  // namespace

@@ -131,6 +131,25 @@ Status HighPerformanceTcpTransport::validateParams() const {
     return Status::OK();
 }
 
+Status HighPerformanceTcpTransport::selectLaneForPeer(SegmentID peer_id,
+                                                      uint32_t* lane_id) {
+    if (lane_id == nullptr || params_.connections_per_peer == 0) {
+        return Status::InvalidArgument(
+            "invalid HP TCP lane selection" LOC_MARK);
+    }
+    try {
+        std::lock_guard<std::mutex> lock(lane_cursor_mutex_);
+        size_t& next_lane = next_lane_by_peer_[peer_id];
+        *lane_id = static_cast<uint32_t>(next_lane);
+        next_lane =
+            next_lane + 1 == params_.connections_per_peer ? 0 : next_lane + 1;
+    } catch (...) {
+        return Status::InternalError(
+            "unable to allocate HP TCP peer lane cursor" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 std::string HighPerformanceTcpTransport::makeIncarnation() const {
     std::random_device device;
     std::mt19937_64 random(device());
@@ -292,11 +311,6 @@ Status HighPerformanceTcpTransport::install(
         return status;
     }
 
-    metadata_->setNotifyCallback([this](const Notification& notification) {
-        RWSpinlock::WriteGuard guard(notify_lock_);
-        notifications_.push_back(notification);
-        return 0;
-    });
     installed_.store(true, std::memory_order_release);
     return Status::OK();
 }
@@ -362,7 +376,6 @@ Status HighPerformanceTcpTransport::uninstall() {
     }
 
     if (metadata_) {
-        metadata_->setNotifyCallback(nullptr);
         Status removed = metadata_->segmentManager().updateLocal(
             [](SegmentDesc& desc) -> Status {
                 if (desc.type != SegmentType::Memory) {
@@ -456,6 +469,7 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
     HighPerformanceTcpEndpointAttr endpoint_attr;
     HighPerformanceTcpBufferAttr buffer_attr;
     SegmentDescRef pin;
+    bool capability_refresh_requested = false;
     Status resolved = metadata_->segmentManager().withCachedSegment(
         request.target_id, pin, [&](SegmentDesc* segment) -> Status {
             if (segment == nullptr || segment->type != SegmentType::Memory) {
@@ -487,20 +501,32 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
             if (!decoded.ok()) {
                 return NeedsRefresh("HP TCP buffer metadata is incompatible");
             }
+            if (endpoint_attr.endpoints.size() != 1 ||
+                request.length > endpoint_attr.max_transfer_bytes) {
+                if (request.target_id != LOCAL_SEGMENT_ID &&
+                    !capability_refresh_requested) {
+                    capability_refresh_requested = true;
+                    return NeedsRefresh(
+                        "HP TCP remote endpoint capability may be stale");
+                }
+                return Status::InvalidArgument(
+                    "HP TCP request exceeds remote endpoint "
+                    "capability" LOC_MARK);
+            }
+            if (!RemotePermissionAllows(buffer_attr, request.opcode)) {
+                if (request.target_id != LOCAL_SEGMENT_ID &&
+                    !capability_refresh_requested) {
+                    capability_refresh_requested = true;
+                    return NeedsRefresh(
+                        "HP TCP remote buffer permission may be stale");
+                }
+                return Status::AddressNotRegistered(
+                    "HP TCP remote permission does not allow requested "
+                    "operation" LOC_MARK);
+            }
             return Status::OK();
         });
     if (!resolved.ok()) return resolved;
-
-    if (endpoint_attr.endpoints.size() != 1 ||
-        request.length > endpoint_attr.max_transfer_bytes) {
-        return Status::InvalidArgument(
-            "HP TCP request exceeds remote endpoint capability" LOC_MARK);
-    }
-    if (!RemotePermissionAllows(buffer_attr, request.opcode)) {
-        return Status::AddressNotRegistered(
-            "HP TCP remote permission does not allow requested "
-            "operation" LOC_MARK);
-    }
 
     uint64_t request_id =
         next_request_id_.fetch_add(1, std::memory_order_relaxed);
@@ -508,8 +534,8 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
         return Status::InternalError(
             "HP TCP request id space exhausted" LOC_MARK);
     }
-    const uint32_t lane_id = static_cast<uint32_t>(
-        request_id % static_cast<uint64_t>(params_.connections_per_peer));
+    uint32_t lane_id = 0;
+    CHECK_STATUS(selectLaneForPeer(request.target_id, &lane_id));
     const size_t owner_worker =
         workers_->affinityOwner(request.target_id, lane_id);
 
@@ -534,8 +560,12 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
     operation.request_id = request_id;
     operation.complete =
         [task](TransferStatusEnum terminal, size_t bytes,
-               std::optional<HighPerformanceTcpStatus> remote_status) {
-            (void)task->completeOnce(terminal, bytes, remote_status);
+               std::optional<HighPerformanceTcpStatus> remote_status,
+               bool pre_request_endpoint_failure,
+               bool remote_write_outcome_unknown) {
+            (void)task->completeOnce(terminal, bytes, remote_status,
+                                     pre_request_endpoint_failure,
+                                     remote_write_outcome_unknown);
         };
 
     HighPerformanceTcpWorkers::Command command;
@@ -634,11 +664,18 @@ Status HighPerformanceTcpTransport::getTransferStatus(SubBatchRef batch,
         static_cast<size_t>(task_id) >= hp_batch->tasks.size()) {
         return Status::InvalidArgument("invalid HP TCP task id" LOC_MARK);
     }
-    CHECK_STATUS(CheckRuntimeHealth(workers_.get(), admission_.get()));
-    status = hp_batch->tasks[static_cast<size_t>(task_id)]->snapshot();
-    const auto remote_status =
-        hp_batch->tasks[static_cast<size_t>(task_id)]->remoteStatus();
+    const auto& task = hp_batch->tasks[static_cast<size_t>(task_id)];
+    status = task->snapshot();
+    if ((status.s == FAILED || status.s == TIMEOUT) &&
+        task->preRequestEndpointFailure()) {
+        return NeedsRefresh("HP TCP endpoint metadata may be stale");
+    }
+    const auto remote_status = task->remoteStatus();
     if (remote_status.has_value()) return RemoteWireStatus(*remote_status);
+    if (status.s == FAILED && task->remoteWriteOutcomeUnknown()) {
+        return Status::InvalidArgument(
+            "HP TCP WRITE outcome is unknown; replay is unsafe" LOC_MARK);
+    }
     return Status::OK();
 }
 
@@ -651,9 +688,11 @@ Status HighPerformanceTcpTransport::retryTransferTask(SubBatchRef batch,
         return Status::InvalidArgument("invalid HP TCP retry task id" LOC_MARK);
     }
     CHECK_STATUS(CheckRuntimeHealth(workers_.get(), admission_.get()));
-    if (hp_batch->tasks[static_cast<size_t>(task_id)]->snapshot().s != FAILED) {
+    const TransferStatusEnum state =
+        hp_batch->tasks[static_cast<size_t>(task_id)]->snapshot().s;
+    if (state != FAILED && state != TIMEOUT) {
         return Status::InvalidArgument(
-            "HP TCP retry requires a failed attempt" LOC_MARK);
+            "HP TCP retry requires a failed or timed-out attempt" LOC_MARK);
     }
 
     TaskPlan plan;
@@ -783,16 +822,23 @@ Status HighPerformanceTcpTransport::sendNotification(
     }
     return metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc* segment) {
-            return ControlClient::notify(segment->rpc_server_addr,
-                                         notification);
+            const std::string& rpc_server_addr = segment->rpc_server_addr;
+            if (rpc_server_addr.empty()) {
+                return NeedsRefresh("Empty RPC server addr");
+            }
+            // Empty metadata is safe to refresh above. Once the RPC is issued,
+            // however, an error may mean the handler ran and only its reply was
+            // lost. Preserve the error so withCachedSegment cannot redeliver.
+            return ControlClient::notify(rpc_server_addr, notification);
         });
 }
 
 Status HighPerformanceTcpTransport::receiveNotification(
     std::vector<Notification>& notifications) {
-    RWSpinlock::WriteGuard guard(notify_lock_);
-    notifications.clear();
-    notifications.swap(notifications_);
+    if (!metadata_) {
+        return Status::InternalError("HP TCP metadata is unavailable" LOC_MARK);
+    }
+    metadata_->drainNotifications(notifications);
     return Status::OK();
 }
 
