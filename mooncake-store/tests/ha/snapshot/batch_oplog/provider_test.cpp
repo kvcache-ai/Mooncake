@@ -61,6 +61,26 @@ class EmptyBackend final : public HaKvBackend {
 
 }  // namespace
 
+TEST(BatchOpLogSnapshotProviderTest, AllAbsentNamespaceIsAnEmptyBaseline) {
+    EmptyBackend backend;
+    LocalFileSnapshotObjectStore object_store(
+        "/tmp/mooncake-n05-provider-all-absent");
+    BatchOpLogSnapshotProvider provider("clusterA", backend, object_store,
+                                        "snapshots");
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+
+    auto result = provider.RestoreBaseline(metadata, registry);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(0u, result->last_applied_seq);
+    EXPECT_EQ(0u, result->last_applied_batch_id);
+    std::string prefix;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Get(BuildDurablePrefixKey("clusterA"), prefix));
+    EXPECT_EQ(EncodeDurablePrefix({.batch_id = 0, .last_seq = 0}), prefix);
+}
+
 TEST(BatchOpLogSnapshotProviderTest, EmptyCompleteHistoryIsAValidBaseline) {
     EmptyBackend backend;
     ASSERT_EQ(ErrorCode::OK,
@@ -203,6 +223,48 @@ TEST(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(1u, result->last_included_seq);
     EXPECT_EQ(1u, result->last_included_batch_id);
+    EXPECT_EQ(2u, result->last_applied_seq);
+    EXPECT_EQ(2u, result->last_applied_batch_id);
+}
+
+TEST(BatchOpLogSnapshotProviderTest,
+     ReplaysCompleteHistoryAfterBothPointersAreInvalid) {
+    const std::string root = "/tmp/mooncake-n05-provider-complete-oplog";
+    LocalFileSnapshotObjectStore object_store(root);
+    EmptyBackend backend;
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(ha::BuildBatchOpLogSnapshotLatestKey("clusterA"), "{}"));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(ha::BuildBatchOpLogSnapshotFallbackKey("clusterA"), "{}"));
+
+    for (uint64_t id = 1; id <= 2; ++id) {
+        OpLogEntry entry;
+        entry.sequence_id = id;
+        entry.op_type = OpType::REMOVE;
+        entry.tenant_id = "tenant";
+        entry.object_key = "key-" + std::to_string(id);
+        OpLogBatchRecord batch;
+        batch.batch_id = id;
+        batch.first_seq = id;
+        batch.last_seq = id;
+        batch.entries.push_back(std::move(entry));
+        ASSERT_EQ(ErrorCode::OK,
+                  backend.Put(BuildBatchRecordKey("clusterA", id),
+                              EncodeOpLogBatchRecord(batch)));
+    }
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+
+    BatchOpLogSnapshotProvider provider("clusterA", backend, object_store,
+                                        "snapshots");
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+    auto result = provider.RestoreBaseline(metadata, registry);
+
+    ASSERT_TRUE(result.has_value());
     EXPECT_EQ(2u, result->last_applied_seq);
     EXPECT_EQ(2u, result->last_applied_batch_id);
 }
