@@ -111,8 +111,8 @@ class RdmaTransport : public Transport {
     int preTouchMemory(void *addr, size_t length);
 
    public:
-    int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
-                               HandShakeDesc &local_desc);
+    virtual int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
+                                       HandShakeDesc &local_desc);
 
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,

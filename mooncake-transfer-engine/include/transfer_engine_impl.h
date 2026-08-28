@@ -33,6 +33,7 @@
 #include "transfer_metadata.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "config.h"
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 #include "transport/device/device_transport.h"
@@ -475,6 +476,9 @@ class TransferEngineImpl {
         }
         if (auto_discover_config_.protocol == "efa") {
             return "efa";
+        }
+        if (globalConfig().use_rdma_twosided) {
+            return "rdma_twosided";
         }
         return "rdma";
     }

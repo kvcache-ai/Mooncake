@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -505,10 +506,19 @@ int RdmaContext::pause() {
     return (expected == DEVICE_PAUSED) ? 0 : -1;
 }
 
+void RdmaContext::evictEndpoints() {
+    if (endpoint_store_) endpoint_store_->evictAll();
+}
+
 int RdmaContext::resume() {
     DeviceStatus expected = DEVICE_PAUSED;
     status_.compare_exchange_strong(expected, DEVICE_ENABLED);
-    return (expected == DEVICE_ENABLED) ? 0 : -1;
+    if (expected != DEVICE_PAUSED) return -1;
+    // Port recovered: evict all cached endpoints so stale QPs (which may
+    // have entered IBV_QPS_ERR while the link was down) are torn down and
+    // rebuilt on the next getOrInsert() call.
+    evictEndpoints();
+    return 0;
 }
 
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
@@ -620,14 +630,29 @@ int RdmaContext::unregisterMemReg(MemReg id) {
         return -1;
     }
     auto entry = (ibv_mr*)id;
+    // Cache addr/length before ibv_dereg_mr: entry is freed by dereg_mr, so
+    // reading entry->addr/entry->length afterwards is a use-after-free.
+    void* region_addr = entry->addr;
+    size_t region_length = entry->length;
     mr_set_mutex_.lock();
     mr_set_.erase(entry);
     mr_set_mutex_.unlock();
 
     if (verbs_.ibv_dereg_mr(entry)) {
-        const void* end = static_cast<const char*>(entry->addr) + entry->length;
-        LOG(ERROR) << "Failed to unregister memory from " << entry->addr
+        const void* end = static_cast<const char*>(region_addr) + region_length;
+        LOG(ERROR) << "Failed to unregister memory from " << region_addr
                    << " to " << end << " in RDMA device " << device_name_;
+        return -1;
+    }
+    // Restore mergeability after ibv_dereg_mr. ibv_reg_mr calls
+    // madvise(MADV_DONTFORK) on the registered range when fork protection
+    // is active; failing to undo this on unregister leaves VMAs permanently
+    // split, exhausting vm.max_map_count under high register/unregister churn.
+    // See issue #3639.
+    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
+        PLOG(WARNING) << "Failed to restore fork state for memory region at "
+                      << region_addr << " (" << region_length
+                      << " bytes), deregister already succeeded";
     }
 
     return 0;

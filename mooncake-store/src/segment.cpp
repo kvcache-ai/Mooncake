@@ -5,6 +5,7 @@
 #include "utils/zstd_util.h"
 
 #include <functional>
+#include <unordered_set>
 
 namespace mooncake {
 namespace {
@@ -95,6 +96,27 @@ std::vector<std::string> BuildHostOrderedSegments(
     return ordered_segments;
 }
 
+void AddAllocatorUsage(
+    StorageUsageSnapshot& snapshot,
+    const std::shared_ptr<BufferAllocatorBase>& allocator,
+    std::unordered_set<const BufferAllocatorBase*>& counted_allocators) {
+    if (!allocator || !counted_allocators.insert(allocator.get()).second) {
+        return;
+    }
+
+    const size_t used_bytes = allocator->size();
+    const size_t capacity_bytes = allocator->capacity();
+    snapshot.used_bytes += used_bytes;
+    snapshot.capacity_bytes += capacity_bytes;
+
+    const std::string segment_name = allocator->getSegmentName();
+    if (!segment_name.empty()) {
+        auto& segment = snapshot.segments[segment_name];
+        segment.used_bytes += used_bytes;
+        segment.capacity_bytes += capacity_bytes;
+    }
+}
+
 }  // namespace
 
 std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
@@ -103,6 +125,38 @@ std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
         return {};
     }
     return BuildHostOrderedSegments(*segments_by_host_, writer_host_id, key);
+}
+
+StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    StorageUsageSnapshot snapshot;
+    std::unordered_set<const BufferAllocatorBase*> counted_allocators;
+
+    // The CXL allocator is owned by SegmentManager independently of client
+    // mounts and may be shared by multiple mounted segment records.
+    AddAllocatorUsage(snapshot, cxl_global_allocator_, counted_allocators);
+
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        AddAllocatorUsage(snapshot, mounted_segment.buf_allocator,
+                          counted_allocators);
+    }
+    return snapshot;
+}
+
+void SegmentManager::AttachMountedUsageTrackers() {
+    std::unordered_set<const BufferAllocatorBase*> attached_allocators;
+    if (cxl_global_allocator_) {
+        cxl_global_allocator_->AttachUsageTracker(usage_tracker_);
+        attached_allocators.insert(cxl_global_allocator_.get());
+    }
+    for (auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        auto& allocator = mounted_segment.buf_allocator;
+        if (allocator && attached_allocators.insert(allocator.get()).second) {
+            allocator->AttachUsageTracker(usage_tracker_);
+        }
+    }
 }
 
 std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
@@ -215,6 +269,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
@@ -314,6 +369,10 @@ bool ScopedSegmentAccess::ReplaceAllocators(
         return false;
     }
     for (const auto& replacement : replacements) {
+        if (replacement.expected != replacement.replacement) {
+            replacement.replacement->AttachUsageTracker(
+                segment_manager_->usage_tracker_);
+        }
         segment_manager_->mounted_segments_.at(replacement.segment_id)
             .buf_allocator = replacement.replacement;
     }
@@ -358,7 +417,9 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     }
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
 
-    // 2. Remove from mounted_segment
+    // 2. Remove from mounted_segment. Do not detach usage here: in-flight
+    // deallocate calls hold a local shared_ptr and must finish first. The
+    // allocator destructor RAII-detaches when the last shared_ptr is dropped.
     mounted_segment.buf_allocator.reset();
 
     // Set the segment status to UNMOUNTING
@@ -997,6 +1058,7 @@ SegmentSerializer::Deserialize(const std::vector<uint8_t>& data) {
         }
     }
 
+    segment_manager_->AttachMountedUsageTrackers();
     return std::move(*local_ssd_state);
 }
 
@@ -1192,6 +1254,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    allocator->AttachUsageTracker(nof_segment_manager_->usage_tracker_);
     nof_segment_manager_->allocator_manager_.addAllocator(segment.name,
                                                           allocator);
     nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
@@ -1375,6 +1438,18 @@ void NoFSegmentManager::GetMountedSegmentsSnapshot(
     }
 }
 
+StorageUsageSnapshot NoFSegmentManager::GetUsageSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    StorageUsageSnapshot snapshot;
+    std::unordered_set<const BufferAllocatorBase*> counted_allocators;
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        AddAllocatorUsage(snapshot, mounted_segment.buf_allocator,
+                          counted_allocators);
+    }
+    return snapshot;
+}
+
 void SegmentManager::releaseCapacityMetrics() {
     // Segments that are still mounted here never went through
     // CommitUnmountSegment, so their contribution to the capacity metrics
@@ -1403,8 +1478,13 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
               << std::fixed << std::setprecision(2)
               << cxl_size / (1024.0 * 1024 * 1024) << " GB)";
 
-    cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
+    auto allocator = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    allocator->AttachUsageTracker(usage_tracker_);
+    {
+        std::unique_lock<std::shared_mutex> lock(segment_mutex_);
+        cxl_global_allocator_ = std::move(allocator);
+    }
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
 }
 

@@ -18,8 +18,8 @@
 #include <thread>
 
 #include "tent/common/config.h"
+#include "tent/runtime/segment.h"
 #include "tent/transport/rdma/rail_monitor.h"
-#include "tent/runtime/topology.h"
 
 namespace mooncake {
 namespace tent {
@@ -56,6 +56,31 @@ static std::shared_ptr<Topology> makeSingleNicTopology(const std::string& nic,
         ADD_FAILURE() << "Topology::parse failed: " << status.ToString();
     }
     return topo;
+}
+
+static SegmentDescRef makeSingleNicSegment(const std::string& nic,
+                                           int numa_node = 0) {
+    auto desc = std::make_shared<SegmentDesc>();
+    desc->type = SegmentType::Memory;
+    auto& topology = std::get<MemorySegmentDesc>(desc->detail).topology;
+    auto json_str = R"({
+        "nics": [{"name": ")" +
+                    nic + R"(", "type": 0, "numa_node": )" +
+                    std::to_string(numa_node) + R"(}],
+        "mems": [{
+            "name": "cuda0",
+            "type": 1,
+            "numa_node": )" +
+                    std::to_string(numa_node) +
+                    R"(,
+            "device_list": {"rank0": [0]}
+        }]
+    })";
+    auto status = topology.parse(json_str);
+    if (!status.ok()) {
+        ADD_FAILURE() << "Topology::parse failed: " << status.ToString();
+    }
+    return desc;
 }
 
 static std::shared_ptr<Topology> makeTwoNicTopology(const std::string& first,
@@ -97,7 +122,7 @@ TEST(RailMonitorConfigTest, CustomJsonOverridesAutomaticPeerMapping) {
     })";
 
     RailMonitor rail;
-    ASSERT_TRUE(rail.load(local.get(), remote.get(), rail_json, nullptr).ok());
+    ASSERT_TRUE(rail.load(local, remote, rail_json, nullptr).ok());
     EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/0), 1);
     EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/1, /*remote_numa=*/0), 0);
     EXPECT_TRUE(rail.available(/*local_nic=*/0, /*remote_nic=*/1));
@@ -155,7 +180,7 @@ TEST(RailMonitorCrossNumaTest, CrossNumaPrefersSameNameDevice) {
     // remote NUMA-0 domain: mlx5_y (idx0); remote NUMA-1 domain: mlx5_x (idx1).
     auto remote = makeNamedNumaTopology("mlx5_y", 0, "mlx5_x", 1);
     RailMonitor rail;
-    ASSERT_TRUE(rail.load(local.get(), remote.get()).ok());
+    ASSERT_TRUE(rail.load(local, remote).ok());
     ASSERT_TRUE(rail.ready());
 
     // local mlx5_y (idx1, NUMA 1) reaching the remote NUMA-0 domain: the only
@@ -175,7 +200,7 @@ TEST(RailMonitorRecoverTest, RecoverResetsErrorCount) {
     auto local = makeSingleNicTopology("mlx5_0");
     auto remote = makeSingleNicTopology("mlx5_1");
     RailMonitor rail;
-    ASSERT_TRUE(rail.load(local.get(), remote.get()).ok());
+    ASSERT_TRUE(rail.load(local, remote).ok());
     ASSERT_TRUE(rail.ready());
 
     // Initially available
@@ -202,7 +227,7 @@ TEST(RailMonitorRecoverTest, RecoverUnpausesPausedRail) {
     auto local = makeSingleNicTopology("mlx5_0");
     auto remote = makeSingleNicTopology("mlx5_1");
     RailMonitor rail;
-    ASSERT_TRUE(rail.load(local.get(), remote.get()).ok());
+    ASSERT_TRUE(rail.load(local, remote).ok());
 
     // Drive error_count to the default threshold (3) to trigger pause
     for (int i = 0; i < 3; ++i) rail.markFailed(0, 0);
@@ -224,10 +249,39 @@ TEST(RailMonitorRecoverTest, RecoverUnknownPairIsNoop) {
     auto local = makeSingleNicTopology("mlx5_0");
     auto remote = makeSingleNicTopology("mlx5_1");
     RailMonitor rail;
-    ASSERT_TRUE(rail.load(local.get(), remote.get()).ok());
+    ASSERT_TRUE(rail.load(local, remote).ok());
 
     // NIC IDs 5 and 7 are not in the topology — must not crash
     EXPECT_NO_FATAL_FAILURE(rail.markRecovered(5, 7));
+}
+
+TEST(RailMonitorLifetimeTest, KeepsSegmentSnapshotsAliveForFailureUpdates) {
+    auto local = makeSingleNicSegment("mlx5_0");
+    auto remote = makeSingleNicSegment("mlx5_1");
+    std::weak_ptr<SegmentDesc> weak_local = local;
+    std::weak_ptr<SegmentDesc> weak_remote = remote;
+    auto* local_topology = &local->getMemory().topology;
+    auto* remote_topology = &remote->getMemory().topology;
+
+    {
+        RailMonitor rail;
+        ASSERT_TRUE(
+            rail.load(std::shared_ptr<const Topology>(local, local_topology),
+                      std::shared_ptr<const Topology>(remote, remote_topology))
+                .ok());
+        local.reset();
+        remote.reset();
+
+        EXPECT_FALSE(weak_local.expired());
+        EXPECT_FALSE(weak_remote.expired());
+        EXPECT_NO_FATAL_FAILURE({
+            for (int i = 0; i < 3; ++i) rail.markFailed(0, 0);
+        });
+        EXPECT_FALSE(rail.available(0, 0));
+    }
+
+    EXPECT_TRUE(weak_local.expired());
+    EXPECT_TRUE(weak_remote.expired());
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +292,7 @@ TEST(RailMonitorRecoverTest, FindBestAfterRecovery) {
     auto local = makeSingleNicTopology("mlx5_0");
     auto remote = makeSingleNicTopology("mlx5_1");
     RailMonitor rail;
-    ASSERT_TRUE(rail.load(local.get(), remote.get()).ok());
+    ASSERT_TRUE(rail.load(local, remote).ok());
 
     // Pause the only available rail
     for (int i = 0; i < 3; ++i) rail.markFailed(0, 0);
@@ -272,7 +326,7 @@ TEST(RailMonitorRecoverTest, CooldownDoesNotCarryOverAfterRecovery) {
     cfg.set(RailMonitor::kCfgCooldownSecs, 1);      // small initial cooldown
 
     RailMonitor rail;
-    ASSERT_TRUE(rail.load(local.get(), remote.get(), "", &cfg).ok());
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
 
     // First pause cycle: single failure arms resume_time at now+1s.
     rail.markFailed(0, 0);

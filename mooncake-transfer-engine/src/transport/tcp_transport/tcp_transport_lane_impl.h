@@ -365,7 +365,123 @@ uint64_t TcpTransport::requestGroupPumpLocked(PeerConnectionGroup& group) {
     return group.pump_epoch;
 }
 
-void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
+bool TcpTransport::requestGroupRetirementLocked(PeerConnectionGroup& group) {
+    if (!group.retiring || group.retirement_scheduled ||
+        group.state != GroupState::OPEN) {
+        return false;
+    }
+    group.retirement_scheduled = true;
+    return true;
+}
+
+void TcpTransport::postGroupRetirement(
+    const std::shared_ptr<PeerConnectionGroup>& group) {
+    try {
+        asio::post(group->executor, [group] { runGroupRetirement(group); });
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        group->retirement_scheduled = false;
+    }
+}
+
+void TcpTransport::scheduleGroupRetirement(
+    const std::shared_ptr<PeerConnectionGroup>& group) {
+    bool scheduled = false;
+    {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        scheduled = requestGroupRetirementLocked(*group);
+    }
+    if (scheduled) postGroupRetirement(group);
+}
+
+void TcpTransport::runGroupRetirement(
+    const std::shared_ptr<PeerConnectionGroup>& group) {
+    std::shared_ptr<asio::steady_timer> retry_timer;
+    std::shared_ptr<asio::steady_timer> admission_timer;
+    std::array<std::shared_ptr<ClientSession>, kMaxTcpLanesPerPeer> sessions;
+    std::array<std::shared_ptr<asio::ip::tcp::resolver>, kMaxTcpLanesPerPeer>
+        resolvers;
+    std::array<std::shared_ptr<asio::ip::tcp::socket>, kMaxTcpLanesPerPeer>
+        sockets;
+    size_t session_count = 0;
+    size_t resolver_count = 0;
+    size_t socket_count = 0;
+    uint64_t pump_epoch = 0;
+    bool retired = false;
+    {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        group->retirement_scheduled = false;
+        if (!group->retiring || group->state != GroupState::OPEN) return;
+
+        if (!group->queue.empty() || !group->pending_admissions.empty()) {
+            pump_epoch = requestGroupPumpLocked(*group);
+        } else {
+            const bool owned_work = std::any_of(
+                group->lanes.begin(), group->lanes.end(), [](const auto& lane) {
+                    return lane->state == LaneState::BUSY ||
+                           lane->state == LaneState::COMPLETING ||
+                           lane->current.has_value();
+                });
+            if (owned_work) return;
+
+            group->state = GroupState::CLOSING;
+            group->pump_scheduled = false;
+            ++group->pump_epoch;
+            ++group->retry_epoch;
+            if (group->retry_epoch == 0) ++group->retry_epoch;
+            ++group->admission_epoch;
+            if (group->admission_epoch == 0) ++group->admission_epoch;
+            retry_timer = std::move(group->retry_timer);
+            admission_timer = std::move(group->admission_timer);
+            for (const auto& lane : group->lanes) {
+                ++lane->operation_epoch;
+                if (lane->operation_epoch == 0) ++lane->operation_epoch;
+                if (lane->session)
+                    sessions[session_count++] = std::move(lane->session);
+                if (lane->resolver)
+                    resolvers[resolver_count++] = std::move(lane->resolver);
+                if (lane->socket)
+                    sockets[socket_count++] = std::move(lane->socket);
+                lane->connect_stage = LaneConnectStage::NONE;
+                lane->state = LaneState::CLOSED;
+            }
+            group->probes_in_flight = 0;
+            group->state = GroupState::CLOSED;
+            retired = true;
+        }
+    }
+
+    if (pump_epoch != 0) {
+        postGroupPump(group, pump_epoch);
+        return;
+    }
+    if (!retired) return;
+
+    for (size_t i = 0; i < session_count; ++i)
+        if (sessions[i]) sessions[i]->cancel();
+    for (size_t i = 0; i < resolver_count; ++i) {
+        const auto& resolver = resolvers[i];
+        if (!resolver) continue;
+        try {
+            resolver->cancel();
+        } catch (...) {
+        }
+    }
+    for (size_t i = 0; i < socket_count; ++i) closeSocketNoThrow(sockets[i]);
+    cancelTimerNoThrow(retry_timer);
+    cancelTimerNoThrow(admission_timer);
+
+    if (auto state = group->owner_state.lock()) {
+        std::lock_guard<std::mutex> state_lock(state->mutex);
+        auto it = std::find(state->retiring_groups.begin(),
+                            state->retiring_groups.end(), group);
+        if (it != state->retiring_groups.end())
+            state->retiring_groups.erase(it);
+    }
+}
+
+void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
+                                         const ConnectionKey& key,
                                          TcpWorkItem work) {
     const auto state = lane_state_;
     std::shared_ptr<PeerConnectionGroup> group;
@@ -373,6 +489,7 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
     std::deque<TcpWorkItem> expired;
     std::deque<TcpWorkItem> runtime_failed;
     std::shared_ptr<asio::steady_timer> timer_to_cancel;
+    std::shared_ptr<PeerConnectionGroup> retiring_group;
     WorkFailureReason rejection_reason = WorkFailureReason::QUEUE_FULL;
     uint64_t pump_epoch = 0;
     [[maybe_unused]] size_t promoted = 0;
@@ -381,6 +498,7 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
     [[maybe_unused]] bool pending_admission = false;
     [[maybe_unused]] bool hard_rejection = false;
     bool timer_armed = false;
+    bool retirement_scheduled = false;
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     size_t queue_depth = 0;
     uint64_t queued_bytes = 0;
@@ -398,6 +516,33 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
                 rejected.emplace(std::move(work));
                 rejection_reason = WorkFailureReason::RUNTIME_UNAVAILABLE;
             } else {
+                auto current_it = state->current_key_by_peer.find(logical_peer);
+                if (current_it == state->current_key_by_peer.end()) {
+                    state->current_key_by_peer.emplace(logical_peer, key);
+                } else if (!(current_it->second == key)) {
+                    const ConnectionKey old_key = current_it->second;
+                    current_it->second = key;
+                    const bool old_key_still_current =
+                        std::any_of(state->current_key_by_peer.begin(),
+                                    state->current_key_by_peer.end(),
+                                    [&old_key](const auto& entry) {
+                                        return entry.second == old_key;
+                                    });
+                    if (!old_key_still_current) {
+                        auto old_group_it = state->groups.find(old_key);
+                        if (old_group_it != state->groups.end()) {
+                            retiring_group = old_group_it->second;
+                            state->retiring_groups.push_back(retiring_group);
+                            state->groups.erase(old_group_it);
+                            std::lock_guard<std::mutex> old_group_lock(
+                                retiring_group->mutex);
+                            retiring_group->retiring = true;
+                            retirement_scheduled =
+                                requestGroupRetirementLocked(*retiring_group);
+                        }
+                    }
+                }
+
                 auto group_it = state->groups.find(key);
                 if (group_it == state->groups.end()) {
                     group = std::make_shared<PeerConnectionGroup>(
@@ -413,6 +558,7 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
                     auto [inserted_it, inserted] =
                         state->groups.emplace(key, group);
                     if (!inserted) group = inserted_it->second;
+                    group->owner_state = state;
                 } else {
                     group = group_it->second;
                 }
@@ -474,6 +620,7 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
     }
 
     cancelTimerNoThrow(timer_to_cancel);
+    if (retirement_scheduled) postGroupRetirement(retiring_group);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     if (rejected) {
         invokeLaneObserverHook(kLaneQueueRejected, queue_depth, queued_bytes,
@@ -537,6 +684,7 @@ void TcpTransport::postGroupPump(
                    << ":" << group->key.port
                    << (error && *error ? ". Error: " : "")
                    << (error && *error ? error : "");
+        scheduleGroupRetirement(group);
     };
 
     try {
@@ -721,6 +869,7 @@ void TcpTransport::runGroupPump(
                   WorkFailureReason::RUNTIME_UNAVAILABLE,
                   group->failure_counters);
     if (followup_pump_epoch != 0) postGroupPump(group, followup_pump_epoch);
+    scheduleGroupRetirement(group);
 }
 
 void TcpTransport::startLaneConnect(
@@ -868,6 +1017,7 @@ void TcpTransport::handleLaneConnected(
     } else if (pump_epoch != 0) {
         postGroupPump(group, pump_epoch);
     }
+    scheduleGroupRetirement(group);
 }
 
 void TcpTransport::handleLaneConnectFailure(
@@ -958,6 +1108,7 @@ void TcpTransport::handleLaneConnectFailure(
                   WorkFailureReason::RUNTIME_UNAVAILABLE,
                   group->failure_counters);
     if (pump_epoch != 0) postGroupPump(group, pump_epoch);
+    scheduleGroupRetirement(group);
 }
 
 void TcpTransport::startLaneSession(
@@ -1117,6 +1268,7 @@ void TcpTransport::handleLaneTerminal(
                            active_sockets, false);
 #endif
     if (pump_epoch != 0) postGroupPump(group, pump_epoch);
+    scheduleGroupRetirement(group);
 }
 
 void TcpTransport::completeTerminalAction(TerminalAction action) noexcept {
@@ -1216,8 +1368,10 @@ void TcpTransport::shutdownConnectionLanes() {
         std::lock_guard<std::mutex> state_lock(state->mutex);
         if (state->shutting_down) return;
         state->shutting_down = true;
-        groups.reserve(state->groups.size());
+        groups.reserve(state->groups.size() + state->retiring_groups.size());
         for (const auto& entry : state->groups) groups.push_back(entry.second);
+        for (const auto& group : state->retiring_groups)
+            groups.push_back(group);
     }
 
     for (const auto& group : groups) {
@@ -1379,6 +1533,8 @@ void TcpTransport::shutdownConnectionLanes() {
     {
         std::lock_guard<std::mutex> state_lock(state->mutex);
         state->groups.clear();
+        state->current_key_by_peer.clear();
+        state->retiring_groups.clear();
         state->runtime.reset();
     }
     groups.clear();

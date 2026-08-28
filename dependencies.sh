@@ -110,7 +110,7 @@ echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
 echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
-echo -e "  - Git submodules (including pybind11 and yalantinglibs)"
+echo -e "  - Git submodules (pybind11)"
 echo -e "  - Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  - SPDK (for NVMe-oF support)"
@@ -243,31 +243,6 @@ else
     echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
     exit 1
 fi
-
-# Build and install yalantinglibs from submodule
-print_section "Installing yalantinglibs"
-cd "${REPO_ROOT}/extern/yalantinglibs"
-check_success "Failed to change to yalantinglibs submodule directory"
-
-mkdir -p build
-check_success "Failed to create build directory"
-cd build
-check_success "Failed to change to build directory"
-
-echo "Configuring yalantinglibs..."
-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-check_success "Failed to configure yalantinglibs"
-
-echo "Building yalantinglibs (using $(nproc) cores)..."
-cmake --build . -j$(nproc)
-check_success "Failed to build yalantinglibs"
-
-echo "Installing yalantinglibs..."
-cmake --install .
-check_success "Failed to install yalantinglibs"
-
-print_success "yalantinglibs installed successfully"
-cd "${REPO_ROOT}"
 
 print_section "Verifying essential build tools"
 
@@ -440,7 +415,6 @@ print_section "Installation Complete"
 echo -e "${GREEN}All dependencies have been successfully installed!${NC}"
 echo -e "The following components were installed:"
 echo -e "  ${GREEN}✓${NC} System packages"
-echo -e "  ${GREEN}✓${NC} yalantinglibs"
 echo -e "  ${GREEN}✓${NC} Git submodules"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then

@@ -22,6 +22,10 @@ void TransferMetadata::SegmentDesc::dump() const {
         LOG(INFO) << "  rdma server name: " << rdma_server_name;
     }
     LOG(INFO) << "  protocol: " << protocol;
+    if (!tcp_data_host.empty()) {
+        LOG(INFO) << "  tcp data endpoint: " << tcp_data_host << ":"
+                  << tcp_data_port;
+    }
     LOG(INFO) << "  topology: " << topology.toString();
     LOG(INFO) << "  devices: ";
     for (auto& device : devices) {

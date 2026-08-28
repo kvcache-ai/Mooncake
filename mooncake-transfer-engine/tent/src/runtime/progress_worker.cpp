@@ -96,6 +96,9 @@ void ProgressWorker::runner() {
                 queued_.erase(batch_id);
             }
         }
+        // lazyFreeBatch reports the first batch it could not reclaim and logs
+        // the skip itself (rate-limited); the worker only sweeps, so the
+        // status is intentionally dropped at these call sites.
         if (queue_ready) {
             (void)impl_->progressRuntimeQueue();
             (void)impl_->lazyFreeBatch();

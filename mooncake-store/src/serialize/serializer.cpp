@@ -983,7 +983,7 @@ Serializer<OffsetBufferAllocator>::serialize(
     packer.pack(allocator.segment_name_);
     packer.pack(static_cast<uint64_t>(allocator.base_));
     packer.pack(static_cast<uint64_t>(allocator.total_size_));
-    packer.pack(static_cast<uint64_t>(allocator.cur_size_.load()));
+    packer.pack(static_cast<uint64_t>(allocator.size()));
     packer.pack(allocator.transport_endpoint_);
 
     // Serialize offset_allocator
@@ -1036,12 +1036,12 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
 
         // Set internal member variable values
         allocator->offset_allocator_ = offset_allocator_result.value();
-        allocator->cur_size_ = cur_size;
+        allocator->RestoreUsageBytes(cur_size);
 
-        // The snapshot restores cur_size_ directly from persisted data
+        // The snapshot restores usage directly from persisted data
         // without going through the live allocate()/adoptImportedBuffer()
         // paths, so no inc_allocated_mem_size() was paired with it. The
-        // allocator destructor still calls dec_allocated_mem_size(cur_size_)
+        // allocator destructor still calls dec_allocated_mem_size(usage)
         // to undo its contribution to the global metric; without a matching
         // inc the gauge would go negative and wrap to ~16M TB when formatted
         // as uint64. Pair it here so the accounting stays symmetric and the

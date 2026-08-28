@@ -64,6 +64,11 @@ class RdmaContext {
 
     int resume();
 
+    // Evict all cached endpoints so they are rebuilt with fresh QPs.
+    // Called on port recovery (IBV_EVENT_PORT_ACTIVE): QPs that entered
+    // IBV_QPS_ERR while the link was down are stale and must be torn down.
+    void evictEndpoints();
+
     enum DeviceStatus {
         DEVICE_UNINIT,
         DEVICE_DISABLED,

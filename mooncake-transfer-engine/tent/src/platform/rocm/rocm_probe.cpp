@@ -194,7 +194,7 @@ static void discoverRocmTopology(std::vector<Topology::NicEntry>& nic_list,
         }
 
         Topology::MemEntry entry;
-        entry.name = "rocm:" + std::to_string(i);
+        entry.name = makeAmdGpuLocation(i);
         entry.numa_node = numa_node;
         entry.pci_bus_id = pci_bus_id;
         entry.type = Topology::MEM_ROCM;
@@ -274,7 +274,7 @@ static inline std::string genCpuNodeName(int node) {
 }
 
 static inline std::string genRocmNodeName(int node) {
-    if (node >= 0) return "rocm:" + std::to_string(node);
+    if (node >= 0) return makeAmdGpuLocation(node);
     return kWildcardLocation;
 }
 

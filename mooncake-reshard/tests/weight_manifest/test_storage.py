@@ -12,7 +12,7 @@ from mooncake.reshard.weight.manifest import (
     SplitAxis,
 )
 from mooncake.reshard.weight.storage_manifest import (
-    StoredFragment,
+    StoredFragmentSnapshot,
     WeightManifest,
 )
 
@@ -57,7 +57,7 @@ def runtime_binding_fragment(**overrides) -> RuntimeBindingFragment:
     return RuntimeBindingFragment(**values)
 
 
-def stored_fragment(**overrides) -> StoredFragment:
+def stored_fragment(**overrides) -> StoredFragmentSnapshot:
     values = {
         "fragment_id": "stored-0",
         "tensor_id": "layers.2.experts.3.w1",
@@ -68,7 +68,7 @@ def stored_fragment(**overrides) -> StoredFragment:
         "nbytes": 64,
     }
     values.update(overrides)
-    return StoredFragment(**values)
+    return StoredFragmentSnapshot(**values)
 
 
 def test_weight_manifest_round_trip_is_stable_and_has_no_runtime_address() -> None:
@@ -117,7 +117,7 @@ def test_weight_manifest_round_trip_preserves_shard_dims() -> None:
         manifest_key=f"{group_id}/manifest",
         tensors=(tensor,),
         fragments=tuple(
-            StoredFragment(
+            StoredFragmentSnapshot(
                 fragment_id=f"stored-e{expert}-o{out_shard}",
                 tensor_id=tensor.tensor_id,
                 global_offset=(expert, out_shard * 4, 0),
@@ -161,7 +161,7 @@ def test_weight_manifest_round_trip_preserves_single_and_multi_axis_shards() -> 
         manifest_key=f"{group_id}/manifest",
         tensors=(single_axis, multi_axis_tensor),
         fragments=(
-            StoredFragment(
+            StoredFragmentSnapshot(
                 fragment_id="single-axis",
                 tensor_id=single_axis.tensor_id,
                 global_offset=(0, 0),
@@ -171,14 +171,12 @@ def test_weight_manifest_round_trip_preserves_single_and_multi_axis_shards() -> 
                 nbytes=64,
             ),
             *(
-                StoredFragment(
+                StoredFragmentSnapshot(
                     fragment_id=f"multi-e{expert}-o{out_shard}",
                     tensor_id=multi_axis_tensor.tensor_id,
                     global_offset=(expert, out_shard * 4, 0),
                     local_shape=(1, 4, 4),
-                    object_key=(
-                        f"{group_id}/payload/multi-e{expert}-o{out_shard}"
-                    ),
+                    object_key=(f"{group_id}/payload/multi-e{expert}-o{out_shard}"),
                     object_offset=0,
                     nbytes=32,
                 )
@@ -256,7 +254,9 @@ def test_weight_manifest_json_emits_single_axis_shard_dims_field() -> None:
         stored_fragment(nbytes=31),
     ],
 )
-def test_weight_manifest_rejects_invalid_fragment(fragment: StoredFragment) -> None:
+def test_weight_manifest_rejects_invalid_fragment(
+    fragment: StoredFragmentSnapshot,
+) -> None:
     with pytest.raises(ValueError):
         WeightManifest(
             namespace="default",

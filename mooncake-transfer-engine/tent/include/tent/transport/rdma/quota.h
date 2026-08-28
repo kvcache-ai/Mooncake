@@ -129,6 +129,13 @@ class DeviceSelector {
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id);
 
+    // Allocate one device for the per-slice path. Small requests do not go
+    // through the aggregate allocator, but must still honor the request
+    // priority and transport policy's device mask. Keep the three-argument
+    // overload above for source and binary compatibility.
+    Status allocate(uint64_t length, const std::string &location,
+                    int &chosen_dev_id, int priority, uint64_t device_mask);
+
     Status release(int dev_id, uint64_t length, double latency);
 
     Status getNicLoadStats(std::vector<NicLoadStats> &stats) const;

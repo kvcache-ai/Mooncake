@@ -31,6 +31,7 @@
 #include "background_worker.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
+#include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -105,6 +106,25 @@ namespace benchmarks {
 class BatchEvictBench;
 }  // namespace benchmarks
 
+// std::unordered_map/set never shrink their bucket array on erase, so a
+// container that once held millions of entries keeps its high-water bucket
+// memory (8 bytes per bucket) forever. ShrinkBucketsIfSparse rehashes a
+// container down to roughly twice its live size once the bucket array is
+// both large enough to matter and less than a quarter full. The bucket
+// floor avoids rehash churn on small containers; the 2x headroom keeps a
+// freshly shrunk container from growing again right away.
+// Rehashing invalidates iterators: callers must hold the lock guarding the
+// container and must not be iterating it.
+inline constexpr size_t kShrinkMinBucketCount = 1024;
+
+template <typename UnorderedContainer>
+void ShrinkBucketsIfSparse(UnorderedContainer& container) {
+    if (container.bucket_count() > kShrinkMinBucketCount &&
+        container.size() < container.bucket_count() / 4) {
+        container.rehash(container.size() * 2);
+    }
+}
+
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
@@ -123,6 +143,7 @@ class BatchEvictBench;
  * corresponding quota-table update. The segment mutex is released before
  * entering ShardedTenantQuotaTable, so these two locks are never nested.
  */
+
 class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
@@ -163,6 +184,7 @@ class MasterService {
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
+    [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
@@ -1051,7 +1073,6 @@ class MasterService {
               group_id(std::move(group_id_)),
               tenant_id(std::move(tenant_id_)),
               user_key(std::move(user_key_)),
-              lease_timeout(),
               soft_pin_timeout(std::move(committed_soft_pin_timeout)),
               hard_pinned(enable_hard_pin),
               replicas_(std::move(reps)) {
@@ -1079,10 +1100,10 @@ class MasterService {
         const std::string user_key;
 
         mutable SpinLock lock;
-        // Default constructor, creates a time_point representing
-        // the Clock's epoch (i.e., time_since_epoch() is zero).
-        mutable std::chrono::system_clock::time_point lease_timeout
-            GUARDED_BY(lock);  // hard lease
+        // Authoritative lease: ungrouped objects own one; grouped objects share
+        // the group's. Never null after construction.
+        mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
+            std::make_shared<Lease>();
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
                                                 // deadline
@@ -1297,32 +1318,35 @@ class MasterService {
             });
         }
 
-        // Grant an ordinary read lease with timeout as now() + ttl. Soft-pin
-        // lifetime is intentionally independent from reads.
-        void GrantReadLease(const uint64_t ttl) const {
+        // Grant a read lease at now() + ttl. Grouped objects extend the shared
+        // group TTL; a zero ttl is a no-op on a live lease (PutEnd cannot
+        // expire a live group).
+        void GrantReadLease(std::chrono::milliseconds ttl) const {
             SpinLocker locker(&lock);
-            std::chrono::system_clock::time_point now =
-                std::chrono::system_clock::now();
-            lease_timeout =
-                std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
+            lease_->GrantReadLease(ttl);
         }
 
-        bool NeedsReadLeaseRefresh(const uint64_t ttl) const {
+        // Whether the authoritative lease needs a refresh.
+        bool NeedsReadLeaseRefresh(std::chrono::milliseconds ttl) const {
             SpinLocker locker(&lock);
             const auto now = std::chrono::system_clock::now();
-            return lease_timeout <= now + std::chrono::milliseconds(ttl / 2);
+            return lease_->ExpiresAt() <= now + ttl / 2;
         }
 
-        // Check if the lease has expired
+        // Whether the authoritative lease is expired.
         bool IsLeaseExpired() const {
             SpinLocker locker(&lock);
-            return std::chrono::system_clock::now() >= lease_timeout;
+            return lease_->IsExpired(std::chrono::system_clock::now());
         }
 
-        // Check if the lease has expired
         bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const {
             SpinLocker locker(&lock);
-            return now >= lease_timeout;
+            return lease_->IsExpired(now);
+        }
+
+        // Lease deadline for the eviction census.
+        std::chrono::system_clock::time_point EvictionDeadline() const {
+            return lease_->ExpiresAt();
         }
 
         SoftPinEvaluation EvaluateSoftPin(
@@ -1570,6 +1594,7 @@ class MasterService {
         kWatermark,
         kQueueCap,
         kPushFailed,
+        kExecutionFailed,
     };
 
     struct PromotionCandidate {
@@ -1581,6 +1606,12 @@ class MasterService {
             PromotionCandidateReason::kQueueCap};
         ErrorCode last_error{ErrorCode::OK};
         uint32_t retry_count{0};
+        // Execution failures in this admission chain (AllocStart / TE-write /
+        // SSD failures reported via NotifyPromotionFailure). Propagated into
+        // PromotionTask at admission so the bound survives the candidate's
+        // consumption; reset only when a genuinely new chain starts (fresh
+        // insert with 0, e.g. after a give-up or a success).
+        uint32_t execution_failures{0};
     };
 
     // NotifyPromotionSuccess should commit, so a concurrent Put on the
@@ -1607,6 +1638,13 @@ class MasterService {
         uint64_t pending_quota_charge_bytes{0};
         std::chrono::system_clock::time_point start_time;
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
+        // Execution failures so far in this admission chain. Read by
+        // NotifyPromotionFailure before the task is erased and re-recorded as
+        // execution_failures+1 until kMaxPromotionExecutionFailures. Note the
+        // asymmetry with PromotionCandidate::execution_failures: admission
+        // copies candidate -> task verbatim, failure re-record writes
+        // task+1 -> candidate.
+        uint32_t execution_failures{0};
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -1628,17 +1666,13 @@ class MasterService {
         std::unordered_map<std::string, std::chrono::steady_clock::time_point>
             dynamic_replication_cooldowns;
 
-        std::unordered_map<std::string, std::unordered_set<std::string>>
-            group_members;  // group_id → set of keys
-
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
                    promotion_tasks.empty() && promotion_candidates.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
-                   dynamic_replication_cooldowns.empty() &&
-                   group_members.empty();
+                   dynamic_replication_cooldowns.empty();
         }
     };
 
@@ -1653,6 +1687,24 @@ class MasterService {
         long disk_object_count GUARDED_BY(mutex) = 0;
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
+
+    // Group domain: all groups in one shard. Routing stays hash(tenant, key);
+    // group state is just member keys + one shared lease, consulted at eviction
+    // (all-or-none) — the read path never touches this table.
+    struct GroupState {
+        std::unordered_set<std::string> member_keys;
+        std::shared_ptr<Lease> lease;
+
+        bool Empty() const { return member_keys.empty(); }
+    };
+
+    // Small and low-frequency (put/register + eviction), so one lock is enough.
+    struct GroupDomain {
+        mutable SharedMutex mutex;
+        // key: tenant_id.MakeScopedKey(group_id)
+        std::unordered_map<std::string, GroupState> groups GUARDED_BY(mutex);
+    };
+    GroupDomain group_domain_;
 
     class SoftPinDeadlineIndex {
        public:
@@ -1717,12 +1769,6 @@ class MasterService {
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr);
-
-    std::unordered_map<std::string, std::string> object_group_ids_
-        GUARDED_BY(group_routing_mutex_);
-    mutable std::unordered_set<std::string> groups_needing_lease_refresh_
-        GUARDED_BY(group_routing_mutex_);
-    mutable std::shared_mutex group_routing_mutex_;
 
     static constexpr size_t kObjectOperationLockStripes = 4096;
 
@@ -1801,6 +1847,41 @@ class MasterService {
         SharedMutexLocker lock_;
     };
 
+    // For accessing the group domain with read-write permission
+    class GroupDomainAccessorRW {
+       public:
+        explicit GroupDomainAccessorRW(MasterService* master_service)
+            : shard_(master_service->group_domain_), lock_(&shard_.mutex) {}
+
+        GroupDomain* operator->() { return &shard_; }
+
+        const GroupDomain* operator->() const { return &shard_; }
+
+        GroupDomain& get() { return shard_; }
+
+        const GroupDomain& get() const { return shard_; }
+
+       private:
+        GroupDomain& shard_;
+        SharedMutexLocker lock_;
+    };
+
+    // For accessing the group domain with read-only permission
+    class GroupDomainAccessorRO {
+       public:
+        explicit GroupDomainAccessorRO(const MasterService* master_service)
+            : shard_(master_service->group_domain_),
+              lock_(&shard_.mutex, shared_lock) {}
+
+        const GroupDomain* operator->() const { return &shard_; }
+
+        const GroupDomain& get() const { return shard_; }
+
+       private:
+        const GroupDomain& shard_;
+        SharedMutexLocker lock_;
+    };
+
     static ObjectIdentity MakeObjectIdentity(const std::string& user_key,
                                              TenantId tenant_id) {
         return {std::move(tenant_id), user_key};
@@ -1831,17 +1912,62 @@ class MasterService {
         return std::hash<std::string>{}(key) % kNumShards;
     }
 
-    size_t getMetadataShardIndex(const TenantId& tenant_id,
-                                 const std::string& key) const;
-    std::optional<std::string> GetGroupRoute(const TenantId& tenant_id,
-                                             const std::string& key) const;
-    void RegisterGroupMember(TenantState& tenant_state,
-                             const TenantId& tenant_id, const std::string& key,
-                             const std::string& group_id);
-    void UnregisterGroupMember(TenantState& tenant_state,
-                               const TenantId& tenant_id,
+    // Registers a member key under a group and returns the group's shared
+    // Lease (creating the group/lease on first member). Callers wire the
+    // returned lease into the object metadata so the read path can extend the
+    // group TTL without touching this table. Returns nullptr for empty
+    // group_id.
+    std::shared_ptr<Lease> RegisterGroupMember(const TenantId& tenant_id,
+                                               const std::string& key,
+                                               const std::string& group_id);
+    void UnregisterGroupMember(const TenantId& tenant_id,
                                const std::string& key,
                                const std::string& group_id);
+    // Reads the member keys registered for `group_id`; empty if unregistered.
+    std::vector<std::string> GetGroupMemberKeys(
+        const TenantId& tenant_id, const std::string& group_id) const;
+
+    // A single group member's eviction outcome, fed back by the
+    // EvictGroupOrObject callback.
+    struct EvictMemberOutcome {
+        uint64_t freed_bytes{0};
+        long evicted_objects{0};
+        bool stop_scan{false};
+        ErrorCode error{ErrorCode::OK};
+    };
+    // Aggregated outcome of a group eviction.
+    struct GroupEvictionResult {
+        uint64_t freed_bytes{0};
+        long evicted_objects{0};
+        bool stop_scan{false};
+        ErrorCode error{ErrorCode::OK};
+    };
+
+    // Evicts every member of `group_id` across its metadata shards. MUST be
+    // called WITHOUT holding any metadata shard lock: the caller releases the
+    // trigger shard lock first, so a caller-held trigger lock is never held
+    // while other shard locks are acquired (that ordering is the AB/BA
+    // cross-shard deadlock this function exists to remove). It acquires each
+    // member shard lock itself in canonical ascending shard order, so any two
+    // concurrent group evictions that touch the same shards acquire them in the
+    // same global order and cannot deadlock.
+    //
+    // Each member is re-looked-up and re-validated under its own lock (lease,
+    // hard/soft pin, evictable replica — all against `now`) because state may
+    // have changed since the caller's snapshot; members that no longer qualify
+    // are skipped without invoking the callback. `evict_one_member` therefore
+    // performs only the path-specific member eviction (oplog persist, offload,
+    // quota charge, publish) and may erase members other than `key`; the
+    // trigger `key` itself is left to the caller. Each call returns that
+    // member's contribution. Returns the aggregated outcome.
+    GroupEvictionResult EvictGroupOrObject(
+        const TenantId& tenant_id, const std::string& key,
+        const std::string& group_id, bool allow_soft_pinned,
+        std::chrono::system_clock::time_point now,
+        const std::function<EvictMemberOutcome(
+            const std::string&, ObjectMetadata&, TenantState&,
+            MetadataShardAccessorRW&)>& evict_one_member);
+
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -1908,10 +2034,11 @@ class MasterService {
         const std::string& why, const TenantId& tenant_id,
         const std::string& key, ObjectMetadata& metadata,
         const StaleHandleCleanupPlan& plan);
-    void RebuildGroupRoutingIndex();
-    void GrantLeaseForGroup(const TenantState& tenant_state,
-                            const std::string& key,
-                            const ObjectMetadata& metadata) const;
+    void RebuildGroupState();
+    // Post-restore migration: re-route every object to its hash(tenant, key)
+    // shard, fixing snapshots that placed grouped objects on hash(group_id)
+    // shards. No-op for correctly-routed snapshots.
+    void ReRouteRestoredObjectsByKey();
     static void ApplySoftPinMetricDelta(int metric_delta);
     size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
     void ApplySoftPinEvaluation(
@@ -2035,7 +2162,8 @@ class MasterService {
     void RecordOrUpdateCandidate(TenantState& tenant_state,
                                  const std::string& key, uint8_t sketch_score,
                                  PromotionCandidateReason reason,
-                                 ErrorCode last_error);
+                                 ErrorCode last_error,
+                                 uint32_t execution_failures = 0);
     void EraseCandidate(TenantState& tenant_state, const std::string& key);
     void EraseCandidate(const ObjectIdentity& object_id);
     void DecrementCandidateCount();
@@ -2113,8 +2241,8 @@ class MasterService {
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
             : service_(service),
               object_id_(std::move(object_id)),
-              shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
-                                                         object_id_.user_key)),
+              shard_idx_(service_->getShardIndex(object_id_.tenant_id,
+                                                 object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
               tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
               tenant_state_(tenant_it_ == shard_guard_->tenants.end()
@@ -2349,8 +2477,8 @@ class MasterService {
                            ObjectIdentity object_id)
             : service_(service),
               object_id_(std::move(object_id)),
-              shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
-                                                         object_id_.user_key)),
+              shard_idx_(service_->getShardIndex(object_id_.tenant_id,
+                                                 object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
               tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
               tenant_state_(tenant_it_ == shard_guard_->tenants.end()
@@ -2483,14 +2611,29 @@ class MasterService {
     std::atomic<uint64_t> promotion_candidate_count_{0};
     std::atomic<size_t> promotion_retry_cursor_{0};
     static constexpr size_t kPromotionCandidateLimit = 50000;
-    static constexpr uint32_t kPromotionCandidateMaxRetries = 8;
+    // Retry budget is sized to the condition it waits on: the watermark /
+    // queue-cap / push-failure gates clear on the client's offload heartbeat
+    // (10s-scale), not in milliseconds. The old budget (8 retries ≈ 2.3s)
+    // expired candidates long before their condition could clear, silently
+    // killing promotions whose only trigger was a one-off read. 64 retries
+    // with a 5s backoff cap spans ~5 minutes (≈ 30 heartbeat ticks); the TTL
+    // bounds how long an unread key can keep a slot.
+    static constexpr uint32_t kPromotionCandidateMaxRetries = 64;
     static constexpr size_t kPromotionRetryBatchSize = 128;
     static constexpr size_t kPromotionRetryShardBatch = 64;
-    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{60000};
+    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{300000};
     static constexpr std::chrono::milliseconds
         kPromotionCandidateInitialBackoff{10};
     static constexpr std::chrono::milliseconds kPromotionCandidateMaxBackoff{
-        1000};
+        5000};
+    // Bound on self-sustaining execution-failure cycles: a key whose
+    // promotion keeps failing at execution time (AllocStart under DRAM
+    // pressure, TE-write flake, SSD error) is re-recorded at most this many
+    // times. Bounds a persistently-failing ("poison") key to this many
+    // delivery slots (~this many heartbeat ticks, ~30s at the 10s default)
+    // before it stops re-queueing itself; genuine reads can still re-admit
+    // it afterwards with a fresh count.
+    static constexpr uint32_t kMaxPromotionExecutionFailures = 3;
 
     // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
     // true. CountMinSketch is mutex-protected internally so we can call into it

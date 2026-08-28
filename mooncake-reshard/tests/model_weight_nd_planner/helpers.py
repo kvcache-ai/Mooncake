@@ -223,8 +223,10 @@ def assert_plan_copies_logical_contents(
         }
         for runtime_fragment in binding.fragments:
             placement_fragment = placement_by_id[runtime_fragment.placement_fragment_id]
-            source_payloads[placement_fragment.placement_fragment_id] = fragment_payload(
-                descriptors[placement_fragment.tensor_id], placement_fragment
+            source_payloads[placement_fragment.placement_fragment_id] = (
+                fragment_payload(
+                    descriptors[placement_fragment.tensor_id], placement_fragment
+                )
             )
 
     target_payloads = {}
@@ -242,9 +244,9 @@ def assert_plan_copies_logical_contents(
             target_payloads[placement_fragment.placement_fragment_id] = bytearray(
                 runtime_fragment.nbytes
             )
-            target_placements_by_fragment_id[placement_fragment.placement_fragment_id] = (
-                placement_fragment
-            )
+            target_placements_by_fragment_id[
+                placement_fragment.placement_fragment_id
+            ] = placement_fragment
 
     for operation in plan.operations:
         source = source_payloads[operation.source.placement_fragment_id]

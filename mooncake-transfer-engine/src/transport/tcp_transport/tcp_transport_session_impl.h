@@ -55,12 +55,31 @@ struct SessionHeader {
 // Callers must call cudaSetDevice before any cudaMemcpy to avoid implicit
 // GPU 0 context creation.
 static int getCudaDeviceId(void* addr) {
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    recordStagingDeviceQueryForTest();
+#endif
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, addr);
     if (status != cudaSuccess) return -1;
     if (attributes.type == cudaMemoryTypeDevice) return attributes.device;
     return -1;
 }
+
+class TcpStagingBuffer {
+   public:
+    char* ensure(size_t size) {
+        if (buffer_.size() < size) {
+            buffer_.resize(size);
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+            recordStagingBufferAllocationForTest();
+#endif
+        }
+        return buffer_.data();
+    }
+
+   private:
+    std::vector<char> buffer_;
+};
 
 #ifdef USE_MACA
 static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
@@ -137,6 +156,12 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     char* local_buffer_;
     bool v2_ = false;
     uint64_t status_frame_;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+    int cuda_device_ = -1;
+    TcpStagingBuffer staging_buffer_;
+#endif
 
     void start() {
         total_transferred_bytes_ = 0;
@@ -191,6 +216,11 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                     if (v2_) sendStatus(kStatusAddrRejected, nullptr);
                     return;
                 }
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                cuda_device_ = getCudaDeviceId(local_buffer_);
+#endif
                 if (opcode == (uint8_t)TransferRequest::WRITE) {
                     readBody();
                 } else if (v2_) {
@@ -216,15 +246,13 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
-        int cuda_device = -1;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDeviceId(addr);
-        if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
-            cudaSetDevice(cuda_device);
+        if (cuda_device_ >= 0) {
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+            cudaSetDevice(cuda_device_);
 #ifdef USE_MACA
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
@@ -237,7 +265,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 LOG(ERROR) << "ServerSession::writeBody failed to copy from "
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
-                delete[] dram_buffer;
                 return;  // Connection will be closed
             }
         }
@@ -245,15 +272,8 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
-                const asio::error_code& ec, std::size_t transferred_bytes) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
-                if (cuda_device >= 0) {
-                    delete[] dram_buffer;
-                }
-#endif
+            [this, addr, dram_buffer, self](const asio::error_code& ec,
+                                            std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
                         << "ServerSession::writeBody failed. "
@@ -289,21 +309,19 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
-        int cuda_device = -1;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDeviceId(addr);
-        if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
+        if (cuda_device_ >= 0) {
+            dram_buffer = staging_buffer_.ensure(buffer_size);
         }
 #endif
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
-                const asio::error_code& ec, std::size_t transferred_bytes) {
+            [this, addr, dram_buffer, self](const asio::error_code& ec,
+                                            std::size_t transferred_bytes) {
                 if (ec) {
                     // If client closed connection (EOF), this is normal - don't
                     // log
@@ -316,15 +334,14 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << ". Error: " << ec.message()
                             << " (value: " << ec.value() << ")";
                     }
-                    if (cuda_device >= 0) delete[] dram_buffer;
                     return;  // Connection will be closed
                 }
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (cuda_device >= 0) {
-                    cudaSetDevice(cuda_device);
+                if (cuda_device_ >= 0) {
+                    cudaSetDevice(cuda_device_);
 #ifdef USE_MACA
                     cudaError_t cuda_status =
                         copyTcpCudaMemory(addr + total_transferred_bytes_,
@@ -339,10 +356,8 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << "ServerSession::readBody failed to copy to CUDA "
                                "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
-                        delete[] dram_buffer;
                         return;  // Connection will be closed
                     }
-                    delete[] dram_buffer;
                 }
 #endif
                 total_transferred_bytes_ += transferred_bytes;
@@ -368,6 +383,12 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     char* local_buffer_;
     bool v2_;
     uint64_t status_frame_;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+    int cuda_device_ = -1;
+    TcpStagingBuffer staging_buffer_;
+#endif
     // v2 WRITE runs the body stream and the ack read concurrently (one
     // async op per direction; handlers serialize on the io thread). The
     // concurrent read lets a rejection — or a v1 server's bogus payload —
@@ -401,12 +422,32 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     }
     std::optional<asio::steady_timer> status_timer_;
     bool status_deadline_disarmed_ = false;
+    // Unlike the status-frame deadline above, this is a sliding liveness
+    // deadline for the whole request. It is refreshed only after an Asio
+    // completion reports actual protocol or payload progress.
+    static int progressTimeoutSec() {
+        const char* env = std::getenv("MC_TCP_PROGRESS_TIMEOUT_SEC");
+        if (env) {
+            int v = std::atoi(env);
+            if (v > 0) return v;
+        }
+        return 30;
+    }
+    std::optional<asio::steady_timer> progress_timer_;
+    uint64_t progress_epoch_ = 0;
+    bool progress_deadline_disarmed_ = true;
+    bool progress_timeout_committed_ = false;
     bool terminal_reported_ = false;
     OnTerminal on_terminal_;
 
     void initiate(void* buffer, uint64_t dest_addr, size_t size,
                   TransferRequest::OpCode opcode) {
         local_buffer_ = (char*)buffer;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+        cuda_device_ = getCudaDeviceId(local_buffer_);
+#endif
         header_.addr = htole64(dest_addr);
         header_.size = htole64(size);
         header_.opcode = (uint8_t)opcode | (v2_ ? kOpcodeV2Flag : 0);
@@ -416,6 +457,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
     void cancel() noexcept {
         cancelStatusDeadline();
+        cancelProgressDeadline();
         if (!socket_) return;
         asio::error_code cancel_ec;
         socket_->cancel(cancel_ec);
@@ -424,10 +466,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     }
 
    private:
-    // All handlers run on the transport's single io thread, so arm/cancel
-    // and the expiry handler never race. Expiry only closes the socket: the
-    // pending status read then completes with an error and its handler owns
-    // the failure path (including source-buffer quiescence for WRITE).
+    // The status-frame deadline is separate from the sliding progress
+    // deadline below. Its expiry closes the socket, but a status completion
+    // already ready in the executor queue retains its original result; the
+    // status handler still owns the terminal path.
     void armStatusDeadline() {
         auto self(shared_from_this());
         status_deadline_disarmed_ = false;
@@ -461,6 +503,83 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         }
     }
 
+    void refreshProgressDeadline() {
+        if (terminal_reported_ || progress_timeout_committed_) return;
+        auto self(shared_from_this());
+        progress_deadline_disarmed_ = false;
+        ++progress_epoch_;
+        if (progress_epoch_ == 0) ++progress_epoch_;
+        const uint64_t progress_epoch = progress_epoch_;
+        if (!progress_timer_) progress_timer_.emplace(socket_->get_executor());
+        progress_timer_->expires_after(
+            std::chrono::seconds(progressTimeoutSec()));
+        progress_timer_->async_wait(
+            [this, self, progress_epoch](const asio::error_code& ec) {
+                handleProgressDeadline(progress_epoch, ec);
+            });
+    }
+
+    void handleProgressDeadline(uint64_t progress_epoch,
+                                const asio::error_code& ec) {
+        if (ec == asio::error::operation_aborted ||
+            progress_deadline_disarmed_ || terminal_reported_ ||
+            progress_epoch != progress_epoch_) {
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+            (void)invokeSessionProgressHook(kSessionTimeoutStale, false);
+#endif
+            return;
+        }
+        progress_timeout_committed_ = true;
+        progress_deadline_disarmed_ = true;
+        ++progress_epoch_;
+        if (progress_epoch_ == 0) ++progress_epoch_;
+        if ((header_.opcode & ~kOpcodeV2Flag) ==
+            static_cast<uint8_t>(TransferRequest::WRITE)) {
+            write_abort_requested_ = true;
+        }
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+        (void)invokeSessionProgressHook(kSessionTimeoutCommitted,
+                                        write_body_in_flight_);
+#endif
+        LOG(ERROR) << "ClientSession: no transfer progress within "
+                   << progressTimeoutSec() << "s; dropping connection";
+        if (socket_ && socket_->is_open()) {
+            asio::error_code cancel_ec;
+            socket_->cancel(cancel_ec);
+            asio::error_code close_ec;
+            socket_->close(close_ec);
+        }
+    }
+
+    bool acceptProgress() {
+        if (progress_timeout_committed_) return false;
+        refreshProgressDeadline();
+        return !progress_timeout_committed_;
+    }
+
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    bool acceptProgressForTest(int event) {
+        const uint64_t previous_epoch = progress_epoch_;
+        const int action = invokeSessionProgressHook(event, false);
+        if (action == kSessionCommitTimeoutBeforeProgress)
+            handleProgressDeadline(previous_epoch, asio::error_code{});
+        if (!acceptProgress()) return false;
+        if (action == kSessionReplayPreviousTimeoutAfterProgress)
+            handleProgressDeadline(previous_epoch, asio::error_code{});
+        return !progress_timeout_committed_;
+    }
+#endif
+
+    void cancelProgressDeadline() {
+        progress_deadline_disarmed_ = true;
+        ++progress_epoch_;
+        if (progress_epoch_ == 0) ++progress_epoch_;
+        if (progress_timer_) {
+            asio::error_code ec;
+            progress_timer_->cancel(ec);
+        }
+    }
+
     // Single terminal path. The invoking Asio operation has already released
     // its buffer before entering its completion handler. The lane posts any
     // follow-up pump, so a clean socket cannot be reused inline here.
@@ -468,6 +587,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         if (terminal_reported_) return;
         terminal_reported_ = true;
         cancelStatusDeadline();
+        cancelProgressDeadline();
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+        (void)invokeSessionProgressHook(kSessionTerminal, clean);
+#endif
         auto on_terminal = std::move(on_terminal_);
         if (on_terminal) on_terminal(status, clean);
     }
@@ -497,6 +620,15 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
+                if (!acceptProgress()) {
+                    if ((header_.opcode & ~kOpcodeV2Flag) ==
+                        static_cast<uint8_t>(TransferRequest::WRITE)) {
+                        abortWrite();
+                    } else {
+                        finalize(TransferStatusEnum::FAILED, false);
+                    }
+                    return;
+                }
                 if ((header_.opcode & ~kOpcodeV2Flag) ==
                     (uint8_t)TransferRequest::WRITE) {
                     if (v2_) readWriteAck();  // concurrent with the body
@@ -507,6 +639,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     readBody();
                 }
             });
+        // Asio does not invoke the completion handler inline. Arm only after
+        // initiation succeeds so a synchronous initiation exception cannot
+        // leave a timer handler retaining this otherwise-abandoned session.
+        refreshProgressDeadline();
     }
 
     // v2 READ: the server prefixes the data with a status frame.
@@ -522,6 +658,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << "ClientSession: failed to read READ status "
                            "frame. Error: "
                         << ec.message() << " (value: " << ec.value() << ")";
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+                if (!acceptProgress()) {
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
@@ -569,6 +709,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     abortWrite();
                     return;
                 }
+                bool progress_accepted = false;
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+                progress_accepted =
+                    acceptProgressForTest(kSessionWriteAckSuccess);
+#else
+                progress_accepted = acceptProgress();
+#endif
+                if (!progress_accepted) {
+                    abortWrite();
+                    return;
+                }
                 uint64_t frame = le64toh(status_frame_);
                 if (!statusFrameValid(frame)) {
                     LOG(ERROR) << "ClientSession: malformed WRITE ack frame "
@@ -609,21 +760,19 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
-        int cuda_device = -1;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDeviceId(addr);
-        if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
+        if (cuda_device_ >= 0) {
+            dram_buffer = staging_buffer_.ensure(buffer_size);
         }
 #endif
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
-                const asio::error_code& ec, std::size_t transferred_bytes) {
+            [this, addr, dram_buffer, self](const asio::error_code& ec,
+                                            std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
                         << "ClientSession::readBody failed. "
@@ -631,11 +780,20 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
-                    if (cuda_device >= 0) delete[] dram_buffer;
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+
+                bool progress_accepted = !progress_timeout_committed_;
+                if (progress_accepted && transferred_bytes > 0) {
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+                    progress_accepted =
+                        acceptProgressForTest(kSessionReadBodySuccess);
+#else
+                    progress_accepted = acceptProgress();
 #endif
+                }
+                if (!progress_accepted) {
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
@@ -643,8 +801,8 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (cuda_device >= 0) {
-                    cudaSetDevice(cuda_device);
+                if (cuda_device_ >= 0) {
+                    cudaSetDevice(cuda_device_);
 #ifdef USE_MACA
                     cudaError_t cuda_status =
                         copyTcpCudaMemory(addr + total_transferred_bytes_,
@@ -659,11 +817,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                             << "ClientSession::readBody failed to copy to CUDA "
                                "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
-                        delete[] dram_buffer;
                         finalize(TransferStatusEnum::FAILED, false);
                         return;
                     }
-                    delete[] dram_buffer;
                 }
 #endif
                 total_transferred_bytes_ += transferred_bytes;
@@ -705,15 +861,13 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
-        int cuda_device = -1;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDeviceId(addr);
-        if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
-            cudaSetDevice(cuda_device);
+        if (cuda_device_ >= 0) {
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+            cudaSetDevice(cuda_device_);
 #ifdef USE_MACA
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
@@ -726,7 +880,6 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
-                delete[] dram_buffer;
                 abortWrite();
                 return;
             }
@@ -736,12 +889,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         write_body_in_flight_ = true;
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
-                const asio::error_code& ec, std::size_t transferred_bytes) {
+            [this, addr, dram_buffer, self](const asio::error_code& ec,
+                                            std::size_t transferred_bytes) {
                 write_body_in_flight_ = false;
-                if (cuda_device >= 0) {
-                    delete[] dram_buffer;
-                }
                 if (ec) {
                     LOG(ERROR)
                         << "ClientSession::writeBody failed. "
@@ -753,9 +903,14 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     return;
                 }
                 if (write_abort_requested_) {
-                    // The early ack path closed the socket while this
-                    // operation still owned the caller's source buffer. It is
-                    // safe to publish failure now that the handler has run.
+                    // An early ACK failure or a committed progress timeout
+                    // closed the socket while this operation still owned the
+                    // caller's source buffer. It is safe to publish failure
+                    // now that the handler has run.
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+                if (transferred_bytes > 0 && !acceptProgress()) {
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }

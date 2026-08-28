@@ -212,6 +212,7 @@ class RdmaEndPoint {
 
     RWSpinlock lock_;
     std::vector<ibv_qp *> qp_list_;
+    uint64_t qp_generation_;
 
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;

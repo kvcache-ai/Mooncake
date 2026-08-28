@@ -25,7 +25,7 @@ namespace tent {
 Status RocmPlatform::allocate(void** pptr, size_t size,
                               MemoryOptions& options) {
     LocationParser location(options.location);
-    if (location.type() == "rocm") {
+    if (isAmdGpuLocationType(location.type())) {
         int hip_dev = 0;
         CHECK_HIP(hipGetDevice(&hip_dev));
         CHECK_HIP(hipSetDevice(location.index()));

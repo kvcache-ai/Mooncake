@@ -237,16 +237,6 @@ Status Topology::parse(const std::string& json_content) {
 
 namespace {
 
-Topology::MemType memTypeFromLocation(const std::string& location) {
-    LocationParser parser(location);
-    const auto type = parser.type();
-    if (type == "cpu") return Topology::MEM_HOST;
-    if (type == "cuda" || type == "gpu") return Topology::MEM_CUDA;
-    if (type == "rocm") return Topology::MEM_ROCM;
-    if (type == "ascend") return Topology::MEM_ASCEND;
-    return Topology::MEM_UNKNOWN;
-}
-
 Topology::NicID ensureNic(
     Topology& topo, const std::string& name,
     std::unordered_map<std::string, Topology::NicID>* ids) {
@@ -281,6 +271,9 @@ Status Topology::parsePriorityMatrix(const std::string& json_content) {
         std::vector<NicID> all_avail;
         std::unordered_set<NicID> seen_preferred;
         std::unordered_set<NicID> seen_avail;
+        // Canonical mem names, to reject configs that specify the same
+        // device twice via the "rocm:N" alias and the canonical "hip:N".
+        std::unordered_set<std::string> seen_mem_names;
 
         for (auto it = root.begin(); it != root.end(); ++it) {
             const auto& value = it.value();
@@ -292,7 +285,15 @@ Status Topology::parsePriorityMatrix(const std::string& json_content) {
             }
 
             MemEntry mem;
-            mem.name = it.key();
+            // Store canonical names: a legacy "rocm:N" key becomes "hip:N"
+            // so runtime lookups with canonical names match.
+            mem.name = canonicalizeLocation(it.key());
+            if (!seen_mem_names.insert(mem.name).second) {
+                return Status::MalformedJson(
+                    "duplicate location key \"" + mem.name +
+                    "\" (the rocm:N alias and hip:N key refer to the same "
+                    "device)" LOC_MARK);
+            }
             mem.pci_bus_id = "";
             mem.type = memTypeFromLocation(mem.name);
             mem.numa_node = -1;
@@ -431,8 +432,9 @@ const Topology::NicEntry* Topology::getNicEntry(const std::string& name) const {
 }
 
 const Topology::MemEntry* Topology::getMemEntry(const std::string& name) const {
+    const auto canonical = canonicalizeLocation(name);
     for (size_t i = 0; i < mem_list_.size(); ++i) {
-        if (mem_list_[i].name == name) return &mem_list_[i];
+        if (mem_list_[i].name == canonical) return &mem_list_[i];
     }
     return nullptr;
 }
@@ -445,8 +447,9 @@ Topology::NicID Topology::getNicId(const std::string& name) const {
 }
 
 Topology::MemID Topology::getMemId(const std::string& name) const {
+    const auto canonical = canonicalizeLocation(name);
     for (size_t i = 0; i < mem_list_.size(); ++i) {
-        if (mem_list_[i].name == name) return (MemID)i;
+        if (mem_list_[i].name == canonical) return (MemID)i;
     }
     return -1;
 }

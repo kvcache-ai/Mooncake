@@ -99,6 +99,8 @@ class NVLinkTransport : public Transport {
 
     Status setPeerAccess();
 
+    friend class NVLinkTransportTestPeer;
+
    private:
     bool installed_;
     std::string local_segment_name_;

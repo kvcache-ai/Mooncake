@@ -43,6 +43,28 @@ cudaStream_t create_comm_stream() {
     return stream;
 }
 
+bool stream_is_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    auto error = cudaStreamIsCapturing(stream, &status);
+    if (error != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return status != cudaStreamCaptureStatusNone;
+}
+
+constexpr int kTopkShadowMaxTokens = 1024;
+constexpr int kTopkShadowMaxTopk = 32;
+constexpr int kTopkShadowSlots = 8;
+constexpr size_t kTopkShadowBytes = static_cast<size_t>(kTopkShadowMaxTokens) *
+                                    kTopkShadowMaxTopk * sizeof(int64_t);
+
+int64_t* topk_shadow(void* workspace, int shadow_slot, int num_experts) {
+    auto* base = reinterpret_cast<uint8_t*>(workspace) +
+                 2 * static_cast<size_t>(num_experts) * sizeof(int);
+    return reinterpret_cast<int64_t*>(base + shadow_slot * kTopkShadowBytes);
+}
+
 }  // namespace
 
 // Initialize an RDMA transport: register memory, allocate control buffer,
@@ -208,6 +230,10 @@ MooncakeEpBuffer::dispatch(
     auto num_scales = hidden / 128;
     int num_local_experts = num_experts / num_ranks;
 
+    auto compute_stream_raw =
+        reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    const bool graph_capture = stream_is_capturing(compute_stream_raw);
+
     // Buffer control
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
@@ -216,15 +242,24 @@ MooncakeEpBuffer::dispatch(
     auto buffer = layout.buffers[current_buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
     int phase_epoch = ++phase_epochs[current_buffer_idx];
+    int shadow_slot;
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex);
+        auto [it, inserted] = dispatch_shadow_slots.emplace(
+            packed_recv_src_info_ptr, next_shadow_slot);
+        if (inserted)
+            next_shadow_slot = (next_shadow_slot + 1) % kTopkShadowSlots;
+        shadow_slot = it->second;
+    }
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream, whose native
     // handle is allowed to be nullptr in CUDA/PyTorch.
-    auto compute_stream_raw =
-        reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    auto launch_stream = return_recv_hook ? compute_stream_raw : comm_stream;
+    auto launch_stream =
+        (return_recv_hook || graph_capture) ? compute_stream_raw : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream_raw);
+    if (not return_recv_hook and not graph_capture)
+        stream_wait(launch_stream, compute_stream_raw);
 
     // Allocate packed tensors
     void* x = reinterpret_cast<void*>(x_ptr);
@@ -248,6 +283,13 @@ MooncakeEpBuffer::dispatch(
                            0 and
                        "TMA requires the number of tokens to be multiple of 4");
         EP_HOST_ASSERT(packed_recv_x_scales != nullptr);
+    }
+    EP_HOST_ASSERT(num_topk <= kTopkShadowMaxTopk);
+    if (num_tokens > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            topk_shadow(workspace, shadow_slot, num_experts), topk_idx,
+            static_cast<size_t>(num_tokens) * num_topk * sizeof(int64_t),
+            cudaMemcpyDeviceToDevice, launch_stream));
     }
 
     int64_t timeout_ticks =
@@ -300,9 +342,12 @@ MooncakeEpBuffer::dispatch(
             num_ranks, use_fp8, workspace, launch_stream, timeout_ticks, phases,
             active_qps_per_rank);
     };
-    if (return_recv_hook) {
+    if (return_recv_hook &&
+        (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_send_done();
+    } else if (graph_capture) {
+        launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
     } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -322,7 +367,7 @@ MooncakeEpBuffer::dispatch(
         event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
     } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
         event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
-    } else if (not return_recv_hook) {
+    } else if (not return_recv_hook and not graph_capture) {
         stream_wait(compute_stream_raw, launch_stream);
     }
 
@@ -330,6 +375,7 @@ MooncakeEpBuffer::dispatch(
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() {
+            if (graph_capture && macaHostPhaseFenceCoversPeers()) return;
             if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
@@ -366,10 +412,23 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     EP_HOST_ASSERT(active_ranks != nullptr);
     EP_HOST_ASSERT(num_combined_tokens == 0 || combined_x != nullptr);
 
-    // Buffer control
+    auto compute_stream_raw =
+        reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    const bool graph_capture = stream_is_capturing(compute_stream_raw);
+
+    // Buffer control.  The metadata tensor is the opaque handle returned by
+    // dispatch through the Python wrapper, so use it to pair this combine
+    // with the dispatch that produced it.  A process-wide flip is incorrect
+    // when TBO interleaves its two logical dispatchers on one native Buffer.
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
     EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
+    int shadow_slot = 0;
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex);
+        auto it = dispatch_shadow_slots.find(src_info_ptr);
+        if (it != dispatch_shadow_slots.end()) shadow_slot = it->second;
+    }
     int current_buffer_idx = buffer_idx;
     auto buffer = layout.buffers[current_buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
@@ -378,11 +437,11 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream, whose native
     // handle is allowed to be nullptr in CUDA/PyTorch.
-    auto compute_stream_raw =
-        reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    auto launch_stream = return_recv_hook ? compute_stream_raw : comm_stream;
+    auto launch_stream =
+        (return_recv_hook || graph_capture) ? compute_stream_raw : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream_raw);
+    if (not return_recv_hook and not graph_capture)
+        stream_wait(launch_stream, compute_stream_raw);
 
     int64_t timeout_ticks =
         timeout_us == -1 ? -1
@@ -424,20 +483,25 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
 
     // Kernel launch
     auto launcher = [=](int phases) {
+        auto* kernel_topk_idx =
+            topk_shadow(workspace, shadow_slot, num_experts);
         mooncake::combine(
             combined_x, active_ranks, gdr_buffer,
             buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
             buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, nullptr,
             nullptr, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr, nvlink_avail,
-            ipc_ptrs, x, topk_idx, topk_weights, src_info, layout_range,
+            ipc_ptrs, x, kernel_topk_idx, topk_weights, src_info, layout_range,
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
             zero_copy, active_qps_per_rank);
     };
-    if (return_recv_hook) {
+    if (return_recv_hook &&
+        (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
         launcher(LOW_LATENCY_SEND_PHASE);
         mark_send_done();
+    } else if (graph_capture) {
+        launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
     } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -457,7 +521,7 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
         event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
     } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
         event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
-    } else if (not return_recv_hook) {
+    } else if (not return_recv_hook and not graph_capture) {
         stream_wait(compute_stream_raw, launch_stream);
     }
 
@@ -465,6 +529,7 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() {
+            if (graph_capture && macaHostPhaseFenceCoversPeers()) return;
             if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };

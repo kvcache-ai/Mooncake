@@ -85,6 +85,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    config/file_storage_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -179,7 +180,10 @@ int main() {
     set(MOONCAKE_HAVE_NVME_URING_CMD ON)
     message(STATUS "io_uring: NVMe uring command support enabled")
   else()
-    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+    message(
+      STATUS
+        "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled"
+    )
   endif()
 endif()
 

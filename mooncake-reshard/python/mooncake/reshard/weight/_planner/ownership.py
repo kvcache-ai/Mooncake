@@ -79,9 +79,7 @@ def complete_dp_owned_source_owners(
             for owner, fragments in fragments_by_owner.items()
             if _fragments_fully_cover_tensor(tensor, fragments)
         )
-        if len(complete_owners) != 1 or len(complete_owners) != len(
-            fragments_by_owner
-        ):
+        if len(complete_owners) != 1 or len(complete_owners) != len(fragments_by_owner):
             if not complete_owners:
                 raise ValueError(
                     "DP-owned source tensor has no complete declared owner: "

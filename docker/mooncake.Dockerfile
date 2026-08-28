@@ -49,7 +49,7 @@ RUN apt-get update && \
 WORKDIR /workspace
 COPY . /workspace
 
-# Install Mooncake dependencies (yalantinglibs, Go, etc.)
+# Install Mooncake dependencies (submodules, Go, etc.)
 RUN bash dependencies.sh -y
 
 # Configure and build the wheel in one layer, then remove build/ only after

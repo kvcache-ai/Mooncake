@@ -187,6 +187,8 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
+
     tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
     ListTenantQuotaSnapshots();
     tl::expected<TenantQuotaSnapshot, ErrorCode> GetTenantQuotaSnapshot(

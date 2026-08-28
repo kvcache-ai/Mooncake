@@ -29,6 +29,9 @@ class LocalSsdTaskMailbox {
     ErrorCode EnqueuePromotion(PromotionTaskItem task);
     std::vector<PromotionTaskItem> TakePromotions(size_t max_items);
     bool RemovePromotion(const TenantId& tenant_id, std::string_view key);
+    // Re-mark a queued promotion as most-recently-touched. No-op (returns
+    // false) when the key is not queued, e.g. already taken by a heartbeat.
+    bool TouchPromotion(const TenantId& tenant_id, std::string_view key);
 
     void RequestRemoveAll();
     bool ConsumeRemoveAll();
@@ -38,8 +41,17 @@ class LocalSsdTaskMailbox {
     bool enable_offloading_ GUARDED_BY(mutex_);
     std::unordered_map<std::string, OffloadTaskItem> pending_offloads_
         GUARDED_BY(mutex_);
-    std::unordered_map<std::string, PromotionTaskItem> pending_promotions_
+    // Dedup map + recency order. seq is monotone; enqueue, a duplicate
+    // enqueue, and TouchPromotion all re-mark the entry with a fresh seq, so
+    // TakePromotions can deliver the most-recently-touched key first instead
+    // of an arbitrary (hash-order) one.
+    struct PromotionEntry {
+        PromotionTaskItem task;
+        uint64_t seq;
+    };
+    std::unordered_map<std::string, PromotionEntry> pending_promotions_
         GUARDED_BY(mutex_);
+    uint64_t promotion_seq_ GUARDED_BY(mutex_){0};
     bool pending_remove_all_ GUARDED_BY(mutex_){false};
 
     friend class LocalSsdManager;
@@ -83,6 +95,8 @@ class LocalSsdManager {
         const UUID& client_id, size_t max_items);
     bool RemovePromotion(const UUID& client_id, const TenantId& tenant_id,
                          std::string_view key);
+    bool TouchPromotion(const UUID& client_id, const TenantId& tenant_id,
+                        std::string_view key);
 
     void RequestRemoveAll();
     void RequestRemoveAll(const std::vector<UUID>& clients);

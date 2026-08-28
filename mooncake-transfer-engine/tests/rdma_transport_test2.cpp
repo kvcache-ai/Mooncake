@@ -243,8 +243,6 @@ TEST_F(RDMATransportTest, MultipleRead) {
                      kDataLength);
         ASSERT_EQ(ret, 0);
     }
-    engine->unregisterLocalMemory(addr);
-    freeMemoryPool(addr, ram_buffer_size);
 }
 
 }  // namespace mooncake

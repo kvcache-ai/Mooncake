@@ -292,8 +292,15 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
 
 Status DeviceSelector::allocate(uint64_t length, const std::string& location,
                                 int& chosen_dev_id) {
+    return allocate(length, location, chosen_dev_id, PRIO_HIGH, ~0ULL);
+}
+
+Status DeviceSelector::allocate(uint64_t length, const std::string& location,
+                                int& chosen_dev_id, int priority,
+                                uint64_t device_mask) {
     std::vector<int> slice_dev_ids;
-    Status status = allocate(length, 1, length, location, slice_dev_ids, ~0ULL);
+    Status status = allocate(length, 1, length, location, slice_dev_ids,
+                             priority, device_mask);
     if (!status.ok()) return status;
     if (slice_dev_ids.empty()) {
         return Status::DeviceNotFound("allocation failed");

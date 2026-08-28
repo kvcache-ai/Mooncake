@@ -13,7 +13,7 @@ from ...contracts import (
 )
 from ...geometry import boxes_exactly_cover
 from ..placement import WeightPlacementManifest
-from ..storage_manifest import StoredFragment, WeightManifest
+from ..storage_manifest import StoredFragmentSnapshot, WeightManifest
 from ..types import ParallelRank, PlacementFragment, TensorDescriptor
 from . import geometry
 from .contracts import (
@@ -169,7 +169,7 @@ def _plan_transfer(
     stored_source_fragments = tuple(
         fragment
         for fragment in source_fragments
-        if isinstance(fragment, StoredFragment)
+        if isinstance(fragment, StoredFragmentSnapshot)
     )
     if (
         len(placement_source_fragments) + len(stored_source_fragments)
@@ -186,9 +186,7 @@ def _plan_transfer(
         else {}
     )
     source_dp_owners = (
-        complete_dp_owned_source_owners(
-            source_tensors, placement_source_fragments
-        )
+        complete_dp_owned_source_owners(source_tensors, placement_source_fragments)
         if parallel_sources
         else {}
     )

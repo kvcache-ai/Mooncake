@@ -23,10 +23,12 @@ def using_musa_backend() -> bool:
 
 
 def using_maca_backend() -> bool:
-    return (
-        os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
-        or bool(getattr(torch.version, "maca", None))
-    )
+    return os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
+        "1",
+        "ON",
+        "TRUE",
+        "YES",
+    } or bool(getattr(torch.version, "maca", None))
 
 
 def import_torchada_if_needed():
@@ -65,9 +67,9 @@ def run_test_iteration(
     disable_p2p: bool = False,
     buf: Buffer = None,
 ):
-    assert not (async_finish and return_recv_hook), (
-        "Should be filtered out by generate_tests."
-    )
+    assert not (
+        async_finish and return_recv_hook
+    ), "Should be filtered out by generate_tests."
 
     torch.manual_seed(2026 + rank)
     scale = 1.0 - 0.05 * (rank / num_ranks)
@@ -356,9 +358,9 @@ def run_stale_data_test(
     event.current_stream_wait()
     torch.cuda.synchronize()
 
-    assert active_ranks[fail_rank].item() == 0, (
-        f"[Rank {rank}] active_ranks[{fail_rank}] should be 0 after timeout"
-    )
+    assert (
+        active_ranks[fail_rank].item() == 0
+    ), f"[Rank {rank}] active_ranks[{fail_rank}] should be 0 after timeout"
     assert not torch.isnan(combined_x).any().item()
     testing.assert_close(
         combined_x,

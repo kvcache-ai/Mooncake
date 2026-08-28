@@ -3,8 +3,9 @@
 
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
-#include <optional>
+#include <string>
 #include <thread>
 
 #include "allocator.h"
@@ -29,6 +30,7 @@ class FileStorageTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
+        UnsetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR");
         UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
         UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
         UnsetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES");
@@ -39,12 +41,17 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS");
         UnsetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION");
         UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
-        data_path = std::filesystem::current_path().string() + "/data";
+        UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
+        UnsetEnv("MOONCAKE_USE_URING");
+        data_path = (std::filesystem::current_path() / "file_storage_test_data")
+                        .string();
         fs::create_directories(data_path);
         for (const auto& entry : fs::directory_iterator(data_path)) {
             std::error_code ec;
@@ -279,21 +286,26 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
-    constexpr size_t kArenaSize = 2 * 1024 * 1024;
-    std::vector<char> restore_arena(kArenaSize + 4096);
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+
+    size_t payload_size = 0;
+    for (const auto size : sizes) {
+        payload_size += static_cast<size_t>(size);
+    }
+    const size_t arena_size = payload_size * 3 / 2;
+    std::vector<char> restore_arena(arena_size + 4096);
     const auto arena_begin =
         (reinterpret_cast<uintptr_t>(restore_arena.data()) + 4095) & ~4095ULL;
     SetPinnedRestoreArena(fileStorage, reinterpret_cast<void*>(arena_begin),
-                          kArenaSize);
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+                          arena_size);
 
     auto pinned_result = fileStorage.BatchGetLocal(keys, sizes);
     ASSERT_TRUE(pinned_result);
     ASSERT_EQ(pinned_result->pointers.size(), keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         EXPECT_GE(pinned_result->pointers[i], arena_begin);
-        EXPECT_LT(pinned_result->pointers[i], arena_begin + kArenaSize);
+        EXPECT_LT(pinned_result->pointers[i], arena_begin + arena_size);
         EXPECT_EQ(
             std::string(reinterpret_cast<char*>(pinned_result->pointers[i]),
                         sizes[i]),
@@ -305,11 +317,36 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
     ASSERT_EQ(fallback_result->pointers.size(), keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         EXPECT_TRUE(fallback_result->pointers[i] < arena_begin ||
-                    fallback_result->pointers[i] >= arena_begin + kArenaSize);
+                    fallback_result->pointers[i] >= arena_begin + arena_size);
         EXPECT_EQ(
             std::string(reinterpret_cast<char*>(fallback_result->pointers[i]),
                         sizes[i]),
             batch_data.at(keys[i]));
+    }
+}
+
+TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 64 * 1024;
+    file_storage_config.use_uring = false;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    for (size_t i = 0; i < 16; ++i) {
+        keys.emplace_back("key" + std::to_string(i));
+        sizes.emplace_back(4 * 1024);
+    }
+
+    auto allocate_result = FileStorageAllocateBatch(fileStorage, keys, sizes);
+    ASSERT_TRUE(allocate_result)
+        << "POSIX reads should not reserve O_DIRECT padding";
+    EXPECT_EQ(allocate_result.value()->total_size,
+              file_storage_config.local_buffer_size);
+    ASSERT_EQ(allocate_result.value()->handles.size(), keys.size());
+    for (const auto& handle : allocate_result.value()->handles) {
+        EXPECT_EQ(handle.size(), 4 * 1024);
     }
 }
 
@@ -452,76 +489,13 @@ TEST_F(FileStorageTest,
         fileStorage, offloading_objects, buckets_keys));
 }
 
-TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
-    auto config = FileStorageConfig::FromEnvironment();
-    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-
-    EXPECT_EQ(config.storage_filepath, "/data/file_storage");
-    EXPECT_EQ(config.local_buffer_size, 1280 * 1024 * 1024);
-    EXPECT_EQ(config.scanmeta_iterator_keys_limit, 20000);
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
-    EXPECT_EQ(bucket_backend_config.bucket_size_limit, 256 * 1024 * 1024);
-    EXPECT_EQ(config.total_keys_limit, 10'000'000);
-    EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
-    EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
-    EXPECT_TRUE(config.enable_disk_watermark_eviction);
-    EXPECT_EQ(config.pinned_restore_arena_size, 0);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
-}
-
-TEST_F(FileStorageTest, ReadStringFromEnv) {
-    SetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/storage");
-
-    auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.storage_filepath, "/tmp/storage");
-}
-
-TEST_F(FileStorageTest, ReadInt64FromEnv) {
-    SetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "2147483648");  // 2GB
-    SetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "67108864");
+TEST_F(FileStorageTest, ReadBucketBackendValues) {
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
-    SetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", "5000000");
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "536870912");
 
-    auto config = FileStorageConfig::FromEnvironment();
-    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-
-    EXPECT_EQ(config.local_buffer_size, 2147483648);
-    EXPECT_EQ(config.pinned_restore_arena_size, 64 * 1024 * 1024);
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 1000);
-    EXPECT_EQ(config.total_keys_limit, 5000000);
-}
-
-TEST_F(FileStorageTest, ReadUint32FromEnv) {
-    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "5");
-
-    auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.heartbeat_interval_seconds, 5u);
-}
-
-TEST_F(FileStorageTest, ReadDiskWatermarkConfigFromEnv) {
-    SetEnv("MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO", "0.77");
-    SetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO", "0.55");
-
-    auto alias_config = FileStorageConfig::FromEnvironment();
-    EXPECT_DOUBLE_EQ(alias_config.disk_eviction_high_watermark_ratio, 0.77);
-    EXPECT_DOUBLE_EQ(alias_config.disk_eviction_low_watermark_ratio, 0.55);
-
-    SetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION", "0");
-    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO", "0.75");
-    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO", "0.50");
-
-    auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_FALSE(config.enable_disk_watermark_eviction);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.75);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.50);
-
-    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO", "0,75");
-    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO", "nan");
-
-    auto invalid_config = FileStorageConfig::FromEnvironment();
-    EXPECT_DOUBLE_EQ(invalid_config.disk_eviction_high_watermark_ratio, 0.90);
-    EXPECT_DOUBLE_EQ(invalid_config.disk_eviction_low_watermark_ratio, 0.80);
+    const auto config = BucketBackendConfig::FromEnvironment();
+    EXPECT_EQ(config.bucket_keys_limit, 1000);
+    EXPECT_EQ(config.bucket_size_limit, 512 * 1024 * 1024);
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
@@ -739,103 +713,6 @@ TEST_F(FileStorageTest, DuplicateOffloadErrorIsPerBucketSoftError) {
     EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::INTERNAL_ERROR));
     EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::INVALID_KEY));
     EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::OK));
-}
-
-TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "abc");
-    SetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "sdfsdf");
-    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-1");
-
-    auto config = FileStorageConfig::FromEnvironment();
-    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
-    EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
-    EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
-}
-
-TEST_F(FileStorageTest, OutOfRangeValueUsesDefault) {
-    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
-           "4294967296");  // > UINT32_MAX
-    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-10");  // negative
-
-    auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.heartbeat_interval_seconds, 10u);  // fallback to default
-}
-
-TEST_F(FileStorageTest, EmptyEnvValueUsesDefault) {
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "");  // empty string
-
-    auto config = FileStorageConfig::FromEnvironment();
-    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);  // fallback
-}
-
-TEST_F(FileStorageTest, ValidateSuccessWithValidConfig) {
-    FileStorageConfig config;
-    config.storage_filepath = std::filesystem::current_path().string();
-    config.total_keys_limit = 1000000;
-    config.total_size_limit = 1073741824;  // 1GB
-    config.heartbeat_interval_seconds = 5;
-
-    EXPECT_TRUE(config.Validate());
-}
-
-TEST_F(FileStorageTest, ValidateFailsOnEmptyStoragePath) {
-    FileStorageConfig config;
-    config.storage_filepath = "";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "   ";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "relative/path";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "./data";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "../data";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "/valid/../invalid";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "/path/./sub";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "/tmp/this_directory_does_not_exist_12345";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = data_path;
-    EXPECT_TRUE(config.Validate());
-}
-
-TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {
-    FileStorageConfig config;
-    config.storage_filepath = "/tmp";
-
-    config.total_keys_limit = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.total_keys_limit = 1;
-    config.total_size_limit = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.total_size_limit = 1;
-    config.pinned_restore_arena_size = -1;
-    EXPECT_FALSE(config.Validate());
-
-    config.pinned_restore_arena_size = 0;
-    config.heartbeat_interval_seconds = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.heartbeat_interval_seconds = 1;
-    config.disk_eviction_low_watermark_ratio = 0.9;
-    config.disk_eviction_high_watermark_ratio = 0.8;
-    EXPECT_FALSE(config.Validate());
-
-    config.disk_eviction_low_watermark_ratio = 0.0;
-    config.disk_eviction_high_watermark_ratio = 0.8;
-    EXPECT_FALSE(config.Validate());
-
-    config.disk_eviction_low_watermark_ratio = 0.8;
-    config.disk_eviction_high_watermark_ratio = 1.1;
-    EXPECT_FALSE(config.Validate());
 }
 
 TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {

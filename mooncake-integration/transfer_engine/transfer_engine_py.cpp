@@ -212,6 +212,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
+    bool use_flagcx = (proto == "flagcx");
 
 #ifdef USE_EFA
     // When using EFA protocol, we still need topology discovery but won't
@@ -238,7 +239,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(true, device_filter);
+    engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
@@ -264,6 +265,15 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
             return -1;
         }
         LOG(INFO) << "EFA transport installed successfully";
+    } else if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
     } else {
         // For non-EFA protocols (e.g. TCP), manually install TCP transport
         // since auto_discover is disabled to prevent RDMA installation
@@ -287,6 +297,15 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
             return -1;
         }
         LOG(INFO) << "CXI transport installed successfully";
+    } else if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
     } else {
         // For non-EFA protocols (e.g. TCP), manually install TCP transport
         // since auto_discover is disabled to prevent RDMA installation
@@ -299,6 +318,17 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
             return -1;
         }
         LOG(INFO) << "TCP transport installed successfully";
+    }
+#else
+    if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
     }
 #endif
 
@@ -554,7 +584,11 @@ int TransferEnginePy::batchTransferSync(
             handle = handle_map_[target_hostname];
         } else {
             handle = engine_->openSegment(target_hostname);
-            if (handle == (Transport::SegmentHandle)-1) return -1;
+            if (handle == (Transport::SegmentHandle)-1) {
+                LOG(ERROR) << "batchTransferSync: openSegment failed for "
+                           << target_hostname;
+                return -1;
+            }
             handle_map_[target_hostname] = handle;
         }
     }
@@ -596,6 +630,10 @@ int TransferEnginePy::batchTransferSync(
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
+            LOG(ERROR) << "batchTransferSync: submitTransfer failed for "
+                       << target_hostname << " (batch of " << batch_size
+                       << " requests, " << total_length
+                       << " bytes): " << s.ToString();
             engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
@@ -620,6 +658,10 @@ int TransferEnginePy::batchTransferSync(
                 engine_->freeBatchID(batch_id);
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
+                LOG(ERROR) << "batchTransferSync: transfer FAILED for "
+                           << target_hostname << " (batch of " << batch_size
+                           << " requests, " << total_length
+                           << " bytes) on retry " << retry << "/" << max_retry;
                 engine_->freeBatchID(batch_id);
                 already_freed = true;
                 completed = true;
@@ -643,6 +685,9 @@ int TransferEnginePy::batchTransferSync(
             }
         }
     }
+    LOG(ERROR) << "batchTransferSync: all " << max_retry
+               << " retries exhausted for " << target_hostname << " (batch of "
+               << batch_size << " requests, " << total_length << " bytes)";
     return -1;
 }
 

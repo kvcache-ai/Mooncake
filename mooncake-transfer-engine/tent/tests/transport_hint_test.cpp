@@ -59,6 +59,10 @@ class FakeTransport : public Transport {
     }
 
     std::atomic<int> submit_calls{0};
+    std::vector<uint64_t> submitted_device_masks;
+    std::vector<std::string> submitted_qp_pools;
+    std::vector<size_t> submitted_request_counts;
+    std::string fail_qp_pool_once;
 
     Status install(std::string&, std::shared_ptr<ControlService>,
                    std::shared_ptr<Topology>,
@@ -80,6 +84,13 @@ class FakeTransport : public Transport {
                                const std::vector<Request>& reqs) override {
         ++submit_calls;
         auto* fb = static_cast<FakeSubBatch*>(batch);
+        submitted_device_masks.push_back(fb->device_mask);
+        submitted_qp_pools.push_back(fb->qp_pool);
+        submitted_request_counts.push_back(reqs.size());
+        if (!fail_qp_pool_once.empty() && fb->qp_pool == fail_qp_pool_once) {
+            fail_qp_pool_once.clear();
+            return Status::InternalError("injected submit failure" LOC_MARK);
+        }
         for (const auto& req : reqs) {
             fb->statuses.push_back({TransferStatusEnum::COMPLETED, req.length});
             fb->task_count++;
@@ -341,6 +352,137 @@ TEST(TransportHint, MixedHintsInBatchSplitAcrossTransports) {
 
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
     EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+// ---------------------------------------------------------------------------
+// 6. Requests using different RDMA policies must not share one scalar
+//    SubBatch policy. The A/B/A order also verifies physical task IDs after
+//    policy grouping remain aligned with the transport's append order.
+// ---------------------------------------------------------------------------
+
+TEST(TransportPolicy, SplitsRdmaSubBatchesByResolvedPolicy) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("merge_requests", true);
+    json topology;
+    topology["cpu:0"] = {{"mlx5_0"}, {"mlx5_1"}};
+    cfg->set("topology/priority_matrix", topology);
+    json policy_a;
+    policy_a["name"] = "rdma-a";
+    policy_a["segment_type"] = "memory";
+    policy_a["transports"] = {"rdma"};
+    policy_a["devices"] = {"mlx5_0"};
+    policy_a["qp_pool"] = "pool-a";
+    json policy_b;
+    policy_b["name"] = "rdma-b";
+    policy_b["segment_type"] = "memory";
+    policy_b["transports"] = {"rdma"};
+    policy_b["devices"] = {"mlx5_1"};
+    policy_b["qp_pool"] = "pool-b";
+    cfg->set("policy", json::array({policy_a, policy_b}));
+
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kRequestLengths[] = {1024, 2048, 3072};
+    constexpr size_t kBufLen =
+        kRequestLengths[0] + kRequestLengths[1] + kRequestLengths[2];
+    std::vector<uint8_t> buf(kBufLen, 0xCC);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    Request request_a0 = makeLocalWriteRequest(buf.data(), kRequestLengths[0]);
+    request_a0.policy_name = "rdma-a";
+    Request request_b = makeLocalWriteRequest(buf.data() + kRequestLengths[0],
+                                              kRequestLengths[1]);
+    request_b.policy_name = "rdma-b";
+    Request request_a1 = makeLocalWriteRequest(
+        buf.data() + kRequestLengths[0] + kRequestLengths[1],
+        kRequestLengths[2]);
+    request_a1.policy_name = "rdma-a";
+
+    BatchID batch_id = engine.allocateBatch(4);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch_id, {request_a0, request_b, request_a1})
+            .ok());
+
+    ASSERT_EQ(fake_rdma->submit_calls.load(), 2);
+    ASSERT_EQ(fake_rdma->submitted_request_counts.size(), 2u);
+    EXPECT_EQ(fake_rdma->submitted_request_counts[0], 2u);
+    EXPECT_EQ(fake_rdma->submitted_request_counts[1], 1u);
+    ASSERT_EQ(fake_rdma->submitted_device_masks.size(), 2u);
+    EXPECT_EQ(fake_rdma->submitted_device_masks[0], 1ULL);
+    EXPECT_EQ(fake_rdma->submitted_device_masks[1], 1ULL << 1);
+    ASSERT_EQ(fake_rdma->submitted_qp_pools.size(), 2u);
+    EXPECT_EQ(fake_rdma->submitted_qp_pools[0], "pool-a");
+    EXPECT_EQ(fake_rdma->submitted_qp_pools[1], "pool-b");
+
+    for (size_t task_id = 0; task_id < 3; ++task_id) {
+        TransferStatus status;
+        ASSERT_TRUE(engine.getTransferStatus(batch_id, task_id, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kRequestLengths[task_id]);
+    }
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+// A failed homogeneous group may return without appending any transport task.
+// The next group must derive its task ID from the SubBatch's actual size, not
+// from the number of requests the engine intended to submit.
+TEST(TransportPolicy, SyncFailureDoesNotShiftLaterGroupTaskIds) {
+    auto cfg = makeMinimalP2PConfig();
+    json topology;
+    topology["cpu:0"] = {{"mlx5_0"}, {"mlx5_1"}};
+    cfg->set("topology/priority_matrix", topology);
+    json failing_policy;
+    failing_policy["name"] = "rdma-fail";
+    failing_policy["segment_type"] = "memory";
+    failing_policy["transports"] = {"rdma"};
+    failing_policy["devices"] = {"mlx5_0"};
+    failing_policy["qp_pool"] = "pool-fail";
+    json succeeding_policy;
+    succeeding_policy["name"] = "rdma-ok";
+    succeeding_policy["segment_type"] = "memory";
+    succeeding_policy["transports"] = {"rdma"};
+    succeeding_policy["devices"] = {"mlx5_1"};
+    succeeding_policy["qp_pool"] = "pool-ok";
+    cfg->set("policy", json::array({failing_policy, succeeding_policy}));
+
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+    fake_rdma->fail_qp_pool_once = "pool-fail";
+
+    constexpr size_t kRequestLength = 4096;
+    constexpr size_t kBufLen = 2 * kRequestLength;
+    std::vector<uint8_t> buf(kBufLen, 0xDD);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    Request failing = makeLocalWriteRequest(buf.data(), kRequestLength);
+    failing.policy_name = "rdma-fail";
+    Request succeeding =
+        makeLocalWriteRequest(buf.data() + kRequestLength, kRequestLength);
+    succeeding.policy_name = "rdma-ok";
+
+    BatchID batch_id = engine.allocateBatch(2);
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {failing, succeeding}).ok());
+    ASSERT_EQ(fake_rdma->submit_calls.load(), 2);
+
+    TransferStatus failed_status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, failed_status).ok());
+    EXPECT_EQ(failed_status.s, TransferStatusEnum::FAILED);
+
+    TransferStatus completed_status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 1, completed_status).ok());
+    EXPECT_EQ(completed_status.s, TransferStatusEnum::COMPLETED);
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());

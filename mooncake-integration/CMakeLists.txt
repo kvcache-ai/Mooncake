@@ -253,9 +253,9 @@ if(WITH_EP)
     PATTERN "*.so")
   install(
     FILES
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/ep.py"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ep_buffer.py"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_elastic_buffer.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/ep.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_ep_buffer.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_elastic_buffer.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
     COMPONENT python)
