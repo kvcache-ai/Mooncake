@@ -9,6 +9,7 @@ from typing import cast
 from ..contracts import ParticipantId
 from .planner import KVCacheLogicalTransferPlan, KVCacheTransferEdge
 from .serde import kv_cache_placement_from_json, kv_cache_placement_to_json
+from .snapshot_serde import kv_cache_snapshot_from_json, kv_cache_snapshot_to_json
 from .types import KVCacheComponent
 
 
@@ -20,6 +21,13 @@ def kv_cache_logical_plan_to_json(plan: KVCacheLogicalTransferPlan) -> str:
             "source_placement_json": kv_cache_placement_to_json(plan.source_placement),
             "target_placement_json": kv_cache_placement_to_json(plan.target_placement),
             "target_participant_id": plan.target_participant_id,
+            "snapshot_json": (
+                kv_cache_snapshot_to_json(plan.snapshot)
+                if plan.snapshot is not None
+                else None
+            ),
+            "plan_id": plan.plan_id,
+            "plan_digest": plan.digest,
             "edges": [_edge_to_wire(edge) for edge in plan.edges],
             "expected_writer_ids": list(plan.expected_writer_ids),
         },
@@ -34,12 +42,16 @@ def kv_cache_logical_plan_from_json(value: str) -> KVCacheLogicalTransferPlan:
         "source_placement_json",
         "target_placement_json",
         "target_participant_id",
+        "snapshot_json",
+        "plan_id",
+        "plan_digest",
         "edges",
         "expected_writer_ids",
     }
     if set(payload) != expected:
         raise ValueError("KV-cache logical plan fields do not match contract")
-    return KVCacheLogicalTransferPlan(
+    snapshot_json = _optional_string(payload["snapshot_json"], "snapshot_json")
+    result = KVCacheLogicalTransferPlan(
         source_placement=kv_cache_placement_from_json(
             _string(payload["source_placement_json"], "source_placement_json")
         ),
@@ -57,7 +69,17 @@ def kv_cache_logical_plan_from_json(value: str) -> KVCacheLogicalTransferPlan:
             ParticipantId(_string(item, "expected_writer_id"))
             for item in _sequence(payload["expected_writer_ids"], "expected_writer_ids")
         ),
+        snapshot=(
+            kv_cache_snapshot_from_json(snapshot_json)
+            if snapshot_json is not None
+            else None
+        ),
     )
+    if result.plan_id != _string(payload["plan_id"], "plan_id"):
+        raise ValueError("KV-cache logical plan ID does not match semantic content")
+    if result.digest != _string(payload["plan_digest"], "plan_digest"):
+        raise ValueError("KV-cache logical plan digest does not match content")
+    return result
 
 
 def _load_json_object(value: str) -> Mapping[str, object]:
@@ -150,6 +172,12 @@ def _string(value: object, label: str) -> str:
     if type(value) is not str or not value:
         raise ValueError(f"{label} must be a non-empty string")
     return value
+
+
+def _optional_string(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, label)
 
 
 def _integer(value: object, label: str) -> int:

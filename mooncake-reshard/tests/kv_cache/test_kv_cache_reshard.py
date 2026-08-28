@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from math import prod
 
 import pytest
 from mooncake.reshard.contracts import (
-    LeaseId,
     ParticipantId,
     PlacementSetId,
     ResourceId,
@@ -25,6 +25,7 @@ from mooncake.reshard.kv_cache import (
     KVCacheRank,
     KVCacheRuntimeBindingManifest,
     KVCacheRuntimeBuffer,
+    KVCacheSnapshotDescriptor,
     KVCacheTopology,
     KVCacheTopologyParticipant,
     assemble_kv_cache_placement,
@@ -36,6 +37,8 @@ from mooncake.reshard.kv_cache import (
     kv_cache_placement_to_json,
     kv_cache_runtime_binding_from_json,
     kv_cache_runtime_binding_to_json,
+    kv_cache_snapshot_from_json,
+    kv_cache_snapshot_to_json,
     placement_fragment_id,
     plan_kv_cache_transfer_to_local_target,
     prepare_kv_cache_transfer,
@@ -52,6 +55,8 @@ def _placement(
     total_kv_heads: int = 4,
     page_size: int = 16,
     dp_size: int = 1,
+    resource_id: str = "kv:qwen-test",
+    revision: str = "qwen-test-revision",
 ) -> KVCachePlacementManifest:
     descriptor = KVCacheDescriptor(
         global_layer_ids=tuple(
@@ -101,8 +106,8 @@ def _placement(
             raise ValueError("test topology has an unsupported TP/head ratio")
         parts.append(
             KVCachePlacementPart(
-                resource_id=ResourceId("kv:qwen-test"),
-                revision=RevisionId("qwen-test-revision"),
+                resource_id=ResourceId(resource_id),
+                revision=RevisionId(revision),
                 placement_set_id=PlacementSetId(f"{prefix}-placement"),
                 topology_id=topology.topology_id,
                 participant_id=participant.participant_id,
@@ -116,12 +121,34 @@ def _placement(
             )
         )
     return KVCachePlacementManifest(
-        resource_id=ResourceId("kv:qwen-test"),
-        revision=RevisionId("qwen-test-revision"),
+        resource_id=ResourceId(resource_id),
+        revision=RevisionId(revision),
         placement_set_id=PlacementSetId(f"{prefix}-placement"),
         topology=topology,
         descriptor=descriptor,
         parts=tuple(parts),
+    )
+
+
+def _fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _snapshot(
+    *,
+    resource_id: str = "kv:qwen-test",
+    token_start: int = 0,
+    token_count: int = 8,
+) -> KVCacheSnapshotDescriptor:
+    return KVCacheSnapshotDescriptor(
+        namespace="tenant-a",
+        resource_id=ResourceId(resource_id),
+        model_id="Qwen/Qwen2.5-1.5B-Instruct",
+        model_revision="main",
+        token_start=token_start,
+        token_count=token_count,
+        token_fingerprint=_fingerprint("token-ids"),
+        semantic_fingerprint=_fingerprint("model-and-adapter"),
     )
 
 
@@ -130,7 +157,7 @@ def _binding(
     participant_id: str,
     *,
     base_address: int,
-    generation: int = 11,
+    snapshot: KVCacheSnapshotDescriptor | None = None,
     capacity_tokens: int = 256,
 ) -> KVCacheRuntimeBindingManifest:
     typed_participant_id = ParticipantId(participant_id)
@@ -182,8 +209,8 @@ def _binding(
         placement_id=placement.placement_id,
         placement_digest=placement.digest,
         instance_id=RuntimeInstanceId(f"instance:{participant_id}"),
-        generation=generation,
-        lease_id=LeaseId(f"lease:{participant_id}"),
+        snapshot_id=snapshot.snapshot_id if snapshot is not None else None,
+        snapshot_digest=snapshot.digest if snapshot is not None else None,
         revision=placement.revision,
         participant_id=typed_participant_id,
         buffers=tuple(buffers),
@@ -196,12 +223,14 @@ def _plan(
     participant_id: str,
     *,
     source_dp_rank: int | None = None,
+    snapshot: KVCacheSnapshotDescriptor | None = None,
 ) -> KVCacheLogicalTransferPlan:
     return plan_kv_cache_transfer_to_local_target(
         source,
         target,
         ParticipantId(participant_id),
         source_dp_rank=source_dp_rank,
+        snapshot=snapshot,
     )
 
 
@@ -435,3 +464,97 @@ def test_logical_plan_round_trip_preserves_both_global_placements() -> None:
     )
     with pytest.raises(ValueError, match="duplicate JSON field"):
         kv_cache_logical_plan_from_json(duplicate)
+
+
+def test_snapshot_contract_is_canonical_and_optional_for_pd() -> None:
+    snapshot = _snapshot(token_start=4, token_count=6)
+    restored = kv_cache_snapshot_from_json(kv_cache_snapshot_to_json(snapshot))
+
+    assert restored == snapshot
+    assert restored.token_end == 10
+
+    source = _placement("source", ((0,),), 1)
+    semantic_target = _placement("semantic-target", ((0,),), 1)
+    plain = _plan(source, semantic_target, "semantic-target-p0-t0")
+    semantic = _plan(
+        source,
+        semantic_target,
+        "semantic-target-p0-t0",
+        snapshot=snapshot,
+    )
+    assert plain.plan_id == semantic.plan_id
+    assert plain.digest != semantic.digest
+
+    target = _placement(
+        "target",
+        ((0,),),
+        1,
+        resource_id="kv:framework-owned-target",
+        revision="different-framework-revision",
+    )
+    plan = _plan(source, target, "target-p0-t0")
+    assert plan.snapshot is None
+
+    with pytest.raises(ValueError, match="target placement resource_id"):
+        _plan(source, target, "target-p0-t0", snapshot=snapshot)
+
+
+def test_page_size_repacking_is_rejected_explicitly() -> None:
+    source = _placement("source", ((0,),), 1, page_size=16)
+    target = _placement("target", ((0,),), 1, page_size=32)
+
+    with pytest.raises(ValueError, match="page_size.*unsupported"):
+        _plan(source, target, "target-p0-t0")
+
+
+def test_logical_plan_identity_and_edges_are_semantically_verified() -> None:
+    source = _placement("source", ((0,),), 2)
+    target = _placement("target", ((0,),), 1)
+    plan = _plan(source, target, "target-p0-t0")
+    restored = kv_cache_logical_plan_from_json(kv_cache_logical_plan_to_json(plan))
+
+    assert restored.plan_id == plan.plan_id
+    assert restored.digest == plan.digest
+
+    malformed_edge = replace(plan.edges[0], head_count=plan.edges[0].head_count + 1)
+    with pytest.raises(ValueError, match="canonical plan"):
+        KVCacheLogicalTransferPlan(
+            source_placement=source,
+            target_placement=target,
+            target_participant_id=plan.target_participant_id,
+            edges=(malformed_edge, *plan.edges[1:]),
+            expected_writer_ids=plan.expected_writer_ids,
+        )
+
+
+def test_snapshot_bound_runtime_bindings_are_checked_at_prepare() -> None:
+    snapshot = _snapshot()
+    source = _placement("source", ((0,),), 2)
+    target = _placement("target", ((0,),), 1)
+    full_plan = _plan(source, target, "target-p0-t0", snapshot=snapshot)
+    source_id = full_plan.source_participant_ids[0]
+    plan = full_plan.for_source(source_id)
+    source_binding = _binding(
+        source,
+        source_id,
+        base_address=1_000_000_000,
+        snapshot=snapshot,
+    )
+    target_binding = _binding(
+        target,
+        "target-p0-t0",
+        base_address=2_000_000_000,
+        snapshot=snapshot,
+    )
+
+    prepared = prepare_kv_cache_transfer(plan, source_binding, target_binding)
+    assert prepared.snapshot_id == snapshot.snapshot_id
+    assert prepared.snapshot_digest == snapshot.digest
+
+    binding_payload = json.loads(kv_cache_runtime_binding_to_json(source_binding))
+    assert "generation" not in binding_payload
+    assert "lease_id" not in binding_payload
+
+    stale = replace(target_binding, snapshot_digest="0" * 64)
+    with pytest.raises(ValueError, match="snapshot digest"):
+        prepare_kv_cache_transfer(plan, source_binding, stale)

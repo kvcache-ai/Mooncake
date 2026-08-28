@@ -8,10 +8,13 @@ from .manifest import (
     KVCachePlacementManifest,
     KVCachePlacementPart,
     KVCacheRank,
+    KVCacheRuntimeBinding,
     KVCacheRuntimeBindingManifest,
     KVCacheRuntimeBuffer,
+    KVCacheSnapshotDescriptor,
     KVCacheTopology,
     KVCacheTopologyParticipant,
+    SnapshotId,
     assemble_kv_cache_placement,
     placement_fragment_id,
     validate_runtime_binding,
@@ -37,6 +40,10 @@ from .serde import (
     kv_cache_runtime_binding_from_json,
     kv_cache_runtime_binding_to_json,
 )
+from .snapshot_serde import (
+    kv_cache_snapshot_from_json,
+    kv_cache_snapshot_to_json,
+)
 
 __all__ = [
     "KVCacheBufferBinding",
@@ -49,11 +56,14 @@ __all__ = [
     "KVCachePreparedTransferEdge",
     "KVCachePreparedTransferPlan",
     "KVCacheRank",
+    "KVCacheRuntimeBinding",
     "KVCacheRuntimeBindingManifest",
     "KVCacheRuntimeBuffer",
+    "KVCacheSnapshotDescriptor",
     "KVCacheTopology",
     "KVCacheTopologyParticipant",
     "KVCacheTransferEdge",
+    "SnapshotId",
     "assemble_kv_cache_placement",
     "kv_cache_logical_plan_from_json",
     "kv_cache_logical_plan_to_json",
@@ -63,6 +73,8 @@ __all__ = [
     "kv_cache_placement_to_json",
     "kv_cache_runtime_binding_from_json",
     "kv_cache_runtime_binding_to_json",
+    "kv_cache_snapshot_from_json",
+    "kv_cache_snapshot_to_json",
     "placement_fragment_id",
     "plan_kv_cache_transfer_to_local_target",
     "prepare_kv_cache_transfer",

@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..contracts import (
-    LeaseId,
     ParticipantId,
     PlacementId,
     ResourceId,
@@ -13,6 +12,7 @@ from ..contracts import (
     RevisionId,
     RuntimeInstanceId,
 )
+from .snapshot import SnapshotId
 from .types import (
     KVCacheComponent,
     KVCacheRuntimeBuffer,
@@ -41,17 +41,17 @@ class KVCacheBufferBinding:
 
 @dataclass(frozen=True)
 class KVCacheRuntimeBindingManifest:
-    """Live physical buffers for one participant of a complete placement."""
+    """Operation-scoped physical buffers supplied by their owning runtime."""
 
     resource_id: ResourceId
     placement_id: PlacementId
     placement_digest: str
     instance_id: RuntimeInstanceId
-    generation: int
-    lease_id: LeaseId
     revision: RevisionId
     participant_id: ParticipantId
     buffers: tuple[KVCacheBufferBinding, ...]
+    snapshot_id: SnapshotId | None = None
+    snapshot_digest: str | None = None
 
     @property
     def resource_kind(self) -> ResourceKind:
@@ -62,13 +62,18 @@ class KVCacheRuntimeBindingManifest:
             "resource_id",
             "placement_id",
             "instance_id",
-            "lease_id",
             "revision",
             "participant_id",
         ):
             require_nonempty_string(getattr(self, name), name)
         require_sha256(self.placement_digest, "placement_digest")
-        require_integer(self.generation, "generation")
+        if (self.snapshot_id is None) != (self.snapshot_digest is None):
+            raise ValueError(
+                "snapshot_id and snapshot_digest must be provided together"
+            )
+        if self.snapshot_id is not None:
+            require_nonempty_string(self.snapshot_id, "snapshot_id")
+            require_sha256(self.snapshot_digest, "snapshot_digest")
         buffers = tuple(
             sorted(
                 require_manifest_items(
@@ -102,4 +107,12 @@ class KVCacheRuntimeBindingManifest:
         )
 
 
-__all__ = ["KVCacheBufferBinding", "KVCacheRuntimeBindingManifest"]
+# RFC name; keep the prototype name as a compatibility alias.
+KVCacheRuntimeBinding = KVCacheRuntimeBindingManifest
+
+
+__all__ = [
+    "KVCacheBufferBinding",
+    "KVCacheRuntimeBinding",
+    "KVCacheRuntimeBindingManifest",
+]

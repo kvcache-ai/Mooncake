@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from itertools import pairwise
 
-from ..contracts import RuntimeInstanceId, validate_resource_binding_identity
+from ..contracts import RuntimeInstanceId
 from .placement import KVCachePlacementManifest
 from .runtime import KVCacheRuntimeBindingManifest
+from .snapshot import KVCacheSnapshotDescriptor
 from .types import (
     KVCacheComponent,
     canonical_strides_bytes,
@@ -18,12 +19,28 @@ from .types import (
 def validate_runtime_binding(
     placement: KVCachePlacementManifest,
     binding: KVCacheRuntimeBindingManifest,
+    *,
+    snapshot: KVCacheSnapshotDescriptor | None = None,
 ) -> None:
     if not isinstance(placement, KVCachePlacementManifest):
         raise TypeError("placement must be a KVCachePlacementManifest")
     if not isinstance(binding, KVCacheRuntimeBindingManifest):
         raise TypeError("binding must be a KVCacheRuntimeBindingManifest")
-    validate_resource_binding_identity(placement, binding)
+    if placement.resource_kind != binding.resource_kind:
+        raise ValueError("placement and runtime binding resource_kind differ")
+    if placement.resource_id != binding.resource_id:
+        raise ValueError("placement and runtime binding resource_id differ")
+    if placement.placement_id != binding.placement_id:
+        raise ValueError("placement_id and runtime binding placement_id differ")
+    if placement.digest != binding.placement_digest:
+        raise ValueError("placement digest and runtime binding placement digest differ")
+    if snapshot is not None:
+        if not isinstance(snapshot, KVCacheSnapshotDescriptor):
+            raise TypeError("snapshot must be a KVCacheSnapshotDescriptor")
+        if binding.snapshot_id != snapshot.snapshot_id:
+            raise ValueError("runtime binding snapshot_id differs")
+        if binding.snapshot_digest != snapshot.digest:
+            raise ValueError("runtime binding snapshot digest differs")
     if placement.revision != binding.revision:
         raise ValueError("placement and runtime binding revision differ")
     part = placement.part(binding.participant_id)
@@ -85,6 +102,8 @@ def validate_runtime_binding(
 def validate_runtime_bindings(
     placement: KVCachePlacementManifest,
     bindings: object,
+    *,
+    snapshot: KVCacheSnapshotDescriptor | None = None,
 ) -> None:
     items = require_manifest_items(
         bindings,
@@ -95,7 +114,7 @@ def validate_runtime_bindings(
     if len(participant_ids) != len(set(participant_ids)):
         raise ValueError("duplicate runtime binding participant")
     for binding in items:
-        validate_runtime_binding(placement, binding)
+        validate_runtime_binding(placement, binding, snapshot=snapshot)
     expected = {part.participant_id for part in placement.parts if part.layer_ids}
     actual = set(participant_ids)
     missing = sorted(expected - actual)

@@ -6,7 +6,12 @@ from .placement import (
     KVCachePlacementManifest,
     assemble_kv_cache_placement,
 )
-from .runtime import KVCacheBufferBinding, KVCacheRuntimeBindingManifest
+from .runtime import (
+    KVCacheBufferBinding,
+    KVCacheRuntimeBinding,
+    KVCacheRuntimeBindingManifest,
+)
+from .snapshot import KVCacheSnapshotDescriptor, SnapshotId
 from .topology import KVCacheTopology, KVCacheTopologyParticipant
 from .types import (
     KVCacheComponent,
@@ -25,10 +30,13 @@ __all__ = [
     "KVCachePlacementManifest",
     "KVCachePlacementPart",
     "KVCacheRank",
+    "KVCacheRuntimeBinding",
     "KVCacheRuntimeBindingManifest",
     "KVCacheRuntimeBuffer",
+    "KVCacheSnapshotDescriptor",
     "KVCacheTopology",
     "KVCacheTopologyParticipant",
+    "SnapshotId",
     "assemble_kv_cache_placement",
     "placement_fragment_id",
     "validate_runtime_binding",

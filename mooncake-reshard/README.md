@@ -98,16 +98,20 @@ names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 
 `KVCachePlacementManifest` describes an address-free KV-cache placement over a
 selected topology. Each participant contributes a `KVCachePlacementPart`, and
-`KVCacheRuntimeBindingManifest` binds that logical placement to live buffers.
-The planner produces logical transfer edges and can prepare their static byte
-ranges before execution.
+`KVCacheRuntimeBindingManifest` supplies operation-scoped live buffers. Runtime
+bindings contain no lease or eviction state; the framework owns pinning and
+lifetime. `KVCacheSnapshotDescriptor` independently describes model and token
+semantics. Runtime-to-Runtime callers may omit it when the runtimes already own
+that semantic agreement, while Store paths require it.
 
 The KV-cache implementation is split by responsibility:
 
+- `snapshot.py` defines optional content identity;
 - `topology.py`, `part.py`, and `placement.py` define logical placement;
 - `runtime.py` and `binding.py` define and validate live buffer bindings;
-- `planner.py` defines logical and prepared transfer plans;
-- `serde.py` and `plan_serde.py` define the JSON wire formats.
+- `planner.py` defines semantically validated logical and prepared plans;
+- `serde.py`, `snapshot_serde.py`, and `plan_serde.py` define strict JSON
+  boundaries.
 
 KV planning is source/target-role agnostic. A placement may expose one or more
 complete DP replicas, and each local-target plan selects exactly one source DP

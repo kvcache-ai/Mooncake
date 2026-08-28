@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 
 from ..contracts import ParticipantId, PlacementId
@@ -9,6 +11,7 @@ from .binding import validate_runtime_binding
 from .part import KVCachePlacementPart
 from .placement import KVCachePlacementManifest
 from .runtime import KVCacheRuntimeBindingManifest
+from .snapshot import KVCacheSnapshotDescriptor, SnapshotId
 from .types import KVCacheComponent, require_integer, require_nonempty_string
 
 
@@ -52,6 +55,9 @@ class KVCacheLogicalTransferPlan:
     target_participant_id: ParticipantId
     edges: tuple[KVCacheTransferEdge, ...]
     expected_writer_ids: tuple[ParticipantId, ...] = ()
+    snapshot: KVCacheSnapshotDescriptor | None = field(default=None, repr=False)
+    _plan_id_cache: str | None = field(init=False, repr=False, compare=False)
+    _digest_cache: str | None = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_placement, KVCachePlacementManifest):
@@ -59,6 +65,13 @@ class KVCacheLogicalTransferPlan:
         if not isinstance(self.target_placement, KVCachePlacementManifest):
             raise ValueError("target_placement is invalid")  # noqa: TRY004
         self.target_placement.part(self.target_participant_id)
+        if self.snapshot is not None and not isinstance(
+            self.snapshot, KVCacheSnapshotDescriptor
+        ):
+            raise ValueError("snapshot is invalid")
+        _validate_placement_compatibility(
+            self.source_placement, self.target_placement, self.snapshot
+        )
         if not self.edges or not all(
             isinstance(edge, KVCacheTransferEdge) for edge in self.edges
         ):
@@ -84,6 +97,33 @@ class KVCacheLogicalTransferPlan:
             raise ValueError(
                 "logical transfer plan must select exactly one source DP replica"
             )
+        _validate_logical_plan_semantics(self)
+        object.__setattr__(self, "_plan_id_cache", None)
+        object.__setattr__(self, "_digest_cache", None)
+
+    @property
+    def plan_id(self) -> str:
+        plan_id = self._plan_id_cache
+        if plan_id is None:
+            plan_id = f"sha256:{_canonical_json_digest(_logical_plan_content(self))}"
+            object.__setattr__(self, "_plan_id_cache", plan_id)
+        return plan_id
+
+    @property
+    def digest(self) -> str:
+        digest = self._digest_cache
+        if digest is None:
+            content = _logical_plan_content(self)
+            content["plan_id"] = self.plan_id
+            content["snapshot_id"] = (
+                self.snapshot.snapshot_id if self.snapshot is not None else None
+            )
+            content["snapshot_digest"] = (
+                self.snapshot.digest if self.snapshot is not None else None
+            )
+            digest = _canonical_json_digest(content)
+            object.__setattr__(self, "_digest_cache", digest)
+        return digest
 
     @property
     def source_dp_rank(self) -> int:
@@ -117,6 +157,7 @@ class KVCacheLogicalTransferPlan:
             target_participant_id=self.target_participant_id,
             edges=edges,
             expected_writer_ids=self.expected_writer_ids,
+            snapshot=self.snapshot,
         )
 
 
@@ -151,56 +192,36 @@ class KVCachePreparedTransferPlan:
     source_placement_digest: str
     target_placement_id: PlacementId
     target_placement_digest: str
+    snapshot_id: SnapshotId | None
+    snapshot_digest: str | None
     page_size: int
     edges: tuple[KVCachePreparedTransferEdge, ...]
 
 
-def _resolve_source_dp_rank(
+def _validate_placement_compatibility(
+    source: KVCachePlacementManifest,
+    target: KVCachePlacementManifest,
+    snapshot: KVCacheSnapshotDescriptor | None,
+) -> None:
+    if source.descriptor.page_size != target.descriptor.page_size:
+        raise ValueError(
+            "source and target page_size differ; page-size repacking is unsupported"
+        )
+    if source.descriptor != target.descriptor:
+        raise ValueError("source and target KV-cache descriptors differ")
+    if snapshot is not None:
+        if source.resource_id != snapshot.resource_id:
+            raise ValueError("source placement resource_id differs from snapshot")
+        if target.resource_id != snapshot.resource_id:
+            raise ValueError("target placement resource_id differs from snapshot")
+
+
+def _build_transfer_edges(
     source_placement: KVCachePlacementManifest,
     target: KVCachePlacementPart,
-    requested_source_dp_rank: int | None,
-) -> int:
-    available = source_placement.dp_ranks
-    if not available:
-        raise ValueError("source placement contains no DP replica")
-    if requested_source_dp_rank is not None:
-        require_integer(requested_source_dp_rank, "source_dp_rank")
-        if requested_source_dp_rank not in available:
-            raise ValueError(
-                f"source DP rank {requested_source_dp_rank} is absent from placement"
-            )
-        return requested_source_dp_rank
-    # Deterministic balanced default for arbitrary source/target DP sizes.
-    return available[target.rank.dp % len(available)]
-
-
-def plan_kv_cache_transfer_to_local_target(
-    source_placement: KVCachePlacementManifest,
-    target_placement: KVCachePlacementManifest,
-    target_participant_id: ParticipantId,
-    *,
-    source_dp_rank: int | None = None,
-) -> KVCacheLogicalTransferPlan:
-    """Plan one target participant from arbitrary source/target topologies."""
-
-    if not isinstance(source_placement, KVCachePlacementManifest):
-        raise TypeError("source_placement must be a KVCachePlacementManifest")
-    if not isinstance(target_placement, KVCachePlacementManifest):
-        raise TypeError("target_placement must be a KVCachePlacementManifest")
-    target = target_placement.part(target_participant_id)
-    checks = {
-        "resource_id": source_placement.resource_id,
-        "revision": source_placement.revision,
-        "descriptor": source_placement.descriptor,
-    }
-    for name, expected in checks.items():
-        if getattr(target_placement, name) != expected:
-            raise ValueError(f"source and target {name} differ")
-
-    selected_source_dp_rank = _resolve_source_dp_rank(
-        source_placement, target, source_dp_rank
-    )
-    descriptor = target_placement.descriptor
+    source_dp_rank: int,
+) -> tuple[KVCacheTransferEdge, ...]:
+    descriptor = source_placement.descriptor
     edges: list[KVCacheTransferEdge] = []
     for layer_id in target.layer_ids:
         head = target.head_start
@@ -210,7 +231,7 @@ def plan_kv_cache_transfer_to_local_target(
                 (
                     part
                     for part in source_placement.parts
-                    if part.rank.dp == selected_source_dp_rank
+                    if part.rank.dp == source_dp_rank
                     and layer_id in part.layer_ids
                     and part.head_start <= head < part.head_start + part.head_count
                 ),
@@ -227,7 +248,7 @@ def plan_kv_cache_transfer_to_local_target(
                     (
                         part
                         for part in source_placement.parts
-                        if part.rank.dp == selected_source_dp_rank
+                        if part.rank.dp == source_dp_rank
                         and layer_id in part.layer_ids
                         and part.head_start
                         <= run_end
@@ -262,11 +283,115 @@ def plan_kv_cache_transfer_to_local_target(
                     )
                 )
             head = run_end
+    return tuple(edges)
+
+
+def _validate_logical_plan_semantics(plan: KVCacheLogicalTransferPlan) -> None:
+    canonical_edges = _build_transfer_edges(
+        plan.source_placement,
+        plan.target_part,
+        plan.source_dp_rank,
+    )
+    canonical_writers = tuple(
+        sorted({edge.source_participant_id for edge in canonical_edges})
+    )
+    if plan.expected_writer_ids != canonical_writers:
+        raise ValueError("logical plan expected writers differ from canonical plan")
+    if plan.edges == canonical_edges:
+        return
+    source_ids = plan.source_participant_ids
+    if len(source_ids) != 1:
+        raise ValueError("logical plan edges differ from canonical plan")
+    writer_edges = tuple(
+        edge for edge in canonical_edges if edge.source_participant_id == source_ids[0]
+    )
+    if plan.edges != writer_edges:
+        raise ValueError("writer logical plan edges differ from canonical plan")
+
+
+def _logical_plan_content(plan: KVCacheLogicalTransferPlan) -> dict[str, object]:
+    return {
+        "schema": "kv-cache-logical-plan",
+        "source_placement_id": plan.source_placement.placement_id,
+        "source_placement_digest": plan.source_placement.digest,
+        "target_placement_id": plan.target_placement.placement_id,
+        "target_placement_digest": plan.target_placement.digest,
+        "target_participant_id": plan.target_participant_id,
+        "source_dp_rank": plan.source_dp_rank,
+        "edges": [
+            {
+                "source_participant_id": edge.source_participant_id,
+                "target_participant_id": edge.target_participant_id,
+                "global_layer_id": edge.global_layer_id,
+                "component": edge.component.value,
+                "global_head_start": edge.global_head_start,
+                "head_count": edge.head_count,
+                "source_head_offset": edge.source_head_offset,
+                "target_head_offset": edge.target_head_offset,
+                "head_dim": edge.head_dim,
+                "itemsize": edge.itemsize,
+            }
+            for edge in plan.edges
+        ],
+        "expected_writer_ids": list(plan.expected_writer_ids),
+    }
+
+
+def _canonical_json_digest(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _resolve_source_dp_rank(
+    source_placement: KVCachePlacementManifest,
+    target: KVCachePlacementPart,
+    requested_source_dp_rank: int | None,
+) -> int:
+    available = source_placement.dp_ranks
+    if not available:
+        raise ValueError("source placement contains no DP replica")
+    if requested_source_dp_rank is not None:
+        require_integer(requested_source_dp_rank, "source_dp_rank")
+        if requested_source_dp_rank not in available:
+            raise ValueError(
+                f"source DP rank {requested_source_dp_rank} is absent from placement"
+            )
+        return requested_source_dp_rank
+    # Deterministic balanced default for arbitrary source/target DP sizes.
+    return available[target.rank.dp % len(available)]
+
+
+def plan_kv_cache_transfer_to_local_target(
+    source_placement: KVCachePlacementManifest,
+    target_placement: KVCachePlacementManifest,
+    target_participant_id: ParticipantId,
+    *,
+    source_dp_rank: int | None = None,
+    snapshot: KVCacheSnapshotDescriptor | None = None,
+) -> KVCacheLogicalTransferPlan:
+    """Plan one target participant with optional framework semantic identity."""
+
+    if not isinstance(source_placement, KVCachePlacementManifest):
+        raise TypeError("source_placement must be a KVCachePlacementManifest")
+    if not isinstance(target_placement, KVCachePlacementManifest):
+        raise TypeError("target_placement must be a KVCachePlacementManifest")
+    if snapshot is not None and not isinstance(snapshot, KVCacheSnapshotDescriptor):
+        raise TypeError("snapshot must be a KVCacheSnapshotDescriptor")
+    target = target_placement.part(target_participant_id)
+    _validate_placement_compatibility(source_placement, target_placement, snapshot)
+    selected_source_dp_rank = _resolve_source_dp_rank(
+        source_placement, target, source_dp_rank
+    )
     return KVCacheLogicalTransferPlan(
         source_placement=source_placement,
         target_placement=target_placement,
         target_participant_id=target.participant_id,
-        edges=tuple(edges),
+        edges=_build_transfer_edges(
+            source_placement,
+            target,
+            selected_source_dp_rank,
+        ),
+        snapshot=snapshot,
     )
 
 
@@ -284,8 +409,16 @@ def prepare_kv_cache_transfer(
         raise ValueError("prepare requires a plan restricted to one source participant")
     if target_binding.participant_id != logical_plan.target_participant_id:
         raise ValueError("target binding participant differs from logical plan")
-    validate_runtime_binding(logical_plan.source_placement, source_binding)
-    validate_runtime_binding(logical_plan.target_placement, target_binding)
+    validate_runtime_binding(
+        logical_plan.source_placement,
+        source_binding,
+        snapshot=logical_plan.snapshot,
+    )
+    validate_runtime_binding(
+        logical_plan.target_placement,
+        target_binding,
+        snapshot=logical_plan.snapshot,
+    )
 
     source_buffers = {
         (item.global_layer_id, item.component): item.fragment
@@ -330,6 +463,14 @@ def prepare_kv_cache_transfer(
         source_placement_digest=logical_plan.source_placement.digest,
         target_placement_id=logical_plan.target_placement.placement_id,
         target_placement_digest=logical_plan.target_placement.digest,
+        snapshot_id=(
+            logical_plan.snapshot.snapshot_id
+            if logical_plan.snapshot is not None
+            else None
+        ),
+        snapshot_digest=(
+            logical_plan.snapshot.digest if logical_plan.snapshot is not None else None
+        ),
         page_size=logical_plan.source_placement.descriptor.page_size,
         edges=tuple(prepared_edges),
     )

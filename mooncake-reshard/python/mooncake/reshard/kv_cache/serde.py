@@ -8,7 +8,6 @@ from collections.abc import Set as AbstractSet
 from typing import TypeAlias, cast
 
 from ..contracts import (
-    LeaseId,
     ParticipantId,
     PlacementFragmentId,
     PlacementId,
@@ -23,6 +22,7 @@ from ..contracts import (
 from .part import KVCachePlacementPart
 from .placement import KVCachePlacementManifest
 from .runtime import KVCacheBufferBinding, KVCacheRuntimeBindingManifest
+from .snapshot import SnapshotId
 from .topology import KVCacheTopology, KVCacheTopologyParticipant
 from .types import (
     KVCacheComponent,
@@ -107,8 +107,8 @@ def kv_cache_runtime_binding_to_json(
             "placement_id": binding.placement_id,
             "placement_digest": binding.placement_digest,
             "instance_id": binding.instance_id,
-            "generation": binding.generation,
-            "lease_id": binding.lease_id,
+            "snapshot_id": binding.snapshot_id,
+            "snapshot_digest": binding.snapshot_digest,
             "revision": binding.revision,
             "participant_id": binding.participant_id,
             "buffers": [_buffer_to_wire(item) for item in binding.buffers],
@@ -127,8 +127,8 @@ def kv_cache_runtime_binding_from_json(
             "placement_id",
             "placement_digest",
             "instance_id",
-            "generation",
-            "lease_id",
+            "snapshot_id",
+            "snapshot_digest",
             "revision",
             "participant_id",
             "buffers",
@@ -141,8 +141,8 @@ def kv_cache_runtime_binding_from_json(
         placement_id=PlacementId(_string(payload["placement_id"], "placement_id")),
         placement_digest=_string(payload["placement_digest"], "placement_digest"),
         instance_id=RuntimeInstanceId(_string(payload["instance_id"], "instance_id")),
-        generation=_integer(payload["generation"], "generation"),
-        lease_id=LeaseId(_string(payload["lease_id"], "lease_id")),
+        snapshot_id=_optional_snapshot_id(payload["snapshot_id"]),
+        snapshot_digest=_optional_string(payload["snapshot_digest"], "snapshot_digest"),
         revision=RevisionId(_string(payload["revision"], "revision")),
         participant_id=ParticipantId(
             _string(payload["participant_id"], "participant_id")
@@ -470,6 +470,17 @@ def _string(value: object, label: str) -> str:
     if type(value) is not str or not value:
         raise ValueError(f"{label} must be a non-empty string")
     return value
+
+
+def _optional_snapshot_id(value: object) -> SnapshotId | None:
+    parsed = _optional_string(value, "snapshot_id")
+    return SnapshotId(parsed) if parsed is not None else None
+
+
+def _optional_string(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, label)
 
 
 def _integer(value: object, label: str, *, minimum: int = 0) -> int:
