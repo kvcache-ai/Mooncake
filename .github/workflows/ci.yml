@@ -435,8 +435,10 @@ jobs:
           filters: |
             src:
               - 'mooncake-*/**'
+              - 'python/**'
               - 'extern/**'
               - 'CMakeLists.txt'
+              - 'pyproject.toml'
               - 'dependencies.sh'
               - 'scripts/**'
               - '.github/actions/**'
