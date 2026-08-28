@@ -674,27 +674,46 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
         local_desc.reply_msg = ss.str();
         return -1;
     }
-    auto endpoint =
-        context->endpointStore()->getOrInsert(peer_desc.local_nic_path);
-    if (!endpoint) {
-        std::stringstream ss;
-        ss << "Cannot allocate endpoint: " << peer_desc.local_nic_path;
-        LOG(ERROR) << ss.str();
-        local_desc.reply_msg = ss.str();
-        return -1;
-    }
-    auto status = endpoint->accept(peer_desc, local_desc);
-    if (!status.ok()) {
-        if (endpoint->status() == RdmaEndPoint::EP_DESTROYING ||
-            endpoint->status() == RdmaEndPoint::EP_DESTROYED) {
-            context->endpointStore()->remove(endpoint.get());
+    // Endpoints are never reset. A peer process that reused the same nic path
+    // (same IP:port after a restart) hits an EP_READY endpoint whose QPs no
+    // longer exist. accept() retires it and the next getOrInsert() creates a
+    // fresh one. Do that retry inside this RPC so the initiator receives a
+    // valid GID instead of an empty bootstrap reply.
+    auto store = context->endpointStore();
+    constexpr int kMaxAcceptAttempts = 2;
+    for (int attempt = 0; attempt < kMaxAcceptAttempts; ++attempt) {
+        auto endpoint = store->getOrInsert(peer_desc.local_nic_path);
+        if (!endpoint) {
+            std::stringstream ss;
+            ss << "Cannot allocate endpoint: " << peer_desc.local_nic_path;
+            LOG(ERROR) << ss.str();
+            local_desc.reply_msg = ss.str();
+            return -1;
+        }
+        local_desc = BootstrapDesc();
+        auto status = endpoint->accept(peer_desc, local_desc);
+        if (status.ok()) {
+            local_desc.reply_msg.clear();
+            return 0;
+        }
+        const auto ep_status = endpoint->status();
+        const bool retired = ep_status == RdmaEndPoint::EP_DESTROYING ||
+                             ep_status == RdmaEndPoint::EP_DESTROYED;
+        if (retired) {
+            store->remove(endpoint.get());
+            if (attempt + 1 < kMaxAcceptAttempts) {
+                LOG(INFO) << "Retrying RDMA bootstrap after retiring stale "
+                             "endpoint for "
+                          << peer_desc.local_nic_path;
+                continue;
+            }
         }
         LOG(ERROR) << status.ToString();
         local_desc.reply_msg = status.ToString();
         return -1;
     }
 
-    return 0;
+    return -1;
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,

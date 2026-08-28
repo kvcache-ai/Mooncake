@@ -16,6 +16,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 
 #include <cassert>
+#include <exception>
 #include <set>
 #include <utility>
 
@@ -57,6 +58,24 @@ Status ControlClient::getSegmentDesc(const std::string& server_addr,
     return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
 }
 
+Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
+                                              BootstrapDesc& response) {
+    try {
+        response = json::parse(response_raw).get<BootstrapDesc>();
+    } catch (const std::exception& e) {
+        return Status::MalformedJson(
+            std::string("Invalid bootstrap response: ") + e.what() + LOC_MARK);
+    }
+    if (!response.reply_msg.empty()) {
+        return Status::RpcServiceError(response.reply_msg);
+    }
+    if (response.local_gid.empty()) {
+        return Status::InvalidArgument(
+            "Missing peer GID in bootstrap" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 Status ControlClient::bootstrap(const std::string& server_addr,
                                 const BootstrapDesc& request,
                                 BootstrapDesc& response) {
@@ -65,8 +84,7 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     request_raw = j.dump();
     CHECK_STATUS(tl_rpc_agent.call(server_addr, BootstrapRdma, request_raw,
                                    response_raw));
-    response = json::parse(response_raw).get<BootstrapDesc>();
-    return Status::OK();
+    return decodeBootstrapResponse(response_raw, response);
 }
 
 Status ControlClient::sendData(const std::string& server_addr,
