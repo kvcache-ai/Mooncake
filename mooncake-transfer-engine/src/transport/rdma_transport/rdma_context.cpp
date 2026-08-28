@@ -774,6 +774,12 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     return endpoint;
 }
 
+std::shared_ptr<RdmaEndPoint> RdmaContext::findEndpoint(
+    const std::string &peer_nic_path) {
+    if (!endpoint_store_) return nullptr;
+    return endpoint_store_->getEndpoint(peer_nic_path);
+}
+
 std::shared_ptr<RdmaEndPoint> RdmaContext::getEndpointByPtr(
     const RdmaEndPoint *endpoint_ptr) {
     return endpoint_store_->getEndpointByPtr(endpoint_ptr);

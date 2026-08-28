@@ -47,6 +47,26 @@ static const std::string &sourceLocationOrUnknown(Transport::Slice *slice) {
     return slice->source_location.empty() ? kUnknown : slice->source_location;
 }
 
+struct ActiveEndpointSetupResult {
+    int ret = 0;
+    bool endpoint_current = false;
+};
+
+static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
+    RdmaContext &context, const std::string &peer_nic_path,
+    const std::shared_ptr<RdmaEndPoint> &endpoint,
+    std::unique_lock<std::mutex> &endpoint_lifecycle_lock) {
+    const bool had_lifecycle_gate = endpoint_lifecycle_lock.owns_lock();
+    if (had_lifecycle_gate) endpoint_lifecycle_lock.unlock();
+
+    int ret = endpoint->setupConnectionsByActive();
+
+    if (had_lifecycle_gate) endpoint_lifecycle_lock.lock();
+    auto current_endpoint = context.findEndpoint(peer_nic_path);
+    return {ret, current_endpoint.get() == endpoint.get() &&
+                     endpoint->active() && !endpoint->retired()};
+}
+
 static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
                             uint64_t offset, size_t length,
                             const std::string &local_hca, int &buffer_id,
@@ -434,7 +454,22 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         if (!endpoint->connected()) {
-            int setup_ret = endpoint->setupConnectionsByActive();
+            auto setup_result = setupEndpointByActiveOutsideLifecycleGate(
+                context_, entry.first, endpoint, endpoint_lifecycle_lock);
+            if (!setup_result.endpoint_current) {
+                LOG(WARNING)
+                    << "Worker: Endpoint changed while active handshake was "
+                       "outstanding: "
+                    << entry.first << ", retrying queued slices";
+#ifdef CONFIG_CACHE_ENDPOINT
+                endpoint.reset();
+#endif
+                for (auto &slice : entry.second)
+                    failed_slice_list.push_back(slice);
+                entry.second.clear();
+                continue;
+            }
+            int setup_ret = setup_result.ret;
             if (setup_ret) {
                 // Active handshake setup failures are ambiguous: the failed
                 // side may be the peer rail, or this local RNIC may have just

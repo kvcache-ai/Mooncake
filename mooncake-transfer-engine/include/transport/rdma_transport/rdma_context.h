@@ -175,6 +175,8 @@ class RdmaContext {
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path,
                                            int cq_index);
+    std::shared_ptr<RdmaEndPoint> findEndpoint(
+        const std::string &peer_nic_path);
 
     std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr);
