@@ -19,16 +19,6 @@
 
 namespace mooncake {
 
-// Copy `cfg` and stamp the calling thread's current request_id (if any) into it.
-// Used by the read-route (GetReplicaList / BatchGetReplicaList) master RPCs to
-// propagate a per-request correlation id to the master.
-static GetReplicaListRequestConfig StampRequestId(GetReplicaListRequestConfig cfg) {
-    if (g_current_ctx) {
-        cfg.request_id = g_current_ctx->request_id;
-    }
-    return cfg;
-}
-
 template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
     static constexpr const char* value = "ExistKey";
@@ -254,8 +244,10 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", key);
 
-    auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(key, StampRequestId(config));
+    auto result =
+        invoke_rpc_with_attachment<&WrappedMasterService::GetReplicaList,
+                                   GetReplicaListResponse>(
+            current_request_id_attachment(), key, config);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -264,8 +256,9 @@ async_simple::coro::Lazy<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::AsyncGetReplicaList(std::string_view key,
                                   const GetReplicaListRequestConfig& config) {
     auto result =
-        co_await invoke_rpc_async<&WrappedMasterService::GetReplicaList,
-                                  GetReplicaListResponse>(key, StampRequestId(config));
+        co_await invoke_rpc_async_with_attachment<
+            &WrappedMasterService::GetReplicaList, GetReplicaListResponse>(
+            current_request_id_attachment(), key, config);
     co_return result;
 }
 
@@ -279,10 +272,10 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string_view>& keys,
         return {};
     }
 
-    auto result = invoke_rpc<
+    auto result = invoke_rpc_with_attachment<
         &WrappedMasterService::BatchGetReplicaList,
-        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>(keys,
-                                                                      StampRequestId(config));
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>(
+        current_request_id_attachment(), keys, config);
     if (result.has_value()) {
         timer.LogResponse("result=", result.value().size(), " requests");
     }
