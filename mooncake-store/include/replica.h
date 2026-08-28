@@ -11,6 +11,7 @@
 #include <optional>
 #include <string_view>
 #include <ostream>
+#include <ylt/struct_pack/compatible.hpp>
 
 #include "types.h"
 #include "allocator.h"
@@ -93,6 +94,13 @@ struct ReplicateConfig {
     std::string preferred_segment{};  // Deprecated: Single preferred segment
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
+
+    // Per-request correlation id propagated store -> master (write path).
+    // Carried as a struct_pack::compatible field: forward/backward compatible
+    // on the wire (old peers ignore the extra field; new peers see it null
+    // when absent), appended last for a gray upgrade. Mirrors
+    // GetReplicaListRequestConfig::request_id on the read path.
+    struct_pack::compatible<std::string> request_id;
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {

@@ -105,7 +105,8 @@ WrappedCentralizedMasterService::PutStart(const UUID& client_id,
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
-                             ", slice_length=", slice_length);
+                             ", slice_length=", slice_length,
+                             ", request_id=", config.request_id.value_or(""));
         },
         [&] {
             CentralizedMasterMetricManager::instance().inc_put_start_requests();
@@ -157,7 +158,8 @@ WrappedCentralizedMasterService::BatchPutStart(
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
-    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
+    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys,
+                     ", request_id=", config.request_id.value_or(""));
     CentralizedMasterMetricManager::instance().inc_batch_put_start_requests(
         total_keys);
 
