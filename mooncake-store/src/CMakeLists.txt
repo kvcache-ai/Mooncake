@@ -20,7 +20,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_repository.cpp
     master_metric_manager.cpp
     segment/region_driver.cpp
-    segment/region_initial_state.cpp
     segment.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
@@ -108,7 +107,6 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
 endif()
-
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
 
