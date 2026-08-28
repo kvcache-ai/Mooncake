@@ -1,7 +1,11 @@
 import os
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+
 import torch
 import torch.distributed as dist
-from typing import Any, Callable, List, Tuple, Optional, Union
+
+if TYPE_CHECKING:
+    from mooncake import ep
 
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -11,9 +15,8 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     return value.upper() in {"1", "ON", "TRUE", "YES"}
 
 
-_USE_MACA = (
-    _env_enabled("MOONCAKE_EP_USE_MACA")
-    or bool(getattr(torch.version, "maca", None))
+_USE_MACA = _env_enabled("MOONCAKE_EP_USE_MACA") or bool(
+    getattr(torch.version, "maca", None)
 )
 _USE_SPLIT_SEND_RECV = _USE_MACA
 
@@ -154,11 +157,7 @@ class Buffer:
         for peer in range(self.group_size):
             if peer == self.rank:
                 continue
-            ops.append(
-                dist.P2POp(
-                    dist.isend, self._maca_phase_token, peer, self.group
-                )
-            )
+            ops.append(dist.P2POp(dist.isend, self._maca_phase_token, peer, self.group))
             ops.append(
                 dist.P2POp(
                     dist.irecv,
@@ -241,7 +240,9 @@ class Buffer:
             peer_lids = [remote_lids[r].tolist() for r in range(self.group_size)]
 
             (subnet_prefix, interface_id) = self.runtime.get_gid()
-            subnet_prefix_t = torch.tensor([subnet_prefix], dtype=torch.int64, device="cuda")
+            subnet_prefix_t = torch.tensor(
+                [subnet_prefix], dtype=torch.int64, device="cuda"
+            )
             subnet_prefixes_list = [
                 torch.empty(1, dtype=torch.int64, device="cuda")
                 for _ in range(self.group_size)
@@ -249,7 +250,9 @@ class Buffer:
             dist.all_gather(subnet_prefixes_list, subnet_prefix_t, self.group)
             subnet_prefixes = torch.cat(subnet_prefixes_list).tolist()
 
-            interface_id_t = torch.tensor([interface_id], dtype=torch.int64, device="cuda")
+            interface_id_t = torch.tensor(
+                [interface_id], dtype=torch.int64, device="cuda"
+            )
             interface_ids_list = [
                 torch.empty(1, dtype=torch.int64, device="cuda")
                 for _ in range(self.group_size)
@@ -259,8 +262,13 @@ class Buffer:
 
             active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
             self.runtime.sync_ibgda_peers(
-                raddrs, rkeys, peer_qpns, peer_lids,
-                subnet_prefixes, interface_ids, active_ranks_mask
+                raddrs,
+                rkeys,
+                peer_qpns,
+                peer_lids,
+                subnet_prefixes,
+                interface_ids,
+                active_ranks_mask,
             )
 
         if self.group_size == 1:
@@ -276,7 +284,9 @@ class Buffer:
                     local_handle_ints, dtype=torch.int32, device="cuda"
                 )
                 handles = [
-                    torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
+                    torch.empty(
+                        len(local_handle_ints), dtype=torch.int32, device="cuda"
+                    )
                     for _ in range(self.group_size)
                 ]
                 dist.all_gather(handles, local_handle_tensor, self.group)
@@ -385,9 +395,7 @@ class Buffer:
         assert num_experts % self.group_size == 0
         caller_active_ranks = active_ranks
         if active_ranks is None:
-            active_ranks = self._active_ranks_tensor(
-                device=x.device, dtype=torch.int32
-            )
+            active_ranks = self._active_ranks_tensor(device=x.device, dtype=torch.int32)
         else:
             assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
             assert active_ranks.dtype == torch.int32
@@ -473,9 +481,7 @@ class Buffer:
             )
             packed_recv_x_scales = None
             if use_fp8:
-                assert (
-                    self.group_size * num_max_dispatch_tokens_per_rank
-                ) % 4 == 0
+                assert (self.group_size * num_max_dispatch_tokens_per_rank) % 4 == 0
                 packed_recv_x_scales = torch.empty(
                     (
                         num_local_experts,
@@ -559,9 +565,7 @@ class Buffer:
         assert topk_weights.dtype == torch.float32
         caller_active_ranks = active_ranks
         if active_ranks is None:
-            active_ranks = self._active_ranks_tensor(
-                device=x.device, dtype=torch.int32
-            )
+            active_ranks = self._active_ranks_tensor(device=x.device, dtype=torch.int32)
         else:
             assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
             assert active_ranks.dtype == torch.int32

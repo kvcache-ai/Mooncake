@@ -1,16 +1,45 @@
 #include "segment.h"
 
+#include "master_metric_manager.h"
+
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <boost/functional/hash.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <functional>
+#include <future>
+#include <mutex>
+#include <semaphore>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mooncake {
+
+namespace {
+
+class BlockingOffsetBufferAllocator : public OffsetBufferAllocator {
+   public:
+    BlockingOffsetBufferAllocator(std::string segment_name, size_t base,
+                                  size_t size, std::string transport_endpoint)
+        : OffsetBufferAllocator(std::move(segment_name), base, size,
+                                std::move(transport_endpoint)) {}
+
+    void deallocate(AllocatedBuffer* handle) override {
+        entered_.release();
+        resume_.acquire();
+        OffsetBufferAllocator::deallocate(handle);
+    }
+
+    std::binary_semaphore entered_{0};
+    std::binary_semaphore resume_{0};
+};
+
+}  // namespace
 
 // Test fixture for Segment tests
 class SegmentTest : public ::testing::Test {
@@ -112,6 +141,33 @@ class SegmentTest : public ::testing::Test {
         return std::find(allocators->begin(), allocators->end(),
                          mounted_segment.buf_allocator) != allocators->end();
     }
+    void InstallSharedCxlAllocatorForTesting(
+        SegmentManager& segment_manager,
+        const std::shared_ptr<BufferAllocatorBase>& allocator,
+        const std::vector<Segment>& segments) {
+        if (segment_manager.cxl_global_allocator_ != allocator) {
+            allocator->AttachUsageTracker(segment_manager.usage_tracker_);
+            segment_manager.cxl_global_allocator_ = allocator;
+        }
+        for (const auto& segment : segments) {
+            segment_manager.mounted_segments_[segment.id] = {
+                segment, SegmentStatus::OK, allocator};
+        }
+    }
+
+    std::unique_lock<std::shared_mutex> HoldSegmentMutexForTesting(
+        SegmentManager& segment_manager) {
+        return std::unique_lock<std::shared_mutex>(
+            segment_manager.segment_mutex_);
+    }
+
+    std::shared_ptr<BufferAllocatorBase> GetNoFAllocatorForTesting(
+        NoFSegmentManager& segment_manager, const UUID& segment_id) {
+        auto it = segment_manager.mounted_segments_.find(segment_id);
+        return it == segment_manager.mounted_segments_.end()
+                   ? nullptr
+                   : it->second.buf_allocator;
+    }
 };
 
 // Mount Segment Operations Tests:
@@ -132,6 +188,312 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
 
     // Verify segment is properly mounted
     ValidateMountedSegment(segment_manager, segment, client_id);
+}
+
+TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "usage_snapshot_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x100000000;
+    UUID client_id = generate_uuid();
+
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+        allocator = segment_access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(allocator, nullptr);
+
+    auto buffer = allocator->allocate(kAllocationSize);
+    ASSERT_NE(buffer, nullptr);
+
+    auto snapshot = segment_manager.GetMemoryUsageSnapshot();
+    auto usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
+    ASSERT_EQ(snapshot.segments.size(), 1u);
+    EXPECT_EQ(snapshot.segments.at(segment.name).used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.segments.at(segment.name).capacity_bytes, kSegmentSize);
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.SetSegmentStatusByName(
+                      segment.name, SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+    }
+    snapshot = segment_manager.GetMemoryUsageSnapshot();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+
+    buffer.reset();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+    allocator.reset();
+
+    snapshot = segment_manager.GetMemoryUsageSnapshot();
+    usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(snapshot.used_bytes, 0u);
+    EXPECT_EQ(snapshot.capacity_bytes, 0u);
+    EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.0);
+    EXPECT_EQ(usage.used_bytes, 0u);
+    EXPECT_EQ(usage.capacity_bytes, 0u);
+}
+
+TEST_F(SegmentTest, AggregateMemoryUsageDoesNotTakeSegmentMutex) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    auto segment_lock = HoldSegmentMutexForTesting(segment_manager);
+    auto usage = std::async(std::launch::async, [&segment_manager] {
+        return segment_manager.GetMemoryUsage();
+    });
+
+    const auto status = usage.wait_for(std::chrono::seconds(1));
+    segment_lock.unlock();
+
+    ASSERT_EQ(status, std::future_status::ready);
+    EXPECT_EQ(usage.get().capacity_bytes, 0u);
+}
+
+TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "usage_race_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x1C0000000;
+    UUID client_id = generate_uuid();
+
+    auto blocking = std::make_shared<BlockingOffsetBufferAllocator>(
+        segment.name, segment.base, segment.size, segment.te_endpoint);
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+        auto original = segment_access.GetAllocator(segment.id);
+        ASSERT_NE(original, nullptr);
+        ASSERT_TRUE(segment_access.ReplaceAllocators(
+            {{segment.id, original, blocking}}));
+    }
+    auto buffer = blocking->allocate(kAllocationSize);
+    ASSERT_NE(buffer, nullptr);
+
+    {
+        std::thread dealloc_thread([&buffer] { buffer.reset(); });
+        struct ResumeAndJoin {
+            BlockingOffsetBufferAllocator& blocking;
+            std::thread& thread;
+            ~ResumeAndJoin() {
+                blocking.resume_.release();
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+        } resume_and_join{*blocking, dealloc_thread};
+
+        ASSERT_TRUE(blocking->entered_.try_acquire_for(std::chrono::seconds(5)))
+            << "deallocate did not enter BlockingOffsetBufferAllocator";
+
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+    blocking.reset();
+
+    const auto usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(usage.used_bytes, 0u);
+    EXPECT_EQ(usage.capacity_bytes, 0u);
+}
+
+TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kOldAllocationSize = 4 * 1024 * 1024;
+    constexpr size_t kRestoredAllocationSize = 8 * 1024 * 1024;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "usage_replacement_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x180000000;
+    UUID client_id = generate_uuid();
+
+    std::shared_ptr<BufferAllocatorBase> old_allocator;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+        old_allocator = segment_access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(old_allocator, nullptr);
+    auto old_buffer = old_allocator->allocate(kOldAllocationSize);
+    ASSERT_NE(old_buffer, nullptr);
+
+    auto replacement = std::make_shared<OffsetBufferAllocator>(
+        segment.name, segment.base, segment.size, segment.te_endpoint);
+    auto restored_buffer = replacement->allocate(kRestoredAllocationSize);
+    ASSERT_NE(restored_buffer, nullptr);
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_TRUE(segment_access.ReplaceAllocators(
+            {{segment.id, old_allocator, replacement}}));
+    }
+    old_allocator.reset();
+
+    auto usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(usage.used_bytes, kRestoredAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+
+    old_buffer.reset();
+    usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(usage.used_bytes, kRestoredAllocationSize);
+
+    restored_buffer.reset();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+    replacement.reset();
+    EXPECT_EQ(segment_manager.GetMemoryUsage().capacity_bytes, 0u);
+}
+
+TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET,
+                                   /*enable_cxl=*/true);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "cxl_pool", 0x200000000, kSegmentSize, "cxl_pool");
+    InstallSharedCxlAllocatorForTesting(segment_manager, allocator, {});
+
+    auto buffer = allocator->allocate(kAllocationSize);
+    ASSERT_NE(buffer, nullptr);
+
+    auto snapshot = segment_manager.GetMemoryUsageSnapshot();
+    auto usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+
+    Segment first;
+    first.id = generate_uuid();
+    first.name = "cxl_client_a";
+    first.protocol = "cxl";
+    Segment second;
+    second.id = generate_uuid();
+    second.name = "cxl_client_b";
+    second.protocol = "cxl";
+    InstallSharedCxlAllocatorForTesting(segment_manager, allocator,
+                                        {first, second});
+
+    snapshot = segment_manager.GetMemoryUsageSnapshot();
+    usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+    ASSERT_EQ(snapshot.segments.size(), 1u);
+    EXPECT_EQ(snapshot.segments.at("cxl_pool").used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.segments.at("cxl_pool").capacity_bytes, kSegmentSize);
+}
+
+TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+
+    NoFSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "nof_usage_snapshot_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x300000000;
+    segment.te_endpoint = "nof_usage_snapshot_endpoint";
+    UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+    }
+    auto allocator = GetNoFAllocatorForTesting(segment_manager, segment.id);
+    ASSERT_NE(allocator, nullptr);
+    auto buffer = allocator->allocate(kAllocationSize);
+    ASSERT_NE(buffer, nullptr);
+
+    auto snapshot = segment_manager.GetUsageSnapshot();
+    auto usage = segment_manager.GetUsage();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
+
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_nof_size();
+    metrics.reset_total_nof_capacity();
+    EXPECT_EQ(metrics.get_allocated_nof_size(), 0);
+    EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
+
+    snapshot = segment_manager.GetUsageSnapshot();
+    usage = segment_manager.GetUsage();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
+
+    // Restore global gauges before teardown because allocator and segment
+    // cleanup still emit their matching decrements.
+    metrics.inc_allocated_nof_size("", kAllocationSize);
+    metrics.inc_total_nof_capacity("", kSegmentSize);
+    buffer.reset();
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+    allocator.reset();
+    EXPECT_EQ(segment_manager.GetUsage().used_bytes, 0u);
+    EXPECT_EQ(segment_manager.GetUsage().capacity_bytes, 0u);
 }
 
 // MountSegmentDuplicate Tests:

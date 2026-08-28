@@ -32,6 +32,7 @@
 #include "tent/runtime/topology.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/params.h"
+#include "tent/transport/rdma/quota.h"
 #include "tent/transport/rdma/rdma_transport.h"
 #include "tent/transport/rdma/workers.h"
 
@@ -120,6 +121,27 @@ std::shared_ptr<Config> makeRdmaConfig() {
     return config;
 }
 
+std::shared_ptr<Topology> topologyWithRdmaNics(size_t count) {
+    auto topology = std::make_shared<Topology>();
+    for (size_t i = 0; i < count; ++i) {
+        Topology::NicEntry nic;
+        nic.name = "mlx5_" + std::to_string(i);
+        nic.type = Topology::NIC_RDMA;
+        nic.numa_node = 0;
+        topology->nic_list_.push_back(std::move(nic));
+    }
+
+    Topology::MemEntry memory;
+    memory.name = "cpu:0";
+    memory.type = Topology::MEM_HOST;
+    memory.numa_node = 0;
+    for (size_t i = 0; i < count; ++i) {
+        memory.device_list[0].push_back(static_cast<int>(i));
+    }
+    topology->mem_list_.push_back(std::move(memory));
+    return topology;
+}
+
 bool waitBatchDone(TransferEngine& engine, BatchID batch) {
     TransferStatus status;
     for (int i = 0; i < 10000; ++i) {
@@ -150,6 +172,41 @@ TEST(RdmaSubBatchTest, ReportsTaskCount) {
     batch.task_list.push_back(nullptr);
     batch.task_list.push_back(nullptr);
     EXPECT_EQ(batch.size(), 2);
+}
+
+TEST(DeviceSelectorTest, PerSliceAllocationHonorsPolicy) {
+    auto topology = topologyWithRdmaNics(3);
+
+    {
+        DeviceSelector selector;
+        ASSERT_TRUE(selector.loadTopology(topology).ok());
+        int chosen_device = -1;
+        ASSERT_TRUE(
+            selector
+                .allocate(4096, "cpu:0", chosen_device, PRIO_HIGH, 1ULL << 1)
+                .ok());
+        EXPECT_EQ(chosen_device, 1);
+    }
+
+    {
+        DeviceSelector selector;
+        ASSERT_TRUE(selector.loadTopology(topology).ok());
+        auto params = selector.getSchedulingParams();
+        params.device_base_priorities = {0, 1, 2};
+        params.local_rotation_interval_us = 0;
+        params.numa_tier_weights[0] = 1.0;
+        params.numa_tier_weights[1] = 1.0;
+        params.numa_tier_weights[2] = 1.0;
+        params.score_jitter_range = 0.0;
+        selector.setSchedulingParams(params);
+
+        int chosen_device = -1;
+        ASSERT_TRUE(selector
+                        .allocate(4096, "cpu:0", chosen_device, PRIO_LOW,
+                                  (1ULL << 1) | (1ULL << 2))
+                        .ok());
+        EXPECT_EQ(chosen_device, 2);
+    }
 }
 
 // context_set_ is subscripted by NicID, so it must keep one slot per NIC even

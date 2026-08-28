@@ -184,7 +184,12 @@ echo "Building wheel package..."
 # combined-wheel builder. Each tracked source remains in its authoritative tree.
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
-MIGRATED_PYTHON_MODULES=(http_metadata_server.py)
+MIGRATED_PYTHON_MODULES=(
+    http_metadata_server.py
+    ep.py
+    mooncake_ep_buffer.py
+    mooncake_elastic_buffer.py
+)
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
 cleanup_migrated_python_staging() {

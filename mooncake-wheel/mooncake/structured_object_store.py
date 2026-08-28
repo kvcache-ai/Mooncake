@@ -51,6 +51,8 @@ class BundleStore(Protocol):
 
     def remove(self, key: str, force: bool = False) -> int: ...
 
+    def is_exist(self, key: str) -> int: ...
+
 
 @dataclass(frozen=True)
 class BundleTransferPolicy:
@@ -558,6 +560,58 @@ class MooncakeBundleTransfer:
         """Remove all Mooncake objects that belong to a stored bundle."""
         self._bundle_store.remove_bundle(ref)
 
+    def cleanup_dataproto_append(
+        self, previous: DataProtoRefLike, appended: DataProtoRefLike
+    ) -> None:
+        """Remove an unpublished append without touching the previous handle."""
+        previous = _resolve_dataproto_ref(previous)
+        appended = _resolve_dataproto_ref(appended)
+        for stage, stage_ref in appended.stage_refs.items():
+            previous_stage_ref = previous.stage_refs.get(stage)
+            if previous_stage_ref is None:
+                self.remove_bundle(stage_ref)
+                continue
+            if stage_ref.manifest_key == previous_stage_ref.manifest_key:
+                continue
+
+            is_exist = getattr(self.store, "is_exist", None)
+            if callable(is_exist) and is_exist(stage_ref.manifest_key) == 0:
+                continue
+            new_manifest = self._bundle_store.resolve_manifest(stage_ref)
+            old_buffer_names = {
+                location.member
+                for location in previous.field_index.values()
+                if location.stage == stage
+            }
+            for name, encoded in previous.encoded_non_tensor.items():
+                if previous.field_index[name].stage == stage:
+                    old_buffer_names.update(encoded["payload_members"].values())
+            new_payloads = [
+                payload
+                for name, payload in new_manifest["buffers"].items()
+                if name not in old_buffer_names
+            ]
+            new_object_ids = {
+                self._bundle_store._object_id_from_bundle_key(payload["key"])
+                for payload in new_payloads
+            }
+            cleanup_keys = [
+                *self._bundle_store.payload_keys(new_manifest["meta"]),
+                *[
+                    chunk["key"]
+                    for payload in new_payloads
+                    for chunk in payload["chunks"]
+                ],
+            ]
+            cleanup_keys.extend(
+                key
+                for key in new_manifest.get("cleanup_keys", [])
+                if self._bundle_store._object_id_from_bundle_key(key)
+                in new_object_ids
+            )
+            self._bundle_store.remove_keys(cleanup_keys, strict=True)
+            self._bundle_store.remove_keys([stage_ref.manifest_key], strict=True)
+
     def put_structured_object(
         self,
         payload: StructuredObjectPayload,
@@ -658,6 +712,12 @@ class MooncakeBundleTransfer:
             items_to_visit = None
             if isinstance(value, Mapping):
                 items_to_visit = value.values()
+            elif hasattr(value, "batch") and hasattr(value, "non_tensor_batch"):
+                items_to_visit = (
+                    value.batch,
+                    value.non_tensor_batch,
+                    getattr(value, "meta_info", None),
+                )
             elif isinstance(value, (list, tuple)):
                 items_to_visit = value
             elif isinstance(value, np.ndarray) and value.dtype == object:
@@ -3690,11 +3750,39 @@ class _BundleManifestStore:
         return RemoteBundleRef(manifest_key=manifest_key, manifest=manifest)
 
     def remove_bundle(self, ref: RemoteBundleRef | Mapping[str, Any]) -> None:
-        manifest = self.resolve_manifest(ref)
+        manifest_key = (
+            ref.manifest_key
+            if isinstance(ref, RemoteBundleRef)
+            else ref.get("manifest_key")
+        )
+        embedded_manifest = (
+            ref.manifest if isinstance(ref, RemoteBundleRef) else ref.get("manifest")
+        )
+        is_exist = getattr(self._store, "is_exist", None)
+        if (
+            not embedded_manifest
+            and isinstance(manifest_key, str)
+            and callable(is_exist)
+        ):
+            status = is_exist(manifest_key)
+            if status == 0:
+                return
+            if status != 1:
+                raise RuntimeError(f"is_exist failed for {manifest_key}: {status}")
+        try:
+            manifest = self.resolve_manifest(ref)
+        except Exception:
+            if (
+                isinstance(manifest_key, str)
+                and callable(is_exist)
+                and is_exist(manifest_key) == 0
+            ):
+                return
+            raise
         keys = self._payload_keys(manifest)
         keys.extend(manifest.get("cleanup_keys", []))
-        keys.append(self._manifest_key(ref, manifest))
         _cleanup_keys(self._store, keys, strict=True)
+        _cleanup_keys(self._store, [self._manifest_key(ref, manifest)], strict=True)
 
     def manifest_key(self, ref: RemoteBundleRef | Mapping[str, Any]) -> str:
         return self._manifest_key(ref, self.resolve_manifest(ref))
@@ -6004,7 +6092,13 @@ def _deserialize_nested_tensor_payload(
 ) -> Any:
     payload_format = field_spec.get("format", "torch_save")
     if payload_format == "torch_save":
-        return _deserialize_torch_save_payload(payload)
+        value = _deserialize_torch_save_payload(payload)
+        return _nested_tensor_from_parts(
+            value.values(),
+            value.offsets(),
+            value.lengths(),
+            int(getattr(value, "_ragged_idx", 1)),
+        )
     if payload_format != "tensor_parts":
         raise ValueError(f"unsupported nested tensor payload format: {payload_format}")
 
@@ -6017,7 +6111,9 @@ def _deserialize_nested_tensor_payload(
     offset = 0
     for part_size in part_bytes:
         if (
-            not isinstance(part_size, int) or isinstance(part_size, bool) or part_size <= 0
+            not isinstance(part_size, int)
+            or isinstance(part_size, bool)
+            or part_size <= 0
         ):
             raise ValueError("nested tensor payload has invalid part size")
         end = offset + int(part_size)
@@ -6028,11 +6124,30 @@ def _deserialize_nested_tensor_payload(
     if offset != len(payload):
         raise ValueError("nested tensor payload has trailing bytes")
 
-    return _torch.nested.nested_tensor_from_jagged(
+    return _nested_tensor_from_parts(
         tensors[0],
-        offsets=tensors[1],
-        lengths=tensors[2] if expected_parts == 3 else None,
-        jagged_dim=int(field_spec.get("ragged_idx", 1)),
+        tensors[1],
+        tensors[2] if expected_parts == 3 else None,
+        int(field_spec.get("ragged_idx", 1)),
+    )
+
+
+def _nested_tensor_from_parts(
+    values: Any, offsets: Any, lengths: Any, ragged_idx: int
+) -> Any:
+    sequence_lengths = lengths if lengths is not None else offsets.diff()
+    if sequence_lengths.numel():
+        min_seqlen = int(sequence_lengths.min().item())
+        max_seqlen = int(sequence_lengths.max().item())
+    else:
+        min_seqlen = max_seqlen = 0
+    return _torch.nested.nested_tensor_from_jagged(
+        values,
+        offsets=offsets,
+        lengths=lengths,
+        jagged_dim=ragged_idx,
+        min_seqlen=min_seqlen,
+        max_seqlen=max_seqlen,
     )
 
 
