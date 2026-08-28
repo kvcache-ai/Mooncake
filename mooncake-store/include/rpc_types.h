@@ -38,7 +38,7 @@ struct GetReplicaListRequestConfig {
     // Carried as a struct_pack::compatible field: forward/backward compatible
     // on the wire (old peers ignore the extra field; new peers see it null
     // when absent), so client and master can be upgraded independently (gray).
-    struct_pack::compatible<std::string> request_id;
+    struct_pack::compatible<std::string, 0> request_id;
 };
 YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config, request_id);
 

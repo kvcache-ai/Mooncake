@@ -100,7 +100,7 @@ struct ReplicateConfig {
     // on the wire (old peers ignore the extra field; new peers see it null
     // when absent), appended last for a gray upgrade. Mirrors
     // GetReplicaListRequestConfig::request_id on the read path.
-    struct_pack::compatible<std::string> request_id;
+    struct_pack::compatible<std::string, 0> request_id;
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
