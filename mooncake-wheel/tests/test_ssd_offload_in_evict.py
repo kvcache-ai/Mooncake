@@ -428,6 +428,11 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.store.remove(key)
             index += 1
         print("Cleanup completed")  
+        self.assertEqual(
+            get_stats.failure_count,
+            0,
+            f"{get_stats.failure_count} concurrent read(s) failed",
+        )
 
     def test_batch_get_in_evict_operations(self):
         """Test batch Put/Get operations with eviction scenario
