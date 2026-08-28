@@ -301,5 +301,6 @@ extra_config:
 | `MC_NOF_SUBMIT_CHUNK_BYTES` | Size of each I/O operation submitted to SPDK. | 128KB |
 | `MC_NOF_INFLIGHT_BYTES_LIMIT` | Maximum number of in-flight I/O bytes allowed in the system. | 32MB |
 | `MC_NOF_BACKEND` | NoF backend pair: `spdk` or `none`. `none` disables NoF at runtime in a `USE_NOF` build — one binary can be deployed on nodes without a working SPDK/hugepage environment. Case-insensitive; unrecognized values fall back to `spdk` with a warning. | `spdk` |
+| `MC_NOF_IOVA_MODE` | SPDK IOVA mode passed to `spdk_env_init`: `pa` or `va`. Set `va` inside containers without physical-address access (restricted `/proc/self/pagemap`), where the default PA mode fails with `Cannot use IOVA as 'PA'`. | unset (SPDK default, PA-preferred) |
 
 These three parameters together provide QoS control for SPDK NoF I/O.

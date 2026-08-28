@@ -133,9 +133,22 @@ class SpdkEnvGuard {
         struct spdk_env_opts opts;
         spdk_env_opts_init(&opts);
         opts.name = "mooncake";
+        // Containers without physical-address access (restricted
+        // /proc/self/pagemap) cannot run IOVA-as-PA; MC_NOF_IOVA_MODE lets
+        // operators opt into "va" there. When unset, SPDK keeps its
+        // PA-preferred default (matching baseline SpdkWrapper).
+        const char* iova_mode = std::getenv("MC_NOF_IOVA_MODE");
+        if (iova_mode && *iova_mode != '\0') {
+            opts.iova_mode = iova_mode;
+        }
         ok_ = (spdk_env_init(&opts) == 0);
         if (!ok_) {
-            LOG(ERROR) << "spdk_env_init failed";
+            LOG(ERROR) << "spdk_env_init failed"
+                       << (iova_mode && *iova_mode != '\0'
+                               ? ""
+                               : " (in a container without "
+                                 "physical-address access, set "
+                                 "MC_NOF_IOVA_MODE=va)");
         }
     }
 
