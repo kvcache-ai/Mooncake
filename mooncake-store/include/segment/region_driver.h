@@ -109,6 +109,10 @@ struct RegionDriverConfig {
 tl::expected<RegionDriverRegistry, ErrorCode> CreateRegionDrivers(
     const RegionDriverConfig& config);
 
+// Converts descriptors that have already been canonicalized to
+// spec.transport_endpoint. Segment-name aliases must be resolved by the
+// recovery layer that owns the segment/catalog context before calling this
+// helper.
 tl::expected<std::vector<LiveAllocation>, ErrorCode> BuildRegionLiveAllocations(
     const RegionResourceSpec& spec,
     std::span<const AllocatedBuffer::Descriptor> descriptors);

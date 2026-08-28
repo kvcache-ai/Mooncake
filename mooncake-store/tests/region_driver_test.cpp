@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "master_metric_manager.h"
+
 namespace mooncake {
 namespace {
 
@@ -81,6 +83,10 @@ TEST(RegionDriverTest, RestoreInputValidatesEndpointBoundsAndPreservesOrder) {
     bad_endpoint[0].transport_endpoint_ = "other";
     EXPECT_EQ(BuildRegionLiveAllocations(spec, bad_endpoint).error(),
               ErrorCode::INVALID_PARAMS);
+    auto segment_name_alias = descriptors;
+    segment_name_alias[0].transport_endpoint_ = spec.name;
+    EXPECT_EQ(BuildRegionLiveAllocations(spec, segment_name_alias).error(),
+              ErrorCode::INVALID_PARAMS);
     auto out_of_bounds = descriptors;
     out_of_bounds[0].buffer_address_ = spec.base + spec.size - 1024;
     EXPECT_EQ(BuildRegionLiveAllocations(spec, out_of_bounds).error(),
@@ -137,6 +143,28 @@ TEST(RegionDriverTest, CxlTargetProducesCxlDescriptors) {
     const auto descriptor = buffer->get_descriptor();
     EXPECT_EQ(descriptor.protocol_, "cxl");
     EXPECT_EQ(descriptor.transport_endpoint_, spec.name);
+}
+
+TEST(RegionDriverTest, CxlDriverOwnsCapacityMetricLifetime) {
+    constexpr char kCxlPath[] = "region-driver-cxl-metric";
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t total_before = metrics.get_total_mem_capacity();
+    const int64_t segment_before =
+        metrics.get_segment_total_mem_capacity(kCxlPath);
+
+    {
+        RegionDriverConfig config;
+        config.cxl = CxlRegionDriverConfig{kCxlPath, kRegionSize};
+        auto drivers = CreateRegionDrivers(config);
+        ASSERT_TRUE(drivers.has_value());
+        EXPECT_EQ(metrics.get_total_mem_capacity(),
+                  total_before + static_cast<int64_t>(kRegionSize));
+        EXPECT_EQ(metrics.get_segment_total_mem_capacity(kCxlPath),
+                  segment_before + static_cast<int64_t>(kRegionSize));
+    }
+
+    EXPECT_EQ(metrics.get_total_mem_capacity(), total_before);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(kCxlPath), segment_before);
 }
 
 TEST(RegionDriverTest, InvalidCxlConfigIsReturnedExplicitly) {

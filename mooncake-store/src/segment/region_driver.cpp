@@ -4,6 +4,8 @@
 #include <map>
 #include <utility>
 
+#include "master_metric_manager.h"
+
 namespace mooncake {
 namespace {
 
@@ -75,8 +77,8 @@ class MemoryRegionDriver final : public RegionDriver {
 class CxlRegionDriver final : public RegionDriver {
    public:
     explicit CxlRegionDriver(
-        std::shared_ptr<BufferAllocatorBase> global_allocator)
-        : global_allocator_(std::move(global_allocator)) {}
+        std::shared_ptr<BufferAllocatorBase> global_allocator);
+    ~CxlRegionDriver() override;
 
     tl::expected<PreparedRegionResource, ErrorCode> PrepareOpen(
         const RegionResourceSpec& spec,
@@ -248,6 +250,22 @@ MemoryRegionDriver::PrepareAdopt(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return Stage(spec.id, MakeNativeResource(std::move(allocator)));
+}
+
+CxlRegionDriver::CxlRegionDriver(
+    std::shared_ptr<BufferAllocatorBase> global_allocator)
+    : global_allocator_(std::move(global_allocator)) {
+    MasterMetricManager::instance().inc_total_mem_capacity(
+        global_allocator_->getSegmentName(), global_allocator_->capacity());
+}
+
+CxlRegionDriver::~CxlRegionDriver() {
+    const std::string name = global_allocator_->getSegmentName();
+    auto& metrics = MasterMetricManager::instance();
+    metrics.dec_total_mem_capacity(name, global_allocator_->capacity());
+    if (metrics.get_segment_total_mem_capacity(name) == 0) {
+        metrics.remove_segment_metrics(name);
+    }
 }
 
 tl::expected<PreparedRegionResource, ErrorCode> CxlRegionDriver::PrepareOpen(
