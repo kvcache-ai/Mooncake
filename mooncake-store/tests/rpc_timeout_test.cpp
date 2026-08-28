@@ -5,6 +5,8 @@
 //   2. End-to-end: MC_RPC_TIMEOUT_MS shortens the per-request deadline so that
 //      an unresponsive master surfaces ErrorCode::RPC_TIMEOUT (not RPC_FAIL),
 //      and it does so within the configured budget rather than the 30s default.
+//   3. MasterClient does not add its own retry delay around a failed leader
+//      connection; the HA monitor owns that retry schedule.
 //
 // The end-to-end test points a MasterClient at a "black hole" TCP listener: a
 // socket that accepts the connection (so connect() succeeds) but never sends a
@@ -117,6 +119,48 @@ TEST(RpcTimeoutTest, RpcTimesOutAgainstUnresponsiveMaster) {
                                 "timeout still active?)";
 }
 
+// A leader view can become visible before the new master has finished binding
+// its RPC endpoint.  A failed connect must return to the HA monitor promptly;
+// the monitor owns the retry loop and cannot make progress while the client
+// pool performs its default multi-attempt reconnect sequence.  Reserve and
+// release an ephemeral loopback port so the failure is deterministic and does
+// not depend on an external black-hole route.
+TEST(RpcTimeoutTest, MasterConnectDoesNotRetryFailedConnection) {
+    int probe_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(probe_fd, 0) << "failed to create probe socket";
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+    addr.sin_port = 0;
+    ASSERT_EQ(
+        ::bind(probe_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0)
+        << "failed to reserve loopback port";
+
+    socklen_t len = sizeof(addr);
+    ASSERT_EQ(::getsockname(probe_fd, reinterpret_cast<sockaddr*>(&addr), &len),
+              0);
+    const auto port = ntohs(addr.sin_port);
+    ASSERT_GT(port, 0);
+    ASSERT_EQ(::close(probe_fd), 0);
+
+    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "100", 1), 0);
+
+    MasterClient client(generate_uuid());
+    const auto start = std::chrono::steady_clock::now();
+    const auto rc = client.Connect("127.0.0.1:" + std::to_string(port));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+
+    ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+
+    EXPECT_EQ(rc, ErrorCode::RPC_FAIL);
+    EXPECT_LT(elapsed, 500)
+        << "MasterClient retried a failed leader connection internally for "
+        << elapsed << "ms";
+}
+
 // The offload data path (store->store) builds its own client pool, separate
 // from the master pool, and used to ignore these variables entirely: its
 // connect timeout stayed at the built-in 30s, so a read that picked a peer
@@ -153,6 +197,8 @@ TEST(RpcTimeoutTest, TimeoutEnvOverridesAreOptIn) {
 
     // The master pool is built from the same helper, so it sees them too.
     auto master_config = detail::MakeMasterRpcClientPoolConfig();
+    EXPECT_EQ(master_config.connect_retry_count, 0u);
+    EXPECT_EQ(master_config.reconnect_wait_time, std::chrono::milliseconds(0));
     EXPECT_EQ(master_config.client_config.connect_timeout_duration,
               std::chrono::milliseconds(1000));
 
