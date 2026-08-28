@@ -2906,6 +2906,10 @@ BucketStorageBackend::PrepareEviction(
         // Container quotas (emptyDir sizeLimit / cgroup) are invisible to
         // fs::space(); when configured, also bound available by physical cap.
         if (bucket_backend_config_.max_physical_bytes > 0) {
+            // In-flight evictions count bytes in both total_size_ and
+            // pending_eviction_size_ until removal completes, so `used`
+            // double-counts briefly. That biases toward early eviction
+            // (safer when a kubelet sizeLimit is looming).
             const int64_t used = total_size_ + pending_eviction_size_ +
                                  pending_write_size_;
             const int64_t remaining =
