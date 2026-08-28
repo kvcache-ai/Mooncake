@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <string>
 
 #include "types.h"
 #include "replica.h"
@@ -32,8 +33,14 @@ struct GetReplicaListRequestConfig {
     static const size_t RETURN_ALL_CANDIDATES = 0;
     size_t max_candidates = RETURN_ALL_CANDIDATES;
     std::optional<P2PGetReplicaListConfigExtra> p2p_config;
+    // Per-request correlation id propagated store -> master (read path).
+    // Filled by the client from the thread-local RequestContext; read by the
+    // master for tracing/logging. Note: changes the struct_pack wire schema,
+    // so client and master must be built together (non-gray; attachment-based
+    // propagation is reserved for Phase 2 in plan.md).
+    std::string request_id;
 };
-YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config);
+YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config, request_id);
 
 // config for filter replicas in read route
 typedef GetReplicaListRequestConfig ReadRouteConfig;

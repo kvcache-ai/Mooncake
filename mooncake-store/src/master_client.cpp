@@ -15,8 +15,19 @@
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
+#include "request_context.h"
 
 namespace mooncake {
+
+// Copy `cfg` and stamp the calling thread's current request_id (if any) into it.
+// Used by the read-route (GetReplicaList / BatchGetReplicaList) master RPCs to
+// propagate a per-request correlation id to the master.
+static GetReplicaListRequestConfig StampRequestId(GetReplicaListRequestConfig cfg) {
+    if (g_current_ctx) {
+        cfg.request_id = g_current_ctx->request_id;
+    }
+    return cfg;
+}
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
@@ -244,7 +255,7 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     timer.LogRequest("object_key=", key);
 
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(key, config);
+                             GetReplicaListResponse>(key, StampRequestId(config));
     timer.LogResponseExpected(result);
     return result;
 }
@@ -254,7 +265,7 @@ MasterClient::AsyncGetReplicaList(std::string_view key,
                                   const GetReplicaListRequestConfig& config) {
     auto result =
         co_await invoke_rpc_async<&WrappedMasterService::GetReplicaList,
-                                  GetReplicaListResponse>(key, config);
+                                  GetReplicaListResponse>(key, StampRequestId(config));
     co_return result;
 }
 
@@ -271,7 +282,7 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string_view>& keys,
     auto result = invoke_rpc<
         &WrappedMasterService::BatchGetReplicaList,
         std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>(keys,
-                                                                      config);
+                                                                      StampRequestId(config));
     if (result.has_value()) {
         timer.LogResponse("result=", result.value().size(), " requests");
     }

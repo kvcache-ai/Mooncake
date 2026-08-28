@@ -8,6 +8,7 @@
 #include "types.h"
 #include "p2p/master/p2p_rpc_types.h"
 #include "rpc_types.h"
+#include "request_context.h"
 #include "p2p/client/runtime_config_store.h"
 
 #include <cstdlib>  // for atexit
@@ -1170,6 +1171,29 @@ PYBIND11_MODULE(store, m) {
     // methods
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
+        .def("set_request_context",
+             [](MooncakeStorePyWrapper& self,
+                const std::optional<std::string>& request_id,
+                const std::optional<std::string>& trace_id,
+                const std::optional<std::string>& span_id,
+                const std::optional<std::string>& parent_span_id) {
+                 (void)self;
+                 RequestContext ctx = g_current_ctx.value_or(RequestContext{});
+                 if (request_id) ctx.request_id = *request_id;
+                 if (trace_id) ctx.trace_id = *trace_id;
+                 if (span_id) ctx.span_id = *span_id;
+                 if (parent_span_id) ctx.parent_span_id = *parent_span_id;
+                 set_current_request_context(std::move(ctx));
+             },
+             py::arg("request_id") = py::none(),
+             py::arg("trace_id") = py::none(),
+             py::arg("span_id") = py::none(),
+             py::arg("parent_span_id") = py::none(),
+             "Set per-request context (request_id/trace_id/...) on the calling "
+             "thread; consumed by subsequent store/master operations.")
+        .def("clear_request_context",
+             [](MooncakeStorePyWrapper& self) { (void)self; clear_current_request_context(); },
+             "Clear the per-request context set on this thread.")
         .def(
             "setup_p2p_real_client",
             [](MooncakeStorePyWrapper& self, const std::string& local_hostname,
