@@ -1,6 +1,7 @@
 #include "segment/pool.h"
 
 #include <gtest/gtest.h>
+#include <msgpack.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -10,9 +11,12 @@
 #include <thread>
 
 #include "placement/domain.h"
+#include "ha/snapshot/store_resource_snapshot_codec.h"
 #include "segment/pool_read_access.h"
+#include "segment/snapshot_view.h"
 #include "segment/pool_write_access.h"
 #include "test_buffer_allocator.h"
+#include "utils/zstd_util.h"
 
 namespace mooncake::test {
 namespace {
@@ -47,6 +51,36 @@ void CommitUnmount(SegmentPool& pool, const Segment& segment,
     auto transaction = access.PrepareUnmount(segment.id, client_id);
     ASSERT_TRUE(transaction.has_value());
     ASSERT_EQ(access.CommitUnmount(*transaction), ErrorCode::OK);
+}
+
+std::vector<uint8_t> ReplaceSnapshotActiveNames(
+    const std::vector<uint8_t>& snapshot,
+    const std::vector<std::string>& active_names) {
+    const auto decompressed = zstd_decompress(snapshot);
+    const auto unpacked =
+        msgpack::unpack(reinterpret_cast<const char*>(decompressed.data()),
+                        decompressed.size());
+    const auto& root = unpacked.get();
+
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    packer.pack_map(root.via.map.size);
+    for (uint32_t i = 0; i < root.via.map.size; ++i) {
+        const auto& item = root.via.map.ptr[i];
+        packer.pack(item.key);
+        if (item.key.type == msgpack::type::STR &&
+            std::string_view(item.key.via.str.ptr, item.key.via.str.size) ==
+                "an") {
+            packer.pack_array(active_names.size());
+            for (const auto& name : active_names) {
+                packer.pack(name);
+            }
+        } else {
+            packer.pack(item.val);
+        }
+    }
+    return zstd_compress(reinterpret_cast<const uint8_t*>(buffer.data()),
+                         buffer.size(), 3);
 }
 
 }  // namespace
@@ -218,6 +252,89 @@ TEST(SegmentPoolTest, AllocationKeepsReadLockAcrossAllocatorCall) {
     ASSERT_TRUE(allocation.get().has_value());
     unmount.join();
     EXPECT_TRUE(unmount_finished.load(std::memory_order_acquire));
+}
+
+TEST(SegmentPoolTest, SnapshotViewDoesNotAcquireInheritedPoolMutex) {
+    SegmentPool pool(Drivers());
+    const UUID client = generate_uuid();
+    auto segment = MakeSegment(0, "fork-safe");
+    {
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+
+        // A fork child can inherit this mutex as locked by a vanished thread.
+        // Encoding must use only the lock-free snapshot view.
+        auto encoded = ha::StoreResourceSnapshotCodec::Encode(
+            pool.GetSnapshotView(), LocalSsdPersistedState{});
+        ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    }
+    CommitUnmount(pool, segment, client);
+}
+
+TEST(SegmentPoolTest, SnapshotRoundTripPreservesCatalogAndHost) {
+    SegmentPool source(Drivers());
+    const UUID client = generate_uuid();
+    auto segment = MakeSegment(0, "snapshot", "tcp", "host-a");
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
+              ErrorCode::OK);
+    auto encoded = ha::StoreResourceSnapshotCodec::Encode(
+        source.GetSnapshotView(), LocalSsdPersistedState{});
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    SegmentPool restored(Drivers());
+    auto stale = MakeSegment(1, "stale");
+    ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(stale, client),
+              ErrorCode::OK);
+    auto decoded =
+        ha::StoreResourceSnapshotCodec::Decode(restored, *encoded, false);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    {
+        MountedRegion mounted;
+        auto view = restored.AcquireReadAccess();
+        EXPECT_EQ(view.Catalog().GetMountedRegion(stale.id, mounted),
+                  ErrorCode::SEGMENT_NOT_FOUND);
+        ASSERT_EQ(view.Catalog().GetMountedRegion(segment.id, mounted),
+                  ErrorCode::OK);
+        EXPECT_EQ(mounted.segment.host_id, segment.host_id);
+        EXPECT_EQ(mounted.client_id, client);
+        EXPECT_EQ(mounted.status, SegmentStatus::OK);
+    }
+
+    restored.AcquireWriteAccess().Clear();
+    CommitUnmount(source, segment, client);
+}
+
+TEST(SegmentPoolTest, InvalidSnapshotDoesNotReplacePublishedPool) {
+    SegmentPool source(Drivers());
+    const UUID client = generate_uuid();
+    auto segment = MakeSegment(0, "snapshot-active");
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
+              ErrorCode::OK);
+    auto encoded = ha::StoreResourceSnapshotCodec::Encode(
+        source.GetSnapshotView(), LocalSsdPersistedState{});
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    SegmentPool restored(Drivers());
+    auto stale = MakeSegment(1, "published");
+    ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(stale, client),
+              ErrorCode::OK);
+    auto corrupted = ReplaceSnapshotActiveNames(*encoded, {});
+    auto result =
+        ha::StoreResourceSnapshotCodec::Decode(restored, corrupted, false);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code, ErrorCode::DESERIALIZE_FAIL);
+
+    {
+        MountedRegion mounted;
+        auto view = restored.AcquireReadAccess();
+        EXPECT_EQ(view.Catalog().GetMountedRegion(stale.id, mounted),
+                  ErrorCode::OK);
+        EXPECT_EQ(view.Catalog().GetMountedRegion(segment.id, mounted),
+                  ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    CommitUnmount(source, segment, client);
 }
 
 }  // namespace mooncake::test
