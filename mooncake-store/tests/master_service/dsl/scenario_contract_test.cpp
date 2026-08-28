@@ -18,6 +18,9 @@ concept SupportsExpectStatus =
     requires(T value) { value.ExpectStatus(ReplicaStatus::COMPLETE); };
 
 template <typename T>
+concept SupportsEventually = requires(T value) { value.Eventually(); };
+
+template <typename T>
 concept SupportsIsReadable = requires(T value) { value.IsReadable(); };
 
 template <typename T>
@@ -83,7 +86,11 @@ using ReadableObjects = decltype(Objects(0, 1).AreReadable());
 
 static_assert(!SupportsExpectReplicas<ErrorExpectedPutStart>);
 static_assert(!SupportsExpectStatus<ErrorExpectedPutStart>);
+static_assert(!SupportsEventually<ErrorExpectedPutStart>);
 static_assert(!SupportsExpectError<SuccessExpectedPutStart>);
+static_assert(SupportsEventually<SuccessExpectedPutStart>);
+static_assert(!SupportsExpectError<
+              decltype(PutStart("compile-time", 1_KB).Eventually())>);
 static_assert(!SupportsExpectedReplicaCountMutation<ErrorExpectedPutStart>);
 static_assert(!SupportsExpectedErrorMutation<SuccessExpectedPutStart>);
 static_assert(!SupportsExpectReplicas<ErrorExpectedUpsertStart>);
@@ -168,6 +175,31 @@ TEST(MasterScenarioContractTest, ReportsPutStartReplicaStatusMismatch) {
             .Given(MemoryNode("memory"))
             .When(PutStart("key", 1_KB).ExpectStatus(ReplicaStatus::COMPLETE)),
         "PutStart(key) replica status mismatch");
+}
+
+TEST(MasterScenarioContractTest, PutStartEventuallyHasBoundedTimeout) {
+    MasterScenario scenario("bounded put start eventual timeout");
+    scenario.Given(MemoryNode("memory").Capacity(1_KB));
+
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_NONFATAL_FAILURE(
+        scenario.When(PutStart("key", 2_KB)
+                          .ExpectReplicas(1)
+                          .Eventually(std::chrono::milliseconds(10))),
+        "PutStart(key) failed: NO_AVAILABLE_HANDLE");
+    EXPECT_LT(std::chrono::steady_clock::now() - started,
+              std::chrono::seconds(1));
+}
+
+TEST(MasterScenarioContractTest, PutStartEventuallyStopsOnPermanentError) {
+    MasterScenario scenario("put start eventual permanent error");
+    scenario.Given(MemoryNode("memory")).When(PutStart("key", 1_KB));
+
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_NONFATAL_FAILURE(scenario.When(PutStart("key", 1_KB).Eventually()),
+                            "PutStart(key) failed: OBJECT_ALREADY_EXISTS");
+    EXPECT_LT(std::chrono::steady_clock::now() - started,
+              std::chrono::seconds(1));
 }
 
 TEST(MasterScenarioContractTest, ReportsUpsertStartReplicaCountMismatch) {
