@@ -51,6 +51,17 @@
 
 namespace mooncake {
 
+std::optional<size_t> GetTransportRegistrationLimit(
+    const std::string& protocol) {
+    if (protocol == "efa" || protocol == "cxi") {
+        return globalConfig().max_mr_size;
+    }
+    if (protocol == "ub") {
+        return globalConfig().max_seg_size;
+    }
+    return std::nullopt;
+}
+
 namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
@@ -603,8 +614,8 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
     }};
 }
 
-tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
-                                                        size_t length) {
+tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
+    const void* addr, size_t length, const std::string& protocol) {
     if (addr == nullptr) {
         LOG(ERROR) << "addr is nullptr";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -613,11 +624,10 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
         LOG(ERROR) << "length is 0";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // Tcp is not limited by max_mr_size, but we ignore it for now.
-    auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
-    if (length > max_mr_size) {
-        LOG(ERROR) << "length " << length
-                   << " is larger than max_mr_size: " << max_mr_size;
+    if (auto limit = GetTransportRegistrationLimit(protocol);
+        limit.has_value() && length > *limit) {
+        LOG(ERROR) << "length " << length << " exceeds registration limit "
+                   << *limit << " for protocol " << protocol;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
@@ -3483,7 +3493,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
-    auto check_result = CheckRegisterMemoryParams(buffer, size);
+    auto check_result = CheckRegisterMemoryParams(buffer, size, protocol);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
@@ -3668,7 +3678,7 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
-    auto check_result = CheckRegisterMemoryParams(addr, length);
+    auto check_result = CheckRegisterMemoryParams(addr, length, protocol_);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
@@ -3729,6 +3739,15 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     }
 
     EnsureStorageControlPlaneStarted();
+    return response;
+}
+
+tl::expected<void, ErrorCode> Client::UnmountLocalDiskSegment() {
+    auto response = master_client_.UnmountLocalDiskSegment(client_id_);
+    if (!response) {
+        LOG(ERROR) << "UnmountLocalDiskSegment failed, error code is "
+                   << response.error();
+    }
     return response;
 }
 
@@ -3952,14 +3971,33 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::vector<std::string>& targets) {
+    return Copy(key, tenant_id, source, targets, UUID{}, 0);
+}
+
+tl::expected<void, ErrorCode> Client::Copy(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const std::vector<std::string>& targets,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
     auto start_result =
-        master_client_.CopyStart(key, tenant_id, source, targets);
+        dynamic_replication_lease_id == UUID{}
+            ? master_client_.CopyStart(key, tenant_id, source, targets)
+            : master_client_.DynamicReplicaCopyStart(
+                  key, tenant_id, source, targets, dynamic_replication_lease_id,
+                  dynamic_replication_version_epoch);
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
+        if (dynamic_replication_lease_id != UUID{} &&
+            error == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            LOG(INFO) << "action=replica_copy_skipped"
+                      << ", key=" << key
+                      << ", info=target_replicas_already_exist";
+            return {};
+        }
         LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
                    << ", source=" << source << ", error=copy_start_failed"
                    << ", error_code=" << error;
@@ -3971,7 +4009,12 @@ tl::expected<void, ErrorCode> Client::Copy(
         LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
                   << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
-        auto copy_end_result = master_client_.CopyEnd(key, tenant_id);
+        auto copy_end_result =
+            dynamic_replication_lease_id == UUID{}
+                ? master_client_.CopyEnd(key, tenant_id)
+                : master_client_.DynamicReplicaCopyEnd(
+                      key, tenant_id, dynamic_replication_lease_id,
+                      dynamic_replication_version_epoch);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
             LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
@@ -3981,10 +4024,22 @@ tl::expected<void, ErrorCode> Client::Copy(
         return {};
     }
 
-    auto result = ExecuteReplicaTransfer(
-        key, "copy", [&]() { return master_client_.CopyEnd(key, tenant_id); },
-        [&]() { return master_client_.CopyRevoke(key, tenant_id); },
-        response.source, response.targets);
+    auto copy_end = [&]() {
+        return dynamic_replication_lease_id == UUID{}
+                   ? master_client_.CopyEnd(key, tenant_id)
+                   : master_client_.DynamicReplicaCopyEnd(
+                         key, tenant_id, dynamic_replication_lease_id,
+                         dynamic_replication_version_epoch);
+    };
+    auto copy_revoke = [&]() {
+        return dynamic_replication_lease_id == UUID{}
+                   ? master_client_.CopyRevoke(key, tenant_id)
+                   : master_client_.DynamicReplicaCopyRevoke(
+                         key, tenant_id, dynamic_replication_lease_id,
+                         dynamic_replication_version_epoch);
+    };
+    auto result = ExecuteReplicaTransfer(key, "copy", copy_end, copy_revoke,
+                                         response.source, response.targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -4563,8 +4618,13 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto copy_result = Copy(payload.key, payload.tenant_id,
-                                        payload.source, payload.targets);
+                const UUID dynamic_lease_id{
+                    payload.dynamic_replication_lease_id_high,
+                    payload.dynamic_replication_lease_id_low};
+                auto copy_result =
+                    Copy(payload.key, payload.tenant_id, payload.source,
+                         payload.targets, dynamic_lease_id,
+                         payload.dynamic_replication_version_epoch);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {

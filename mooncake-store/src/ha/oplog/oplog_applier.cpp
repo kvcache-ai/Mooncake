@@ -131,7 +131,6 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
                      << entry.object_key
                      << ", sequence_id=" << entry.sequence_id;
         StandbyObjectMetadata empty_metadata;
-        empty_metadata.last_sequence_id = entry.sequence_id;
         if (!metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
                                           empty_metadata)) {
             LOG(ERROR) << "OpLogApplier: failed to PutMetadata key="
@@ -151,15 +150,13 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
                    << ", error_code=" << static_cast<int>(result);
         // Fallback to empty metadata if parsing fails
         StandbyObjectMetadata empty_metadata;
-        empty_metadata.last_sequence_id = entry.sequence_id;
         metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
                                      empty_metadata);
         return;
     }
 
     // Convert to StandbyObjectMetadata and store
-    StandbyObjectMetadata metadata =
-        payload.ToStandbyMetadata(entry.sequence_id);
+    StandbyObjectMetadata metadata = payload.ToStandbyMetadata();
 
     if (!metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
                                       metadata)) {

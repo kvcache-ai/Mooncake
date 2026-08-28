@@ -274,23 +274,20 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // === Enhanced State ===
         state.key_count = service->GetKeyCount();
 
-        // === LocalDiskSegment State (via friend access) ===
+        // === LocalSSD persisted state ===
         {
-            auto access = service->segment_manager_.getLocalDiskSegmentAccess();
-            // Copy client_by_name_ to sorted map
-            for (const auto& [name, client_id] : access.getClientByName()) {
-                state.client_by_name[name] = client_id;
-            }
-            // Copy local_disk_segments with full state
-            for (const auto& [client_id, segment] :
-                 access.getClientLocalDiskSegment()) {
-                LocalDiskSegmentState seg_state;
-                seg_state.enable_offloading = segment->enable_offloading;
-                // Copy offloading_objects to sorted map
-                std::lock_guard<Mutex> lock(segment->offloading_mutex_);
-                for (const auto& [key, task] : segment->offloading_objects) {
-                    seg_state.offloading_objects[key] = task;
+            auto access = service->segment_manager_.getAllocatorAccess();
+            for (const auto& name : state.all_segments) {
+                auto client_id = access.GetOwnerClientId(name);
+                if (client_id) {
+                    state.client_by_name[name] = *client_id;
                 }
+            }
+            for (const auto& [client_id, client] :
+                 service->local_ssd_manager_.ExportPersistedState()) {
+                LocalDiskSegmentState seg_state;
+                seg_state.enable_offloading = client.enable_offloading;
+                seg_state.offloading_objects = client.pending_offloads;
                 state.local_disk_segments[client_id] = std::move(seg_state);
             }
         }

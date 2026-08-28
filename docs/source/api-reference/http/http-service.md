@@ -280,9 +280,10 @@ mc_store_rest_server --config /path/to/mooncake_config.json --port 8080
 ```
 
 ### `/api/mount_shm`
-Mount a named shared memory object as one or more Mooncake store segments. If
-the requested size exceeds the maximum registration size, the service may split
-the region and return multiple segment ids.
+Mount a named shared memory object as one or more Mooncake store segments.
+Protocols with a registration-size limit split oversized regions and return
+multiple segment ids. Protocols without such a Store-level limit, such as TCP
+and RDMA, use a single segment regardless of `max_mr_size`.
 
 **Method**: `POST`
 **Content-Type**: `application/json`
@@ -366,9 +367,10 @@ curl -X POST http://localhost:8080/api/unmount_shm \
 
 ### `/api/mount`
 Allocate memory inside the store process and mount it as one or more Mooncake
-store segments. If the requested size exceeds the maximum registration size,
-the service may split it and return multiple segment ids. The response includes
-the actual allocated size after alignment.
+store segments. Protocols with a registration-size limit split oversized
+requests and return multiple segment ids. Protocols without such a Store-level
+limit, such as TCP and RDMA, use a single segment regardless of `max_mr_size`.
+The response includes the actual allocated size after alignment.
 
 **Method**: `POST`
 **Content-Type**: `application/json`
@@ -439,4 +441,55 @@ curl -X POST http://localhost:8080/api/unmount \
   -H "Content-Type: application/json" \
   -d '{"segment_ids": ["00000000-0000-0000-0000-000000000002"],
        "grace_period_seconds": 30}'
+```
+
+### `/api/unmount_local_disk`
+Deregister this store's SSD offload tier from the master before the process
+goes away. Intended for a shutdown hook.
+
+The master stops naming this store as the owner of the keys it offloaded, so a
+reader gets a clean miss instead of a peer that is about to disappear. Without
+this, a `LOCAL_DISK` segment leaves the master only when the client expires —
+one `client_ttl` after the store stops pinging — and reads that pick up the
+stale owner in that window block on the connect retries (see
+`MC_RPC_CONNECT_TIMEOUT_MS`) before missing.
+
+The call then holds for `grace_period_seconds` before returning. Unlike a memory
+replica, which the NIC serves without help from the store process, a disk
+replica is read and pushed by that process, so it has to stay alive for the
+reads the master handed out before the deregistration. Offloading is stopped for
+good when this is called; the store is expected to exit afterwards.
+
+Returns success and does nothing when SSD offload is not enabled on this store.
+Safe to call more than once.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "grace_period_seconds": 30
+}
+```
+
+`grace_period_seconds` is optional and defaults to `0`, which returns as soon as
+the master has dropped the segment. Must be a non-negative integer no greater
+than 3600 (1 hour); a malformed body or an out-of-range value gets a `400`
+without touching the store, so a mistake here (seconds where milliseconds were
+meant, say) cannot block a preStop hook for hours.
+
+**Success Response**:
+```json
+{
+  "status": "success"
+}
+```
+
+**Example** — as a Kubernetes preStop hook, with a
+`terminationGracePeriodSeconds` longer than the grace period:
+```bash
+curl -X POST http://localhost:8080/api/unmount_local_disk \
+  -H "Content-Type: application/json" \
+  -d '{"grace_period_seconds": 30}'
 ```

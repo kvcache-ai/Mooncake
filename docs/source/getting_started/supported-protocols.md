@@ -11,6 +11,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **efa** | AWS EFA-capable instance | High-performance on AWS (libfabric SRD) | ✅ Primary |
 | **nvmeof** | NVMe-oF capable storage | Direct NVMe storage access | ⚠️ Advanced |
 | **nvlink** | NVIDIA MNNVL | Inter-node GPU communication | ⚠️ Advanced |
+| **musa** | Moore Threads GPU + MTLink | Intra-node GPU IPC/P2P | ⚠️ Advanced |
 | **nvlink_intra** | NVIDIA NVLink | Intra-node GPU communication | ⚠️ Advanced |
 | **hip** | AMD ROCm/HIP | AMD GPU communication | ⚠️ Advanced |
 | **barex** | RDMA-capable NIC | Bare-metal RDMA extension | ⚠️ Advanced |
@@ -18,6 +19,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
 | **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
+| **flagcx** | RDMA-capable NIC(s) | Unified P2P transfer through FlagOS FlagCX | ⚠️ Advanced |
 
 ## Commonly Used Protocols (Python API)
 
@@ -205,6 +207,52 @@ export MC_FORCE_MNNVL=true
 
 **Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
 
+### MUSA Transport (musa)
+
+**Description:** Moore Threads GPU IPC transport for P2P copies over the
+intra-node MTLink path. It reuses the NVLink transport's transfer bookkeeping,
+but opens imported IPC memory and submits copies using MUSA-specific device
+context rules.
+
+**Requirements:**
+- Moore Threads GPUs with peer access (validated on S5000)
+- MUSA SDK/runtime; MUSA 5.2 or newer enables the low-CPU transfer-batch API
+- Compiled with `USE_MUSA=ON`
+
+**Configuration:**
+```bash
+# Use the same runtime-visible logical-device mapping in every peer process.
+export MUSA_VISIBLE_DEVICES=0,1
+export MC_FORCE_MUSA=1
+
+# Safe defaults shown explicitly. Opt in to metadata after checking the
+# visibility contract below; "default" rolls back to per-slice copies.
+export MC_MUSA_IPC_OPEN_DEVICE=current
+export MC_MUSA_COPY_API=auto
+
+# Performance path after both peers use the same logical device mapping.
+export MC_MUSA_IPC_OPEN_DEVICE=metadata
+```
+
+`MTHREADS_VISIBLE_DEVICES` is consumed by mt-container-toolkit when the
+container is created; Mooncake does not use it to infer the MUSA runtime's
+logical device mapping. Buffer metadata uses runtime-visible logical ordinals
+such as `musa:0`. With `metadata`, every peer must map each logical ordinal to
+the same physical GPU. Mooncake validates that the advertised ordinal exists
+locally, but it cannot prove cross-peer identity from environment variables.
+Both peers must run a version that recognizes the `musa` protocol; rolling
+interoperability with an older peer advertising only `nvlink` is not supported.
+`MC_MUSA_IPC_OPEN_DEVICE=current` is the safe default; select `metadata` only
+when peers satisfy the logical mapping contract above. Python bindings that
+register the default wildcard location (`*`) resolve the owning MUSA device
+during registration; an older peer that still advertises `*` falls back to the
+current-device open path.
+
+In `auto` mode, batches whose copies are at least 1 MiB use
+`muMemoryTransferBatchAsync`; set `MC_MUSA_TRANSFER_BATCH_MIN_BYTES` to tune the
+threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
+`MC_MUSA_COPY_API=default` to use the CUDA-compatible per-slice path.
+
 ### Intra-Node NVLink (nvlink_intra)
 
 **Description:** NVIDIA NVLink for GPU-to-GPU communication within a single node.
@@ -215,7 +263,15 @@ export MC_FORCE_MNNVL=true
 
 **Requirements:**
 - NVIDIA NVLink hardware
-- Compiled with `USE_INTRA_NVLINK=ON`
+- Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
+
+**Configuration:**
+```bash
+# Select the intra-node NVLink transport. Cannot be combined with MC_FORCE_MNNVL.
+export MC_INTRANODE_NVLINK=true
+```
+
+**Note:** On a build without `USE_MNNVL=ON`, leaving `MC_INTRANODE_NVLINK` unset keeps the usual RDMA (or TCP, when no HCA is detected) selection.
 
 ### HIP Transport (hip)
 
@@ -330,6 +386,55 @@ so it cannot be selected through `MOONCAKE_PROTOCOL` or `transfer_engine_bench -
 See [MPComm Transport](../design/transfer-engine/mpcomm_transport.md) for the full guide,
 including selection via transport policy, tuning environment variables, and troubleshooting.
 
+### FlagOS FlagCX Transport (flagcx)
+
+**Description:** [FlagCX](https://github.com/flagos-ai/FlagCX) is the unified communication library
+in the FlagOS ecosystem for multi-vendor and cross-vendor deployments. Mooncake integrates the
+FlagCX P2P Engine as a classic Transfer Engine transport, allowing the existing Mooncake transfer
+workflow to use the accelerator and network backends provided by the local FlagCX build.
+
+**Use When:**
+- Deploying Mooncake on a platform supported by FlagCX
+- Using FlagCX's P2P Engine for accelerator memory transfers
+- Building a cross-vendor deployment around the FlagOS communication stack
+
+**Build Requirements:**
+```bash
+cmake -S . -B build \
+  -DUSE_FLAGCX=ON \
+  -DFLAGCX_HOME=/path/to/FlagCX/build
+cmake --build build -j
+```
+
+`FLAGCX_HOME` must contain `include/flagcx_p2p.h` and either `lib/libflagcx.so` or
+`lib64/libflagcx.so`. If it is omitted, Mooncake checks `$FLAGCX_HOME` and then
+`$HOME/FlagCX/build`.
+
+**Configuration:**
+```python
+engine.initialize(
+    hostname="node1",
+    metadata_server="P2PHANDSHAKE",
+    protocol="flagcx",
+    device_name=""
+)
+```
+
+```bash
+# Select the interface used for FlagCX bootstrap and endpoint advertisement.
+export FLAGCX_SOCKET_IFNAME="eth0"
+```
+
+**Current Scope:**
+- Available through the classic Transfer Engine; it is not a TENT transport
+- Must be built from source with `USE_FLAGCX=ON`
+- Should be selected as the standalone `flagcx` protocol, not as part of a multi-protocol string
+- Buffers should be registered before the first transfer to a peer and remain registered while
+  that peer connection is active
+
+See [FlagOS FlagCX Transport](../design/transfer-engine/flagcx_transport.md) for dependency,
+build, benchmark, runtime configuration, and troubleshooting details.
+
 ## Configuration Examples
 
 ### Configuration File (JSON)
@@ -390,6 +495,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
 | Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
+| Multi-vendor or cross-vendor clusters | flagcx | Build with `-DUSE_FLAGCX=ON`; transfers use the FlagCX P2P Engine over RDMA-capable NICs |
 
 ## Troubleshooting
 

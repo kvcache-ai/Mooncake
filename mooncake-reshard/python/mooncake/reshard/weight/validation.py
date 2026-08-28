@@ -4,18 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from itertools import product as cartesian_product
-from math import prod
 
-from ..contracts import RuntimeInstanceId, TensorId
+from ..contracts import RuntimeBindingFragment, RuntimeInstanceId, TensorId
+from ..geometry import boxes_exactly_cover, boxes_overlap
 from .topology import ParallelTopology
 from .types import (
     OwnershipAxis,
     ParallelRank,
     PlacementFragment,
     ReplicatedAxis,
-    RuntimeBindingFragment,
     SplitAxis,
     TensorDescriptor,
+    validate_fragment_geometry,
 )
 
 
@@ -356,62 +356,9 @@ def _fragments_exactly_cover_tensor(
     boxes = tuple(
         (fragment.global_offset, fragment.local_shape) for fragment in fragments
     )
-    if not boxes:
-        return False
-    if sum(prod(shape) for _, shape in boxes) != prod(tensor.global_shape):
-        return False
-    if any(
-        any(
-            offset < 0 or offset + extent > total
-            for offset, extent, total in zip(
-                box_offset,
-                box_shape,
-                tensor.global_shape,
-            )
-        )
-        for box_offset, box_shape in boxes
-    ):
-        return False
-    return not _boxes_overlap(boxes)
-
-
-def _boxes_overlap(
-    boxes: Sequence[tuple[tuple[int, ...], tuple[int, ...]]],
-) -> bool:
-    if len(boxes) < 2:
-        return False
-    ndim = len(boxes[0][0])
-    sweep_dim = max(
-        range(ndim),
-        key=lambda dim: len(
-            {(offset[dim], offset[dim] + shape[dim]) for offset, shape in boxes}
-        ),
+    return boxes_exactly_cover(
+        (0,) * len(tensor.global_shape), tensor.global_shape, boxes
     )
-    ordered = sorted(boxes, key=lambda item: item[0][sweep_dim])
-    active: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-    for offset, shape in ordered:
-        begin = offset[sweep_dim]
-        active = [
-            candidate
-            for candidate in active
-            if candidate[0][sweep_dim] + candidate[1][sweep_dim] > begin
-        ]
-        if any(
-            all(
-                left_begin < right_begin + right_extent
-                and right_begin < left_begin + left_extent
-                for left_begin, left_extent, right_begin, right_extent in zip(
-                    candidate_offset,
-                    candidate_shape,
-                    offset,
-                    shape,
-                )
-            )
-            for candidate_offset, candidate_shape in active
-        ):
-            return True
-        active.append((offset, shape))
-    return False
 
 
 def _validate_logical_fragment_overlaps(
@@ -426,77 +373,27 @@ def _validate_logical_fragment_overlaps(
     for owner_fragments in by_tensor_and_rank.values():
         if len(owner_fragments) < 2:
             continue
-        ndim = len(owner_fragments[0].global_offset)
-        sweep_dim = max(
-            range(ndim),
-            key=lambda dim: len(
-                {
-                    (
-                        fragment.global_offset[dim],
-                        fragment.global_offset[dim] + fragment.local_shape[dim],
-                    )
-                    for fragment in owner_fragments
-                }
-            ),
+        boxes = tuple(
+            (fragment.global_offset, fragment.local_shape)
+            for fragment in owner_fragments
         )
-        ordered = sorted(
-            owner_fragments,
-            key=lambda fragment: fragment.global_offset[sweep_dim],
-        )
-        active: list[PlacementFragment] = []
-        for current in ordered:
-            current_begin = current.global_offset[sweep_dim]
-            active = [
-                previous
-                for previous in active
-                if previous.global_offset[sweep_dim] + previous.local_shape[sweep_dim]
-                > current_begin
-            ]
-            for previous in active:
-                if all(
-                    previous_offset < current_offset + current_extent
-                    and current_offset < previous_offset + previous_extent
-                    for (
-                        previous_offset,
-                        previous_extent,
-                        current_offset,
-                        current_extent,
-                    ) in zip(
-                        previous.global_offset,
-                        previous.local_shape,
-                        current.global_offset,
-                        current.local_shape,
-                    )
-                ):
-                    raise ValueError(
-                        "logical fragment boxes overlap for tensor and "
-                        "parallel rank: "
-                        f"{previous.fragment_id} and {current.fragment_id}"
-                    )
-            active.append(current)
+        if boxes_overlap(boxes):
+            raise ValueError(
+                "logical fragment boxes overlap for tensor and parallel rank"
+            )
 
 
 def _validate_fragment_geometry(
     tensor: TensorDescriptor,
     fragment: PlacementFragment,
 ) -> None:
-    ndim = len(tensor.global_shape)
-    if len(fragment.global_offset) != ndim or len(fragment.local_shape) != ndim:
-        raise ValueError(f"fragment rank mismatch: {fragment.fragment_id}")
-    for offset, extent, total in zip(
-        fragment.global_offset,
-        fragment.local_shape,
-        tensor.global_shape,
-    ):
-        if offset + extent > total:
-            raise ValueError(f"fragment is out of bounds: {fragment.fragment_id}")
-
-    expected_nbytes = prod(fragment.local_shape) * tensor.itemsize
-    if fragment.nbytes != expected_nbytes:
-        raise ValueError(
-            f"fragment byte size mismatch: {fragment.fragment_id}: "
-            f"expected {expected_nbytes}, got {fragment.nbytes}"
-        )
+    validate_fragment_geometry(
+        tensor,
+        fragment_id=fragment.fragment_id,
+        global_offset=fragment.global_offset,
+        local_shape=fragment.local_shape,
+        nbytes=fragment.nbytes,
+    )
 
 
 def _runtime_alias_descriptor_key(tensor: TensorDescriptor) -> tuple[object, ...]:

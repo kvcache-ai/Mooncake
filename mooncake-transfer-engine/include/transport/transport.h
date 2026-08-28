@@ -167,6 +167,7 @@ class Transport {
                 void *dest_addr;
                 void *cuda_stream;  // cudaStream_t, used by async NVLink
                                     // transport
+                int cuda_device;    // device that owns cuda_stream
             } local;
             struct {
                 void *event;  // cudaEvent_t
@@ -196,6 +197,9 @@ class Transport {
             struct {
                 uint64_t dest_addr;
             } ubshmem;
+            struct {
+                uint64_t dest_offset;
+            } flagcx;
         };
 
        public:

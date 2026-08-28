@@ -87,23 +87,52 @@ class TENTBenchRunner : public BenchRunner {
                    ((thread_id / seg_type_mix_.size()) / count);
     }
 
+    size_t getTargetCount() const;
+
+    uint64_t getTargetSegmentId(int thread_id) const;
+
     uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
                                  uint64_t batch_size) const {
+        const size_t target_idx = targetIndex(thread_id);
+        const int local_thread_id = localTargetThreadId(thread_id);
+        const auto& info = target_infos_[target_idx];
         if (seg_type_mix_.empty()) {
             // Single seg_type mode: original behavior.
-            return info_.buffers[thread_id % info_.buffers.size()].base +
-                   block_size * batch_size * (thread_id / info_.buffers.size());
+            const size_t buffer_idx = local_thread_id % info.buffers.size();
+            const uint64_t bytes =
+                checkedMul(block_size, batch_size, "target operation size");
+            const uint64_t relative_offset =
+                checkedMul(bytes, local_thread_id / info.buffers.size(),
+                           "target relative offset");
+            const auto& buffer = info.buffers[buffer_idx];
+            if (XferBenchConfig::target_range_size != 0 &&
+                !rangeContains(relative_offset, bytes,
+                               XferBenchConfig::target_range_size)) {
+                LOG(FATAL) << "Target range too small for thread " << thread_id;
+            }
+            if (XferBenchConfig::target_offset > buffer.length ||
+                !rangeContains(
+                    relative_offset, bytes,
+                    buffer.length - XferBenchConfig::target_offset)) {
+                LOG(FATAL) << "Target buffer too small for thread "
+                           << thread_id;
+            }
+            return checkedAdd(
+                buffer.base,
+                checkedAdd(XferBenchConfig::target_offset, relative_offset,
+                           "target address offset"),
+                "target address");
         }
         // Mixed mode: pick this thread's seg_type, then index into the
         // subset of target segment buffers matching that seg_type. Use
         // LocationParser to classify each buffer as host (cpu) vs device
         // (cuda/rocm/supa/...) rather than hard-coding a vendor prefix.
         const std::string& seg_type =
-            seg_type_mix_[thread_id % seg_type_mix_.size()];
+            seg_type_mix_[local_thread_id % seg_type_mix_.size()];
         bool want_device = (seg_type == "vram");
         std::vector<size_t> matches;
-        for (size_t i = 0; i < info_.buffers.size(); ++i) {
-            const auto& loc = info_.buffers[i].location;
+        for (size_t i = 0; i < info.buffers.size(); ++i) {
+            const auto& loc = info.buffers[i].location;
             bool is_device =
                 LocationParser(loc).type() != "cpu" && loc != kWildcardLocation;
             if (is_device == want_device) {
@@ -114,16 +143,33 @@ class TENTBenchRunner : public BenchRunner {
             LOG(FATAL) << "No target buffer of seg_type " << seg_type
                        << " for thread " << thread_id;
         }
-        size_t slot = (thread_id / seg_type_mix_.size()) % matches.size();
-        return info_.buffers[matches[slot]].base +
-               block_size * batch_size *
-                   ((thread_id / seg_type_mix_.size()) / matches.size());
+        size_t slot = (local_thread_id / seg_type_mix_.size()) % matches.size();
+        const uint64_t bytes =
+            checkedMul(block_size, batch_size, "target operation size");
+        const uint64_t relative_offset = checkedMul(
+            bytes, (local_thread_id / seg_type_mix_.size()) / matches.size(),
+            "target relative offset");
+        const auto& buffer = info.buffers[matches[slot]];
+        if (XferBenchConfig::target_range_size != 0 &&
+            !rangeContains(relative_offset, bytes,
+                           XferBenchConfig::target_range_size)) {
+            LOG(FATAL) << "Target range too small for thread " << thread_id;
+        }
+        if (XferBenchConfig::target_offset > buffer.length ||
+            !rangeContains(relative_offset, bytes,
+                           buffer.length - XferBenchConfig::target_offset)) {
+            LOG(FATAL) << "Target buffer too small for thread " << thread_id;
+        }
+        return checkedAdd(buffer.base,
+                          checkedAdd(XferBenchConfig::target_offset,
+                                     relative_offset, "target address offset"),
+                          "target address");
     }
 
-    double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
-                             uint64_t block_size, uint64_t batch_size,
-                             OpCode opcode, uint64_t deadline_ns,
-                             IntentType intent_type);
+    double runSingleTransfer(uint64_t local_addr, uint64_t target_id,
+                             uint64_t target_addr, uint64_t block_size,
+                             uint64_t batch_size, OpCode opcode,
+                             uint64_t deadline_ns, IntentType intent_type);
 
    private:
     int allocateBuffers();
@@ -131,6 +177,10 @@ class TENTBenchRunner : public BenchRunner {
     int freeBuffers();
 
     int runner(int thread_id);
+
+    size_t targetIndex(int thread_id) const;
+
+    int localTargetThreadId(int thread_id) const;
 
    private:
     std::unique_ptr<TransferEngine> engine_;
@@ -142,8 +192,8 @@ class TENTBenchRunner : public BenchRunner {
     // Parsed --seg_type_mix (e.g. ["dram", "vram"]). Empty when --seg_type_mix
     // is not set → single-seg_type mode (existing behavior).
     std::vector<std::string> seg_type_mix_;
-    SegmentID handle_;
-    SegmentInfo info_;
+    std::vector<SegmentID> target_handles_;
+    std::vector<SegmentInfo> target_infos_;
     TransportType transport_hint_{UNSPEC};
     IntentType intent_type_{IntentType::INTENT_UNSPEC};
 

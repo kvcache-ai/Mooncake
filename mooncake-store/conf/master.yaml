@@ -16,6 +16,15 @@ eviction_ratio: 0.1
 # usage-ratio eviction; allocation-failure-triggered eviction remains enabled.
 eviction_high_watermark_ratio: 1.0
 
+# Dynamic MEMORY replica fanout is disabled by default. Replica removal is
+# driven by the existing memory eviction/reclaim path; when a dynamic replica
+# is evicted, Master records a short recreate cooldown so hot-read admission
+# does not immediately add the same capacity back.
+dynamic_replication_mode: "off"
+dynamic_replication_heat_window_seconds: 10
+dynamic_replication_admission_qps_threshold: 0.8
+dynamic_replication_max_memory_replicas: 2
+
 enable_multi_tenants: false
 tenant_quota_connector_type: "file"
 tenant_quota_connector_uri: ""

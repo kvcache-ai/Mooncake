@@ -14,6 +14,35 @@
 
 #include "config.h"
 
+// MOONCAKE_GLOG_HAS_IS_INITIALIZED is defined by FindGLOG.cmake via the
+// glog::glog INTERFACE compile definitions. It is set to 1 only when the
+// detected glog version is >= 0.6.0, where google::IsGoogleLoggingInitialized()
+// is publicly exported as a top-level symbol. This defensive fallback keeps the
+// file buildable even if the macro was not propagated for some reason.
+#ifndef MOONCAKE_GLOG_HAS_IS_INITIALIZED
+#define MOONCAKE_GLOG_HAS_IS_INITIALIZED 0
+#endif
+
+#if !MOONCAKE_GLOG_HAS_IS_INITIALIZED
+// glog < 0.6.0 does NOT export google::IsGoogleLoggingInitialized() at the
+// top level; the public declaration was only added in 0.6.0. However, the same
+// function has always existed in these older versions inside the internal
+// namespace google::glog_internal_namespace_ (declared in glog's private
+// header src/utilities.h, which is not installed). The symbol is exported by
+// libglog, so we forward-declare it here to reuse it without depending on any
+// private header. This lets old glog perform a real "already initialized"
+// check instead of blindly re-initializing.
+//
+// NOTE: In glog >= 0.6.0 this internal symbol no longer exists (it was moved
+// to the top-level google:: namespace), which is exactly why this branch is
+// only compiled when MOONCAKE_GLOG_HAS_IS_INITIALIZED == 0.
+namespace google {
+namespace glog_internal_namespace_ {
+bool IsGoogleLoggingInitialized();
+}  // namespace glog_internal_namespace_
+}  // namespace google
+#endif
+
 #include <charconv>
 #include <cstring>
 #include <cstdio>
@@ -443,7 +472,23 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
-        google::InitGoogleLogging("mooncake-transfer-engine");
+        // Only initialize when the caller (upstream program) has not already
+        // initialized glog, to avoid double initialization. On both new and old
+        // glog versions this performs a real "already initialized" check:
+        //   - glog >= 0.6.0: public google::IsGoogleLoggingInitialized()
+        //   - glog <  0.6.0: the equivalent function that lives in the internal
+        //     namespace google::glog_internal_namespace_ (forward-declared at
+        //     the top of this file).
+        // The using-declaration below selects the right overload for the
+        // detected version, so the call site stays identical.
+#if MOONCAKE_GLOG_HAS_IS_INITIALIZED
+        using google::IsGoogleLoggingInitialized;
+#else
+        using google::glog_internal_namespace_::IsGoogleLoggingInitialized;
+#endif
+        if (!IsGoogleLoggingInitialized()) {
+            google::InitGoogleLogging("mooncake-transfer-engine");
+        }
         std::error_code ec;
         if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
@@ -528,6 +573,65 @@ void loadGlobalConfig(GlobalConfig& config) {
         parseBoolConfigEnv(track_rdma_posted_slices_env,
                            "MC_TRACK_RDMA_POSTED_SLICES",
                            config.track_rdma_posted_slices);
+    }
+
+    const char* use_rdma_twosided_env = std::getenv("MC_USE_RDMA_TWOSIDED");
+    if (use_rdma_twosided_env) {
+        parseBoolConfigEnv(use_rdma_twosided_env, "MC_USE_RDMA_TWOSIDED",
+                           config.use_rdma_twosided);
+    }
+
+    const char* rdma_notify_enabled_env = std::getenv("MC_RDMA_NOTIFY_ENABLED");
+    if (rdma_notify_enabled_env) {
+        parseBoolConfigEnv(rdma_notify_enabled_env, "MC_RDMA_NOTIFY_ENABLED",
+                           config.rdma_notify_enabled);
+    }
+    const char* rdma_notify_recv_count_env =
+        std::getenv("MC_RDMA_NOTIFY_RECV_COUNT");
+    if (rdma_notify_recv_count_env) {
+        int val = atoi(rdma_notify_recv_count_env);
+        if (val > 0 && val <= 4096)
+            config.rdma_notify_recv_count = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_RECV_COUNT";
+    }
+    const char* rdma_notify_buffer_size_env =
+        std::getenv("MC_RDMA_NOTIFY_BUFFER_SIZE");
+    if (rdma_notify_buffer_size_env) {
+        int val = atoi(rdma_notify_buffer_size_env);
+        if (val >= 256 && val <= 65536)
+            config.rdma_notify_buffer_size = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_BUFFER_SIZE";
+    }
+    const char* rdma_notify_max_pending_sends_env =
+        std::getenv("MC_RDMA_NOTIFY_MAX_PENDING_SENDS");
+    if (rdma_notify_max_pending_sends_env) {
+        int val = atoi(rdma_notify_max_pending_sends_env);
+        if (val > 0 && val <= 4096)
+            config.rdma_notify_max_pending_sends = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_MAX_PENDING_SENDS";
+    }
+    const char* rdma_notify_oob_fallback_env =
+        std::getenv("MC_RDMA_NOTIFY_OOB_FALLBACK");
+    if (rdma_notify_oob_fallback_env) {
+        parseBoolConfigEnv(rdma_notify_oob_fallback_env,
+                           "MC_RDMA_NOTIFY_OOB_FALLBACK",
+                           config.rdma_notify_oob_fallback);
+    }
+    const char* rdma_notify_connect_timeout_env =
+        std::getenv("MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS");
+    if (rdma_notify_connect_timeout_env) {
+        int val = atoi(rdma_notify_connect_timeout_env);
+        if (val >= 100 && val <= 600000)
+            config.rdma_notify_connect_timeout_ms = static_cast<uint32_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS";
     }
 
     const char* enable_parallel_reg_mr =
@@ -762,6 +866,16 @@ void dumpGlobalConfig() {
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "
               << (config.track_rdma_posted_slices ? "true" : "false");
+    LOG(INFO) << "use_rdma_twosided = "
+              << (config.use_rdma_twosided ? "true" : "false");
+    LOG(INFO) << "rdma_notify_enabled = "
+              << (config.rdma_notify_enabled ? "true" : "false");
+    LOG(INFO) << "rdma_notify_recv_count = " << config.rdma_notify_recv_count;
+    LOG(INFO) << "rdma_notify_buffer_size = " << config.rdma_notify_buffer_size;
+    LOG(INFO) << "rdma_notify_max_pending_sends = "
+              << config.rdma_notify_max_pending_sends;
+    LOG(INFO) << "rdma_notify_oob_fallback = "
+              << (config.rdma_notify_oob_fallback ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

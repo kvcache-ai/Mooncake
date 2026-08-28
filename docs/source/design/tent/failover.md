@@ -1,3 +1,4 @@
+(tent-failover)=
 # TENT Failover
 
 TENT hides transfer failures from the application by recovering inside the data path.
@@ -135,56 +136,19 @@ The counter is only built when TENT is compiled with `-DTENT_METRICS_ENABLED=ON`
 | `Rail recovered: local_nic=... remote_nic=... (cooldown expired)` | Cooldown elapsed and the rail is back in service. |
 | `Rail recovered: ... (un-paused by successful transfer)` | Live success on a previously paused rail brought it back early. |
 
+(tent-failover-testing)=
 ## Testing
 
-Real hardware faults are hard to stage, so TENT tests the failover machinery with decorator-style fault injection.
+Real hardware faults are hard to stage, so failover is tested by driving the real `TransferEngineImpl` with FakeTransport backends and a fault-injecting decorator. The engine is unmodified: a completion-stage `FAILED` looks like a WC error or a dropped peer, and `resubmitTransferTask` runs as it would in production.
 
-### FaultProxyTransport
+The harness — why a fake `Transport` is enough, how fakes are swapped in, and what this can and cannot prove — is in {ref}`TENT Testing <tent-testing>`. That page is the mechanism; this section only notes what failover uses it for:
 
-`FaultProxyTransport` wraps any `Transport` and injects four policy-driven faults:
+* Completion-stage `FAILED` on the primary must resubmit on the next available transport.
+* Exhausting `max_failover_attempts` (including `0` and `1`) must surface `FAILED` and must not touch a transport beyond the budget.
+* `failover_count` is per-task: one failing request must not spend another request's budget.
+* With `enable_auto_failover_on_poll=false`, status polling is observational; `progressBatch` / `waitTransferCompletion` / `transferSync` still recover.
 
-* `submit_fail_rate` — probability that `submitTransferTasks` returns an error.
-* `status_corrupt_rate` — probability that `getTransferStatus` flips `COMPLETED → FAILED`.
-* `fail_after_n_submits` — deterministic variant: succeed the first N submits, then always fail.
-* `fail_install` — make `install()` fail, simulating a transport that cannot come up.
-
-Because it implements the `Transport` interface, the engine sees an ordinary transport. All failover paths (`submitTransfer`, `getTransferStatus`, `resubmitTransferTask`) run unmodified.
-
-### Test-only injection hook
-
-`TransferEngineImpl::swapTransportForTest` replaces the transport in one slot after `construct()`. This is the only way the end-to-end test can wrap the real transport with `FaultProxyTransport` without bypassing `resolveTransport` or `resubmitTransferTask`. Production code never calls it.
-
-### End-to-end suite
-
-The end-to-end failover test suite drives the real `TransferEngineImpl` with fake transports (`FakeTransport`) wrapped in `FaultProxyTransport`. It uses a `p2p` metadata backend on `127.0.0.1` so no external services are required — the whole suite is self-contained.
-
-Current cases:
-
-| Test | What it exercises |
-|------|-------------------|
-| `StatusCorruptionTriggersFailoverToSecondary` | Primary reports `FAILED` in `getTransferStatus`; engine must resubmit on the secondary. |
-| `BothTransportsFailExhaustsFailoverBudget` | Both transports fail at the completion stage; task must surface `FAILED` once the budget is drained. |
-| `MixedFaultsAcrossManySubmissions` | 10 one-request batches with 30% completion corruption on RDMA; every task must end `COMPLETED`, and submit-counter math must hold. |
-| `MaxFailoverAttemptsZeroDisablesFailover` | `max_failover_attempts = 0` → the first completion fault is permanent, TCP is never touched. |
-| `MaxFailoverAttemptsOneAllowsSingleFailover` | `max_failover_attempts = 1` → one switch allowed; RDMA fault → TCP success. |
-| `PerTaskFailoverCountsAreIndependent` | A failing task must not consume another task's budget; `failover_count` is strictly per-task. |
-
-A test-local `PerRequestFaultProxy` (in the same file) subclasses `FaultProxyTransport` to take a `std::function` predicate, remembers which sub-task ids it marked as "poisoned" at submit time, and flips only those completions from `COMPLETED` to `FAILED` at status-query time.
-
-### Running manually
-
-The TENT tests are **not** in CI today (the upstream workflow builds with `USE_TENT=OFF`). Run them locally:
-
-```bash
-cmake -S . -B build-tent -DUSE_TENT=ON -DUSE_CUDA=OFF
-cmake --build build-tent --target tent_failover_test tent_engine_failover_e2e_test -j
-./build-tent/mooncake-transfer-engine/tent/tests/tent_failover_test
-./build-tent/mooncake-transfer-engine/tent/tests/tent_engine_failover_e2e_test
-```
-
-Setting `USE_CUDA=OFF` forces `CpuPlatform`, which always reports `MTYPE_CPU`. With `USE_CUDA=ON` on a host without a GPU, `cudaPointerGetAttributes` fails, `getMemoryType` returns `MTYPE_UNKNOWN`, every transport reports unavailable, and `resolveTransport` returns `UNSPEC` before the fault injection ever runs.
-
-Companion unit tests cover the rail monitor and related building blocks: `tent_rail_monitor_test`, `tent_failover_test`, `tent_fault_proxy_test`.
+Submit-stage failures are intentionally not covered here; see Known Gaps.
 
 ## Known Gaps
 
@@ -194,4 +158,4 @@ Companion unit tests cover the rail monitor and related building blocks: `tent_r
   A safe submit-stage recovery needs either (a) a transport-level "atomic submit" capability flag plus per-task skip of derived ids, or (b) per-request status returned from `submitTransferTasks`. Neither exists today.
 * `markRecovered` (and cooldown expiry in `available`) clears the exponential-backoff memory entirely. A rail that flaps repeatedly therefore does not accumulate a growing cooldown across recovery cycles. If this becomes a problem the fix is to decay rather than reset.
 * Cross-transport failover is driven purely by return status; there is no latency-based "this transport is healthy but too slow, try another" signal. That belongs to the scheduler, not this document.
-* TENT tests are not exercised by CI. A follow-up can add a CI job that builds with `-DUSE_TENT=ON -DUSE_CUDA=OFF` and runs the `tent_*` test targets; none of the code in this document changes in that case.
+* Runtime-layer failover is covered by FakeTransport tests in the `tent-ci` `cuda-off` legs. DMA integrity, real WC errors, and staging under NVLink still need hardware runners; see {ref}`TENT Testing <tent-testing>`.

@@ -21,6 +21,7 @@
 #include "config.h"
 #include "multi_transport_locality.h"
 #include "transport/rdma_transport/rdma_transport.h"
+#include "transport/rdma_twosided/rdma_twosided_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -52,6 +53,9 @@
 #ifdef USE_MACA
 #include "transport/maca_transport/maca_transport.h"
 #endif
+#ifdef USE_MUSA
+#include "transport/musa_transport/musa_transport.h"
+#endif
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
@@ -60,6 +64,9 @@
 #endif
 #ifdef USE_UBSHMEM
 #include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
+#endif
+#ifdef USE_FLAGCX
+#include "transport/flagcx_transport/flagcx_transport.h"
 #endif
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
@@ -411,8 +418,18 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
     Transport* transport = nullptr;
-    if (std::string(proto) == "rdma") {
-        transport = new RdmaTransport();
+    if (std::string(proto) == "rdma" || std::string(proto) == "rdma_twosided") {
+        if ((proto == "rdma" && transport_map_.count("rdma_twosided")) ||
+            (proto == "rdma_twosided" && transport_map_.count("rdma"))) {
+            LOG(ERROR) << "Cannot install both rdma and rdma_twosided "
+                          "transports in the same Transfer Engine instance";
+            return nullptr;
+        }
+        if (std::string(proto) == "rdma") {
+            transport = new RdmaTransport();
+        } else {
+            transport = new RdmaTwoSidedTransport();
+        }
     }
 #ifdef USE_UB
     else if (std::string(proto) == "ub") {
@@ -471,6 +488,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new MacaTransport();
     }
 #endif
+#ifdef USE_MUSA
+    else if (std::string(proto) == "musa") {
+        transport = new MusaTransport();
+    }
+#endif
 #ifdef USE_MNNVL
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
@@ -484,6 +506,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_UBSHMEM
     else if (std::string(proto) == "ubshmem") {
         transport = new UBShmemTransport();
+    }
+#endif
+#ifdef USE_FLAGCX
+    else if (std::string(proto) == "flagcx") {
+        transport = new FlagCxTransport();
     }
 #endif
 #ifdef USE_EFA
@@ -574,6 +601,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             // that know they need the cross-node path to de-prioritize hip.
             if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
             if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
+            if (p == "musa") return std::getenv("MC_DISABLE_MUSA") ? 0 : 4;
             if (p == "cxl") return 3;
             if (p == "rdma") return 2;
             if (p == "tcp") return 1;
@@ -585,8 +613,8 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         // This makes the intra-node fast path (hip) and the cross-node path
         // (rdma) work automatically from a single multi-protocol segment,
         // without requiring the operator to set MC_DISABLE_HIP.
-        const bool hip_reachable =
-            isHipReachableTarget(target_segment_desc->name, local_server_name_);
+        const bool gpu_ipc_reachable = isGpuIpcReachableTarget(
+            target_segment_desc->name, local_server_name_);
         std::string chosen;
         int chosen_priority = -1;
         for (const auto& buffer : target_segment_desc->buffers) {
@@ -598,7 +626,10 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                     : buffer.addr;
             if (entry.target_offset >= start &&
                 entry.target_offset < start + buffer.length) {
-                if (buffer.protocol == "hip" && !hip_reachable) continue;
+                if ((buffer.protocol == "hip" || buffer.protocol == "musa") &&
+                    !gpu_ipc_reachable) {
+                    continue;
+                }
                 int priority = protocol_priority(buffer.protocol);
                 if (priority > chosen_priority) {
                     chosen = buffer.protocol;
@@ -612,6 +643,10 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                 "segment " +
                 std::to_string(entry.target_id));
         }
+        if (!transport_map_.count(chosen) && chosen == "rdma" &&
+            transport_map_.count("rdma_twosided")) {
+            chosen = "rdma_twosided";
+        }
         if (!transport_map_.count(chosen)) {
             return Status::NotSupportedTransport("Transport " + chosen +
                                                  " not installed");
@@ -619,7 +654,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         if (globalConfig().trace) {
             LOG(INFO) << "MultiTransport::selectTransport route: target_id="
                       << entry.target_id << " segment_protocol=\"" << proto
-                      << "\" hip_reachable=" << hip_reachable
+                      << "\" gpu_ipc_reachable=" << gpu_ipc_reachable
                       << " chosen=" << chosen;
         }
         transport = transport_map_[chosen].get();
@@ -634,6 +669,13 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         proto = "ascend";
     }
 #endif
+    // RdmaTwoSidedTransport still publishes segment protocol "rdma" (one-sided
+    // memory path). Route those segments to the installed twosided transport.
+    if (!transport_map_.count(proto) && proto == "rdma" &&
+        transport_map_.count("rdma_twosided")) {
+        transport = transport_map_["rdma_twosided"].get();
+        return Status::OK();
+    }
     if (!transport_map_.count(proto)) {
         return Status::NotSupportedTransport("Transport " + proto +
                                              " not installed");
@@ -662,8 +704,9 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
     // hip GPU IPC cannot reach a remote host; downgrade an explicit hip
     // preference to a cross-host-capable transport for a cross-host target
     // (mirrors the locality gate in selectTransport). Prefer rdma, then tcp.
-    if (preferred_proto == "hip" &&
-        !isHipReachableTarget(target_segment_desc->name, local_server_name_)) {
+    if ((preferred_proto == "hip" || preferred_proto == "musa") &&
+        !isGpuIpcReachableTarget(target_segment_desc->name,
+                                 local_server_name_)) {
         std::string fallback;
         for (const char* candidate : {"rdma", "tcp"}) {
             if (std::find(protos.begin(), protos.end(), candidate) !=
@@ -674,7 +717,7 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
         }
         if (fallback.empty()) {
             return Status::NotSupportedTransport(
-                "hip target is cross-host but segment " +
+                preferred_proto + " target is cross-host but segment " +
                 std::to_string(entry.target_id) +
                 " offers no cross-host transport (rdma/tcp)");
         }
@@ -690,11 +733,18 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
         preferred_proto = "ascend";
     }
 #endif
+    if (!transport_map_.count(preferred_proto) && preferred_proto == "rdma" &&
+        transport_map_.count("rdma_twosided")) {
+        preferred_proto = "rdma_twosided";
+    }
     if (!transport_map_.count(preferred_proto)) {
         return Status::NotSupportedTransport("Transport " + preferred_proto +
                                              " not installed");
     }
-    if (std::find(protos.begin(), protos.end(), preferred_proto) ==
+    // Segment metadata still advertises "rdma" for the twosided install.
+    const std::string segment_proto =
+        (preferred_proto == "rdma_twosided") ? "rdma" : preferred_proto;
+    if (std::find(protos.begin(), protos.end(), segment_proto) ==
         protos.end()) {
         return Status::NotSupportedTransport(
             "Transport " + preferred_proto +
