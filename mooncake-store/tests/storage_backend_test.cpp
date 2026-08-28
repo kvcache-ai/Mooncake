@@ -180,7 +180,9 @@ class StorageBackendTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("StorageBackendTest");
         FLAGS_logtostderr = true;
-        data_path = std::filesystem::current_path().string() + "/data";
+        data_path =
+            (std::filesystem::current_path() / "storage_backend_test_data")
+                .string();
         // Remove all leftover files and subdirectories from previous runs
         if (fs::exists(data_path)) {
             for (const auto& entry : fs::directory_iterator(data_path)) {
@@ -659,16 +661,6 @@ TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
 }
 
 TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
-    std::string data_path = std::filesystem::current_path().string() + "/data";
-    fs::create_directories(data_path);
-
-    // Clean up any existing files
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            fs::remove(entry.path());
-        }
-    }
-
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;

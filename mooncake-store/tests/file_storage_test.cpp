@@ -51,7 +51,8 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
         UnsetEnv("MOONCAKE_USE_URING");
-        data_path = std::filesystem::current_path().string() + "/data";
+        data_path = (std::filesystem::current_path() / "file_storage_test_data")
+                        .string();
         fs::create_directories(data_path);
         for (const auto& entry : fs::directory_iterator(data_path)) {
             std::error_code ec;

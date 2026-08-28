@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <chrono>
@@ -36,6 +37,7 @@
 #include <mutex>
 #include <optional>
 #include <type_traits>
+#include <vector>
 
 #include "common.h"
 #include "transfer_engine.h"
@@ -68,6 +70,20 @@ LaneObserverHook lane_observer_hook = nullptr;
 LaneFailureReasonHook lane_failure_reason_hook = nullptr;
 SessionProgressHook session_progress_hook = nullptr;
 StartTransferMetadataHook start_transfer_metadata_hook = nullptr;
+std::atomic<size_t> staging_buffer_allocation_count{0};
+std::atomic<size_t> staging_device_query_count{0};
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+void recordStagingBufferAllocationForTest() noexcept {
+    staging_buffer_allocation_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void recordStagingDeviceQueryForTest() noexcept {
+    staging_device_query_count.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
 
 enum LaneTestEvent {
     kLaneQueueAdmitted = 1,
@@ -234,6 +250,19 @@ bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {
            std::is_move_constructible<TcpTransport::TerminalAction>::value &&
            !std::is_copy_constructible<TcpTransport::TerminalAction>::value &&
            !std::is_copy_assignable<TcpTransport::TerminalAction>::value;
+}
+
+void tcpTransportResetStagingStatsForTest() noexcept {
+    staging_buffer_allocation_count.store(0, std::memory_order_relaxed);
+    staging_device_query_count.store(0, std::memory_order_relaxed);
+}
+
+size_t tcpTransportStagingBufferAllocationCountForTest() noexcept {
+    return staging_buffer_allocation_count.load(std::memory_order_relaxed);
+}
+
+size_t tcpTransportStagingDeviceQueryCountForTest() noexcept {
+    return staging_device_query_count.load(std::memory_order_relaxed);
 }
 #endif
 
