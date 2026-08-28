@@ -9,7 +9,11 @@ on:
     branches:
       - "main"
       - "release/**"
-    types: [opened, synchronize, reopened, labeled]
+    # `labeled` is intentionally omitted. Auto-labeler already applies
+    # `run-ci`, so any new label (including `run-e2e-ci`) would retrigger
+    # this whole workflow and cancel the in-progress run. Same-SHA
+    # retrigger via the `run-ci` label lives in ci-on-label.yml.
+    types: [opened, synchronize, reopened]
   workflow_dispatch: {}
 
 permissions:
