@@ -214,6 +214,7 @@ jobs:
           VERSION: ${{ env.VERSION }}
 
       - name: Smoke test repaired wheel
+        shell: bash
         run: |
           smoke_venv=$(mktemp -d)
           python -m venv "$smoke_venv"
