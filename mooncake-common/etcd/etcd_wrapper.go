@@ -282,6 +282,9 @@ func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 	cancelAllStoreKeepAlives()
 	cancelAllStoreWatches()
 	cancelAllStorePrefixWatches()
+	// Join prefix-watch goroutines before closing the old client so reset is
+	// closer to fixture-style teardown (cancel + wait + close).
+	waitAllStorePrefixWatches(5 * time.Second)
 
 	storeMutex.Lock()
 	oldClient := storeClient
@@ -502,6 +505,34 @@ func cancelAllStorePrefixWatches() {
 
 	for _, cancel := range cancels {
 		cancel()
+	}
+}
+
+// waitAllStorePrefixWatches waits for prefix-watch goroutines previously
+// cancelled by cancelAllStorePrefixWatches to fully exit (done closed).
+// Returns early if the timeout elapses; callers should still Close the old
+// client afterward so residual RPCs are aborted.
+func waitAllStorePrefixWatches(timeout time.Duration) {
+	storePrefixWatchMutex.Lock()
+	dones := make([]<-chan struct{}, 0, len(storePrefixWatchCtx))
+	for _, watchInfo := range storePrefixWatchCtx {
+		if watchInfo.done != nil {
+			dones = append(dones, watchInfo.done)
+		}
+	}
+	storePrefixWatchMutex.Unlock()
+
+	deadline := time.Now().Add(timeout)
+	for _, done := range dones {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		select {
+		case <-done:
+		case <-time.After(remaining):
+			return
+		}
 	}
 }
 
