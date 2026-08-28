@@ -14,6 +14,7 @@
 #include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 #include "rpc_types.h"
+#include "request_context.h"
 #include "types.h"
 #include "default_config.h"
 
@@ -645,9 +646,11 @@ std::vector<int64_t> DummyClient::batch_get_into(
     for (auto ptr : buffer_ptrs) {
         buffers.push_back(reinterpret_cast<uint64_t>(ptr));
     }
+    ReadRouteConfig stamped_cfg = config;
+    apply_current_request_id(stamped_cfg.request_id);
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper, int64_t>(
-            keys.size(), keys, buffers, sizes, config, client_id_);
+            keys.size(), keys, buffers, sizes, stamped_cfg, client_id_);
     std::vector<int64_t> results;
     results.reserve(internal_results.size());
 

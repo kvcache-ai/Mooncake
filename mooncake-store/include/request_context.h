@@ -47,4 +47,13 @@ inline const std::optional<RequestContext>& get_current_request_context() {
     return g_current_ctx;
 }
 
+// Stamp the calling thread's current request_id (if any) into `out`. No-op when
+// no context is set, which lets a downstream process preserve a request_id that
+// was already carried in (e.g. across the dummy -> RealClient hop A).
+inline void apply_current_request_id(std::string& out) {
+    if (g_current_ctx) {
+        out = g_current_ctx->request_id;
+    }
+}
+
 }  // namespace mooncake
