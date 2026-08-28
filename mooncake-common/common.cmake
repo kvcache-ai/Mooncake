@@ -87,20 +87,6 @@ option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
 option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
-option(USE_RISCV "Enable RISC-V build compatibility settings" OFF)
-if(USE_RISCV)
-  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
-    message(
-      WARNING
-        "USE_RISCV is enabled, but CMAKE_SYSTEM_PROCESSOR is '${CMAKE_SYSTEM_PROCESSOR}'"
-    )
-  endif()
-  # Define this before any pybind11 module is created. Otherwise pybind11 adds
-  # its default full-LTO target, which is prohibitively resource-intensive on
-  # RISC-V build hosts.
-  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
-  message(STATUS "RISC-V: IPO disabled for Mooncake Python extensions")
-endif()
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
