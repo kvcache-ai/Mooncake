@@ -64,13 +64,11 @@ inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
 
 inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
     RpcClientPool::PoolConfig config;
-    // Connection establishment is retried by the Client HA monitor and the
-    // storage heartbeat. Retrying here blocks those control-plane loops: a
-    // leader view can be published before the new master's RPC listener is
-    // ready, and the default pool sequence would spend up to four connection
-    // timeouts before the caller can try again.  The pool waits after its
-    // first failed attempt even when the retry count is zero, so disable that
-    // wait as well; the caller owns the retry schedule.
+    // The Client HA monitor and storage heartbeat own the retry schedule.
+    // Internal retries can block those loops when a leader view is published
+    // before the new master's listener is ready. YLT waits after the initial
+    // attempt even when retry count is zero, so disable that wait as well.
+    // The independently configurable per-attempt timeout is unchanged.
     config.connect_retry_count = 0;
     config.reconnect_wait_time = std::chrono::milliseconds{0};
     const char* value = std::getenv("MC_RPC_PROTOCOL");

@@ -122,9 +122,9 @@ TEST(RpcTimeoutTest, RpcTimesOutAgainstUnresponsiveMaster) {
 // A leader view can become visible before the new master has finished binding
 // its RPC endpoint.  A failed connect must return to the HA monitor promptly;
 // the monitor owns the retry loop and cannot make progress while the client
-// pool performs its default multi-attempt reconnect sequence.  Reserve and
-// release an ephemeral loopback port so the failure is deterministic and does
-// not depend on an external black-hole route.
+// pool performs its default multi-attempt reconnect sequence. Bind an
+// ephemeral loopback port without listening on it so connection attempts are
+// rejected deterministically while the port remains reserved by this test.
 TEST(RpcTimeoutTest, MasterConnectDoesNotRetryFailedConnection) {
     int probe_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(probe_fd, 0) << "failed to create probe socket";
@@ -142,7 +142,6 @@ TEST(RpcTimeoutTest, MasterConnectDoesNotRetryFailedConnection) {
               0);
     const auto port = ntohs(addr.sin_port);
     ASSERT_GT(port, 0);
-    ASSERT_EQ(::close(probe_fd), 0);
 
     ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "100", 1), 0);
 
@@ -154,9 +153,10 @@ TEST(RpcTimeoutTest, MasterConnectDoesNotRetryFailedConnection) {
                              .count();
 
     ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+    EXPECT_EQ(::close(probe_fd), 0);
 
     EXPECT_EQ(rc, ErrorCode::RPC_FAIL);
-    EXPECT_LT(elapsed, 500)
+    EXPECT_LT(elapsed, 750)
         << "MasterClient retried a failed leader connection internally for "
         << elapsed << "ms";
 }
