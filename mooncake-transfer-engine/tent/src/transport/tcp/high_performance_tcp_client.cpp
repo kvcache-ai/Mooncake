@@ -436,6 +436,9 @@ HighPerformanceTcpClient::~HighPerformanceTcpClient() {
         !workers_->onWorkerThread()) {
         (void)cancelAll(CANCELED);
     }
+    DCHECK(workers_ == nullptr ||
+           active_operations_.load(std::memory_order_acquire) == 0)
+        << "HP TCP client destroyed with active operations";
 }
 
 void HighPerformanceTcpClient::operationStarted() {

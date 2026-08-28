@@ -4,6 +4,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <future>
+#include <stdexcept>
 #include <thread>
 
 #include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
@@ -60,6 +62,50 @@ TEST(HighPerformanceTcpWorkersTest, BatchAdmissionHasNoPartialCommit) {
     EXPECT_EQ(admission.outstandingTasks(), 1u);
     admission.release(1, 512);
     EXPECT_TRUE(workers.stop().ok());
+}
+
+TEST(HighPerformanceTcpAdmissionControllerTest,
+     UnderflowFailsClosedWithoutForgingDrain) {
+    HighPerformanceTcpAdmissionController admission(2, 1024);
+    ASSERT_TRUE(admission.tryReserve(1, 512).ok());
+
+    std::promise<bool> result;
+    auto result_future = result.get_future();
+    std::thread waiter(
+        [&] { result.set_value(admission.waitForZero().IsInternalError()); });
+
+    admission.release(2, 512);
+
+    EXPECT_TRUE(admission.failed());
+    EXPECT_EQ(admission.outstandingTasks(), 1u);
+    EXPECT_EQ(admission.outstandingBytes(), 512u);
+    const auto wait_status = result_future.wait_for(std::chrono::seconds(1));
+    if (wait_status != std::future_status::ready) {
+        // Ensure a broken implementation cannot strand the test thread.
+        admission.release(1, 512);
+    }
+    EXPECT_EQ(wait_status, std::future_status::ready);
+    EXPECT_TRUE(result_future.get());
+    waiter.join();
+    EXPECT_TRUE(admission.tryReserve(1, 1).IsInternalError());
+}
+
+TEST(HighPerformanceTcpWorkersTest,
+     FailedWorkerRejectsAdmissionButKeepsTeardownLive) {
+    HighPerformanceTcpWorkers workers({.worker_count = 1});
+    ASSERT_TRUE(workers.start().ok());
+
+    std::atomic<bool> owner_loop_continued{false};
+
+    asio::post(workers.ioContext(0),
+               [] { throw std::runtime_error("test worker failure"); });
+    asio::post(workers.ioContext(0), [&] { owner_loop_continued.store(true); });
+
+    ASSERT_TRUE(WaitUntil([&] { return workers.hasFailedWorker(); }));
+    EXPECT_TRUE(workers.barrier().ok());
+    EXPECT_TRUE(owner_loop_continued.load());
+    EXPECT_TRUE(SubmitToWorker(workers, 0, [](size_t) {}).IsInternalError());
+    EXPECT_TRUE(workers.stop().IsInternalError());
 }
 
 TEST(HighPerformanceTcpTaskTest, CompletionReleasesLeaseAndBudgetOnce) {

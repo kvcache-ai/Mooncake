@@ -56,6 +56,20 @@ Status NeedsRefresh(const std::string& message) {
     return Status::NeedsRefreshCache(message + LOC_MARK);
 }
 
+Status CheckRuntimeHealth(
+    const HighPerformanceTcpWorkers* workers,
+    const HighPerformanceTcpAdmissionController* admission) {
+    if (workers != nullptr && workers->hasFailedWorker()) {
+        return Status::InternalError(
+            "HP TCP worker runtime has failed" LOC_MARK);
+    }
+    if (admission != nullptr && admission->failed()) {
+        return Status::InternalError(
+            "HP TCP admission accounting has failed" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 Status RemoteWireStatus(HighPerformanceTcpStatus status) {
     switch (status) {
         case HighPerformanceTcpStatus::kStaleRegistration:
@@ -288,6 +302,9 @@ Status HighPerformanceTcpTransport::install(
 }
 
 Status HighPerformanceTcpTransport::stopRuntime(bool close_registry) {
+    // Lifecycle invariant: this is the sole normal teardown order. Client and
+    // server async callbacks hold raw parent pointers, so they must quiesce
+    // before their owners are destroyed and before worker contexts disappear.
     Status first = Status::OK();
     if (admission_) admission_->close();
     if (server_) first = FirstError(std::move(first), server_->stopAccepting());
@@ -298,8 +315,25 @@ Status HighPerformanceTcpTransport::stopRuntime(bool close_registry) {
         first = FirstError(std::move(first), client_->cancelAll(CANCELED));
     if (server_) first = FirstError(std::move(first), server_->cancelAll());
 
-    if (admission_) admission_->waitForZero();
+    if (admission_) {
+        if (workers_ && workers_->hasFailedWorker() &&
+            (admission_->outstandingTasks() != 0 ||
+             admission_->outstandingBytes() != 0)) {
+            first = FirstError(
+                std::move(first),
+                Status::InternalError("HP TCP admission cannot drain after "
+                                      "worker failure" LOC_MARK));
+        } else {
+            first = FirstError(std::move(first), admission_->waitForZero());
+        }
+    }
     if (server_) first = FirstError(std::move(first), server_->stop());
+    if (first.ok()) {
+        DCHECK(!admission_ || (admission_->outstandingTasks() == 0 &&
+                               admission_->outstandingBytes() == 0));
+        DCHECK(!client_ || client_->activeOperations() == 0);
+        DCHECK(!server_ || server_->activeSessionsForTest() == 0);
+    }
     if (workers_) first = FirstError(std::move(first), workers_->stop());
     return first;
 }
@@ -534,6 +568,7 @@ Status HighPerformanceTcpTransport::submitTransferTasks(
         return Status::InvalidArgument(
             "HP TCP transport is unavailable" LOC_MARK);
     }
+    CHECK_STATUS(CheckRuntimeHealth(workers_.get(), admission_.get()));
     if (requests.empty()) return Status::OK();
     if (requests.size() > hp_batch->max_size - hp_batch->tasks.size()) {
         return Status::TooManyRequests(
@@ -599,6 +634,7 @@ Status HighPerformanceTcpTransport::getTransferStatus(SubBatchRef batch,
         static_cast<size_t>(task_id) >= hp_batch->tasks.size()) {
         return Status::InvalidArgument("invalid HP TCP task id" LOC_MARK);
     }
+    CHECK_STATUS(CheckRuntimeHealth(workers_.get(), admission_.get()));
     status = hp_batch->tasks[static_cast<size_t>(task_id)]->snapshot();
     const auto remote_status =
         hp_batch->tasks[static_cast<size_t>(task_id)]->remoteStatus();
@@ -614,6 +650,7 @@ Status HighPerformanceTcpTransport::retryTransferTask(SubBatchRef batch,
         static_cast<size_t>(task_id) >= hp_batch->tasks.size()) {
         return Status::InvalidArgument("invalid HP TCP retry task id" LOC_MARK);
     }
+    CHECK_STATUS(CheckRuntimeHealth(workers_.get(), admission_.get()));
     if (hp_batch->tasks[static_cast<size_t>(task_id)]->snapshot().s != FAILED) {
         return Status::InvalidArgument(
             "HP TCP retry requires a failed attempt" LOC_MARK);

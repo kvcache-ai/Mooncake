@@ -50,13 +50,26 @@ cancels every client lane and server session on its owner, waits for operations
 and leases, then stops and joins worker threads. This makes shutdown bounded
 even when a peer sends only part of a request.
 
+This ordering is a lifecycle invariant, not an incidental destructor detail:
+the client and server are destroyed before the worker contexts they use. In a
+debug build, normal teardown asserts that admission, client operations and
+server sessions have all drained before their owners are destroyed.
+
+An exception escaping an ASIO handler marks the runtime failed and blocks
+further admission. The owner event loop continues only to retire previously
+committed work and process teardown cancellation with the same affinity. Once
+those resources drain, shutdown joins the workers and reports the failure.
+Likewise, admission-release underflow is fail-closed: counters are preserved,
+new work is rejected, and drain returns an error instead of treating live work
+as complete.
+
 ## Configuration
 
 The transport is configured under `transports.hp_tcp`:
 
 | Field | Meaning |
 | --- | --- |
-| `enable` | Enable `hp_tcp`. |
+| `enable` | Enable `hp_tcp`; set `transports.tcp.enable` to `false`. The two transports cannot be enabled together because control-plane notification ownership is singular. |
 | `bind_address`, `advertise_address`, `port` | Listener and published endpoint. |
 | `worker_count` | ASIO event-loop threads. |
 | `connections_per_peer` | Persistent lanes per peer. |

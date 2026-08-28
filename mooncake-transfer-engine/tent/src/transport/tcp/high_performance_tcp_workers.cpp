@@ -16,6 +16,10 @@ Status HighPerformanceTcpAdmissionController::tryReserve(uint64_t tasks,
             "HP TCP admission reservation must be non-zero" LOC_MARK);
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (failed_) {
+        return Status::InternalError(
+            "HP TCP admission accounting is failed" LOC_MARK);
+    }
     if (!accepting_) {
         return Status::TooManyRequests("HP TCP admission is closed" LOC_MARK);
     }
@@ -31,20 +35,23 @@ Status HighPerformanceTcpAdmissionController::tryReserve(uint64_t tasks,
 
 void HighPerformanceTcpAdmissionController::release(uint64_t tasks,
                                                     uint64_t bytes) {
-    bool zero = false;
+    bool notify_waiters = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (tasks > tasks_ || bytes > bytes_) {
             LOG(ERROR) << "HP TCP admission release underflow";
-            tasks_ = 0;
-            bytes_ = 0;
+            // Do not manufacture a drained state. A double release is a
+            // lifecycle invariant violation; preserving the counters keeps
+            // shutdown from treating live work as retired.
+            failed_ = true;
+            notify_waiters = true;
         } else {
             tasks_ -= tasks;
             bytes_ -= bytes;
+            notify_waiters = tasks_ == 0 && bytes_ == 0;
         }
-        zero = tasks_ == 0 && bytes_ == 0;
     }
-    if (zero) zero_cv_.notify_all();
+    if (notify_waiters) zero_cv_.notify_all();
 }
 
 void HighPerformanceTcpAdmissionController::close() {
@@ -52,9 +59,20 @@ void HighPerformanceTcpAdmissionController::close() {
     accepting_ = false;
 }
 
-void HighPerformanceTcpAdmissionController::waitForZero() {
+Status HighPerformanceTcpAdmissionController::waitForZero() {
     std::unique_lock<std::mutex> lock(mutex_);
-    zero_cv_.wait(lock, [&] { return tasks_ == 0 && bytes_ == 0; });
+    zero_cv_.wait(lock,
+                  [&] { return failed_ || (tasks_ == 0 && bytes_ == 0); });
+    if (failed_) {
+        return Status::InternalError(
+            "HP TCP admission accounting is failed" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+bool HighPerformanceTcpAdmissionController::failed() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return failed_;
 }
 
 uint64_t HighPerformanceTcpAdmissionController::outstandingTasks() const {
@@ -84,17 +102,26 @@ Status HighPerformanceTcpWorkers::start() {
 
     try {
         started_ = true;
+        failed_.store(false, std::memory_order_release);
         workers_.reserve(config_.worker_count);
         for (size_t i = 0; i < config_.worker_count; ++i) {
             workers_.push_back(std::make_unique<WorkerContext>());
         }
         running_.store(true, std::memory_order_release);
         for (auto& worker : workers_) {
-            worker->thread = std::thread([context = worker.get()] {
-                try {
-                    context->io.run();
-                } catch (const std::exception& error) {
-                    LOG(ERROR) << "HP TCP io_context failed: " << error.what();
+            worker->thread = std::thread([this, context = worker.get()] {
+                for (;;) {
+                    try {
+                        context->io.run();
+                        break;
+                    } catch (const std::exception& error) {
+                        LOG(ERROR) << "HP TCP io_context handler failed: "
+                                   << error.what();
+                        markWorkerFailed();
+                    } catch (...) {
+                        LOG(ERROR) << "HP TCP io_context handler failed";
+                        markWorkerFailed();
+                    }
                 }
             });
         }
@@ -113,6 +140,13 @@ Status HighPerformanceTcpWorkers::start() {
     return Status::OK();
 }
 
+void HighPerformanceTcpWorkers::markWorkerFailed() noexcept {
+    failed_.store(true, std::memory_order_release);
+    // New batches observe failed_ and are rejected. The owner loop deliberately
+    // keeps running so already-committed work and teardown cancellation retain
+    // their original affinity and can retire every task, session and lease.
+}
+
 bool HighPerformanceTcpWorkers::onWorkerThread() const {
     const auto current = std::this_thread::get_id();
     return std::any_of(workers_.begin(), workers_.end(), [&](const auto& w) {
@@ -127,13 +161,20 @@ Status HighPerformanceTcpWorkers::stop() {
         return Status::InvalidArgument(
             "HP TCP worker cannot synchronously stop itself" LOC_MARK);
     }
+    const bool failed = hasFailedWorker();
     running_.store(false, std::memory_order_release);
     for (auto& worker : workers_) worker->guard.reset();
     for (auto& worker : workers_) worker->io.stop();
     for (auto& worker : workers_) {
         if (worker->thread.joinable()) worker->thread.join();
     }
-    workers_.clear();
+    // Keep stopped contexts alive until their client/server owners are
+    // destroyed. Those owners contain socket objects and cancellation handlers
+    // that refer to these contexts, even after no worker can execute them.
+    if (failed) {
+        return Status::InternalError(
+            "HP TCP workers stopped after an owner thread failure" LOC_MARK);
+    }
     return Status::OK();
 }
 
@@ -158,6 +199,10 @@ Status HighPerformanceTcpWorkers::tryCommitBatch(
     if (commands.empty()) return Status::OK();
 
     std::lock_guard<std::mutex> submit_lock(submit_mutex_);
+    if (hasFailedWorker()) {
+        return Status::InternalError(
+            "HP TCP worker owner thread has failed" LOC_MARK);
+    }
     if (!running()) {
         return Status::InternalError("HP TCP workers are not running" LOC_MARK);
     }
@@ -225,6 +270,10 @@ Status HighPerformanceTcpWorkers::barrier() {
             "HP TCP barrier cannot run on a worker thread" LOC_MARK);
     }
     if (workers_.empty()) return Status::OK();
+    if (!running()) {
+        return Status::InternalError(
+            "HP TCP barrier cannot run after workers stop" LOC_MARK);
+    }
 
     struct Latch {
         std::mutex mutex;

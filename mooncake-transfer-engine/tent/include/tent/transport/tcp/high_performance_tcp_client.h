@@ -76,6 +76,9 @@ class HighPerformanceTcpClient {
     uint64_t connectionsCreatedForTest() const {
         return connections_created_.load(std::memory_order_acquire);
     }
+    uint64_t activeOperations() const {
+        return active_operations_.load(std::memory_order_acquire);
+    }
 
    private:
     struct LaneKey {

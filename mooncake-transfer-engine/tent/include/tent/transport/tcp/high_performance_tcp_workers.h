@@ -29,7 +29,10 @@ class HighPerformanceTcpAdmissionController {
     Status tryReserve(uint64_t tasks, uint64_t bytes);
     void release(uint64_t tasks, uint64_t bytes);
     void close();
-    void waitForZero();
+    // Returns an error rather than waiting forever if accounting was
+    // corrupted. The counters are intentionally left unchanged in that case.
+    Status waitForZero();
+    bool failed() const;
     uint64_t outstandingTasks() const;
     uint64_t outstandingBytes() const;
 
@@ -41,6 +44,7 @@ class HighPerformanceTcpAdmissionController {
     uint64_t tasks_{0};
     uint64_t bytes_{0};
     bool accepting_{true};
+    bool failed_{false};
 };
 
 // Thin owner-thread pool for sockets. ASIO is the queue; this class adds
@@ -77,7 +81,15 @@ class HighPerformanceTcpWorkers {
     Status barrier();
     size_t affinityOwner(uint64_t peer, uint32_t lane) const;
     bool running() const { return running_.load(std::memory_order_acquire); }
-    bool controlContextAvailable() const { return !workers_.empty(); }
+    bool hasFailedWorker() const {
+        return failed_.load(std::memory_order_acquire);
+    }
+    // A stopped context is kept alive until client and server teardown has
+    // destroyed every socket and resolver that uses it, but it cannot run
+    // control work anymore.
+    bool controlContextAvailable() const {
+        return running() && !workers_.empty();
+    }
     size_t workerCount() const { return config_.worker_count; }
     asio::io_context& ioContext(size_t worker_id);
     bool onWorkerThread() const;
@@ -91,10 +103,12 @@ class HighPerformanceTcpWorkers {
     };
 
     void runCommand(Command command);
+    void markWorkerFailed() noexcept;
 
     Config config_;
     std::vector<std::unique_ptr<WorkerContext>> workers_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> failed_{false};
     bool started_{false};
     mutable std::mutex lifecycle_mutex_;
     mutable std::mutex submit_mutex_;

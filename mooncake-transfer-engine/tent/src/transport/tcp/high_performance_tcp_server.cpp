@@ -278,7 +278,12 @@ HighPerformanceTcpServer::HighPerformanceTcpServer(
     if (workers_ != nullptr) sessions_.resize(workers_->workerCount());
 }
 
-HighPerformanceTcpServer::~HighPerformanceTcpServer() { (void)stop(); }
+HighPerformanceTcpServer::~HighPerformanceTcpServer() {
+    (void)stop();
+    DCHECK(workers_ == nullptr ||
+           active_sessions_.load(std::memory_order_acquire) == 0)
+        << "HP TCP server destroyed with active sessions";
+}
 
 bool HighPerformanceTcpServer::reserveConnection() {
     size_t current = active_sessions_.load(std::memory_order_acquire);
