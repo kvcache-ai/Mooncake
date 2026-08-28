@@ -35,8 +35,7 @@ void PackOptionalString(msgpack::packer<msgpack::sbuffer>& packer,
 }
 
 size_t ComputeEventMapSize(bool is_stored, bool is_cleared, bool emit_legacy,
-                           bool emit_object_key,
-                           size_t connector_metadata_fields) {
+                           bool emit_object_key) {
     if (is_cleared) {
         // Envelope only: event_id, timestamp, event_type, model_name,
         // block_size, additional_salt, lora_name, tenant_id, backend_id,
@@ -54,7 +53,6 @@ size_t ComputeEventMapSize(bool is_stored, bool is_cleared, bool emit_legacy,
     if (emit_object_key) {
         map_size += 1;  // object_key
     }
-    map_size += connector_metadata_fields;
     if (is_stored) {
         map_size += 3;  // base_block_idx, parent_hash, token_ids
         if (emit_legacy) {
@@ -168,12 +166,10 @@ void KvEventPublisher::PublishStored(const std::string& object_key,
         tenant_id.empty() ? "default" : tenant_id;
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto& state = object_states_[normalized_tenant][object_key];
-    state.context = BuildEventContext(object_key);
     state.media.insert(medium);
     std::vector<PendingEvent> events;
-    events.push_back(
-        PendingEvent{EventKind::kStored, object_key, medium, normalized_tenant,
-                     ResolveGroupId(group_id, state.context), state.context});
+    events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
+                                  normalized_tenant, group_id});
     EnqueueBatch(std::move(events));
 }
 
@@ -189,9 +185,6 @@ void KvEventPublisher::PublishRemoved(const std::string& object_key,
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto& tenant_states = object_states_[normalized_tenant];
     auto state_it = tenant_states.find(object_key);
-    EventContext context = state_it == tenant_states.end()
-                               ? BuildEventContext(object_key)
-                               : state_it->second.context;
     if (state_it != tenant_states.end()) {
         state_it->second.media.erase(medium);
         if (state_it->second.media.empty()) {
@@ -202,9 +195,8 @@ void KvEventPublisher::PublishRemoved(const std::string& object_key,
         object_states_.erase(normalized_tenant);
     }
     std::vector<PendingEvent> events;
-    events.push_back(
-        PendingEvent{EventKind::kRemoved, object_key, medium, normalized_tenant,
-                     ResolveGroupId(group_id, context), std::move(context)});
+    events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
+                                  normalized_tenant, group_id});
     EnqueueBatch(std::move(events));
 }
 
@@ -218,7 +210,7 @@ void KvEventPublisher::PublishCleared(const std::string& tenant_id) {
     object_states_.erase(normalized_tenant);
     std::vector<PendingEvent> events;
     events.push_back(
-        PendingEvent{EventKind::kCleared, "", "", normalized_tenant, "", {}});
+        PendingEvent{EventKind::kCleared, "", "", normalized_tenant, ""});
     EnqueueBatch(std::move(events));
 }
 
@@ -238,23 +230,17 @@ void KvEventPublisher::PublishCommitted(
     const std::unordered_set<std::string> previous_media =
         state_it == tenant_states.end() ? std::unordered_set<std::string>{}
                                         : state_it->second.media;
-    const EventContext context = state_it == tenant_states.end()
-                                     ? BuildEventContext(object_key)
-                                     : state_it->second.context;
-    const std::string event_group_id = ResolveGroupId(group_id, context);
 
     std::vector<PendingEvent> events;
     for (const auto& medium : SortedMedia(previous_media)) {
         if (!new_media.contains(medium)) {
             events.push_back(PendingEvent{EventKind::kRemoved, object_key,
-                                          medium, normalized_tenant,
-                                          event_group_id, context});
+                                          medium, normalized_tenant, group_id});
         }
     }
     for (const auto& medium : SortedMedia(new_media)) {
         events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                      normalized_tenant, event_group_id,
-                                      context});
+                                      normalized_tenant, group_id});
     }
 
     if (new_media.empty()) {
@@ -265,7 +251,7 @@ void KvEventPublisher::PublishCommitted(
             object_states_.erase(normalized_tenant);
         }
     } else {
-        tenant_states[object_key] = ObjectEventState{context, new_media};
+        tenant_states[object_key] = ObjectEventState{new_media};
     }
     EnqueueBatch(std::move(events));
 }
@@ -282,27 +268,21 @@ void KvEventPublisher::PublishObjectRemoved(
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto tenant_it = object_states_.find(normalized_tenant);
     std::unordered_set<std::string> previous_media;
-    EventContext context;
     if (tenant_it != object_states_.end()) {
         const auto state_it = tenant_it->second.find(object_key);
         if (state_it != tenant_it->second.end()) {
             previous_media = state_it->second.media;
-            context = state_it->second.context;
         } else {
             previous_media = NormalizeMedia(previous_media_hint);
-            context = BuildEventContext(object_key);
         }
     } else {
         previous_media = NormalizeMedia(previous_media_hint);
-        context = BuildEventContext(object_key);
     }
 
     std::vector<PendingEvent> events;
-    const std::string event_group_id = ResolveGroupId(group_id, context);
     for (const auto& medium : SortedMedia(previous_media)) {
         events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
-                                      normalized_tenant, event_group_id,
-                                      context});
+                                      normalized_tenant, group_id});
     }
 
     if (tenant_it != object_states_.end()) {
@@ -331,24 +311,18 @@ void KvEventPublisher::SyncObjectState(
     const auto previous_media = state_it == tenant_states.end()
                                     ? NormalizeMedia(previous_media_hint)
                                     : state_it->second.media;
-    const EventContext context = state_it == tenant_states.end()
-                                     ? BuildEventContext(object_key)
-                                     : state_it->second.context;
-    const std::string event_group_id = ResolveGroupId(group_id, context);
 
     std::vector<PendingEvent> events;
     for (const auto& medium : SortedMedia(previous_media)) {
         if (!new_media.contains(medium)) {
             events.push_back(PendingEvent{EventKind::kRemoved, object_key,
-                                          medium, normalized_tenant,
-                                          event_group_id, context});
+                                          medium, normalized_tenant, group_id});
         }
     }
     for (const auto& medium : SortedMedia(new_media)) {
         if (!previous_media.contains(medium)) {
             events.push_back(PendingEvent{EventKind::kStored, object_key,
-                                          medium, normalized_tenant,
-                                          event_group_id, context});
+                                          medium, normalized_tenant, group_id});
         }
     }
 
@@ -357,12 +331,12 @@ void KvEventPublisher::SyncObjectState(
         // PROCESSING). Retain compact context until a commit or explicit
         // object deletion arrives.
         if (state_it != tenant_states.end() || !previous_media.empty()) {
-            tenant_states[object_key] = ObjectEventState{context, {}};
+            tenant_states[object_key] = ObjectEventState{{}};
         } else if (tenant_states.empty()) {
             object_states_.erase(normalized_tenant);
         }
     } else {
-        tenant_states[object_key] = ObjectEventState{context, new_media};
+        tenant_states[object_key] = ObjectEventState{new_media};
     }
     EnqueueBatch(std::move(events));
 }
@@ -373,55 +347,7 @@ KvEventPublisher::Stats KvEventPublisher::GetStats() const {
     stats.published_events = published_events_.load();
     stats.dropped_events = dropped_events_.load();
     stats.skipped_unparsed_keys = skipped_unparsed_keys_.load();
-    stats.invalid_event_hashes = invalid_event_hashes_.load();
     return stats;
-}
-
-KvEventPublisher::EventContext KvEventPublisher::BuildEventContext(
-    const std::string& object_key) {
-    EventContext context;
-    if (const auto key_info = ParseKvEventKey(object_key)) {
-        context.cache_prefix = key_info->cache_prefix;
-        context.model_name = key_info->model_name;
-        context.seq_hash = key_info->seq_hash;
-        context.group_id = key_info->group_id;
-        context.tp_rank = key_info->tp_rank;
-        context.head_or_tp_rank = key_info->head_or_tp_rank;
-        context.pcp_rank = key_info->pcp_rank;
-        context.dcp_rank = key_info->dcp_rank;
-        context.pp_rank = key_info->pp_rank;
-        context.layer_id = key_info->layer_id;
-        context.has_explicit_block_hash = !key_info->block_hash.empty();
-        if (context.has_explicit_block_hash) {
-            if (context.seq_hash.has_value()) {
-                context.connector_block_hash = key_info->block_hash;
-            } else {
-                RecordInvalidHash("key block_hash", key_info->block_hash);
-            }
-        }
-        return context;
-    }
-    context.seq_hash = ParseSeqHashFromObjectKey(object_key);
-    return context;
-}
-
-std::string KvEventPublisher::ResolveGroupId(const std::string& group_id,
-                                             const EventContext& context) {
-    if (context.group_id.has_value()) {
-        return std::to_string(context.group_id.value());
-    }
-    return group_id;
-}
-
-void KvEventPublisher::RecordInvalidHash(const char* field,
-                                         const std::string& value) {
-    const uint64_t count =
-        invalid_event_hashes_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (count <= 10 || count % 1000 == 0) {
-        LOG(WARNING) << "kv_events: cannot encode " << field
-                     << " as RFC u64, value=" << value
-                     << ", invalid_hash_count=" << count;
-    }
 }
 
 void KvEventPublisher::EnqueueBatch(std::vector<PendingEvent> events) {
@@ -491,14 +417,9 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     encoded.reserve(batch.size());
     for (const auto& pending : batch) {
         if (pending.kind != EventKind::kCleared &&
-            !pending.context.seq_hash.has_value()) {
-            if (!config_.emit_object_key || pending.object_key.empty()) {
-                skipped_unparsed_keys_.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            if (!pending.context.has_explicit_block_hash) {
-                skipped_unparsed_keys_.fetch_add(1, std::memory_order_relaxed);
-            }
+            (!config_.emit_object_key || pending.object_key.empty())) {
+            skipped_unparsed_keys_.fetch_add(1, std::memory_order_relaxed);
+            continue;
         }
         encoded.push_back(EncodedEvent{
             pending, next_event_id_.fetch_add(1, std::memory_order_relaxed)});
@@ -526,24 +447,11 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
                       : (is_cleared ? "AllBlocksCleared" : "BlockRemoved");
         const std::string& tenant_id =
             item.pending.tenant_id.empty() ? "default" : item.pending.tenant_id;
-        const std::string& model_name = item.pending.context.model_name.empty()
-                                            ? config_.model_name
-                                            : item.pending.context.model_name;
+        const std::string& model_name = config_.model_name;
 
-        const size_t connector_metadata_fields =
-            static_cast<size_t>(
-                !item.pending.context.connector_block_hash.empty()) +
-            static_cast<size_t>(!item.pending.context.cache_prefix.empty()) +
-            static_cast<size_t>(item.pending.context.tp_rank.has_value()) +
-            static_cast<size_t>(
-                item.pending.context.head_or_tp_rank.has_value()) +
-            static_cast<size_t>(item.pending.context.pcp_rank.has_value()) +
-            static_cast<size_t>(item.pending.context.dcp_rank.has_value()) +
-            static_cast<size_t>(item.pending.context.pp_rank.has_value()) +
-            static_cast<size_t>(item.pending.context.layer_id.has_value());
         const size_t map_size = ComputeEventMapSize(
             is_stored, is_cleared, config_.emit_legacy_compat_fields,
-            config_.emit_object_key, connector_metadata_fields);
+            config_.emit_object_key);
 
         packer.pack_map(map_size);
         packer.pack("event_id");
@@ -589,62 +497,16 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
             packer.pack(item.pending.object_key);
         }
 
-        if (!item.pending.context.connector_block_hash.empty()) {
-            packer.pack("connector_block_hash");
-            packer.pack(item.pending.context.connector_block_hash);
-        }
-
-        if (!item.pending.context.cache_prefix.empty()) {
-            packer.pack("cache_prefix");
-            packer.pack(item.pending.context.cache_prefix);
-        }
-
-        if (item.pending.context.tp_rank.has_value()) {
-            packer.pack("tp_rank");
-            packer.pack(item.pending.context.tp_rank.value());
-        }
-        if (item.pending.context.head_or_tp_rank.has_value()) {
-            packer.pack("head_or_tp_rank");
-            packer.pack(item.pending.context.head_or_tp_rank.value());
-        }
-        if (item.pending.context.pcp_rank.has_value()) {
-            packer.pack("pcp_rank");
-            packer.pack(item.pending.context.pcp_rank.value());
-        }
-        if (item.pending.context.dcp_rank.has_value()) {
-            packer.pack("dcp_rank");
-            packer.pack(item.pending.context.dcp_rank.value());
-        }
-        if (item.pending.context.pp_rank.has_value()) {
-            packer.pack("pp_rank");
-            packer.pack(item.pending.context.pp_rank.value());
-        }
-        if (item.pending.context.layer_id.has_value()) {
-            packer.pack("layer_id");
-            packer.pack(item.pending.context.layer_id.value());
-        }
-
         packer.pack("seq_hashes");
-        if (item.pending.context.seq_hash.has_value()) {
-            packer.pack_array(1);
-            packer.pack(item.pending.context.seq_hash.value());
-        } else {
-            packer.pack_array(0);
-        }
+        packer.pack_array(0);
 
-        if (config_.emit_legacy_compat_fields &&
-            item.pending.context.seq_hash.has_value()) {
-            packer.pack("block_hashes");
-            packer.pack_array(1);
-            packer.pack(item.pending.context.seq_hash.value());
-        } else if (config_.emit_legacy_compat_fields) {
+        if (config_.emit_legacy_compat_fields) {
             packer.pack("block_hashes");
             packer.pack_array(0);
         }
 
         if (is_stored) {
             packer.pack("base_block_idx");
-            // Connector keys carry a prefix hash but not its block depth.
             packer.pack_nil();
             packer.pack("parent_hash");
             packer.pack_nil();

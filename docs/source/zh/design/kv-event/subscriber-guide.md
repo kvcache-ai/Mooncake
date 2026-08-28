@@ -2,16 +2,20 @@
 
 [English](../../../design/kv-event/subscriber-guide.md)
 
-Conductor 目前可以读取两种键值（KV）事件格式：vLLM 引擎事件和 Mooncake
-共享缓存池事件。本页帮助你选择正确的注册来源类型、满足 Conductor 检查的
-字段，并准确理解 Store、Remove、Clear 和 unregister 会修改什么。本文也会
-介绍哈希转换和漏掉事件时的限制。
+Conductor 目前可以读取三条 KV 事件路径：vLLM 原生引擎事件、SGLang 原生
+引擎事件，以及 Mooncake 共享缓存池 map 事件。SGLang 引擎通过 Mooncake
+上报时仍使用 Mooncake map envelope，但由已注册的 SGLang handler 解析原始
+object key。本页帮助你选择正确的注册来源类型、满足 Conductor 检查的字段，
+并准确理解 Store、Remove、Clear 和 unregister 会修改什么。本文也会介绍哈希
+转换和漏掉事件时的限制。
 
 ## 选择注册来源类型
 
 每个 endpoint 必须且只能注册为下面一种区分大小写的 `type`：
 
 - 推理引擎上报自身 GPU 缓存时使用 `"vLLM"`；
+- 推理引擎上报 SGLang 原生事件或通过 Mooncake 上报 SGLang key 时使用
+  `"SGLang"`；
 - Mooncake Master 上报共享 CPU 或 Disk 对象时使用 `"Mooncake"`。
 
 Conductor 根据注册时记录的 type 选择 MessagePack 解析方式。即使两种发布端
@@ -19,31 +23,41 @@ Conductor 根据注册时记录的 type 选择 MessagePack 解析方式。即使
 同时用于标识消息来源、限制清理范围和记录日志。注册字段与示例见
 [HTTP API 参考](../conductor/indexer-api-design.md)。
 
-## 对比 vLLM 和 Mooncake
+## 对比事件来源
 
-| 问题 | `vLLM` 来源 | `Mooncake` 来源 |
-|---|---|---|
-| 注册 `type` | 必须是 `vLLM`。 | 必须是 `Mooncake`。 |
-| 事件名 | `type` 中的 `BlockStored`、`BlockRemoved`、`AllBlocksCleared`。 | `event_type` 中的 `stored`、`removed`、`cleared`；可以带对应的旧版 `type`。 |
-| 批次时间戳 | 以秒为单位的有限 MessagePack 浮点数。事件中不要求单独的时间戳字段。 | 以毫秒为单位的非负 MessagePack 整数。每个事件的 `timestamp` 都必须是同一个整数。 |
-| 接受的缓存位置 | `GPU`，不区分大小写。其他值会记录警告并被忽略。 | `CPU` 或 `Disk`，不区分大小写。其他值会记录警告并被忽略。 |
-| Tenant、模型、LoRA、块大小 | 可信的注册信息提供这些缓存共享字段。Store 事件中的块大小和低秩适配（LoRA）名称只用于核对。 | Store 事件提供 `tenant_id`、`model_name`、`lora_name` 和 `block_size`。它们必须对应一个已有的 vLLM 缓存共享范围，并使用已注册的 hash profile。 |
-| 数据并行 rank | 可信的注册信息提供引擎 rank。批次中的非 `nil` rank 必须与它一致，否则整批都会被拒绝。 | 批次和事件中的 `dp_rank` 只用于排查问题，不会生成 GPU 记录或查询实例。 |
-| Group | `group_idx` 可以不存在、为 `nil` 或为 `0`。 | `group_id` 可以是 `nil`、空字符串或十进制字符串 `"0"`。 |
-| 对象字段 | 使用 `block_hashes`，没有 Mooncake 对象 key。 | Store 需要 `object_key` 和 `connector_block_hash`；Remove 需要 `object_key`；Clear 不携带这两个字段。 |
-| `/query` 的 `instances` | 已注册引擎按 `instance_id` 出现，其中包含已注册的 rank。 | Mooncake 来源不会成为一个 instance。它的 CPU 或 Disk 信息显示在每个兼容的 vLLM 引擎下。 |
+| 问题 | `vLLM` 来源 | `SGLang` 来源 | `Mooncake` 来源 |
+|---|---|---|---|
+| 注册 `type` | 必须是 `vLLM`。 | 必须是 `SGLang`；它选择原生解码器，或为 SGLang Store 选择 Mooncake map 解码器。 | 必须是 `Mooncake`。 |
+| 事件名 | `type` 中的 `BlockStored`、`BlockRemoved`、`AllBlocksCleared`。 | 数组标签中的同名事件，或 Mooncake map 中 `event_type` 的 `stored`、`removed`、`cleared`。 | `event_type` 中的 `stored`、`removed`、`cleared`；可以带对应的旧版 `type`。 |
+| 批次时间戳 | 以秒为单位的有限 MessagePack 浮点数。事件中不要求单独的时间戳字段。 | 原生事件使用秒浮点数；Mooncake map 使用毫秒整数。 | 以毫秒为单位的非负 MessagePack 整数。每个事件的 `timestamp` 都必须是同一个整数。 |
+| 接受的缓存位置 | `GPU`，不区分大小写。其他值会记录警告并被忽略。 | 原生事件把 `nil` 视为引擎本地 GPU 缓存，也接受显式 `GPU`、`CPU_PINNED` 或 `DISK`；Mooncake map 接受 `CPU` 或 `Disk`。 | `CPU` 或 `Disk`，不区分大小写。其他值会记录警告并被忽略。 |
+| Tenant、模型、LoRA、块大小 | 可信的注册信息提供这些缓存共享字段。Store 事件中的块大小和低秩适配（LoRA）名称只用于核对。 | 原生事件使用可信注册信息。vLLM 要求 `block_size` 相等；SGLang 允许最后一个部分页的大小处于 `1..注册 block_size` 范围内。Mooncake map Store 事件提供字段并必须与注册信息和 profile 匹配。 | Store 事件提供 `tenant_id`、`model_name`、`lora_name` 和 `block_size`。它们必须对应一个已有的 vLLM 或 SGLang 缓存共享范围，并使用已注册的 hash profile。 |
+| 数据并行 rank | 可信的注册信息提供引擎 rank。批次中的非 `nil` rank 必须与它一致，否则整批都会被拒绝。 | 可信的注册信息提供引擎 rank。批次中的非 `nil` rank 必须与它一致，否则整批都会被拒绝。 | 批次和事件中的 `dp_rank` 只用于排查问题，不会生成 GPU 记录或查询实例。 |
+| Group | `group_idx` 可以不存在、为 `nil` 或为 `0`。 | 原生事件没有 group 字段；SGLang Mooncake map 的 `group_id` 按不透明字符串保存。 | `group_id` 可以是 `nil`、空字符串或十进制字符串 `"0"`。 |
+| 对象字段 | 使用 `block_hashes`，没有 Mooncake 对象 key。 | 原生事件使用 `block_hashes`；Mooncake map Store 和 Remove 需要 `object_key`，由注册的 handler 解析。 | Store 和 Remove 需要 `object_key`；旧版 `connector_block_hash` 可选，存在时会核对；Clear 不携带这两个字段。 |
+| `/query` 的 `instances` | 已注册引擎按 `instance_id` 出现，其中包含已注册的 rank。 | 已注册引擎按 `instance_id` 出现，其中包含已注册的 rank。 | Mooncake 来源不会成为一个 instance。它的 CPU 或 Disk 信息显示在每个兼容的 vLLM 或 SGLang 引擎下。 |
 
 决定 CPU 或 Disk 信息能否被某个引擎共用的四个字段是 `tenant_id`、模型、
 `lora_name` 和 `block_size`。它们如何影响查询结果，见
 [架构页](../conductor/conductor-architecture-design.md#哪些缓存可以共用)。
 
+SGLang 原生事件与 vLLM 使用相同的三帧传输结构，但 payload 是数组形式的
+MessagePack。注册为 `SGLang` 后，Conductor 会解析 `BlockStored`、
+`BlockRemoved` 和 `AllBlocksCleared`，把缺失的 medium 视为引擎本地 GPU 缓存，
+并将有符号 wire hash 的位模式保存为无符号 64 位值。普通 token hash 使用
+`strategy: "sglang"`，EAGLE/推测式
+bigram hash 使用 `strategy: "sglang_bigram"`，投影方式为
+`index_projection: "first64_be"`。SGLang 不使用 `PYTHONHASHSEED`，每次
+`/query` 的 `cache_salt` 会提供哈希链根。
+
 ## 匹配前缀哈希配置
 
-KV Event 不携带 `PYTHONHASHSEED`，也不携带完整的第一个 parent 摘要，因此注册
-信息是可信的部署声明。同一兼容缓存范围内的每个 vLLM 和 Mooncake 注册项都必须
-提供同一段准确的 `python_hash_seed` 字符串。Conductor 把这段文本编码为规范
-CBOR，再计算 SHA-256 派生第一个 parent 使用的 `root_digest`；调用方不注册这个
-摘要。
+KV Event 不携带 `PYTHONHASHSEED`，也不携带完整的第一个 parent 摘要，因此对
+vLLM 来说注册信息是可信的部署声明。同一兼容 vLLM 缓存范围内的每个 vLLM 和
+Mooncake 注册项都必须提供同一段准确的 `python_hash_seed` 字符串。SGLang 注册
+改为选择 SGLang hash strategy，并在 `/query` 中使用请求的 `cache_salt`；seed
+字段只是为了复用注册 schema。Conductor 会把 vLLM seed 文本编码为规范 CBOR，
+再计算 SHA-256 派生第一个 parent 使用的 `root_digest`；调用方不注册这个摘要。
 
 种子必须是字面量 `random`，或者数值在 `0..4294967295` 范围内的 ASCII 十进制
 文本。准确文本会影响结果：`"0"` 和 `"00"` 派生不同的根摘要。未设置
@@ -110,7 +124,7 @@ Mooncake payload 必须是
 
 | 事件 | 解析时必需的字段 | 真正修改索引还需要什么 |
 |---|---|---|
-| `stored` | `group_id`、`seq_hashes`、`base_block_idx`、`parent_hash` 和 `token_ids`。后三个字段可以是 `nil`；`seq_hashes` 可以是 `[]`。 | 受支持的 group 和介质、完整的 tenant/model/LoRA/block size、`object_key`，以及可用的完整 `connector_block_hash`。如果有 sequence hash，它必须与完整哈希一致。 |
+| `stored` | `group_id`、`seq_hashes`、`base_block_idx`、`parent_hash` 和 `token_ids`。后三个字段可以是 `nil`；`seq_hashes` 可以是 `[]`。 | 受支持的 group 和介质、完整的 tenant/model/LoRA/block size，以及 `object_key`。旧版 `connector_block_hash` 可选；SGLang 注册会直接解析 object key。 |
 | `removed` | `group_id`、`seq_hashes` 和 `base_block_idx`；`seq_hashes` 可以是 `[]`。不能包含 stored 专用的 parent 和 token 字段。 | 受支持的 group 和介质，以及 `object_key`。Conductor 会查找 Store 保存的准确对象记录；可选的完整哈希或 sequence hash 必须与该记录一致。 |
 | `cleared` | 只包含通用字段。不能带任何已识别的对象、哈希、group、parent、token 或并行拓扑字段。 | 非空的 `backend_id` 和 `tenant_id`。该事件会清除这个来源 endpoint 下匹配的 CPU 和 Disk 对象记录。 |
 
@@ -129,16 +143,17 @@ Conductor 会把两种来源的哈希转成同一种无符号 64 位查询值。
 |---|---|
 | vLLM 无符号整数 | 它已经是查询值，直接使用。 |
 | vLLM MessagePack 二进制字符串 | 至少需要八个字节，然后按大端序读取最后八个字节。 |
-| Mooncake `connector_block_hash` | 去掉可选的 `0x`，接受大小写十六进制，要求长度为偶数且至少表示八个字节，将文本统一为小写，然后按大端序读取最后八个解码后的字节。 |
+| Mooncake `connector_block_hash` | 去掉可选的 `0x`，接受大小写十六进制，要求长度为偶数且至少表示八个字节，将文本统一为小写，然后按大端序读取最后八个解码后的字节。SGLang object key 使用前 16 个十六进制字符。 |
 
 Mooncake Store 的 `seq_hashes` 可以为空，也可以只包含一个值；该值必须等于
 从 `connector_block_hash` 得到的查询值。值不同或多于一个时，Conductor 会
 拒绝该事件，不修改已保存的对象记录或缓存索引。Remove 如果带有完整哈希或
 sequence 值，也必须与此前的 Store 记录一致。
 
-虽然 `/query` 只使用最后八个字节，Conductor 仍会保存完整 Mooncake 哈希和
-对象 key。如果两个对象的完整哈希不同，但最后八个字节相同，它们都可以提供
-同一个可能的查询命中；删除其中一个不会删除另一个对象的记录。查询端如何生成
+如果旧版事件带有 `connector_block_hash`，Conductor 会保存它和对象 key；当前发布端
+不填写这个 connector 派生字段，而是由已注册的 vLLM 或 SGLang handler 从对象 key
+投影哈希。虽然 `/query` 只使用投影值，如果两个对象的完整哈希不同但投影值相同，
+它们都可以提供同一个可能的查询命中；删除其中一个不会删除另一个对象的记录。查询端如何生成
 哈希，见 [token 块如何变成查找值](../conductor/conductor-architecture-design.md#token-块如何变成查找值)。
 
 ## 理解每种事件会修改什么
@@ -169,8 +184,9 @@ DP rank 如果与注册信息冲突，同样会使整批被拒绝。
 前面已完成的修改。未知字段会被忽略，方便发布端增加新的可选数据；已识别字段
 重复或类型错误时，只会拒绝该事件。
 
-修改 topic 不能让某个来源切换到另一种解析方式。即使 payload 的形状看起来像
-另一种来源，Conductor 也不会改用另一种方式重试。
+修改 topic 不能让某个来源切换到另一种解析方式。注册为 SGLang 的来源会先尝试
+数组协议；如果数组协议的事件项不是数组，Conductor 会按 SGLang-backed
+Mooncake 部署回退到 map 协议。注册为 vLLM 或 Mooncake 的来源不会切换协议。
 
 ## 清理一个来源
 
@@ -190,14 +206,14 @@ tenant/model/LoRA/block size。
 
 Conductor 会记录每个订阅最后收到的传输序号。如果后续序号向前跳跃，Conductor
 会记录空缺，并更新累计丢失事件数和空缺次数。对于配置了 `replay_endpoint` 的
-vLLM 订阅，Conductor 会从第一个缺失序号开始请求消息，持续读取 vLLM multipart
-重放流直到结束标记，并在处理触发空缺的实时消息之前依次派发恢复的消息。重放流中
-序号等于或大于当前实时消息的部分仍会被读完，但不会被重复派发。
+vLLM 或原生 SGLang 订阅，Conductor 会从第一个缺失序号开始请求消息，持续读取
+发布端 multipart 重放流直到结束标记，并在处理触发空缺的实时消息之前依次派发
+恢复的消息。重放流中序号等于或大于当前实时消息的部分仍会被读完，但不会被重复派发。
 
 如果重放请求失败、发布端缓冲区已不再包含所有缺失序号，或者没有配置
-`replay_endpoint`，Conductor 会记录警告并继续处理实时消息。失败的 vLLM 区间会
-保留到后续实时事件或重连时重试；如果发布端已经淘汰该区间，缓存记录可能仍不
-完整或已经过期，Conductor 不会自动将其失效。
+`replay_endpoint`，Conductor 会记录警告并继续处理实时消息。失败的 vLLM 或
+SGLang 区间会保留到后续实时事件或重连时重试；如果发布端已经淘汰该区间，缓存
+记录可能仍不完整或已经过期，Conductor 不会自动将其失效。
 
 断开连接后，Conductor 会重新连接实时订阅。只有配置了 `replay_endpoint` 且
 已知此前序号时，它才会请求从下一个序号开始的消息并派发返回的消息流。空 replay
@@ -215,18 +231,18 @@ endpoint 是有效配置，此时只创建实时订阅。
 1. 使用 `-DENABLE_KV_EVENTS=ON` 构建 Mooncake Store，启用发布端，保持
    `kv_events_emit_object_key=true`，并确认 `GET /kv_events/status` 返回
    `"enabled":true`。
-2. 先注册至少一个 `vLLM` 引擎。它的 `tenant_id`、`modelname`、
+2. 先注册至少一个 `vLLM` 或 `SGLang` 引擎。它的 `tenant_id`、`modelname`、
    `lora_name` 和 `block_size` 必须等于 Mooncake Store 事件将携带的值。
    使用上文明确的 `PYTHONHASHSEED` 和 `--prefix-caching-hash-algo` 设置启动
    每个引擎。确认 `/global_view` 中能看到该引擎和每个预期 rank。
-3. 该 vLLM 范围和 `Mooncake` 注册必须使用同一份完整 `hash_profile`：
+3. 该引擎范围和 `Mooncake` 注册必须使用同一份完整 `hash_profile`：
    `strategy`、`algorithm`、准确的 `python_hash_seed` 和 `index_projection`
    必须完全相同。Conductor 会派生并验证根摘要；任一发布端的事件都不会提供它。
-4. 为 Mooncake 发布端配置非空 `backend_id`、可用的模型备用值、正数块大小，
-   以及相同的 LoRA 名称。注意，从 `object_key` 解析出的模型会覆盖备用值。
-5. 每个对象 key 都应使用可识别的 connector 格式，并包含完整、有效的十六进制
-   哈希。Conductor 能接受的 `stored` 必须同时包含 `object_key` 和
-   `connector_block_hash`。
+4. 为 Mooncake 发布端配置非空 `backend_id`、可用的固定模型值、正数块大小，
+   以及相同的 LoRA 名称。
+5. 保持 object key 发布开启，并使用已注册引擎的 key 格式。Conductor 能接受的
+   `stored` 必须包含 `object_key`；vLLM 和 SGLang 分别由对应 handler 解析。
+   如果存在旧版 `connector_block_hash`，Conductor 仍会进行一致性核对。
 6. 不使用 group 或只使用 group zero，并且 Mooncake 来源只上报 CPU 或 Disk
    可用性。Conductor 会忽略其他介质，并拒绝非零 group。
 7. 注册 Mooncake endpoint，然后在 `/services` 中检查所有预期的 vLLM 和
@@ -240,6 +256,18 @@ endpoint 是有效配置，此时只创建实时订阅。
 `/services` 只能说明 Conductor 接受了注册，不能证明 ZMQ 发布端已经送达事件，
 也不能证明订阅前创建的对象已经被记录。完整的注册和查询命令见
 [Conductor 使用指南](../conductor/usage.md)。
+
+## SGLang 来源
+
+注册信息中的 `type` 可以使用 `SGLang`。SGLang 原生事件使用数组形式的
+MessagePack 解码器，并将有符号 wire hash 的位模式统一保存为 `uint64`。
+普通 token hash 使用 `strategy: "sglang"`，EAGLE/speculative bigram hash
+使用 `strategy: "sglang_bigram"`，投影方式为 `first64_be`。
+
+SGLang 通过 Mooncake Store 上报时，事件 envelope 仍使用 Mooncake map 协议，
+Conductor 会使用 SGLang handler 解析原始 `object_key`。物理后缀（如 `_k`、
+`_v` 和 sidecar 后缀）会规范化到同一个逻辑哈希节点；SGLang 的 group ID
+（例如 `sglang-hicache:<logical_key>`）按不透明字符串保存。
 
 ## 了解当前完整性限制
 

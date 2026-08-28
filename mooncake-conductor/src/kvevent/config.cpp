@@ -47,13 +47,11 @@ bool JsonInt64(const Json::Value& value, int64_t* out) {
     return false;
 }
 
-// Keep the configuration boundary deliberately narrower than the internal
-// hash-strategy implementation.  The registration contract currently
-// exposes exactly the two recipes that vLLM supports for v1 prefix caching;
-// rejecting anything else here also guarantees that an invalid algorithm
-// cannot cause root derivation or any later subscription side effects.
+// Validate the supported vLLM and SGLang recipes at the configuration
+// boundary before creating any subscriptions.
 bool IsSupportedHashAlgorithm(std::string_view algorithm) {
-    return algorithm == "sha256" || algorithm == "sha256_cbor";
+    return algorithm == "sha256" || algorithm == "sha256_cbor" ||
+           algorithm == "sha256_raw";
 }
 
 bool ParseHashProfile(const Json::Value& raw,

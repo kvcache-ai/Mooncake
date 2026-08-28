@@ -34,7 +34,8 @@ void U64ToBigEndian(uint64_t v, unsigned char* out) {
 }
 
 bool ReplayEnabled(const ZMQClientConfig& config) {
-    return config.publisher_kind == common::PublisherKind::kVllm &&
+    return (config.publisher_kind == common::PublisherKind::kVllm ||
+            config.publisher_kind == common::PublisherKind::kSglang) &&
            !config.replay_endpoint.empty();
 }
 
@@ -221,7 +222,7 @@ std::string ZMQClient::Connect() {
     if (!config_.replay_endpoint.empty() && !ReplayEnabled(config_)) {
         LOG(WARNING) << "Ignoring replay_endpoint for publisher kind="
                      << common::PublisherKindName(config_.publisher_kind)
-                     << "; replay is supported only for vLLM";
+                     << "; replay is supported only for vLLM and SGLang";
     }
 
     return "";
@@ -376,6 +377,23 @@ std::string ZMQClient::DispatchMessage(const std::string& topic,
         } else {
             decode_error = std::move(decoded.error);
         }
+    } else if (config_.publisher_kind == common::PublisherKind::kSglang) {
+        auto decoded = DecodeSglangEventBatch(payload, payload_size);
+        if (decoded.ok) {
+            batch = std::move(decoded.batch);
+        } else {
+            // A SGLang-backed Mooncake Store still uses the Mooncake map
+            // envelope.  Native SGLang is attempted first; fall back to the
+            // Mooncake decoder for that deployment mode.
+            auto mooncake = DecodeMooncakeEventBatch(payload, payload_size);
+            if (mooncake.ok) {
+                batch = std::move(mooncake.batch);
+            } else {
+                decode_error = "SGLang decode failed: " + decoded.error +
+                               "; Mooncake fallback failed: " +
+                               mooncake.error;
+            }
+        }
     } else {
         auto decoded = DecodeVllmEventBatch(payload, payload_size);
         if (decoded.ok) {
@@ -449,7 +467,6 @@ std::string ZMQClient::RequestReplay(int64_t from_seq,
         }
 
         struct ReplayMessage {
-            std::string topic;
             int64_t sequence;
             std::string payload;
         };
@@ -462,20 +479,21 @@ std::string ZMQClient::RequestReplay(int64_t from_seq,
             if (!frame_count) {
                 return fail("failed to receive replay response: timed out");
             }
-            if (frames.size() != 4 || !frames[0].empty()) {
+            // The ROUTER sends [identity, empty, sequence, payload]. The
+            // DEALER strips only the routing identity.
+            if (frames.size() != 3 || !frames[0].empty()) {
                 return fail("invalid replay response frame count or delimiter");
             }
 
-            auto& topic_msg = frames[1];
-            auto& seq_msg = frames[2];
-            auto& payload_msg = frames[3];
+            auto& seq_msg = frames[1];
+            auto& payload_msg = frames[2];
             if (seq_msg.size() != 8) {
                 return fail("invalid replay sequence length");
             }
             const uint64_t raw_seq = BigEndianToU64(
                 static_cast<const unsigned char*>(seq_msg.data()));
             if (raw_seq == std::numeric_limits<uint64_t>::max()) {
-                if (!topic_msg.empty() || !payload_msg.empty()) {
+                if (!payload_msg.empty()) {
                     return fail("invalid replay end marker");
                 }
                 if (until_seq.has_value() && next_expected < *until_seq) {
@@ -484,8 +502,8 @@ std::string ZMQClient::RequestReplay(int64_t from_seq,
                 }
                 for (const auto& message : messages) {
                     if (auto err = DispatchMessage(
-                            message.topic, message.sequence,
-                            message.payload.data(), message.payload.size());
+                            "", message.sequence, message.payload.data(),
+                            message.payload.size());
                         !err.empty()) {
                         return fail("failed to process replay message: " + err);
                     }
@@ -518,10 +536,7 @@ std::string ZMQClient::RequestReplay(int64_t from_seq,
             next_expected = replay_seq + 1;
 
             messages.push_back(
-                {.topic =
-                     std::string(static_cast<const char*>(topic_msg.data()),
-                                 topic_msg.size()),
-                 .sequence = replay_seq,
+                {.sequence = replay_seq,
                  .payload =
                      std::string(static_cast<const char*>(payload_msg.data()),
                                  payload_msg.size())});

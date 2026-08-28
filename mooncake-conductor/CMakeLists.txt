@@ -43,6 +43,7 @@ add_library(
   src/zmq/zmq_client.cpp
   src/kvevent/event_handler.cpp
   src/kvevent/event_manager.cpp
+  src/kvevent/object_key_parser.cpp
   src/kvevent/config.cpp)
 
 target_include_directories(conductor_cpp_core

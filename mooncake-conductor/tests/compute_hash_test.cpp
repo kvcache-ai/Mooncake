@@ -783,4 +783,87 @@ TEST(HashChain, RejectsInvalidInputsAtSetup) {
         nullptr);
 }
 
+TEST(SglangHashChain, MatchesNativeSha256TokenChain) {
+    HashProfile profile;
+    const HashProfileConfig source{
+        .strategy = "sglang",
+        .algorithm = "sha256_raw",
+        .python_hash_seed = "0",
+        .index_projection = "first64_be",
+    };
+    ASSERT_TRUE(ResolveHashProfile(source, &profile).empty());
+    ASSERT_TRUE(ValidateHashProfile(profile).empty());
+
+    std::string error;
+    auto strategy = CreateHashStrategy(profile, &error);
+    ASSERT_NE(strategy, nullptr) << error;
+    const ContextKey context{.tenant_id = "default",
+                             .model_name = "model",
+                             .lora_name = "",
+                             .block_size = 4};
+    const std::vector<int32_t> tokens{1, 2, 3, 4};
+    std::vector<HashBlock> blocks;
+    ASSERT_TRUE(strategy->Compute(context, tokens, std::nullopt, &blocks)
+                    .empty());
+    ASSERT_EQ(blocks.size(), 1u);
+    EXPECT_EQ(blocks[0].projected.value, 0xcf97adeedb59e05bULL);
+
+    blocks.clear();
+    ASSERT_TRUE(strategy->Compute(context, tokens, std::string("salty"),
+                                   &blocks)
+                    .empty());
+    ASSERT_EQ(blocks.size(), 1u);
+    EXPECT_EQ(blocks[0].projected.value, 0xd98f7292c18ec8ddULL);
+}
+
+TEST(SglangHashChain, IncludesPartialFinalBlock) {
+    HashProfile profile;
+    const HashProfileConfig source{
+        .strategy = "sglang",
+        .algorithm = "sha256_raw",
+        .python_hash_seed = "0",
+        .index_projection = "first64_be",
+    };
+    ASSERT_TRUE(ResolveHashProfile(source, &profile).empty());
+
+    std::string error;
+    auto strategy = CreateHashStrategy(profile, &error);
+    ASSERT_NE(strategy, nullptr) << error;
+    const ContextKey context{.tenant_id = "default",
+                             .model_name = "model",
+                             .lora_name = "",
+                             .block_size = 2};
+    const std::vector<int32_t> tokens{1, 2, 3};
+    std::vector<HashBlock> blocks;
+    ASSERT_TRUE(strategy->Compute(context, tokens, std::nullopt, &blocks)
+                    .empty());
+    EXPECT_EQ(blocks.size(), 2u);
+}
+
+TEST(SglangHashChain, MatchesBigramGolden) {
+    HashProfile profile;
+    const HashProfileConfig source{
+        .strategy = "sglang_bigram",
+        .algorithm = "sha256_raw",
+        .python_hash_seed = "0",
+        .index_projection = "first64_be",
+    };
+    ASSERT_TRUE(ResolveHashProfile(source, &profile).empty());
+    ASSERT_TRUE(ValidateHashProfile(profile).empty());
+
+    std::string error;
+    auto strategy = CreateHashStrategy(profile, &error);
+    ASSERT_NE(strategy, nullptr) << error;
+    const ContextKey context{.tenant_id = "default",
+                             .model_name = "model",
+                             .lora_name = "",
+                             .block_size = 4};
+    const std::vector<int32_t> tokens{10, 20, 30, 40};
+    std::vector<HashBlock> blocks;
+    ASSERT_TRUE(strategy->Compute(context, tokens, std::nullopt, &blocks)
+                    .empty());
+    ASSERT_EQ(blocks.size(), 1u);
+    EXPECT_EQ(blocks[0].projected.value, 15710792592378487421ULL);
+}
+
 }  // namespace

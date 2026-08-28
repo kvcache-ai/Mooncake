@@ -41,6 +41,10 @@ using conductor::zmq::DecodedBatch;
 using conductor::zmq::DecodeMooncakeEventBatch;
 using conductor::zmq::DecodeVllmEventBatch;
 using conductor::zmq::MessageMetadata;
+using conductor::zmq::SglangEvent;
+using conductor::zmq::SglangEventBatch;
+using conductor::zmq::SglangRemovedEvent;
+using conductor::zmq::SglangStoredEvent;
 
 using Packer = msgpack::packer<std::stringstream>;
 
@@ -61,6 +65,18 @@ HashProfile TestProfile() {
     return profile;
 }
 
+HashProfile SglangTestProfile() {
+    const conductor::common::HashProfileConfig source{
+        .strategy = "sglang",
+        .algorithm = "sha256_raw",
+        .python_hash_seed = "",
+        .index_projection = "first64_be",
+    };
+    HashProfile profile;
+    EXPECT_EQ(ResolveHashProfile(source, &profile), "");
+    return profile;
+}
+
 ContextKey ContextFor(const ServiceConfig& service) {
     return {.tenant_id = service.tenant_id,
             .model_name = service.model_name,
@@ -70,7 +86,7 @@ ContextKey ContextFor(const ServiceConfig& service) {
 
 EngineRegistration RegistrationFor(const ServiceConfig& service) {
     return {.context = ContextFor(service),
-            .profile = TestProfile(),
+            .profile = service.hash_profile,
             .instance_id = service.instance_id,
             .dp_rank = service.dp_rank,
             .effective_block_size = service.block_size,
@@ -89,6 +105,15 @@ ServiceConfig VllmService(std::string instance_id, std::string endpoint,
     service.block_size = 4;
     service.cache_group = 0;
     service.hash_profile = TestProfile();
+    return service;
+}
+
+ServiceConfig SglangService(std::string instance_id, std::string endpoint,
+                            std::string tenant_id = "default") {
+    auto service = VllmService(std::move(instance_id), std::move(endpoint),
+                               std::move(tenant_id));
+    service.publisher_kind = PublisherKind::kSglang;
+    service.hash_profile = SglangTestProfile();
     return service;
 }
 
@@ -238,13 +263,16 @@ void PackMooncakeCommon(Packer& packer, uint64_t event_id,
 }
 
 void PackMooncakeObject(Packer& packer, uint64_t hash,
-                        std::string_view object_key) {
+                        std::string_view object_key,
+                        bool emit_connector_hash = true) {
     packer.pack("group_id");
     packer.pack("0");
     packer.pack("object_key");
     packer.pack(std::string(object_key));
-    packer.pack("connector_block_hash");
-    packer.pack(ConnectorHashFor(hash));
+    if (emit_connector_hash) {
+        packer.pack("connector_block_hash");
+        packer.pack(ConnectorHashFor(hash));
+    }
     packer.pack("seq_hashes");
     packer.pack_array(1);
     packer.pack_uint64(hash);
@@ -257,11 +285,12 @@ void PackMooncakeObject(Packer& packer, uint64_t hash,
 
 void PackMooncakeStored(Packer& packer, const ServiceConfig& context,
                         uint64_t hash, std::string_view object_key,
-                        std::string_view backend = "backend-a") {
-    packer.pack_map(21);
+                        std::string_view backend = "backend-a",
+                        bool emit_connector_hash = true) {
+    packer.pack_map(20 + (emit_connector_hash ? 1 : 0));
     PackMooncakeCommon(packer, 1, "stored", "BlockStored", context, backend,
                        "CPU");
-    PackMooncakeObject(packer, hash, object_key);
+    PackMooncakeObject(packer, hash, object_key, emit_connector_hash);
     packer.pack("parent_hash");
     packer.pack_nil();
     packer.pack("token_ids");
@@ -272,11 +301,12 @@ void PackMooncakeStored(Packer& packer, const ServiceConfig& context,
 
 void PackMooncakeRemoved(Packer& packer, const ServiceConfig& context,
                          uint64_t hash, std::string_view object_key,
-                         std::string_view backend = "backend-a") {
-    packer.pack_map(18);
+                         std::string_view backend = "backend-a",
+                         bool emit_connector_hash = true) {
+    packer.pack_map(17 + (emit_connector_hash ? 1 : 0));
     PackMooncakeCommon(packer, 2, "removed", "BlockRemoved", context, backend,
                        "CPU");
-    PackMooncakeObject(packer, hash, object_key);
+    PackMooncakeObject(packer, hash, object_key, emit_connector_hash);
 }
 
 void PackMooncakeCleared(Packer& packer, const ServiceConfig& context,
@@ -649,6 +679,162 @@ TEST(EventIngestIntegration,
               0);
     snapshot = PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
     EXPECT_TRUE(snapshot.contexts.at(ContextFor(tenant_b)).blocks.empty());
+}
+
+TEST(EventIngestIntegration,
+     SglangMooncakePhysicalComponentsShareOneLogicalPresence) {
+    EventManager manager({}, 0);
+    const auto service =
+        SglangService("sglang-engine", "tcp://127.0.0.1:47604");
+    ASSERT_TRUE(manager.GetIndexer()
+                    ->Register(RegistrationFor(service))
+                    .error.empty());
+    KVEventHandler handler(&manager, service);
+
+    constexpr uint64_t kHash = 0x1234567890abcdefULL;
+    const std::string full_hash = "1234567890abcdef" + std::string(48, '0');
+    const std::string key_prefix = "sglang_model_" + full_hash;
+    const std::string key_k = key_prefix + "_0_k";
+    const std::string key_v = key_prefix + "_0_v";
+    const std::string key_temporal = key_prefix + "_0_temporal";
+
+    const auto stores = PackMooncakeBatch(3, [&](Packer& packer) {
+        PackMooncakeStored(packer, service, kHash, key_k, "backend-a", false);
+        PackMooncakeStored(packer, service, kHash, key_v, "backend-a", false);
+        PackMooncakeStored(packer, service, kHash, key_temporal, "backend-a",
+                           false);
+    });
+    ExpectDispatched(DecodeAndDispatchMooncake(
+        stores, handler, MetadataFor(service, "sglang-topic", 60)));
+
+    const auto context = ContextFor(service);
+    auto presence = PrefixCacheTableTestPeer::Presence(
+        *manager.GetIndexer(), context, {.value = kHash});
+    ASSERT_TRUE(presence.has_value());
+    ASSERT_EQ(presence->cpu_owners.size(), 1u);
+
+    const auto remove_k = PackMooncakeBatch(1, [&](Packer& packer) {
+        PackMooncakeRemoved(packer, service, kHash, key_k, "backend-a", false);
+    });
+    ExpectDispatched(DecodeAndDispatchMooncake(
+        remove_k, handler, MetadataFor(service, "sglang-topic", 61)));
+    presence = PrefixCacheTableTestPeer::Presence(
+        *manager.GetIndexer(), context, {.value = kHash});
+    ASSERT_TRUE(presence.has_value());
+    ASSERT_EQ(presence->cpu_owners.size(), 1u);
+
+    const auto remove_v = PackMooncakeBatch(1, [&](Packer& packer) {
+        PackMooncakeRemoved(packer, service, kHash, key_v, "backend-a", false);
+    });
+    ExpectDispatched(DecodeAndDispatchMooncake(
+        remove_v, handler, MetadataFor(service, "sglang-topic", 62)));
+    presence = PrefixCacheTableTestPeer::Presence(
+        *manager.GetIndexer(), context, {.value = kHash});
+    ASSERT_TRUE(presence.has_value());
+    ASSERT_EQ(presence->cpu_owners.size(), 1u);
+
+    const auto remove_temporal = PackMooncakeBatch(1, [&](Packer& packer) {
+        PackMooncakeRemoved(packer, service, kHash, key_temporal, "backend-a",
+                            false);
+    });
+    ExpectDispatched(DecodeAndDispatchMooncake(
+        remove_temporal, handler, MetadataFor(service, "sglang-topic", 63)));
+    EXPECT_FALSE(PrefixCacheTableTestPeer::Presence(
+                     *manager.GetIndexer(), context, {.value = kHash})
+                     .has_value());
+}
+
+TEST(EventIngestIntegration, SglangNativeStoreRemoveAndBlockSizeValidation) {
+    EventManager manager({}, 0);
+    const auto service =
+        SglangService("sglang-native", "tcp://127.0.0.1:47605");
+    ASSERT_TRUE(manager.GetIndexer()
+                    ->Register(RegistrationFor(service))
+                    .error.empty());
+    KVEventHandler handler(&manager, service);
+
+    constexpr uint64_t kStoredHash = 0x1234567890abcdefULL;
+    constexpr uint64_t kPartialHash = 0x0badcafe12345678ULL;
+    constexpr uint64_t kRejectedHash = 0xfedcba0987654321ULL;
+    constexpr uint64_t kLoraHash = 0x13579bdf2468ace0ULL;
+    const auto dispatch = [&](SglangEvent event) {
+        SglangEventBatch batch;
+        batch.timestamp_seconds = 1.0;
+        batch.data_parallel_rank = 0;
+        batch.events.push_back({.event = std::move(event)});
+        return handler.HandleBatch(
+            DecodedBatch(std::move(batch)),
+            MetadataFor(service, "sglang-topic", 70));
+    };
+
+    EXPECT_TRUE(dispatch(SglangStoredEvent{
+                             .block_hashes = {kStoredHash},
+                             .parent_block_hash = std::nullopt,
+                             .token_ids = std::nullopt,
+                             .block_size = service.block_size,
+                             .lora_id = std::nullopt,
+                             .medium = std::nullopt,
+                             .cache_salt = std::nullopt})
+                    .empty());
+    const auto context = ContextFor(service);
+    auto presence = PrefixCacheTableTestPeer::Presence(
+        *manager.GetIndexer(), context, {.value = kStoredHash});
+    ASSERT_TRUE(presence.has_value());
+    ASSERT_EQ(presence->gpu_owners.size(), 1u);
+
+    // SGLang reports the actual number of tokens for the final partial page.
+    // It is still indexed under the registered fixed page-size context.
+    EXPECT_TRUE(dispatch(SglangStoredEvent{
+                             .block_hashes = {kPartialHash},
+                             .parent_block_hash = kStoredHash,
+                             .token_ids = std::vector<int32_t>{1, 2, 3},
+                             .block_size = service.block_size - 1,
+                             .lora_id = std::nullopt,
+                             .medium = "GPU",
+                             .cache_salt = std::nullopt})
+                    .empty());
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Presence(
+                    *manager.GetIndexer(), context, {.value = kPartialHash})
+                    .has_value());
+
+    EXPECT_TRUE(dispatch(SglangStoredEvent{
+                             .block_hashes = {kRejectedHash},
+                             .parent_block_hash = std::nullopt,
+                             .token_ids = std::nullopt,
+                             .block_size = service.block_size + 1,
+                             .lora_id = std::nullopt,
+                             .medium = "GPU",
+                             .cache_salt = std::nullopt})
+                    .empty());
+    EXPECT_FALSE(PrefixCacheTableTestPeer::Presence(
+                     *manager.GetIndexer(), context, {.value = kRejectedHash})
+                     .has_value());
+
+    EXPECT_TRUE(dispatch(SglangStoredEvent{
+                             .block_hashes = {kLoraHash},
+                             .parent_block_hash = std::nullopt,
+                             .token_ids = std::nullopt,
+                             .block_size = service.block_size,
+                             .lora_id = 7,
+                             .medium = "GPU",
+                             .cache_salt = std::nullopt})
+                    .empty());
+    EXPECT_FALSE(PrefixCacheTableTestPeer::Presence(
+                     *manager.GetIndexer(), context, {.value = kLoraHash})
+                     .has_value());
+
+    EXPECT_TRUE(dispatch(SglangRemovedEvent{.block_hashes = {kStoredHash},
+                                            .medium = std::nullopt})
+                    .empty());
+    EXPECT_FALSE(PrefixCacheTableTestPeer::Presence(
+                     *manager.GetIndexer(), context, {.value = kStoredHash})
+                     .has_value());
+    EXPECT_TRUE(dispatch(SglangRemovedEvent{.block_hashes = {kPartialHash},
+                                            .medium = "GPU"})
+                    .empty());
+    EXPECT_FALSE(PrefixCacheTableTestPeer::Presence(
+                     *manager.GetIndexer(), context, {.value = kPartialHash})
+                     .has_value());
 }
 
 TEST(EventIngestIntegration,

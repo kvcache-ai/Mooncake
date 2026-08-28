@@ -164,6 +164,35 @@ ValueResult<std::optional<uint64_t>> ParseNullableUint64(const object& value) {
     return ValueResult<std::optional<uint64_t>>::Ok(*parsed.value);
 }
 
+// SGLang's event API exposes hashes as signed int64 values.  The Conductor
+// keeps the exact 64-bit bit pattern in uint64_t so high-bit hashes remain
+// compatible with the other event sources.
+ValueResult<uint64_t> ParseSglangHash(const object& value) {
+    if (value.type == object_type::NEGATIVE_INTEGER) {
+        return ValueResult<uint64_t>::Ok(
+            static_cast<uint64_t>(value.via.i64));
+    }
+    if (value.type == object_type::POSITIVE_INTEGER &&
+        value.via.u64 <=
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return ValueResult<uint64_t>::Ok(value.via.u64);
+    }
+    return ValueResult<uint64_t>::Err(
+        "expected signed 64-bit hash, got " + TypeName(value));
+}
+
+ValueResult<std::optional<uint64_t>> ParseNullableSglangHash(
+    const object& value) {
+    if (value.type == object_type::NIL) {
+        return ValueResult<std::optional<uint64_t>>::Ok(std::nullopt);
+    }
+    auto parsed = ParseSglangHash(value);
+    if (!parsed.value.has_value()) {
+        return ValueResult<std::optional<uint64_t>>::Err(parsed.error);
+    }
+    return ValueResult<std::optional<uint64_t>>::Ok(*parsed.value);
+}
+
 ValueResult<ExternalHash> ParseExternalHash(const object& value) {
     if (value.type == object_type::POSITIVE_INTEGER) {
         return ValueResult<ExternalHash>::Ok(value.via.u64);
@@ -628,6 +657,174 @@ ValueResult<MooncakeEvent> ParseMooncakeEvent(const object& raw,
     return ValueResult<MooncakeEvent>::Ok(std::move(event));
 }
 
+ValueResult<std::optional<std::vector<int32_t>>> ParseSglangTokenIds(
+    const object& value) {
+    if (value.type == object_type::NIL) {
+        return ValueResult<std::optional<std::vector<int32_t>>>::Ok(
+            std::nullopt);
+    }
+    if (value.type != object_type::ARRAY) {
+        return ValueResult<std::optional<std::vector<int32_t>>>::Err(
+            "expected array or nil, got " + TypeName(value));
+    }
+    std::vector<int32_t> result;
+    for (uint32_t index = 0; index < value.via.array.size; ++index) {
+        const object& item = value.via.array.ptr[index];
+        if (item.type == object_type::ARRAY) {
+            if (item.via.array.size != 2) {
+                return ValueResult<std::optional<std::vector<int32_t>>>::Err(
+                    "token tuple must contain two integers");
+            }
+            for (uint32_t tuple_index = 0; tuple_index < 2; ++tuple_index) {
+                auto parsed = ParseInt64(item.via.array.ptr[tuple_index]);
+                if (!parsed.value.has_value() ||
+                    *parsed.value < std::numeric_limits<int32_t>::min() ||
+                    *parsed.value > std::numeric_limits<int32_t>::max()) {
+                    return ValueResult<std::optional<std::vector<int32_t>>>::Err(
+                        "token tuple element is outside int32 range");
+                }
+                result.push_back(static_cast<int32_t>(*parsed.value));
+            }
+            continue;
+        }
+        auto parsed = ParseInt64(item);
+        if (!parsed.value.has_value() ||
+            *parsed.value < std::numeric_limits<int32_t>::min() ||
+            *parsed.value > std::numeric_limits<int32_t>::max()) {
+            return ValueResult<std::optional<std::vector<int32_t>>>::Err(
+                "token id is outside int32 range");
+        }
+        result.push_back(static_cast<int32_t>(*parsed.value));
+    }
+    return ValueResult<std::optional<std::vector<int32_t>>>::Ok(
+        std::move(result));
+}
+
+ValueResult<SglangEvent> ParseSglangEvent(const object& raw) {
+    if (raw.type != object_type::ARRAY || raw.via.array.size == 0) {
+        return ValueResult<SglangEvent>::Err(
+            "expected tagged SGLang event array");
+    }
+    const auto& array = raw.via.array;
+    if (array.ptr[0].type != object_type::STR) {
+        return ValueResult<SglangEvent>::Err("SGLang event tag must be a string");
+    }
+    const std::string tag(array.ptr[0].via.str.ptr,
+                          array.ptr[0].via.str.size);
+
+    if (tag == "AllBlocksCleared") {
+        if (array.size != 1) {
+            return ValueResult<SglangEvent>::Err(
+                "AllBlocksCleared must not contain fields");
+        }
+        return ValueResult<SglangEvent>::Ok(SglangClearedEvent{});
+    }
+
+    if (tag == "BlockRemoved") {
+        if (array.size < 2) {
+            return ValueResult<SglangEvent>::Err(
+                "BlockRemoved has too few fields");
+        }
+        auto hashes = ParseArray<uint64_t>(array.ptr[1], ParseSglangHash);
+        if (!hashes.value.has_value()) {
+            return ValueResult<SglangEvent>::Err(
+                "invalid SGLang block_hashes: " + hashes.error);
+        }
+        auto medium = array.size >= 3
+                          ? ParseNullableString(array.ptr[2])
+                          : ValueResult<std::optional<std::string>>::Ok(
+                                std::nullopt);
+        if (!medium.value.has_value()) {
+            return ValueResult<SglangEvent>::Err(
+                "invalid SGLang medium: " + medium.error);
+        }
+        return ValueResult<SglangEvent>::Ok(SglangRemovedEvent{
+            .block_hashes = std::move(*hashes.value),
+            .medium = std::move(*medium.value)});
+    }
+
+    if (tag == "BlockStored") {
+        // BlockStored's inherited fields are array-like and ordered as in
+        // SGLang's BlockStored struct.  A metadata extension, when present,
+        // is trailing and intentionally ignored by the base decoder.
+        if (array.size < 6) {
+            return ValueResult<SglangEvent>::Err(
+                "BlockStored has too few fields");
+        }
+        auto hashes = ParseArray<uint64_t>(array.ptr[1], ParseSglangHash);
+        if (!hashes.value.has_value()) {
+            return ValueResult<SglangEvent>::Err(
+                "invalid SGLang block_hashes: " + hashes.error);
+        }
+        auto parent = ParseNullableSglangHash(array.ptr[2]);
+        if (!parent.value.has_value()) {
+            return ValueResult<SglangEvent>::Err(
+                "invalid SGLang parent_block_hash: " + parent.error);
+        }
+        auto tokens = ParseSglangTokenIds(array.ptr[3]);
+        if (!tokens.value.has_value()) {
+            return ValueResult<SglangEvent>::Err(
+                "invalid SGLang token_ids: " + tokens.error);
+        }
+        auto block_size = ParseInt64(array.ptr[4]);
+        if (!block_size.value.has_value() || *block_size.value <= 0) {
+            return ValueResult<SglangEvent>::Err(
+                "invalid SGLang block_size: " + block_size.error);
+        }
+        auto lora_id = ParseNullableInt64(array.ptr[5]);
+        if (!lora_id.value.has_value()) {
+            return ValueResult<SglangEvent>::Err(
+                "invalid SGLang lora_id: " + lora_id.error);
+        }
+        auto medium = array.size >= 7
+                          ? ParseNullableString(array.ptr[6])
+                          : ValueResult<std::optional<std::string>>::Ok(
+                                std::nullopt);
+        if (!medium.value.has_value()) {
+            return ValueResult<SglangEvent>::Err(
+                "invalid SGLang medium: " + medium.error);
+        }
+
+        std::optional<std::string> cache_salt;
+        if (array.size > 7 && array.ptr[7].type != object_type::NIL) {
+            // BlockStoredWithMetadata currently serializes metadata as a
+            // one-field array-like struct.  Accept a map as well for forward
+            // compatibility with msgspec configuration changes.
+            const auto& metadata = array.ptr[7];
+            if (metadata.type == object_type::ARRAY &&
+                metadata.via.array.size >= 1 &&
+                metadata.via.array.ptr[0].type == object_type::STR) {
+                cache_salt = std::string(metadata.via.array.ptr[0].via.str.ptr,
+                                         metadata.via.array.ptr[0].via.str.size);
+            } else if (metadata.type == object_type::MAP) {
+                for (uint32_t i = 0; i < metadata.via.map.size; ++i) {
+                    const auto& item = metadata.via.map.ptr[i];
+                    if (item.key.type == object_type::STR &&
+                        std::string_view(item.key.via.str.ptr,
+                                         item.key.via.str.size) == "cache_salt") {
+                        auto parsed = ParseString(item.val);
+                        if (!parsed.value.has_value()) {
+                            return ValueResult<SglangEvent>::Err(
+                                "invalid SGLang cache_salt: " + parsed.error);
+                        }
+                        cache_salt = std::move(*parsed.value);
+                    }
+                }
+            }
+        }
+        return ValueResult<SglangEvent>::Ok(SglangStoredEvent{
+            .block_hashes = std::move(*hashes.value),
+            .parent_block_hash = std::move(*parent.value),
+            .token_ids = std::move(*tokens.value),
+            .block_size = *block_size.value,
+            .lora_id = std::move(*lora_id.value),
+            .medium = std::move(*medium.value),
+            .cache_salt = std::move(cache_salt)});
+    }
+
+    return ValueResult<SglangEvent>::Err("unknown SGLang event tag: " + tag);
+}
+
 template <typename Batch>
 BatchDecodeResult<Batch> EnvelopeError(std::string error) {
     return {.ok = false, .batch = {}, .error = std::move(error)};
@@ -767,6 +964,63 @@ MooncakeEventBatchResult DecodeMooncakeEventBatch(const char* data,
     for (uint32_t index = 0; index < events->via.array.size; ++index) {
         auto parsed = ParseMooncakeEvent(events->via.array.ptr[index],
                                          batch.timestamp_milliseconds);
+        if (parsed.value.has_value()) {
+            batch.events.push_back(
+                {.event = std::move(*parsed.value), .error = ""});
+        } else {
+            batch.events.push_back({.event = std::nullopt,
+                                    .error = "event " + std::to_string(index) +
+                                             ": " + parsed.error});
+        }
+    }
+    return {.ok = true, .batch = std::move(batch), .error = ""};
+}
+
+SglangEventBatchResult DecodeSglangEventBatch(const char* data, size_t len) {
+    auto unpacked = UnpackOne(data, len);
+    if (!unpacked.value.has_value()) {
+        return EnvelopeError<SglangEventBatch>(
+            "failed to decode SGLang envelope: " + unpacked.error);
+    }
+    const object* timestamp = nullptr;
+    const object* events = nullptr;
+    const object* dp_rank = nullptr;
+    std::string error;
+    if (!ValidateEnvelopeShape(unpacked.value->get(), &timestamp, &events,
+                               &dp_rank, &error)) {
+        return EnvelopeError<SglangEventBatch>(error);
+    }
+    // A SGLang batch is array-like at both the envelope and event levels.
+    // Treat a map event as a protocol mismatch so ZMQClient can fall back to
+    // the Mooncake map decoder for an SGLang-backed Mooncake Store.  Malformed
+    // array events still remain event-local errors below.
+    for (uint32_t index = 0; index < events->via.array.size; ++index) {
+        if (events->via.array.ptr[index].type != object_type::ARRAY) {
+            return EnvelopeError<SglangEventBatch>(
+                "SGLang event entries must be arrays");
+        }
+    }
+    if (timestamp->type != object_type::FLOAT32 &&
+        timestamp->type != object_type::FLOAT64) {
+        return EnvelopeError<SglangEventBatch>(
+            "SGLang timestamp must be a float");
+    }
+    if (!std::isfinite(timestamp->via.f64)) {
+        return EnvelopeError<SglangEventBatch>(
+            "SGLang timestamp must be finite");
+    }
+    auto parsed_rank = ParseBatchDpRank(*dp_rank);
+    if (!parsed_rank.value.has_value()) {
+        return EnvelopeError<SglangEventBatch>(
+            "invalid SGLang data_parallel_rank: " + parsed_rank.error);
+    }
+
+    SglangEventBatch batch{.timestamp_seconds = timestamp->via.f64,
+                           .events = {},
+                           .data_parallel_rank = *parsed_rank.value};
+    batch.events.reserve(events->via.array.size);
+    for (uint32_t index = 0; index < events->via.array.size; ++index) {
+        auto parsed = ParseSglangEvent(events->via.array.ptr[index]);
         if (parsed.value.has_value()) {
             batch.events.push_back(
                 {.event = std::move(*parsed.value), .error = ""});

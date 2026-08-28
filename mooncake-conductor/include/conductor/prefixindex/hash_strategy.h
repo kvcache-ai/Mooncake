@@ -28,7 +28,8 @@ class HashChain {
    public:
     virtual ~HashChain() = default;
 
-    // Number of complete blocks the chain can produce.
+    // Number of logical blocks the chain can produce. The SGLang strategies
+    // include their final partial block; vLLM keeps its complete-block rule.
     virtual size_t BlockCount() const = 0;
 
     // Number of blocks hashed so far (observability/testing hook).
@@ -43,8 +44,8 @@ class HashStrategy {
    public:
     virtual ~HashStrategy() = default;
 
-    // Computes hashes only for complete blocks. Returns an empty string on
-    // success and leaves out empty on failure.
+    // Computes hashes for the blocks defined by the selected engine strategy.
+    // Returns an empty string on success and leaves out empty on failure.
     virtual std::string Compute(const ContextKey& context,
                                 std::span<const int32_t> token_ids,
                                 std::optional<std::string> cache_salt,

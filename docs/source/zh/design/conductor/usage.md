@@ -244,7 +244,7 @@ conductor("/register", {
 })
 ```
 
-配置 Mooncake 发布端，使每个事件携带的租户、模型、LoRA 名称和块大小与 vLLM 的缓存信息一致。`hash_profile` 来自 Mooncake 注册项，并且必须与该事件对应的缓存信息已经绑定的哈希配置相同。注册时也使用同样的缓存信息，这样更容易对照 `/services` 和发布端。Mooncake 的 `instance_id` 和 `dp_rank` 只用于在 `/services` 中标识订阅，以及通过 `/unregister` 注销；它们不会创建查询实例，也不会覆盖事件中的缓存信息。`stored` 事件还必须带有对象 key 和可用的完整连接器哈希；事件检查规则请参阅[订阅兼容指南](../kv-event/subscriber-guide.md)。
+配置 Mooncake 发布端，使每个事件携带的租户、模型、LoRA 名称和块大小与兼容引擎的缓存信息一致。`hash_profile` 来自 Mooncake 注册项，并且必须与该事件对应的缓存信息已经绑定的哈希配置相同。注册时也使用同样的缓存信息，这样更容易对照 `/services` 和发布端。Mooncake 的 `instance_id` 和 `dp_rank` 只用于在 `/services` 中标识订阅，以及通过 `/unregister` 注销；它们不会创建查询实例，也不会覆盖事件中的缓存信息。`stored` 事件还必须带有对象 key；当前发布端不填写连接器派生字段，Conductor 会根据已注册的推理引擎类型解析 key。事件检查规则请参阅[订阅兼容指南](../kv-event/subscriber-guide.md)。
 
 放开业务流量前，确认 `/services` 同时包含两个 vLLM rank 和 Mooncake 订阅：
 
@@ -331,8 +331,8 @@ conductor("/unregister", {"instance_id": "engine-a", "tenant_id": "default", "dp
 | 现象 | 检查 | 处理方式 |
 |---|---|---|
 | HTTP 请求无法连接，或日志显示端口为 `0` | 确认 `CONDUCTOR_CONFIG_PATH` 指向刚才编辑的文件，并且文件中包含数值类型的 `http_server_port`。 | 设置绝对配置路径，添加明确的非零端口，然后重启 Conductor。 |
-| `/services` 中没有某个事件源 | 查看注册响应和 Conductor 日志，检查是否使用了不支持的 type、非零 `cache_group`、无效哈希配置、重复 endpoint 或冲突的 service key。 | type 只使用 `vLLM` 或 `Mooncake`；缓存组使用 `0` 或省略；使用唯一 endpoint 和准确的种子式哈希字段。 |
+| `/services` 中没有某个事件源 | 查看注册响应和 Conductor 日志，检查是否使用了不支持的 type、非零 `cache_group`、无效哈希配置、重复 endpoint 或冲突的 service key。 | type 使用 `vLLM`、`SGLang` 或 `Mooncake`；缓存组使用 `0` 或省略；使用唯一 endpoint 和准确的种子式哈希字段。 |
 | `/services` 中有事件源，但命中值一直为零 | 检查发布端是否在 Conductor 连接后发出过事件。`/services` 不能证明事件已经送达。 | 检查发布端状态，配置期间保持业务流量暂停，并在产生新缓存前完成注册。此前的 Mooncake 事件不会重发。 |
-| Mooncake 事件没有增加 CPU 或 Disk 可用性 | 对照 `/global_view`，检查 Mooncake 事件携带的租户、模型、LoRA 名称和块大小；比较注册的哈希配置；确认 stored 事件包含对象信息和完整连接器哈希数据。 | 先注册 vLLM，确保事件中的缓存信息和哈希配置一致，并修正 Mooncake 发布端或 key 配置。 |
+| Mooncake 事件没有增加 CPU 或 Disk 可用性 | 对照 `/global_view`，检查 Mooncake 事件携带的租户、模型、LoRA 名称和块大小；比较注册的哈希配置；确认 stored 事件包含按已注册引擎格式生成的对象 key。 | 先注册兼容引擎，确保事件中的缓存信息和哈希配置一致，并修正 Mooncake 发布端或 key 配置。 |
 | `/query` 返回空的 `instances` 对象，或命中长度比预期短 | 对照事件生产端检查 `model`、`tenant_id`、`lora_name`、`block_size`、可选 `instance_id`、token IDs 和 `cache_salt`。同时检查末尾是否是不完整块。 | 查询准确的已注册四字段组合，使用生产端的盐值规则，并发送足够组成完整块的 token。 |
 | HTTP 请求返回 `400` | 查看 JSON 中的 `reason`、`field` 和可选 `index`；注册或注销请求的 JSON 格式错误会改为返回纯文本。 | 删除不支持的字段，并按照 [API 字段表](./indexer-api-design.md)修正错误中指出的值。 |

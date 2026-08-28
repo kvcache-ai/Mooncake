@@ -3,8 +3,8 @@
 [中文](../../zh/design/kv-event/index.md)
 
 KV Events tell Conductor where key-value (KV) cache blocks are currently
-available. In this repository, vLLM reports GPU blocks owned by one inference
-engine and rank, while Mooncake reports objects available from a shared CPU or
+available. In this repository, vLLM and SGLang report GPU blocks owned by one
+inference engine and rank, while Mooncake reports objects available from a shared CPU or
 Disk pool. Use this page to choose the guide for the side you are configuring.
 
 ## Choose an event source
@@ -12,11 +12,12 @@ Disk pool. Use this page to choose the guide for the side you are configuring.
 | Source | What it reports | Where to continue |
 |---|---|---|
 | vLLM | GPU cache for one registered engine and data-parallel (DP) rank. | Use the [Conductor subscriber guide](./subscriber-guide.md) to see the accepted vLLM message fields. |
+| SGLang | Native GPU events, or SGLang object keys carried by a Mooncake publisher. | Use the [Conductor subscriber guide](./subscriber-guide.md) for the native decoder and key parser. |
 | Mooncake Master | CPU or Disk objects shared by compatible registered engines. | Use the [Mooncake publisher guide](./publisher-design.md) to enable and inspect the publisher. |
 
 The registered source `type`, not the ZeroMQ (ZMQ) topic text, decides how
 Conductor reads a message. The subscriber guide gives the detailed comparison
-between `vLLM` and `Mooncake`.
+between `vLLM`, `SGLang`, and `Mooncake`.
 
 ## Publish Mooncake events
 

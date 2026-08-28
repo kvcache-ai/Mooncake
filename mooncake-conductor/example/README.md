@@ -112,15 +112,17 @@ CLI mode expresses the same mapping as follows:
   per publisher rank, including multiple ranks for one instance when needed;
 - `--prefiller-registration` may reference only an ID listed by
   `--prefiller-instance-ids`;
-- the hash strategy and projection are fixed to `vllm_v1` and `low64_be`;
-  select the hash algorithm with `--hash-algorithm sha256` or
+- the vLLM hash strategy and projection are fixed to `vllm_v1` and `low64_be`;
+  SGLang registrations use `sglang` (regular) or `sglang_bigram` (EAGLE),
+  with `first64_be`; select the vLLM hash algorithm with `--hash-algorithm sha256` or
   `--hash-algorithm sha256_cbor` (legacy CLI default: `sha256_cbor`), and
   supply the deployment-specific seed with `--python-hash-seed`.
 
 ### Hash Algorithm Compatibility
 
-Conductor reproduces vLLM v1 prefix-cache block hashes and supports exactly
-two recipes, selected by `hash_profile.algorithm`:
+Conductor reproduces vLLM v1 prefix-cache block hashes and SGLang SHA-256
+chains. vLLM supports exactly two recipes, selected by
+`hash_profile.algorithm`:
 
 - `sha256`: SHA-256 over CPython Pickle protocol-5 serialization. This is the
   current vLLM default (`--prefix-caching-hash-algo sha256`).

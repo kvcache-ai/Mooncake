@@ -3,18 +3,19 @@
 [English](../../../design/kv-event/index.md)
 
 KV Event 用来告诉 Conductor：键值（KV）缓存块当前存放在哪里。在本项目中，
-vLLM 上报某个推理引擎及其 rank 持有的 GPU 缓存块，Mooncake 则上报共享
-CPU 或 Disk 缓存池中的对象。请根据你要配置的一端选择对应指南。
+vLLM 和 SGLang 上报某个推理引擎及其 rank 持有的 GPU 缓存块，Mooncake
+则上报共享 CPU 或 Disk 缓存池中的对象。请根据你要配置的一端选择对应指南。
 
 ## 选择事件来源
 
 | 来源 | 上报内容 | 后续文档 |
 |---|---|---|
 | vLLM | 某个已注册引擎及其数据并行（DP）rank 的 GPU 缓存。 | 查看 [Conductor 订阅指南](./subscriber-guide.md)，了解 Conductor 接受哪些 vLLM 消息字段。 |
+| SGLang | 原生 GPU 事件，或由 Mooncake 发布端携带的 SGLang 对象 key。 | 查看 [Conductor 订阅指南](./subscriber-guide.md)，了解原生解码器和 key 解析器。 |
 | Mooncake Master | 可由兼容的已注册引擎共享的 CPU 或 Disk 对象。 | 查看 [Mooncake 发布指南](./publisher-design.md)，启用发布端并检查其状态。 |
 
 Conductor 根据注册来源的 `type` 选择消息读取方式，而不是根据 ZeroMQ
-（ZMQ）的 topic 文本选择。订阅指南详细对比了 `vLLM` 和 `Mooncake`。
+（ZMQ）的 topic 文本选择。订阅指南详细对比了 `vLLM`、`SGLang` 和 `Mooncake`。
 
 ## 发布 Mooncake 事件
 

@@ -568,8 +568,20 @@ int LowerHexValue(char value) {
 std::string ValidateProfileSelectors(std::string_view strategy,
                                      std::string_view algorithm,
                                      std::string_view index_projection) {
-    if (strategy != "vllm_v1") {
+    if (strategy != "vllm_v1" && strategy != "sglang" &&
+        strategy != "sglang_bigram") {
         return "unsupported hash strategy: " + std::string(strategy);
+    }
+    if (strategy == "sglang" || strategy == "sglang_bigram") {
+        if (algorithm != "sha256_raw") {
+            return "unsupported SGLang hash algorithm: " +
+                   std::string(algorithm);
+        }
+        if (index_projection != "first64_be") {
+            return "unsupported SGLang index projection: " +
+                   std::string(index_projection);
+        }
+        return "";
     }
     if (algorithm != "sha256" && algorithm != "sha256_cbor") {
         return "unsupported hash algorithm: " + std::string(algorithm);
@@ -626,9 +638,11 @@ std::string ValidateResolvedHashProfileShape(const HashProfile& profile) {
         !error.empty()) {
         return error;
     }
-    if (auto error = ValidatePythonHashSeed(profile.python_hash_seed);
-        !error.empty()) {
-        return error;
+    if (profile.strategy == "vllm_v1") {
+        if (auto error = ValidatePythonHashSeed(profile.python_hash_seed);
+            !error.empty()) {
+            return error;
+        }
     }
     return ValidateRootDigest(profile.root_digest);
 }
@@ -845,6 +859,187 @@ class VllmV1HashStrategy final : public HashStrategy {
     std::array<uint8_t, kSha256DigestSize> root_digest_;
 };
 
+ProjectedPrefix ProjectSglangDigest(
+    const std::array<uint8_t, kSha256DigestSize>& digest) {
+    uint64_t value = 0;
+    for (size_t index = 0; index < sizeof(value); ++index) {
+        value = (value << 8) | digest[index];
+    }
+    return ProjectedPrefix{value};
+}
+
+class SglangHashChain final : public HashChain {
+   public:
+    SglangHashChain(const ContextKey& context,
+                    std::span<const int32_t> token_ids,
+                    std::optional<std::string> cache_salt, bool bigram)
+        : token_ids_(token_ids),
+          block_size_(static_cast<size_t>(context.block_size)),
+          block_count_(bigram ? (token_ids.size() < 2
+                                      ? 0
+                                      : (token_ids.size() - 1) / block_size_ +
+                                            ((token_ids.size() - 1) %
+                                                     block_size_ !=
+                                                 0))
+                              : token_ids.size() / block_size_ +
+                                    (token_ids.size() % block_size_ != 0)),
+          bigram_(bigram),
+          cache_salt_(std::move(cache_salt)) {
+        computed_.reserve(block_count_);
+        encoded_.reserve(block_size_ * sizeof(uint32_t) * (bigram ? 2 : 1));
+        if (cache_salt_.has_value()) {
+            std::vector<uint8_t> root_input;
+            constexpr std::string_view kSaltPrefix(
+                "sglang-cache-salt-v1\0", 21);
+            root_input.insert(root_input.end(), kSaltPrefix.begin(),
+                              kSaltPrefix.end());
+            root_input.insert(root_input.end(), cache_salt_->begin(),
+                              cache_salt_->end());
+            if (std::string error = Sha256(root_input, &parent_);
+                !error.empty()) {
+                sticky_error_ = std::move(error);
+            } else {
+                has_parent_ = true;
+            }
+        }
+    }
+
+    static std::string ValidateInputs(const ContextKey& context,
+                                      std::optional<std::string> cache_salt,
+                                      std::span<const int32_t> token_ids) {
+        if (context.block_size <= 0 ||
+            static_cast<uint64_t>(context.block_size) >
+                std::numeric_limits<size_t>::max()) {
+            return "block_size must be a positive size_t value";
+        }
+        if (cache_salt.has_value() && !IsValidUtf8(*cache_salt)) {
+            return "cache_salt must contain valid UTF-8";
+        }
+        for (int32_t token : token_ids) {
+            if (token < 0) {
+                return "SGLang token_ids must be non-negative";
+            }
+        }
+        return "";
+    }
+
+    size_t BlockCount() const override { return block_count_; }
+    size_t ComputedCount() const override { return computed_.size(); }
+
+    const HashBlock* At(size_t index, std::string* error) override {
+        if (index >= block_count_) {
+            if (error != nullptr) *error = "hash chain index out of range";
+            return nullptr;
+        }
+        if (!sticky_error_.empty()) {
+            if (error != nullptr) *error = sticky_error_;
+            return nullptr;
+        }
+        while (computed_.size() <= index) {
+            const size_t block_index = computed_.size();
+            encoded_.clear();
+            const size_t logical_length = bigram_ ? token_ids_.size() - 1
+                                                  : token_ids_.size();
+            const size_t block_begin = block_index * block_size_;
+            const size_t block_end =
+                std::min(block_begin + block_size_, logical_length);
+            for (size_t token_index = block_begin; token_index < block_end;
+                 ++token_index) {
+                const int32_t token = token_ids_[token_index];
+                const uint32_t value = static_cast<uint32_t>(token);
+                encoded_.push_back(static_cast<uint8_t>(value));
+                encoded_.push_back(static_cast<uint8_t>(value >> 8));
+                encoded_.push_back(static_cast<uint8_t>(value >> 16));
+                encoded_.push_back(static_cast<uint8_t>(value >> 24));
+                if (bigram_) {
+                    const uint32_t next_value =
+                        static_cast<uint32_t>(token_ids_[token_index + 1]);
+                    encoded_.push_back(static_cast<uint8_t>(next_value));
+                    encoded_.push_back(
+                        static_cast<uint8_t>(next_value >> 8));
+                    encoded_.push_back(
+                        static_cast<uint8_t>(next_value >> 16));
+                    encoded_.push_back(
+                        static_cast<uint8_t>(next_value >> 24));
+                }
+            }
+            std::vector<uint8_t> input;
+            input.reserve((has_parent_ ? parent_.size() : 0) +
+                          encoded_.size());
+            if (has_parent_) {
+                input.insert(input.end(), parent_.begin(), parent_.end());
+            }
+            input.insert(input.end(), encoded_.begin(), encoded_.end());
+
+            HashBlock hashed;
+            if (std::string hash_error = Sha256(input, &hashed.digest);
+                !hash_error.empty()) {
+                sticky_error_ = std::move(hash_error);
+                if (error != nullptr) *error = sticky_error_;
+                return nullptr;
+            }
+            hashed.projected = ProjectSglangDigest(hashed.digest);
+            parent_ = hashed.digest;
+            has_parent_ = true;
+            computed_.push_back(std::move(hashed));
+        }
+        return &computed_[index];
+    }
+
+   private:
+    std::span<const int32_t> token_ids_;
+    size_t block_size_;
+    size_t block_count_;
+    bool bigram_;
+    std::optional<std::string> cache_salt_;
+    std::array<uint8_t, kSha256DigestSize> parent_{};
+    bool has_parent_ = false;
+    std::vector<HashBlock> computed_;
+    std::vector<uint8_t> encoded_;
+    std::string sticky_error_;
+};
+
+class SglangHashStrategy final : public HashStrategy {
+   public:
+    explicit SglangHashStrategy(bool bigram) : bigram_(bigram) {}
+
+    std::string Compute(const ContextKey& context,
+                        std::span<const int32_t> token_ids,
+                        std::optional<std::string> cache_salt,
+                        std::vector<HashBlock>* out) const override {
+        if (out == nullptr) return "hash output must not be null";
+        out->clear();
+        std::string error;
+        auto chain = CreateChain(context, token_ids, std::move(cache_salt),
+                                 &error);
+        if (!chain) return error;
+        out->reserve(chain->BlockCount());
+        for (size_t index = 0; index < chain->BlockCount(); ++index) {
+            const auto* block = chain->At(index, &error);
+            if (block == nullptr) return error;
+            out->push_back(*block);
+        }
+        return "";
+    }
+
+    std::unique_ptr<HashChain> CreateChain(
+        const ContextKey& context, std::span<const int32_t> token_ids,
+        std::optional<std::string> cache_salt,
+        std::string* error) const override {
+        if (std::string validation = SglangHashChain::ValidateInputs(
+                context, cache_salt, token_ids);
+            !validation.empty()) {
+            if (error != nullptr) *error = std::move(validation);
+            return nullptr;
+        }
+        return std::make_unique<SglangHashChain>(
+            context, token_ids, std::move(cache_salt), bigram_);
+    }
+
+   private:
+    bool bigram_ = false;
+};
+
 }  // namespace
 
 std::string ResolveHashProfile(const common::HashProfileConfig& config,
@@ -859,6 +1054,19 @@ std::string ResolveHashProfile(const common::HashProfileConfig& config,
         !error.empty()) {
         return error;
     }
+    if (config.strategy == "sglang" || config.strategy == "sglang_bigram") {
+        // SGLang has no process-level Python seed/root in its token hash
+        // chain.  Keep a deterministic sentinel for the existing profile
+        // registration wire contract; cache_salt, when present, supplies the
+        // actual chain root at query time.
+        *out = {.strategy = config.strategy,
+                .algorithm = config.algorithm,
+                .python_hash_seed = config.python_hash_seed,
+                .root_digest = std::string(64, '0'),
+                .index_projection = config.index_projection};
+        return "";
+    }
+
     if (auto error = ValidatePythonHashSeed(config.python_hash_seed);
         !error.empty()) {
         return error;
@@ -915,6 +1123,11 @@ std::unique_ptr<HashStrategy> CreateHashStrategy(const HashProfile& profile,
     }
     if (!validation_error.empty()) {
         return nullptr;
+    }
+    if (profile.strategy == "sglang" ||
+        profile.strategy == "sglang_bigram") {
+        return std::make_unique<SglangHashStrategy>(
+            profile.strategy == "sglang_bigram");
     }
     const VllmValueCodec* codec = CodecForAlgorithm(profile.algorithm);
     if (codec == nullptr) {

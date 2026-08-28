@@ -38,6 +38,29 @@ struct VllmClearedEvent {};
 using VllmEvent =
     std::variant<VllmStoredEvent, VllmRemovedEvent, VllmClearedEvent>;
 
+// SGLang's native KV-event protocol is msgspec array-like/tagged data.  Keep
+// its signed wire hashes as uint64 bit patterns internally so all index paths
+// use one unsigned representation.
+struct SglangStoredEvent {
+    std::vector<uint64_t> block_hashes;
+    std::optional<uint64_t> parent_block_hash;
+    std::optional<std::vector<int32_t>> token_ids;
+    int64_t block_size = 0;
+    std::optional<int64_t> lora_id;
+    std::optional<std::string> medium;
+    std::optional<std::string> cache_salt;
+};
+
+struct SglangRemovedEvent {
+    std::vector<uint64_t> block_hashes;
+    std::optional<std::string> medium;
+};
+
+struct SglangClearedEvent {};
+
+using SglangEvent =
+    std::variant<SglangStoredEvent, SglangRemovedEvent, SglangClearedEvent>;
+
 struct MooncakeEventFields {
     uint64_t event_id = 0;
     int64_t timestamp_milliseconds = 0;
@@ -106,7 +129,14 @@ struct MooncakeEventBatch {
     std::optional<int64_t> data_parallel_rank;
 };
 
-using DecodedBatch = std::variant<VllmEventBatch, MooncakeEventBatch>;
+struct SglangEventBatch {
+    double timestamp_seconds = 0;
+    std::vector<DecodedEvent<SglangEvent>> events;
+    std::optional<int64_t> data_parallel_rank;
+};
+
+using DecodedBatch =
+    std::variant<VllmEventBatch, MooncakeEventBatch, SglangEventBatch>;
 
 struct MessageMetadata {
     common::PublisherKind publisher_kind = common::PublisherKind::kVllm;

@@ -2,17 +2,22 @@
 
 [English](../../../design/conductor/conductor-architecture-design.md)
 
-Mooncake Conductor 读取实时的键值（KV）缓存事件，并在内存中维护一份供路由决策使用的缓存索引。本页说明 vLLM 的 GPU 信息和 Mooncake 的 CPU 或 Disk 信息如何进入这份索引、查询中的 token 如何变成查找值，以及低秩适配（Low-Rank Adaptation，LoRA）如何隔离缓存。这里描述的是当前 C++ 服务，也会说明判断缓存命中时需要注意的限制。
+Mooncake Conductor 读取实时的键值（KV）缓存事件，并在内存中维护一份供路由决策使用的缓存索引。本页说明 vLLM 和 SGLang 的 GPU 信息，以及 Mooncake 的 CPU 或 Disk 信息如何进入这份索引、查询中的 token 如何变成查找值，以及低秩适配（Low-Rank Adaptation，LoRA）如何隔离缓存。这里描述的是当前 C++ 服务，也会说明判断缓存命中时需要注意的限制。
 
 ## 从事件到查询结果
 
 ```mermaid
 flowchart LR
     V["vLLM KV 事件"] --> VR["注册 type 为 vLLM"]
+    L["SGLang KV 事件"] --> LR["注册 type 为 SGLang"]
     M["Mooncake Master KV 事件"] --> MR["注册 type 为 Mooncake"]
     VR --> VD["读取 vLLM 事件字段"]
+    LR --> LD["读取 SGLang 原生数组"]
+    LR --> LM["读取带 SGLang key 解析器的 Mooncake map"]
     MR --> MD["读取 Mooncake 事件字段"]
     VD --> G["某个引擎及其数据并行 rank 的 GPU 块"]
+    LD --> G
+    LM --> S["共享的 CPU 或 Disk 对象"]
     MD --> S["共享的 CPU 或 Disk 对象"]
     G --> I["内存中的缓存索引<br/>租户 + 模型 + LoRA + 块大小"]
     S --> I
@@ -24,10 +29,7 @@ flowchart LR
 
 注册时填写的 `type` 决定 Conductor 怎样读取消息。topic 文本和消息内容（payload）的结构都不会改变这个选择。对于同一个事件源，Conductor 按收到的先后顺序应用有效事件。
 
-vLLM 事件更新已注册引擎及其数据并行（DP）rank 的 GPU 信息。Mooncake 事件更新
-共享的 CPU 或 Disk 信息。查询会对完整的 token 块计算哈希，为每个已注册 rank
-按 GPU、共享 CPU、共享 Disk 的顺序逐块查找，并在 Disk 第一次未命中时结束该
-rank 的结果。
+vLLM 或原生 SGLang 事件更新已注册引擎及其数据并行（DP）rank 的 GPU 信息。Mooncake 事件更新共享的 CPU 或 Disk 信息。SGLang 注册还可以接收由 SGLang handler 解析 object key 的 Mooncake map。查询会对完整的 token 块计算哈希，为每个已注册 rank 按 GPU、共享 CPU、共享 Disk 的顺序逐块查找，并在 Disk 第一次未命中时结束该 rank 的结果。
 
 ## 哪些缓存可以共用
 
@@ -44,11 +46,12 @@ rank 的结果。
 
 每个四字段组合只绑定一个已注册的 `hash_profile`。之后为相同组合注册的事件源，必须使用完全相同的策略、算法、准确的 `python_hash_seed` 文本、派生根摘要和查找规则。目前只支持缓存组 `0`，也可以不填写缓存组。
 
-## vLLM 的 GPU 信息与 Mooncake 的 CPU/Disk 信息
+## 引擎 GPU 信息与 Mooncake 的 CPU/Disk 信息
 
 | 注册的事件源 | 接受的缓存位置 | 一个 stored 块表示什么 | 在 `/query` 中出现在哪里 |
 |---|---|---|---|
 | `vLLM` | GPU，不区分大小写 | 这条注册记录指定的 endpoint、引擎和 DP rank 报告了该块。 | 位于该引擎的 `instances` 结果和对应 DP rank 下。 |
+| `SGLang` | 原生事件支持 GPU（包括 `medium=nil`）、CPU_PINNED 或 Disk；Mooncake map 支持 CPU 或 Disk | 注册的 SGLang endpoint 报告了该块，或其 Mooncake backend 保存了解析后的逻辑对象。 | 原生 GPU 记录位于引擎的 `instances` 结果下；共享记录会扩展兼容 rank。 |
 | `Mooncake` | CPU 或 Disk，不区分大小写 | 一个 Mooncake 对象向所有四个缓存共享字段相同的已注册引擎提供该块。 | 在较高层匹配结束后，可以扩展每个兼容 rank 的累计 `cpu` 或 `disk` 边界。 |
 
 Mooncake 注册项只是订阅名称，不是推理引擎，因此不会在 `/query` 中增加一行结果。即使还没有兼容的 vLLM 引擎，Conductor 也可以先接受这个订阅；但在对应的四字段组合建立前，Mooncake 事件无法加入共享缓存信息。因此，[使用指南](./usage.md)会先注册引擎，再注册共享缓存池。
@@ -180,7 +183,7 @@ CPU 和 Disk 最大值；Conductor 不会拼接不同 rank 的 GPU 块来制造�
 清理操作只删除受影响事件源贡献的信息：
 
 - vLLM 的 remove 或 clear 只影响报告该事件的 endpoint、引擎和 DP rank 的 GPU 记录。其他 rank、其他引擎和共享缓存信息都会保留。
-- Mooncake 记录会保存报告事件的 endpoint、后端、租户、对象 key、完整连接器哈希，以及 CPU 或 Disk 位置。因此，即使两个对象的哈希最后 8 字节相同，删除其中一个对象也会保留另一个对象。
+- Mooncake 记录会保存报告事件的 endpoint、后端、租户、对象 key、由已注册推理引擎 handler 投影的哈希，以及 CPU 或 Disk 位置。因此，即使两个对象的哈希最后 8 字节相同，删除其中一个对象也会保留另一个对象。
 - Mooncake clear 只影响报告事件的 endpoint、后端和租户下的共享对象。vLLM GPU 记录和其他 Mooncake 事件源不受影响。
 - 注销时，Conductor 会先停止选中的 `(instance_id, tenant_id, dp_rank)` 订阅，再删除该 endpoint 贡献的信息。注销 vLLM 还会从查询结果中删除对应 rank；注销 Mooncake 会删除该 endpoint 保存的全部对象绑定。
 
@@ -192,10 +195,12 @@ CPU 和 Disk 最大值；Conductor 不会拼接不同 rank 的 GPU 块来制造�
 - 传输序号向前跳跃时，Conductor 会记录警告，但保留现有缓存记录。对于配置了
   `replay_endpoint` 的 vLLM 订阅，Conductor 会立即读取发布端的 multipart 重放流，
   并在触发空缺的实时事件之前派发缺失事件。失败或不完整的区间会保留到后续实时
-  事件或重连时重试；如果发布端已经淘汰该区间，则不保证能够恢复。当前 Mooncake
-  publisher 没有 replay 服务。
+  事件或重连时重试；如果发布端已经淘汰该区间，则不保证能够恢复。原生 SGLang
+  publisher 使用与 vLLM 相同的 replay 传输；通过 Mooncake 的 SGLang 场景仍然只能
+  实时接收，因为当前 Mooncake publisher 没有 replay 服务。
 - Conductor 按收到的批次顺序处理 Mooncake 事件。它不会仅仅因为 `event_id` 重复就自动忽略事件。
-- vLLM 只提供 GPU 信息，Mooncake 只提供 CPU 或 Disk 信息。其他缓存位置会被忽略，并记录警告。
+- vLLM 只提供 GPU 信息。原生 SGLang 提供 GPU、CPU_PINNED 或 Disk 信息；Mooncake
+  只提供 CPU 或 Disk 信息。其他缓存位置会被忽略，并记录警告。
 - Conductor 会读取连接器 key 中的层和并行 rank 信息，但在报告共享缓存可用之前，不会检查是否已经收到所有层，也不会检查是否已经收到所有张量并行（tensor parallel，TP）、预填充上下文并行（prefill context parallel，PCP）、解码上下文并行（decode context parallel，DCP）或流水线并行（pipeline parallel，PP）部分。
 
 ## 维护者参考源码
