@@ -957,7 +957,21 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
 
     if (deferred) {
         std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-        if (!isBatchAlive(batch_id)) {
+        // The shard lock was released before taking progress_mutex_ to keep
+        // the lock order one-way. In the default queue-off mode,
+        // progress_mutex_ does not protect the per-shard registry, so
+        // reacquire that shard before reading alive_batches_. Queue mode
+        // already makes progress_mutex_ the caller's lock and isBatchAlive()
+        // takes the shard for this check.
+        bool batch_alive = false;
+        if (runtime_queue_config_.enabled) {
+            batch_alive = isBatchAlive(batch_id);
+        } else {
+            std::lock_guard<std::recursive_mutex> shard_lk(
+                batchShardMutex(batch_id));
+            batch_alive = isBatchAlive(batch_id);
+        }
+        if (!batch_alive) {
             // We marked free_requested; another thread already reaped it.
             return Status::OK();
         }
