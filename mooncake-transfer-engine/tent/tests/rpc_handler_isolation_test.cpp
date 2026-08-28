@@ -196,6 +196,7 @@ TEST(ControlRpcCompatibility, LegacyWireIdsPreserved) {
     static_assert(Probe == 9);
     static_assert(SubscribeSegmentUpdate == 10);
     static_assert(NotifySegmentUpdated == 11);
+    static_assert(BootstrapUb == 12);
 
     constexpr int kLegacyDelegate = 6;
     constexpr int kLegacyPin = 7;
