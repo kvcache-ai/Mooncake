@@ -502,22 +502,37 @@ uint64_t DummyClient::alloc_from_mem_pool(size_t size) {
 
 int DummyClient::put(const std::string& key, std::span<const char> value,
                      const WriteConfig& config) {
+    // Carry this thread's request_id across hop A in the ReplicateConfig
+    // alternative so the server-side master hop sees it (read-path parity).
+    // The P2P WriteRouteRequestConfig alternative is left unstamped by design.
+    WriteConfig stamped_config = config;
+    if (auto* rc = std::get_if<ReplicateConfig>(&stamped_config)) {
+        apply_current_request_id(rc->request_id);
+    }
     return to_py_ret(invoke_rpc<&RealClient::put_dummy_helper, void>(
-        key, value, config, client_id_));
+        key, value, stamped_config, client_id_));
 }
 
 int DummyClient::put_batch(const std::vector<std::string>& keys,
                            const std::vector<std::span<const char>>& values,
                            const WriteConfig& config) {
+    WriteConfig stamped_config = config;
+    if (auto* rc = std::get_if<ReplicateConfig>(&stamped_config)) {
+        apply_current_request_id(rc->request_id);
+    }
     return to_py_ret(invoke_rpc<&RealClient::put_batch_dummy_helper, void>(
-        keys, values, config, client_id_));
+        keys, values, stamped_config, client_id_));
 }
 
 int DummyClient::put_parts(const std::string& key,
                            std::vector<std::span<const char>> values,
                            const WriteConfig& config) {
+    WriteConfig stamped_config = config;
+    if (auto* rc = std::get_if<ReplicateConfig>(&stamped_config)) {
+        apply_current_request_id(rc->request_id);
+    }
     return to_py_ret(invoke_rpc<&RealClient::put_parts_dummy_helper, void>(
-        key, values, config, client_id_));
+        key, values, stamped_config, client_id_));
 }
 
 int DummyClient::remove(const std::string& key, bool force) {
@@ -620,9 +635,13 @@ std::vector<int> DummyClient::batch_put_from(
     for (auto ptr : buffer_ptrs) {
         buffers.push_back(reinterpret_cast<uint64_t>(ptr));
     }
+    WriteConfig stamped_config = config;
+    if (auto* rc = std::get_if<ReplicateConfig>(&stamped_config)) {
+        apply_current_request_id(rc->request_id);
+    }
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_put_from_dummy_helper, void>(
-            keys.size(), keys, buffers, sizes, config, client_id_);
+            keys.size(), keys, buffers, sizes, stamped_config, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
