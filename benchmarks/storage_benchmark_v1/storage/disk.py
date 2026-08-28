@@ -197,6 +197,9 @@ class DiskHashTable(Storage):
         try:
             fd, base, owned = self._open_page(page_id, write=False)
             os.pread(fd, length, base + offset_in_page)
+            if owned:
+                close_fd, fd = fd, None
+                os.close(close_fd)
 
             latency = (time.perf_counter() - start) * 1000.0
             self.stats['read_count'] += 1
@@ -249,14 +252,18 @@ class DiskHashTable(Storage):
                 os.fsync(fd)
                 self.stats['sync_count'] += 1
                 self._pending_syncs = 0
-                latency = (time.perf_counter() - start) * 1000.0
             elif self.fsync_mode == 'batch':
                 self._pending_syncs += 1
                 if self._pending_syncs >= self.fsync_batch_size:
                     os.fsync(fd)
                     self.stats['sync_count'] += 1
                     self._pending_syncs = 0
-                latency = (write_done - start) * 1000.0
+            if owned:
+                close_fd, fd = fd, None
+                os.close(close_fd)
+
+            if self.fsync_mode == 'always' or owned:
+                latency = (time.perf_counter() - start) * 1000.0
             else:
                 latency = (write_done - start) * 1000.0
 
