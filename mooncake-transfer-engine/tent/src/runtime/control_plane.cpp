@@ -72,12 +72,23 @@ Status ControlClient::bootstrap(const std::string& server_addr,
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
-    std::string request, response;
+    std::string response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
-    request.resize(sizeof(XferDataDesc) + length);
-    memcpy(&request[0], &desc, sizeof(desc));
-    Platform::getLoader().copy(&request[sizeof(desc)], local_mem_addr, length);
-    auto status = tl_rpc_agent.call(server_addr, SendData, request, response);
+    std::string request;
+    request.reserve(sizeof(XferDataDesc) + length);
+    request.resize(sizeof(XferDataDesc));
+    memcpy(request.data(), &desc, sizeof(desc));
+    auto& loader = Platform::getLoader();
+    if (loader.getMemoryType(local_mem_addr) == MTYPE_CPU) {
+        // Single copy into the RPC attachment; avoids the resize() zero-fill
+        // and the extra copy in call().
+        request.append(reinterpret_cast<const char*>(local_mem_addr), length);
+    } else {
+        request.resize(sizeof(XferDataDesc) + length);
+        loader.copy(request.data() + sizeof(desc), local_mem_addr, length);
+    }
+    auto status = tl_rpc_agent.callOwned(server_addr, SendData,
+                                         std::move(request), response);
     if (!status.ok()) return status;
     if (!response.empty()) return Status::RpcServiceError(response);
     return Status::OK();
@@ -165,12 +176,13 @@ void ControlClient::delegateAsync(const std::string& server_addr,
         [callback = std::move(callback)](Status status,
                                          std::string response_raw) mutable {
             if (!status.ok()) {
-                callback(std::move(status));
+                callback(std::move(status), false);
                 return;
             }
             callback(response_raw.empty()
                          ? Status::OK()
-                         : Status::RpcServiceError(response_raw));
+                         : Status::RpcServiceError(response_raw),
+                     true);
         });
 }
 
@@ -194,6 +206,25 @@ Status ControlClient::unpinStageBuffer(const std::string& server_addr,
     CHECK_STATUS(
         tl_rpc_agent.call(server_addr, Unpin, request_raw, response_raw));
     return Status::OK();
+}
+
+void ControlClient::unpinStageBufferAsync(const std::string& server_addr,
+                                          uint64_t addr,
+                                          UnpinStageBufferCallback callback) {
+    json j = addr;
+    std::string request_raw = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, Unpin, request_raw,
+        [callback = std::move(callback)](Status status,
+                                         std::string response_raw) mutable {
+            if (!status.ok()) {
+                callback(std::move(status));
+                return;
+            }
+            callback(response_raw.empty()
+                         ? Status::OK()
+                         : Status::RpcServiceError(response_raw));
+        });
 }
 
 ControlService::ControlService(const std::string& type,
@@ -321,8 +352,8 @@ void ControlService::finishNotifyCallback() {
     notify_cb_cv_.notify_all();
 }
 
-Status ControlService::start(uint16_t& port, bool ipv6_) {
-    return rpc_server_->start(port, ipv6_);
+Status ControlService::start(uint16_t& port, bool ipv6_, size_t threads) {
+    return rpc_server_->start(port, ipv6_, threads);
 }
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
@@ -422,9 +453,15 @@ void ControlService::onRecvData(const std::string_view& request,
     }
 
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        response.resize(length);
-        Platform::getLoader().copy(response.data(), (void*)peer_mem_addr,
-                                   length);
+        auto& loader = Platform::getLoader();
+        if (loader.getMemoryType((void*)peer_mem_addr) == MTYPE_CPU) {
+            // assign() skips the resize() zero-fill pass.
+            response.assign(reinterpret_cast<const char*>(peer_mem_addr),
+                            length);
+        } else {
+            response.resize(length);
+            loader.copy(response.data(), (void*)peer_mem_addr, length);
+        }
     } else {
         response = "RecvData failed: target address not in registered buffer";
     }

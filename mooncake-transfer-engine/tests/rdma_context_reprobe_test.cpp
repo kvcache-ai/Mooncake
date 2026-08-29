@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include "error.h"
 #include "rdma_test_peers.h"
 #include "transfer_metadata.h"
+#include "ib_link_speed.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 
@@ -54,6 +56,10 @@ struct FakeVerbsDevice {
     ibv_device *device_list[2] = {&device, nullptr};
     ibv_context context = {};
     size_t alloc_pd_calls = 0;
+    // Reported by the interposed ibv_query_port.
+    uint8_t active_speed = 0;
+    uint8_t active_width = 0;
+    uint32_t active_speed_ex = 0;
 };
 
 FakeVerbsDevice fake_verbs;
@@ -65,6 +71,9 @@ class FakeVerbsDeviceScope {
         fake_verbs.context = {};
         fake_verbs.context.num_comp_vectors = num_comp_vectors;
         fake_verbs.alloc_pd_calls = 0;
+        fake_verbs.active_speed = 0;
+        fake_verbs.active_width = 0;
+        fake_verbs.active_speed_ex = 0;
     }
 
     ~FakeVerbsDeviceScope() { fake_verbs.enabled = false; }
@@ -111,6 +120,11 @@ int ibv_query_port(ibv_context *context, uint8_t,
     port_attr->state = IBV_PORT_ACTIVE;
     port_attr->lid = 1;
     port_attr->active_mtu = IBV_MTU_4096;
+    port_attr->active_speed = fake_verbs.active_speed;
+    port_attr->active_width = fake_verbs.active_width;
+#ifdef HAVE_IBV_ACTIVE_SPEED_EX
+    port_attr->active_speed_ex = fake_verbs.active_speed_ex;
+#endif
     return 0;
 }
 
@@ -174,6 +188,70 @@ TEST_F(RdmaContextConstructionTest, RejectsZeroCompletionChannelsBeforeSetup) {
                                   /*num_comp_channels=*/0),
               ERR_INVALID_ARGUMENT);
     EXPECT_FALSE(RdmaContextTestPeer::hasEndpointStore(*context_));
+}
+
+TEST_F(RdmaContextConstructionTest, LogsPortNumberAsIntegerNotCharacter) {
+    // `port` is a uint8_t; streaming it raw into glog renders the byte as a
+    // control character, so the operator sees "on port \x01" instead of the
+    // number they configured. The failure path for a missing device is enough
+    // to exercise the log line.
+    const bool saved_logtostderr = FLAGS_logtostderr;
+    FLAGS_logtostderr = true;
+    ::testing::internal::CaptureStderr();
+    EXPECT_EQ(context_->construct(/*num_cq_list=*/1,
+                                  /*num_comp_channels=*/1,
+                                  /*port=*/1,
+                                  /*gid_index=*/-1),
+              ERR_CONTEXT);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    FLAGS_logtostderr = saved_logtostderr;
+
+    EXPECT_NE(log.find("on port 1 with GID"), std::string::npos) << log;
+    EXPECT_EQ(log.find(std::string("on port \x01")), std::string::npos) << log;
+}
+
+// openRdmaDevice() records the negotiated speed before construct() goes on
+// to validate completion vectors, so a device with none lets the recorded
+// values be inspected without allocating anything.
+TEST_F(RdmaContextConstructionTest, RecordsNegotiatedPortSpeedAndWidth) {
+#ifdef __linux__
+    FakeVerbsDeviceScope fake_device(/*num_comp_vectors=*/0);
+    fake_verbs.active_speed = 64;  // HDR, 50 Gb/s per lane
+    fake_verbs.active_width = 2;   // 4x
+
+    EXPECT_EQ(context_->construct(1, 1, /*port=*/1, /*gid_index=*/0),
+              ERR_CONTEXT);
+    EXPECT_EQ(context_->activeSpeed(), 64);
+    EXPECT_EQ(context_->activeWidth(), 2);
+    EXPECT_DOUBLE_EQ(
+        ibLinkSpeedGbps(context_->activeSpeed(), context_->activeWidth()),
+        200.0);
+    RdmaContextTestPeer::disableContextForTeardown(*context_);
+#else
+    GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
+#endif
+}
+
+// XDR's encoding (256) does not fit ibv_port_attr::active_speed (uint8_t),
+// which reads 0; rdma-core carries it in active_speed_ex. show_links must
+// report 800 Gbps for XDR 4x, not 0.
+TEST_F(RdmaContextConstructionTest, PrefersActiveSpeedExForXdr) {
+#if defined(__linux__) && defined(HAVE_IBV_ACTIVE_SPEED_EX)
+    FakeVerbsDeviceScope fake_device(/*num_comp_vectors=*/0);
+    fake_verbs.active_speed = 0;       // what the uint8_t field reads for XDR
+    fake_verbs.active_speed_ex = 256;  // XDR
+    fake_verbs.active_width = 2;       // 4x
+
+    EXPECT_EQ(context_->construct(1, 1, /*port=*/1, /*gid_index=*/0),
+              ERR_CONTEXT);
+    EXPECT_EQ(context_->activeSpeed(), 256);
+    EXPECT_DOUBLE_EQ(
+        ibLinkSpeedGbps(context_->activeSpeed(), context_->activeWidth()),
+        800.0);
+    RdmaContextTestPeer::disableContextForTeardown(*context_);
+#else
+    GTEST_SKIP() << "Requires Linux and ibv_port_attr::active_speed_ex";
+#endif
 }
 
 TEST_F(RdmaContextConstructionTest,

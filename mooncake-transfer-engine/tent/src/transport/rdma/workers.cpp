@@ -179,13 +179,44 @@ Workers::Workers(RdmaTransport* transport)
     // ============================================================
 
     params.default_bandwidth_gbps =
-        conf->get("transports/rdma/default_bandwidth_gbps", 400.0);
-    params.min_bandwidth_gbps =
-        conf->get("transports/rdma/min_bandwidth_gbps", 10.0);
-    params.max_bandwidth_gbps =
-        conf->get("transports/rdma/max_bandwidth_gbps", 800.0);
+        conf->get("transports/rdma/default_bandwidth_gbps",
+                  params.default_bandwidth_gbps);
+    params.min_bandwidth_gbps = conf->get("transports/rdma/min_bandwidth_gbps",
+                                          params.min_bandwidth_gbps);
+    params.max_bandwidth_gbps = conf->get("transports/rdma/max_bandwidth_gbps",
+                                          params.max_bandwidth_gbps);
 
     device_selector_->setSchedulingParams(params);
+
+    // Seed each device from its context. context_set_ is indexed by NicID,
+    // the same id the selector uses. Three cases:
+    //   - no usable context (DEVICE_UNINIT: initializeContexts() replaced a
+    //     failed construct() with an inert slot; DEVICE_DISABLED handled the
+    //     same way defensively): the NIC cannot carry traffic, so it gets no
+    //     bandwidth at all -- not the default -- and leaves candidate
+    //     selection and the aggregate.
+    //   - port down at open (DEVICE_PAUSED): seeded from whatever the port
+    //     reports (possibly 0, i.e. the default), but unavailable until
+    //     IBV_EVENT_PORT_ACTIVE.
+    //   - DEVICE_ENABLED: seeded from the negotiated speed, or the configured
+    //     default (with a warning) when the speed could not be read.
+    for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
+         ++dev_id) {
+        const auto* nic = transport_->local_topology_->getNicEntry(dev_id);
+        // Only NIC_RDMA entries have a selector slot (see loadTopology()).
+        if (!nic || nic->type != Topology::NIC_RDMA) continue;
+        const auto& context = transport_->context_set_[dev_id];
+        const auto status =
+            context ? context->status() : RdmaContext::DEVICE_UNINIT;
+        if (status == RdmaContext::DEVICE_UNINIT ||
+            status == RdmaContext::DEVICE_DISABLED) {
+            device_selector_->setDeviceAvailable(dev_id, false);
+            continue;
+        }
+        device_selector_->setDeviceBandwidth(dev_id, context->linkSpeedGbps());
+        device_selector_->setDeviceAvailable(
+            dev_id, status == RdmaContext::DEVICE_ENABLED);
+    }
 
     // ============================================================
     // Shared Memory Configuration
@@ -735,8 +766,10 @@ void Workers::asyncPollCq() {
                 if (auto* rail = slice->rail_monitor; rail && rail->ready())
                     rail->markRecovered(slice->source_dev_id,
                                         slice->target_dev_id);
-                worker.perf.inflight_lat.add(inflight_lat);
-                worker.perf.enqueue_lat.add(enqueue_lat);
+                if (transport_->params_->workers.show_latency_info) {
+                    worker.perf.inflight_lat.add(inflight_lat);
+                    worker.perf.enqueue_lat.add(enqueue_lat);
+                }
             }
         }
     }
@@ -796,30 +829,93 @@ void Workers::workerThread(int thread_id) {
     }
 }
 
-int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
+int Workers::handleContextEvents(int dev_id,
+                                 std::shared_ptr<RdmaContext>& context) {
     ibv_async_event event;
     if (ibv_get_async_event(context->nativeContext(), &event) < 0) return -1;
     LOG(WARNING) << "Received context async event "
                  << ibv_event_type_str(event.event_type) << " for context "
                  << context->name();
-    if (event.event_type == IBV_EVENT_QP_FATAL ||
-        event.event_type == IBV_EVENT_WQ_FATAL) {
-        auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
-        context->endpointStore()->remove(endpoint);
-    } else if (event.event_type == IBV_EVENT_CQ_ERR) {
-        context->pause();
-        context->resume();
-        LOG(WARNING) << "Action: " << context->name() << " restarted";
-    } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
-               event.event_type == IBV_EVENT_PORT_ERR) {
-        context->pause();
-        LOG(WARNING) << "Action: " << context->name() << " down";
-    } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
-        context->resume();
-        LOG(WARNING) << "Action: " << context->name() << " up";
-    }
+    applyContextEvent(dev_id, *context, event);
     ibv_ack_async_event(&event);
     return 0;
+}
+
+void Workers::applyContextEvent(int dev_id, RdmaContext& context,
+                                const ibv_async_event& event) {
+    switch (event.event_type) {
+        case IBV_EVENT_QP_FATAL:
+        case IBV_EVENT_WQ_FATAL: {
+            auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
+            context.endpointStore()->remove(endpoint);
+            break;
+        }
+        case IBV_EVENT_CQ_ERR:
+            context.pause();
+            context.resume();
+            LOG(WARNING) << "Action: " << context.name() << " restarted";
+            break;
+        case IBV_EVENT_DEVICE_FATAL:
+            // Device-scoped: every port is gone.
+            context.pause();
+            device_selector_->setDeviceAvailable(dev_id, false);
+            LOG(WARNING) << "Action: " << context.name() << " down";
+            break;
+        case IBV_EVENT_PORT_ERR:
+        case IBV_EVENT_PORT_ACTIVE: {
+            if (event.element.port_num != context.portNum()) {
+                LOG(INFO) << context.name() << ": ignoring "
+                          << ibv_event_type_str(event.event_type)
+                          << " for port " << event.element.port_num
+                          << " (this context uses port "
+                          << static_cast<int>(context.portNum()) << ")";
+                break;
+            }
+            if (event.event_type == IBV_EVENT_PORT_ERR) {
+                context.pause();
+                // Out of selection and out of the aggregate until the port
+                // returns; its EWMA cannot learn anything while no traffic
+                // flows.
+                device_selector_->setDeviceAvailable(dev_id, false);
+                LOG(WARNING) << "Action: " << context.name() << " down";
+            } else {
+                context.resume();
+                // The link may have renegotiated while down: re-seed before
+                // the device becomes selectable so no worker scores it on
+                // the old rate.
+                refreshLinkSpeed(dev_id, context);
+                device_selector_->setDeviceAvailable(dev_id, true);
+                LOG(WARNING) << "Action: " << context.name() << " up";
+            }
+            break;
+        }
+#ifdef HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE
+        case IBV_EVENT_DEVICE_SPEED_CHANGE:
+            // rdma-core >= 62: a port speed changed without a link flap
+            // (e.g. a VF over LAG losing a PF). Device-level, so the event
+            // names no port; each context opens exactly one, so re-query
+            // that one.
+            refreshLinkSpeed(dev_id, context);
+            break;
+#endif
+        default:
+            break;
+    }
+}
+
+void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {
+    if (!device_selector_) return;
+    const double before = context.linkSpeedGbps();
+    if (context.refreshPortAttributes() != 0) return;  // already logged
+    const double after = context.linkSpeedGbps();
+    // Both values decode from the same integer encodings, so exact
+    // comparison is meaningful. A speed that can no longer be read (0)
+    // counts as a change: setDeviceBandwidth() then falls back to the
+    // configured default and warns, the same as at startup.
+    if (after == before) return;
+    LOG(WARNING) << context.name() << " link speed " << before << " -> "
+                 << after << " Gbps, re-seeding its bandwidth estimate";
+    device_selector_->setDeviceBandwidth(dev_id, after);
 }
 
 void Workers::reclaimEndpoints() {
@@ -848,7 +944,9 @@ void Workers::monitorThread() {
             last_reclaim_time = current_time;
         }
 
-        for (auto& context : transport_->context_set_) {
+        for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
+             ++dev_id) {
+            auto& context = transport_->context_set_[dev_id];
             struct epoll_event event;
             if (context->eventFd() < 0) continue;
             int num_events = epoll_wait(context->eventFd(), &event, 1, 100);
@@ -859,7 +957,7 @@ void Workers::monitorThread() {
             if (num_events == 0) continue;
             if (!(event.events & EPOLLIN)) continue;
             if (event.data.fd == context->nativeContext()->async_fd)
-                handleContextEvents(context);
+                handleContextEvents(static_cast<int>(dev_id), context);
         }
     }
 }
@@ -924,7 +1022,8 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     auto& worker = worker_context_[tl_wid];
     if (slice->source_dev_id < 0) {
         CHECK_STATUS(device_selector_->allocate(
-            slice->length, source.buffer->location, slice->source_dev_id));
+            slice->length, source.buffer->location, slice->source_dev_id,
+            slice->priority, slice->task->device_mask));
         slice->quota_charged = true;
     }
 
@@ -934,8 +1033,9 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
     if (!rail.ready() || target.topo != rail.remote())
-        rail.load(source.topo, target.topo, rail_topo_json_,
-                  transport_->conf_.get());
+        rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
+                  std::shared_ptr<const Topology>(target.pin, target.topo),
+                  rail_topo_json_, transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
@@ -1080,12 +1180,15 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
             : &getOrCreateRail(worker.rails, target.segment->machine_id);
     size_t start =
         static_cast<size_t>(slice->last_fallback_idx + 1) % total_combos;
+    const uint64_t device_mask = slice->task->device_mask;
     for (size_t k = 0; k < total_combos; ++k) {
         size_t idx = (start + k) % total_combos;
         size_t src_idx = idx / dst_total;
         size_t dst_idx = idx % dst_total;
         int sdev = getDeviceByFlatIndex(source, src_idx);
         int tdev = getDeviceByFlatIndex(target, dst_idx);
+        if (sdev < 0 || sdev >= 64 || (device_mask & (1ULL << sdev)) == 0)
+            continue;
         bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
                                       : rail_mon->available(sdev, tdev);
 

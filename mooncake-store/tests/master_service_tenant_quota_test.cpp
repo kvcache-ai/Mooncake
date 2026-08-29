@@ -256,7 +256,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void DiscardExpiredProcessingForTest(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
+        const size_t shard_idx = service.getShardIndex(tenant_id, key);
         MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::time_point::max());

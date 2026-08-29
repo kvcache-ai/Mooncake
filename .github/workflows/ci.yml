@@ -188,15 +188,11 @@ jobs:
         python mooncake-pg/tests/test_pg_collectives.py
       shell: bash
 
-    - name: Test PyTorch 2.13 Single-Buffer Collectives (CPU Only)
-      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.10'
+    - name: Test PyTorch >= 2.13 Single-Buffer Collectives (CPU Only)
       env:
         MC_FORCE_TCP: "true"
       run: |
         source test_env/bin/activate
-        python -m pip install --force-reinstall "torch==2.13.0" \
-          --index-url https://download.pytorch.org/whl/cu126 \
-          --extra-index-url https://pypi.org/simple
         python mooncake-pg/tests/test_pg_collectives.py \
           TestMooncakePGCollectivesCPU.test_all_gather_into_tensor \
           TestMooncakePGCollectivesCPU.test_reduce_scatter_sum
@@ -329,6 +325,27 @@ jobs:
         bash scripts/check_reshard_types.sh
       shell: bash
 
+  release-gate-tests:
+    name: Test TestPyPI release gate
+    if: *run-ci
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Run focused release gate tests
+      run: |
+        python -m pip install --disable-pip-version-check \
+          packaging pytest==8.3.5
+        python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
+      shell: bash
+
   clang-format:
     name: Check code format
     if: *run-ci
@@ -419,6 +436,7 @@ jobs:
     outputs:
       should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
       should-run-tent: ${{ steps.dispatch-override.outputs.tent || steps.filter.outputs.tent }}
+      should-run-reshard: ${{ steps.dispatch-override.outputs.reshard || steps.filter.outputs.reshard }}
     steps:
       # workflow_dispatch has no PR/push diff context — skip paths-filter and default to true
       - name: Default to true for workflow_dispatch
@@ -427,6 +445,7 @@ jobs:
         run: |
           echo "src=true" >> $GITHUB_OUTPUT
           echo "tent=true" >> $GITHUB_OUTPUT
+          echo "reshard=true" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v4
         if: github.event_name != 'workflow_dispatch'
         with:
@@ -451,6 +470,49 @@ jobs:
               - 'CMakeLists.txt'
               - 'dependencies.sh'
               - '.github/workflows/ci.yml'
+            reshard:
+              - 'mooncake-reshard/**'
+              - 'mooncake-wheel/pyproject.toml'
+              - 'requirements.txt'
+              - 'scripts/check_reshard_types.sh'
+              - '.github/workflows/ci.yml'
+
+  reshard-test:
+    name: Test Reshard (Python ${{ matrix.python-version }})
+    needs: [check-paths]
+    if: >-
+      (needs.check-paths.outputs.should-run-reshard == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install Reshard test dependencies
+      run: |
+        python -m pip install --disable-pip-version-check --upgrade pip
+        python -m pip install --disable-pip-version-check \
+          -r requirements.txt pytest==8.3.5
+
+    - name: Test Reshard
+      run: |
+        PYTHONPATH=mooncake-reshard/python \
+          python -m pytest -q mooncake-reshard/tests
+      shell: bash
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
@@ -559,6 +621,9 @@ jobs:
         df -h
       shell: bash
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
     - name: Configure project with TENT
       run: |
         mkdir build-tent
@@ -577,16 +642,69 @@ jobs:
         sudo cmake --install .
       shell: bash
 
+    # Check the Transfer Engine Rust crate against the freshly built C++
+    # libraries. This is a compile/link check, so it is safe to run on every
+    # matrix leg (including the cuda-on leg, which only verifies that the
+    # USE_CUDA code paths compile).
+    - name: Check Transfer Engine Rust bindings, examples, and tests
+      run: |
+        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
+           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
+          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+        fi
+        if [ "${{ matrix.need_cuda }}" = "true" ]; then
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        fi
+        cd mooncake-transfer-engine/rust
+        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build-tent
+        export MOONCAKE_TE_LIB_DIR=$GITHUB_WORKSPACE/build-tent/mooncake-transfer-engine/src
+        export MOONCAKE_TE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-transfer-engine/include
+        cargo test --lib
+        cargo test --examples --tests --no-run
+        cargo clean
+      shell: bash
+
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
     # with USE_CUDA=ON tent's cuda_probe hits the CUDA stub library at
     # runtime and drives some dispatch paths past the fake objects the
     # unit tests rely on, causing false failures. cuda-on still validates
     # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
+      id: ctest
       if: '!matrix.need_cuda'
       run: |
         cd build-tent
-        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
+        mkdir -p test-results
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j \
+          --output-on-failure \
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
+      shell: bash
+
+    - name: Preserve TENT CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: TENT CTest failure (${{ matrix.name }})
+        artifact-name: ctest-diagnostics-tent-${{ matrix.name }}
+        junit-report: build-tent/test-results/ctest.xml
+        failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+
+    - name: Start Metadata Server
+      if: '!matrix.need_cuda'
+      run: |
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
+        python ./bootstrap_server.py &
+        sleep 2
+      shell: bash
+
+    - name: Run Transfer Engine Rust smoke test
+      if: '!matrix.need_cuda'
+      env:
+        MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build-tent
+        MOONCAKE_TE_RUST_LINK_ASAN: "0"
+      run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
       shell: bash
 
     - name: Run sccache stat for check
@@ -601,6 +719,9 @@ jobs:
       - spell-check
       - clang-format
       - docs-check
+      - reshard-type-check
+      - release-gate-tests
+      - reshard-test
       - build-wheel
       - build-flags
       - test-wheel-ubuntu

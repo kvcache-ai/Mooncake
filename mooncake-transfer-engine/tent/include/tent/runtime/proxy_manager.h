@@ -15,6 +15,7 @@
 #ifndef PROXY_MANAGER_H_
 #define PROXY_MANAGER_H_
 
+#include <chrono>
 #include <memory>
 #include <shared_mutex>
 
@@ -119,6 +120,11 @@ class ProxyManager {
     const size_t chunk_size_;
     const size_t chunk_count_;
     TransferEngineImpl* impl_;
+    // How long deconstruct() waits for in-flight staging batches to reach a
+    // terminal state before handing the survivors to the engine for deferred
+    // teardown. Read from "staging/shutdown_drain_timeout_ms" so a regression
+    // test can exercise the timeout path without the 30s default.
+    const std::chrono::milliseconds shutdown_drain_timeout_;
     // Guards the map, not the chunk bitmaps in it: those are atomic_flags and
     // stay lock-free under a shared lock. Exclusive only to insert or erase an
     // entry, at most once per location. Reached by the kShards staging workers

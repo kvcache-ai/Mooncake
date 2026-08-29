@@ -7,6 +7,8 @@
 
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
@@ -73,6 +75,10 @@ class S3Helper {
 
     tl::expected<void, std::string> DeleteObjectsWithPrefix(
         const std::string &prefix);
+
+    tl::expected<void, std::string> InspectObject(
+        const std::string &key, uint64_t &stored_size,
+        std::optional<uint32_t> &crc32c);
 
    private:
     Aws::S3::S3Client s3_client_;

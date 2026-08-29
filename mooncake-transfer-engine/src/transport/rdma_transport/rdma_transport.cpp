@@ -23,7 +23,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
-#include <future>
 #include <set>
 #include <thread>
 #include <utility>
@@ -35,6 +34,7 @@
 #include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "transport/batch_registration.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
@@ -737,28 +737,29 @@ int RdmaTransport::registerLocalMemoryBatch(
         }
     } else {
 #endif
-        std::vector<std::future<int>> results;
-        for (auto &buffer : buffer_list) {
-            results.emplace_back(std::async(
-                std::launch::async, [this, buffer, location]() -> int {
-                    // Use force_sequential=true to avoid nested parallelism
-                    return registerLocalMemoryInternal(buffer.addr,
-                                                       buffer.length, location,
-                                                       true, false, true);
-                }));
-        }
+        auto start = std::chrono::steady_clock::now();
+        int first_error =
+            runBoundedRegMrBatch(buffer_list.size(), [&](size_t i) {
+                int ret = registerLocalMemoryInternal(
+                    buffer_list[i].addr, buffer_list[i].length, location, true,
+                    false, true);
+                if (ret) {
+                    LOG(WARNING)
+                        << "RdmaTransport: Failed to register memory: addr "
+                        << buffer_list[i].addr << " length "
+                        << buffer_list[i].length;
+                }
+                return ret;
+            });
 
-        int first_error = 0;
-        for (size_t i = 0; i < buffer_list.size(); ++i) {
-            int ret = results[i].get();
-            if (ret) {
-                LOG(WARNING)
-                    << "RdmaTransport: Failed to register memory: addr "
-                    << buffer_list[i].addr << " length "
-                    << buffer_list[i].length;
-                if (!first_error) first_error = ret;
-            }
-        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        LOG(INFO) << "RdmaTransport: registered " << buffer_list.size()
+                  << " buffers on "
+                  << std::min(buffer_list.size(), maxConcurrentRegMr())
+                  << " threads in " << elapsed << "ms";
+
         if (first_error) return first_error;
 #if defined(USE_CUDA) || defined(USE_SUPA)
     }  // Environ::Get().GetWithNvidiaPeermem()
@@ -769,24 +770,15 @@ int RdmaTransport::registerLocalMemoryBatch(
 
 int RdmaTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    std::vector<std::future<int>> results;
-    for (auto &addr : addr_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, addr]() -> int {
-                // Use force_sequential=true to avoid nested parallelism
-                return unregisterLocalMemoryInternal(addr, false, true);
-            }));
-    }
-
-    int first_error = 0;
-    for (size_t i = 0; i < addr_list.size(); ++i) {
-        int ret = results[i].get();
+    int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
+        int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         if (ret) {
             LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
-            if (!first_error) first_error = ret;
         }
-    }
+        return ret;
+    });
+
     int metadata_ret = metadata_->updateLocalSegmentDesc();
     return first_error ? first_error : metadata_ret;
 }

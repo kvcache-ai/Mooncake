@@ -55,7 +55,10 @@ include(${CMAKE_CURRENT_LIST_DIR}/limit_jobs.cmake)
 
 option(ENABLE_SCCACHE "Whether to open sccache" OFF)
 if(ENABLE_SCCACHE)
-  find_program(SCCACHE sccache REQUIRED)
+  find_program(SCCACHE sccache)
+  if(NOT SCCACHE)
+    message(FATAL_ERROR "sccache executable not found")
+  endif()
 endif()
 if(SCCACHE AND ENABLE_SCCACHE)
   message(STATUS "Building with SCCACHE enabled")
@@ -162,7 +165,7 @@ option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE
-       "build the Rust interface and sample code for the transfer engine" OFF)
+       "build the Transfer Engine Rust library and sample code" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
 option(USE_EVENT_DRIVEN_COMPLETION
@@ -663,5 +666,56 @@ if(NOT TARGET gflags::gflags)
     endif()
   endforeach()
 endif()
-find_package(yalantinglibs CONFIG REQUIRED)
-add_compile_definitions(YLT_ENABLE_IBV)
+
+set(GH_MIRROR "")
+if(DEFINED ENV{ASCEND_GITHUB_MIRROR_URLS})
+  set(GH_MIRROR $ENV{ASCEND_GITHUB_MIRROR_URLS})
+endif()
+if(GH_MIRROR)
+  message(STATUS "Using Github mirror: ${GH_MIRROR}")
+endif()
+
+include(${CMAKE_CURRENT_LIST_DIR}/FindYLT.cmake)
+
+option(USE_FLAGCX "option for using FlagCX-backed transport (cross-vendor CCL)"
+       OFF)
+if(USE_FLAGCX)
+  if(NOT FLAGCX_HOME)
+    if(DEFINED ENV{FLAGCX_HOME})
+      set(FLAGCX_HOME $ENV{FLAGCX_HOME})
+    else()
+      set(FLAGCX_HOME "$ENV{HOME}/FlagCX/build")
+    endif()
+  endif()
+  find_path(
+    FLAGCX_INCLUDE_DIR
+    NAMES flagcx_p2p.h
+    HINTS "${FLAGCX_HOME}/include")
+  find_library(
+    FLAGCX_LIBRARY
+    NAMES flagcx
+    HINTS "${FLAGCX_HOME}/lib" "${FLAGCX_HOME}/lib64")
+  if(NOT FLAGCX_INCLUDE_DIR)
+    message(
+      FATAL_ERROR
+        "USE_FLAGCX=ON but flagcx_p2p.h was not found (set -DFLAGCX_HOME=...)")
+  endif()
+  if(NOT FLAGCX_LIBRARY)
+    message(
+      FATAL_ERROR
+        "USE_FLAGCX=ON but the FlagCX library was not found (set -DFLAGCX_HOME=...)"
+    )
+  endif()
+  if(NOT TARGET FlagCX::flagcx)
+    add_library(FlagCX::flagcx UNKNOWN IMPORTED)
+    set_target_properties(
+      FlagCX::flagcx
+      PROPERTIES IMPORTED_LOCATION "${FLAGCX_LIBRARY}"
+                 INTERFACE_INCLUDE_DIRECTORIES "${FLAGCX_INCLUDE_DIR}")
+  endif()
+  add_compile_definitions(USE_FLAGCX)
+  message(
+    STATUS
+      "FlagCX transport enabled, include=${FLAGCX_INCLUDE_DIR}, library=${FLAGCX_LIBRARY}"
+  )
+endif()

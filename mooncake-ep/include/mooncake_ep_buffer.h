@@ -4,7 +4,9 @@
 #include <cuda_alike.h>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
@@ -74,6 +76,12 @@ struct MooncakeEpBuffer {
     // GDR buffer — allocated by p2p_transport_; peer mappings are optional.
     int buffer_idx{};
     int phase_epochs[2]{};
+    // TBO owns multiple logical dispatchers but shares one native Buffer.
+    // Keep a private top-k snapshot slot per dispatch metadata tensor so
+    // interleaved subbatches cannot overwrite one another.
+    std::mutex buffer_mutex;
+    std::unordered_map<uint64_t, int> dispatch_shadow_slots;
+    int next_shadow_slot = 0;
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 

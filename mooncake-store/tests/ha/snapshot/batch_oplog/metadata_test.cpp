@@ -244,6 +244,8 @@ TEST(BatchOpLogSnapshotTypesTest, BuildsControlAndArtifactKeys) {
 
     const auto snapshot_id = BuildBatchOpLogSnapshotId(9, 12345);
     ASSERT_EQ(snapshot_id, "9-12345");
+    EXPECT_EQ(BuildBatchOpLogSnapshotArtifactPrefix("snapshots/", snapshot_id),
+              "snapshots/batch-oplog/9-12345/");
     EXPECT_EQ(BuildBatchOpLogSnapshotDescriptorKey("snapshots", snapshot_id),
               "snapshots/batch-oplog/9-12345/descriptor.json");
     EXPECT_EQ(BuildBatchOpLogSnapshotManifestKey("snapshots/", snapshot_id),

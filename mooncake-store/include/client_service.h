@@ -473,6 +473,15 @@ class Client {
     tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
 
     /**
+     * @brief Deregisters this client's local disk segment from the master.
+     * Idempotent. The master drops the LOCAL_DISK replicas this client owns, so
+     * readers stop being handed a disk whose owner is about to stop serving.
+     * Callers must stop offloading first, otherwise the storage heartbeat
+     * re-mounts the segment on its next tick.
+     */
+    tl::expected<void, ErrorCode> UnmountLocalDiskSegment();
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this

@@ -61,6 +61,8 @@ class FakeStore:
         self.unmount_failures = set()
         self.allocated_mount_calls = []
         self.free_unmount_calls = []
+        self.unmount_local_disk_calls = []
+        self.fail_unmount_local_disk = False
         self.setup_calls = []
 
     def setup(self, *args):
@@ -103,12 +105,19 @@ class FakeStore:
         self.free_unmount_calls.append((list(segment_ids), grace_period_seconds))
         return 0
 
+    def unmount_local_disk_segment(self, grace_period_seconds=0):
+        self.unmount_local_disk_calls.append(grace_period_seconds)
+        return -1 if self.fail_unmount_local_disk else 0
+
 
 class FakeRequest:
-    def __init__(self, body):
+    def __init__(self, body, json_error=None):
         self.body = body
+        self.json_error = json_error
 
     async def json(self):
+        if self.json_error is not None:
+            raise self.json_error
         return self.body
 
 
@@ -491,6 +500,82 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 400)
         body = json.loads(resp.text)
         self.assertIn("Missing segment_ids", body["error"])
+
+    # ============= /api/unmount_local_disk tests =============
+
+    async def test_unmount_local_disk_malformed_json_rejected(self):
+        resp = await self.service.handle_unmount_local_disk(
+            FakeRequest(None, json_error=json.JSONDecodeError("bad", "doc", 0))
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [])
+
+    async def test_unmount_local_disk_rejects_non_object_body(self):
+        resp = await self.service.handle_unmount_local_disk(FakeRequest([1, 2, 3]))
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [])
+
+    async def test_unmount_local_disk_rejects_bool_grace_period(self):
+        resp = await self.service.handle_unmount_local_disk(
+            FakeRequest({"grace_period_seconds": True})
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [])
+
+    async def test_unmount_local_disk_rejects_string_grace_period(self):
+        resp = await self.service.handle_unmount_local_disk(
+            FakeRequest({"grace_period_seconds": "30"})
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [])
+
+    async def test_unmount_local_disk_rejects_float_grace_period(self):
+        resp = await self.service.handle_unmount_local_disk(
+            FakeRequest({"grace_period_seconds": 1.5})
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [])
+
+    async def test_unmount_local_disk_rejects_negative_grace_period(self):
+        resp = await self.service.handle_unmount_local_disk(
+            FakeRequest({"grace_period_seconds": -1})
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [])
+
+    async def test_unmount_local_disk_rejects_grace_period_above_bound(self):
+        resp = await self.service.handle_unmount_local_disk(
+            FakeRequest({"grace_period_seconds": 3601})
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [])
+
+    async def test_unmount_local_disk_accepts_bound_grace_period(self):
+        resp = await self.service.handle_unmount_local_disk(
+            FakeRequest({"grace_period_seconds": 3600})
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [3600])
+
+    async def test_unmount_local_disk_defaults_grace_period_to_zero(self):
+        resp = await self.service.handle_unmount_local_disk(FakeRequest({}))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.text)
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [0])
+
+    async def test_unmount_local_disk_passes_positive_grace_period(self):
+        resp = await self.service.handle_unmount_local_disk(
+            FakeRequest({"grace_period_seconds": 30})
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [30])
+
+    async def test_unmount_local_disk_store_failure(self):
+        self.fake_store.fail_unmount_local_disk = True
+        resp = await self.service.handle_unmount_local_disk(FakeRequest({}))
+        self.assertEqual(resp.status, 500)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [0])
 
     # ==================== /api/put tests ====================
 
