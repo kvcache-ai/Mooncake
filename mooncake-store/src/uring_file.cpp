@@ -843,6 +843,9 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
 // ---------------------------------------------------------------------------
 
 tl::expected<void, ErrorCode> UringFile::datasync() {
+    if (ConsumeSyncFailureForTest(SyncKind::kDatasync)) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
     if (fd_ < 0) return make_error<void>(ErrorCode::FILE_NOT_FOUND);
     auto res = SharedUringRing::instance().fsync(fd_);
     if (!res) {

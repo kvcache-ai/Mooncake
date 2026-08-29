@@ -201,6 +201,43 @@ inline std::ostream& operator<<(std::ostream& os,
     }
 }
 
+// How BucketStorageBackend flushes a bucket's data file before committing the
+// bucket's metadata (.meta) file. Restart recovery walks .meta files, so this
+// setting decides what a crash can leave behind: metadata committed for data
+// that never reached the device. Separate from OffsetPersistMode so the two
+// backends can be configured independently.
+enum class BucketPersistMode {
+    kDisabled,  // No flush (default). Both files are left dirty and the order
+                // in which they reach the device is left to kernel writeback.
+    kRelaxed,   // sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER): write the
+                // bucket data back and wait for it before .meta is written.
+                // This buys ordering, not durability -- sync_file_range() does
+                // not write file metadata -- and it relies on the filesystem
+                // committing metadata in order (ext4, xfs).
+    kStrict,    // fdatasync(): as kRelaxed, and makes the bucket data itself
+                // durable, subject to the device honoring cache flushes.
+};
+
+// Note what none of these levels do: StoreBucketMetadata() does not flush
+// .meta, so a crash right after an offload still loses the bucket at every
+// level (recovery finds no .meta and drops the orphaned data file). What the
+// setting removes is the corrupt outcome -- durable metadata pointing at data
+// that was not persisted -- not the lost one.
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const BucketPersistMode& mode) {
+    switch (mode) {
+        case BucketPersistMode::kDisabled:
+            return os << "disabled";
+        case BucketPersistMode::kRelaxed:
+            return os << "relaxed";
+        case BucketPersistMode::kStrict:
+            return os << "strict";
+        default:
+            return os << "unknown";
+    }
+}
+
 struct BucketBackendConfig {
     int64_t bucket_size_limit =
         256 * kMB;  // Max total size of a single bucket (256 MB)
@@ -237,6 +274,10 @@ struct BucketBackendConfig {
     // more often. <=0 disables caching (scan every check). Only relevant when
     // max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
+    // Ordering of a bucket's data against the metadata that points at it.
+    // Disabled by default: every level above kDisabled costs write throughput
+    // on the offload path.
+    BucketPersistMode persist_mode = BucketPersistMode::kDisabled;
 
     bool Validate() const;
 
@@ -1036,6 +1077,15 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
         std::vector<iovec>& iovs);
+
+    /**
+     * @brief Flush a bucket's data file at the configured persist mode, before
+     * its metadata is committed.
+     * @param file The bucket data file, already written.
+     * @return Empty on success (including kDisabled, which flushes nothing),
+     * FILE_WRITE_FAIL if the flush failed.
+     */
+    tl::expected<void, ErrorCode> PersistBucketData(StorageFile& file);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
