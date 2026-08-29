@@ -172,7 +172,8 @@ jobs:
           exit 1
         fi
 
-        python scripts/test_tensor_api.py -n 1
+        python scripts/test_upsert_api.py
+        python -m unittest mooncake-wheel.tests.test_weight_snapshot_api
         python scripts/test_async_store.py
         python scripts/test_copy_move_api.py
         python -m unittest mooncake-wheel.tests.test_safetensor_functions
