@@ -61,6 +61,20 @@ class RdmaTransportTestPeer {
         return transport.initializeContexts();
     }
 
+    // Constructs Workers (which seeds the DeviceSelector from context_set_)
+    // without starting any threads.
+    static std::unique_ptr<Workers> makeWorkers(RdmaTransport& transport) {
+        return std::make_unique<Workers>(&transport);
+    }
+
+    // Drives the decision half of handleContextEvents with a synthesized
+    // event, bypassing ibv_get_async_event/ibv_ack_async_event.
+    static void applyContextEvent(Workers& workers, int dev_id,
+                                  RdmaContext& context,
+                                  const ibv_async_event& event) {
+        workers.applyContextEvent(dev_id, context, event);
+    }
+
     static const RdmaContextSet& contextSet(const RdmaTransport& transport) {
         return transport.context_set_;
     }
@@ -297,6 +311,118 @@ TEST(RdmaNicIndexAlignmentTest, ContextSetKeepsOneSlotWhenConstructFails) {
               static_cast<size_t>(0));
     expectInertContextPerNic(RdmaTransportTestPeer::contextSet(transport),
                              topology->getNicCount());
+}
+
+// A NIC whose construct() failed is still an RDMA entry in the topology, so
+// loadTopology() gives it a DeviceSelector slot. Workers must mark it
+// unavailable: it can carry no traffic, so it must be neither a selection
+// candidate nor part of the aggregate bandwidth the admission queue reads --
+// the configured default speed is for usable NICs only.
+TEST(RdmaNicIndexAlignmentTest, FailedContextIsUnavailableToSelector) {
+    auto topology = std::make_shared<Topology>();
+    ASSERT_TRUE(topology
+                    ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                    .ok());
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport),
+              static_cast<size_t>(0));
+
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    auto* selector = workers->getDeviceSelector();
+    ASSERT_NE(selector, nullptr);
+    EXPECT_FALSE(selector->isDeviceAvailable(1));
+    // Nothing usable: no bandwidth to predict with, rather than 400G of it.
+    EXPECT_LT(selector->getAggregateEwmaBandwidth(), 0.0);
+}
+
+// refreshPortAttributes() is called from the monitor thread on port events.
+// On a slot that never opened a device it must fail cleanly and leave the
+// (zero) speed alone rather than touch a null ibv_context.
+// Port events carry the port they concern, and a device's async fd delivers
+// events for every port of that device. A context opens exactly one port, so
+// an event for another port must not touch its availability. These run on an
+// inert context: pause()/resume() are no-ops there and the decision under
+// test is the selector flip.
+class RdmaContextEventTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        topology_ = std::make_shared<Topology>();
+        ASSERT_TRUE(topology_
+                        ->parse(R"({"nics":[
+                            {"name":"mc-tcp-0","type":1,"numa_node":0},
+                            {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                        .ok());
+        RdmaTransportTestPeer::bindTopology(transport_, topology_);
+        ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport_), 0u);
+        workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
+        selector_ = workers_->getDeviceSelector();
+        ASSERT_NE(selector_, nullptr);
+        // Init marked the failed context unavailable; pretend it recovered so
+        // the flips below are observable.
+        ASSERT_TRUE(selector_->setDeviceAvailable(kDev, true).ok());
+    }
+
+    RdmaContext& context() {
+        return *RdmaTransportTestPeer::contextSet(transport_)[kDev];
+    }
+
+    void fire(ibv_event_type type, int port_num) {
+        ibv_async_event event{};
+        event.event_type = type;
+        event.element.port_num = port_num;
+        RdmaTransportTestPeer::applyContextEvent(*workers_, kDev, context(),
+                                                 event);
+    }
+
+    int ourPort() { return context().portNum(); }
+    int otherPort() { return ourPort() + 1; }
+
+    static constexpr int kDev = 1;
+    std::shared_ptr<Topology> topology_;
+    RdmaTransport transport_;
+    std::unique_ptr<Workers> workers_;
+    DeviceSelector* selector_ = nullptr;
+};
+
+TEST_F(RdmaContextEventTest, PortErrAndPortActiveFlipAvailability) {
+    fire(IBV_EVENT_PORT_ERR, ourPort());
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+    EXPECT_LT(selector_->getAggregateEwmaBandwidth(), 0.0);
+    fire(IBV_EVENT_PORT_ACTIVE, ourPort());
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+    EXPECT_GT(selector_->getAggregateEwmaBandwidth(), 0.0);
+}
+
+TEST_F(RdmaContextEventTest, EventsForAnotherPortAreIgnored) {
+    fire(IBV_EVENT_PORT_ERR, otherPort());
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+
+    fire(IBV_EVENT_PORT_ERR, ourPort());
+    ASSERT_FALSE(selector_->isDeviceAvailable(kDev));
+    fire(IBV_EVENT_PORT_ACTIVE, otherPort());
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+}
+
+TEST_F(RdmaContextEventTest, DeviceFatalMarksUnavailableRegardlessOfPort) {
+    fire(IBV_EVENT_DEVICE_FATAL, otherPort());  // device-scoped: no port
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+}
+
+TEST_F(RdmaContextEventTest, CqErrLeavesAvailabilityAlone) {
+    fire(IBV_EVENT_CQ_ERR, ourPort());
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+}
+
+TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {
+    RdmaTransport transport;
+    RdmaContext context(transport);
+    ASSERT_EQ(context.status(), RdmaContext::DEVICE_UNINIT);
+    EXPECT_EQ(context.refreshPortAttributes(), -1);
+    EXPECT_DOUBLE_EQ(context.linkSpeedGbps(), 0.0);
 }
 
 TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
