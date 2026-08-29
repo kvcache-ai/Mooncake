@@ -1222,15 +1222,16 @@ TEST_F(MasterServiceSSDTest, PutEndNoopOffloadDoesNotLeakRefcount) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(
-        service->PutStart(client_id, key, TenantId::Default(), slice_length,
-                          config)
-            .has_value());
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, key, TenantId::Default(),
+                               slice_length, config)
+                    .has_value());
 
     // PutEnd triggers the offload enqueue, which is a no-op here. With the fix
     // it stays best-effort and still succeeds.
     ASSERT_TRUE(
-        service->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
+        service
+            ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
             .has_value());
 
     // The object is readable...
