@@ -87,7 +87,7 @@ The transport is configured under `transports.hp_tcp`:
 | `worker_count` | ASIO event-loop threads. |
 | `connections_per_peer` | Persistent lanes per peer. |
 | `max_outstanding_tasks`, `max_outstanding_bytes` | Global admission bounds. |
-| `max_transfer_bytes`, `chunk_size` | Request and I/O step limits. |
+| `max_transfer_bytes` | Maximum request size. I/O progress is tracked in fixed internal steps. |
 | `connect_timeout_ms`, `progress_timeout_ms` | Connection and I/O deadlines. |
 
 Tests cover wire validation, admission, buffer leases, connection reuse,

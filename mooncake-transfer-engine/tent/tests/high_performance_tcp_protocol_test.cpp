@@ -55,16 +55,16 @@ TEST(HighPerformanceTcpProtocolTest, RejectsMalformedWireFrames) {
 }
 
 TEST(HighPerformanceTcpProtocolTest, MetadataAttributesRoundTrip) {
-    HighPerformanceTcpEndpointAttr endpoint{
-        "00112233445566778899aabbccddeeff", {{"127.0.0.1", 1234}}, 4096};
+    HighPerformanceTcpEndpointAttr endpoint{"00112233445566778899aabbccddeeff",
+                                            "127.0.0.1", 1234, 4096};
     std::string encoded;
     ASSERT_TRUE(EncodeHighPerformanceTcpEndpointAttr(endpoint, &encoded).ok());
     HighPerformanceTcpEndpointAttr decoded_endpoint;
     ASSERT_TRUE(
         DecodeHighPerformanceTcpEndpointAttr(encoded, &decoded_endpoint).ok());
     EXPECT_EQ(decoded_endpoint.incarnation, endpoint.incarnation);
-    ASSERT_EQ(decoded_endpoint.endpoints.size(), 1u);
-    EXPECT_EQ(decoded_endpoint.endpoints[0].port, 1234);
+    EXPECT_EQ(decoded_endpoint.host, endpoint.host);
+    EXPECT_EQ(decoded_endpoint.port, endpoint.port);
 
     ASSERT_TRUE(
         EncodeHighPerformanceTcpBufferAttr({42, "global_read_write"}, &encoded)

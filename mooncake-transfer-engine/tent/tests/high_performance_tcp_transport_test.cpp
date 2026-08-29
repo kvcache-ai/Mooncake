@@ -75,7 +75,6 @@ HighPerformanceTcpParams MakeParams() {
     params.max_outstanding_tasks = 16;
     params.max_outstanding_bytes = 1 << 20;
     params.max_transfer_bytes = 1 << 20;
-    params.chunk_size = 16 << 10;
     params.connect_timeout_ms = 1000;
     params.progress_timeout_ms = 1000;
     return params;
@@ -158,9 +157,8 @@ TEST(HighPerformanceTcpTransportTest,
     HighPerformanceTcpEndpointAttr endpoint;
     ASSERT_TRUE(
         DecodeHighPerformanceTcpEndpointAttr(attr_it->second, &endpoint).ok());
-    ASSERT_EQ(endpoint.endpoints.size(), 1U);
-    EXPECT_EQ(endpoint.endpoints[0].host, "127.0.0.1");
-    EXPECT_NE(endpoint.endpoints[0].port, 0);
+    EXPECT_EQ(endpoint.host, "127.0.0.1");
+    EXPECT_NE(endpoint.port, 0);
 
     std::array<uint8_t, 64> local_only_storage{};
     BufferDesc local_only;

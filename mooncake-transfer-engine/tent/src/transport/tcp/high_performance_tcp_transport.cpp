@@ -17,6 +17,8 @@
 namespace mooncake::tent {
 namespace {
 
+constexpr uint64_t kIoProgressStepBytes = 1ULL << 20;
+
 std::string HostFromRpc(const std::string& address) {
     if (address.empty()) return {};
     if (address.front() == '[') {
@@ -121,8 +123,6 @@ Status HighPerformanceTcpTransport::validateParams() const {
     if (params_.worker_count == 0 || params_.connections_per_peer == 0 ||
         params_.max_outstanding_tasks == 0 ||
         params_.max_outstanding_bytes == 0 || params_.max_transfer_bytes == 0 ||
-        params_.chunk_size == 0 ||
-        params_.chunk_size > params_.max_transfer_bytes ||
         params_.connect_timeout_ms == 0 || params_.progress_timeout_ms == 0) {
         return Status::InvalidArgument(
             "invalid high-performance TCP limits" LOC_MARK);
@@ -212,7 +212,9 @@ Status HighPerformanceTcpTransport::install(
 
     client_ = std::make_unique<HighPerformanceTcpClient>(
         HighPerformanceTcpClient::Config{
-            params_.max_transfer_bytes, params_.chunk_size,
+            params_.max_transfer_bytes,
+            static_cast<size_t>(std::min<uint64_t>(kIoProgressStepBytes,
+                                                   params_.max_transfer_bytes)),
             params_.connect_timeout_ms, params_.progress_timeout_ms,
             params_.connections_per_peer},
         workers_.get());
@@ -224,7 +226,9 @@ Status HighPerformanceTcpTransport::install(
     server_ = std::make_unique<HighPerformanceTcpServer>(
         HighPerformanceTcpServer::Config{
             params_.bind_address, params_.port, params_.max_transfer_bytes,
-            params_.chunk_size, params_.progress_timeout_ms, max_connections},
+            static_cast<size_t>(std::min<uint64_t>(kIoProgressStepBytes,
+                                                   params_.max_transfer_bytes)),
+            params_.progress_timeout_ms, max_connections},
         &registry_, workers_.get());
 
     uint16_t bound_port = 0;
@@ -252,7 +256,7 @@ Status HighPerformanceTcpTransport::install(
         const std::string incarnation = makeIncarnation();
         std::string encoded;
         status = EncodeHighPerformanceTcpEndpointAttr(
-            {incarnation, {{host, bound_port}}, params_.max_transfer_bytes},
+            {incarnation, host, bound_port, params_.max_transfer_bytes},
             &encoded);
         if (status.ok()) {
             status = metadata_->segmentManager().updateLocal(
@@ -490,8 +494,7 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
         });
     if (!resolved.ok()) return resolved;
 
-    if (endpoint_attr.endpoints.size() != 1 ||
-        request.length > endpoint_attr.max_transfer_bytes) {
+    if (request.length > endpoint_attr.max_transfer_bytes) {
         return Status::InvalidArgument(
             "HP TCP request exceeds remote endpoint capability" LOC_MARK);
     }
@@ -520,8 +523,8 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
     HighPerformanceTcpClient::Operation operation;
     operation.peer_id = request.target_id;
     operation.incarnation = endpoint_attr.incarnation;
-    operation.host = endpoint_attr.endpoints[0].host;
-    operation.port = endpoint_attr.endpoints[0].port;
+    operation.host = endpoint_attr.host;
+    operation.port = endpoint_attr.port;
     operation.lane_id = lane_id;
     operation.registration_id = buffer_attr.registration_id;
     operation.remote_addr = request.target_offset;

@@ -19,7 +19,6 @@ struct HighPerformanceTcpParams {
     uint64_t max_outstanding_tasks{4096};
     uint64_t max_outstanding_bytes{1ULL << 32};
     uint64_t max_transfer_bytes{1ULL << 30};
-    size_t chunk_size{1ULL << 20};
     uint64_t connect_timeout_ms{2000};
     uint64_t progress_timeout_ms{30000};
 };

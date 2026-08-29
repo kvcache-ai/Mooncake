@@ -92,7 +92,6 @@
             "max_outstanding_tasks": 4096,
             "max_outstanding_bytes": 4294967296,
             "max_transfer_bytes": 1073741824,
-            "chunk_size": 1048576,
             "connect_timeout_ms": 2000,
             "progress_timeout_ms": 30000
         },

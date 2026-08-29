@@ -97,7 +97,6 @@ Status ParseHpTcpTransportConfig(const Config& config,
                               &parsed.params.max_outstanding_bytes));
     CHECK_STATUS(ReadUnsigned(hp_tcp, "max_transfer_bytes",
                               &parsed.params.max_transfer_bytes));
-    CHECK_STATUS(ReadUnsigned(hp_tcp, "chunk_size", &parsed.params.chunk_size));
     CHECK_STATUS(ReadUnsigned(hp_tcp, "connect_timeout_ms",
                               &parsed.params.connect_timeout_ms));
     CHECK_STATUS(ReadUnsigned(hp_tcp, "progress_timeout_ms",
@@ -107,8 +106,7 @@ Status ParseHpTcpTransportConfig(const Config& config,
     if (parsed.enabled &&
         (hp.worker_count == 0 || hp.connections_per_peer == 0 ||
          hp.max_outstanding_tasks == 0 || hp.max_outstanding_bytes == 0 ||
-         hp.max_transfer_bytes == 0 || hp.chunk_size == 0 ||
-         hp.chunk_size > hp.max_transfer_bytes || hp.connect_timeout_ms == 0 ||
+         hp.max_transfer_bytes == 0 || hp.connect_timeout_ms == 0 ||
          hp.progress_timeout_ms == 0)) {
         return Invalid("transports/hp_tcp",
                        "contains zero or inconsistent limits");

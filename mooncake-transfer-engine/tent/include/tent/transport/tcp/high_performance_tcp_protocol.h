@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
@@ -62,14 +61,10 @@ EncodeHighPerformanceTcpResponse(const HighPerformanceTcpResponseFrame& frame);
 Status DecodeHighPerformanceTcpResponse(const uint8_t* bytes, size_t size,
                                         HighPerformanceTcpResponseFrame* frame);
 
-struct HighPerformanceTcpEndpoint {
-    std::string host;
-    uint16_t port{0};
-};
-
 struct HighPerformanceTcpEndpointAttr {
     std::string incarnation;
-    std::vector<HighPerformanceTcpEndpoint> endpoints;
+    std::string host;
+    uint16_t port{0};
     uint64_t max_transfer_bytes{0};
 };
 

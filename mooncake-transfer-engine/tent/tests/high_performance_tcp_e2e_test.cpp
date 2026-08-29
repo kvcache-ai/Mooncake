@@ -81,7 +81,6 @@ std::shared_ptr<Config> MakeHpConfig() {
     config->set("transports/hp_tcp/max_outstanding_tasks", 128);
     config->set("transports/hp_tcp/max_outstanding_bytes", 64ULL << 20);
     config->set("transports/hp_tcp/max_transfer_bytes", 8ULL << 20);
-    config->set("transports/hp_tcp/chunk_size", 64ULL << 10);
     config->set("transports/hp_tcp/connect_timeout_ms", 2000);
     config->set("transports/hp_tcp/progress_timeout_ms", 5000);
     config->set("transports/rdma/enable", false);

@@ -33,18 +33,17 @@ TEST(HpTcpTransportConfigTest, ParsesAndValidatesLimits) {
     ASSERT_TRUE(
         config
             .load(
-                R"({"transports":{"tcp":{"enable":false},"hp_tcp":{"enable":true,"port":0,"worker_count":4,"connections_per_peer":2,"max_outstanding_tasks":16,"max_outstanding_bytes":4096,"max_transfer_bytes":1024,"chunk_size":512,"connect_timeout_ms":1,"progress_timeout_ms":2}}})")
+                R"({"transports":{"tcp":{"enable":false},"hp_tcp":{"enable":true,"port":0,"worker_count":4,"connections_per_peer":2,"max_outstanding_tasks":16,"max_outstanding_bytes":4096,"max_transfer_bytes":1024,"connect_timeout_ms":1,"progress_timeout_ms":2}}})")
             .ok());
     HpTcpTransportConfig parsed;
     ASSERT_TRUE(ParseHpTcpTransportConfig(config, &parsed).ok());
     EXPECT_TRUE(parsed.enabled);
     EXPECT_EQ(parsed.params.worker_count, 4U);
-    EXPECT_EQ(parsed.params.chunk_size, 512U);
 
     ASSERT_TRUE(
         config
             .load(
-                R"({"transports":{"tcp":{"enable":false},"hp_tcp":{"enable":true,"chunk_size":2,"max_transfer_bytes":1}}})")
+                R"({"transports":{"tcp":{"enable":false},"hp_tcp":{"enable":true,"max_transfer_bytes":0}}})")
             .ok());
     EXPECT_TRUE(ParseHpTcpTransportConfig(config, &parsed).IsInvalidArgument());
 }
