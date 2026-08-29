@@ -50,7 +50,8 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
         UnsetEnv("MOONCAKE_USE_URING");
-        data_path = std::filesystem::current_path().string() + "/data";
+        data_path = (std::filesystem::current_path() / "file_storage_test_data")
+                        .string();
         fs::create_directories(data_path);
         for (const auto& entry : fs::directory_iterator(data_path)) {
             std::error_code ec;
@@ -285,21 +286,26 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
-    constexpr size_t kArenaSize = 2 * 1024 * 1024;
-    std::vector<char> restore_arena(kArenaSize + 4096);
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+
+    size_t payload_size = 0;
+    for (const auto size : sizes) {
+        payload_size += static_cast<size_t>(size);
+    }
+    const size_t arena_size = payload_size * 3 / 2;
+    std::vector<char> restore_arena(arena_size + 4096);
     const auto arena_begin =
         (reinterpret_cast<uintptr_t>(restore_arena.data()) + 4095) & ~4095ULL;
     SetPinnedRestoreArena(fileStorage, reinterpret_cast<void*>(arena_begin),
-                          kArenaSize);
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+                          arena_size);
 
     auto pinned_result = fileStorage.BatchGetLocal(keys, sizes);
     ASSERT_TRUE(pinned_result);
     ASSERT_EQ(pinned_result->pointers.size(), keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         EXPECT_GE(pinned_result->pointers[i], arena_begin);
-        EXPECT_LT(pinned_result->pointers[i], arena_begin + kArenaSize);
+        EXPECT_LT(pinned_result->pointers[i], arena_begin + arena_size);
         EXPECT_EQ(
             std::string(reinterpret_cast<char*>(pinned_result->pointers[i]),
                         sizes[i]),
@@ -311,11 +317,36 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
     ASSERT_EQ(fallback_result->pointers.size(), keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         EXPECT_TRUE(fallback_result->pointers[i] < arena_begin ||
-                    fallback_result->pointers[i] >= arena_begin + kArenaSize);
+                    fallback_result->pointers[i] >= arena_begin + arena_size);
         EXPECT_EQ(
             std::string(reinterpret_cast<char*>(fallback_result->pointers[i]),
                         sizes[i]),
             batch_data.at(keys[i]));
+    }
+}
+
+TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 64 * 1024;
+    file_storage_config.use_uring = false;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    for (size_t i = 0; i < 16; ++i) {
+        keys.emplace_back("key" + std::to_string(i));
+        sizes.emplace_back(4 * 1024);
+    }
+
+    auto allocate_result = FileStorageAllocateBatch(fileStorage, keys, sizes);
+    ASSERT_TRUE(allocate_result)
+        << "POSIX reads should not reserve O_DIRECT padding";
+    EXPECT_EQ(allocate_result.value()->total_size,
+              file_storage_config.local_buffer_size);
+    ASSERT_EQ(allocate_result.value()->handles.size(), keys.size());
+    for (const auto& handle : allocate_result.value()->handles) {
+        EXPECT_EQ(handle.size(), 4 * 1024);
     }
 }
 

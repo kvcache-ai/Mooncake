@@ -30,12 +30,14 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <json/json.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -43,8 +45,10 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "transfer_engine.h"
@@ -66,6 +70,8 @@ void tcpTransportSetLaneFailureReasonHookForTest(
     void (*hook)(int) noexcept) noexcept;
 void tcpTransportSetSessionProgressHookForTest(
     int (*hook)(int, bool) noexcept) noexcept;
+void tcpTransportSetStartTransferMetadataHookForTest(
+    void (*hook)() noexcept) noexcept;
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept;
 }  // namespace mooncake
 #endif
@@ -175,6 +181,8 @@ std::atomic<bool> session_timeout_commit_entered{false};
 std::atomic<bool> session_timeout_commit_had_write_in_flight{false};
 std::atomic<bool> hold_session_timeout_commit{false};
 std::atomic<bool> release_session_timeout_commit{false};
+std::atomic<bool> start_transfer_metadata_hook_entered{false};
+std::atomic<bool> release_start_transfer_metadata_hook{false};
 
 template <typename Predicate, typename Rep, typename Period>
 bool waitForPredicate(Predicate&& predicate,
@@ -409,6 +417,43 @@ int observeSessionProgress(int event, bool detail) noexcept {
                                             std::memory_order_acq_rel);
 }
 
+void blockStartTransferAfterMetadataLookup() noexcept {
+    start_transfer_metadata_hook_entered.store(true, std::memory_order_release);
+    while (
+        !release_start_transfer_metadata_hook.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+class ScopedStartTransferMetadataHook {
+   public:
+    ScopedStartTransferMetadataHook() {
+        start_transfer_metadata_hook_entered.store(false,
+                                                   std::memory_order_release);
+        release_start_transfer_metadata_hook.store(false,
+                                                   std::memory_order_release);
+        tcpTransportSetStartTransferMetadataHookForTest(
+            blockStartTransferAfterMetadataLookup);
+    }
+
+    ~ScopedStartTransferMetadataHook() { reset(); }
+
+    void release() noexcept {
+        release_start_transfer_metadata_hook.store(true,
+                                                   std::memory_order_release);
+    }
+
+    void reset() noexcept {
+        if (!active_) return;
+        release();
+        tcpTransportSetStartTransferMetadataHookForTest(nullptr);
+        active_ = false;
+    }
+
+   private:
+    bool active_ = true;
+};
+
 class ScopedLaneHooks {
    public:
     explicit ScopedLaneHooks(bool block_first_connect_handler = false,
@@ -545,6 +590,213 @@ struct TestSessionHeader {
 
 static_assert(sizeof(TestSessionHeader) == 24,
               "legacy TCP header ABI changed unexpectedly");
+
+// Small in-process implementation of the HTTP metadata key/value contract.
+// It lets refresh tests update the authoritative store first and then exercise
+// TransferEngine::syncSegmentCache(), rather than mutating the cached
+// SegmentDesc returned by getSegmentDescByID().
+class LocalHttpMetadataServer {
+   public:
+    LocalHttpMetadataServer() {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) return;
+        int one = 1;
+        if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one,
+                       sizeof(one)) != 0)
+            return;
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
+                 sizeof(addr)) != 0)
+            return;
+        if (listen(listen_fd_, 16) != 0) return;
+
+        socklen_t len = sizeof(addr);
+        if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) !=
+            0)
+            return;
+        port_ = ntohs(addr.sin_port);
+        ok_ = true;
+        thread_ = std::thread([this] { serve(); });
+    }
+
+    ~LocalHttpMetadataServer() {
+        stopped_.store(true, std::memory_order_release);
+        if (listen_fd_ >= 0) (void)shutdown(listen_fd_, SHUT_RDWR);
+        if (thread_.joinable()) thread_.join();
+        if (listen_fd_ >= 0) close(listen_fd_);
+    }
+
+    bool ok() const { return ok_; }
+    std::string uri() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/metadata";
+    }
+
+    bool rewriteStoredRpcHost(const std::string& server_name,
+                              const std::string& new_host) {
+        std::lock_guard<std::mutex> lock(values_mutex_);
+        size_t rewritten = 0;
+        for (auto& [key, encoded] : values_) {
+            if (key != "mooncake/rpc_meta/" + server_name) continue;
+            Json::CharReaderBuilder reader_builder;
+            Json::Value value;
+            std::string errors;
+            std::unique_ptr<Json::CharReader> reader(
+                reader_builder.newCharReader());
+            if (!reader->parse(encoded.data(), encoded.data() + encoded.size(),
+                               &value, &errors) ||
+                !value.isMember("ip_or_host_name")) {
+                continue;
+            }
+            value["ip_or_host_name"] = new_host;
+            Json::StreamWriterBuilder writer_builder;
+            writer_builder["indentation"] = "";
+            encoded = Json::writeString(writer_builder, value);
+            ++rewritten;
+        }
+        return rewritten == 1;
+    }
+
+   private:
+    static std::string decodeUrlComponent(const std::string& value) {
+        auto hexDigit = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        std::string decoded;
+        decoded.reserve(value.size());
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (value[i] == '%' && i + 2 < value.size()) {
+                const int high = hexDigit(value[i + 1]);
+                const int low = hexDigit(value[i + 2]);
+                if (high >= 0 && low >= 0) {
+                    decoded.push_back(static_cast<char>((high << 4) | low));
+                    i += 2;
+                    continue;
+                }
+            }
+            decoded.push_back(value[i] == '+' ? ' ' : value[i]);
+        }
+        return decoded;
+    }
+
+    static bool sendExact(int fd, const std::string& value) {
+        size_t offset = 0;
+        while (offset < value.size()) {
+            const ssize_t n = send(fd, value.data() + offset,
+                                   value.size() - offset, MSG_NOSIGNAL);
+            if (n <= 0) return false;
+            offset += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    static bool readRequest(int fd, std::string& request) {
+        constexpr size_t kMaximumRequestSize = 1 << 20;
+        char buffer[4096];
+        size_t header_end = std::string::npos;
+        while ((header_end = request.find("\r\n\r\n")) == std::string::npos) {
+            const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+            if (n <= 0) return false;
+            request.append(buffer, static_cast<size_t>(n));
+            if (request.size() > kMaximumRequestSize) return false;
+        }
+
+        size_t content_length = 0;
+        std::istringstream headers(request.substr(0, header_end));
+        std::string line;
+        std::getline(headers, line);
+        while (std::getline(headers, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::string lower = line;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            constexpr char kContentLength[] = "content-length:";
+            if (lower.rfind(kContentLength, 0) == 0) {
+                content_length =
+                    std::stoull(line.substr(sizeof(kContentLength) - 1));
+            }
+        }
+
+        const size_t complete_size = header_end + 4 + content_length;
+        while (request.size() < complete_size) {
+            const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+            if (n <= 0) return false;
+            request.append(buffer, static_cast<size_t>(n));
+            if (request.size() > kMaximumRequestSize) return false;
+        }
+        return true;
+    }
+
+    void handle(int fd) {
+        std::string request;
+        if (!readRequest(fd, request)) return;
+
+        const size_t request_line_end = request.find("\r\n");
+        if (request_line_end == std::string::npos) return;
+        std::istringstream request_line(request.substr(0, request_line_end));
+        std::string method;
+        std::string target;
+        std::string version;
+        request_line >> method >> target >> version;
+        (void)version;
+        const size_t key_pos = target.find("?key=");
+        if (key_pos == std::string::npos) return;
+        const std::string key = decodeUrlComponent(target.substr(key_pos + 5));
+
+        std::string body = "{}";
+        int status = 200;
+        if (method == "PUT") {
+            const size_t header_end = request.find("\r\n\r\n");
+            const std::string value = request.substr(header_end + 4);
+            std::lock_guard<std::mutex> lock(values_mutex_);
+            values_[key] = value;
+        } else if (method == "GET") {
+            std::lock_guard<std::mutex> lock(values_mutex_);
+            auto it = values_.find(key);
+            if (it == values_.end()) {
+                status = 404;
+            } else {
+                body = it->second;
+            }
+        } else if (method == "DELETE") {
+            std::lock_guard<std::mutex> lock(values_mutex_);
+            values_.erase(key);
+        } else {
+            status = 405;
+        }
+
+        const std::string response =
+            "HTTP/1.1 " + std::to_string(status) +
+            (status == 200 ? " OK\r\n" : " Error\r\n") +
+            "Content-Type: application/json\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" +
+            body;
+        (void)sendExact(fd, response);
+    }
+
+    void serve() {
+        while (!stopped_.load(std::memory_order_acquire)) {
+            const int fd = accept(listen_fd_, nullptr, nullptr);
+            if (fd < 0) break;
+            handle(fd);
+            close(fd);
+        }
+    }
+
+    int listen_fd_ = -1;
+    uint16_t port_ = 0;
+    bool ok_ = false;
+    std::thread thread_;
+    std::atomic<bool> stopped_{false};
+    std::mutex values_mutex_;
+    std::unordered_map<std::string, std::string> values_;
+};
 
 // Minimal legacy-server behavior for a flagged WRITE: v1 does not recognize
 // opcode 0x81 as WRITE, so it treats the request as READ and streams payload
@@ -781,6 +1033,11 @@ class HoldingWriteServer {
     std::atomic<int> max_accepted_count_{0};
 };
 
+// Reads a complete request header and optionally a fixed prefix of the WRITE
+// payload, then stops consuming. The receive window is kept deliberately
+// small so a large request cannot finish in the initiator's kernel buffers.
+// Condition variables expose protocol events; wall-clock time is used only by
+// the test's bounded no-progress watchdog.
 class PayloadStallingWriteServer {
    public:
     explicit PayloadStallingWriteServer(size_t payload_prefix_to_read)
@@ -956,7 +1213,8 @@ class UnavailableTcpPeer {
 // multiple request/ack exchanges on each one.
 class ReusingWriteServer {
    public:
-    explicit ReusingWriteServer(bool hold_first_ack = false)
+    explicit ReusingWriteServer(bool hold_first_ack = false,
+                                const char* bind_address = nullptr)
         : hold_first_ack_(hold_first_ack) {
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) return;
@@ -968,7 +1226,11 @@ class ReusingWriteServer {
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind_address) {
+            if (inet_pton(AF_INET, bind_address, &addr.sin_addr) != 1) return;
+        } else {
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        }
         if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
                  sizeof(addr)) != 0)
             return;
@@ -988,6 +1250,15 @@ class ReusingWriteServer {
     bool ok() const { return ok_; }
     uint16_t port() const { return port_; }
     int acceptedCount() const { return accepted_count_.load(); }
+    int activeAcceptedCount() const {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        return static_cast<int>(accepted_fds_.size());
+    }
+    bool waitForNoActiveConnections(std::chrono::milliseconds timeout) const {
+        std::unique_lock<std::mutex> lock(connection_mutex_);
+        return connection_cv_.wait_for(
+            lock, timeout, [this] { return accepted_fds_.empty(); });
+    }
 
     bool waitForRequests(int count, std::chrono::seconds timeout) const {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -1106,6 +1377,7 @@ class ReusingWriteServer {
             auto it = std::find(accepted_fds_.begin(), accepted_fds_.end(), fd);
             if (it != accepted_fds_.end()) accepted_fds_.erase(it);
         }
+        connection_cv_.notify_all();
         close(fd);
     }
 
@@ -1128,7 +1400,8 @@ class ReusingWriteServer {
     uint16_t port_ = 0;
     bool ok_ = false;
     std::thread accept_thread_;
-    std::mutex connection_mutex_;
+    mutable std::mutex connection_mutex_;
+    mutable std::condition_variable connection_cv_;
     mutable std::mutex request_mutex_;
     std::vector<int> accepted_fds_;
     std::vector<std::thread> connection_threads_;
@@ -1156,7 +1429,8 @@ struct EngineHandle {
     bool ok = false;  // ASSERT_* in a helper only aborts the helper
 
     void init(const std::string& metadata_server,
-              const std::string& server_name, size_t pool_size) {
+              const std::string& server_name, size_t pool_size,
+              const std::string& remote_segment_name = {}) {
         // Exercise the pooled-connection path (default off): connection
         // reuse vs. discard-on-unclean-exchange is part of the contract
         // under test.
@@ -1177,9 +1451,12 @@ struct EngineHandle {
         // that is the engine-reported ip:port; against a real metadata
         // service (CI runs one at http://...) it is the requested
         // server_name, matching how production callers open segments.
-        std::string segment_name = (metadata_server == P2PHANDSHAKE)
-                                       ? engine->getLocalIpAndPort()
-                                       : server_name;
+        std::string segment_name = remote_segment_name;
+        if (segment_name.empty()) {
+            segment_name = (metadata_server == P2PHANDSHAKE)
+                               ? engine->getLocalIpAndPort()
+                               : server_name;
+        }
         segment_id = engine->openSegment(segment_name);
         auto desc = engine->getMetadata()->getSegmentDescByID(segment_id);
         ASSERT_NE(desc, nullptr);
@@ -1194,6 +1471,35 @@ void pointTcpSegmentAt(EngineHandle& handle, uint16_t port) {
     ASSERT_NE(desc, nullptr);
     desc->tcp_data_port = port;
     desc->tcp_proto_version = 2;
+}
+
+std::string publishAndRefreshTcpEndpoint(EngineHandle& handle,
+                                         Transport::SegmentID segment_id,
+                                         uint16_t port,
+                                         const std::string& host = {}) {
+    auto metadata = handle.engine->getMetadata();
+    auto current = metadata->getSegmentDescByID(segment_id);
+    EXPECT_NE(current, nullptr);
+    if (!current) return {};
+    auto authoritative = *current;
+    if (!host.empty()) authoritative.tcp_data_host = host;
+    authoritative.tcp_data_port = port;
+    authoritative.tcp_proto_version = 2;
+    EXPECT_EQ(metadata->updateSegmentDesc(current->name, authoritative), 0);
+    EXPECT_EQ(handle.engine->syncSegmentCache(current->name), 0);
+    auto refreshed = metadata->getSegmentDescByID(segment_id);
+    EXPECT_NE(refreshed, nullptr);
+    if (refreshed) {
+        if (!host.empty()) {
+            EXPECT_EQ(refreshed->tcp_data_host, host);
+        }
+        EXPECT_EQ(refreshed->tcp_data_port, port);
+    }
+    return current->name;
+}
+
+std::string publishAndRefreshTcpEndpoint(EngineHandle& handle, uint16_t port) {
+    return publishAndRefreshTcpEndpoint(handle, handle.segment_id, port);
 }
 
 TransferRequest makeWriteRequest(const EngineHandle& handle, size_t length,
@@ -3430,4 +3736,347 @@ TEST(TcpWriteVisibilityTest, ShutdownWithArmedProgressDeadlineCompletesOnce) {
     reclaimBatchDescAfterEngineShutdownForTest(batch_id);
     fake_peer.release();
 }
+
+TEST(TcpWriteVisibilityTest, EndpointRefreshRoutesNewWorkToNewTcpEndpoint) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint_a;
+    ReusingWriteServer endpoint_b;
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint_a.ok());
+    ASSERT_TRUE(endpoint_b.ok());
+
+    const std::string logical_peer = "127.0.0.2:18041";
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18141", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint_a.port()), logical_peer);
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(endpoint_a.waitForRequests(1, std::chrono::seconds(5)));
+
+    const auto refreshed_logical_peer =
+        publishAndRefreshTcpEndpoint(h, endpoint_b.port());
+    ASSERT_EQ(refreshed_logical_peer, logical_peer);
+
+    EXPECT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(endpoint_b.waitForRequests(1, std::chrono::seconds(5)))
+        << "new work did not observe endpoint B after explicit metadata "
+           "refresh";
+    EXPECT_EQ(endpoint_a.acceptedCount(), 1)
+        << "endpoint visibility is a separate observation from old-group "
+           "retirement";
+}
+
+TEST(TcpWriteVisibilityTest,
+     ConcurrentEndpointRefreshNeverCombinesHostAndPortSnapshots) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint_a(false, "127.0.0.1");
+    ReusingWriteServer endpoint_b(false, "127.0.0.2");
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint_a.ok());
+    ASSERT_TRUE(endpoint_b.ok());
+
+    const std::string logical_peer = "127.0.0.2:18051";
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18151", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+    ASSERT_TRUE(
+        metadata_server.rewriteStoredRpcHost(logical_peer, "127.0.0.1"));
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, h.segment_id, endpoint_a.port(),
+                                           "127.0.0.1"),
+              logical_peer);
+
+    // Declare the future first so the hook's destructor releases a blocked
+    // submitter before the future is destroyed on any fatal assertion path.
+    std::future<TransferStatusEnum> transfer;
+    ScopedStartTransferMetadataHook hook;
+    transfer = std::async(std::launch::async, [&] {
+        return runOne(h.engine.get(), makeWriteRequest(h, 1));
+    });
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return start_transfer_metadata_hook_entered.load(
+                std::memory_order_acquire);
+        },
+        std::chrono::seconds(5)));
+
+    auto metadata = h.engine->getMetadata();
+    auto old_snapshot = metadata->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(old_snapshot, nullptr);
+    auto authoritative = *old_snapshot;
+    authoritative.tcp_data_host = "127.0.0.2";
+    authoritative.tcp_data_port = endpoint_b.port();
+    ASSERT_TRUE(
+        metadata_server.rewriteStoredRpcHost(logical_peer, "127.0.0.2"));
+    ASSERT_EQ(metadata->updateSegmentDesc(logical_peer, authoritative), 0);
+    ASSERT_EQ(h.engine->syncSegmentCache(logical_peer), 0);
+
+    hook.release();
+    ASSERT_EQ(transfer.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_EQ(transfer.get(), TransferStatusEnum::COMPLETED)
+        << "a transfer that captured endpoint A before refresh must not use "
+           "the new host with endpoint A's old port";
+    EXPECT_TRUE(endpoint_a.waitForRequests(1, std::chrono::seconds(5)));
+
+    hook.reset();
+    EXPECT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(endpoint_b.waitForRequests(1, std::chrono::seconds(5)));
+    EXPECT_EQ(endpoint_a.acceptedCount(), 1);
+    EXPECT_EQ(endpoint_b.acceptedCount(), 1);
+}
+
+TEST(TcpWriteVisibilityTest, EndpointRefreshRetiresOldTcpGroup) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint_a;
+    ReusingWriteServer endpoint_b;
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint_a.ok());
+    ASSERT_TRUE(endpoint_b.ok());
+
+    const std::string logical_peer = "127.0.0.2:18042";
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18142", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint_a.port()), logical_peer);
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(endpoint_a.waitForRequests(1, std::chrono::seconds(5)));
+    ASSERT_EQ(endpoint_a.activeAcceptedCount(), 1);
+
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint_b.port()), logical_peer);
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(endpoint_b.waitForRequests(1, std::chrono::seconds(5)));
+
+    EXPECT_TRUE(
+        endpoint_a.waitForNoActiveConnections(std::chrono::milliseconds(500)))
+        << "RED: endpoint B is visible, but the idle group/socket for old "
+           "endpoint A is never retired";
+}
+
+TEST(TcpWriteVisibilityTest, SharedEndpointOnePeerMovesDoesNotRetireOtherPeer) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint_a;
+    ReusingWriteServer endpoint_b;
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint_a.ok());
+    ASSERT_TRUE(endpoint_b.ok());
+
+    const std::string logical_peer_x = "127.0.0.2:18046";
+    const std::string logical_peer_y = "127.0.0.2:18047";
+    EngineHandle target_x;
+    target_x.init(metadata_server.uri(), logical_peer_x, 64 * 1024);
+    ASSERT_TRUE(target_x.ok);
+    EngineHandle target_y;
+    target_y.init(metadata_server.uri(), logical_peer_y, 64 * 1024);
+    ASSERT_TRUE(target_y.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18146", 64 * 1024, logical_peer_x);
+    ASSERT_TRUE(h.ok);
+    const auto segment_y = h.engine->openSegment(logical_peer_y);
+    ASSERT_NE(h.engine->getMetadata()->getSegmentDescByID(segment_y), nullptr);
+
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, h.segment_id, endpoint_a.port()),
+              logical_peer_x);
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, segment_y, endpoint_a.port()),
+              logical_peer_y);
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    auto peer_y_request = makeWriteRequest(h, 1);
+    peer_y_request.target_id = segment_y;
+    ASSERT_EQ(runOne(h.engine.get(), peer_y_request),
+              TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(endpoint_a.waitForRequests(2, std::chrono::seconds(5)));
+    ASSERT_EQ(endpoint_a.acceptedCount(), 1);
+
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, h.segment_id, endpoint_b.port()),
+              logical_peer_x);
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(endpoint_b.waitForRequests(1, std::chrono::seconds(5)));
+
+    EXPECT_EQ(endpoint_a.activeAcceptedCount(), 1)
+        << "moving peer X must not retire endpoint A while peer Y still maps "
+           "to it";
+    ASSERT_EQ(runOne(h.engine.get(), peer_y_request),
+              TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(endpoint_a.waitForRequests(3, std::chrono::seconds(5)));
+    EXPECT_EQ(endpoint_a.acceptedCount(), 1)
+        << "peer Y should retain and reuse the shared endpoint-A group";
+}
+
+TEST(TcpWriteVisibilityTest, EndpointChangesAtoBtoCWithoutLeakingOldGroups) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint_a;
+    ReusingWriteServer endpoint_b;
+    ReusingWriteServer endpoint_c;
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint_a.ok());
+    ASSERT_TRUE(endpoint_b.ok());
+    ASSERT_TRUE(endpoint_c.ok());
+
+    const std::string logical_peer = "127.0.0.2:18048";
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18148", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+
+    for (const auto* endpoint : {&endpoint_a, &endpoint_b, &endpoint_c}) {
+        ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint->port()),
+                  logical_peer);
+        ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+                  TransferStatusEnum::COMPLETED);
+        ASSERT_TRUE(endpoint->waitForRequests(1, std::chrono::seconds(5)));
+    }
+
+    EXPECT_TRUE(endpoint_a.waitForNoActiveConnections(std::chrono::seconds(5)));
+    EXPECT_TRUE(endpoint_b.waitForNoActiveConnections(std::chrono::seconds(5)));
+    EXPECT_EQ(endpoint_c.activeAcceptedCount(), 1);
+    EXPECT_EQ(endpoint_a.acceptedCount(), 1);
+    EXPECT_EQ(endpoint_b.acceptedCount(), 1);
+    EXPECT_EQ(endpoint_c.acceptedCount(), 1);
+}
+
+TEST(TcpWriteVisibilityTest, EndpointRetirementRacesWithBusyCompletion) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint_a(/*hold_first_ack=*/true);
+    ReusingWriteServer endpoint_b;
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint_a.ok());
+    ASSERT_TRUE(endpoint_b.ok());
+
+    const std::string logical_peer = "127.0.0.2:18049";
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18149", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint_a.port()), logical_peer);
+
+    const auto busy_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(busy_batch, {makeWriteRequest(h, 1)}).ok());
+    ASSERT_TRUE(endpoint_a.waitForFirstRequest(std::chrono::seconds(5)));
+
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint_b.port()), logical_peer);
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(endpoint_a.activeAcceptedCount(), 1)
+        << "a retiring group must retain a BUSY session until completion";
+
+    endpoint_a.releaseFirstAck();
+    TransferStatusEnum status = TransferStatusEnum::WAITING;
+    ASSERT_TRUE(waitForTaskTerminal(h.engine.get(), busy_batch,
+                                    std::chrono::seconds(5), &status));
+    EXPECT_EQ(status, TransferStatusEnum::COMPLETED);
+    expectEverySliceCompletedExactlyOnce(busy_batch);
+    EXPECT_TRUE(endpoint_a.waitForNoActiveConnections(std::chrono::seconds(5)));
+    EXPECT_TRUE(h.engine->freeBatchID(busy_batch).ok());
+}
+
+TEST(TcpWriteVisibilityTest, EndpointRetirementRacesWithShutdown) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint_a(/*hold_first_ack=*/true);
+    ReusingWriteServer endpoint_b;
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint_a.ok());
+    ASSERT_TRUE(endpoint_b.ok());
+
+    const std::string logical_peer = "127.0.0.2:18050";
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18150", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint_a.port()), logical_peer);
+
+    const auto busy_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(busy_batch, {makeWriteRequest(h, 1)}).ok());
+    ASSERT_TRUE(endpoint_a.waitForFirstRequest(std::chrono::seconds(5)));
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint_b.port()), logical_peer);
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+
+    auto engine = std::move(h.engine);
+    auto destruction =
+        std::async(std::launch::async,
+                   [engine = std::move(engine)]() mutable { engine.reset(); });
+    ASSERT_EQ(destruction.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    destruction.get();
+    endpoint_a.releaseFirstAck();
+
+    expectEverySliceCompletedExactlyOnceAfterShutdown(busy_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(busy_batch);
+}
+
+TEST(TcpWriteVisibilityTest, RpcMetadataRefreshInvalidatesCachedHost) {
+    LocalHttpMetadataServer metadata_server;
+    ASSERT_TRUE(metadata_server.ok());
+
+    const std::string logical_peer = "127.0.0.2:18043";
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18143", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+    auto metadata = h.engine->getMetadata();
+    auto segment = metadata->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(segment, nullptr);
+    ASSERT_EQ(segment->name, logical_peer);
+
+    TransferMetadata::RpcMetaDesc initial_rpc;
+    ASSERT_EQ(metadata->getRpcMetaEntry(logical_peer, initial_rpc), 0);
+    const std::string endpoint_b_host = "198.51.100.29";
+    ASSERT_NE(initial_rpc.ip_or_host_name, endpoint_b_host);
+    ASSERT_TRUE(
+        metadata_server.rewriteStoredRpcHost(logical_peer, endpoint_b_host));
+
+    auto authoritative = *segment;
+    // Model a peer that predates tcp_data_host publication. Refresh must
+    // resolve the authoritative RPC host once and freeze it into the local
+    // SegmentDesc snapshot before startTransfer can consume it.
+    authoritative.tcp_data_host.clear();
+    authoritative.tcp_data_port =
+        segment->tcp_data_port == 65534 ? 65533 : 65534;
+    ASSERT_EQ(metadata->updateSegmentDesc(logical_peer, authoritative), 0);
+    ASSERT_EQ(h.engine->syncSegmentCache(logical_peer), 0);
+    auto refreshed_segment = metadata->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(refreshed_segment, nullptr);
+    ASSERT_EQ(refreshed_segment->tcp_data_host, endpoint_b_host);
+    ASSERT_EQ(refreshed_segment->tcp_data_port, authoritative.tcp_data_port);
+
+    TransferMetadata::RpcMetaDesc refreshed_rpc;
+    ASSERT_EQ(metadata->getRpcMetaEntry(logical_peer, refreshed_rpc), 0);
+    EXPECT_EQ(refreshed_rpc.ip_or_host_name, endpoint_b_host)
+        << "RED: segment metadata refreshed, but getRpcMetaEntry() retained "
+           "the independently cached host "
+        << initial_rpc.ip_or_host_name;
+}
+
 #endif

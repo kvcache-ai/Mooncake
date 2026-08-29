@@ -82,7 +82,22 @@ class Workers {
     // failure load.
     void reclaimEndpoints();
 
-    int handleContextEvents(std::shared_ptr<RdmaContext>& context);
+    // dev_id is the NicID (context_set_ index), which is also the
+    // DeviceSelector id, so port events can flip that device's availability.
+    int handleContextEvents(int dev_id, std::shared_ptr<RdmaContext>& context);
+
+    // The decision half of handleContextEvents, kept apart from
+    // ibv_get_async_event/ibv_ack_async_event so a synthesized event can
+    // drive it in tests. Port events (PORT_ERR/PORT_ACTIVE) name their port;
+    // a device's async fd delivers them for every port of the device, and a
+    // context opens exactly one, so events for another port are ignored.
+    void applyContextEvent(int dev_id, RdmaContext& context,
+                           const ibv_async_event& event);
+
+    // Re-read the link speed after a port event and re-seed the selector if
+    // it changed; a link that returns at the same speed keeps what it
+    // learned.
+    void refreshLinkSpeed(int dev_id, RdmaContext& context);
 
     Status generatePostPath(RdmaSlice* slice);
 

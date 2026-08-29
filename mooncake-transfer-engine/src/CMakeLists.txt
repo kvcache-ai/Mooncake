@@ -2,6 +2,18 @@ file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
 set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
 list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
+# ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
+# newer rdma-core adds active_speed_ex to carry it. TENT probes the same cache
+# variable in tent/src; this definition covers the classic RdmaContext under
+# transport/ so both decode the port speed the same way.
+include(CheckStructHasMember)
+check_struct_has_member(
+  "struct ibv_port_attr" active_speed_ex infiniband/verbs.h
+  HAVE_IBV_ACTIVE_SPEED_EX LANGUAGE CXX)
+if(HAVE_IBV_ACTIVE_SPEED_EX)
+  add_compile_definitions(HAVE_IBV_ACTIVE_SPEED_EX)
+endif()
+
 add_subdirectory(common)
 add_subdirectory(transport)
 
