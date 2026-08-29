@@ -75,6 +75,55 @@ std::string GenerateKeyForSegment(const UUID& client_id,
     }
 }
 
+TEST_F(MasterServiceSnapshotTest, RestoreKeepsExpiredCompleteObject) {
+    constexpr uint64_t kLeaseTtlMs = 60'000;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_default_kv_lease_ttl(0)
+                              .build();
+    service_.reset(new MasterService(service_config));
+    const auto context = PrepareSimpleSegment(*service_);
+    const std::string complete_key = "restored_expired_lease";
+    const std::string incomplete_key = "incomplete_object";
+
+    ASSERT_TRUE(service_
+                    ->PutStart(context.client_id, complete_key,
+                               TenantId::Default(), 1024, {.replica_num = 1})
+                    .has_value());
+    ASSERT_TRUE(service_
+                    ->PutEnd(context.client_id, complete_key,
+                             TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service_
+                    ->PutStart(context.client_id, incomplete_key,
+                               TenantId::Default(), 1024, {.replica_num = 1})
+                    .has_value());
+
+    const std::string snapshot_id = GenerateSnapshotId();
+    ASSERT_TRUE(CallPersistState(service_.get(), snapshot_id).has_value());
+
+    ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+    auto restore_config = MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_default_kv_lease_ttl(kLeaseTtlMs)
+                              .set_enable_snapshot_restore(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    std::unique_ptr<MasterService> restored_service(
+        new MasterService(restore_config));
+
+    auto replicas =
+        restored_service->GetReplicaList(complete_key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_EQ(replicas->replicas.front().status, ReplicaStatus::COMPLETE);
+
+    auto incomplete =
+        restored_service->GetReplicaList(incomplete_key, TenantId::Default());
+    ASSERT_FALSE(incomplete.has_value());
+    EXPECT_EQ(incomplete.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
 TEST_F(MasterServiceSnapshotTest, MountUnmountSegmentWithOffsetAllocator) {
     auto service_config = MasterServiceConfig::builder()
                               .set_memory_allocator(BufferAllocatorType::OFFSET)

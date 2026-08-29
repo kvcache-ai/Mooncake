@@ -9629,21 +9629,23 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         segment_access.GetAllSegmentNames(segment_names);
     }
 
-    // Cleanup expired metadata (unless test environment disables it)
+    // Cleanup incomplete metadata (unless test environment disables it)
     {
         const bool skip_cleanup =
             std::getenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
         if (!skip_cleanup) {
-            auto cleanup_now = now;
             for (auto& shard : metadata_shards_) {
                 for (auto tenant_it = shard.tenants.begin();
                      tenant_it != shard.tenants.end();) {
                     auto& tenant_state = tenant_it->second;
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end();) {
-                        if (it->second.HasDiffRepStatus(
-                                ReplicaStatus::COMPLETE) ||
-                            it->second.IsLeaseExpired(cleanup_now)) {
+                        auto& metadata = it->second;
+                        const bool has_incomplete_replica =
+                            metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE)
+                                .has_value();
+                        if (has_incomplete_replica ||
+                            metadata.CountReplicas() == 0) {
                             VLOG(1) << "clear metadata key=" << it->first;
                             it = EraseMetadata(tenant_state, it,
                                                tenant_it->first);
