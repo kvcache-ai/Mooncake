@@ -2920,6 +2920,9 @@ class MasterService {
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::vector<Replica::Descriptor>& replicas) const;
+    std::string SerializeMetadataForOpLogFromReplicaDescriptors(
+        const UUID& client_id, uint64_t size,
+        const std::vector<Replica::Descriptor>& replicas) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,

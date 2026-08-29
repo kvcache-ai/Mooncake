@@ -13263,6 +13263,18 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     return std::string(result.begin(), result.end());
 }
 
+std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
+    const UUID& client_id, uint64_t size,
+    const std::vector<Replica::Descriptor>& replicas) const {
+    MetadataPayload payload;
+    payload.client_id = client_id;
+    payload.size = size;
+    payload.replicas = replicas;
+    payload.hard_pinned = false;
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
 ErrorCode MasterService::InitializeBatchOpLogWriter(
     std::shared_ptr<HaKvBackend> backend) {
     if (!backend || !backend->SupportsTxn()) {
