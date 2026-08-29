@@ -1178,6 +1178,14 @@ void FileStorage::ClientBufferGCThreadFunc() {
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
 }
 
+tl::expected<bool, ErrorCode> FileStorage::Exists(const std::string& key) {
+    if (!storage_backend_) {
+        LOG(ERROR) << "Storage backend is not initialized. Call Init() first.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return storage_backend_->IsExist(key);
+}
+
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     MutexLocker locker(&client_buffer_mutex_);
     auto it = client_buffer_allocated_batches_.find(batch_id);

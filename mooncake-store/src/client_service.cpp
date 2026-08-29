@@ -2017,32 +2017,18 @@ bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
         // still serve reads, so there is nothing for this client to heal.
         return false;
     }
-    if (!local_disk || !transfer_submitter_) {
+    if (!local_disk || !local_disk_probe_fn_) {
         return false;
     }
     // RemoveAll wipes client SSD files while master keeps the metadata
     // (issue #3709), leaving a completed entry whose backing file is gone.
-    // Reporting success for a Put on top of it would store nothing. Probe the
-    // last byte through the normal read path: a file-gone error proves the
-    // replica is dangling. Anything else (readable, or a transport error)
-    // keeps the old idempotent path so we never evict a healthy replica.
-    const uint64_t object_size =
-        local_disk->get_local_disk_descriptor().object_size;
-    if (object_size == 0) {
-        return false;
-    }
-    char probe = 0;
-    std::vector<Slice> probe_slice{Slice{&probe, 1}};
-    const ErrorCode probe_err =
-        TransferReadRange(*local_disk, probe_slice, object_size - 1);
-    // The offload read path reports a wiped SSD file as INVALID_KEY (the
-    // storage key is gone from the backend), while other backends surface
-    // OBJECT_NOT_FOUND / FILE_OPEN_FAIL. All three prove the file is gone;
-    // transport/config failures come back as different codes, so a healthy
-    // replica still can never be evicted by mistake.
-    if (probe_err != ErrorCode::OBJECT_NOT_FOUND &&
-        probe_err != ErrorCode::FILE_OPEN_FAIL &&
-        probe_err != ErrorCode::INVALID_KEY) {
+    // Reporting success for a Put on top of it would store nothing. Ask the
+    // installed probe (the offload file storage owned by RealClient) whether
+    // the file is still there. Only a proven-gone answer evicts; present or
+    // unknown (transport/config trouble) keeps the old idempotent path, so a
+    // healthy replica can never be evicted by mistake.
+    const std::optional<bool> file_gone = local_disk_probe_fn_(key);
+    if (file_gone != true) {
         return false;
     }
     auto evicted =

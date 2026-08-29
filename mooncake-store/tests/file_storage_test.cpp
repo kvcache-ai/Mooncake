@@ -943,6 +943,17 @@ void RunPutHealWipeScenario(const std::string& data_path,
         });
     ASSERT_TRUE(offload_result.has_value());
 
+    // Wire the probe the way RealClient does in production: existence against
+    // this process's offload files.
+    client.value()->SetLocalDiskProbe(
+        [&file_storage](const std::string& k) -> std::optional<bool> {
+            auto exists = file_storage.Exists(k);
+            if (!exists) {
+                return std::nullopt;
+            }
+            return !*exists;
+        });
+
     auto query = client.value()->Query(key);
     ASSERT_TRUE(query.has_value());
     bool has_local_disk = false;
@@ -954,11 +965,12 @@ void RunPutHealWipeScenario(const std::string& data_path,
     // Simulate the #3709 divergence: the SSD file is wiped physically while
     // master keeps the metadata.
     file_storage.storage_backend_->RemoveAll();
-    auto exists = file_storage.storage_backend_->IsExist(key);
+    auto exists = file_storage.Exists(key);
     ASSERT_TRUE(exists.has_value());
     ASSERT_FALSE(exists.value());
-    query = client.value()->Query(key);
-    ASSERT_TRUE(query.has_value());
+    // QueryResult is not assignable, so re-query into a fresh variable.
+    auto query_after_wipe = client.value()->Query(key);
+    ASSERT_TRUE(query_after_wipe.has_value());
 
     // Put the same key again: the dangling replica must be evicted and the
     // Put must really store new data.

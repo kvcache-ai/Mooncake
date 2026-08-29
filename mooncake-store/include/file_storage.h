@@ -1,5 +1,7 @@
 #pragma once
 
+#include <gtest/gtest_prod.h>
+
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
@@ -81,6 +83,16 @@ class FileStorage {
         return pinned_restore_arena_allocator_ != nullptr;
     }
 
+    /**
+     * @brief Reports whether the backend still holds an entry for the key.
+     *
+     * Answers existence only, without allocating read buffers. After a
+     * physical wipe the per-key backend's filesystem lookup and the bucket
+     * backend's in-memory index both report false, which is exactly the
+     * divergence a dangling-replica probe needs to detect.
+     */
+    tl::expected<bool, ErrorCode> Exists(const std::string& key);
+
     FileStorageConfig config_;
 
     /**
@@ -94,6 +106,12 @@ class FileStorage {
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
+    // TEST_F bodies are generated subclasses and do not inherit the fixture's
+    // friendship, so the dangling-replica tests are friended by name.
+    FRIEND_TEST(FileStorageTest,
+                PutAfterPhysicalWipeHealsDanglingLocalDiskReplica);
+    FRIEND_TEST(FileStorageTest,
+                PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket);
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;

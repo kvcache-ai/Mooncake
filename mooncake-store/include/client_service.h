@@ -482,6 +482,16 @@ class Client {
     tl::expected<void, ErrorCode> UnmountLocalDiskSegment();
 
     /**
+     * @brief Installs the existence probe used by the dangling-replica heal.
+     * The probe lives outside this class because the offload file storage is
+     * owned by the caller (RealClient), not by Client.
+     */
+    void SetLocalDiskProbe(
+        std::function<std::optional<bool>(const std::string& key)> probe) {
+        local_disk_probe_fn_ = std::move(probe);
+    }
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
@@ -964,6 +974,14 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+
+    // Probe used by healDanglingLocalDiskReplica to prove a completed
+    // LOCAL_DISK replica's backing file is gone. Installed by the owner of
+    // the offload file storage (RealClient); unset means no local-disk
+    // offload is active and the heal stays inert. true: file is gone,
+    // false: file present, nullopt: unknown (keep the old path).
+    std::function<std::optional<bool>(const std::string& key)>
+        local_disk_probe_fn_;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
