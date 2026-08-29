@@ -366,48 +366,12 @@ func (store *P2PStore) performTransfer(ctx context.Context, source uintptr, shar
 	retryCount := 0
 	maxRetryCount := max(3, shard.Count())
 	for retryCount < maxRetryCount {
-		batchID, err := store.transfer.allocateBatchID(1)
-		if err != nil {
-			return err
-		}
-
 		location := shard.GetLocation(retryCount)
 		if location == nil {
 			break
 		}
 
-		targetID, err := store.transfer.openSegment(location.SegmentName, retryCount == 0)
-		if err != nil {
-			return err
-		}
-
-		request := TransferRequest{
-			Opcode:       OPCODE_READ,
-			Source:       uint64(source),
-			TargetID:     targetID,
-			TargetOffset: location.Offset,
-			Length:       shard.Length,
-		}
-
-		err = store.transfer.submitTransfer(batchID, []TransferRequest{request})
-		if err != nil {
-			return err
-		}
-
-		var status int
-		for status == STATUS_WAITING || status == STATUS_PENDING {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				status, _, err = store.transfer.getTransferStatus(batchID, 0)
-				if err != nil {
-					return err
-				}
-			}
-		}
-
-		err = store.transfer.freeBatchID(batchID)
+		status, err := store.performTransferOnce(ctx, source, shard.Length, location, retryCount == 0)
 		if err != nil {
 			return err
 		}
@@ -420,6 +384,57 @@ func (store *P2PStore) performTransfer(ctx context.Context, source uintptr, shar
 	}
 
 	return ErrTooManyRetries
+}
+
+// performTransferOnce runs a single transfer attempt against the given
+// location. The allocated batch ID is released on every return path,
+// including context cancellation and intermediate errors.
+func (store *P2PStore) performTransferOnce(ctx context.Context, source uintptr, length uint64, location *Location, useCache bool) (status int, err error) {
+	batchID, err := store.transfer.allocateBatchID(1)
+	if err != nil {
+		return STATUS_FAILED, err
+	}
+	defer func() {
+		freeErr := store.transfer.freeBatchID(batchID)
+		if freeErr != nil {
+			log.Println("cascading error: failed to free batch ID:", freeErr)
+			if err == nil {
+				err = freeErr
+			}
+		}
+	}()
+
+	targetID, err := store.transfer.openSegment(location.SegmentName, useCache)
+	if err != nil {
+		return STATUS_FAILED, err
+	}
+
+	request := TransferRequest{
+		Opcode:       OPCODE_READ,
+		Source:       uint64(source),
+		TargetID:     targetID,
+		TargetOffset: location.Offset,
+		Length:       length,
+	}
+
+	err = store.transfer.submitTransfer(batchID, []TransferRequest{request})
+	if err != nil {
+		return STATUS_FAILED, err
+	}
+
+	for status == STATUS_WAITING || status == STATUS_PENDING {
+		select {
+		case <-ctx.Done():
+			return STATUS_FAILED, ctx.Err()
+		default:
+			status, _, err = store.transfer.getTransferStatus(batchID, 0)
+			if err != nil {
+				return STATUS_FAILED, err
+			}
+		}
+	}
+
+	return status, nil
 }
 
 func (store *P2PStore) updatePayloadMetadata(ctx context.Context, name string, addrList []uintptr, sizeList []uint64, payload *Payload, revision int64) error {
