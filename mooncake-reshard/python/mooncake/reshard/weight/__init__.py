@@ -41,7 +41,7 @@ from .planner import (
     resolve_executor_plan,
     resolve_executor_plans,
 )
-from .storage_manifest import StoredFragmentSnapshot, WeightManifest
+from .storage_manifest import StoredFragmentSnapshot, StoredWeightManifest
 
 __all__ = [
     "ParallelRank",
@@ -61,7 +61,7 @@ __all__ = [
     "weight_placement_from_json",
     "weight_placement_to_json",
     "StoredFragmentSnapshot",
-    "WeightManifest",
+    "StoredWeightManifest",
     "BoundWeightFragment",
     "ExecutableTransferOperation",
     "ExecutorTransferPlan",

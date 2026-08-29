@@ -8,7 +8,7 @@ transfer.
 ## Inputs and Output
 
 The source is either a complete `WeightPlacementManifest` or a committed
-`WeightManifest` snapshot. The target is a complete
+`StoredWeightManifest` snapshot. The target is a complete
 `WeightPlacementManifest`. Both sides must identify the same resource,
 revision, and weight generation.
 
@@ -31,7 +31,7 @@ executor projections. A Store source is represented by a persistent
 `StoredFragmentSnapshot`; a live runtime executor carries an ephemeral
 `RuntimeFragmentSnapshot` for each selected fragment.
 For a Store source, `TransferPlan` retains the authoritative canonical
-`WeightManifest` and its `StoredManifestIdentity.content_sha256`. Each selected
+`StoredWeightManifest` and its `StoredManifestIdentity.content_sha256`. Each selected
 operation source is revalidated against that committed manifest during plan
 construction and restore. The selected-fragment cache is derived state, so a
 coordinated operation/cache mutation cannot redirect a plan to another Store
@@ -73,7 +73,7 @@ descriptors, topology, and logical coverage before planning. Planning then
 fails closed when source and target tensor identity, dtype, shape, layout
 fingerprint, ownership, or coverage differ.
 
-A `WeightManifest` source is retained as an immutable logical snapshot. Its
+A `StoredWeightManifest` source is retained as an immutable logical snapshot. Its
 canonical identity and selected stored fragments are revalidated whenever a
 logical plan is constructed or reconstructed. This proves that the plan still
 refers to the same Store snapshot; it does not make Store persistence or
@@ -132,7 +132,7 @@ throughput.
 
 This phase does not accept Store `with_parallelism` metadata or Store keys as a
 planner input. A future Store adapter must translate one committed Store
-snapshot into a complete canonical `WeightManifest` or
+snapshot into a complete canonical `StoredWeightManifest` or
 `WeightPlacementManifest`, including tensor identity and descriptor, every
 logical fragment's offset, shape, object range, and all TP, PP, EP, and DP
 semantics. If Store metadata cannot represent any required fact, the adapter
