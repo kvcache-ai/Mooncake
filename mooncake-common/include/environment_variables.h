@@ -44,6 +44,14 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct ClientMetricEnvironmentVariables {
+    // Keep these values as strings because ClientMetricConfig preserves the
+    // existing per-setting fallback and logging behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC_INTERVAL);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC_BANDWIDTH);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake
