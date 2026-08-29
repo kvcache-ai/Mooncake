@@ -1183,6 +1183,75 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     EXPECT_TRUE(late_replicas.value().replicas[0].is_local_disk_replica());
 }
 
+// Regression test for issue #2997.
+//
+// When PutEnd completes a memory replica and offload is enabled, it asks
+// PushOffloadingQueue to enqueue an offload task. If the client has no
+// local-disk (offloading) segment, no task can be enqueued and
+// PushOffloadingQueue must report the no-op with an explicit failure.
+//
+// The bug was that PushOffloadingQueue returned a silent success ({}) in that
+// case. PutEnd then recorded a phantom OffloadingTask and called inc_refcnt()
+// on the source replica for work that was never submitted, leaking the
+// refcount until the 600s TTL reaper ran. A pinned (refcnt > 0) replica is
+// treated as busy, so an immediate overwrite of the same key is rejected with
+// OBJECT_REPLICA_BUSY even though no reader actually holds it.
+//
+// This test exercises the public PutEnd path: it mounts a memory-only segment
+// (no MountLocalDiskSegment), so the offload enqueue is guaranteed to be a
+// no-op, and verifies that (1) PutEnd still succeeds (offload is best-effort)
+// and (2) no phantom refcount is left behind, observable through a same-size
+// UpsertStart that must not fail with OBJECT_REPLICA_BUSY.
+TEST_F(MasterServiceSSDTest, PutEndNoopOffloadDoesNotLeakRefcount) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client_id = generate_uuid();
+
+    // Memory segment only -- deliberately no MountLocalDiskSegment, so the
+    // client has no offloading-capable segment and the offload enqueue is a
+    // no-op.
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "mem_only_segment";
+    segment.base = 0x400000000;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    const std::string key = "noop_offload_key";
+    constexpr uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(
+        service->PutStart(client_id, key, TenantId::Default(), slice_length,
+                          config)
+            .has_value());
+
+    // PutEnd triggers the offload enqueue, which is a no-op here. With the fix
+    // it stays best-effort and still succeeds.
+    ASSERT_TRUE(
+        service->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+
+    // The object is readable...
+    auto replicas = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(1u, replicas.value().replicas.size());
+
+    // ...and, crucially, no phantom offload task pinned it. A same-size
+    // UpsertStart rejects a genuinely busy (refcnt > 0) object with
+    // OBJECT_REPLICA_BUSY; the leaked inc_refcnt() from the buggy silent
+    // success would trip exactly that path. With the fix the refcount is 0 and
+    // the overwrite proceeds instead.
+    auto upsert = service->UpsertStart(client_id, key, TenantId::Default(),
+                                       slice_length, config);
+    if (!upsert.has_value()) {
+        EXPECT_NE(ErrorCode::OBJECT_REPLICA_BUSY, upsert.error())
+            << "PutEnd leaked a refcount from a no-op offload enqueue "
+               "(issue #2997)";
+    }
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
