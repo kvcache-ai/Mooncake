@@ -296,9 +296,19 @@ inline size_t align_up(size_t size, size_t alignment) {
  * (which only replaces the reservation, never live mappings), and release the
  * unaligned head/tail. `size` should be a multiple of 2MB (callers align it).
  *
- * NOTE: SPDK >= 26.09 (commit d6dc356ff) supports 4KB-aligned registrations, so
- * once the pinned version is upgraded this helper and the 2MB size padding in
- * ShmHelper::allocate can be removed and a plain mmap used instead.
+ * NOTE: virtual 2MB alignment is NECESSARY but NOT sufficient on the pinned
+ * SPDK: in iova=pa mode spdk_mem_register additionally checks each segment's
+ * PHYSICAL address (vtophys pagemap path, `paddr & MASK_2MB`), so the memory
+ * must also be hugepage-backed or registration fails with -EINVAL. HugeTLB
+ * mappings are automatically 2MB/1GB-aligned, so this helper is only needed
+ * where the source cannot be hugepage-backed; today it is used solely by the
+ * receiver (RealClient::map_shm_internal_with_device) for the shared fd
+ * (1GB-hugepage fds whose MAP_FIXED here fails fall back to a plain mmap). The
+ * sender (ShmHelper::allocate) always maps hugepages under
+ * MC_STORE_REGISTER_SPDK=1 and needs no aligned base. SPDK >= 26.09 (commit
+ * d6dc356ff) relaxes the API check to 4KB, but iova=pa still needs hugepages,
+ * so a plain mmap remains insufficient for SPDK registration regardless of
+ * version.
  *
  * @param size Mapping length; must be a multiple of 2MB for a clean head/tail.
  * @param fd memfd to map at offset 0.

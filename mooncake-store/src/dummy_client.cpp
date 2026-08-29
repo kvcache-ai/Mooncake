@@ -657,7 +657,13 @@ int DummyClient::unregister_device_buffer_for_reconnect(void* buffer) {
 
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         buffer_addr, client_id_);
-    if (ret.has_value()) {
+    // Same contract as unregister_buffer: the receiver tears the mapping down
+    // even on INTERNAL_ERROR, and INVALID_PARAMS means the server has no such
+    // mapping, so drop the local bookkeeping then; keep it on RPC_FAIL /
+    // RPC_TIMEOUT where the server may not have run.
+    if (ret.has_value() ||
+        (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
+                              ret.error() == ErrorCode::INVALID_PARAMS))) {
         std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
         registered_device_buffers_.erase(buffer_addr);
     }
@@ -717,17 +723,19 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         return -1;
     }
     // Check bounds. The buffer must be the segment base and the size must match
-    // the caller's original request (ShmSegment::requested_size). shm->size may
-    // be padded up to the hugepage/2MB boundary for SPDK registration, so it is
-    // NOT the size the caller should pass here.
+    // either the caller's original request (ShmSegment::requested_size) or the
+    // padded mapping size (shm->size, aligned up to the hugepage/2MB boundary
+    // for SPDK registration). Both are valid: IPC always sends shm->size, and
+    // legacy callers may pass the padded size directly.
     if (reinterpret_cast<uint8_t*>(buffer) !=
             reinterpret_cast<uint8_t*>(shm->base_addr) ||
-        size != shm->requested_size) {
+        (size != shm->requested_size && size != shm->size)) {
         LOG(ERROR) << "Invalid buffer address or size for registration: "
                       "Buffer addr: "
                    << buffer << ", need addr: " << shm->base_addr
                    << ", buffer size: " << size
-                   << ", need size: " << shm->requested_size;
+                   << ", need size: " << shm->requested_size
+                   << " (padded: " << shm->size << ")";
         return -1;
     }
 
@@ -776,7 +784,15 @@ int DummyClient::unregister_buffer(void* buffer) {
     }
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         reinterpret_cast<uint64_t>(buffer), client_id_);
-    if (ret.has_value()) {
+    // The receiver unregisters and unmaps the shm even when its internal
+    // unregisterLocalMemory fails (it reports INTERNAL_ERROR only after
+    // munmap/erase), so the mapping is gone on that side: clear the local flag
+    // for INTERNAL_ERROR (server executed the teardown) and INVALID_PARAMS
+    // (server has no such mapping). Keep it on RPC_FAIL/RPC_TIMEOUT, where the
+    // RPC may never have reached the server and the mapping may still be alive.
+    if (ret.has_value() ||
+        (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
+                              ret.error() == ErrorCode::INVALID_PARAMS))) {
         shm->registered = false;
     }
     return to_py_ret(ret);

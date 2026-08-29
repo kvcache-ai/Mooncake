@@ -34,6 +34,31 @@ static int memfd_create_wrapper(const char* name, unsigned int flags) {
 #endif
 }
 
+// Build a clear error message for a failed shared-memory allocation step.
+// When the allocation uses hugepages (forced by MC_STORE_REGISTER_SPDK=1), the
+// usual failure is an insufficient hugepage pool (ENOMEM at ftruncate/mmap);
+// spell out exactly how many hugepages of what size are needed so the operator
+// can configure them. Non-hugepage messages keep the pre-existing text exactly.
+static std::string shm_alloc_error(const char* step, size_t size,
+                                   bool use_hugepage, size_t hp_size, int err) {
+    if (!use_hugepage) {
+        return std::string("Failed to ") + step + ": " + strerror(err);
+    }
+    std::string msg = std::string("Failed to ") + step + " using ";
+    if (hp_size >= SZ_1GB) {
+        msg += std::to_string(hp_size / SZ_1GB) + "GB hugepages";
+    } else {
+        msg += std::to_string(hp_size / (1024 * 1024)) + "MB hugepages";
+    }
+    msg += " (size " + std::to_string(size) + " bytes, need " +
+           std::to_string(size / hp_size) + " hugepages): " + strerror(err);
+    msg +=
+        ". Configure enough hugepages via /proc/sys/vm/nr_hugepages (or "
+        "hugepages-2048kB/hugepages-1048576kB nr_hugepages), or unset "
+        "MC_STORE_REGISTER_SPDK to skip SPDK registration";
+    return msg;
+}
+
 ShmHelper* ShmHelper::getInstance() {
     static ShmHelper instance;
     return &instance;
@@ -60,6 +85,17 @@ ShmHelper::ShmHelper() {
     // allocation behavior is preserved exactly.
     register_spdk_ = is_register_spdk_enabled();
     if (register_spdk_) {
+#ifdef USE_NOF
+        // spdk_mem_register() requires hugepage-backed memory: SPDK's vtophys
+        // notify checks each 2MB segment's PHYSICAL address for 2MB alignment,
+        // which only hugepage pages satisfy (4KB-backed memory always fails
+        // with -EINVAL, on v23.01.1 and every later version in iova=pa mode).
+        // Virtual-address alignment alone (mmap_shm_2mb_aligned) is not
+        // sufficient, so force hugepages here; if not enough are configured the
+        // allocation below fails with a clear error instead of silently losing
+        // NoF zero-copy.
+        use_hugepage_ = true;
+#endif
         LOG(INFO) << "MC_STORE_REGISTER_SPDK=1: shared memory will be "
                      "registered with SPDK for NoF zero-copy transfers";
     }
@@ -147,66 +183,53 @@ void* ShmHelper::allocate(size_t size) {
     const size_t requested = size;
 
     unsigned int flags = MFD_CLOEXEC;
+    size_t hp_size = 0;  // hugepage size when use_hugepage_ (0 otherwise)
     if (use_hugepage_) {
         bool use_memfd = true;
-        size = align_up(size, get_hugepage_size_from_env(&flags, use_memfd));
+        hp_size = get_hugepage_size_from_env(&flags, use_memfd);
+        if (!(flags & MFD_HUGETLB)) {
+            // get_hugepage_size_from_env() returns 0 and sets no MFD_HUGETLB
+            // flag when MC_STORE_USE_HUGEPAGE is unset -- exactly the case when
+            // MC_STORE_REGISTER_SPDK=1 forces hugepages (see constructor).
+            // Default to 2MB hugepages.
+            flags |= MFD_HUGETLB | MFD_HUGE_2MB;
+            if (hp_size == 0) {
+                hp_size = SZ_2MB;
+            }
+            LOG(INFO) << "Using 2MB hugepages (set MC_STORE_USE_HUGEPAGE and "
+                         "MC_STORE_HUGEPAGE_SIZE=1GB to use 1GB)";
+        }
+        size = align_up(size, hp_size);
         LOG(INFO) << "Using huge pages for shared memory, size: " << size;
     }
-#ifdef USE_NOF
-    // spdk_mem_register() requires an aligned start and an aligned length.
-    // SPDK before 26.09 (e.g. the v23.01.1 pinned by dependencies.sh) only
-    // accepts 2MB-aligned registrations (MASK_2MB); 4KB support arrived in
-    // 26.09 (commit d6dc356ff). 2MB alignment satisfies both. When hugepages
-    // are configured the size is already a hugepage multiple (and MAP_HUGETLB
-    // guarantees a 2MB-aligned base); otherwise align to 2MB so the tail is
-    // compatible with older SPDK. mmap() already maps whole pages, so this only
-    // pads the tail and does not change the bytes visible to callers. Only
-    // applied when SPDK registration is enabled (MC_STORE_REGISTER_SPDK=1) so
-    // the default flow keeps the exact previous allocation sizes.
-    // NOTE: SPDK >= 26.09 supports 4KB-aligned registrations, so once the
-    // pinned version is upgraded this 2MB size padding AND the aligned base
-    // mapping (mmap_shm_2mb_aligned, utils.h) can be removed and plain mmap
-    // used.
-    if (register_spdk_) {
-        const size_t hp_size = get_hugepage_size_from_env();
-        const size_t align =
-            hp_size > 0 ? hp_size : static_cast<size_t>(SZ_2MB);
-        size = align_up(size, align);
-    }
-#endif
+    // When MC_STORE_REGISTER_SPDK=1 forces hugepages, the branch above already
+    // aligned size to the hugepage size, and hugetlb mmap returns a
+    // hugepage-aligned base, so no separate 2MB size padding or aligned base
+    // mapping (mmap_shm_2mb_aligned, utils.h) is needed on the sender side.
+    // (The receiver maps the shared fd and aligns its own base in
+    // RealClient::map_shm_internal_with_device.)
 
     int fd = memfd_create_wrapper(MOONCAKE_SHM_NAME, flags);
     if (fd == -1) {
-        std::string extra_msg =
-            use_hugepage_ ? " (Check /proc/sys/vm/nr_hugepages?)" : "";
-        throw std::runtime_error("Failed to create anonymous shared memory" +
-                                 extra_msg + ": " +
-                                 std::string(strerror(errno)));
+        throw std::runtime_error(
+            shm_alloc_error("create anonymous shared memory", size,
+                            use_hugepage_, hp_size, errno));
     }
 
     if (ftruncate(fd, size) == -1) {
+        int err = errno;
         close(fd);
-        throw std::runtime_error("Failed to set shared memory size: " +
-                                 std::string(strerror(errno)));
+        throw std::runtime_error(shm_alloc_error("set shared memory size", size,
+                                                 use_hugepage_, hp_size, err));
     }
 
-    void* base_addr = nullptr;
-#ifdef USE_NOF
-    // SPDK < 26.09 (v23.01.1) needs a 2MB-aligned base; the hugepage path
-    // already provides one, so only the non-hugepage path needs the aligned
-    // mapping (keeps MC_STORE_USE_HUGEPAGE optional).
-    if (register_spdk_ && !use_hugepage_) {
-        base_addr = mmap_shm_2mb_aligned(size, fd);
-    } else
-#endif
-    {
-        base_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_POPULATE, fd, 0);
-    }
+    void* base_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_POPULATE, fd, 0);
     if (base_addr == MAP_FAILED) {
+        int err = errno;
         close(fd);
-        throw std::runtime_error("Failed to map shared memory: " +
-                                 std::string(strerror(errno)));
+        throw std::runtime_error(shm_alloc_error("map shared memory", size,
+                                                 use_hugepage_, hp_size, err));
     }
 
     auto shm = std::make_shared<ShmSegment>();
@@ -227,6 +250,13 @@ void* ShmHelper::allocate(size_t size) {
                          << base_addr << ", size=" << size
                          << "; NoF zero-copy transfers to this buffer will be "
                             "unavailable";
+            // spdk_mem_register() marks g_mem_reg_map REGISTERED before running
+            // its notify callbacks and does NOT roll back on failure (SPDK
+            // v23.01.1, lib/env_dpdk/memory.c). Unregister the range so a later
+            // registration of the same virtual address (e.g. mmap reuse after
+            // free) does not return -EBUSY. The unregister path tolerates
+            // ranges that were never fully registered.
+            SpdkWrapper::GetInstance().UnregisterMemory(base_addr, size);
         } else {
             shm->spdk_registered = true;
         }

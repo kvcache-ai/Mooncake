@@ -2502,6 +2502,15 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
                          << shm.shm_buffer << ", size=" << shm.shm_size
                          << "; NoF zero-copy transfers to this buffer will be "
                             "unavailable";
+            // spdk_mem_register() marks g_mem_reg_map REGISTERED before running
+            // its notify callbacks and does NOT roll back on failure (SPDK
+            // v23.01.1, lib/env_dpdk/memory.c). Unregister the range so a later
+            // registration of the same virtual address (e.g. mmap reuse after
+            // munmap) does not return -EBUSY. Mirrors ShmHelper::allocate. The
+            // unregister path tolerates ranges that were never fully
+            // registered.
+            SpdkWrapper::GetInstance().UnregisterMemory(shm.shm_buffer,
+                                                        shm.shm_size);
         } else {
             shm.spdk_registered = true;
         }
@@ -2855,6 +2864,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+    bool unregister_failed = false;
 
     // Find the shm corresponding to this dummy address
     auto shm_it = context.mapped_shms.end();
@@ -2904,8 +2914,13 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
             if (!rc) {
                 LOG(ERROR) << "Failed to unregister memory: "
                            << shm_it->shm_name;
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                unregister_failed = true;
             }
+            // munmap and erase even after an unregisterLocalMemory failure (the
+            // SPDK registration above was already torn down), so a partial
+            // failure does not leak the mapping or leave the dummy issuing NoF
+            // against a buffer whose SPDK translation is gone. Mirrors
+            // unmap_shm_internal.
             if (munmap(shm_it->shm_buffer, shm_it->shm_size) != 0) {
                 LOG(ERROR) << "Failed to munmap shared memory: "
                            << shm_it->shm_name
@@ -2920,6 +2935,9 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     // Remove shm from list
     context.mapped_shms.erase(shm_it);
 
+    if (unregister_failed) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return {};
 }
 

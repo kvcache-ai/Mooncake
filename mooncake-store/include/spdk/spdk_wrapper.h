@@ -60,8 +60,16 @@ class SpdkWrapper {
      * that NoF RDMA transfers can DMA to/from it directly
      * (spdk_rdma_get_translation).
      *
-     * @param addr Start of the region; must be page-aligned.
-     * @param size Region length; must be a multiple of the page size.
+     * The pinned SPDK (v23.01.1) requires BOTH addr and size to be 2MB-aligned
+     * (MASK_2MB), and in iova=pa mode (the typical libibverbs NoF setup) the
+     * PHYSICAL pages must be 2MB-aligned too, which only HugeTLB pages satisfy.
+     * 4KB page-aligned memory always fails with -EINVAL. Callers must pass
+     * 2MB-aligned, hugepage-backed memory (ShmHelper forces this under
+     * MC_STORE_REGISTER_SPDK=1); a failed registration leaves SPDK's
+     * g_mem_reg_map half-marked, so callers should UnregisterMemory() on error.
+     *
+     * @param addr Start of the region; must be 2MB-aligned (hugepage-backed).
+     * @param size Region length; must be a multiple of 2MB.
      * @return 0 on success, non-zero on failure.
      */
     int RegisterMemory(void *addr, size_t size);

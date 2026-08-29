@@ -214,7 +214,15 @@ int SpdkWrapper::UnregisterMemory(void *addr, size_t size) {
         return 0;
     }
     int rc = spdk_mem_unregister(addr, size);
-    if (rc != 0) {
+    if (rc != 0 && rc != -EINVAL) {
+        // -EINVAL is the expected no-op on the register-failure cleanup path:
+        // spdk_mem_unregister returns it (memory.c:404/426) both when the range
+        // fails the 2MB alignment check -- a failed spdk_mem_register never
+        // reached g_mem_reg_map -- and when no segment is marked REGISTERED, so
+        // there is nothing to clean up. Logging it as an error would mislead
+        // operators on a path that already degrades gracefully with a WARNING.
+        // Other codes (-ERANGE etc.) indicate a real teardown problem on a
+        // range that was registered and keep the ERROR level.
         LOG(ERROR) << "spdk_mem_unregister failed (addr=" << addr
                    << ", size=" << size << "): " << strerror(-rc);
     }
