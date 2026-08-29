@@ -845,7 +845,6 @@ When to bump the version:
 :maxdepth: 1
 
 ssd-offload
-unified-parallel-tensor-io
 ssd-free-ratio-first-allocation
 engram
 

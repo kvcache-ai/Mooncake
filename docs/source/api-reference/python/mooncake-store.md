@@ -733,232 +733,52 @@ store.put("key-a", b"value-a", config)
 
 ---
 
-## Unified Parallel Tensor IO API
+## Model Weight Snapshot API
 
-Mooncake Store also provides a unified tensor IO family for tensors that are stored either as full objects or as explicitly identified parallel shards.
-
-This API family is the long-term interface for TP / DP / EP / PP-aware tensor IO:
-
-- write and upsert use `TensorParallelism`
-- reads use `ReadTarget`
-- legacy TP-only APIs remain available as compatibility wrappers
-
-### ParallelAxis
-
-`ParallelAxis` describes one axis in a shard identity.
+Heterogeneous model-weight snapshots use the manifest-backed Reshard API.
+The framework adapter owns model semantics and exports a complete source
+placement plus live runtime bindings. Mooncake Store persists the resulting
+payloads and the immutable stored manifest.
 
 ```python
-axis = mooncake.store.ParallelAxis()
-axis.kind = "tp"      # one of: "tp", "dp", "ep", "pp"
-axis.rank = 0
-axis.size = 8
-axis.split_dim = 1     # used for layout-sharding axes such as TP
-axis.expert_id = 3     # optional, for EP
-axis.stage_id = 1      # optional, for PP
+from mooncake.reshard.weight.store import WeightStore
+
+weight_store = WeightStore(store)
+session = weight_store.begin_weight_snapshot(descriptor, adapter)
+session.write_tensor(tensor_id, tensor)
+manifest = session.commit()
 ```
 
-**Fields:**
-- `kind`: Parallelism axis kind.
-- `rank`: Current shard rank on that axis.
-- `size`: Total number of shards on that axis.
-- `split_dim`: Optional tensor split dimension for layout-sharding axes.
-- `expert_id`: Optional expert identifier for EP layouts.
-- `stage_id`: Optional pipeline stage identifier for PP layouts.
+`MooncakeDistributedStore.begin_weight_snapshot(descriptor, adapter)` provides
+the same session for callers that already hold the native Store object.
 
-### TensorParallelism
+`write_tensor()` validates the adapter-selected source fragments against the
+session placement and runtime bindings. `commit()` publishes one
+`StoredWeightManifest` after complete durable coverage. Restore uses
+`WeightStore.load_manifest()`, `plan_load()`, and `load()` with the target
+placement and runtime binding manifests.
 
-`TensorParallelism` is an ordered list of axes that identifies the stored or requested shard.
+### Breaking Change and Migration
 
-```python
-parallelism = mooncake.store.TensorParallelism()
-parallelism.axes = [
-    tp_axis,
-]
-```
+This release removes the public `*_with_parallelism` API family and the
+associated `ParallelAxis`, `TensorParallelism`, and `ReadTarget` helper types.
+Applications that create heterogeneous model-weight snapshots migrate their
+write path to `begin_weight_snapshot()`, `write_tensor()`, and `commit()`.
+The writer creates manifest-managed payload fragments and one
+`StoredWeightManifest`; it does not create ordinary Store tensor objects.
 
-Examples:
-- TP shard: `axes=[TP(...)]`
-- DP + TP shard: `axes=[DP(...), TP(...)]`
-- PP + TP shard: `axes=[PP(...), TP(...)]`
-- EP shard: `axes=[EP(...)]`
+Applications restore a snapshot through `load_manifest()`, `plan_load()`, and
+`load()` with the target placement and runtime binding manifests. The existing
+single-axis TP APIs named `*_with_tp` remain separate compatibility APIs.
 
-### ReadTarget
-
-`ReadTarget` tells Mooncake whether the caller wants the stored form, a specific shard view, or the reconstructed full tensor.
-
-```python
-target = mooncake.store.ReadTarget()
-target.mode = "full"          # one of: "as_stored", "shard", "full"
-target.parallelism = None      # required for target shard reads
-```
-
-**Fields:**
-- `mode`: Read materialization mode.
-- `parallelism`: Optional `TensorParallelism`. Required when `mode="shard"`.
-
-### put_tensor_with_parallelism()
-
-Store a tensor using the unified parallelism model.
-
-```python
-def put_tensor_with_parallelism(
-    self,
-    key: str,
-    tensor,
-    parallelism: mooncake.store.TensorParallelism | None = None,
-    config: ReplicateConfig | None = None,
-    writer_partition = None,
-) -> int
-```
-
-Use `parallelism=None` to store a full tensor object. Provide `TensorParallelism` to store a shard-scoped object.
-
-`writer_partition` is an optional write-side shorthand for full-tensor inputs that should be stored as one shard. It describes the writer's `(rank, size, split_dim)` and is mutually exclusive with `parallelism`; do not provide both in one call.
-
-For TP-containing multi-axis layouts, the caller may pass the full source tensor; Mooncake derives and persists the uniform shard selected by the requested TP rank/layout. That applies to layouts such as `dp_tp`, `pp_tp`, and `ep_tp`.
-
-Plain single-axis TP remains shard-input for compatibility.
-
-Pure DP still does not imply a split axis by itself.
-
-### batch_put_tensor_with_parallelism()
-
-Batch version of unified tensor writes.
-
-```python
-def batch_put_tensor_with_parallelism(
-    self,
-    keys: list[str],
-    tensors: list,
-    parallelisms: list[mooncake.store.TensorParallelism | None] | None = None,
-    config: ReplicateConfig | None = None,
-    writer_partitions = None,
-) -> list[int]
-```
-
-`writer_partitions` is an optional write-side convenience input for batch full-tensor writes that should be partitioned into stored shards. Each entry describes the target shard write as `(rank, size, split_dim)`.
-
-Use `writer_partitions` when the caller has full tensors and wants Mooncake to derive the stored shard objects from writer-side partition info instead of constructing full `TensorParallelism` objects per element. TP-containing `parallelisms` can now express the same full-tensor-input behavior too; `writer_partitions` remains the lighter explicit write-side shorthand.
-
-### get_tensor_with_parallelism()
-
-Read a tensor through the unified read path.
-
-```python
-def get_tensor_with_parallelism(
-    self,
-    key: str,
-    target: mooncake.store.ReadTarget | None = None,
-)
-```
-
-Typical modes:
-- `target=None` or `mode="as_stored"`: return the stored local object.
-- `mode="shard"`: return the target shard described by `target.parallelism`.
-- `mode="full"`: reconstruct and return the full tensor.
-
-### batch_get_tensor_with_parallelism()
-
-Batch version of unified tensor reads.
-
-```python
-def batch_get_tensor_with_parallelism(
-    self,
-    keys: list[str],
-    targets: list[mooncake.store.ReadTarget | None] | None = None,
-) -> list
-```
-
-### get_tensor_with_parallelism_into() / batch_get_tensor_with_parallelism_into()
-
-Zero-copy unified read forms. The destination buffers must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
-
-```python
-def get_tensor_with_parallelism_into(
-    self,
-    key: str,
-    buffer_ptr: int,
-    size: int,
-    target: mooncake.store.ReadTarget | None = None,
-)
-```
-
-```python
-def batch_get_tensor_with_parallelism_into(
-    self,
-    keys: list[str],
-    buffer_ptrs: list[int],
-    sizes: list[int],
-    targets: list[mooncake.store.ReadTarget | None] | None = None,
-) -> list
-```
-
-### upsert_tensor_with_parallelism()
-
-Unified upsert form for tensor objects.
-
-```python
-def upsert_tensor_with_parallelism(
-    self,
-    key: str,
-    tensor,
-    parallelism: mooncake.store.TensorParallelism | None = None,
-    config: ReplicateConfig | None = None,
-    writer_partition = None,
-) -> int
-```
-
-The write semantics match `put_tensor_with_parallelism()`, including full-tensor input for TP-containing layouts and the mutually exclusive `writer_partition` shorthand.
-
-### batch_upsert_tensor_with_parallelism()
-
-Batch unified upsert form.
-
-```python
-def batch_upsert_tensor_with_parallelism(
-    self,
-    keys: list[str],
-    tensors: list,
-    parallelisms: list[mooncake.store.TensorParallelism | None] | None = None,
-    config: ReplicateConfig | None = None,
-    writer_partitions = None,
-) -> list[int]
-```
-
-The write semantics match `put_tensor_with_parallelism()`, including full-tensor input for TP-containing layouts.
-
-### *_from zero-copy write variants
-
-The unified write and upsert family also has `_from` variants for registered-memory inputs, including:
-
-- `put_tensor_with_parallelism_from(...)`
-- `batch_put_tensor_with_parallelism_from(...)`
-- `upsert_tensor_with_parallelism_from(...)`
-- `batch_upsert_tensor_with_parallelism_from(...)`
-
-These APIs accept Store-managed registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
-
-```text
-[TensorObjectHeader + layout metadata][tensor data]
-```
-
-As with other zero-copy APIs, every source pointer must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
-
-### Compatibility wrappers
-
-Legacy TP-only methods such as:
-
-- `put_tensor_with_tp(...)`
-- `batch_put_tensor_with_tp(...)`
-- `get_tensor_with_tp(...)`
-- `batch_get_tensor_with_tp(...)`
-- corresponding `_into`, `_from`, and upsert variants
-
-remain supported for compatibility, but they are wrapper-style APIs around the unified parallel tensor IO model. Prefer the unified `*_with_parallelism` family for new code and new documentation examples.
+When `commit()` reports a manifest publication failure after Store records the
+commit decision, the writer remains open and preserves its payloads. Retry
+`commit()` on that writer to complete manifest publication.
 
 ---
 
 ## Non-Zero-Copy API (Simple Usage)
+
 
 For simpler use cases, use the standard API without memory registration:
 
@@ -1209,8 +1029,9 @@ store.setup_dummy(1024*1024*256, 1024*1024*64, "localhost:8080")
 Dummy clients do not own Store segments. They use a local shared-memory buffer
 that is mapped by a real client process at `server_address`. Tensor APIs that
 stage through this SHM buffer are supported, including tensor put/get,
-`*_tensor_from`, `*_tensor_into`, tensor upsert/pub, TP wrappers, and unified
-parallelism write wrappers.
+`*_tensor_from`, `*_tensor_into`, tensor upsert/pub, and the single-axis TP
+wrappers. Model-weight snapshots use the explicit snapshot API described
+above.
 
 The real client owns the SHM buffer allocator. This keeps tensor writes and
 regular object writes from allocating overlapping offsets when they run
