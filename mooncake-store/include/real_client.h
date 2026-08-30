@@ -364,6 +364,23 @@ class RealClient : public PyClient {
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
     /**
+     * @brief Point-in-time existence check that grants no read lease
+     * @param key Key to check
+     * @return 1 if exists, 0 if not exists, -1 if error. The object may
+     * still be evicted before a subsequent get.
+     */
+    int probeKey(const std::string &key);
+
+    /**
+     * @brief Point-in-time existence check for multiple objects, granting
+     * no read leases
+     * @param keys Vector of keys to check
+     * @return Vector of existence results: 1 if exists, 0 if not exists, -1
+     * if error
+     */
+    std::vector<int> batchProbeKey(const std::vector<std::string> &keys);
+
+    /**
      * @brief Get the size of an object
      * @param key Key of the object
      * @return Size of the object in bytes, or -1 if error or object doesn't
@@ -749,6 +766,11 @@ class RealClient : public PyClient {
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
+        const std::vector<std::string> &keys);
+
+    tl::expected<bool, ErrorCode> probeKey_internal(const std::string &key);
+
+    std::vector<tl::expected<bool, ErrorCode>> batchProbeKey_internal(
         const std::vector<std::string> &keys);
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
