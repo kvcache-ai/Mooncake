@@ -508,7 +508,44 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
     ASSERT_TRUE(renew.has_value());
     ASSERT_TRUE(renew.value());
 
-    // Check the master view is correctly set
+    // The ownership reservation must block both upgraded and legacy
+    // candidates while the service endpoint is still hidden.
+    auto contender = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(contender, nullptr);
+    auto contended = contender->TryAcquireLeadership("other-master:8888");
+    ASSERT_TRUE(contended.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::CONTENDED, contended->status);
+    ASSERT_FALSE(contended->observed_view.has_value());
+
+    EtcdLeaseId legacy_lease = 0;
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::GrantLease(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC,
+                                     legacy_lease));
+    EtcdRevisionId legacy_revision = 0;
+    const std::string master_view_key =
+        "mooncake-store/mooncake_cluster/master_view";
+    const std::string legacy_address = "legacy-master:8888";
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
+              EtcdHelper::CreateWithLease(
+                  master_view_key.c_str(), master_view_key.size(),
+                  legacy_address.c_str(), legacy_address.size(), legacy_lease,
+                  legacy_revision));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::RevokeLease(legacy_lease));
+
+    // The lease-bound placeholder is not exposed as a routable master view.
+    current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_FALSE(current_view.value().has_value());
+
+    auto stale_session = session;
+    stale_session.owner_token = "stale-owner";
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
+              coordinator->PublishServiceReady(stale_session));
+
+    ASSERT_EQ(ErrorCode::OK, coordinator->PublishServiceReady(session));
+    EXPECT_EQ(ErrorCode::OK, coordinator->PublishServiceReady(session));
+
+    // Check the master view is published after readiness.
     current_view = coordinator->ReadCurrentView();
     ASSERT_TRUE(current_view.has_value());
     ASSERT_TRUE(current_view.value().has_value());
@@ -574,6 +611,8 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsPromptlyOnLeaderLoss) {
     ASSERT_TRUE(renew.has_value());
     ASSERT_TRUE(renew.value());
 
+    ASSERT_EQ(ErrorCode::OK, coordinator->PublishServiceReady(session));
+
     // Release leadership from another thread after a short delay; this revokes
     // the lease and deletes the master_view key, which the watch observes.
     std::thread releaser([&]() {
@@ -616,6 +655,8 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeTimesOutWhenStable) {
     ASSERT_TRUE(renew.has_value());
     ASSERT_TRUE(renew.value());
 
+    ASSERT_EQ(ErrorCode::OK, coordinator->PublishServiceReady(session));
+
     const auto timeout = std::chrono::milliseconds(500);
     const auto start = std::chrono::steady_clock::now();
     auto result =
@@ -651,6 +692,8 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsCurrentViewImmediately) {
     ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
     ASSERT_TRUE(acquire->session.has_value());
     const auto session = *acquire->session;
+
+    ASSERT_EQ(ErrorCode::OK, coordinator->PublishServiceReady(session));
 
     const auto start = std::chrono::steady_clock::now();
     auto result =

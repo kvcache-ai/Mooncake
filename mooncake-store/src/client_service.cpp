@@ -669,11 +669,6 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
-
-        leader_monitor_running_ = true;
-        leader_monitor_thread_ =
-            std::thread([this]() { this->LeaderMonitorThreadMain(); });
-
         return ErrorCode::OK;
     } else {
         auto err = master_client_.Connect(master_server_entry);
@@ -688,6 +683,22 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         last_ping_success_.store(true);
         return ErrorCode::OK;
     }
+}
+
+void Client::EnterHaRuntimeMode() {
+    if (!leader_coordinator_) {
+        return;
+    }
+
+    // Initial discovery and configuration reads deliberately use the normal
+    // retry budget. Once initialization succeeds, replace the pool before any
+    // HA background thread starts: runtime retries belong to the outer
+    // heartbeat/monitor loops, and each attempt must return promptly when an
+    // obsolete pod IP silently drops packets.
+    master_client_.EnableHaConnectionPolicy();
+    leader_monitor_running_ = true;
+    leader_monitor_thread_ =
+        std::thread([this]() { this->LeaderMonitorThreadMain(); });
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
@@ -747,6 +758,25 @@ void Client::LeaderMonitorThreadMain() {
         }
 
         if (!view_change->changed || !view_change->current_view.has_value()) {
+            // A warming leader owns master_view without exposing a routable
+            // endpoint. Acknowledge the empty observation so the next wait
+            // blocks on the ready-value update instead of spinning on the old
+            // view version.
+            if (view_change->changed &&
+                !view_change->current_view.has_value()) {
+                std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                // Do not let a stale empty watch result erase a newer view
+                // installed concurrently by the heartbeat recovery path.
+                const bool still_on_observed_view =
+                    known_version.has_value()
+                        ? current_master_view_.has_value() &&
+                              current_master_view_->view_version ==
+                                  known_version.value()
+                        : !current_master_view_.has_value();
+                if (still_on_observed_view) {
+                    current_master_view_.reset();
+                }
+            }
             continue;
         }
 
@@ -1104,6 +1134,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
             }
         }
     }
+
+    client->EnterHaRuntimeMode();
 
     // this only performs RPC calls
     if (protocol == "rpc_only") {
