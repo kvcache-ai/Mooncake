@@ -142,7 +142,8 @@ class TcpTransport : public Transport {
                           std::shared_ptr<asio::ip::tcp::socket> socket);
     void cleanupIdleConnections();
 
-    static constexpr std::chrono::seconds kConnectionIdleTimeout{60};
+    // Configurable via MC_TCP_CONNECTION_IDLE_TIMEOUT env var (default: 60s)
+    std::chrono::seconds connection_idle_timeout_{60};
 };
 }  // namespace mooncake
 

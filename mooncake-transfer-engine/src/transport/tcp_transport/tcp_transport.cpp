@@ -487,6 +487,15 @@ TcpTransport::TcpTransport() : context_(nullptr), running_(false) {
             enable_connection_pool_ = true;
         }
     }
+    // Allow tuning the idle timeout via env var (default: 60s).
+    // A shorter timeout reclaims idle sockets faster, reducing pool memory
+    // and fd usage under bursty workloads.
+    if (getenv("MC_TCP_CONNECTION_IDLE_TIMEOUT") != nullptr) {
+        int timeout_val = atoi(getenv("MC_TCP_CONNECTION_IDLE_TIMEOUT"));
+        if (timeout_val > 0) {
+            connection_idle_timeout_ = std::chrono::seconds(timeout_val);
+        }
+    }
 }
 
 TcpTransport::~TcpTransport() {
@@ -841,25 +850,30 @@ void TcpTransport::cleanupIdleConnections() {
     for (auto it = connection_pool_.begin(); it != connection_pool_.end();) {
         auto& queue = it->second;
 
-        // Remove idle connections that exceed timeout
-        while (!queue.empty()) {
-            auto& entry = queue.back();
+        // Remove ALL idle connections that exceed timeout (not just the tail).
+        // The previous implementation only inspected queue.back(), which meant
+        // that a single in_use or non-expired entry at the tail prevented
+        // cleanup of every older idle entry earlier in the deque.  In
+        // long-running services this caused unbounded socket/fd accumulation
+        // because connections were created faster than they could be reused.
+        for (auto qit = queue.begin(); qit != queue.end();) {
+            auto& entry = *qit;
             if (!entry->in_use) {
                 auto idle_duration =
                     std::chrono::duration_cast<std::chrono::seconds>(
                         now - entry->last_used)
                         .count();
-                if (idle_duration > kConnectionIdleTimeout.count()) {
+                if (idle_duration > connection_idle_timeout_.count()) {
                     if (entry->socket && entry->socket->is_open()) {
                         asio::error_code ec;
                         entry->socket->close(ec);
                     }
-                    queue.pop_back();
+                    qit = queue.erase(qit);
                 } else {
-                    break;
+                    ++qit;
                 }
             } else {
-                break;
+                ++qit;
             }
         }
 
