@@ -1158,18 +1158,40 @@ TEST_F(MasterServiceTest, PutWithPreferredSegments) {
 
 TEST_F(MasterServiceTest,
        ResolveMooncakeHostIdUsesLocalHostnameAndRejectsLoopback) {
-    {
-        EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
-        EXPECT_EQ(ResolveMooncakeHostId("hostB:5001"), "hostB");
-        EXPECT_EQ(ResolveMooncakeHostId("[2001:db8::1]:5000"), "2001:db8::1");
-        EXPECT_TRUE(ResolveMooncakeHostId("localhost:5000").empty());
-        EXPECT_TRUE(ResolveMooncakeHostId("127.0.0.1:5000").empty());
-        EXPECT_TRUE(ResolveMooncakeHostId("0.0.0.0:5000").empty());
-        EXPECT_TRUE(ResolveMooncakeHostId("::1").empty());
-        EXPECT_TRUE(ResolveMooncakeHostId("[::1]:5000").empty());
-        EXPECT_TRUE(ResolveMooncakeHostId("::").empty());
-        EXPECT_TRUE(ResolveMooncakeHostId("[::]").empty());
-        EXPECT_TRUE(ResolveMooncakeHostId("[::]:5000").empty());
+    ScopedEnvVar host_id("MOONCAKE_HOST_ID");
+
+    EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
+    EXPECT_EQ(ResolveMooncakeHostId("hostB:5001"), "hostB");
+    EXPECT_EQ(ResolveMooncakeHostId("[2001:db8::1]:5000"), "2001:db8::1");
+    EXPECT_TRUE(ResolveMooncakeHostId("localhost:5000").empty());
+    EXPECT_TRUE(ResolveMooncakeHostId("127.0.0.1:5000").empty());
+    EXPECT_TRUE(ResolveMooncakeHostId("0.0.0.0:5000").empty());
+    EXPECT_TRUE(ResolveMooncakeHostId("::1").empty());
+    EXPECT_TRUE(ResolveMooncakeHostId("[::1]:5000").empty());
+    EXPECT_TRUE(ResolveMooncakeHostId("::").empty());
+    EXPECT_TRUE(ResolveMooncakeHostId("[::]").empty());
+    EXPECT_TRUE(ResolveMooncakeHostId("[::]:5000").empty());
+}
+
+TEST_F(MasterServiceTest, ResolveMooncakeHostIdPrefersDeploymentOverride) {
+    ScopedEnvVar host_id("MOONCAKE_HOST_ID", "  kubernetes-node-a  ");
+
+    EXPECT_EQ(ResolveMooncakeHostId("10.244.1.17:5000"), "kubernetes-node-a");
+}
+
+TEST_F(MasterServiceTest, ResolveMooncakeHostIdFallsBackForEmptyOverride) {
+    ScopedEnvVar host_id("MOONCAKE_HOST_ID", " \t ");
+
+    EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
+}
+
+TEST_F(MasterServiceTest, ResolveMooncakeHostIdRejectsInvalidOverride) {
+    const std::vector<const char*> invalid_host_ids = {
+        "localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]", "::", "[::]"};
+    for (const char* invalid_host_id : invalid_host_ids) {
+        ScopedEnvVar host_id("MOONCAKE_HOST_ID", invalid_host_id);
+        EXPECT_TRUE(ResolveMooncakeHostId("hostB:5000").empty())
+            << invalid_host_id;
     }
 }
 
