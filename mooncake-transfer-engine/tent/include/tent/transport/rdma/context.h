@@ -46,6 +46,7 @@ class RdmaTransport;
 class RdmaContext {
     friend class RdmaCQ;
     friend class RdmaEndPoint;
+    friend class RdmaContextTestPeer;
 
    public:
     RdmaContext(RdmaTransport &transport);
@@ -191,7 +192,11 @@ class RdmaContext {
     // PCIe Relaxed Ordering support
     bool relaxed_ordering_enabled_ = false;
 
-    const IbvSymbols &verbs_;
+    // The context's own copy of the loader's verbs table (copied once at
+    // construction, read-only afterwards). A copy rather than a reference so
+    // tests can substitute individual entries and drive the port-attribute
+    // and event paths without an RNIC.
+    IbvSymbols verbs_;
 };
 
 }  // namespace tent

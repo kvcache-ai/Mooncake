@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cerrno>
 #include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
@@ -79,6 +80,27 @@ class RdmaTransportTestPeer {
 
     static const RdmaContextSet& contextSet(const RdmaTransport& transport) {
         return transport.context_set_;
+    }
+};
+
+// Friend accessor for RdmaContext: TENT reaches libibverbs through a table of
+// function pointers the context copies from IbvLoader, so a test can replace
+// individual entries and hand the context a placeholder device instead of
+// needing an RNIC.
+class RdmaContextTestPeer {
+   public:
+    static IbvSymbols& verbs(RdmaContext& context) { return context.verbs_; }
+
+    // Make the context look opened on `native` (never dereferenced by the
+    // port-attribute paths, only passed back to the verbs) with `params`.
+    static void bindDevice(RdmaContext& context, ibv_context* native,
+                           std::shared_ptr<RdmaParams> params) {
+        context.native_context_ = native;
+        context.params_ = std::move(params);
+    }
+
+    static void unbindDevice(RdmaContext& context) {
+        context.native_context_ = nullptr;
     }
 };
 
@@ -435,6 +457,161 @@ TEST(RdmaContextPortSpeedTest, EffectiveSpeedVerbIsOptional) {
     // Mandatory symbols resolve regardless of the optional one.
     EXPECT_NE(sym.ibv_query_port_default, nullptr);
     EXPECT_NE(sym.ibv_open_device, nullptr);
+}
+
+// Verbs stand-ins wired through RdmaContextTestPeer::verbs(). Plain function
+// pointers, so state lives in one static block.
+struct FakePortVerbs {
+    ibv_context native{};      // placeholder handle, never dereferenced
+    uint8_t active_speed = 0;  // what ibv_query_port reports
+    uint8_t active_width = 0;
+    int query_port_rc = 0;
+    uint64_t speed_100mbps = 0;  // what ibv_query_port_speed reports
+    int query_speed_rc = 0;
+    int query_speed_calls = 0;
+};
+FakePortVerbs fake_port;
+
+int fakeQueryPort(ibv_context* context, uint8_t, ibv_port_attr* attr) {
+    if (context != &fake_port.native) return EINVAL;
+    if (fake_port.query_port_rc) return fake_port.query_port_rc;
+    *attr = {};
+    attr->state = IBV_PORT_ACTIVE;
+    attr->active_speed = fake_port.active_speed;
+    attr->active_width = fake_port.active_width;
+    return 0;
+}
+
+int fakeQueryPortSpeed(ibv_context* context, uint32_t, uint64_t* speed) {
+    ++fake_port.query_speed_calls;
+    if (context != &fake_port.native) return EINVAL;
+    if (fake_port.query_speed_rc) return fake_port.query_speed_rc;
+    *speed = fake_port.speed_100mbps;
+    return 0;
+}
+
+// A context whose port-attribute verbs are the fakes above, "opened" on the
+// placeholder device. Exercises refreshPortAttributes()/linkSpeedGbps()
+// exactly as the monitor thread does, without an RNIC.
+class RdmaContextFakeVerbsTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        fake_port = FakePortVerbs{};
+        fake_port.active_speed = 128;  // NDR
+        fake_port.active_width = 2;    // 4x -> 400 Gbps encoded
+        context_ = std::make_unique<RdmaContext>(transport_);
+        auto& verbs = RdmaContextTestPeer::verbs(*context_);
+        verbs.ibv_query_port_default = fakeQueryPort;
+        verbs.ibv_query_port_speed = fakeQueryPortSpeed;
+        RdmaContextTestPeer::bindDevice(*context_, &fake_port.native,
+                                        std::make_shared<RdmaParams>());
+    }
+
+    void TearDown() override {
+        // The context never owned the placeholder; keep its destructor away
+        // from it.
+        RdmaContextTestPeer::unbindDevice(*context_);
+    }
+
+    RdmaTransport transport_;
+    std::unique_ptr<RdmaContext> context_;
+};
+
+TEST_F(RdmaContextFakeVerbsTest, EffectiveSpeedPreferredWhenVerbReportsIt) {
+    fake_port.speed_100mbps = 2000;  // LAG down to one 200G PF
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+    EXPECT_EQ(fake_port.query_speed_calls, 1);
+}
+
+TEST_F(RdmaContextFakeVerbsTest, EncodedRateWhenVerbFails) {
+    fake_port.speed_100mbps = 2000;
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    ASSERT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+    // The verb starts failing: the stale effective value must not linger.
+    fake_port.query_speed_rc = -1;
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);
+}
+
+TEST_F(RdmaContextFakeVerbsTest, EncodedRateWhenVerbAbsent) {
+    fake_port.speed_100mbps = 2000;
+    RdmaContextTestPeer::verbs(*context_).ibv_query_port_speed = nullptr;
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);
+    EXPECT_EQ(fake_port.query_speed_calls, 0);
+}
+
+TEST_F(RdmaContextFakeVerbsTest, RefreshSeesRenegotiatedLink) {
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    ASSERT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);
+    fake_port.active_speed = 32;  // came back as EDR 4x
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 100.0);
+}
+
+TEST_F(RdmaContextFakeVerbsTest, RefreshFailsCleanlyWhenQueryPortFails) {
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    fake_port.query_port_rc = EIO;
+    fake_port.active_speed = 32;
+    EXPECT_EQ(context_->refreshPortAttributes(), -1);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);  // cached values kept
+}
+
+// The whole runtime chain: a port event reaches Workers::applyContextEvent,
+// the context re-reads its (fake) port, and the selector is re-seeded only
+// when the speed actually changed -- with the device marked available again
+// on the new rate, not the old one.
+TEST(RdmaContextEventChainTest, PortActiveReseedsOnlyWhenTheSpeedChanged) {
+    auto topology = std::make_shared<Topology>();
+    ASSERT_TRUE(topology
+                    ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                    .ok());
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport), 0u);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    auto* selector = workers->getDeviceSelector();
+    constexpr int kDev = 1;
+    auto& context = *RdmaTransportTestPeer::contextSet(transport)[kDev];
+
+    fake_port = FakePortVerbs{};
+    fake_port.active_speed = 128;
+    fake_port.active_width = 2;  // 400G
+    auto& verbs = RdmaContextTestPeer::verbs(context);
+    verbs.ibv_query_port_default = fakeQueryPort;
+    verbs.ibv_query_port_speed = fakeQueryPortSpeed;
+    RdmaContextTestPeer::bindDevice(context, &fake_port.native,
+                                    std::make_shared<RdmaParams>());
+
+    // Pretend init seeded it at 400G and it learned ~45 GB/s since.
+    ASSERT_EQ(context.refreshPortAttributes(), 0);
+    ASSERT_TRUE(
+        selector->setDeviceBandwidth(kDev, context.linkSpeedGbps()).ok());
+    ASSERT_TRUE(selector->setDeviceAvailable(kDev, true).ok());
+    for (int i = 0; i < 64; ++i)
+        ASSERT_TRUE(selector->release(kDev, 1 << 20, (1 << 20) / 45e9).ok());
+    ASSERT_NEAR(selector->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+
+    ibv_async_event event{};
+    event.event_type = IBV_EVENT_PORT_ACTIVE;
+    event.element.port_num = context.portNum();
+
+    // Same speed after the flap: keep what was learned.
+    RdmaTransportTestPeer::applyContextEvent(*workers, kDev, context, event);
+    EXPECT_NEAR(selector->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    EXPECT_TRUE(selector->isDeviceAvailable(kDev));
+
+    // LAG lost a PF: the effective speed halves, the seed and clamp follow.
+    fake_port.speed_100mbps = 2000;
+    RdmaTransportTestPeer::applyContextEvent(*workers, kDev, context, event);
+    EXPECT_DOUBLE_EQ(context.linkSpeedGbps(), 200.0);
+    EXPECT_DOUBLE_EQ(selector->getAggregateEwmaBandwidth(), 25e9);
+    EXPECT_TRUE(selector->isDeviceAvailable(kDev));
+
+    RdmaContextTestPeer::unbindDevice(context);
 }
 
 TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {
