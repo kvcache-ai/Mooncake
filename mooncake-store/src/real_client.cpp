@@ -1146,7 +1146,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // owns. true: backing file is gone, false: present, nullopt: unknown.
         std::weak_ptr<FileStorage> weak_storage = file_storage_;
         client_->SetLocalDiskProbe(
-            [weak_storage](const std::string& key) -> std::optional<bool> {
+            [weak_storage](const std::string &key) -> std::optional<bool> {
                 auto storage = weak_storage.lock();
                 if (!storage) {
                     return std::nullopt;
