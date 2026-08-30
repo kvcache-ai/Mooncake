@@ -142,6 +142,12 @@ int tent_open_segment(tent_engine_t engine, tent_segment_id_t* handle,
 
 int tent_close_segment(tent_engine_t engine, tent_segment_id_t handle);
 
+// Eagerly establish connection state towards `handle` on every installed
+// transport that supports it (RDMA endpoint bootstrap, control-plane TCP
+// dial), so the first transfer does not pay the setup cost. Best effort and
+// idempotent; returns 0 when there is nothing to warm. Returns 0 on success.
+int tent_warmup_segment(tent_engine_t engine, tent_segment_id_t handle);
+
 int tent_get_segment_info(tent_engine_t engine, tent_segment_id_t handle,
                           tent_segment_info_t* info);
 
@@ -281,6 +287,13 @@ class TransferEngine {
     Status closeSegment(SegmentID handle);
 
     Status getSegmentInfo(SegmentID handle, SegmentInfo& info);
+
+    // Establishes connection state towards a segment ahead of the first
+    // transfer, so the setup cost is paid where the caller chooses instead of
+    // inside the first request. Best effort and idempotent: a transport with
+    // nothing to warm, including the local segment, succeeds as a no-op, and
+    // a pair that cannot connect yet keeps the lazy path.
+    Status warmupSegment(SegmentID handle);
 
    public:
     Status allocateLocalMemory(void** addr, size_t size,

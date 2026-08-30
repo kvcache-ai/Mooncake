@@ -154,6 +154,10 @@ Status TransferEngine::cancelTransfer(BatchID batch_id, size_t task_id) {
     return impl_->cancelTransfer(batch_id, task_id);
 }
 
+Status TransferEngine::warmupSegment(SegmentID handle) {
+    return impl_->warmupSegment(handle);
+}
+
 Status TransferEngine::sendNotification(SegmentID target_id,
                                         const Notification& notifi) {
     return impl_->sendNotification(target_id, notifi);

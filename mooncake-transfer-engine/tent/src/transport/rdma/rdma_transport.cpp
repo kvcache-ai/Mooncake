@@ -765,6 +765,89 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
     return endpoint;
 }
 
+Status RdmaTransport::warmupSegment(SegmentID target_id) {
+    std::string rpc_server_addr, target_seg_name, target_nic_path_name;
+    std::vector<std::string> target_dev_names;
+
+    auto status = metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            // withCachedSegment reruns this on NeedsRefreshCache, so start
+            // from a clean list rather than appending to the first pass.
+            target_dev_names.clear();
+            if (segment->type != SegmentType::Memory) {
+                // File and other non-memory segments carry no RDMA endpoint
+                // state. Nothing to warm is not a failure.
+                return Status::NotImplemented(
+                    "Segment type is not Memory" LOC_MARK);
+            }
+            if (target_id != LOCAL_SEGMENT_ID) {
+                rpc_server_addr = segment->rpc_server_addr;
+            }
+            auto topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
+            target_seg_name = segment->name;
+            target_nic_path_name = segment->nicPathServerName();
+            for (size_t id = 0; id < topo->getNicCount(); ++id) {
+                if (topo->getNicType(id) != Topology::NIC_RDMA) continue;
+                auto dev_name = topo->getNicName(id);
+                if (!dev_name.empty()) target_dev_names.push_back(dev_name);
+            }
+            if (target_seg_name.empty()) {
+                return Status::NeedsRefreshCache(
+                    "Empty target segment name" LOC_MARK);
+            }
+            if (target_dev_names.empty()) {
+                // A TCP-only or CPU-only peer advertises no RDMA NIC. There
+                // is nothing to warm towards it, which is not a failure -
+                // and it must not look like a stale cache, or every warmup
+                // of such a peer would refetch the whole segment desc.
+                return Status::NotImplemented(
+                    "Target advertises no RDMA device" LOC_MARK);
+            }
+            return Status::OK();
+        });
+    if (!status.ok()) return status;
+
+    // All enabled local contexts x all remote RDMA NICs: the data plane may
+    // route a slice over any of these pairs, and bootstrapping also brings
+    // up the notification QP that rides on the same endpoint.
+    size_t attempted = 0, ready = 0;
+    Status last_error = Status::OK();
+    for (auto& ctx : context_set_) {
+        if (!ctx || ctx->status() != RdmaContext::DEVICE_ENABLED) continue;
+        for (const auto& dev_name : target_dev_names) {
+            ++attempted;
+            std::string peer_name = MakeNicPath(target_nic_path_name, dev_name);
+            auto endpoint = ctx->endpointStore()->getOrInsert(peer_name);
+            if (!endpoint) {
+                last_error = Status::InternalError("Cannot allocate endpoint " +
+                                                   peer_name + LOC_MARK);
+                continue;
+            }
+            if (endpoint->status() == RdmaEndPoint::EP_READY) {
+                ++ready;
+                continue;
+            }
+            auto connect_status =
+                endpoint->connect(target_seg_name, dev_name, rpc_server_addr);
+            if (connect_status.ok()) {
+                ++ready;
+            } else {
+                last_error = connect_status;
+                LOG(WARNING) << "RDMA warmup: endpoint " << peer_name
+                             << " not ready: " << connect_status.ToString();
+            }
+        }
+    }
+    if (attempted == 0) {
+        // No enabled local context: nothing to warm from, same as above.
+        return Status::NotImplemented("No enabled RDMA context" LOC_MARK);
+    }
+    LOG(INFO) << "RDMA warmup towards segment " << target_seg_name << ": "
+              << ready << "/" << attempted << " endpoints ready";
+    if (ready == 0) return last_error;
+    return Status::OK();
+}
+
 Status RdmaTransport::sendNotification(SegmentID target_id,
                                        const Notification& notify) {
     auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID);

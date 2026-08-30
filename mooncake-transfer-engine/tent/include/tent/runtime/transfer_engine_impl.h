@@ -268,6 +268,13 @@ class TransferEngineImpl {
 
     Status probePeerAliveByID(SegmentID target_id);
 
+    // Eagerly establish connection state towards the target segment on every
+    // installed transport that supports it, so the first transfer does not
+    // pay the setup cost (RDMA endpoint bootstrap has been observed to stall
+    // first batches for seconds). Best effort and idempotent; a target with
+    // nothing to warm (including LOCAL_SEGMENT_ID) succeeds as a no-op.
+    Status warmupSegment(SegmentID target_id);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);
 

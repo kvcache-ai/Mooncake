@@ -101,6 +101,27 @@ int tent_close_segment(tent_engine_t engine, tent_segment_id_t handle) {
     return 0;
 }
 
+int tent_warmup_segment(tent_engine_t engine, tent_segment_id_t handle) {
+    CHECK_POINTER(engine);
+    // Warming reaches the peer's control plane, which parses a response the
+    // peer produced; that can throw, and an exception must not cross back
+    // into a C caller.
+    try {
+        auto status = CAST(engine)->warmupSegment(handle);
+        if (!status.ok()) {
+            LOG(ERROR) << "tent_warmup_segment: " << status.ToString();
+            return -1;
+        }
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "tent_warmup_segment: " << e.what();
+        return -1;
+    } catch (...) {
+        LOG(ERROR) << "tent_warmup_segment: unknown exception";
+        return -1;
+    }
+    return 0;
+}
+
 int tent_get_segment_info(tent_engine_t engine, tent_segment_id_t handle,
                           tent_segment_info_t* info) {
     CHECK_POINTER(engine);

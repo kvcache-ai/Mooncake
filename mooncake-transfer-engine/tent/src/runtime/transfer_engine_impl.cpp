@@ -2424,6 +2424,28 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
     return Status::InvalidArgument("Notification not supported" LOC_MARK);
 }
 
+Status TransferEngineImpl::warmupSegment(SegmentID target_id) {
+    if (target_id == LOCAL_SEGMENT_ID) {
+        // Local transfers take the in-process path; there is no connection
+        // state to establish.
+        return Status::OK();
+    }
+    Status first_error = Status::OK();
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        auto& transport = transport_list_[type];
+        if (!transport) continue;
+        auto status = transport->warmupSegment(target_id);
+        // NotImplemented covers both "this transport does not warm" and
+        // "this transport has nothing to warm towards this target"; neither
+        // is a failure. Anything else is, and every transport still gets its
+        // turn - a failure here leaves that transport on its lazy path, it
+        // does not stop the others from being warmed.
+        if (status.ok() || status.IsNotImplemented()) continue;
+        if (first_error.ok()) first_error = status;
+    }
+    return first_error;
+}
+
 Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
     return metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc* segment) {
