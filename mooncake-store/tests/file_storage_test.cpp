@@ -946,7 +946,7 @@ void RunPutHealWipeScenario(const std::string& data_path,
     // Wire the probe the way RealClient does in production: existence against
     // this process's offload files.
     client.value()->SetLocalDiskProbe(
-        [&file_storage](const std::string &k) -> std::optional<bool> {
+        [&file_storage](const std::string& k) -> std::optional<bool> {
             auto exists = file_storage.Exists(k);
             if (!exists) {
                 return std::nullopt;
