@@ -288,10 +288,9 @@ TEST(LocalNotificationTest, NotifiedTargetIsNotRedeliveredWhileAPeerFails) {
     remote_req.length = kBufLen;
 
     BatchID batch = engine.allocateBatch(4);
-    // Submitted peer-first: hook.targets is an unordered_set, and on libstdc++
-    // it iterates in reverse insertion order, so this puts the local target
-    // ahead of the failing peer. The assertions below hold either way; this
-    // only decides whether the case is exercised or trivially satisfied.
+    // Order does not matter any more: every remaining target is attempted on
+    // every pass. SelfNotificationIsNotHeldBackByAnUnreachablePeer below is
+    // the test that pins that; this one pins exactly-once delivery.
     ASSERT_TRUE(
         engine.submitTransfer(batch, {remote_req, local_req}, notifi).ok());
 
@@ -341,6 +340,133 @@ TEST(LocalNotificationTest, NotifiedTargetIsNotRedeliveredWhileAPeerFails) {
     (void)engine.unregisterLocalMemory(source.data(), kBufLen);
     (void)engine.unregisterLocalMemory(local_target.data(), kBufLen);
     (void)peer.unregisterLocalMemory(peer_target.data(), kBufLen);
+}
+
+// Delivery to one target must not depend on where an unreachable one happens
+// to sit in the iteration order. hook.targets is an unordered_set; a loop that
+// stopped at the first failure would leave every target behind it unattempted,
+// and because the order is stable across polls it would stay that way. A
+// self-targeted notification cannot fail, so an unrelated peer being down
+// would block a local receiver until that peer came back.
+//
+// Two unreachable peers are what makes the check order-independent: with the
+// fix every pass attempts both of them, without it a pass stops after one.
+// That count is the deterministic part. The first-poll delivery assertion is
+// the property callers actually care about, but on its own it only fails when
+// the iteration order happens to put a peer first.
+TEST(LocalNotificationTest, SelfNotificationIsNotHeldBackByAnUnreachablePeer) {
+    TransferEngineImpl peer_a(makeConfig(/*enable_tcp=*/true, "peer-a"));
+    ASSERT_TRUE(peer_a.available());
+    TransferEngineImpl peer_b(makeConfig(/*enable_tcp=*/true, "peer-b"));
+    ASSERT_TRUE(peer_b.available());
+    TransferEngineImpl engine(makeConfig(/*enable_tcp=*/true));
+    ASSERT_TRUE(engine.available());
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> source(kBufLen, 0x5A);
+    std::vector<uint8_t> local_target(kBufLen, 0);
+    std::vector<uint8_t> a_target(kBufLen, 0);
+    std::vector<uint8_t> b_target(kBufLen, 0);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), kBufLen).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(local_target.data(), kBufLen).ok());
+    ASSERT_TRUE(peer_a.registerLocalMemory(a_target.data(), kBufLen).ok());
+    ASSERT_TRUE(peer_b.registerLocalMemory(b_target.data(), kBufLen).ok());
+
+    SegmentID remote_a = ~0ull, remote_b = ~0ull;
+    ASSERT_TRUE(engine.openSegment(remote_a, peer_a.getSegmentName()).ok());
+    ASSERT_TRUE(engine.openSegment(remote_b, peer_b.getSegmentName()).ok());
+    ASSERT_NE(remote_a, LOCAL_SEGMENT_ID);
+    ASSERT_NE(remote_b, LOCAL_SEGMENT_ID);
+    ASSERT_NE(remote_a, remote_b);
+
+    // The data path stays real - all three writes complete, which is what
+    // lets the hook fire. Only notification routing is swapped for a
+    // transport that fails, standing in for peers that cannot take delivery.
+    auto probe = std::make_shared<LocalSendFailsTransport>();
+    std::string seg_name = engine.getSegmentName();
+    ASSERT_TRUE(probe->install(seg_name, nullptr, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, probe);
+
+    Notification notifi;
+    notifi.name = kSegmentName;
+    notifi.msg = "three-targets";
+
+    auto make_req = [&](SegmentID target, void* dst) {
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = source.data();
+        req.target_id = target;
+        req.target_offset = reinterpret_cast<uint64_t>(dst);
+        req.length = kBufLen;
+        return req;
+    };
+
+    BatchID batch = engine.allocateBatch(8);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {make_req(remote_a, a_target.data()),
+                             make_req(remote_b, b_target.data()),
+                             make_req(LOCAL_SEGMENT_ID, local_target.data())},
+                            notifi)
+            .ok());
+
+    TransferStatus overall{};
+    uint64_t polls = 0;
+    while (true) {
+        ASSERT_TRUE(engine.getTransferStatus(batch, overall).ok());
+        if (overall.s == TransferStatusEnum::COMPLETED) break;
+        ASSERT_NE(overall.s, TransferStatusEnum::FAILED);
+        waitBeforeNextPoll(polls++);
+        ASSERT_LT(polls, 100000u) << "three-target transfer did not complete";
+    }
+
+    // The poll that saw COMPLETED already ran the hook, so the local
+    // notification must be waiting now - while both peers are still down.
+    size_t delivered = 0;
+    std::vector<Notification> first;
+    ASSERT_TRUE(engine.receiveNotification(first).ok());
+    delivered += first.size();
+    EXPECT_EQ(first.size(), 1u)
+        << "the self-targeted notification was held back by an unreachable "
+           "peer";
+    if (!first.empty()) EXPECT_EQ(first[0].msg, "three-targets");
+
+    // Every pass must attempt both failing peers. This is the part that does
+    // not depend on iteration order: stopping at the first failure gives one
+    // attempt per pass instead of two.
+    constexpr int kPasses = 4;
+    const int before = probe->send_attempts;
+    for (int i = 0; i < kPasses; ++i) {
+        TransferStatus again{};
+        (void)engine.getTransferStatus(batch, again);
+        std::vector<Notification> more;
+        (void)engine.receiveNotification(more);
+        delivered += more.size();
+    }
+    EXPECT_EQ(probe->send_attempts - before, 2 * kPasses)
+        << "each pass must attempt both unreachable peers; got "
+        << (probe->send_attempts - before) << " attempts over " << kPasses
+        << " passes";
+
+    // Let both peers recover: the hook completes, and the target that already
+    // took delivery is not sent a second time.
+    probe->fail_sends = false;
+    for (int i = 0; i < 3; ++i) {
+        TransferStatus again{};
+        (void)engine.getTransferStatus(batch, again);
+        std::vector<Notification> more;
+        (void)engine.receiveNotification(more);
+        delivered += more.size();
+    }
+    EXPECT_EQ(delivered, 1u)
+        << "self-notification delivered " << delivered << " times";
+
+    (void)engine.freeBatch(batch);
+    (void)engine.unregisterLocalMemory(source.data(), kBufLen);
+    (void)engine.unregisterLocalMemory(local_target.data(), kBufLen);
+    (void)peer_a.unregisterLocalMemory(a_target.data(), kBufLen);
+    (void)peer_b.unregisterLocalMemory(b_target.data(), kBufLen);
 }
 
 }  // namespace tent
