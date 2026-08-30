@@ -403,6 +403,14 @@ class PyClient {
     virtual std::vector<int> batchIsExist(
         const std::vector<std::string> &keys) = 0;
 
+    // Point-in-time existence check that grants no read lease: 1 if the
+    // object existed at the time of the call, 0 if not, negative on error.
+    // The object may still be evicted before a subsequent get.
+    virtual int probeKey(const std::string &key) = 0;
+
+    virtual std::vector<int> batchProbeKey(
+        const std::vector<std::string> &keys) = 0;
+
     virtual int64_t getSize(const std::string &key) = 0;
 
     virtual std::map<std::string, std::vector<Replica::Descriptor>>
