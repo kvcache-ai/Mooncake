@@ -496,6 +496,13 @@ TEST_F(DummyClientGetBufferTest, ExternalHostRangedRead) {
     EXPECT_EQ(destination[15], '_');
 
     ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
+    const auto rejected = dummy_client_->get_into_ranges(
+        {destination.data()}, {{key}}, {{{4, 20}}}, {{{2, 10}}}, {{{6, 8}}});
+    ASSERT_EQ(rejected.size(), 1);
+    ASSERT_EQ(rejected[0].size(), 1);
+    EXPECT_EQ(rejected[0][0],
+              (std::vector<int64_t>{toInt(ErrorCode::INVALID_PARAMS),
+                                    toInt(ErrorCode::INVALID_PARAMS)}));
 }
 
 // ---- Test: get_buffer via hot cache shm zero-copy path ----
