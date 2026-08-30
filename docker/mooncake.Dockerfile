@@ -23,6 +23,7 @@ ARG CLEAN_BUILD_ARTIFACTS=0
 
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
     TORCH_VERSION=${TORCH_VERSION} \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     PATH="/usr/local/go/bin:${PATH}"
 
 # Install base build utilities and the requested Python version via deadsnakes PPA
@@ -79,8 +80,7 @@ RUN mkdir -p build && \
     cd /workspace && \
     OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
     python${PYTHON_VERSION} -m pip install --no-cache-dir mooncake-wheel/dist/*.whl && \
-    TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
-        python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
+    python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
     if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
         rm -rf build; \
     fi

@@ -32,9 +32,6 @@ def _using_musa() -> bool:
     configured = os.environ.get("MOONCAKE_EP_USE_MUSA")
     if configured is not None:
         return _env_enabled("MOONCAKE_EP_USE_MUSA")
-    # MUSA PyTorch builds expose a version while regular CUDA builds do not.
-    # Prefer this runtime signal so MUSA wheels work without a packaging-only
-    # environment variable.
     return bool(getattr(getattr(torch, "version", None), "musa", None))
 
 

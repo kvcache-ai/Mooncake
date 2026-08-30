@@ -25,9 +25,6 @@ rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
 
-# The runtime PG JIT source bundle is staged by CMake from the authoritative
-# mooncake-pg/torch tree. Consume that staging output for the legacy wheel
-# builder; the source files are not maintained in the package tree.
 if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
     rm -rf mooncake-wheel/mooncake/_pg_jit
     cp -R "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" mooncake-wheel/mooncake/
