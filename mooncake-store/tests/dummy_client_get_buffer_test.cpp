@@ -46,6 +46,7 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::isExist_internal>(&rc);
     server.register_handler<&RealClient::getSize_internal>(&rc);
     server.register_handler<&RealClient::get_into_range_shm_helper>(&rc);
+    server.register_handler<&RealClient::get_into_ranges_shm_helper>(&rc);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
     server.register_handler<&RealClient::allocate_buffer_dummy>(&rc);
@@ -465,6 +466,35 @@ TEST_F(DummyClientGetBufferTest, ExternalHostRegistrationLifecycle) {
         << "one duplicate unregister must keep registration alive";
     ASSERT_EQ(dummy_client_->unregister_buffer(source.data()), 0);
     EXPECT_NE(dummy_client_->unregister_buffer(source.data()), 0);
+    EXPECT_NE(dummy_client_->put_from(key, source.data(), 1), 0)
+        << "transfers after the final unregister must be rejected";
+    ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
+}
+
+TEST_F(DummyClientGetBufferTest, ExternalHostRangedRead) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    const std::string key = "dummy_external_host_ranged_read";
+    const std::string data = "0123456789abcdefghijklmnopqrstuvwxyz";
+    PutData(key, data);
+
+    std::vector<char> destination(32, '_');
+    ASSERT_EQ(
+        dummy_client_->register_buffer(destination.data(), destination.size()),
+        0);
+
+    const auto results = dummy_client_->get_into_ranges(
+        {destination.data()}, {{key}}, {{{4, 20}}}, {{{2, 10}}}, {{{6, 8}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_EQ(results[0].size(), 1);
+    ASSERT_EQ(results[0][0], (std::vector<int64_t>{6, 8}));
+    EXPECT_EQ(std::string(destination.begin() + 4, destination.begin() + 10),
+              data.substr(2, 6));
+    EXPECT_EQ(std::string(destination.begin() + 20, destination.begin() + 28),
+              data.substr(10, 8));
+    EXPECT_EQ(destination[0], '_');
+    EXPECT_EQ(destination[15], '_');
+
     ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
 }
 

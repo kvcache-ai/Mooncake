@@ -210,6 +210,9 @@ class DummyClient : public PyClient {
     bool is_device_buffer(void *buffer) const;
     bool is_dummy_shm_buffer(void *buffer, size_t size) const;
     std::optional<size_t> external_buffer_remaining(void *buffer) const;
+    bool is_registered_buffer(void *buffer, size_t size) const;
+    int register_external_buffer(void *buffer, size_t size);
+    int unregister_external_buffer(void *buffer);
     std::optional<PreparedBuffer> prepare_buffer(void *buffer, size_t size,
                                                  bool copy_to_staging,
                                                  bool copy_back = false);
@@ -311,6 +314,7 @@ class DummyClient : public PyClient {
     std::atomic<bool> connected_{false};
 
 #if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex external_fabric_registration_mutex_;
     mutable std::mutex registered_device_buffers_mutex_;
     std::unordered_map<uint64_t, size_t> registered_device_buffers_;
 #endif

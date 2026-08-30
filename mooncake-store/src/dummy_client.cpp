@@ -624,13 +624,78 @@ bool DummyClient::is_device_buffer(void* buffer) const {
 std::optional<size_t> DummyClient::external_buffer_remaining(
     void* buffer) const {
     const uintptr_t address = reinterpret_cast<uintptr_t>(buffer);
-    std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
-    for (const auto& [base, registration] : registered_external_buffers_) {
-        if (address >= base && address - base <= registration.size) {
-            return registration.size - (address - base);
+    {
+        std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
+        for (const auto& [base, registration] : registered_external_buffers_) {
+            if (address >= base && address - base <= registration.size) {
+                return registration.size - (address - base);
+            }
         }
     }
+
+#if defined(USE_ASCEND_DIRECT)
+    // Ascend device allocations are registered through register_ascend_shm()
+    // and tracked separately so they can be restored after reconnect.  Treat
+    // those mappings as registered external buffers for all transfer paths.
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        for (const auto& [base, size] : registered_device_buffers_) {
+            if (address >= base && address - base <= size) {
+                return size - (address - base);
+            }
+        }
+    }
+#endif
+
     return std::nullopt;
+}
+
+bool DummyClient::is_registered_buffer(void* buffer, size_t size) const {
+    if (buffer == nullptr) return size == 0;
+    auto remaining = external_buffer_remaining(buffer);
+    return remaining.has_value() && size <= *remaining;
+}
+
+int DummyClient::register_external_buffer(void* buffer, size_t size) {
+    if (buffer == nullptr || size == 0) return -1;
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(buffer);
+    if (size > std::numeric_limits<uintptr_t>::max() - base) return -1;
+
+    std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
+    for (const auto& [other_base, registration] :
+         registered_external_buffers_) {
+        const uintptr_t other_end = other_base + registration.size;
+        const uintptr_t end = base + size;
+        if (base < other_end && other_base < end &&
+            (base != other_base || size != registration.size)) {
+            LOG(ERROR) << "Overlapping external buffer registration";
+            return -1;
+        }
+    }
+
+    auto [it, inserted] = registered_external_buffers_.emplace(
+        base, ExternalBufferRegistration{size, 1});
+    if (!inserted) {
+        if (it->second.size != size) return -1;
+        ++it->second.references;
+    }
+    return 0;
+}
+
+int DummyClient::unregister_external_buffer(void* buffer) {
+    if (buffer == nullptr) return -1;
+
+    std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
+    auto it =
+        registered_external_buffers_.find(reinterpret_cast<uintptr_t>(buffer));
+    if (it == registered_external_buffers_.end()) return -1;
+    if (it->second.references > 1) {
+        --it->second.references;
+    } else {
+        registered_external_buffers_.erase(it);
+    }
+    return 0;
 }
 
 std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
@@ -690,6 +755,11 @@ int64_t DummyClient::unregister_shm() {
 int DummyClient::register_device_buffer_for_reconnect(void* buffer,
                                                       size_t size) {
     const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
+    if (size == 0 || size > std::numeric_limits<uintptr_t>::max() -
+                                static_cast<uintptr_t>(buffer_addr)) {
+        LOG(ERROR) << "Device buffer registration overflows address range";
+        return -1;
+    }
     {
         std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
         auto it = registered_device_buffers_.find(buffer_addr);
@@ -770,10 +840,23 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
             return register_device_buffer_for_reconnect(buffer, size);
         }
         if (globalConfig().ascend_use_fabric_mem) {
+            std::lock_guard<std::mutex> registration_lock(
+                external_fabric_registration_mutex_);
             auto shm = std::make_shared<ShmHelper::ShmSegment>();
             shm->base_addr = buffer;
             shm->size = size;
+
+            // Fabric host buffers are mapped by register_ascend_shm(), but
+            // unlike Dummy SHM they are not discoverable through ShmHelper.
+            // Track the range locally so put/get/ranged-read validation can
+            // accept the same subranges after registration.
+            if (register_external_buffer(buffer, size) != 0) {
+                LOG(ERROR) << "Invalid or overlapping Fabric buffer"
+                           << ", buffer=" << buffer << ", size=" << size;
+                return -1;
+            }
             if (register_ascend_shm(shm.get(), false) != 0) {
+                (void)unregister_external_buffer(buffer);
                 LOG(ERROR) << "Failed to register buffer, buffer=" << buffer
                            << ", size=" << size;
                 return -1;
@@ -787,25 +870,7 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
     auto shm = shm_helper_->get_shm(buffer);
     if (shm && is_device_buffer(buffer)) shm = nullptr;
     if (!shm) {
-        const uintptr_t base = reinterpret_cast<uintptr_t>(buffer);
-        if (size > std::numeric_limits<uintptr_t>::max() - base) return -1;
-        std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
-        for (const auto& [other_base, registration] :
-             registered_external_buffers_) {
-            if (base < other_base + registration.size &&
-                other_base < base + size &&
-                (base != other_base || size != registration.size)) {
-                LOG(ERROR) << "Overlapping external buffer registration";
-                return -1;
-            }
-        }
-        auto [it, inserted] = registered_external_buffers_.emplace(
-            base, ExternalBufferRegistration{size, 1});
-        if (!inserted) {
-            if (it->second.size != size) return -1;
-            ++it->second.references;
-        }
-        return 0;
+        return register_external_buffer(buffer, size);
     }
     if (shm_helper_->is_hugepage()) {
         const size_t alignment = get_hugepage_size_from_env();
@@ -847,6 +912,30 @@ int DummyClient::unregister_buffer(void* buffer) {
 
 #if defined(USE_ASCEND_DIRECT)
     if (globalConfig().ascend_agent_mode) {
+        if (globalConfig().ascend_use_fabric_mem) {
+            std::lock_guard<std::mutex> registration_lock(
+                external_fabric_registration_mutex_);
+            const auto address = reinterpret_cast<uintptr_t>(buffer);
+            std::lock_guard<std::mutex> lock(
+                registered_external_buffers_mutex_);
+            auto it = registered_external_buffers_.find(address);
+            if (it != registered_external_buffers_.end()) {
+                if (it->second.references > 1) {
+                    --it->second.references;
+                    return 0;
+                }
+
+                // Keep the local registration until the real-side mapping is
+                // removed successfully.  This makes a failed unregister
+                // retryable instead of silently losing the range.
+                auto ret =
+                    invoke_rpc<&RealClient::unregister_shm_buffer_internal,
+                               void>(static_cast<uint64_t>(address),
+                                     client_id_);
+                if (ret.has_value()) registered_external_buffers_.erase(it);
+                return to_py_ret(ret);
+            }
+        }
         aclrtPtrAttributes attributes{};
         auto acl_ret = aclrtPointerGetAttributes(buffer, &attributes);
         if (acl_ret == ACL_ERROR_NONE &&
@@ -860,16 +949,7 @@ int DummyClient::unregister_buffer(void* buffer) {
     auto shm = shm_helper_->get_shm(buffer);
     if (shm && is_device_buffer(buffer)) shm = nullptr;
     if (!shm) {
-        std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
-        auto it = registered_external_buffers_.find(
-            reinterpret_cast<uintptr_t>(buffer));
-        if (it == registered_external_buffers_.end()) return -1;
-        if (it->second.references > 1) {
-            --it->second.references;
-        } else {
-            registered_external_buffers_.erase(it);
-        }
-        return 0;
+        return unregister_external_buffer(buffer);
     }
     if (!shm->registered) {
         LOG(ERROR) << "Buffer is not registered with RealClient";
@@ -1184,7 +1264,64 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>>& all_sizes,
     const QueryResultCache* query_result_cache) {
-    std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
+    if (buffers.size() != all_keys.size() ||
+        buffers.size() != all_dst_offsets.size() ||
+        buffers.size() != all_src_offsets.size() ||
+        buffers.size() != all_sizes.size()) {
+        return build_ranged_read_error_results(buffers.size(), all_keys,
+                                               all_dst_offsets,
+                                               ErrorCode::INVALID_PARAMS);
+    }
+
+    // RealClient only understands addresses in the Dummy SHM mappings.  For
+    // registered host/device pointers, use a per-call SHM staging allocation,
+    // preserve untouched destination holes, and copy the result back after
+    // the remote scatter completes.
+    std::vector<PreparedBuffer> prepared;
+    std::vector<uint64_t> dummy_buffers;
+    prepared.reserve(buffers.size());
+    dummy_buffers.reserve(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        if (all_keys[i].size() != all_dst_offsets[i].size() ||
+            all_keys[i].size() != all_src_offsets[i].size() ||
+            all_keys[i].size() != all_sizes[i].size()) {
+            return build_ranged_read_error_results(buffers.size(), all_keys,
+                                                   all_dst_offsets,
+                                                   ErrorCode::INVALID_PARAMS);
+        }
+
+        size_t required_size = 0;
+        for (size_t j = 0; j < all_dst_offsets[i].size(); ++j) {
+            if (all_dst_offsets[i][j].size() != all_src_offsets[i][j].size() ||
+                all_dst_offsets[i][j].size() != all_sizes[i][j].size()) {
+                return build_ranged_read_error_results(
+                    buffers.size(), all_keys, all_dst_offsets,
+                    ErrorCode::INVALID_PARAMS);
+            }
+            for (size_t k = 0; k < all_dst_offsets[i][j].size(); ++k) {
+                const size_t dst_offset = all_dst_offsets[i][j][k];
+                const size_t size = all_sizes[i][j][k];
+                if (size > std::numeric_limits<size_t>::max() - dst_offset) {
+                    return build_ranged_read_error_results(
+                        buffers.size(), all_keys, all_dst_offsets,
+                        ErrorCode::INVALID_PARAMS);
+                }
+                required_size = std::max(required_size, dst_offset + size);
+            }
+        }
+
+        // Seed staging with the caller's destination.  This preserves bytes
+        // in holes between ranges when the remote operation copies back.
+        auto item = prepare_buffer(buffers[i], required_size, true, true);
+        if (!item) {
+            return build_ranged_read_error_results(buffers.size(), all_keys,
+                                                   all_dst_offsets,
+                                                   ErrorCode::INVALID_PARAMS);
+        }
+        dummy_buffers.push_back(reinterpret_cast<uint64_t>(item->dummy));
+        prepared.push_back(std::move(*item));
+    }
+
     auto cached_query_results =
         build_cached_query_results_from_query_result_cache(query_result_cache);
     const auto start_time = std::chrono::steady_clock::now();
@@ -1202,6 +1339,56 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
                                                internal_results.error());
     }
     auto results = convert_ranged_read_results(internal_results.value());
+
+    if (results.size() != prepared.size()) {
+        LOG(ERROR) << "get_into_ranges response size mismatch: expected "
+                   << prepared.size() << ", got " << results.size();
+        return build_ranged_read_error_results(buffers.size(), all_keys,
+                                               all_dst_offsets,
+                                               ErrorCode::INTERNAL_ERROR);
+    }
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].size() != all_keys[i].size()) {
+            LOG(ERROR) << "get_into_ranges response key count mismatch at " << i
+                       << ": expected " << all_keys[i].size() << ", got "
+                       << results[i].size();
+            return build_ranged_read_error_results(buffers.size(), all_keys,
+                                                   all_dst_offsets,
+                                                   ErrorCode::INTERNAL_ERROR);
+        }
+        for (size_t j = 0; j < results[i].size(); ++j) {
+            if (results[i][j].size() != all_sizes[i][j].size()) {
+                LOG(ERROR)
+                    << "get_into_ranges response fragment count mismatch "
+                    << "at [" << i << "][" << j << "]: expected "
+                    << all_sizes[i][j].size() << ", got "
+                    << results[i][j].size();
+                return build_ranged_read_error_results(
+                    buffers.size(), all_keys, all_dst_offsets,
+                    ErrorCode::INTERNAL_ERROR);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < prepared.size(); ++i) {
+        size_t required_size = 0;
+        for (size_t j = 0; j < all_dst_offsets[i].size(); ++j) {
+            for (size_t k = 0; k < all_dst_offsets[i][j].size(); ++k) {
+                required_size =
+                    std::max(required_size,
+                             all_dst_offsets[i][j][k] + all_sizes[i][j][k]);
+            }
+        }
+        if (!copy_from_staging(prepared[i], required_size)) {
+            LOG(ERROR) << "Failed to copy ranged read staging buffer back";
+            for (auto& key_results : results[i]) {
+                for (auto& result : key_results) {
+                    if (result >= 0) result = toInt(ErrorCode::INTERNAL_ERROR);
+                }
+            }
+        }
+    }
+
     const size_t total_bytes = sum_positive_ranges(results);
     if (total_bytes > 0) {
         ObserveTransferMetric(TransferOperationKind::kRead, "get_into_ranges",
@@ -1247,18 +1434,31 @@ std::vector<int> DummyClient::batch_put_from(
     if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
         return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     }
-    if (auto payloads = try_export_cuda_ipc_buffers(buffer_ptrs, sizes);
-        payloads && keys.size() == payloads->size()) {
-        std::vector<CudaIpcWriteRequest> requests;
-        requests.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            requests.push_back(CudaIpcWriteRequest{
-                .key = keys[i],
-                .metadata = CudaIpcShmBufferRef{},
-                .payload = (*payloads)[i],
-            });
+    // CUDA IPC requests carry a process-local allocation handle.  Only export
+    // buffers that are currently registered with the Dummy client; otherwise
+    // an unregistered allocation (or a stale pointer after unregister) would
+    // bypass prepare_buffer()'s bounds and lifetime checks.
+    bool all_buffers_registered = true;
+    for (size_t i = 0; i < buffer_ptrs.size(); ++i) {
+        if (!is_registered_buffer(buffer_ptrs[i], sizes[i])) {
+            all_buffers_registered = false;
+            break;
         }
-        return batch_put_from_cuda_ipc(requests, config);
+    }
+    if (all_buffers_registered) {
+        if (auto payloads = try_export_cuda_ipc_buffers(buffer_ptrs, sizes);
+            payloads && keys.size() == payloads->size()) {
+            std::vector<CudaIpcWriteRequest> requests;
+            requests.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                requests.push_back(CudaIpcWriteRequest{
+                    .key = keys[i],
+                    .metadata = CudaIpcShmBufferRef{},
+                    .payload = (*payloads)[i],
+                });
+            }
+            return batch_put_from_cuda_ipc(requests, config);
+        }
     }
 
     std::vector<PreparedBuffer> prepared;
@@ -1308,19 +1508,30 @@ std::vector<int64_t> DummyClient::batch_get_into(
         return std::vector<int64_t>(keys.size(),
                                     toInt(ErrorCode::INVALID_PARAMS));
     }
-    if (auto dst_buffers = try_export_cuda_ipc_buffers(buffer_ptrs, sizes);
-        dst_buffers && keys.size() == dst_buffers->size()) {
-        std::vector<CudaIpcReadRequest> requests;
-        requests.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            requests.push_back(CudaIpcReadRequest{
-                .key = keys[i],
-                .destination = (*dst_buffers)[i],
-                .source_offset = 0,
-                .size = static_cast<uint64_t>(sizes[i]),
-            });
+    // Keep the CUDA IPC fast path subject to the same registration and range
+    // checks as the staging path below.
+    bool all_buffers_registered = true;
+    for (size_t i = 0; i < buffer_ptrs.size(); ++i) {
+        if (!is_registered_buffer(buffer_ptrs[i], sizes[i])) {
+            all_buffers_registered = false;
+            break;
         }
-        return batch_get_into_cuda_ipc(requests);
+    }
+    if (all_buffers_registered) {
+        if (auto dst_buffers = try_export_cuda_ipc_buffers(buffer_ptrs, sizes);
+            dst_buffers && keys.size() == dst_buffers->size()) {
+            std::vector<CudaIpcReadRequest> requests;
+            requests.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                requests.push_back(CudaIpcReadRequest{
+                    .key = keys[i],
+                    .destination = (*dst_buffers)[i],
+                    .source_offset = 0,
+                    .size = static_cast<uint64_t>(sizes[i]),
+                });
+            }
+            return batch_get_into_cuda_ipc(requests);
+        }
     }
 
     std::vector<PreparedBuffer> prepared;
