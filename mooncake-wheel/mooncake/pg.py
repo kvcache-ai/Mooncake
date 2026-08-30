@@ -38,6 +38,13 @@ def _using_musa() -> bool:
     return bool(getattr(getattr(torch, "version", None), "musa", None))
 
 
+def _using_maca() -> bool:
+    configured = os.environ.get("MOONCAKE_EP_USE_MACA")
+    if configured is not None:
+        return _env_enabled("MOONCAKE_EP_USE_MACA")
+    return bool(getattr(getattr(torch, "version", None), "maca", None))
+
+
 def _load_torchada() -> None:
     """Install torchada's MUSA mappings before loading cpp_extension."""
     if not _using_musa():
@@ -58,6 +65,17 @@ def _mcc_path() -> Path | None:
         return candidate if candidate.is_file() else None
     mcc = shutil.which("mcc")
     return Path(mcc) if mcc else None
+
+
+def _mxcc_path() -> Path | None:
+    for variable in ("MACA_HOME", "MACA_PATH"):
+        root = os.environ.get(variable)
+        if root:
+            candidate = Path(root) / "bin" / "mxcc"
+            if candidate.is_file():
+                return candidate
+    mxcc = shutil.which("mxcc")
+    return Path(mxcc) if mxcc else None
 
 
 def _source_dir() -> Path:
@@ -93,6 +111,8 @@ def _cache_key(source_dir: Path, core_path: Path, backend: str) -> str:
     digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
     digest.update(str(torch.version.git_version).encode())
     digest.update(backend.encode())
+    digest.update(str(core_path.resolve()).encode())
+    digest.update(str(sys.implementation.cache_tag).encode())
     digest.update(core_path.read_bytes())
     for name in (*_SOURCE_NAMES, *_HEADER_NAMES):
         digest.update(name.encode())
@@ -139,11 +159,12 @@ def _load_cached_extension(build_dir: Path, is_musa: bool):
 
 
 def _cache_directory(source_dir: Path, core_path: Path, is_musa: bool) -> Path:
-    backend = (
-        f"musa:{os.environ.get('MTGPU_TARGET', 'mp_31')}"
-        if is_musa
-        else "cuda"
-    )
+    if is_musa:
+        backend = f"musa:{os.environ.get('MTGPU_TARGET', 'mp_31')}"
+    elif _using_maca():
+        backend = "maca"
+    else:
+        backend = "cuda"
     return _cache_root() / _cache_key(source_dir, core_path, backend)
 
 
@@ -151,6 +172,7 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
     _load_torchada()
     verbose = os.environ.get("MOONCAKE_PG_JIT_VERBOSE", "0") == "1"
     is_musa = _using_musa()
+    is_maca = _using_maca()
     extra_cflags = [
         "-std=c++20",
         "-O3",
@@ -221,8 +243,11 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
         extra_cflags += ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
     else:
         # Retain the CUDA link contract validated by the fresh-wheel smoke.
-        extra_ldflags += ["-lc10_cuda", "-ltorch_cuda"]
+        if not is_maca:
+            extra_ldflags += ["-lc10_cuda", "-ltorch_cuda"]
         extra_cuda_cflags = None
+        if is_maca:
+            extra_cflags += ["-DUSE_MACA", "-DMOONCAKE_EP_USE_MACA=1"]
         adapter_source_dir = source_dir
         source_paths = [_source_path(source_dir, name) for name in _SOURCE_NAMES]
 
@@ -261,6 +286,7 @@ def _load_jit_adapter():
         )
 
     is_musa = _using_musa()
+    is_maca = _using_maca()
     build_dir = _cache_directory(source_dir, core_path, is_musa)
     build_dir.mkdir(parents=True, exist_ok=True)
     lock_path = build_dir.with_suffix(".lock")
@@ -282,6 +308,12 @@ def _load_jit_adapter():
                     raise ImportError(
                         "Mooncake PG MUSA JIT requires the MUSA compiler (mcc). "
                         "Set MUSA_HOME or add mcc to PATH."
+                    )
+            elif is_maca:
+                if _mxcc_path() is None:
+                    raise ImportError(
+                        "Mooncake PG MACA JIT requires the MACA compiler (mxcc). "
+                        "Set MACA_HOME or add mxcc to PATH."
                     )
             else:
                 from torch.utils.cpp_extension import CUDA_HOME
@@ -321,10 +353,11 @@ def _load_jit_adapter():
 
 def _compatibility_report() -> int:
     is_musa = _using_musa()
+    is_maca = _using_maca()
     ready = True
     print("Mooncake PG JIT compatibility report")
     print(f"  torch: {torch.__version__}")
-    print(f"  backend: {'MUSA' if is_musa else 'CUDA'}")
+    print(f"  backend: {'MUSA' if is_musa else 'MACA' if is_maca else 'CUDA'}")
     print(f"  torch.version.cuda: {torch.version.cuda}")
     print(f"  torch.version.musa: {getattr(torch.version, 'musa', None)}")
     source_dir = _source_dir()
@@ -349,6 +382,10 @@ def _compatibility_report() -> int:
         print(f"  mcc: {mcc or 'missing'}")
         toolchain_ready = mcc is not None
         print(f"  MTGPU_TARGET: {os.environ.get('MTGPU_TARGET', 'mp_31')}")
+    elif is_maca:
+        mxcc = _mxcc_path()
+        print(f"  mxcc: {mxcc or 'missing'}")
+        toolchain_ready = mxcc is not None
     else:
         try:
             from torch.utils.cpp_extension import CUDA_HOME

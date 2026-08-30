@@ -52,7 +52,7 @@ RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
 
 # Warm the runtime JIT cache in the builder image. The cache is copied into the
 # runtime image below, so importing mooncake.pg there does not require mcc.
-RUN python${PYTHON_VERSION} -m pip install --no-cache-dir dist/*.whl && \
+RUN python${PYTHON_VERSION} -m pip install --no-cache-dir mooncake-wheel/dist/*.whl && \
     python${PYTHON_VERSION} -m mooncake.pg --prebuild
 
 ###############################################################################

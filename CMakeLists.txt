@@ -177,9 +177,9 @@ if(WITH_EP)
     file(REMOVE_RECURSE "${EP_PG_STAGING_DIR}")
     file(MAKE_DIRECTORY "${EP_PG_STAGING_DIR}")
 
-    # Stage the runtime JIT source bundle for the legacy wheel script as well
-    # as the scikit-build install path.  The authoritative files stay under
-    # mooncake-pg/torch; no package-tree mirror is maintained.
+    # Stage the runtime JIT source bundle for the legacy wheel script. The
+    # scikit-build install path consumes the authoritative files directly via
+    # python/CMakeLists.txt; no package-tree mirror is maintained.
     add_custom_target(
       mooncake_pg_jit_sources_stage ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory
