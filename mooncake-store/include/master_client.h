@@ -62,15 +62,17 @@ inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
     }
 }
 
-inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
+inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
+    bool ha_enabled = false) {
     RpcClientPool::PoolConfig config;
-    // The Client HA monitor and storage heartbeat own the retry schedule.
-    // Internal retries can block those loops when a leader view is published
-    // before the new master's listener is ready. YLT waits after the initial
-    // attempt even when retry count is zero, so disable that wait as well.
-    // The independently configurable per-attempt timeout is unchanged.
-    config.connect_retry_count = 0;
-    config.reconnect_wait_time = std::chrono::milliseconds{0};
+    if (ha_enabled) {
+        // HA monitor and heartbeat loops own the retry schedule. Keep each
+        // attempt bounded so a deleted pod IP that silently drops SYNs cannot
+        // block failover on YLT's default 4 x 30-second retry budget.
+        config.connect_retry_count = 0;
+        config.reconnect_wait_time = std::chrono::milliseconds{0};
+        config.client_config.connect_timeout_duration = std::chrono::seconds{1};
+    }
     const char* value = std::getenv("MC_RPC_PROTOCOL");
     if (value && std::string_view(value) == "rdma") {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
@@ -95,6 +97,11 @@ class MasterClient {
           tenant_id_(std::move(tenant_id)),
           metrics_(metrics) {}
     ~MasterClient();
+
+    void EnableHaConnectionPolicy() {
+        client_accessor_.Reconfigure(
+            detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true));
+    }
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
 

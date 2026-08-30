@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -479,12 +480,14 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
-        std::atomic<bool> serve_shutdown_requested{false};
+        std::mutex serve_state_mutex;
+        bool serve_shutdown_requested = false;
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
             *leadership_session,
-            [&server, &admin_server, &serve_shutdown_requested,
-             &label_reconciler](auto reason) {
-                serve_shutdown_requested.store(true, std::memory_order_release);
+            [&server, &admin_server, &serve_state_mutex,
+             &serve_shutdown_requested, &label_reconciler](auto reason) {
+                std::lock_guard<std::mutex> lock(serve_state_mutex);
+                serve_shutdown_requested = true;
                 admin_server.SetServiceAvailable(false);
                 label_reconciler.SetLeader(false);
                 SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
@@ -524,9 +527,45 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             return -1;
         }
 
-        if (!serve_shutdown_requested.load(std::memory_order_acquire)) {
-            ActivateServingState(admin_server, wrapped_master_service,
-                                 label_reconciler);
+        ErrorCode publish_ready_err = ErrorCode::OK;
+        {
+            std::lock_guard<std::mutex> lock(serve_state_mutex);
+            if (!serve_shutdown_requested) {
+                // Election ownership is acquired before promotion and server
+                // startup, but the endpoint must not become discoverable until
+                // the listener and the restored service are ready. Serialize
+                // publication with leadership loss so a stopped server cannot
+                // be advertised by a racing serve transition.
+                publish_ready_err =
+                    leader_coordinator.PublishServiceReady(*leadership_session);
+                if (publish_ready_err == ErrorCode::OK) {
+                    ActivateServingState(admin_server, wrapped_master_service,
+                                         label_reconciler);
+                } else {
+                    serve_shutdown_requested = true;
+                    DeactivateServingState(admin_server, label_reconciler);
+                    server.stop();
+                }
+            }
+        }
+
+        if (publish_ready_err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to publish master service readiness: "
+                       << toString(publish_ready_err);
+            StopLeadershipMonitor(leadership_monitor_handle);
+            auto server_err = std::move(ec).get();
+            LOG(ERROR) << "Master service stopped after readiness failure: "
+                       << server_err;
+            EnterStandbyMode(admin_server, *standby_controller,
+                             accept_standby_runtime_updates,
+                             leadership_session->view);
+            if (HandleLeadershipPhaseError(
+                    "service readiness publication failure",
+                    "publish master service readiness", leader_coordinator,
+                    *leadership_session, publish_ready_err, spec.type)) {
+                return -1;
+            }
+            continue;
         }
 
         auto server_err = std::move(ec).get();

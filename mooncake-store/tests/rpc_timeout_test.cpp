@@ -5,8 +5,8 @@
 //   2. End-to-end: MC_RPC_TIMEOUT_MS shortens the per-request deadline so that
 //      an unresponsive master surfaces ErrorCode::RPC_TIMEOUT (not RPC_FAIL),
 //      and it does so within the configured budget rather than the 30s default.
-//   3. MasterClient does not add its own retry delay around a failed leader
-//      connection; the HA monitor owns that retry schedule.
+//   3. HA MasterClient bounds failed leader connections while non-HA clients
+//      retain the default initial-connection retry policy.
 //
 // The end-to-end test points a MasterClient at a "black hole" TCP listener: a
 // socket that accepts the connection (so connect() succeeds) but never sends a
@@ -119,13 +119,13 @@ TEST(RpcTimeoutTest, RpcTimesOutAgainstUnresponsiveMaster) {
                                 "timeout still active?)";
 }
 
-// A leader view can become visible before the new master has finished binding
-// its RPC endpoint.  A failed connect must return to the HA monitor promptly;
-// the monitor owns the retry loop and cannot make progress while the client
-// pool performs its default multi-attempt reconnect sequence. Bind an
-// ephemeral loopback port without listening on it so connection attempts are
-// rejected deterministically while the port remains reserved by this test.
-TEST(RpcTimeoutTest, MasterConnectDoesNotRetryFailedConnection) {
+// During failover the heartbeat can still be connecting to the deleted
+// leader's pod IP. It must return promptly so the HA loop can use the newly
+// published view instead of spending the default retry budget on a stale
+// peer. Bind an ephemeral loopback port without listening on it so connection
+// attempts are rejected deterministically while the port remains reserved by
+// this test.
+TEST(RpcTimeoutTest, HaRuntimePolicyReplacesInitialConnectionPolicy) {
     int probe_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(probe_fd, 0) << "failed to create probe socket";
 
@@ -146,6 +146,19 @@ TEST(RpcTimeoutTest, MasterConnectDoesNotRetryFailedConnection) {
     ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "100", 1), 0);
 
     MasterClient client(generate_uuid());
+
+    // Initialization keeps the normal retry policy. With an immediately
+    // refused endpoint, its three one-second retry waits are observable.
+    const auto initial_start = std::chrono::steady_clock::now();
+    const auto initial_rc = client.Connect("127.0.0.1:" + std::to_string(port));
+    const auto initial_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - initial_start)
+            .count();
+
+    // Client initialization has now used the pool. Entering HA runtime must
+    // replace it, rather than silently retaining the initial retry policy.
+    client.EnableHaConnectionPolicy();
     const auto start = std::chrono::steady_clock::now();
     const auto rc = client.Connect("127.0.0.1:" + std::to_string(port));
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -155,6 +168,9 @@ TEST(RpcTimeoutTest, MasterConnectDoesNotRetryFailedConnection) {
     ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
     EXPECT_EQ(::close(probe_fd), 0);
 
+    EXPECT_EQ(initial_rc, ErrorCode::RPC_FAIL);
+    EXPECT_GE(initial_elapsed, 2500)
+        << "initial connection unexpectedly lost its retry resilience";
     EXPECT_EQ(rc, ErrorCode::RPC_FAIL);
     EXPECT_LT(elapsed, 750)
         << "MasterClient retried a failed leader connection internally for "
@@ -179,13 +195,26 @@ TEST(RpcTimeoutTest, TimeoutEnvOverridesAreOptIn) {
     ::unsetenv("MC_RPC_TIMEOUT_MS");
     ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
 
+    auto non_ha_config = detail::MakeMasterRpcClientPoolConfig();
+    EXPECT_EQ(non_ha_config.connect_retry_count, 3u);
+    EXPECT_EQ(non_ha_config.reconnect_wait_time,
+              std::chrono::milliseconds(1000));
+    EXPECT_EQ(non_ha_config.client_config.connect_timeout_duration,
+              std::chrono::seconds(30));
+
+    auto ha_config = detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true);
+    EXPECT_EQ(ha_config.connect_retry_count, 0u);
+    EXPECT_EQ(ha_config.reconnect_wait_time, std::chrono::milliseconds(0));
+    EXPECT_EQ(ha_config.client_config.connect_timeout_duration,
+              std::chrono::seconds(1));
+
     StubClientConfig defaults;
     detail::ApplyRpcTimeoutEnvOverrides(defaults);
     EXPECT_EQ(defaults.request_timeout_duration, std::chrono::seconds(30));
     EXPECT_EQ(defaults.connect_timeout_duration, std::chrono::seconds(30));
 
     ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS", "1500", /*overwrite=*/1), 0);
-    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "1000", /*overwrite=*/1),
+    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "1500", /*overwrite=*/1),
               0);
 
     StubClientConfig overridden;
@@ -193,14 +222,15 @@ TEST(RpcTimeoutTest, TimeoutEnvOverridesAreOptIn) {
     EXPECT_EQ(overridden.request_timeout_duration,
               std::chrono::milliseconds(1500));
     EXPECT_EQ(overridden.connect_timeout_duration,
-              std::chrono::milliseconds(1000));
+              std::chrono::milliseconds(1500));
 
-    // The master pool is built from the same helper, so it sees them too.
-    auto master_config = detail::MakeMasterRpcClientPoolConfig();
+    // Explicit timeout overrides still take precedence over the HA default.
+    auto master_config =
+        detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true);
     EXPECT_EQ(master_config.connect_retry_count, 0u);
     EXPECT_EQ(master_config.reconnect_wait_time, std::chrono::milliseconds(0));
     EXPECT_EQ(master_config.client_config.connect_timeout_duration,
-              std::chrono::milliseconds(1000));
+              std::chrono::milliseconds(1500));
 
     ::unsetenv("MC_RPC_TIMEOUT_MS");
     ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");

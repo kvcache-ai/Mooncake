@@ -803,6 +803,8 @@ class Client {
         const std::vector<std::string>& keys,
         const std::vector<std::vector<uint64_t>>& slice_lengths,
         const ReplicateConfig& config);
+
+    void EnterHaRuntimeMode();
     ErrorCode InitTransferEngine(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,

@@ -28,6 +28,15 @@ class LeaderCoordinator {
     virtual tl::expected<AcquireLeadershipResult, ErrorCode>
     TryAcquireLeadership(const std::string& leader_address) = 0;
 
+    // Backends that advertise a service endpoint separately from election
+    // ownership override this after the RPC listener is ready. The default
+    // keeps the existing behavior for backends whose election record already
+    // is their service endpoint.
+    virtual ErrorCode PublishServiceReady(
+        const LeadershipSession& /*session*/) {
+        return ErrorCode::OK;
+    }
+
     virtual tl::expected<bool, ErrorCode> RenewLeadership(
         const LeadershipSession& session) = 0;
 
