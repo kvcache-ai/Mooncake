@@ -113,7 +113,9 @@ class RdmaContext {
     // The one port this context opened; 0 for a slot that never constructed.
     uint8_t portNum() const { return params_ ? params_->device.port : 0; }
 
-    // Negotiated port speed in Gbps, 0 when it could not be determined.
+    // Port speed in Gbps: the effective speed from ibv_query_port_speed()
+    // where the library provides it (LAG-aware), otherwise the negotiated
+    // link rate. 0 when neither could be determined.
     double linkSpeedGbps() const;
 
     // Re-read the port's negotiated speed and width from the hardware, so
@@ -141,6 +143,9 @@ class RdmaContext {
     int openDevice(const std::string &device_name, uint8_t port);
     // Decode one ibv_query_port result into active_speed_/active_width_.
     void recordPortSpeed(const ibv_port_attr &port_attr);
+    // Ask ibv_query_port_speed() for the effective speed when the library
+    // has it; records 0 otherwise so linkSpeedGbps() falls back.
+    void queryEffectiveSpeed();
 
     // Release every resource currently owned by this context. This is
     // intentionally state-independent so it can clean up a partially completed
@@ -169,6 +174,8 @@ class RdmaContext {
     // atomic so a reader added elsewhere stays well-defined.
     std::atomic<int> active_speed_{0};
     std::atomic<int> active_width_{0};
+    // From ibv_query_port_speed(), converted to Mb/s; 0 = unavailable.
+    std::atomic<uint64_t> effective_speed_mbps_{0};
     int gid_index_ = -1;
     ibv_gid gid_;
 

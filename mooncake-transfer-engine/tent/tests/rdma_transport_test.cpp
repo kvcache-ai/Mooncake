@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
 #include <sys/wait.h>
@@ -34,6 +35,7 @@
 #include "tent/transport/rdma/params.h"
 #include "tent/transport/rdma/quota.h"
 #include "tent/transport/rdma/rdma_transport.h"
+#include "tent/transport/rdma/ibv_loader.h"
 #include "tent/transport/rdma/workers.h"
 
 namespace mooncake {
@@ -415,6 +417,24 @@ TEST_F(RdmaContextEventTest, DeviceFatalMarksUnavailableRegardlessOfPort) {
 TEST_F(RdmaContextEventTest, CqErrLeavesAvailabilityAlone) {
     fire(IBV_EVENT_CQ_ERR, ourPort());
     EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+}
+
+// ibv_query_port_speed() exists only in rdma-core >= 62. It must be resolved
+// as an optional symbol: present -> non-null, absent -> null, and either way
+// the mandatory verbs are still there (an older libibverbs must not lose
+// RDMA over it). Compared against a direct dlsym so the expectation is
+// whatever this host's library actually has.
+TEST(RdmaContextPortSpeedTest, EffectiveSpeedVerbIsOptional) {
+    void* lib = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) GTEST_SKIP() << "libibverbs.so.1 not loadable";
+    const bool host_has_verb = dlsym(lib, "ibv_query_port_speed") != nullptr;
+    dlclose(lib);
+
+    const auto& sym = IbvLoader::Instance().sym();
+    EXPECT_EQ(sym.ibv_query_port_speed != nullptr, host_has_verb);
+    // Mandatory symbols resolve regardless of the optional one.
+    EXPECT_NE(sym.ibv_query_port_default, nullptr);
+    EXPECT_NE(sym.ibv_open_device, nullptr);
 }
 
 TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {

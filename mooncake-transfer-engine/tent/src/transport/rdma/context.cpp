@@ -851,6 +851,7 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     native_context_ = context.release();
     lid_ = port_attr.lid;
     recordPortSpeed(port_attr);
+    queryEffectiveSpeed();
     return 0;
 }
 
@@ -877,12 +878,26 @@ int RdmaContext::refreshPortAttributes() {
         return -1;
     }
     recordPortSpeed(port_attr);
+    queryEffectiveSpeed();
     return 0;
 }
 
+void RdmaContext::queryEffectiveSpeed() {
+    uint64_t speed = 0;
+    if (native_context_ && verbs_.ibv_query_port_speed &&
+        verbs_.ibv_query_port_speed(native_context_, params_->device.port,
+                                    &speed) != 0) {
+        speed = 0;  // verb present but failed: encodings decide
+    }
+    // The verb reports 100 Mb/s units; store plain Mb/s.
+    effective_speed_mbps_.store(speed * 100, std::memory_order_relaxed);
+}
+
 double RdmaContext::linkSpeedGbps() const {
-    return ibLinkSpeedGbps(active_speed_.load(std::memory_order_relaxed),
-                           active_width_.load(std::memory_order_relaxed));
+    return ibPortSpeedGbps(
+        effective_speed_mbps_.load(std::memory_order_relaxed),
+        active_speed_.load(std::memory_order_relaxed),
+        active_width_.load(std::memory_order_relaxed));
 }
 }  // namespace tent
 }  // namespace mooncake

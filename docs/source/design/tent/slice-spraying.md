@@ -270,7 +270,12 @@ All slice spraying parameters are configurable via the configuration file:
 **Notes**:
 - Each device's bandwidth is read from the speed and width its port
   negotiated (`ibv_query_port`), so a 100G and a 400G NIC in the same host
-  start from different theoretical rates
+  start from different theoretical rates. Where libibverbs provides
+  `ibv_query_port_speed()` (rdma-core >= 62) the *effective* speed it
+  reports is preferred: for a VF over LAG that is the bandwidth left after
+  a PF drops out of the bond, which the encoded link rate cannot express.
+  The verb is resolved as an optional symbol, so older libraries keep
+  working on the encoded rate
 - The theoretical rate seeds the EWMA and bounds it to
   `[ewma_min_multiplier, ewma_max_multiplier]` times that rate
 - If a device's port speed cannot be read or is outside [min, max],
