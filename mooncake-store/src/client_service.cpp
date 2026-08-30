@@ -4975,60 +4975,6 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
     return replica_list[0];
 }
 
-size_t Client::GetLocalHotCacheSizeFromEnv() {
-    if (const char* ev_size = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE")) {
-        std::string ev_size_str(ev_size);
-        std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_CACHE_SIZE='" +
-                                ev_size_str + "', disable local hot cache";
-        // Check for negative values
-        if (!ev_size_str.empty() && ev_size_str[0] == '-') {
-            LOG(WARNING) << error_msg;
-            return 0;
-        }
-        try {
-            unsigned long long v = std::stoull(ev_size_str, nullptr, 10);
-            if (v > 0) {
-                return static_cast<size_t>(v);
-            } else {
-                LOG(WARNING) << error_msg;
-                return 0;
-            }
-        } catch (const std::exception&) {
-            LOG(WARNING) << error_msg;
-            return 0;
-        }
-    }
-    return 0;
-}
-
-size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
-    if (const char* ev_block_size =
-            std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE")) {
-        std::string ev_block_size_str(ev_block_size);
-        std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_BLOCK_SIZE='" +
-                                ev_block_size_str +
-                                "', using default block size";
-        // Check for negative values
-        if (!ev_block_size_str.empty() && ev_block_size_str[0] == '-') {
-            LOG(WARNING) << error_msg;
-            return default_value;
-        }
-        try {
-            unsigned long long v = std::stoull(ev_block_size_str, nullptr, 10);
-            if (v > 0) {
-                return static_cast<size_t>(v);
-            } else {
-                LOG(WARNING) << error_msg;
-                return default_value;
-            }
-        } catch (const std::exception&) {
-            LOG(WARNING) << error_msg;
-            return default_value;
-        }
-    }
-    return default_value;
-}
-
 ErrorCode Client::InitLocalHotCache() {
     hot_cache_handler_.reset();
     UnregisterLocalHotCacheMemory();
@@ -5039,38 +4985,22 @@ ErrorCode Client::InitLocalHotCache() {
         return ErrorCode::OK;
     }
 
-    // Defaults: hot cache is disabled unless MC_STORE_LOCAL_HOT_CACHE_SIZE is
-    // set to a positive value; when enabled, default block size is 16MB and
-    // thread_num is 2.
-    size_t block_size = 16 * 1024 * 1024;  // 16MB default block size
-    size_t thread_num = 2;
-
-    // Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment
-    size_t total_cache = GetLocalHotCacheSizeFromEnv();
-    if (total_cache == 0) {
-        // Environment variable not set or invalid, disable cache
+    const auto config = LocalHotCacheConfig::FromEnvironment();
+    if (config.total_size_bytes == 0) {
         return ErrorCode::OK;
     }
 
-    // Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment
-    block_size = GetLocalHotBlockSizeFromEnv(block_size);
-
-    // MC_STORE_LOCAL_HOT_CACHE_USE_SHM: "1" enables memfd-backed shm (default
-    // off). When enabled, hot cache is shareable with dummy clients via IPC.
-    bool use_shm = false;
-    if (const char* ev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM")) {
-        use_shm = (std::string(ev) == "1");
-    }
+    size_t thread_num = 2;
 
     // Enable hot cache
     {
-        hot_cache_ =
-            std::make_shared<LocalHotCache>(total_cache, block_size, use_shm);
+        hot_cache_ = std::make_shared<LocalHotCache>(
+            config.total_size_bytes, config.block_size_bytes, config.use_shm);
         // Check if cache initialization was successful
         if (hot_cache_->GetCacheSize() == 0) {
             LOG(ERROR)
                 << "Local hot cache creation failed: no blocks allocated. "
-                << "total_cache=" << total_cache;
+                << "total_cache=" << config.total_size_bytes;
             hot_cache_.reset();
             hot_cache_handler_.reset();
             admission_sketch_.reset();
@@ -5094,35 +5024,17 @@ ErrorCode Client::InitLocalHotCache() {
         }
         hot_cache_memory_registered_ = true;
 
-        LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache
-                  << ", block size=" << block_size
+        LOG(INFO) << "Local hot cache enabled with cache size="
+                  << config.total_size_bytes
+                  << ", block size=" << config.block_size_bytes
                   << ", block amount=" << hot_cache_->GetCacheSize()
-                  << ", shm=" << (use_shm ? "on" : "off")
+                  << ", shm=" << (config.use_shm ? "on" : "off")
                   << ", transfer engine registered=on";
         // Create async handler with 2 worker threads
         hot_cache_handler_ =
             std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
         admission_sketch_ = std::make_unique<CountMinSketch>();
-
-        // MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD: minimum CMS count before a
-        // key is admitted to hot cache (default 2).
-        if (const char* ev =
-                std::getenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD")) {
-            std::string ev_str(ev);
-            std::string error_msg =
-                "Invalid MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD='" + ev_str +
-                "', using default";
-            try {
-                unsigned long long v = std::stoull(ev_str, nullptr, 10);
-                if (v > 0 && v <= 255) {
-                    admission_threshold_ = static_cast<uint8_t>(v);
-                } else {
-                    LOG(WARNING) << error_msg;
-                }
-            } catch (const std::exception&) {
-                LOG(WARNING) << error_msg;
-            }
-        }
+        admission_threshold_ = config.admission_threshold;
     }
     return ErrorCode::OK;
 }
