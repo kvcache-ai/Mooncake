@@ -13,17 +13,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 ARG PYTHON_VERSION=3.10
-ARG TORCH_VERSION=2.7.1
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
-ARG TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0"
 # CI can opt in to removing /workspace/build from the builder layer.
 ARG CLEAN_BUILD_ARTIFACTS=0
 
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
-    TORCH_VERSION=${TORCH_VERSION} \
-    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     PATH="/usr/local/go/bin:${PATH}"
 
 # Install base build utilities and the requested Python version via deadsnakes PPA
@@ -42,7 +37,6 @@ RUN apt-get update && \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv && \
     curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
-    python${PYTHON_VERSION} -m pip install --no-cache-dir "torch==${TORCH_VERSION}" --index-url ${TORCH_INDEX_URL} && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     apt-get purge -y --auto-remove software-properties-common && \
@@ -79,8 +73,6 @@ RUN mkdir -p build && \
     bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
     cd /workspace && \
     OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
-    python${PYTHON_VERSION} -m pip install --no-cache-dir mooncake-wheel/dist/*.whl && \
-    python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
     if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
         rm -rf build; \
     fi
@@ -96,11 +88,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Inherit build-args so the runtime stage installs the matching interpreter
 ARG PYTHON_VERSION=3.10
-ARG TORCH_VERSION=2.7.1
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
-ENV PYTHON_VERSION=${PYTHON_VERSION} \
-    TORCH_VERSION=${TORCH_VERSION}
+ENV PYTHON_VERSION=${PYTHON_VERSION}
 
 # Install runtime dependencies and the requested Python version
 RUN apt-get update && \
@@ -121,7 +110,6 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} && \
     curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
-    python${PYTHON_VERSION} -m pip install --no-cache-dir "torch==${TORCH_VERSION}" --index-url ${TORCH_INDEX_URL} && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     apt-get purge -y --auto-remove software-properties-common curl && \
@@ -129,7 +117,6 @@ RUN apt-get update && \
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
-COPY --from=builder /root/.cache/mooncake/pg_jit /root/.cache/mooncake/pg_jit
 COPY --chmod=755 scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
 RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
