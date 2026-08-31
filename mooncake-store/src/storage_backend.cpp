@@ -2661,21 +2661,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     } else
 #endif
     {
@@ -2693,13 +2678,32 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     }
+
+    // Flush bucket data to stable storage before writing metadata.
+    // This prevents a crash from leaving valid metadata pointing at
+    // incomplete data (write-ordering durability guarantee).
+    // StorageFile declares a virtual datasync() overridden by both PosixFile
+    // (fdatasync) and UringFile, so a single call covers both write paths and
+    // the branches above only keep their own write logic.
+    auto sync_result = file->datasync();
+    // Test-only: override sync result to exercise the same !sync_result
+    // cleanup path as a real fdatasync() failure.
+    if (test_datasync_failure_.load(std::memory_order_relaxed)) {
+        sync_result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (!sync_result) {
+        LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+        CleanupOrphanedBucket(bucket_id);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    // Invalidate cache for this file since content changed
+    {
+        MutexLocker cache_locker(&file_cache_mutex_);
+        file_cache_.erase(bucket_data_path);
+    }
+
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
