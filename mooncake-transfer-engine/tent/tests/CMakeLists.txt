@@ -260,6 +260,13 @@ target_include_directories(tent_endpoint_lifecycle_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
 
+add_executable(tent_bootstrap_response_test bootstrap_response_test.cpp)
+target_link_libraries(tent_bootstrap_response_test PRIVATE gtest gtest_main
+                                                           tent_link_group)
+target_include_directories(tent_bootstrap_response_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_bootstrap_response_test COMMAND tent_bootstrap_response_test)
+
 add_executable(tent_endpoint_store_test endpoint_store_test.cpp)
 target_link_libraries(tent_endpoint_store_test PRIVATE gtest gtest_main
                                                        tent_link_group)

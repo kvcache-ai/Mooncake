@@ -223,6 +223,10 @@ TEST(EndpointLifecycleTest, BootstrapWithNewPeerQpsRetiresEstablishedEndpoint) {
 
     EXPECT_FALSE(endpoint.accept(peer_desc, local_desc).ok());
     EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
+    // The failed accept does not populate a GID. The transport retries on a
+    // newly inserted endpoint in the same bootstrap RPC so the initiator is
+    // not left with an empty reply.
+    EXPECT_TRUE(local_desc.local_gid.empty());
 }
 
 TEST(EndpointLifecycleTest, ExternalOwnerCanReleaseAfterExplicitDeconstruct) {
