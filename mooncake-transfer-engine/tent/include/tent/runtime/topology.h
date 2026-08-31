@@ -182,7 +182,7 @@ inline std::string canonicalizeLocation(const std::string& location) {
 inline Topology::MemType memTypeFromLocation(const std::string& location) {
     LocationParser parser(location);
     const auto type = parser.type();
-    if (type == "cpu") return Topology::MEM_HOST;
+    if (type == "cpu" || type == "segments") return Topology::MEM_HOST;
     if (type == "cuda" || type == "gpu") return Topology::MEM_CUDA;
     if (isAmdGpuLocationType(type)) return Topology::MEM_ROCM;
     if (type == "ascend") return Topology::MEM_ASCEND;
