@@ -988,7 +988,7 @@ StandbyObjectEntry MakeStandbyEntry(const std::string& key, uint64_t obj_size,
     buf.buffer_address_ = addr;
     buf.transport_endpoint_ = endpoint;
     Replica::Descriptor desc;
-    desc.id = generate_uuid();
+    desc.id = addr;
     desc.descriptor_variant = MemoryDescriptor{buf};
     desc.status = ReplicaStatus::COMPLETE;
     entry.metadata.replicas.push_back(desc);
