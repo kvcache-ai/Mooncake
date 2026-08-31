@@ -1,5 +1,6 @@
-#include "storage/distributed/distributed_storage_backend.h"
+#include "config/distributed_storage_config.h"
 
+#include <glog/logging.h>
 #include <chrono>
 #include <filesystem>
 #include <sstream>
