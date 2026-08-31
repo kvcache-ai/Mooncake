@@ -1179,15 +1179,32 @@ TEST_F(MasterServiceTest, ResolveMooncakeHostIdPrefersDeploymentOverride) {
     EXPECT_EQ(ResolveMooncakeHostId("10.244.1.17:5000"), "kubernetes-node-a");
 }
 
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdFallsBackForEmptyOverride) {
-    ScopedEnvVar host_id("MOONCAKE_HOST_ID", " \t ");
+TEST_F(MasterServiceTest, ResolveMooncakeHostIdNormalizesEndpointOverride) {
+    ScopedEnvVar host_id("MOONCAKE_HOST_ID", "  kubernetes-node-a:5000  ");
 
-    EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
+    EXPECT_EQ(ResolveMooncakeHostId("10.244.1.17:5000"), "kubernetes-node-a");
+}
+
+TEST_F(MasterServiceTest, ResolveMooncakeHostIdFallsBackForEmptyOverride) {
+    {
+        ScopedEnvVar host_id("MOONCAKE_HOST_ID", "");
+        EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
+    }
+
+    {
+        ScopedEnvVar host_id("MOONCAKE_HOST_ID", " \t ");
+        EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
+    }
 }
 
 TEST_F(MasterServiceTest, ResolveMooncakeHostIdRejectsInvalidOverride) {
     const std::vector<const char*> invalid_host_ids = {
-        "localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]", "::", "[::]"};
+        "localhost",  "localhost:5000",
+        "127.0.0.1",  "127.0.0.1:5000",
+        "0.0.0.0",    "0.0.0.0:5000",
+        "::1",        "[::1]",
+        "[::1]:5000", "::",
+        "[::]",       "[::]:5000"};
     for (const char* invalid_host_id : invalid_host_ids) {
         ScopedEnvVar host_id("MOONCAKE_HOST_ID", invalid_host_id);
         EXPECT_TRUE(ResolveMooncakeHostId("hostB:5000").empty())
