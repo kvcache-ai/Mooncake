@@ -3307,7 +3307,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
             continue;
         }
         const size_t existing_shard_idx =
-            getMetadataShardIndex(tenant_id, user_key);
+            GetMetadataShardIndex(tenant_id, user_key);
         {
             MetadataShardAccessorRO existing_shard(this, existing_shard_idx);
             auto existing_tenant = existing_shard->tenants.find(tenant_id);
