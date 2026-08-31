@@ -57,6 +57,7 @@ WHEEL_DIR=${WHEEL_DIR:-}
 WHEEL_DIR_SGLANG=${WHEEL_DIR_SGLANG:-$WHEEL_DIR}
 WHEEL_DIR_VLLM=${WHEEL_DIR_VLLM:-$WHEEL_DIR}
 GIT_REPO=${GIT_REPO:-}
+MOONCAKE_ENV_UNHEALTHY=false
 
 if [ "$MOONCAKE_CI_TIER" = "core-4gpu" ]; then
     # The upstream heterogeneous-TP test starts TP4 and TP2 workers on the
@@ -378,7 +379,12 @@ run_single_test(){
     local framework_type=$(get_framework_from_test_name "$test_name")
     echo "Test $test_name will use framework: $framework_type"
 
-    setup_env_for_test "$test_name" "$framework_type" || return 1
+    local type
+    type=$(get_test_type "$test_name") || return 1
+    if ! setup_env_for_test "$test_name" "$framework_type"; then
+        cleanup_test_env "$type" || true
+        return 1
+    fi
 
     source "$RUN_DIR/.shrc"
     cd "$TONE_TESTS_DIR/scripts"
@@ -394,8 +400,10 @@ run_single_test(){
         parse "$exit_code" || exit_code=1
     fi
 
-    local type=$(get_test_type "$test_name")
-    cleanup_test_env "$type"
+    if ! cleanup_test_env "$type"; then
+        echo "ERROR: Test cleanup/postflight failed" >&2
+        exit_code=1
+    fi
     return $exit_code
 }
 
@@ -411,7 +419,11 @@ run_all_tests(){
     local framework_type=$(get_framework_from_test_array "$input_tests")
     echo "===== Running All Tests for $framework_type Framework (Double Machine Mode) ====="
 
-    setup_env_for_test "all" "$framework_type" || return 1
+    if ! setup_env_for_test "all" "$framework_type"; then
+        MOONCAKE_ENV_UNHEALTHY=true
+        cleanup_test_env "double" || true
+        return 1
+    fi
 
     source "$RUN_DIR/.shrc"
     cd "$TONE_TESTS_DIR/scripts"
@@ -447,11 +459,16 @@ run_all_tests(){
             echo "ERROR: Shared test environment is unhealthy after ${test_name}." >&2
             echo "ERROR: Skipping ${remaining_count} remaining test case(s); node intervention is required." >&2
             all_passed=false
+            MOONCAKE_ENV_UNHEALTHY=true
             break
         fi
     done
 
-    cleanup_test_env "double"
+    if ! cleanup_test_env "double"; then
+        echo "ERROR: Test cleanup/postflight failed" >&2
+        all_passed=false
+        MOONCAKE_ENV_UNHEALTHY=true
+    fi
     $all_passed && return 0 || return 1
 }
 
@@ -467,36 +484,46 @@ show_help(){
     echo "  run-all VLLM                       - Run all VLLM tests (using VLLM image)"
 }
 
-case "$1" in
-    "run-single")
-        shift
-        run_single_test "$@"
-        ;;
- "run-all")
-    shift
-    if [ -z "$1" ]; then
-        # No parameter specified, run both SGLANG and VLLM tests
-        all_frameworks_passed=true
-        echo "No framework specified, running all SGLANG tests..."
-        run_all_tests "All_TEST_SCRIPTS_SGLANG" || all_frameworks_passed=false
+main() {
+    case "${1:-}" in
+        "run-single")
+            shift
+            run_single_test "$@"
+            ;;
+        "run-all")
+            shift
+            if [ -z "${1:-}" ]; then
+                # No parameter specified, run both SGLANG and VLLM tests
+                all_frameworks_passed=true
+                echo "No framework specified, running all SGLANG tests..."
+                run_all_tests "All_TEST_SCRIPTS_SGLANG" || all_frameworks_passed=false
 
-        echo "Running all VLLM tests..."
-        run_all_tests "All_TEST_SCRIPTS_VLLM" || all_frameworks_passed=false
-        $all_frameworks_passed
-    else
-        FRAMEWORK=$1
-        if [ "$FRAMEWORK" = "VLLM" ]; then
-            run_all_tests "All_TEST_SCRIPTS_VLLM"
-        elif [ "$FRAMEWORK" = "SGLANG" ]; then
-            run_all_tests "All_TEST_SCRIPTS_SGLANG"
-        else
-            echo "ERROR: Unknown framework '$FRAMEWORK'. Use SGLANG or VLLM."
+                if $MOONCAKE_ENV_UNHEALTHY; then
+                    echo "ERROR: Skipping VLLM because the shared environment is unhealthy" >&2
+                else
+                    echo "Running all VLLM tests..."
+                    run_all_tests "All_TEST_SCRIPTS_VLLM" || all_frameworks_passed=false
+                fi
+                $all_frameworks_passed
+            else
+                FRAMEWORK=$1
+                if [ "$FRAMEWORK" = "VLLM" ]; then
+                    run_all_tests "All_TEST_SCRIPTS_VLLM"
+                elif [ "$FRAMEWORK" = "SGLANG" ]; then
+                    run_all_tests "All_TEST_SCRIPTS_SGLANG"
+                else
+                    echo "ERROR: Unknown framework '$FRAMEWORK'. Use SGLANG or VLLM."
+                    show_help
+                    return 1
+                fi
+            fi
+            ;;
+        *)
             show_help
-            return 1
-        fi
-    fi
-    ;;
-    *)
-        show_help
-        ;;
-esac
+            ;;
+    esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

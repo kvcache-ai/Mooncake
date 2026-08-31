@@ -102,14 +102,27 @@ jobs:
           [ "$CI_ACCELERATOR" = rocm ]
           export SSH_CMD="ssh -F ${MOONCAKE_SSH_CONFIG}"
 
-          for command in docker flock realpath rocm-smi rsync ssh; do
+          for command in docker flock python3 realpath rocm-smi rsync ssh; do
             command -v "$command" >/dev/null || {
               echo "Missing required command: $command" >&2
               exit 1
             }
           done
           test -c /dev/kfd
-          ssh -F "${MOONCAKE_SSH_CONFIG}" "${REMOTE_SSH_TARGET}" true
+          test -d /sys/class/kfd/kfd/topology/nodes
+          test -d /sys/class/kfd/kfd/proc
+          ssh -F "${MOONCAKE_SSH_CONFIG}" "${REMOTE_SSH_TARGET}" '
+            set -eu
+            for command in docker python3 rocm-smi; do
+              command -v "$command" >/dev/null || {
+                echo "Missing required remote command: $command" >&2
+                exit 1
+              }
+            done
+            test -c /dev/kfd
+            test -d /sys/class/kfd/kfd/topology/nodes
+            test -d /sys/class/kfd/kfd/proc
+          '
           [ -w "$(dirname "$MOONCAKE_LOCK_FILE")" ] || {
             echo "Runner cannot write the Mooncake lock directory" >&2
             exit 1
@@ -121,17 +134,22 @@ jobs:
             exit 1
           }
 
-          cleanup() {
+          cleanup_best_effort() {
+            local exit_code=$?
+            trap - EXIT
             if [ -f scripts/tone_tests/run/.shrc ]; then
               set +e
               # shellcheck disable=SC1091
               source scripts/tone_tests/run/.shrc
               # shellcheck disable=SC1091
               source scripts/tone_tests/scripts/common.sh
-              cleanup_test_env double
+              cleanup_test_env double || true
             fi
+            exit "$exit_code"
           }
-          trap cleanup EXIT INT TERM
+          trap cleanup_best_effort EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           if ${{ inputs.run_sglang }}; then
             bash scripts/tone_tests/scripts/run_test.sh run-all
           else

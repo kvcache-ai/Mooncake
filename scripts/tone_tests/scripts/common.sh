@@ -665,16 +665,49 @@ save_test_result() {
 
 cleanup_test_env() {
     local test_type=$1
+    local cleanup_failed=false
 
     echo "===== Cleaning up $test_type machine environment ====="
 
-    stop_container "${CONTAINER_NAME}"
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        if ! cleanup_rocm_node "local"; then
+            cleanup_failed=true
+        fi
 
-    if [ "$test_type" = "double" ] && [ -n "$REMOTE_IP" ]; then
-        stop_container "${CONTAINER_NAME}" "$REMOTE_IP"
+        if [ "$test_type" = "double" ] && [ -n "${REMOTE_IP:-}" ]; then
+            echo "===== Running ROCm postflight on remote node ${REMOTE_IP} ====="
+            if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "
+                source ${REMOTE_TEST_DIR}/run/.shrc && \
+                source ${REMOTE_TEST_DIR}/scripts/common.sh && \
+                cleanup_rocm_node remote
+            "; then
+                echo "ERROR: Remote ROCm cleanup/postflight failed on ${REMOTE_IP}" >&2
+                cleanup_failed=true
+            fi
+        fi
+    else
+        if ! stop_container "${CONTAINER_NAME}"; then
+            cleanup_failed=true
+        fi
+
+        if [ "$test_type" = "double" ] && [ -n "${REMOTE_IP:-}" ]; then
+            if ! stop_container "${CONTAINER_NAME}" "$REMOTE_IP"; then
+                cleanup_failed=true
+            fi
+        fi
     fi
 
-    echo "Cleanup completed"
+    if $cleanup_failed; then
+        echo "ERROR: Cleanup did not complete successfully" >&2
+        return 1
+    fi
+
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        echo "Cleanup and postflight completed"
+    else
+        echo "Cleanup completed"
+    fi
+    return 0
 }
 
 # Return the maximum used memory, in MiB, for only this CI allocation.
@@ -685,14 +718,19 @@ gpu_max_used_mb() {
 import json, sys
 indices = {f"card{i}" for i in sys.argv[1].split(",")}
 data = json.load(sys.stdin)
-used = []
+used = {}
 for card, values in data.items():
     if card not in indices:
         continue
     for key, value in values.items():
         if "VRAM Total Used Memory" in key:
-            used.append(int(value) // (1024 * 1024))
-print(max(used) if used else -1)
+            used[card] = int(value) // (1024 * 1024)
+missing = sorted(indices - used.keys())
+if missing:
+    print("Missing ROCm memory data for: " + ", ".join(missing), file=sys.stderr)
+    print(-1)
+else:
+    print(max(used.values()))
 ' "${MOONCAKE_GPU_INDICES:-0,1,2,3}"
     else
         command -v nvidia-smi >/dev/null 2>&1 || return 1
@@ -725,6 +763,135 @@ wait_gpu_idle() {
     done
     echo "GPU memory not drained within ${max_seconds}s (max used ${max_used}MB)"
     return 1
+}
+
+# Fail closed if KFD still reports a process with a queue on one of this
+# allocation's GPUs. Mapping the configured render nodes through KFD topology
+# keeps this check scoped to the shared host's ROCm CI partition.
+verify_no_allocated_gpu_processes() {
+    if [ "${CI_ACCELERATOR:-cuda}" != "rocm" ]; then
+        return 0
+    fi
+
+    local topology_root=${MOONCAKE_KFD_TOPOLOGY_ROOT:-/sys/class/kfd/kfd/topology/nodes}
+    local process_root=${MOONCAKE_KFD_PROCESS_ROOT:-/sys/class/kfd/kfd/proc}
+    if [ ! -d "$topology_root" ] || [ ! -d "$process_root" ]; then
+        echo "ERROR: KFD topology or process sysfs is unavailable" >&2
+        return 1
+    fi
+
+    local -a render_nodes
+    read -r -a render_nodes <<<"${MOONCAKE_RENDER_DEVICES:-}"
+    if [ "${#render_nodes[@]}" -eq 0 ]; then
+        echo "ERROR: MOONCAKE_RENDER_DEVICES is empty; cannot check ROCm processes" >&2
+        return 1
+    fi
+
+    local device render_minor node_dir node_render_minor gpu_id
+    local allocation_gpu_ids=""
+    for device in "${render_nodes[@]}"; do
+        if [ ! -e "$device" ] || [[ ! "$device" =~ /render[D]([0-9]+)$ ]]; then
+            echo "ERROR: Allocated ROCm render device is missing: $device" >&2
+            return 1
+        fi
+        render_minor=${BASH_REMATCH[1]}
+
+        gpu_id=""
+        for node_dir in "$topology_root"/*; do
+            [ -r "$node_dir/properties" ] && [ -r "$node_dir/gpu_id" ] || continue
+            node_render_minor=$(awk '$1 == "drm_render_minor" { print $2; exit }' \
+                "$node_dir/properties")
+            if [ "$node_render_minor" = "$render_minor" ]; then
+                gpu_id=$(tr -d '[:space:]' < "$node_dir/gpu_id")
+                break
+            fi
+        done
+        if ! [[ "$gpu_id" =~ ^[0-9]+$ ]] || [ "$gpu_id" = 0 ]; then
+            echo "ERROR: Could not map $device to a KFD GPU ID" >&2
+            return 1
+        fi
+        allocation_gpu_ids="${allocation_gpu_ids}${gpu_id}"$'\n'
+    done
+
+    local proc_dir queue_gpu_file queue_gpu_id pid
+    local remaining_pids=""
+    for proc_dir in "$process_root"/[0-9]*; do
+        [ -d "$proc_dir" ] || continue
+        pid=${proc_dir##*/}
+        for queue_gpu_file in "$proc_dir"/queues/*/gpuid; do
+            [ -r "$queue_gpu_file" ] || continue
+            queue_gpu_id=$(tr -d '[:space:]' < "$queue_gpu_file")
+            if printf '%s' "$allocation_gpu_ids" | grep -Fxq -- "$queue_gpu_id"; then
+                remaining_pids="${remaining_pids}${pid}"$'\n'
+                break
+            fi
+        done
+    done
+
+    remaining_pids=$(printf '%s' "$remaining_pids" | sort -nu)
+    if [ -n "$remaining_pids" ]; then
+        echo "ERROR: KFD processes remain on allocated ROCm GPUs:" >&2
+        ps -o pid,ppid,stat,args -p \
+            "$(printf '%s\n' "$remaining_pids" | paste -sd, -)" \
+            >&2 2>/dev/null || true
+        return 1
+    fi
+
+    echo "No KFD processes remain on the allocated ROCm GPUs"
+    return 0
+}
+
+# Final ROCm teardown is intentionally stricter than the reusable between-test
+# reset: remove the named container, then prove the allocated GPUs and device
+# handles are clean before releasing the cluster lock.
+cleanup_rocm_node() {
+    local location=${1:-local}
+    local cleanup_failed=false
+    local container_names
+
+    echo "Stopping and removing ${location} ROCm container: ${CONTAINER_NAME}"
+    if ! container_names=$(docker ps -a --format '{{.Names}}'); then
+        echo "ERROR: Failed to list ${location} Docker containers" >&2
+        cleanup_failed=true
+        container_names=""
+    fi
+
+    if printf '%s\n' "$container_names" | grep -Fxq -- "${CONTAINER_NAME}"; then
+        if ! docker stop "${CONTAINER_NAME}" >/dev/null 2>&1; then
+            echo "ERROR: Failed to stop ${location} container: ${CONTAINER_NAME}" >&2
+            cleanup_failed=true
+        fi
+        if ! docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1; then
+            echo "ERROR: Failed to remove ${location} container: ${CONTAINER_NAME}" >&2
+            cleanup_failed=true
+        fi
+    else
+        echo "No ${location} container named ${CONTAINER_NAME}"
+    fi
+
+    if ! container_names=$(docker ps -a --format '{{.Names}}'); then
+        echo "ERROR: Failed to verify ${location} Docker container removal" >&2
+        cleanup_failed=true
+    elif printf '%s\n' "$container_names" | grep -Fxq -- "${CONTAINER_NAME}"; then
+        echo "ERROR: ${location} container still exists: ${CONTAINER_NAME}" >&2
+        cleanup_failed=true
+    else
+        echo "Verified ${location} container removal: ${CONTAINER_NAME}"
+    fi
+
+    if ! wait_gpu_idle "${MOONCAKE_CLEANUP_TIMEOUT_SECONDS:-90}" \
+        "${MOONCAKE_GPU_IDLE_THRESHOLD_MB:-1024}"; then
+        echo "ERROR: ${location} ROCm GPU allocation did not drain" >&2
+        cleanup_failed=true
+    fi
+    if ! verify_no_allocated_gpu_processes; then
+        echo "ERROR: ${location} ROCm process postflight failed" >&2
+        cleanup_failed=true
+    fi
+
+    $cleanup_failed && return 1
+    echo "ROCm cleanup/postflight passed on ${location} node"
+    return 0
 }
 
 # Kill only GPU processes whose cgroup still identifies them as belonging to
@@ -879,6 +1046,57 @@ launch_and_track_process() {
     local process_cmd=$1
     local log_path=$2
     local pid_file=$3
+    local grep_pattern=${4:-}
+
+    if [ "${CI_ACCELERATOR:-cuda}" != "rocm" ]; then
+        if [ -z "$grep_pattern" ]; then
+            echo "ERROR: CUDA process tracking requires a grep pattern" >&2
+            return 1
+        fi
+
+        local escaped_log launch_cmd
+        printf -v escaped_log '%q' "$log_path"
+        launch_cmd="${process_cmd} > ${escaped_log} 2>&1 &"
+        echo "Executing command..."
+        printf 'docker exec %q bash -c %q\n' "${CONTAINER_NAME}" "$launch_cmd"
+        if ! docker exec "${CONTAINER_NAME}" bash -c "$launch_cmd"; then
+            echo "ERROR: Failed to launch process in ${CONTAINER_NAME}" >&2
+            return 1
+        fi
+
+        echo "Waiting for process to initialize..."
+        local container_main_pid pid
+        for i in {1..15}; do
+            container_main_pid=$(docker inspect --format '{{.State.Pid}}' \
+                "${CONTAINER_NAME}" 2>/dev/null)
+            if [ -n "$container_main_pid" ] && [ "$container_main_pid" != "0" ]; then
+                pid=$(ps -eo pid,ppid,cmd | awk \
+                    -v root="$container_main_pid" -v pattern="$grep_pattern" '
+                    BEGIN { pids[root] = 1 }
+                    {
+                        if ($2 in pids && $0 ~ pattern) {
+                            print $1
+                            exit
+                        }
+                    }
+                ')
+            fi
+
+            if [ -n "${pid:-}" ]; then
+                mkdir -p "$(dirname "$pid_file")"
+                echo "$pid" > "$pid_file"
+                echo "PID $pid (on host) saved to $pid_file"
+                return 0
+            fi
+
+            echo "  Attempt $i/15..."
+            sleep 2
+        done
+
+        echo "Process not found after 30 seconds"
+        return 1
+    fi
+
     local escaped_cmd escaped_log launch_cmd container_pid process_group
 
     printf -v escaped_cmd '%q' "$process_cmd"
@@ -921,6 +1139,26 @@ kill_process() {
 
     if [ ! -f "$pid_file" ]; then
         echo "No PID file for $service_name."
+        return 0
+    fi
+
+    if [ "${CI_ACCELERATOR:-cuda}" != "rocm" ]; then
+        local pid
+        pid=$(cat "$pid_file")
+        if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$pid_file"
+            return 0
+        fi
+
+        echo "Stopping $service_name (PID: $pid)..."
+        kill -TERM "$pid" 2>/dev/null
+        sleep 2
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null
+        fi
+
+        rm -f "$pid_file"
+        echo "✓ $service_name stopped"
         return 0
     fi
 
@@ -968,6 +1206,10 @@ kill_process() {
 }
 
 verify_model_processes_stopped() {
+    if [ "${CI_ACCELERATOR:-cuda}" != "rocm" ]; then
+        return 0
+    fi
+
     local process_pattern='sglang[.]launch_server|sglang_router[.]launch_router|sglang::router|vllm[.]entrypoints[.]openai[.]api_server|mooncake_connector_proxy[.]py|toy_proxy_server[.]py'
     local remaining
     remaining=$(docker exec "${CONTAINER_NAME}" bash -c \
@@ -1406,7 +1648,7 @@ launch_sglang_server() {
     fi
 
     local offline_prefix=$(hf_offline_prefix "$model_path")
-    local sglang_cmd="${offline_prefix}exec python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
+    local sglang_cmd="${offline_prefix}python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
     if [ -n "$extra_args" ]; then
         sglang_cmd="${sglang_cmd} ${extra_args}"
     fi
@@ -1417,9 +1659,10 @@ launch_sglang_server() {
 
 
     local pid_file="${PID_DIR}/server_${pid_suffix}.pid"
+    local grep_pattern="python -m sglang.launch_server.*${model_path}"
 
     echo "Starting SGLang Server..."
-    if ! launch_and_track_process "$sglang_cmd" "$log_path" "$pid_file"; then
+    if ! launch_and_track_process "$sglang_cmd" "$log_path" "$pid_file" "$grep_pattern"; then
         return 1
     fi
 
@@ -1459,17 +1702,18 @@ launch_vllm_server() {
     fi
     env_prefix="${env_prefix}$(hf_offline_prefix "$model_path")"
 
-    local vllm_cmd="${env_prefix}exec python3 -m vllm.entrypoints.openai.api_server --model '${model_path}' --host '${host}' --port ${port}"
+    local vllm_cmd="${env_prefix}python3 -m vllm.entrypoints.openai.api_server --model '${model_path}' --host '${host}' --port ${port}"
 
     if [ -n "$extra_args" ]; then
         vllm_cmd="${vllm_cmd} ${extra_args}"
     fi
 
     local pid_file="${PID_DIR}/server_${pid_suffix}.pid"
+    local grep_pattern="python3 -m vllm.entrypoints.openai.api_server.*${model_path}"
 
     echo "Starting vLLM Server..."
     echo "Command: $vllm_cmd"
-    if ! launch_and_track_process "$vllm_cmd" "$log_path" "$pid_file"; then
+    if ! launch_and_track_process "$vllm_cmd" "$log_path" "$pid_file" "$grep_pattern"; then
         return 1
     fi
 
@@ -1501,16 +1745,17 @@ launch_sglang_router() {
 
     echo "===== Starting SGLang Router ====="
 
-    local router_cmd="exec python3 -m sglang_router.launch_router --pd-disaggregation --prefill ${prefill_url} --decode ${decode_url} --host ${host} --port ${port}"
+    local router_cmd="python3 -m sglang_router.launch_router --pd-disaggregation --prefill ${prefill_url} --decode ${decode_url} --host ${host} --port ${port}"
     if [ -n "$extra_args" ]; then
         router_cmd="${router_cmd} ${extra_args}"
     fi
 
     local pid_file="${PID_DIR}/proxy.pid"
+    local grep_pattern="sglang::router"
 
     echo "Load balancer starting..."
     echo "Command: $router_cmd"
-    if ! launch_and_track_process "$router_cmd" "$log_path" "$pid_file"; then
+    if ! launch_and_track_process "$router_cmd" "$log_path" "$pid_file" "$grep_pattern"; then
         return 1
     fi
 

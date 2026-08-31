@@ -10,13 +10,16 @@ run_test()
 {
     echo "===== Running pytest tests ====="
     local log_file="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${test_case_name}.log"
+    local pytest_env=""
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        pytest_env="SGLANG_IS_IN_CI=1 "
+    fi
 
     echo "Running tests in container and saving output to: $log_file"
     ${docker_exec} "\
-        export SGLANG_IS_IN_CI=1 && \
         export PYTHONPATH=/sgl-workspace/sglang/test/registered/hicache:\$PYTHONPATH && \
         cd /test_run/python && \
-        python3 -m pytest test_hicache_storage_mooncake_backend.py -v -s --tb=long" \
+        ${pytest_env}python3 -m pytest test_hicache_storage_mooncake_backend.py -v -s --tb=long" \
         2>&1 | tee "$log_file"
 
     return ${PIPESTATUS[0]}

@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     is_in_ci,
 )
 
-DEFAULT_MHA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-8B"
+ROCM_MHA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-8B"
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
@@ -34,7 +34,9 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
 
     @classmethod
     def _get_model_name(cls):
-        return DEFAULT_MHA_MODEL_NAME_FOR_TEST
+        if os.getenv("CI_ACCELERATOR") == "rocm":
+            return ROCM_MHA_MODEL_NAME_FOR_TEST
+        return super()._get_model_name()
 
     @classmethod
     def setUpClass(cls):

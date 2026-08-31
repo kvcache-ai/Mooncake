@@ -38,8 +38,10 @@ start_server()
 
     local kv_config_json
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
-        # Diagnose vLLM#44238 by serializing Mooncake sender work. Keep every
-        # other serving and transfer parameter identical to the baseline run.
+        # This lane is serialized smoke coverage for basic connector
+        # correctness. It does not exercise concurrent sender workers; that
+        # remains separate coverage while vllm-project/vllm#44238 is unresolved.
+        echo "ROCm vLLM coverage: serialized Mooncake connector smoke (num_workers=1)"
         kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\",\"kv_connector_extra_config\":{\"num_workers\":1}}"
     else
         kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\"}"
@@ -105,9 +107,11 @@ run_proxy()
 
     # Launch proxy
     local pid_file="${PID_DIR}/proxy.pid"
+    local grep_pattern
+    grep_pattern=$(echo "$proxy_script" | grep -oE '[^/]+\.py')
 
     echo "Starting proxy server..."
-    if ! launch_and_track_process "exec $proxy_script" "$proxy_log_path" "$pid_file"; then
+    if ! launch_and_track_process "$proxy_script" "$proxy_log_path" "$pid_file" "$grep_pattern"; then
         return 1
     fi
 
