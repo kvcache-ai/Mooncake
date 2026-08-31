@@ -1253,10 +1253,10 @@ TEST_F(MasterServiceTenantQuotaTest,
 // Without these, a tenant whose effective quota sits at or below the pool-wide
 // eviction_high_watermark_ratio reaches its own ceiling before the pool crosses
 // the pool-wide watermark. EvictionThreadFunc gates on a pool-global used_ratio
-// (strictly greater), and the quota path cannot arm it either -- need_mem_evic-
-// tion_ is only set next to inc_put_start_alloc_failures(), and a quota
-// rejection returns before allocation is attempted. Admission then falls back
-// to the synchronous per-object EvictTenantMemoryForQuota with
+// (strictly greater), and the quota path cannot arm it either:
+// need_mem_eviction_ is only set next to inc_put_start_alloc_failures(), and a
+// quota rejection returns before allocation is attempted. Admission then falls
+// back to the synchronous per-object EvictTenantMemoryForQuota with
 // kMaxTenantQuotaEvictionRetries and starts returning TENANT_QUOTA_EXCEEDED.
 
 TEST_F(MasterServiceTenantQuotaTest,

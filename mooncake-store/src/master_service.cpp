@@ -9195,16 +9195,21 @@ void MasterService::EvictTenantsOverWatermark() {
             continue;
         }
 
-        LOG(INFO) << "[TENANT-EVICT-TRIGGER] tenant=" << snapshot.tenant_id
-                  << " used_ratio=" << used_ratio
-                  << " high_watermark=" << tenant_eviction_high_watermark_ratio_
-                  << " target_ratio=" << target_ratio
-                  << " target_bytes=" << target_bytes;
+        // VLOG rather than INFO: this pass runs once per second and emits a
+        // line per over-watermark tenant, so sustained quota pressure in a
+        // large multi-tenant deployment would flood the log. The pool-level
+        // [EVICT-TRIGGER] above stays at INFO because it is a single line
+        // gated on a pool-wide threshold.
+        VLOG(1) << "[TENANT-EVICT-TRIGGER] tenant=" << snapshot.tenant_id
+                << " used_ratio=" << used_ratio
+                << " high_watermark=" << tenant_eviction_high_watermark_ratio_
+                << " target_ratio=" << target_ratio
+                << " target_bytes=" << target_bytes;
         const TenantQuotaEvictionResult result =
             EvictTenantMemoryForQuota(snapshot.tenant_id, target_bytes);
-        LOG(INFO) << "[TENANT-EVICT-DONE] tenant=" << snapshot.tenant_id
-                  << " freed_bytes=" << result.freed_bytes
-                  << " evicted_objects=" << result.evicted_objects;
+        VLOG(1) << "[TENANT-EVICT-DONE] tenant=" << snapshot.tenant_id
+                << " freed_bytes=" << result.freed_bytes
+                << " evicted_objects=" << result.evicted_objects;
     }
 }
 
