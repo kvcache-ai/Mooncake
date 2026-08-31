@@ -945,6 +945,17 @@ jobs:
       run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
       shell: bash
 
+    - name: Smoke test TENT UB benchmark CLI
+      if: matrix.name == 'ub-mock'
+      run: |
+        cd build-tent
+        help_output="$(./mooncake-transfer-engine/benchmark/tebench \
+          --backend=tent --xport_type=ub --tent_transport_hint=ub \
+          --help 2>&1 || true)"
+        grep -q 'iouring|ub|sunrise_link' <<< "${help_output}"
+        grep -q 'ascend|ub|sunrise_link' <<< "${help_output}"
+      shell: bash
+
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}
       shell: bash
