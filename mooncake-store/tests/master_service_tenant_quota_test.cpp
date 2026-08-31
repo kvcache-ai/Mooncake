@@ -260,6 +260,14 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         return count;
     }
 
+    void SetNeedMemEvictionForTest(MasterService& service, bool value) {
+        service.need_mem_eviction_.store(value, std::memory_order_relaxed);
+    }
+
+    bool GetNeedMemEvictionForTest(MasterService& service) const {
+        return service.need_mem_eviction_.load(std::memory_order_relaxed);
+    }
+
     void DiscardExpiredProcessingForTest(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
@@ -1320,7 +1328,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(Snapshot(service, heavy).charged_bytes,
               static_cast<uint64_t>(fill_count) * kObjectSize);
 
-    service.need_mem_eviction_.store(false, std::memory_order_relaxed);
+    SetNeedMemEvictionForTest(service, false);
     const int64_t attempts_before =
         MasterMetricManager::instance().get_eviction_attempts();
 
@@ -1328,7 +1336,7 @@ TEST_F(MasterServiceTenantQuotaTest,
                                  MemoryConfig());
     ASSERT_FALSE(over.has_value());
     EXPECT_EQ(over.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
-    EXPECT_TRUE(service.need_mem_eviction_.load(std::memory_order_relaxed));
+    EXPECT_TRUE(GetNeedMemEvictionForTest(service));
     EXPECT_GT(MasterMetricManager::instance().get_eviction_attempts(),
               attempts_before);
 }
