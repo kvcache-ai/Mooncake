@@ -43,6 +43,8 @@ class WorkerPool {
     using SliceList = std::vector<Transport::Slice *>;
     const static int kShardCount = 8;
 
+    WorkerPool(RdmaContext &context, int numa_socket_id, bool start_workers);
+
     // Enqueue slices that were prepared by another WorkerPool. Used for
     // local-NIC failure handoff: the original worker keeps the remote path
     // fixed, updates the local lkey, and pushes the slice to this context's
@@ -51,6 +53,10 @@ class WorkerPool {
         const std::vector<Transport::Slice *> &slice_list);
     void enqueuePreparedSlices(SliceList (&slice_list_map)[kShardCount],
                                uint64_t submitted_slice_count);
+    void trackPostedSlices(const SliceList &slice_list, size_t count);
+    void untrackPostedSlices(const ibv_wc *wc_list, int count);
+    SliceList reapTimedOutPostedSlices(uint64_t current_ts);
+    void handleTimedOutPostedSlices(const SliceList &timed_out_slices);
 
     void performPostSend(int thread_id);
 
@@ -90,6 +96,15 @@ class WorkerPool {
     void maybeActivateRecoveredContext();
     bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
                                          const std::string &failed_peer_path);
+    bool noRouteRetryTimedOut(Transport::Slice *slice) const;
+    bool keepNoRouteSlice(Transport::Slice *slice, SliceList &keep,
+                          SliceList &failed, const std::string &reason,
+                          const std::string &peer_nic_path);
+    bool deferNoRouteRedispatch(Transport::Slice *slice, int thread_id,
+                                const std::string &peer_nic_path, int device_id,
+                                bool use_local_queue,
+                                int &shared_redispatch_count,
+                                const std::string &reason);
 
     static bool isLocalWcFailure(const ibv_wc &wc);
 
