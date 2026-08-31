@@ -67,9 +67,7 @@ def _sink(meta, result):
         )
         assert rc == 0, f"batch_register_memory returned {rc}"
         for view, address in zip(views, addresses):
-            read = engine.transfer_sync_read(
-                segment, view.data_ptr(), address, NBYTES
-            )
+            read = engine.transfer_sync_read(segment, view.data_ptr(), address, NBYTES)
             assert read == 0, f"transfer_sync_read returned {read}"
         torch.cuda.synchronize()
 
@@ -81,9 +79,7 @@ def _sink(meta, result):
         # Report the payload before unregistering so a failure below surfaces
         # as itself, not as a missing result.
         result.put(("sink", observed))
-        rc = engine.batch_unregister_memory(
-            [view.data_ptr() for view in views]
-        )
+        rc = engine.batch_unregister_memory([view.data_ptr() for view in views])
         assert rc == 0, f"batch_unregister_memory returned {rc}"
         result.put(("sink", None))
     except Exception as e:  # noqa: BLE001
@@ -94,12 +90,8 @@ def _alias_lifecycle(result):
     try:
         torch.cuda.set_device(0)
         # Offset into the allocation so no sub-range starts at its base.
-        pool = torch.zeros(
-            (BUFFERS + 1) * NBYTES, dtype=torch.uint8, device="cuda:0"
-        )
-        views = [
-            pool[(i + 1) * NBYTES : (i + 2) * NBYTES] for i in range(BUFFERS)
-        ]
+        pool = torch.zeros((BUFFERS + 1) * NBYTES, dtype=torch.uint8, device="cuda:0")
+        views = [pool[(i + 1) * NBYTES : (i + 2) * NBYTES] for i in range(BUFFERS)]
         engine = _engine()
         addresses = [view.data_ptr() for view in views]
 
