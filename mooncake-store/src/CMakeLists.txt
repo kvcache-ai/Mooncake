@@ -10,7 +10,8 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     uds_transport.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
-    utils/file_util.cpp)
+    utils/file_util.cpp
+    nof/nof_runtime.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
@@ -200,10 +201,19 @@ if(STORE_USE_K8S_LEASE)
       "${CMAKE_BINARY_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.h")
 endif()
 
-if(USE_NOF)
-  add_subdirectory(spdk)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES ${SPDK_WRAPPER_SOURCES})
+# NoF support code that is SPDK-free (page-registration bookkeeping and
+# probe-context pooling). Built in every configuration so unit tests can
+# exercise it without SPDK; both mooncake_store and mooncake_nof_spdk link
+# it (the latter cannot link mooncake_store — that would be a cycle).
+add_library(mooncake_nof_core STATIC nof/page_registry.cpp
+                                     nof/probe_context_pool.cpp)
+target_include_directories(mooncake_nof_core
+                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(mooncake_nof_core
+                      PUBLIC glog::glog yalantinglibs::yalantinglibs
+                             cachelib_memory_allocator)
 
+if(USE_NOF)
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
       CACHE PATH "SPDK include directory")
@@ -275,6 +285,44 @@ if(USE_NOF)
       rdmacm
       ssl
       bsd)
+
+  # ---------------------------------------------------------------------------
+  # SPDK-backed NoF initiator implementation, linked PRIVATE so SPDK/DPDK
+  # static libs stop propagating as usage requirements to client/master.
+  # ---------------------------------------------------------------------------
+  add_library(mooncake_nof_spdk STATIC nof/spdk_initiator.cpp)
+  target_include_directories(
+    mooncake_nof_spdk
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  target_link_libraries(mooncake_nof_spdk
+                        PRIVATE ${SPDK_STATIC_LIBS} glog::glog
+                                mooncake_nof_core yalantinglibs::yalantinglibs)
+
+  # spdk_mem_register (SPDK >= 22.05) compile-time probe.
+  # CMAKE_TRY_COMPILE_TARGET_TYPE was added in CMake 3.6 (project requires
+  # 3.16), so check_cxx_source_compiles compiles to a static library and never
+  # links; (void)&spdk_mem_register only needs the declaration to exist.
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR})
+  check_cxx_source_compiles(
+    "#include <spdk/env.h>
+     int main() { (void)&spdk_mem_register; return 0; }"
+    HAVE_SPDK_MEM_REGISTER)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
+  if(HAVE_SPDK_MEM_REGISTER)
+    target_compile_definitions(mooncake_nof_spdk
+                               PRIVATE HAVE_SPDK_MEM_REGISTER=1)
+  else()
+    message(
+      WARNING
+      "spdk_mem_register not found under ${SPDK_INCLUDE_DIR} "
+      "(SPDK < 22.05?). NoF-over-RDMA user-buffer registration (#3131) "
+      "will remain unfixed: pure-NoF writes over RDMA will fail with "
+      "'No translation for ptr' errors.")
+  endif()
 endif()
 
 # Resolve target-independent configuration before defining the Store targets.
@@ -395,10 +443,6 @@ if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
 endif()
-if(USE_NOF)
-  target_include_directories(mooncake_store_client_objects
-                             PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
-endif()
 if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_URING)
   target_link_libraries(mooncake_store_client_objects
@@ -459,6 +503,12 @@ endif()
 if(USE_UB)
   target_link_libraries(mooncake_store_master PRIVATE ub_allocator)
 endif()
+if(USE_NOF)
+  # The master-side NoF heartbeat probe path (master_service.cpp) goes through
+  # the neutral interface in nof/nof_runtime.cpp (shared sources) into the
+  # SPDK-backed initiator.
+  target_link_libraries(mooncake_store_master PRIVATE mooncake_nof_spdk)
+endif()
 
 # Complete public Store library.
 add_library(
@@ -474,13 +524,18 @@ target_link_libraries(
          ${ETCD_WRAPPER_LIB}
          glog::glog
          ${EXTRA_LIBS}
-         ${SPDK_STATIC_LIBS}
          mooncake_common
          Mooncake::zstd
          asio_shared
          transfer_engine
+         mooncake_nof_core
          yalantinglibs::yalantinglibs
   PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash numa)
+if(USE_NOF)
+  # SPDK/DPDK stay confined to mooncake_nof_spdk (PRIVATE) instead of
+  # propagating to every mooncake_store consumer.
+  target_link_libraries(mooncake_store PRIVATE mooncake_nof_spdk)
+endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()

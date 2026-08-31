@@ -9,7 +9,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
+#include <algorithm>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -23,6 +25,8 @@
 
 #include "config.h"
 #include "real_client.h"
+#include "nof/dma_buffer_allocator.h"
+#include "nof/nvmeof_initiator.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -2707,6 +2711,111 @@ TEST_F(RealClientTest, SunriseLinkHostPutGetRemove) {
     EXPECT_EQ(py_client_->isExist(key), 0);
 }
 #endif
+
+namespace {
+
+// Records RegisterMemory/UnregisterMemory calls so tests can assert on the
+// client-side NoF registration lifecycle without SPDK.
+class RecordingNofInitiator : public NVMeoFInitiator {
+   public:
+    NofSegmentHandle* OpenSegment(const std::string&) override {
+        return nullptr;
+    }
+    bool ProbeSegment(const std::string&, uint32_t, std::string*) override {
+        return false;
+    }
+    uint32_t GetBlockSize(const NofSegmentHandle*) override {
+        return kInvalidBlockSize;
+    }
+    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
+                 NofIOAdaptor*) override {
+        return -EINVAL;
+    }
+    int64_t PollCompletion(NofSegmentHandle*, uint32_t) override { return 0; }
+
+    ErrorCode RegisterMemory(void* ptr, size_t size) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++register_calls_;
+        registered_[ptr] = size;
+        return ErrorCode::OK;
+    }
+
+    ErrorCode UnregisterMemory(void* ptr) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++unregister_calls_;
+        unregistered_.push_back(ptr);
+        return ErrorCode::OK;
+    }
+
+    NofCapabilities GetCapabilities() const override { return {}; }
+
+    bool WasUnregistered(void* ptr) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return std::find(unregistered_.begin(), unregistered_.end(), ptr) !=
+               unregistered_.end();
+    }
+
+    mutable std::mutex mu_;
+    int register_calls_ = 0;
+    int unregister_calls_ = 0;
+    std::map<void*, size_t> registered_;
+    std::vector<void*> unregistered_;
+};
+
+// Clears the NoF runtime factory seam even when the test body fails.
+struct NofFactoryGuard {
+    ~NofFactoryGuard() { RealClient::SetNofRuntimeFactoryForTesting(nullptr); }
+};
+
+}  // namespace
+
+// Regression test: closing a client without manually unregistering every
+// buffer must still release its SPDK registrations (they live in the
+// process-global page registry, so orphaned entries would outlive the client
+// and a reopened client could reuse stale translation state).
+TEST_F(RealClientTest, TearDownWithoutUnregisterReleasesNofRegistrations) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17931", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(initiator->register_calls_, 1);
+
+    // Close WITHOUT unregister_buffer: teardown must release the
+    // registration anyway.
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
+
+    // Reopen: a new client with a fresh initiator registers the same buffer
+    // cleanly, with no stale state carried over.
+    auto initiator2 = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator2]() {
+        return NofRuntime{initiator2, std::make_shared<SystemDmaAllocator>()};
+    });
+    py_client_ = RealClient::create();
+    ASSERT_EQ(py_client_->setup_real("localhost:17932", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(initiator2->register_calls_, 1);
+    EXPECT_EQ(initiator->register_calls_, 1);  // old initiator untouched
+
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_TRUE(initiator2->WasUnregistered(buffer.data()));
+}
 
 }  // namespace testing
 

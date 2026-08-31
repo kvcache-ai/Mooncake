@@ -37,9 +37,7 @@
 #include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
+#include "nof/nof_runtime.h"
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -247,6 +245,12 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
         };
     }
     return ((*client).*write)(keys, batched_slices.value(), config, stager);
+}
+
+// Backing slot for RealClient::SetNofRuntimeFactoryForTesting.
+std::function<NofRuntime()> &NofRuntimeFactoryForTestingSlot() {
+    static std::function<NofRuntime()> factory;
+    return factory;
 }
 
 #ifdef USE_ASCEND_DIRECT
@@ -751,6 +755,11 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+void RealClient::SetNofRuntimeFactoryForTesting(
+    std::function<NofRuntime()> factory) {
+    NofRuntimeFactoryForTestingSlot() = std::move(factory);
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -776,12 +785,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
-#ifdef USE_NOF
-    if (!SpdkWrapper::GetInstance().InitializeEnv()) {
-        LOG(ERROR) << "spdk env init fail";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-#endif
+    // The SPDK env initializes lazily on first use, so setup no longer
+    // fail-fasts.
+    auto &nof_factory = NofRuntimeFactoryForTestingSlot();
+    nof_runtime_ = nof_factory ? nof_factory() : CreateNofRuntime();
 
     std::optional<std::string> device_name =
         ((rdma_devices.empty() || rdma_devices == "auto-discovery")
@@ -806,7 +813,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
             master_server_addr, transfer_engine, {{"client_mode", "real"}},
-            tenant_id);
+            tenant_id, nof_runtime_.initiator);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -844,7 +851,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
                 master_server_addr, transfer_engine, {{"client_mode", "real"}},
-                tenant_id);
+                tenant_id, nof_runtime_.initiator);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -873,13 +880,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    bool use_spdk_dma_for_client_buffer = false;
-#ifdef USE_NOF
-    use_spdk_dma_for_client_buffer = true;
-#endif
+    // Inject the SPDK DMA allocator only when NoF is actually available;
+    // otherwise pass nullptr so allocate_buffer_allocator_memory falls
+    // through to exactly the same path as use_spdk_dma=false today
+    // (protocol-specific allocation -> VRAM -> aligned_alloc).
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
-        use_spdk_dma_for_client_buffer);
+        nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -1377,6 +1384,24 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
     // Reset all resources
     client_.reset();
+    // NoF I/O is drained by now: destroying client_ destroys the transfer
+    // engine, and NofWorkerPool workers only exit once every outstanding
+    // sub-I/O has completed. Release this client's SPDK registrations so a
+    // closed client never leaves orphan entries in the process-global page
+    // registry — its buffers may be freed or remapped afterwards, and
+    // another client could otherwise reuse stale translation state.
+    if (nof_runtime_.initiator) {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        for (const auto &[buffer, size] : registered_buffer_sizes_) {
+            auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
+            if (rc != ErrorCode::OK) {
+                LOG(WARNING) << "Failed to release NoF registration for "
+                                "buffer "
+                             << buffer << " on teardown: " << toString(rc);
+            }
+        }
+        registered_buffer_sizes_.clear();
+    }
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -3384,6 +3409,24 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     if (!result) {
         return result;
     }
+    // #3131: SPDK's RDMA transport keeps its own translation table, which TE
+    // registration does not cover. Once TE registration succeeds, register
+    // with the initiator; on failure roll back the TE registration so no
+    // half-registered state is left behind.
+    if (nof_runtime_.initiator) {
+        auto rc = nof_runtime_.initiator->RegisterMemory(buffer, size);
+        if (rc != ErrorCode::OK) {
+            LOG(ERROR) << "Initiator memory registration failed, rolling "
+                          "back TE registration: "
+                       << toString(rc);
+            auto rollback = client_->unregisterLocalMemory(buffer, true);
+            if (!rollback) {
+                LOG(ERROR) << "TE rollback failed for buffer " << buffer << ": "
+                           << toString(rollback.error());
+            }
+            return tl::unexpected(rc);
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         registered_buffer_sizes_[buffer] = size;
@@ -3406,6 +3449,15 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Unregister buffer failed with error: "
                    << toString(unregister_result.error());
         return tl::unexpected(unregister_result.error());
+    }
+    if (nof_runtime_.initiator) {
+        auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
+        if (rc != ErrorCode::OK) {
+            // The TE unregistration can no longer be rolled back; warn and
+            // continue (same severity as existing unregister failures).
+            LOG(WARNING) << "Initiator memory unregistration failed: "
+                         << toString(rc);
+        }
     }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
