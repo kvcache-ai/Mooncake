@@ -57,10 +57,12 @@ class WrappedMasterService {
                             GetReplicaListRequestConfig());
 
     // Bypass (out-of-band attachment) RPC handlers for the read route. They
-    // share the read logic with the in-process GetReplicaList / BatchGetReplicaList
-    // (which tests/HTTP call directly) but read the per-request request_id from
-    // the coro_rpc out-of-band attachment set client-side, and reply via
-    // ctx.response_msg.
+    // delegate to the value-returning GetReplicaList / BatchGetReplicaList
+    // (also used in-process by tests and HTTP /batch_query_keys), so the read,
+    // logging and metrics logic lives in one place. These handlers only: fold
+    // the per-request request_id (read from the coro_rpc out-of-band
+    // attachment set client-side) into a config copy, invoke the shared body,
+    // and reply via ctx.response_msg.
     void GetReplicaListRpc(
         coro_rpc::context<tl::expected<GetReplicaListResponse, ErrorCode>> ctx,
         std::string_view key, const GetReplicaListRequestConfig& config =
