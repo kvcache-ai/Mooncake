@@ -262,9 +262,8 @@ class Workers {
     uint64_t slice_timeout_ns_;
     uint64_t priority_promotion_timeout_ns_;  // Timeout for priority promotion
     // Opt-in (issue #2528): when true, a promotion pass promotes exactly the
-    // entries that have themselves timed out, instead of promoting the whole
-    // queue whenever only the head has timed out. Default false keeps the
-    // historical "flush the tier" behavior.
+    // entries that have themselves timed out (DecidePromotionPerEntry).
+    // Default false keeps DecidePromotionHeadOnly ("flush the tier").
     bool priority_promotion_per_entry_ = false;
 
     std::unique_ptr<DeviceSelector> device_selector_;

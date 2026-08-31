@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Deterministic reproduction of the promotion issues reported in #2528. The
-// historical head-only policy is contrasted with a per-entry policy on the same
-// inputs so the unintended behavior is unambiguous and re-runnable (no RDMA
-// stack, no timing noise).
+// Pins both promotion policies used by Workers::promoteTimedOutRequests
+// (issue #2528). Head-only is the default; per-entry is opt-in via
+// transports/rdma/priority_promotion_per_entry. Contrasted on the same inputs
+// so the default "flush the tier" behavior stays unambiguous (no RDMA stack,
+// no timing noise).
 
 #include "tent/transport/rdma/promotion_policy.h"
 
@@ -44,7 +45,7 @@ TEST(PromotionPolicyTest, HeadOnlyPromotesFreshEntriesWhenHeadTimedOut) {
 
     auto d = DecidePromotionHeadOnly(q, kNow, kTimeout);
 
-    // BUG: all three are promoted, including the two fresh (non-starving) ones.
+    // Default policy: all three are promoted, including the two fresh ones.
     EXPECT_EQ(d.promote_indices, (std::vector<size_t>{0, 1, 2}));
 
     // The per-entry policy promotes only the genuinely starving head.
@@ -58,7 +59,7 @@ TEST(PromotionPolicyTest, HeadOnlyMissesTimedOutTailWhenHeadFresh) {
 
     auto d = DecidePromotionHeadOnly(q, kNow, kTimeout);
 
-    // BUG: nothing is promoted even though indices 1 and 2 are starving.
+    // Default policy: nothing is promoted even though indices 1 and 2 starve.
     EXPECT_TRUE(d.promote_indices.empty());
 
     auto fixed = DecidePromotionPerEntry(q, kNow, kTimeout);
@@ -86,7 +87,7 @@ TEST(PromotionPolicyTest, ZeroTimestampNeverTimesOut) {
 
 TEST(PromotionPolicyTest, AllTimedOutPromotesAllUnderBothPolicies) {
     // When every entry is starving the two policies agree — this is the case
-    // the historical policy was designed around.
+    // the default head-only policy was designed around.
     std::vector<uint64_t> q = {timedOut(), timedOut(), timedOut()};
     EXPECT_EQ(DecidePromotionHeadOnly(q, kNow, kTimeout).promote_indices,
               (std::vector<size_t>{0, 1, 2}));
