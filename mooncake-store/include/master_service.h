@@ -1005,6 +1005,11 @@ class MasterService {
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const;
+    // Caller holds the Replica owner's retaining guard.
+    auto AddReplicaForRetainedClient(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, Replica& replica)
+        -> tl::expected<bool, ErrorCode>;
     // Caller must hold client_mutex_.
     std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
         const;
@@ -2949,6 +2954,10 @@ class MasterService {
         OrderedOpLogWriter::Reservation&& reservation, OpType type,
         const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
+
+    // Standby-restored memory endpoints remain unreadable until the owning
+    // Client has successfully remounted them.
+    std::unordered_set<std::string> invalid_replica_endpoints_;
 
     // Keep DummyBufferAllocator alive after standby restore.
     // Key: transport_endpoint, Value: allocator.

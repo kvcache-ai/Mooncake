@@ -62,14 +62,16 @@ class ClientOffboardingWorker {
 
     void Start();
     void Stop();
-    [[nodiscard]] bool Schedule(ClientOffboardingJob job);
     [[nodiscard]] bool HasPending() const {
         return pending_jobs_.load(std::memory_order_acquire) != 0;
     }
 
    private:
+    friend class MasterService;
     friend class test::MasterServiceTest;
 
+    void ReserveJob();
+    void ScheduleReserved(ClientOffboardingJob job);
     void ThreadFunc();
     void CompleteJob(const ClientOffboardingJob& job);
     void DropJob(const ClientOffboardingJob& job, const char* reason);

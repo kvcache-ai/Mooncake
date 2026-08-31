@@ -8,6 +8,7 @@ namespace mooncake {
 
 class ScopedNoFSegmentAccess;
 class ScopedSegmentAccess;
+class SegmentSerializer;
 template <typename T>
 class Serializer;
 class SegmentAllocatorRegistration {
@@ -24,13 +25,17 @@ class SegmentAllocatorRegistration {
     void BindAllocator(std::shared_ptr<BufferAllocatorBase> replacement);
     void BindClientLiveness(std::shared_ptr<ClientLivenessRecord> record);
     void BindBuffer(AllocatedBuffer& buffer) const;
-    void Invalidate() { lifetime_.setAvailable(false); }
+    [[nodiscard]] bool OwnsBuffer(const AllocatedBuffer& buffer) const;
+    void SetAllocatable(bool allocatable);
+    void Invalidate();
     std::shared_ptr<BufferAllocatorBase> allocator_;
-    SegmentLifetime lifetime_;
+    SegmentLifetime allocation_lifetime_;
+    SegmentLifetime buffer_lifetime_;
     std::shared_ptr<ClientLivenessRecord> client_liveness_;
     friend class AllocatorManager;
     friend class ScopedNoFSegmentAccess;
     friend class ScopedSegmentAccess;
+    friend class SegmentSerializer;
     friend class Serializer<AllocatedBuffer>;
 };
 

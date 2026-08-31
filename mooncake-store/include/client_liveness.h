@@ -59,17 +59,11 @@ class ClientLivenessRecord {
         RetainingGuard(RetainingGuard&&) noexcept = default;
         RetainingGuard& operator=(RetainingGuard&&) noexcept = default;
 
-        [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
-            return record_->CommitObservationLocked(now);
-        }
-
        private:
         friend class ClientLivenessRecord;
-        RetainingGuard(ClientLivenessRecord* record,
-                       std::unique_lock<std::mutex>&& lock)
-            : record_(record), lock_(std::move(lock)) {}
+        explicit RetainingGuard(std::unique_lock<std::mutex>&& lock)
+            : lock_(std::move(lock)) {}
 
-        ClientLivenessRecord* record_;
         std::unique_lock<std::mutex> lock_;
     };
 
@@ -100,7 +94,7 @@ class ClientLivenessRecord {
             ClientLivenessState::OFFLINE) {
             return std::nullopt;
         }
-        return RetainingGuard(this, std::move(lock));
+        return RetainingGuard(std::move(lock));
     }
 
     [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
@@ -124,28 +118,6 @@ class ClientLivenessRecord {
         return CommitObservationLocked(now, current_state);
     }
 
-    template <typename Operation>
-    [[nodiscard]] bool RunIfServing(Operation&& operation) {
-        std::lock_guard<std::mutex> lock(transition_mutex_);
-        if (state_.load(std::memory_order_relaxed) !=
-            ClientLivenessState::ACTIVE) {
-            return false;
-        }
-        std::forward<Operation>(operation)();
-        return true;
-    }
-
-    template <typename Operation>
-    [[nodiscard]] bool RunUnlessOffline(Operation&& operation) {
-        std::lock_guard<std::mutex> lock(transition_mutex_);
-        if (state_.load(std::memory_order_relaxed) ==
-            ClientLivenessState::OFFLINE) {
-            return false;
-        }
-        std::forward<Operation>(operation)();
-        return true;
-    }
-
     [[nodiscard]] ClientLivenessTransition Evaluate(
         TimePoint now, Clock::duration active_ttl,
         Clock::duration suspicion_ttl) {
@@ -156,6 +128,17 @@ class ClientLivenessRecord {
     [[nodiscard]] ClientLivenessTransition EvaluateAndRetire(
         TimePoint now, Clock::duration active_ttl,
         Clock::duration suspicion_ttl, RetireOperation&& retire_operation) {
+        return EvaluateAndRetire(now, active_ttl, suspicion_ttl, [] {},
+                                 std::forward<RetireOperation>(
+                                     retire_operation));
+    }
+
+    template <typename ReserveRetirement, typename RetireOperation>
+    [[nodiscard]] ClientLivenessTransition EvaluateAndRetire(
+        TimePoint now, Clock::duration active_ttl,
+        Clock::duration suspicion_ttl,
+        ReserveRetirement&& reserve_retirement,
+        RetireOperation&& retire_operation) {
         ClientLivenessTransition transition = ClientLivenessTransition::NONE;
         {
             std::lock_guard<std::mutex> lock(transition_mutex_);
@@ -170,6 +153,9 @@ class ClientLivenessRecord {
                     break;
                 case ClientLivenessState::SUSPECTED:
                     if (now - suspected_since_ >= suspicion_ttl) {
+                        // Publish the external barrier before OFFLINE so a
+                        // concurrent snapshot cannot miss terminal work.
+                        std::forward<ReserveRetirement>(reserve_retirement)();
                         state_.store(ClientLivenessState::OFFLINE,
                                      std::memory_order_release);
                         transition = ClientLivenessTransition::BECAME_OFFLINE;
@@ -189,12 +175,6 @@ class ClientLivenessRecord {
     }
 
    private:
-    [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
-        TimePoint now) {
-        return CommitObservationLocked(now,
-                                       state_.load(std::memory_order_relaxed));
-    }
-
     [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
         TimePoint now, ClientLivenessState current_state) {
         last_liveness_at_ = now;

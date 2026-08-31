@@ -45,6 +45,7 @@ static constexpr size_t kAllocatorUnknownFreeSpace =
 // Forward declarations
 class BufferAllocatorBase;
 class Replica;
+class SegmentAllocatorRegistration;
 
 class SegmentLifetime {
    public:
@@ -56,6 +57,10 @@ class SegmentLifetime {
 
     void setAvailable(bool available) const {
         available_->store(available, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool operator==(const SegmentLifetime& other) const {
+        return available_ == other.available_;
     }
 
    private:
@@ -109,15 +114,15 @@ class AllocatedBuffer {
         return !record || record->IsServing();
     }
 
-    void bindSegmentLifetime(SegmentLifetime lifetime) {
-        segment_lifetime_ = std::move(lifetime);
-    }
-
     void bindClientLiveness(
         std::shared_ptr<ClientLivenessRecord> client_liveness) {
         std::atomic_store_explicit(&client_liveness_,
                                    std::move(client_liveness),
                                    std::memory_order_release);
+    }
+
+    void bindSegmentLifetime(SegmentLifetime lifetime) {
+        segment_lifetime_ = std::move(lifetime);
     }
 
     [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
@@ -164,6 +169,7 @@ class AllocatedBuffer {
 
     friend class Serializer<AllocatedBuffer>;
     friend class Replica;
+    friend class SegmentAllocatorRegistration;
 };
 
 /**

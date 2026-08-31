@@ -3357,7 +3357,7 @@ TEST_F(MasterServiceSnapshotTest, CopyStart) {
 
     // Mount 4 segments (segment_1, segment_2, segment_3, segment_4) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
+    const auto context1 =
         PrepareSimpleSegment(*service_, "segment_1");
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
@@ -3366,7 +3366,7 @@ TEST_F(MasterServiceSnapshotTest, CopyStart) {
     [[maybe_unused]] const auto context4 =
         PrepareSimpleSegment(*service_, "segment_4");
 
-    UUID client_id = generate_uuid();
+    UUID client_id = context1.client_id;
 
     // Test Case 1: CopyStart a non-existent key, should fail.
     auto copy_result =
@@ -3501,15 +3501,15 @@ TEST_F(MasterServiceSnapshotTest, CopyEnd) {
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
+    const auto context1 =
         PrepareSimpleSegment(*service_, "segment_1");
-    [[maybe_unused]] const auto context2 =
+    const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyEnd a non-existent key, should fail.
     auto copy_end_result =
@@ -3616,13 +3616,13 @@ TEST_F(MasterServiceSnapshotTest, CopyRevoke) {
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
+    const auto context1 =
         PrepareSimpleSegment(*service_, "segment_1");
-    [[maybe_unused]] const auto context2 =
+    const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyRevoke a non-existent key, should fail.
     auto copy_revoke_result = service_->CopyRevoke(
@@ -3707,13 +3707,13 @@ TEST_F(MasterServiceSnapshotTest, MoveEnd) {
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
+    const auto context1 =
         PrepareSimpleSegment(*service_, "segment_1");
-    [[maybe_unused]] const auto context2 =
+    const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveEnd a non-existent key, should fail.
     auto move_end_result =
@@ -3789,13 +3789,13 @@ TEST_F(MasterServiceSnapshotTest, MoveRevoke) {
     service_.reset(new MasterService());
 
     // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
+    const auto context1 =
         PrepareSimpleSegment(*service_, "segment_1");
-    [[maybe_unused]] const auto context2 =
+    const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveRevoke a non-existent key, should fail.
     auto move_revoke_result = service_->MoveRevoke(
@@ -3887,14 +3887,14 @@ TEST_F(MasterServiceSnapshotTest, MoveStart) {
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
+    const auto context1 =
         PrepareSimpleSegment(*service_, "segment_1");
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
+    UUID client_id = context1.client_id;
 
     // Test Case 1: MoveStart a non-existent key, should fail.
     auto move_start_result =
@@ -4038,12 +4038,12 @@ TEST_F(MasterServiceSnapshotTest, ProtectCopyMoveSourceFromEviction) {
     // 16 MB
     constexpr size_t kBaseAddr = 0x100000000;
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;  // 16 MB
-    [[maybe_unused]] const auto context1 =
+    const auto context1 =
         PrepareSimpleSegment(*service_, "segment_1", kBaseAddr, kSegmentSize);
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2", kBaseAddr, kSegmentSize);
 
-    UUID client_id = generate_uuid();
+    UUID client_id = context1.client_id;
 
     const std::string copy_key = "copy_key";
     const std::string move_key = "move_key";

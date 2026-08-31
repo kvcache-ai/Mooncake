@@ -113,7 +113,7 @@ class ScopedSegmentAccess {
      */
     ErrorCode MountSegment(
         const Segment& segment, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness = nullptr);
+        std::shared_ptr<ClientLivenessRecord> client_liveness);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -178,6 +178,8 @@ class ScopedSegmentAccess {
     void BindClientLiveness(
         const UUID& client_id,
         const std::shared_ptr<ClientLivenessRecord>& client_liveness);
+    void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
+    [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**
      * @brief Get the names of all the segments
@@ -245,6 +247,9 @@ class ScopedSegmentAccess {
                                      SegmentStatus status);
 
    private:
+    void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,
+                                        const std::string& segment_name);
+
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
 };
