@@ -7,6 +7,7 @@
 #include <thread>
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_rpc/coro_rpc_context.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_service.h"
@@ -54,6 +55,24 @@ class WrappedMasterService {
     BatchGetReplicaList(const std::vector<std::string_view>& keys,
                         const GetReplicaListRequestConfig& config =
                             GetReplicaListRequestConfig());
+
+    // Bypass (out-of-band attachment) RPC handlers for the read route. They
+    // share the read logic with the in-process GetReplicaList / BatchGetReplicaList
+    // (which tests/HTTP call directly) but read the per-request request_id from
+    // the coro_rpc out-of-band attachment set client-side, and reply via
+    // ctx.response_msg.
+    void GetReplicaListRpc(
+        coro_rpc::context<tl::expected<GetReplicaListResponse, ErrorCode>> ctx,
+        std::string_view key, const GetReplicaListRequestConfig& config =
+                                  GetReplicaListRequestConfig());
+
+    void BatchGetReplicaListRpc(
+        coro_rpc::context<
+            std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>
+            ctx,
+        const std::vector<std::string_view>& keys,
+        const GetReplicaListRequestConfig& config =
+            GetReplicaListRequestConfig());
 
     tl::expected<void, ErrorCode> Remove(std::string_view key,
                                          bool force = false);

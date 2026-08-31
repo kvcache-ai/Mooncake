@@ -479,6 +479,91 @@ WrappedMasterService::HeartbeatServiceReady() {
     return response;
 }
 
+void
+WrappedMasterService::GetReplicaListRpc(
+    coro_rpc::context<tl::expected<GetReplicaListResponse, ErrorCode>> ctx,
+    std::string_view key, const GetReplicaListRequestConfig& config) {
+    // Bypass: the per-request request_id rides the out-of-band request
+    // attachment (set client-side from g_current_ctx via
+    // send_request_with_attachment). Fall back to the struct_pack::compatible
+    // config.request_id so the not-yet-converted dummy hop-A read path (which
+    // stamps the field) still reports an id; once that hop is converted the
+    // fallback can be dropped.
+    std::string request_id = config.request_id.value_or("");
+    if (auto att = ctx.get_context_info()->get_request_attachment();
+        !att.empty()) {
+        request_id.assign(att);
+    }
+
+    ScopedVLogTimer timer(1, "GetReplicaList");
+    timer.LogRequest("key=", key, ", request_id=", request_id);
+    MasterMetricManager::instance().inc_get_replica_list_requests();
+
+    auto result = GetMasterService().GetReplicaList(key, config);
+    if (!result.has_value()) {
+        MasterMetricManager::instance().inc_get_replica_list_failures();
+    }
+    timer.LogResponseExpected(result);
+
+    ctx.response_msg(std::move(result));
+}
+
+void
+WrappedMasterService::BatchGetReplicaListRpc(
+    coro_rpc::context<
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>
+        ctx,
+    const std::vector<std::string_view>& keys,
+    const GetReplicaListRequestConfig& config) {
+    std::string request_id = config.request_id.value_or("");
+    if (auto att = ctx.get_context_info()->get_request_attachment();
+        !att.empty()) {
+        request_id.assign(att);
+    }
+
+    ScopedVLogTimer timer(1, "BatchGetReplicaList");
+    const size_t total_requests = keys.size();
+    timer.LogRequest("requests_count=", total_requests, ", request_id=", request_id);
+    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
+        total_requests);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
+    results.reserve(total_requests);
+    for (const auto& key : keys) {
+        results.emplace_back(GetMasterService().GetReplicaList(key, config));
+    }
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            auto error = results[i].error();
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
+                        << keys[i] << "': " << toString(error);
+            } else {
+                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
+                           << "] '" << keys[i] << "': " << toString(error);
+            }
+        }
+    }
+
+    if (failure_count == total_requests) {
+        MasterMetricManager::instance().inc_batch_get_replica_list_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance()
+            .inc_batch_get_replica_list_partial_success(failure_count);
+    }
+
+    timer.LogResponse("total=", results.size(), ", success=",
+                      results.size() - failure_count, ", failures=",
+                      failure_count);
+
+    ctx.response_msg(std::move(results));
+}
+
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                         mooncake::WrappedMasterService& wrapped_master_service,
                         bool include_heartbeat) {
@@ -489,10 +574,10 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
     server.register_handler<
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
+    server.register_handler<&mooncake::WrappedMasterService::GetReplicaListRpc>(
         &wrapped_master_service);
     server
-        .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
+        .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaListRpc>(
             &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Remove>(
         &wrapped_master_service);
