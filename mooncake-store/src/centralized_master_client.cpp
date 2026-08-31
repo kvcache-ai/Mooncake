@@ -129,16 +129,9 @@ CentralizedMasterClient::PutStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
-    // Stamp the calling thread's request_id (if any) into a write-route copy so
-    // it rides config.request_id (the compatible field) to the master, mirroring
-    // the read path. On a dummy server thread g_current_ctx is unset, so this is
-    // a no-op that preserves a request_id already carried across hop A.
-    ReplicateConfig stamped_config = config;
-    apply_current_request_id(stamped_config.request_id);
-
     auto result = invoke_rpc<&WrappedCentralizedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
-        client_id_, key, total_slice_length, stamped_config);
+        client_id_, key, total_slice_length, config);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -161,14 +154,10 @@ CentralizedMasterClient::BatchPutStart(
         total_slice_lengths.emplace_back(total_slice_length);
     }
 
-    // See PutStart: stamp request_id into a write-route copy for the master hop.
-    ReplicateConfig stamped_config = config;
-    apply_current_request_id(stamped_config.request_id);
-
     auto result =
         invoke_batch_rpc<&WrappedCentralizedMasterService::BatchPutStart,
                          std::vector<Replica::Descriptor>>(
-            keys.size(), client_id_, keys, total_slice_lengths, stamped_config);
+            keys.size(), client_id_, keys, total_slice_lengths, config);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
