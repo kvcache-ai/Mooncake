@@ -16,6 +16,19 @@ eviction_ratio: 0.1
 # usage-ratio eviction; allocation-failure-triggered eviction remains enabled.
 eviction_high_watermark_ratio: 1.0
 
+# Per-tenant eviction watermark, as a fraction of each tenant's OWN effective
+# quota. 0.0 (the code default) disables it and keeps the historical behaviour.
+#
+# Only relevant with enable_multi_tenants. Because effective quotas sum to
+# exactly the pool capacity, at most one tenant's share can exceed
+# eviction_high_watermark_ratio; every other tenant reaches its own ceiling
+# before the pool crosses the pool-wide watermark, so the background evictor
+# never runs for it and admission degrades to a synchronous per-object
+# evict-and-retry that rejects writes with TENANT_QUOTA_EXCEEDED. Setting this
+# (0.9 mirrors the pool default) gives each tenant its own bulk-eviction
+# trigger so it evicts to make room instead of rejecting.
+tenant_eviction_high_watermark_ratio: 0.0
+
 # Dynamic MEMORY replica fanout is disabled by default. Replica removal is
 # driven by the existing memory eviction/reclaim path; when a dynamic replica
 # is evicted, Master records a short recreate cooldown so hot-read admission
