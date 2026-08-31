@@ -56,6 +56,8 @@ class BenchRunner {
 
     virtual size_t getTargetCount() const = 0;
 
+    virtual size_t getTargetIndex(int thread_id) const = 0;
+
     virtual uint64_t getTargetSegmentId(int thread_id) const = 0;
 
     virtual uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,

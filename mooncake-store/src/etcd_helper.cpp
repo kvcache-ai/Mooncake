@@ -116,6 +116,68 @@ ErrorCode EtcdHelper::CreateWithLease(const char* key, const size_t key_size,
     }
 }
 
+ErrorCode EtcdHelper::AcquireMaintenanceSession(
+    std::string_view key, int64_t lease_ttl, int64_t& session_handle,
+    EtcdLeaseId& lease_id, EtcdRevisionId& create_revision) {
+    char* err_msg = nullptr;
+    GoInt64 go_session_handle = 0;
+    GoInt64 go_lease_id = 0;
+    GoInt64 go_create_revision = 0;
+    int ret = EtcdStoreAcquireMaintenanceSessionWrapper(
+        const_cast<char*>(key.data()), static_cast<int>(key.size()),
+        static_cast<GoInt64>(lease_ttl), &go_session_handle, &go_lease_id,
+        &go_create_revision, &err_msg);
+    if (ret == -2) {
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
+    }
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to acquire maintenance session: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    session_handle = static_cast<int64_t>(go_session_handle);
+    lease_id = static_cast<EtcdLeaseId>(go_lease_id);
+    create_revision = static_cast<EtcdRevisionId>(go_create_revision);
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::CloseMaintenanceSession(int64_t session_handle) {
+    char* err_msg = nullptr;
+    int ret = EtcdStoreCloseMaintenanceSessionWrapper(
+        static_cast<GoInt64>(session_handle), &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to close maintenance session: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+tl::expected<bool, ErrorCode> EtcdHelper::MaintenanceSessionAlive(
+    int64_t session_handle) {
+    char* err_msg = nullptr;
+    int ret = EtcdStoreMaintenanceSessionAliveWrapper(
+        static_cast<GoInt64>(session_handle), &err_msg);
+    if (ret < 0) {
+        LOG(ERROR) << "Failed to check maintenance session: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    return ret == 1;
+}
+
 ErrorCode EtcdHelper::BatchCreate(const std::vector<std::string>& keys,
                                   const std::vector<std::string>& values) {
     if (keys.size() != values.size()) {
@@ -163,11 +225,13 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
     std::vector<int> compare_kinds;
     std::vector<char*> compare_values;
     std::vector<int> compare_value_sizes;
+    std::vector<GoInt64> compare_revisions;
     compare_keys.reserve(compares.size());
     compare_key_sizes.reserve(compares.size());
     compare_kinds.reserve(compares.size());
     compare_values.reserve(compares.size());
     compare_value_sizes.reserve(compares.size());
+    compare_revisions.reserve(compares.size());
     for (const auto& compare : compares) {
         compare_keys.push_back(const_cast<char*>(compare.key.data()));
         compare_key_sizes.push_back(static_cast<int>(compare.key.size()));
@@ -176,6 +240,8 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
             const_cast<char*>(compare.expected_value.data()));
         compare_value_sizes.push_back(
             static_cast<int>(compare.expected_value.size()));
+        compare_revisions.push_back(
+            static_cast<GoInt64>(compare.expected_revision));
     }
 
     std::vector<char*> put_keys;
@@ -197,9 +263,9 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
     int ret = EtcdStoreTxnCompareAndPutWrapper(
         compare_keys.data(), compare_key_sizes.data(), compare_kinds.data(),
         compare_values.data(), compare_value_sizes.data(),
-        static_cast<int>(compares.size()), put_keys.data(),
-        put_key_sizes.data(), put_values.data(), put_value_sizes.data(),
-        static_cast<int>(puts.size()), &err_msg);
+        compare_revisions.data(), static_cast<int>(compares.size()),
+        put_keys.data(), put_key_sizes.data(), put_values.data(),
+        put_value_sizes.data(), static_cast<int>(puts.size()), &err_msg);
     if (ret == -2) {
         if (err_msg != nullptr) {
             free(err_msg);
@@ -495,6 +561,31 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     (void)etcd_endpoints;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::AcquireMaintenanceSession(
+    std::string_view key, int64_t lease_ttl, int64_t& session_handle,
+    EtcdLeaseId& lease_id, EtcdRevisionId& create_revision) {
+    (void)key;
+    (void)lease_ttl;
+    (void)session_handle;
+    (void)lease_id;
+    (void)create_revision;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::CloseMaintenanceSession(int64_t session_handle) {
+    (void)session_handle;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+tl::expected<bool, ErrorCode> EtcdHelper::MaintenanceSessionAlive(
+    int64_t session_handle) {
+    (void)session_handle;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
 }
 
 ErrorCode EtcdHelper::ResetEtcdStoreClient(const std::string& etcd_endpoints) {

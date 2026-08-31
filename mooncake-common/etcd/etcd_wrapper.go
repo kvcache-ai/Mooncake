@@ -35,6 +35,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,7 @@ import (
 
 	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
 // prefixWatchInfo stores cancel function and callback context for a prefix watch
@@ -54,6 +56,44 @@ type prefixWatchInfo struct {
 	broken bool
 	// brokenNotified prevents duplicate WATCH_BROKEN callbacks from exit races.
 	brokenNotified bool
+}
+
+type maintenanceSession struct {
+	session *concurrency.Session
+	cancel  context.CancelFunc
+}
+
+func (s *maintenanceSession) close() error {
+	err := s.session.Close()
+	s.cancel()
+	return err
+}
+
+var startMaintenanceSession = func(ctx context.Context, cli *clientv3.Client,
+	ttl int) (*concurrency.Session, error) {
+	return concurrency.NewSession(cli, concurrency.WithTTL(ttl), concurrency.WithContext(ctx))
+}
+
+func newMaintenanceSession(cli *clientv3.Client, ttl int,
+	startupTimeout time.Duration) (*maintenanceSession, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	timer := time.AfterFunc(startupTimeout, cancel)
+	session, err := startMaintenanceSession(ctx, cli, ttl)
+	timedOut := !timer.Stop()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if session == nil {
+		cancel()
+		return nil, errors.New("maintenance session creation returned nil")
+	}
+	if timedOut {
+		_ = session.Close()
+		cancel()
+		return nil, context.DeadlineExceeded
+	}
+	return &maintenanceSession{session: session, cancel: cancel}, nil
 }
 
 // Use different etcd client so they are not affected by each other,
@@ -69,6 +109,10 @@ var (
 	// keep alive contexts for store
 	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
 	storeKeepAliveMutex sync.Mutex
+	// maintenance sessions own their keepalive and lease lifecycle in Go.
+	storeMaintenanceSessions   = make(map[int64]*maintenanceSession)
+	storeMaintenanceNextHandle int64
+	storeMaintenanceMutex      sync.Mutex
 	// watch contexts for store
 	storeWatchCtx   = make(map[string]context.CancelFunc)
 	storeWatchMutex sync.Mutex
@@ -89,6 +133,7 @@ const (
 const (
 	storeDialKeepAliveTime    = 10 * time.Second
 	storeDialKeepAliveTimeout = 3 * time.Second
+	maintenanceStartupTimeout = 5 * time.Second
 )
 
 func newStoreClientConfig(validEndpoints []string) clientv3.Config {
@@ -280,6 +325,7 @@ func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 	}
 
 	cancelAllStoreKeepAlives()
+	closeAllStoreMaintenanceSessions()
 	cancelAllStoreWatches()
 	cancelAllStorePrefixWatches()
 
@@ -442,6 +488,92 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, 
 	}
 }
 
+//export EtcdStoreAcquireMaintenanceSessionWrapper
+func EtcdStoreAcquireMaintenanceSessionWrapper(key *C.char, keySize C.int, ttl int64,
+	sessionHandle *int64, leaseId *int64, createRevision *int64, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	if ttl <= 0 {
+		*errMsg = C.CString("maintenance session TTL must be positive")
+		return -1
+	}
+
+	session, err := newMaintenanceSession(cli, int(ttl), maintenanceStartupTimeout)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	k := C.GoStringN(key, keySize)
+	id := int64(session.session.Lease())
+	ownerToken := strconv.FormatInt(id, 10)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	resp, err := cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
+		Then(clientv3.OpPut(k, ownerToken, clientv3.WithLease(session.session.Lease()))).
+		Commit()
+	cancel()
+	if err != nil {
+		_ = session.close()
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !resp.Succeeded {
+		_ = session.close()
+		*errMsg = C.CString("maintenance lock is already held")
+		return -2
+	}
+
+	storeMaintenanceMutex.Lock()
+	storeMaintenanceNextHandle++
+	handle := storeMaintenanceNextHandle
+	storeMaintenanceSessions[handle] = session
+	storeMaintenanceMutex.Unlock()
+
+	*sessionHandle = handle
+	*leaseId = id
+	*createRevision = resp.Header.Revision
+	return 0
+}
+
+//export EtcdStoreCloseMaintenanceSessionWrapper
+func EtcdStoreCloseMaintenanceSessionWrapper(sessionHandle int64, errMsg **C.char) int {
+	storeMaintenanceMutex.Lock()
+	session, exists := storeMaintenanceSessions[sessionHandle]
+	if exists {
+		delete(storeMaintenanceSessions, sessionHandle)
+	}
+	storeMaintenanceMutex.Unlock()
+	if !exists {
+		return 0
+	}
+	if err := session.close(); err != nil && !errors.Is(err, rpctypes.ErrLeaseNotFound) {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
+//export EtcdStoreMaintenanceSessionAliveWrapper
+func EtcdStoreMaintenanceSessionAliveWrapper(sessionHandle int64, errMsg **C.char) int {
+	storeMaintenanceMutex.Lock()
+	session, exists := storeMaintenanceSessions[sessionHandle]
+	storeMaintenanceMutex.Unlock()
+	if !exists {
+		*errMsg = C.CString("maintenance session handle not found")
+		return -1
+	}
+	select {
+	case <-session.session.Done():
+		return 0
+	default:
+		return 1
+	}
+}
+
 /*
 * @brief First cancel the watch context, then delete it from the map.
 *        Cancel must be called before delete in case this is a new context
@@ -472,6 +604,20 @@ func cancelAllStoreKeepAlives() {
 
 	for _, cancel := range cancels {
 		cancel()
+	}
+}
+
+func closeAllStoreMaintenanceSessions() {
+	storeMaintenanceMutex.Lock()
+	sessions := make([]*maintenanceSession, 0, len(storeMaintenanceSessions))
+	for handle, session := range storeMaintenanceSessions {
+		sessions = append(sessions, session)
+		delete(storeMaintenanceSessions, handle)
+	}
+	storeMaintenanceMutex.Unlock()
+
+	for _, session := range sessions {
+		_ = session.close()
 	}
 }
 
@@ -792,7 +938,7 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 }
 
 //export EtcdStoreTxnCompareAndPutWrapper
-func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareRevisions *int64, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -809,6 +955,7 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 		compareKindList := (*[1 << 28]C.int)(unsafe.Pointer(compareKinds))[:cmpN:cmpN]
 		compareValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(compareValues))[:cmpN:cmpN]
 		compareValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(compareValueSizes))[:cmpN:cmpN]
+		compareRevisionList := (*[1 << 28]int64)(unsafe.Pointer(compareRevisions))[:cmpN:cmpN]
 		for i := 0; i < cmpN; i++ {
 			k := C.GoStringN(compareKeyPtrs[i], compareKeySizeList[i])
 			switch int(compareKindList[i]) {
@@ -817,6 +964,8 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 				cmps = append(cmps, clientv3.Compare(clientv3.Value(k), "=", v))
 			case 1:
 				cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", 0))
+			case 2:
+				cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", compareRevisionList[i]))
 			default:
 				*errMsg = C.CString("unsupported compare kind")
 				return -1

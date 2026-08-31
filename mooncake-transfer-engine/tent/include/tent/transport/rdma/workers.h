@@ -234,6 +234,14 @@ class Workers {
         // Next time to check for priority promotions (nanoseconds)
         uint64_t next_promotion_check_ns = 0;
 
+        // Tick-internal re-enqueues that found their target queue full
+        // (target priority, entry). Parked items stay counted in
+        // inflight_slices, which both keeps the accounting continuous and
+        // keeps the worker from suspending while they are pending. The
+        // asyncPostSend drain consumes this list before the shared queues,
+        // so parked entries can never starve behind contending producers.
+        std::vector<std::pair<int, RdmaSliceList>> requeue_overflow;
+
         // Values are held via unique_ptr so that map rehashing does not
         // invalidate pointers into RailMonitor stored on in-flight slices
         // (see RdmaSlice::rail_monitor).
@@ -245,13 +253,17 @@ class Workers {
     // Promote timed-out low priority requests to higher priority queues
     void promoteTimedOutRequests(WorkerContext& worker);
 
+    // Tick-internal re-enqueue: the worker thread must never block on its own
+    // queue (issue #3637), so these park into requeue_overflow on a full queue
+    // and the asyncPostSend drain consumes them first.
+    void submitFromTick(WorkerContext& worker, RdmaSlice* slice);
+
     WorkerContext* worker_context_;
     uint64_t slice_timeout_ns_;
     uint64_t priority_promotion_timeout_ns_;  // Timeout for priority promotion
     // Opt-in (issue #2528): when true, a promotion pass promotes exactly the
-    // entries that have themselves timed out, instead of promoting the whole
-    // queue whenever only the head has timed out. Default false keeps the
-    // historical "flush the tier" behavior.
+    // entries that have themselves timed out (DecidePromotionPerEntry).
+    // Default false keeps DecidePromotionHeadOnly ("flush the tier").
     bool priority_promotion_per_entry_ = false;
 
     std::unique_ptr<DeviceSelector> device_selector_;

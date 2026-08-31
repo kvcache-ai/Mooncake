@@ -304,6 +304,24 @@ Status Workers::submit(RdmaSlice* slice) {
     return submit(slice_list);
 }
 
+void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {
+    RdmaSliceList slice_list;
+    slice_list.first = slice;
+    slice_list.num_slices = 1;
+    int priority = PRIO_HIGH;
+    if (slice && slice->task) {
+        priority = slice->priority;
+    }
+    // The worker must never block on its own queue (issue #3637): a full
+    // queue parks the slice in requeue_overflow and the next tick retries.
+    // Either way it stays counted as inflight, which keeps the worker from
+    // suspending while a parked flush is pending.
+    if (!worker.queues[priority].try_push(slice_list)) {
+        worker.requeue_overflow.emplace_back(priority, slice_list);
+    }
+    worker.inflight_slices.fetch_add(1);
+}
+
 Status Workers::cancel(RdmaTask* task) {
     if (!task) return Status::InvalidArgument("Invalid RDMA task" LOC_MARK);
     if (task->cancel_requested.exchange(true, std::memory_order_acq_rel)) {
@@ -426,9 +444,21 @@ void Workers::asyncPostSend() {
     // Promote timed-out low priority requests
     promoteTimedOutRequests(worker);
 
-    // Priority selection: HIGH -> MEDIUM -> LOW
+    // Priority selection: HIGH -> MEDIUM -> LOW. The worker-local overflow is
+    // drained before the shared queues, so a parked retry can never starve
+    // behind producers that keep refilling freed slots (issue #3637).
+    auto& overflow = worker.requeue_overflow;
     for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
         if (shared_quota && !shared_quota->canSend(prio)) continue;
+        for (auto it = overflow.begin(); it != overflow.end();) {
+            if (it->first == prio) {
+                result.push_back(it->second);
+                it = overflow.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (!result.empty()) break;
         worker.queues[prio].pop(result);
         if (!result.empty()) break;
     }
@@ -492,7 +522,7 @@ void Workers::asyncPostSend() {
                     updateSliceStatus(slice, FAILED);
                 } else {
                     releaseSliceQuota(slice);
-                    submit(slice);
+                    submitFromTick(worker, slice);
                 }
                 worker.inflight_slices.fetch_sub(1);
             }
@@ -560,7 +590,7 @@ void Workers::asyncPostSend() {
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
                 } else {
-                    submit(slice);
+                    submitFromTick(worker, slice);
                 }
                 worker.inflight_slices.fetch_sub(1);
             } else {
@@ -590,17 +620,14 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
         worker.queues[from].pop(drained);
         if (drained.empty()) return false;
 
-        if (!priority_promotion_per_entry_) {
-            auto* slice = drained.front().first;
-            const bool head_timed_out = slice && slice->enqueue_ts > 0 &&
-                                        current_ts >= slice->enqueue_ts &&
-                                        (current_ts - slice->enqueue_ts) >=
-                                            priority_promotion_timeout_ns_;
-            for (auto& slice_list : drained) {
-                worker.queues[head_timed_out ? to : from].push(slice_list);
+        // The worker must never block on its own queue: a full target parks
+        // the entry in requeue_overflow and the next tick retries (issue
+        // #3637). Parked entries stay counted as inflight throughout.
+        auto requeue = [&](int target, RdmaSliceList& slice_list) {
+            if (!worker.queues[target].try_push(slice_list)) {
+                worker.requeue_overflow.emplace_back(target, slice_list);
             }
-            return head_timed_out;
-        }
+        };
 
         std::vector<uint64_t> enqueue_ts;
         enqueue_ts.reserve(drained.size());
@@ -609,12 +636,15 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
             enqueue_ts.push_back(slice ? slice->enqueue_ts : 0);
         }
 
-        PromotionDecision decision = DecidePromotionPerEntry(
-            enqueue_ts, current_ts, priority_promotion_timeout_ns_);
+        PromotionDecision decision =
+            priority_promotion_per_entry_
+                ? DecidePromotionPerEntry(enqueue_ts, current_ts,
+                                          priority_promotion_timeout_ns_)
+                : DecidePromotionHeadOnly(enqueue_ts, current_ts,
+                                          priority_promotion_timeout_ns_);
 
         if (!decision.promoted_any()) {
-            for (auto& slice_list : drained)
-                worker.queues[from].push(slice_list);
+            for (auto& slice_list : drained) requeue(from, slice_list);
             return false;
         }
 
@@ -623,7 +653,7 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
             if (idx < drained.size()) promote[idx] = true;
         }
         for (size_t i = 0; i < drained.size(); ++i) {
-            worker.queues[promote[i] ? to : from].push(drained[i]);
+            requeue(promote[i] ? to : from, drained[i]);
         }
         return true;
     };
@@ -737,7 +767,7 @@ void Workers::asyncPollCq() {
                             std::memory_order_acquire)) {
                         updateSliceStatus(slice, CANCELED);
                     } else {
-                        submit(slice);
+                        submitFromTick(worker, slice);
                     }
                 }
             } else {
