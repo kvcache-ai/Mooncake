@@ -116,11 +116,14 @@ public JSON APIs. Their wire format contains only canonical fields, and
 deserialization rejects alternate field names rather than translating
 framework-specific input.
 
-Run the reshard tests from the repository root:
+The root Python project is the authoritative source. The former
+`PYTHONPATH=mooncake-reshard/python` source-tree workflow is intentionally no
+longer supported. Install the root project in editable mode and run the reshard
+tests from the repository root:
 
 ```bash
-PYTHONPATH=mooncake-reshard/python \
-python3 -m pytest -q mooncake-reshard/tests
+python3 -m pip install -e '.[dev]'
+python3 -m pytest -q python/tests/reshard
 
-npx --yes pyright --project mooncake-reshard/pyrightconfig.json
+pyright --project python/pyrightconfig.json
 ```

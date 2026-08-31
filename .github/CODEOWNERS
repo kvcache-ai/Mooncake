@@ -13,6 +13,8 @@
 /mooncake-integration/store @ykwd @stmatengss @zxpdemonio
 /mooncake-pg @UNIDY2002 @ympcMark @yuechen-sys
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
+/python/**/reshard/ @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
+/python/pyrightconfig.json @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
 /python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys

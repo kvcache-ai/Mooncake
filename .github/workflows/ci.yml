@@ -458,8 +458,10 @@ jobs:
           filters: |
             src:
               - 'mooncake-*/**'
+              - 'python/**'
               - 'extern/**'
               - 'CMakeLists.txt'
+              - 'pyproject.toml'
               - 'dependencies.sh'
               - 'scripts/**'
               - '.github/actions/**'
@@ -472,7 +474,12 @@ jobs:
               - '.github/workflows/ci.yml'
             reshard:
               - 'mooncake-reshard/**'
+              - 'python/mooncake/reshard/**'
+              - 'python/tests/reshard/**'
+              - 'python/tests/typecheck/reshard/**'
+              - 'python/pyrightconfig.json'
               - 'mooncake-wheel/pyproject.toml'
+              - 'pyproject.toml'
               - 'requirements.txt'
               - 'scripts/check_reshard_types.sh'
               - '.github/workflows/ci.yml'
@@ -509,9 +516,9 @@ jobs:
           -r requirements.txt pytest==8.3.5
 
     - name: Test Reshard
-      run: |
-        PYTHONPATH=mooncake-reshard/python \
-          python -m pytest -q mooncake-reshard/tests
+      run: python -m pytest -q python/tests/reshard
+      env:
+        PYTHONPATH: mooncake-wheel:python
       shell: bash
 
   build-wheel-cu13:

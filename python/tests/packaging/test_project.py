@@ -57,6 +57,13 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
 
 
+def test_reshard_has_one_authoritative_source() -> None:
+    assert (REPOSITORY_ROOT / "python" / "mooncake" / "reshard").is_dir()
+    legacy_root = REPOSITORY_ROOT / "mooncake-reshard"
+    assert not list((legacy_root / "python").rglob("*.py"))
+    assert not list((legacy_root / "tests").rglob("*.py"))
+
+
 def test_ep_modules_have_one_authoritative_source() -> None:
     package_root = REPOSITORY_ROOT / "python" / "mooncake"
     legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"

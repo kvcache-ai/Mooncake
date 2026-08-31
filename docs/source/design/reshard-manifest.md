@@ -5,9 +5,10 @@ Mooncake resharding and its model-weight specialization. The contract separates
 complete logical placement from live physical addresses so planning can finish
 before a runtime binding is available.
 
-The implementation is owned by the top-level `mooncake-reshard` module. Common
-contracts are exposed through `mooncake.reshard.contracts`; the public weight API
-is `mooncake.reshard.weight`.
+The implementation lives in the root Python project under
+`python/mooncake/reshard`. Common contracts are exposed through
+`mooncake.reshard.contracts`; the public weight API is
+`mooncake.reshard.weight`.
 
 Framework-owned adapters outside Mooncake inspect framework runtime objects,
 normalize framework-specific values, and construct the typed canonical

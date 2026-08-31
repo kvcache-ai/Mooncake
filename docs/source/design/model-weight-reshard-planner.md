@@ -1,6 +1,6 @@
 # Model Weight Reshard Planner And Runtime Binding
 
-`mooncake-reshard` plans an address-free conversion between complete model
+`mooncake.reshard` plans an address-free conversion between complete model
 weight placements, then binds the selected logical regions to immutable
 runtime snapshots. It does not inspect framework runtime objects or submit a
 transfer.
@@ -113,7 +113,7 @@ contracts. It creates synthetic manifests and runtime bindings but does not
 allocate GPU memory, contact Store, or submit work to Transfer Engine:
 
 ```bash
-PYTHONPATH=mooncake-reshard/python \
+PYTHONPATH=mooncake-wheel:python \
   python mooncake-reshard/benchmarks/runtime_binding.py
 ```
 

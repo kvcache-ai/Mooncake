@@ -3,7 +3,7 @@
 
 Run from a source checkout:
 
-    PYTHONPATH=mooncake-reshard/python \
+    PYTHONPATH=mooncake-wheel:python \
       python mooncake-reshard/benchmarks/runtime_binding.py
 
 This is deliberately an opt-in metadata benchmark. It creates no GPU tensors,
