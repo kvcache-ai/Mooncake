@@ -1152,6 +1152,161 @@ TEST_F(MetricsRecordingTest, ConcurrentRecordsAcrossTransportsAreExact) {
               0);
 }
 
+// Task failure with reason="submit": a synchronously rejected submit fails
+// the attempt at the submit site, so recordTaskCompletionMetrics sees
+// attempt_active == false. The counter must attribute the failure to the
+// attempt transport (rdma) even though task.type is UNSPEC by then — the
+// attribution leak the reason counter must not reproduce.
+TEST_F(MetricsRecordingTest, SubmitFailureRecordsTaskFailureWithSubmitReason) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/false,
+                                                /*force_submit_fail=*/true);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xCD);
+    auto before_register = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    auto after_register = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(after_register.series(
+                  "tent_registered_buffer_bytes{transport=\"rdma\"}") -
+                  before_register.series(
+                      "tent_registered_buffer_bytes{transport=\"rdma\"}"),
+              static_cast<double>(kLen));
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(
+        after.series(
+            "tent_task_failures_total{transport=\"rdma\",reason=\"submit"
+            "\"}") -
+            before.series("tent_task_failures_total{transport=\"rdma\",reason="
+                          "\"submit\"}"),
+        1);
+    EXPECT_EQ(
+        after.series(
+            "tent_task_failures_total{transport=\"rdma\",reason=\"poll\"}") -
+            before.series(
+                "tent_task_failures_total{transport=\"rdma\",reason=\""
+                "poll\"}"),
+        0);
+    // In-flight gauge returns to zero after the terminal failure.
+    EXPECT_EQ(after.counter("tent_inflight_attempts") -
+                  before.counter("tent_inflight_attempts"),
+              0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+    auto after_unregister = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(after_unregister.series(
+                  "tent_registered_buffer_bytes{transport=\"rdma\"}"),
+              0);
+}
+
+// Task failure with reason="poll": the transport accepted the request and
+// reported FAILED from getTransferStatus, so the attempt is still active when
+// recordTaskCompletionMetrics runs.
+TEST_F(MetricsRecordingTest, PollFailureRecordsTaskFailureWithPollReason) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/true,
+                                                /*force_submit_fail=*/false);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xAB);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(
+        after.series(
+            "tent_task_failures_total{transport=\"rdma\",reason=\"poll\"}") -
+            before.series(
+                "tent_task_failures_total{transport=\"rdma\",reason=\""
+                "poll\"}"),
+        1);
+    EXPECT_EQ(
+        after.series(
+            "tent_task_failures_total{transport=\"rdma\",reason=\"submit"
+            "\"}") -
+            before.series("tent_task_failures_total{transport=\"rdma\",reason="
+                          "\"submit\"}"),
+        0);
+    EXPECT_EQ(after.counter("tent_inflight_attempts") -
+                  before.counter("tent_inflight_attempts"),
+              0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+}
+
+// Gauges must stay symmetric across setEnabled() transitions: the runtime
+// switch governs statistical sampling, not state tracking. Skipping one half
+// of a paired add/sub would permanently corrupt the gauge (review feedback).
+TEST_F(MetricsRecordingTest, InflightGaugeSurvivesEnableToggle) {
+    auto& m = TentMetrics::instance();
+    auto before = MetricsSnapshot(m);
+
+    // Enabled at start, disabled before finish.
+    TentMetrics::setEnabled(true);
+    m.recordInflightAttemptStarted(RDMA);
+    TentMetrics::setEnabled(false);
+    m.recordInflightAttemptFinished(RDMA);
+
+    // Disabled at start, enabled before finish (reverse straddle).
+    m.recordInflightAttemptStarted(RDMA);
+    TentMetrics::setEnabled(true);
+    m.recordInflightAttemptFinished(RDMA);
+
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.counter("tent_inflight_attempts") -
+                  before.counter("tent_inflight_attempts"),
+              0);
+    EXPECT_EQ(after.series("tent_inflight_attempts{transport=\"rdma\"}") -
+                  before.series("tent_inflight_attempts{transport=\"rdma\"}"),
+              0);
+}
+
+TEST_F(MetricsRecordingTest, RegisteredBytesGaugeSurvivesEnableToggle) {
+    auto& m = TentMetrics::instance();
+    auto before = MetricsSnapshot(m);
+
+    TentMetrics::setEnabled(true);
+    m.recordRegisteredBufferBytes(RDMA, 4096);
+    TentMetrics::setEnabled(false);
+    m.recordRegisteredBufferBytes(RDMA, -4096);
+    TentMetrics::setEnabled(true);
+
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.counter("tent_registered_buffer_bytes") -
+                  before.counter("tent_registered_buffer_bytes"),
+              0);
+    EXPECT_EQ(
+        after.series("tent_registered_buffer_bytes{transport=\"rdma\"}") -
+            before.series("tent_registered_buffer_bytes{transport=\"rdma\"}"),
+        0);
+}
+
 // ---------------------------------------------------------------------------
 // L2 HTTP integration: scrape the real /metrics, /metrics/json, /health
 // endpoints via coro_http_client and assert on status + body. Validates the
