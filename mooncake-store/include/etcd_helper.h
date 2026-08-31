@@ -1,7 +1,10 @@
 #pragma once
 
 #include <glog/logging.h>
+#include <ylt/util/tl/expected.hpp>
+
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "types.h"
@@ -61,6 +64,15 @@ class EtcdHelper {
                                      EtcdLeaseId lease_id,
                                      EtcdRevisionId& revision_id);
 
+    static ErrorCode AcquireMaintenanceSession(std::string_view key,
+                                               int64_t lease_ttl,
+                                               int64_t& session_handle,
+                                               EtcdLeaseId& lease_id,
+                                               EtcdRevisionId& create_revision);
+    static ErrorCode CloseMaintenanceSession(int64_t session_handle);
+    static tl::expected<bool, ErrorCode> MaintenanceSessionAlive(
+        int64_t session_handle);
+
     /*
      * @brief Batch create key-value pairs in a single transaction.
      *        Fails if any key already exists.
@@ -74,12 +86,16 @@ class EtcdHelper {
     enum class TxnCompareKind {
         kValueEquals = 0,
         kKeyNotExists = 1,
+        // Compare the key's creation revision to expected_revision.
+        kCreateRevisionEquals = 2,
     };
 
     struct TxnCompare {
         std::string key;
         TxnCompareKind kind{TxnCompareKind::kValueEquals};
         std::string expected_value;
+        // Used only by kCreateRevisionEquals.
+        EtcdRevisionId expected_revision{0};
     };
 
     struct TxnPut {
