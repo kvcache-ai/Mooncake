@@ -13,6 +13,7 @@
   "allow_evict_soft_pinned_objects": true,
   "eviction_ratio": 0.1,
   "eviction_high_watermark_ratio": 1.0,
+  "tenant_eviction_high_watermark_ratio": 0.0,
   "dynamic_replication_mode": "off",
   "dynamic_replication_heat_window_seconds": 10,
   "dynamic_replication_admission_qps_threshold": 0.8,

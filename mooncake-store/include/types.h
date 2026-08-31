@@ -90,6 +90,10 @@ static constexpr uint64_t DEFAULT_MAX_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
+// Per-tenant eviction watermark, as a fraction of a tenant's own effective
+// quota. 0.0 disables it, which is the pre-existing behaviour: only the
+// pool-wide watermark above triggers background eviction.
+static constexpr double DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO = 0.0;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
