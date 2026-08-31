@@ -23,7 +23,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mooncake-transfer-engine"
-version = "0.3.13"
+version = "0.3.13.post1"
 description = "A KVCache-centric Disaggregated Architecture for large-scale LLM inference and training."
 authors = [
     { name = "Mooncake Authors" }
