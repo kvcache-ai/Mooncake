@@ -26,6 +26,8 @@ else()
 endif()
 
 file(GLOB TEBENCH_SOURCES "*.cpp")
+list(REMOVE_ITEM TEBENCH_SOURCES
+     "${CMAKE_CURRENT_SOURCE_DIR}/scatter_lifecycle_bench.cpp")
 # The TENT backend is only available when USE_TENT is enabled; drop its
 # translation unit (which pulls in tent/ headers) from non-TENT builds.
 if(NOT USE_TENT)
@@ -36,6 +38,11 @@ if(NOT USE_TENT)
 endif()
 add_executable(tebench ${TEBENCH_SOURCES})
 target_link_libraries(tebench PUBLIC transfer_engine)
+
+# Hardware-free control-plane benchmark for the deadline-safe scatter lifecycle.
+# It uses a scripted transport and does not report data-plane throughput.
+add_executable(scatter_lifecycle_bench scatter_lifecycle_bench.cpp)
+target_link_libraries(scatter_lifecycle_bench PUBLIC transfer_engine)
 if(USE_TENT)
   target_compile_definitions(tebench PRIVATE USE_TENT)
   # tent_link_group's interface brings in the tent/ header search path.
