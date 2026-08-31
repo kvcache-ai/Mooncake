@@ -37,6 +37,7 @@
 #include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "version.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -1924,6 +1925,15 @@ int RealClient::start_http_server(int port) {
             }
             resp.add_header("Content-Type", "text/plain");
             resp.set_status_and_content(status_type::ok, std::move(*result));
+        });
+
+    http_server_->set_http_handler<GET>(
+        "/version", [](coro_http_request &req, coro_http_response &resp) {
+            std::string body = "{\"version\":\"" + GetMooncakeStoreVersion() +
+                               "\",\"display_version\":\"" +
+                               std::string(MOONCAKE_DISPLAY_VERSION) + "\"}";
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(status_type::ok, std::move(body));
         });
 
     auto ec = http_server_->async_start();
