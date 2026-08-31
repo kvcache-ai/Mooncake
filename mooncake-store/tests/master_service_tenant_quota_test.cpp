@@ -1240,18 +1240,17 @@ TEST_F(MasterServiceTenantQuotaTest,
     constexpr uint64_t kQuotaBytes = kObjectSize * 5;
     constexpr int kWrites = 256;
 
-    auto config =
-        MasterServiceConfig::builder()
-            .set_enable_multi_tenants(true)
-            .set_tenant_quota_connector_type("file")
-            .set_tenant_quota_connector_uri(
-                WritePolicyFile({{tenant, kQuotaBytes}}))
-            .set_default_kv_lease_ttl(0)
-            // Keep BatchEvict idle so the tenant admission path is the one
-            // that frees space for subsequent Puts.
-            .set_eviction_high_watermark_ratio(1.0)
-            .set_eviction_ratio(0.05)
-            .build();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(
+                          WritePolicyFile({{tenant, kQuotaBytes}}))
+                      .set_default_kv_lease_ttl(0)
+                      // Keep BatchEvict idle so the tenant admission path is
+                      // the one that frees space for subsequent Puts.
+                      .set_eviction_high_watermark_ratio(1.0)
+                      .set_eviction_ratio(0.05)
+                      .build();
     MasterService service(config);
     UUID client_id = MountSegment(service, /*size=*/1024 * 1024);
     const int64_t attempts_before =
@@ -1263,9 +1262,8 @@ TEST_F(MasterServiceTenantQuotaTest,
                                       MemoryConfig());
         ASSERT_TRUE(start.has_value())
             << "write " << i << " failed: " << toString(start.error());
-        ASSERT_TRUE(
-            service.PutEnd(client_id, key, tenant, ReplicaType::MEMORY)
-                .has_value());
+        ASSERT_TRUE(service.PutEnd(client_id, key, tenant, ReplicaType::MEMORY)
+                        .has_value());
     }
 
     const auto snap = Snapshot(service, tenant);
@@ -1288,16 +1286,15 @@ TEST_F(MasterServiceTenantQuotaTest,
     constexpr double kWatermark = 0.90;
     // Requested sum == capacity so weights scale: heavy gets 90% of the pool,
     // matching eviction_high_watermark_ratio * capacity.
-    auto config =
-        MasterServiceConfig::builder()
-            .set_enable_multi_tenants(true)
-            .set_tenant_quota_connector_type("file")
-            .set_tenant_quota_connector_uri(
-                WritePolicyFile({{heavy, 9000}, {light, 1000}}))
-            .set_eviction_high_watermark_ratio(kWatermark)
-            .set_eviction_ratio(0.05)
-            .set_default_kv_lease_ttl(60000)
-            .build();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(
+                          WritePolicyFile({{heavy, 9000}, {light, 1000}}))
+                      .set_eviction_high_watermark_ratio(kWatermark)
+                      .set_eviction_ratio(0.05)
+                      .set_default_kv_lease_ttl(60000)
+                      .build();
     MasterService service(config);
     UUID client_id = MountSegment(service, kSegmentSize);
 
@@ -1317,9 +1314,8 @@ TEST_F(MasterServiceTenantQuotaTest,
         auto start =
             service.PutStart(client_id, key, heavy, kObjectSize, hard_pinned);
         ASSERT_TRUE(start.has_value()) << toString(start.error());
-        ASSERT_TRUE(
-            service.PutEnd(client_id, key, heavy, ReplicaType::MEMORY)
-                .has_value());
+        ASSERT_TRUE(service.PutEnd(client_id, key, heavy, ReplicaType::MEMORY)
+                        .has_value());
     }
     EXPECT_EQ(Snapshot(service, heavy).charged_bytes,
               static_cast<uint64_t>(fill_count) * kObjectSize);
