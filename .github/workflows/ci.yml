@@ -96,6 +96,13 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
+    - name: Run in-process master e2e tests (no mooncake_master)
+      run: |
+        source test_env/bin/activate
+        bash scripts/run_standalone_store_e2e.sh
+        deactivate
+      shell: bash
+
     - name: Run tests with ssd
       run: |
         # Reserve port 50052 (mooncake_client RPC port) so the kernel never

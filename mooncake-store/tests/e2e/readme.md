@@ -149,3 +149,11 @@ python3 store_client_e2e.py \
 - `--payload-size 4096`: keep NoF writes 4K aligned
 - `--duration-sec`: total workload duration
 - `--sleep-ms`: interval between operations
+
+### In-process master e2e (no `mooncake_master`)
+
+Linux CI (`test-wheel-ubuntu`) runs `scripts/run_standalone_store_e2e.sh` before starting `mooncake_master`. This covers EmbeddedMaster plumbing used by tests; it is not a documented user deployment mode.
+
+```bash
+bash scripts/run_standalone_store_e2e.sh
+```
