@@ -3306,8 +3306,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
             reject_standby_object(entry, "duplicate_object");
             continue;
         }
-        const size_t existing_shard_idx =
-            getShardIndex(tenant_id, user_key);
+        const size_t existing_shard_idx = getShardIndex(tenant_id, user_key);
         {
             MetadataShardAccessorRO existing_shard(this, existing_shard_idx);
             auto existing_tenant = existing_shard->tenants.find(tenant_id);
