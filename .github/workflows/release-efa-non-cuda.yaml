@@ -8,6 +8,7 @@ on:
 # Publishes mooncake-transfer-engine-efa-non-cuda, the CPU/DRAM AWS EFA wheel.
 jobs:
   build:
+    if: ${{ !contains(github.ref_name, '-') }}
     permissions:
       contents: write
     uses: ./.github/workflows/_build-efa-wheel.yaml

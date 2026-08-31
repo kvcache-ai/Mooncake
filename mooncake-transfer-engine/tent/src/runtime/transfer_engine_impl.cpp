@@ -345,8 +345,18 @@ Status TransferEngineImpl::construct() {
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
+    // TCP SendData/RecvData copies are offloaded, but the RPC io_context still
+    // reads the full attachment. One thread serializes concurrent bulk TCP.
+    // Leave RDMA-only at 1; when TCP is on and the user did not set
+    // rpc_server_threads, use several so attachments can be read in parallel.
     size_t rpc_server_threads = 1;
-    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, 1, rpc_server_threads));
+    const size_t rpc_threads_default =
+        conf_->get("transports/tcp/enable", false)
+            ? std::min<size_t>(
+                  8, std::max<size_t>(4, std::thread::hardware_concurrency()))
+            : 1;
+    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, rpc_threads_default,
+                                               rpc_server_threads));
     merge_requests_ = conf_->get("merge_requests", true);
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     enable_auto_failover_on_poll_ =
@@ -888,6 +898,14 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                     LOG(WARNING) << s.ToString();
                 }
             }
+            // desc.transports lists the transports that actually registered
+            // the buffer (each transport appends itself on success).
+            for (auto& desc : descs) {
+                for (auto type : desc.transports) {
+                    TentMetrics::instance().recordRegisteredBufferBytes(
+                        type, static_cast<int64_t>(desc.length));
+                }
+            }
             return Status::OK();
         });
     if (!status.ok()) return status;
@@ -903,17 +921,23 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
     auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             removed = true;
+            const auto registered_transports = desc.transports;
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                 auto& transport = transport_list_[type];
                 if (!transport) continue;
                 const auto transport_type = static_cast<TransportType>(type);
                 const bool advertised =
-                    std::find(desc.transports.begin(), desc.transports.end(),
-                              transport_type) != desc.transports.end();
+                    std::find(registered_transports.begin(),
+                              registered_transports.end(),
+                              transport_type) != registered_transports.end();
                 if (!advertised && !transport->tracksLocalBuffer(desc))
                     continue;
                 auto status = transport->removeMemoryBuffer(desc);
                 if (!status.ok()) LOG(WARNING) << status.ToString();
+            }
+            for (auto type : registered_transports) {
+                TentMetrics::instance().recordRegisteredBufferBytes(
+                    type, -static_cast<int64_t>(desc.length));
             }
             return Status::OK();
         });
@@ -935,19 +959,25 @@ Status TransferEngineImpl::unregisterLocalMemory(
             (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
             [&](BufferDesc& desc) -> Status {
                 removed = true;
+                const auto registered_transports = desc.transports;
                 for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                     auto& transport = transport_list_[type];
                     if (!transport) continue;
                     const auto transport_type =
                         static_cast<TransportType>(type);
                     const bool advertised =
-                        std::find(desc.transports.begin(),
-                                  desc.transports.end(),
-                                  transport_type) != desc.transports.end();
+                        std::find(registered_transports.begin(),
+                                  registered_transports.end(),
+                                  transport_type) !=
+                        registered_transports.end();
                     if (!advertised && !transport->tracksLocalBuffer(desc))
                         continue;
                     auto s = transport->removeMemoryBuffer(desc);
                     if (!s.ok()) LOG(WARNING) << s.ToString();
+                }
+                for (auto type : registered_transports) {
+                    TentMetrics::instance().recordRegisteredBufferBytes(
+                        type, -static_cast<int64_t>(desc.length));
                 }
                 return Status::OK();
             });
@@ -1943,11 +1973,16 @@ Status TransferEngineImpl::commitPreparedSubmit(
             auto status = transport->submitTransferTasks(sub_batch, requests);
             if (!status.ok()) {
                 auto attempt_end = std::chrono::steady_clock::now();
+                // failure_stage must be marked in this first segment, before
+                // any recovery/failover attempt on the failure: a task that
+                // recovers and later fails at poll must still attribute its
+                // root cause to submit.
                 for (const auto physical_task_id : group) {
                     for (const auto public_task_id :
                          public_tasks_by_physical_owner.at(physical_task_id)) {
-                        finishTransportAttempt(batch->task_list[public_task_id],
-                                               FAILED, attempt_end);
+                        auto& task = batch->task_list[public_task_id];
+                        if (task.failure_stage < 0) task.failure_stage = 0;
+                        finishTransportAttempt(task, FAILED, attempt_end);
                     }
                 }
                 // Recover by failing over to the remaining candidate
@@ -2170,6 +2205,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        if (task.failure_stage < 0) task.failure_stage = 0;
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
         // Submit-stage failover: walk the remaining candidate transports
         // before giving up (the queued path dispatches one owner task at a
@@ -2474,6 +2510,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        if (task.failure_stage < 0) task.failure_stage = 0;
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
     }
     return status;
@@ -2587,6 +2624,14 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
     task.status = task_status.s;
+    // First-failure attribution: a terminal failure observed by polling marks
+    // the poll stage. Submit-stage failures were already marked at their
+    // origin and are not overwritten (a poll failure followed by a rejected
+    // failover resubmit still counts as poll).
+    if (task_status.s == FAILED || task_status.s == TIMEOUT ||
+        task_status.s == CANCELED) {
+        if (task.failure_stage < 0) task.failure_stage = 1;
+    }
     if (!allow_failover || task.cancel_requested || task.suppress_failover ||
         task_status.s != FAILED || task.type == UNSPEC)
         return;
@@ -2965,6 +3010,35 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
 #if TENT_METRICS_ENABLED
     if (prev_status == PENDING && new_status != PENDING && !task.derived) {
         auto end_time = std::chrono::steady_clock::now();
+        // Failure reason: task.failure_stage marks where the first failure
+        // originated (0 = submit, 1 = poll), set at the failure site — a
+        // poll-observed failure stays "poll" even when the failover resubmit
+        // is synchronously rejected. TIMEOUT/CANCELED come from the status
+        // itself and were previously not recorded anywhere.
+        if (new_status == FAILED || new_status == TIMEOUT ||
+            new_status == CANCELED) {
+            TentMetrics::TaskFailureReason reason;
+            if (new_status == TIMEOUT) {
+                reason = TentMetrics::TaskFailureReason::Timeout;
+            } else if (new_status == CANCELED) {
+                reason = TentMetrics::TaskFailureReason::Canceled;
+            } else if (task.failure_stage == 0) {
+                reason = TentMetrics::TaskFailureReason::Submit;
+            } else if (task.failure_stage == 1) {
+                reason = TentMetrics::TaskFailureReason::Poll;
+            } else {
+                // Unmarked path: an attempt still in flight means the
+                // failure was observed by polling.
+                reason = task.attempt_active
+                             ? TentMetrics::TaskFailureReason::Poll
+                             : TentMetrics::TaskFailureReason::Submit;
+            }
+            // Prefer the attempt transport: task.type may already be UNSPEC
+            // after a submit-stage failure.
+            TransportType failure_tp =
+                task.attempt_type != UNSPEC ? task.attempt_type : task.type;
+            TentMetrics::instance().recordTaskFailure(failure_tp, reason);
+        }
         finishTransportAttempt(task, new_status, end_time);
         auto start_time = task.start_time;
         if (start_time.time_since_epoch().count() > 0) {
@@ -3066,6 +3140,7 @@ void TransferEngineImpl::startTransportAttempt(
 #if TENT_METRICS_ENABLED
     TentMetrics::instance().recordTransportAttemptStarted(type,
                                                           task.request.opcode);
+    TentMetrics::instance().recordInflightAttemptStarted(type);
 #else
     (void)type;
 #endif
@@ -3077,6 +3152,10 @@ void TransferEngineImpl::finishTransportAttempt(
     if (!task.attempt_active) return;
     task.attempt_active = false;
 #if TENT_METRICS_ENABLED
+    // Decrement before the early return below so the in-flight gauge stays
+    // symmetric with recordInflightAttemptStarted() for every attempt that
+    // actually started.
+    TentMetrics::instance().recordInflightAttemptFinished(task.attempt_type);
     auto post_time = task.attempt_post_time;
     if (post_time.time_since_epoch().count() == 0) return;
     double latency_us =

@@ -33,6 +33,7 @@
 #include "common.h"
 #include "environ.h"
 #include "segment.h"
+#include "segment/region_driver.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
 #endif
@@ -550,8 +551,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (config.enable_cxl) {
         allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
-        segment_manager_.initializeCxlAllocator(config.cxl_path,
-                                                config.cxl_size);
+        const auto result = segment_manager_.initializeCxlAllocator(
+            config.cxl_path, config.cxl_size);
+        LOG_IF(FATAL, result != ErrorCode::OK)
+            << "Failed to initialize CXL allocator: "
+            << static_cast<int>(result);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
 }
@@ -1176,28 +1180,36 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             if (restore.descriptors.empty()) {
                 continue;
             }
+            const RegionResourceSpec spec{
+                restore.segment.id, restore.segment.name, restore.segment.base,
+                restore.segment.size, restore.segment.te_endpoint};
+            auto allocations =
+                BuildRegionLiveAllocations(spec, restore.descriptors);
+            if (!allocations) {
+                return fail_remount(allocations.error());
+            }
             if (std::dynamic_pointer_cast<OffsetBufferAllocator>(
                     restore.old_allocator)) {
-                auto restored = RestoreOffsetBufferAllocator(
+                auto imported = ImportOffsetBufferAllocator(
                     restore.segment.name, restore.segment.base,
                     restore.segment.size, restore.segment.te_endpoint,
-                    restore.descriptors);
-                if (!restored) {
+                    *allocations);
+                if (!imported) {
                     return fail_remount(ErrorCode::INVALID_PARAMS);
                 }
-                restore.restored_allocator = std::move(restored->allocator);
-                restore.buffers = std::move(restored->buffers);
+                restore.restored_allocator = std::move(imported->allocator);
+                restore.buffers = std::move(imported->buffers);
             } else if (std::dynamic_pointer_cast<CachelibBufferAllocator>(
                            restore.old_allocator)) {
-                auto restored = RestoreCachelibBufferAllocator(
+                auto imported = ImportCachelibBufferAllocator(
                     restore.segment.name, restore.segment.base,
                     restore.segment.size, restore.segment.te_endpoint,
-                    restore.descriptors);
-                if (!restored) {
+                    *allocations);
+                if (!imported) {
                     return fail_remount(ErrorCode::INVALID_PARAMS);
                 }
-                restore.restored_allocator = std::move(restored->allocator);
-                restore.buffers = std::move(restored->buffers);
+                restore.restored_allocator = std::move(imported->allocator);
+                restore.buffers = std::move(imported->buffers);
             } else {
                 return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
             }
