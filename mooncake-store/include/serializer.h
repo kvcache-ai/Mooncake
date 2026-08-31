@@ -283,6 +283,8 @@ class SerializerReader {
      */
     bool finish_read() const { return offset_ == size_; }
 
+    size_t remaining_size() const { return size_ - offset_; }
+
    private:
     const void*
         buffer_;   ///< Pointer to the source buffer containing serialized data
