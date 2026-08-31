@@ -3,8 +3,11 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cerrno>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <cmath>
@@ -19,6 +22,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -262,44 +267,121 @@ TEST_F(StorageBackendTest, CreateAcceptsValidConfig) {
     EXPECT_NE(result.value(), nullptr);
 }
 
-TEST_F(StorageBackendTest, RemoveFileSerializesWithConcurrentStore) {
+TEST_F(StorageBackendTest, RemoveFileWaitsForStoreInWriteCriticalSection) {
     StorageBackend backend(data_path, "unused", false);
-    const std::string value(256 * 1024, 'x');
+    ASSERT_TRUE(backend.Init(0));
 
-    for (size_t i = 0; i < 100; ++i) {
-        const std::string path =
-            data_path + "/concurrent_remove_" + std::to_string(i);
-        std::atomic<bool> start{false};
-        std::optional<tl::expected<std::vector<std::string>, ErrorCode>>
-            store_result;
+    const std::string path = data_path + "/concurrent_remove_fifo";
+    std::error_code cleanup_ec;
+    fs::remove(path, cleanup_ec);
+    ASSERT_FALSE(cleanup_ec);
+    ASSERT_EQ(mkfifo(path.c_str(), 0600), 0) << strerror(errno);
 
-        std::thread writer([&]() {
-            while (!start.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            store_result = backend.StoreObject(path, value);
-        });
-        std::thread remover([&]() {
-            while (!start.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            backend.RemoveFile(path);
-        });
-
-        start.store(true, std::memory_order_release);
-        writer.join();
-        remover.join();
-
-        ASSERT_TRUE(store_result.has_value());
-        ASSERT_TRUE(store_result->has_value());
-        if (fs::exists(path)) {
-            std::string loaded;
-            ASSERT_TRUE(backend.LoadObject(path, loaded, value.size()));
-            EXPECT_EQ(loaded, value);
-            backend.RemoveFile(path);
-        }
-        EXPECT_FALSE(fs::exists(path));
+    const int reader_fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+    if (reader_fd < 0) {
+        fs::remove(path);
+        FAIL() << "Failed to open FIFO reader: " << strerror(errno);
     }
+    const int pipe_capacity = fcntl(reader_fd, F_GETPIPE_SZ);
+    if (pipe_capacity <= 0) {
+        close(reader_fd);
+        fs::remove(path);
+        FAIL() << "Failed to query FIFO capacity: " << strerror(errno);
+    }
+
+    // With no reader draining the FIFO, this write fills the pipe and blocks
+    // after StoreObject has acquired the path mutex.
+    const std::string value(static_cast<size_t>(pipe_capacity) * 2, 'x');
+    std::atomic<bool> store_done{false};
+    auto store_future = std::async(std::launch::async, [&]() {
+        auto result = backend.StoreObject(path, value);
+        store_done.store(true, std::memory_order_release);
+        return result;
+    });
+
+    bool queue_probe_ok = true;
+    bool writer_blocked = false;
+    const auto write_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < write_deadline) {
+        int queued_bytes = 0;
+        if (ioctl(reader_fd, FIONREAD, &queued_bytes) != 0) {
+            queue_probe_ok = false;
+            break;
+        }
+        const auto status = store_future.wait_for(std::chrono::milliseconds(0));
+        if (queued_bytes > 0 && status == std::future_status::timeout) {
+            writer_blocked = true;
+            break;
+        }
+        if (status == std::future_status::ready) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+
+    bool remove_blocked = false;
+    std::optional<std::future<void>> remove_future;
+    if (writer_blocked) {
+        std::promise<void> remove_started_promise;
+        auto remove_started = remove_started_promise.get_future();
+        remove_future.emplace(std::async(std::launch::async, [&]() {
+            remove_started_promise.set_value();
+            backend.RemoveFile(path);
+        }));
+        remove_started.wait();
+        remove_blocked =
+            remove_future->wait_for(std::chrono::milliseconds(200)) ==
+            std::future_status::timeout;
+    }
+
+    // Drain the FIFO only after checking that RemoveFile is blocked. This
+    // lets StoreObject finish and release the path mutex.
+    auto drain_future = std::async(std::launch::async, [&]() {
+        std::vector<char> buffer(64 * 1024);
+        size_t drained_bytes = 0;
+        for (;;) {
+            const ssize_t n = read(reader_fd, buffer.data(), buffer.size());
+            if (n > 0) {
+                drained_bytes += static_cast<size_t>(n);
+                continue;
+            }
+            if (n == 0) {
+                if (store_done.load(std::memory_order_acquire)) {
+                    return std::optional<size_t>{drained_bytes};
+                }
+                std::this_thread::yield();
+                continue;
+            }
+            if (errno == EINTR || errno == EAGAIN) {
+                std::this_thread::yield();
+                continue;
+            }
+            return std::optional<size_t>{};
+        }
+    });
+
+    auto store_result = store_future.get();
+    auto drain_result = drain_future.get();
+    if (remove_future.has_value()) {
+        remove_future->get();
+    } else {
+        backend.RemoveFile(path);
+    }
+    close(reader_fd);
+
+    const bool path_exists = fs::exists(path);
+    if (path_exists) {
+        fs::remove(path);
+    }
+
+    EXPECT_TRUE(queue_probe_ok);
+    EXPECT_TRUE(writer_blocked);
+    EXPECT_TRUE(remove_blocked);
+    ASSERT_TRUE(store_result.has_value());
+    ASSERT_TRUE(drain_result.has_value());
+    EXPECT_EQ(drain_result.value(), value.size());
+    EXPECT_FALSE(path_exists);
 }
 
 class OffsetAllocatorEnvironmentTest : public StorageBackendTest {
