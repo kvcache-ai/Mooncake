@@ -344,6 +344,15 @@ class TransferEngineImpl {
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
+    // Submit-stage failover: recover a task whose synchronous
+    // submitTransferTasks() failed by walking the remaining candidate
+    // transports (bounded by max_failover_attempts_), mirroring the poll-time
+    // failover in updateTaskStatusAfterPoll. Returns true when the task is
+    // PENDING again on a fallback transport; otherwise the task is
+    // terminally FAILED with task.type left at the last attempted transport
+    // so failure metrics attribute to a real transport instead of UNSPEC.
+    bool attemptSubmitStageFailover(Batch* batch, size_t task_id);
+
     Status retainBatch(BatchID batch_id, Batch*& batch);
 
     Status releaseBatch(Batch* batch);

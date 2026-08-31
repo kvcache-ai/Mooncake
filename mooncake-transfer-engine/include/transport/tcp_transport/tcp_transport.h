@@ -35,9 +35,14 @@
 #include <utility>
 #include <vector>
 
+#include <asio/dispatch.hpp>
+#include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
+#include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
+#include <glog/logging.h>
+#include <pthread.h>
 
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -48,6 +53,101 @@ class TransferMetadata;
 struct ClientSession;
 class TcpContext;
 class TcpTransport;
+
+// A bounded pool of asio::io_context instances, each driven by its own thread.
+// TCP lanes and accepted server sockets are round-robin distributed across the
+// shards so a single hot peer can use more than one CPU core. With size 1 the
+// behavior is identical to the historical single-io_context transport.
+class TcpIoPool {
+   public:
+    explicit TcpIoPool(size_t num_threads) {
+        if (num_threads < 1) num_threads = 1;
+        contexts_.reserve(num_threads);
+        guards_.reserve(num_threads);
+        for (size_t i = 0; i < num_threads; ++i) {
+            contexts_.push_back(std::make_unique<asio::io_context>());
+            guards_.push_back(
+                std::make_unique<work_guard_t>(contexts_[i]->get_executor()));
+        }
+    }
+
+    ~TcpIoPool() { stop(); }
+
+    size_t size() const { return contexts_.size(); }
+
+    asio::io_context &context(size_t i) {
+        return *contexts_[i % contexts_.size()];
+    }
+
+    asio::io_context::executor_type executor(size_t i) {
+        return contexts_[i % contexts_.size()]->get_executor();
+    }
+
+    // Group coordination (pump/admission/retry/retirement timers) is pinned to
+    // one shard chosen by hash, so a group's serialized state stays on a single
+    // executor while its lanes spread across shards.
+    asio::io_context::executor_type coordinatorExecutor(size_t hash) {
+        return executor(hash % contexts_.size());
+    }
+
+    // Round-robin executor for a new lane / accepted socket.
+    asio::io_context::executor_type nextLaneExecutor() {
+        return executor(rr_.fetch_add(1, std::memory_order_relaxed));
+    }
+
+    size_t nextShardIndex() {
+        return rr_.fetch_add(1, std::memory_order_relaxed) % contexts_.size();
+    }
+
+    // Spawns one thread per shard. before_run(i) runs on shard i's thread
+    // before each io_context.run() (used to arm the acceptor on shard 0 and to
+    // re-arm it after an exception-driven restart).
+    void start(std::function<void(size_t)> before_run) {
+        for (size_t i = 0; i < contexts_.size(); ++i) {
+            threads_.emplace_back([this, i, before_run] {
+#ifdef __linux__
+                std::string name = "mc-tcp-io-" + std::to_string(i);
+                pthread_setname_np(pthread_self(), name.c_str());
+#endif
+                while (!stopping_.load(std::memory_order_acquire)) {
+                    try {
+                        if (before_run) before_run(i);
+                        contexts_[i]->run();
+                        break;
+                    } catch (const std::exception &e) {
+                        LOG(ERROR) << "TcpIoPool shard " << i
+                                   << " encountered an exception during run: "
+                                   << e.what();
+                        // Do not restart once stop() has published its intent:
+                        // re-arming (e.g. shard 0's async_accept) after stop()
+                        // stopped the context would keep run() alive and hang
+                        // join().
+                        if (stopping_.load(std::memory_order_acquire)) break;
+                        contexts_[i]->restart();
+                    }
+                }
+            });
+        }
+    }
+
+    void stop() {
+        stopping_.store(true, std::memory_order_release);
+        guards_.clear();
+        for (auto &c : contexts_) c->stop();
+        for (auto &t : threads_)
+            if (t.joinable()) t.join();
+        threads_.clear();
+    }
+
+   private:
+    using work_guard_t =
+        asio::executor_work_guard<asio::io_context::executor_type>;
+    std::vector<std::unique_ptr<asio::io_context>> contexts_;
+    std::vector<std::unique_ptr<work_guard_t>> guards_;
+    std::vector<std::thread> threads_;
+    std::atomic<size_t> rr_{0};
+    std::atomic<bool> stopping_{false};
+};
 
 class TcpTransport : public Transport {
    public:
@@ -94,8 +194,6 @@ class TcpTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
-    void worker();
-
     Slice *prepareTransfer(TransferTask *task, const TransferRequest &request);
 
     void startTransfer(Slice *slice,
@@ -111,7 +209,8 @@ class TcpTransport : public Transport {
    private:
     TcpContext *context_;
     std::atomic_bool running_;
-    std::thread thread_;
+    std::unique_ptr<TcpIoPool> io_pool_;
+    size_t num_io_threads_ = 1;
     bool enable_connection_pool_ = true;
 
     // Client-side bounded work queues and fixed connection lanes.
@@ -211,10 +310,16 @@ class TcpTransport : public Transport {
     enum class LaneConnectStage { NONE, RESOLVING, CONNECTING };
 
     struct ConnectionLaneRuntime {
-        explicit ConnectionLaneRuntime(asio::io_context &io_context)
-            : executor(io_context.get_executor()) {}
+        explicit ConnectionLaneRuntime(TcpIoPool &pool_arg) : pool(&pool_arg) {}
 
-        asio::io_context::executor_type executor;
+        asio::io_context::executor_type coordinatorExecutor(size_t hash) {
+            return pool->coordinatorExecutor(hash);
+        }
+        asio::io_context::executor_type nextLaneExecutor() {
+            return pool->nextLaneExecutor();
+        }
+
+        TcpIoPool *pool;
     };
 
     struct ConnectionLaneState;
@@ -222,11 +327,15 @@ class TcpTransport : public Transport {
 
     struct ConnectionLane {
         ConnectionLane(size_t lane_id_arg,
-                       const std::shared_ptr<PeerConnectionGroup> &group_arg)
-            : lane_id(lane_id_arg), group(group_arg) {}
+                       const std::shared_ptr<PeerConnectionGroup> &group_arg,
+                       const asio::io_context::executor_type &executor_arg)
+            : lane_id(lane_id_arg), group(group_arg), executor(executor_arg) {}
 
         size_t lane_id;
         std::weak_ptr<PeerConnectionGroup> group;
+        // Shard executor this lane's socket/resolver/session/timers are bound
+        // to. Round-robin assigned so a group's lanes spread across io threads.
+        asio::io_context::executor_type executor;
         LaneState state = LaneState::DISCONNECTED;
         LaneConnectStage connect_stage = LaneConnectStage::NONE;
         uint64_t operation_epoch = 0;

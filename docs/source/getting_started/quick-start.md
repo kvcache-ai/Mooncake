@@ -29,6 +29,7 @@ variant in an environment.
 | NVIDIA CUDA 13.0/13.1 | [`mooncake-transfer-engine-cuda13`](https://pypi.org/project/mooncake-transfer-engine-cuda13/) | `pip install mooncake-transfer-engine-cuda13` |
 | Non-CUDA | [`mooncake-transfer-engine-non-cuda`](https://pypi.org/project/mooncake-transfer-engine-non-cuda/) | `pip install mooncake-transfer-engine-non-cuda` |
 | Ascend NPU | [`mooncake-transfer-engine-npu`](https://pypi.org/project/mooncake-transfer-engine-npu/) | `pip install mooncake-transfer-engine-npu` |
+| AMD ROCm | [`mooncake-transfer-engine-rocm`](https://pypi.org/project/mooncake-transfer-engine-rocm/) | `pip install mooncake-transfer-engine-rocm` |
 | Moore Threads MUSA | [`mooncake-transfer-engine-musa`](https://pypi.org/project/mooncake-transfer-engine-musa/) | `pip install mooncake-transfer-engine-musa` |
 | AWS EFA with CUDA 12 | [`mooncake-transfer-engine-efa`](https://pypi.org/project/mooncake-transfer-engine-efa/) | `pip install mooncake-transfer-engine-efa` |
 | AWS EFA without CUDA | [`mooncake-transfer-engine-efa-non-cuda`](https://pypi.org/project/mooncake-transfer-engine-efa-non-cuda/) | `pip install mooncake-transfer-engine-efa-non-cuda` |

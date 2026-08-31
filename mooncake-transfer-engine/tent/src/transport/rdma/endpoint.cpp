@@ -1234,5 +1234,23 @@ void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
         notify_send_cv_.notify_one();
     }
 }
+
+void RdmaEndPoint::disableNotification(const std::string& reason) {
+    {
+        std::lock_guard<std::mutex> send_guard(notify_send_mutex_);
+        // A second failing completion on the same QP must not report again.
+        if (!notify_connected_.exchange(false)) return;
+        notify_send_cv_.notify_all();
+    }
+    LOG(WARNING) << "Notifications disabled on endpoint " << endpoint_name_
+                 << ", data path kept alive: " << reason;
+
+    // Unpublish so the WRs still posted on the dead QP flush silently instead
+    // of re-reporting the same fault once per WR.
+    std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
+    if (notify_qp_) {
+        context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
+    }
+}
 }  // namespace tent
 }  // namespace mooncake

@@ -398,14 +398,15 @@ void TcpTransport::runGroupRetirement(
     const std::shared_ptr<PeerConnectionGroup>& group) {
     std::shared_ptr<asio::steady_timer> retry_timer;
     std::shared_ptr<asio::steady_timer> admission_timer;
-    std::array<std::shared_ptr<ClientSession>, kMaxTcpLanesPerPeer> sessions;
-    std::array<std::shared_ptr<asio::ip::tcp::resolver>, kMaxTcpLanesPerPeer>
-        resolvers;
-    std::array<std::shared_ptr<asio::ip::tcp::socket>, kMaxTcpLanesPerPeer>
-        sockets;
-    size_t session_count = 0;
-    size_t resolver_count = 0;
-    size_t socket_count = 0;
+    // Each lane's asio objects live on that lane's shard executor; collect them
+    // together with the executor so teardown can run on the owning shard.
+    struct LaneTeardown {
+        asio::io_context::executor_type executor;
+        std::shared_ptr<ClientSession> session;
+        std::shared_ptr<asio::ip::tcp::resolver> resolver;
+        std::shared_ptr<asio::ip::tcp::socket> socket;
+    };
+    std::vector<LaneTeardown> teardowns;
     uint64_t pump_epoch = 0;
     bool retired = false;
     {
@@ -436,12 +437,10 @@ void TcpTransport::runGroupRetirement(
             for (const auto& lane : group->lanes) {
                 ++lane->operation_epoch;
                 if (lane->operation_epoch == 0) ++lane->operation_epoch;
-                if (lane->session)
-                    sessions[session_count++] = std::move(lane->session);
-                if (lane->resolver)
-                    resolvers[resolver_count++] = std::move(lane->resolver);
-                if (lane->socket)
-                    sockets[socket_count++] = std::move(lane->socket);
+                if (lane->session || lane->resolver || lane->socket)
+                    teardowns.push_back(
+                        {lane->executor, std::move(lane->session),
+                         std::move(lane->resolver), std::move(lane->socket)});
                 lane->connect_stage = LaneConnectStage::NONE;
                 lane->state = LaneState::CLOSED;
             }
@@ -457,17 +456,28 @@ void TcpTransport::runGroupRetirement(
     }
     if (!retired) return;
 
-    for (size_t i = 0; i < session_count; ++i)
-        if (sessions[i]) sessions[i]->cancel();
-    for (size_t i = 0; i < resolver_count; ++i) {
-        const auto& resolver = resolvers[i];
-        if (!resolver) continue;
-        try {
-            resolver->cancel();
-        } catch (...) {
-        }
+    // Cancel/close each lane's socket, session and resolver ON ITS OWN SHARD
+    // so these asio objects are only touched by their owning io thread. With
+    // MC_NUM_TCP_IO_THREADS == 1 asio::dispatch runs inline (unchanged
+    // behavior); with more shards it hops to the lane's io thread, avoiding
+    // concurrent close()/cancel() against an outstanding async op.
+    for (auto& teardown : teardowns) {
+        auto session = std::move(teardown.session);
+        auto resolver = std::move(teardown.resolver);
+        auto socket = std::move(teardown.socket);
+        asio::dispatch(teardown.executor, [session, resolver, socket] {
+            if (session) session->cancel();
+            if (resolver) {
+                try {
+                    resolver->cancel();
+                } catch (...) {
+                }
+            }
+            closeSocketNoThrow(socket);
+        });
     }
-    for (size_t i = 0; i < socket_count; ++i) closeSocketNoThrow(sockets[i]);
+    // Retry/admission timers are group->executor objects and we are running on
+    // that executor, so cancel them here.
     cancelTimerNoThrow(retry_timer);
     cancelTimerNoThrow(admission_timer);
 
@@ -546,14 +556,15 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
                 auto group_it = state->groups.find(key);
                 if (group_it == state->groups.end()) {
                     group = std::make_shared<PeerConnectionGroup>(
-                        key, runtime->executor,
+                        key,
+                        runtime->coordinatorExecutor(ConnectionKeyHash{}(key)),
                         state->max_queued_transfers_per_peer,
                         state->max_pending_admissions_per_peer,
                         state->admission_timeout, state->failure_counters);
                     group->lanes.reserve(state->lanes_per_peer);
                     for (size_t i = 0; i < state->lanes_per_peer; ++i) {
-                        group->lanes.push_back(
-                            std::make_shared<ConnectionLane>(i, group));
+                        group->lanes.push_back(std::make_shared<ConnectionLane>(
+                            i, group, runtime->nextLaneExecutor()));
                     }
                     auto [inserted_it, inserted] =
                         state->groups.emplace(key, group);
@@ -858,10 +869,26 @@ void TcpTransport::runGroupPump(
         invokeLaneObserverHook(kLaneAdmissionTimerArmed, pending_depth, 0, 0,
                                false);
 #endif
-    for (size_t i = 0; i < connect_count; ++i)
-        startLaneConnect(group, connects[i].lane, connects[i].epoch);
-    for (size_t i = 0; i < session_count; ++i)
-        startLaneSession(group, sessions[i].lane, sessions[i].epoch);
+    // Dispatch each lane's connect/session onto that lane's shard executor so
+    // its socket I/O runs on the owning io thread. asio::dispatch runs inline
+    // when already on the target executor (the single-shard/N=1 case stays
+    // identical to the historical inline calls) and hops otherwise.
+    for (size_t i = 0; i < connect_count; ++i) {
+        auto connect_lane = connects[i].lane;
+        uint64_t connect_epoch = connects[i].epoch;
+        asio::dispatch(connect_lane->executor,
+                       [group, connect_lane, connect_epoch] {
+                           startLaneConnect(group, connect_lane, connect_epoch);
+                       });
+    }
+    for (size_t i = 0; i < session_count; ++i) {
+        auto session_lane = sessions[i].lane;
+        uint64_t session_epoch = sessions[i].epoch;
+        asio::dispatch(session_lane->executor,
+                       [group, session_lane, session_epoch] {
+                           startLaneSession(group, session_lane, session_epoch);
+                       });
+    }
     failWorkItems(std::move(failed), failure_reason, group->failure_counters);
     failWorkItems(std::move(expired), WorkFailureReason::QUEUE_TIMEOUT,
                   group->failure_counters);
@@ -895,9 +922,9 @@ void TcpTransport::startLaneConnect(
 #endif
             try {
                 lane->resolver =
-                    std::make_shared<asio::ip::tcp::resolver>(group->executor);
+                    std::make_shared<asio::ip::tcp::resolver>(lane->executor);
                 lane->socket =
-                    std::make_shared<asio::ip::tcp::socket>(group->executor);
+                    std::make_shared<asio::ip::tcp::socket>(lane->executor);
                 lane->connect_stage = LaneConnectStage::RESOLVING;
                 lane->resolver->async_resolve(
                     group->key.host, std::to_string(group->key.port),
@@ -1403,49 +1430,70 @@ void TcpTransport::shutdownConnectionLanes() {
     }
 
     auto cancellation_posts = std::make_shared<LaneCancellationPostTracker>();
-    if (context_ && running_) {
+    if (io_pool_ && running_) {
+        struct LaneTeardown {
+            asio::io_context::executor_type executor;
+            std::shared_ptr<ClientSession> session;
+            std::shared_ptr<asio::ip::tcp::resolver> resolver;
+            std::shared_ptr<asio::ip::tcp::socket> socket;
+        };
         for (const auto& group : groups) {
-            cancellation_posts->add();
-            try {
-                asio::post(group->executor, [group, cancellation_posts] {
-                    std::vector<std::shared_ptr<ClientSession>> sessions;
-                    std::vector<std::shared_ptr<asio::ip::tcp::resolver>>
-                        resolvers;
-                    std::vector<std::shared_ptr<asio::ip::tcp::socket>> sockets;
-                    std::shared_ptr<asio::steady_timer> retry_timer;
-                    std::shared_ptr<asio::steady_timer> admission_timer;
-                    {
-                        std::lock_guard<std::mutex> lock(group->mutex);
-                        retry_timer = group->retry_timer;
-                        admission_timer = group->admission_timer;
-                        for (const auto& lane : group->lanes) {
-                            if (lane->session)
-                                sessions.push_back(lane->session);
-                            if (lane->resolver)
-                                resolvers.push_back(lane->resolver);
-                            if (lane->socket) sockets.push_back(lane->socket);
-                        }
-                    }
-                    for (const auto& session : sessions)
-                        if (session) session->cancel();
-                    for (const auto& resolver : resolvers) {
-                        if (!resolver) continue;
-                        try {
-                            resolver->cancel();
-                        } catch (...) {
-                        }
-                    }
-                    for (const auto& socket : sockets)
-                        closeSocketNoThrow(socket);
-                    if (retry_timer) {
-                        asio::error_code timer_ec;
-                        retry_timer->cancel(timer_ec);
-                    }
-                    cancelTimerNoThrow(admission_timer);
+            std::vector<LaneTeardown> teardowns;
+            std::shared_ptr<asio::steady_timer> retry_timer;
+            std::shared_ptr<asio::steady_timer> admission_timer;
+            {
+                std::lock_guard<std::mutex> lock(group->mutex);
+                retry_timer = group->retry_timer;
+                admission_timer = group->admission_timer;
+                for (const auto& lane : group->lanes) {
+                    if (lane->session || lane->resolver || lane->socket)
+                        teardowns.push_back({lane->executor, lane->session,
+                                             lane->resolver, lane->socket});
+                }
+            }
+            // Cancel/close each lane's asio objects on the lane's own shard;
+            // the group timers stay on the coordinator (group) executor. Each
+            // post is tracked so waitUntil() waits for all of them. At N=1
+            // asio::dispatch runs inline on the single io thread.
+            for (auto& teardown : teardowns) {
+                cancellation_posts->add();
+                auto session = teardown.session;
+                auto resolver = teardown.resolver;
+                auto socket = teardown.socket;
+                try {
+                    asio::dispatch(
+                        teardown.executor,
+                        [session, resolver, socket, cancellation_posts] {
+                            if (session) session->cancel();
+                            if (resolver) {
+                                try {
+                                    resolver->cancel();
+                                } catch (...) {
+                                }
+                            }
+                            closeSocketNoThrow(socket);
+                            cancellation_posts->done();
+                        });
+                } catch (...) {
                     cancellation_posts->done();
-                });
-            } catch (...) {
-                cancellation_posts->done();
+                }
+            }
+            if (retry_timer || admission_timer) {
+                cancellation_posts->add();
+                try {
+                    asio::dispatch(
+                        group->executor,
+                        [retry_timer, admission_timer, cancellation_posts] {
+                            if (retry_timer) {
+                                asio::error_code timer_ec;
+                                retry_timer->cancel(timer_ec);
+                            }
+                            cancelTimerNoThrow(admission_timer);
+                            cancellation_posts->done();
+                        });
+                } catch (...) {
+                    cancellation_posts->done();
+                }
             }
         }
         cancellation_posts->waitUntil(std::chrono::steady_clock::now() +
@@ -1453,8 +1501,10 @@ void TcpTransport::shutdownConnectionLanes() {
     }
 
     running_ = false;
-    if (context_) context_->io_context.stop();
-    if (thread_.joinable()) thread_.join();
+    // Stopping the pool stops every shard io_context and joins every io
+    // thread; after this returns no handler can run, which is the quiescence
+    // barrier for the synchronous teardown below.
+    if (io_pool_) io_pool_->stop();
 
     std::deque<TcpWorkItem> deferred;
     std::vector<std::shared_ptr<ClientSession>> sessions;
