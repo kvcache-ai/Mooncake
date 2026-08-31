@@ -1882,9 +1882,32 @@ Status TransferEngineImpl::commitPreparedSubmit(
                 for (const auto physical_task_id : group) {
                     for (const auto public_task_id :
                          public_tasks_by_physical_owner.at(physical_task_id)) {
+                        finishTransportAttempt(batch->task_list[public_task_id],
+                                               FAILED, attempt_end);
+                    }
+                }
+                // Recover by failing over to the remaining candidate
+                // transports instead of terminal-failing the tasks. Only
+                // physical (owner) tasks carry a submission: resubmitting a
+                // public alias would re-post the merged transfer (see
+                // docs/source/design/tent/failover.md, hazard 1).
+                for (const auto physical_task_id : group) {
+                    attemptSubmitStageFailover(batch, physical_task_id);
+                }
+                // Public aliases mirror their owner's recovered (or
+                // terminally failed) route so per-task status queries observe
+                // the same transport and sub-batch slot as the owner.
+                for (const auto physical_task_id : group) {
+                    const auto& owner_task = batch->task_list[physical_task_id];
+                    for (const auto public_task_id :
+                         public_tasks_by_physical_owner.at(physical_task_id)) {
+                        if (public_task_id == physical_task_id) continue;
                         auto& task = batch->task_list[public_task_id];
-                        finishTransportAttempt(task, FAILED, attempt_end);
-                        task.type = UNSPEC;
+                        task.type = owner_task.type;
+                        task.sub_task_id = owner_task.sub_task_id;
+                        task.status = owner_task.status;
+                        task.failover_count = owner_task.failover_count;
+                        task.xport_priority = owner_task.xport_priority;
                     }
                 }
             }
@@ -2084,7 +2107,12 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
-        task.type = UNSPEC;
+        // Submit-stage failover: walk the remaining candidate transports
+        // before giving up (the queued path dispatches one owner task at a
+        // time, so there are no derived aliases to mirror here).
+        if (attemptSubmitStageFailover(batch, queued.owner_task_id)) {
+            return markQueuedOwnerSubmitted(owner_id);
+        }
         return finishQueuedOwner(owner_id, FAILED);
     }
     return markQueuedOwnerSubmitted(owner_id);
@@ -2385,6 +2413,36 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
     }
     return status;
+}
+
+bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
+                                                    size_t task_id) {
+    auto& task = batch->task_list[task_id];
+    // Mark terminal first so a concurrent poll cannot observe a task that is
+    // half-migrated to its fallback transport (mirrors the poll-time
+    // failover in updateTaskStatusAfterPoll, which sets task.status = FAILED
+    // before calling resubmitTransferTask).
+    task.status = FAILED;
+    for (int attempt = 0; attempt < max_failover_attempts_; ++attempt) {
+        if (resubmitTransferTask(batch, task_id).ok()) {
+            task.status = PENDING;
+            return true;
+        }
+        // resubmitTransferTask() already finished the failed attempt, logged
+        // the reason and advanced the candidate cursor; the next iteration
+        // tries the following transport until the candidates or the failover
+        // budget are exhausted.
+    }
+    // Terminally failed: record the logical outcome here. The poll paths only
+    // record tasks transitioning out of PENDING, so they would never observe
+    // this task's PENDING -> FAILED transition. Record BEFORE resetting
+    // task.type so the failure is attributed to the last attempted transport.
+    recordTaskCompletionMetrics(task, PENDING, FAILED);
+    // Reset to UNSPEC so pollTaskStatus()'s UNSPEC short-circuit applies: the
+    // last failed submit never created a sub-batch entry for this task, so
+    // there is nothing to poll on the transport.
+    task.type = UNSPEC;
+    return false;
 }
 
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
@@ -2833,10 +2891,17 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                     }
                 }
             } else if (new_status == FAILED) {
+                // A task whose type is UNSPEC (no candidate ever resolved,
+                // or a legacy submit-stage failure clobbered it) has lost its
+                // transport attribution; fall back to the last physical
+                // attempt's transport so terminal failures are not
+                // mislabeled "unspec".
+                const auto attributed_type =
+                    task.type != UNSPEC ? task.type : task.attempt_type;
                 if (task.request.opcode == Request::READ) {
-                    TentMetrics::instance().recordReadFailed(task.type);
+                    TentMetrics::instance().recordReadFailed(attributed_type);
                 } else {
-                    TentMetrics::instance().recordWriteFailed(task.type);
+                    TentMetrics::instance().recordWriteFailed(attributed_type);
                 }
             }
             // Observability only (RFC #2519): deadline feasibility. The
