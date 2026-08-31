@@ -438,6 +438,9 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
 Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                          TransferStatus &status) {
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
+    if (!mnnvl_batch) {
+        return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
+    }
     if (task_id < 0 || task_id >= (int)mnnvl_batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }

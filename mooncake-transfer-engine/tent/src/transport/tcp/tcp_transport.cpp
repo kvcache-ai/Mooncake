@@ -168,6 +168,9 @@ Status TcpTransport::submitTransferTasks(
 Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                        TransferStatus &status) {
     auto tcp_batch = dynamic_cast<TcpSubBatch *>(batch);
+    if (!tcp_batch) {
+        return Status::InvalidArgument("Invalid TCP sub-batch" LOC_MARK);
+    }
     if (task_id < 0 || task_id >= (int)tcp_batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
