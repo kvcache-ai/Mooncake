@@ -75,6 +75,12 @@ class RdmaTransportTestPeer {
         workers.applyContextEvent(dev_id, context, event);
     }
 
+    // Runs the monitorThread() 1 Hz safety net for contexts whose
+    // IBV_EVENT_PORT_ACTIVE never arrived, without starting any threads.
+    static void resumePausedContexts(Workers& workers) {
+        workers.resumePausedContexts();
+    }
+
     static const RdmaContextSet& contextSet(const RdmaTransport& transport) {
         return transport.context_set_;
     }
@@ -485,6 +491,75 @@ TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {
     ASSERT_EQ(context.status(), RdmaContext::DEVICE_UNINIT);
     EXPECT_EQ(context.refreshPortAttributes(), -1);
     EXPECT_DOUBLE_EQ(context.linkSpeedGbps(), 0.0);
+}
+
+// The 1 Hz recovery poll only reactivates contexts that are actually paused.
+// An inert slot never opened a device, so there is no port to consult and
+// nothing to hand back to the selector.
+TEST_F(RdmaContextEventTest, RecoveryPollLeavesInertContextsAlone) {
+    fire(IBV_EVENT_PORT_ERR, ourPort());
+    ASSERT_FALSE(selector_->isDeviceAvailable(kDev));
+    ASSERT_EQ(context().status(), RdmaContext::DEVICE_UNINIT);
+
+    RdmaTransportTestPeer::resumePausedContexts(*workers_);
+
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+}
+
+TEST(RdmaContextPortStateTest, QueryOnInertContextIsRejected) {
+    RdmaTransport transport;
+    RdmaContext context(transport);
+    ASSERT_EQ(context.status(), RdmaContext::DEVICE_UNINIT);
+
+    ibv_port_state state = IBV_PORT_DOWN;
+    EXPECT_EQ(context.queryPortState(&state), -1);
+    EXPECT_EQ(state, IBV_PORT_DOWN) << "a failed query must not invent a state";
+    EXPECT_EQ(context.queryPortState(nullptr), -1);
+}
+
+// A context paused by IBV_EVENT_PORT_ERR whose IBV_EVENT_PORT_ACTIVE never
+// arrives (the async fd is edge-triggered, so a queued event can be stranded)
+// used to stay DEVICE_PAUSED for the rest of the process' life, failing every
+// transfer routed to that NIC. The monitor thread's poll must notice that the
+// hardware reports the port as up and reactivate the context.
+TEST(RdmaPausedContextRecoveryTest, PollActivatesPausedContextWithLivePort) {
+    if (!hasRdmaDevice()) GTEST_SKIP() << "no RDMA device detected";
+
+    int count = 0;
+    ibv_device** devices = ibv_get_device_list(&count);
+    ASSERT_NE(devices, nullptr);
+    ASSERT_GT(count, 0);
+    const std::string device_name = ibv_get_device_name(devices[0]);
+    ibv_free_device_list(devices);
+
+    auto topology = std::make_shared<Topology>();
+    const std::string spec = R"({"nics":[{"name":")" + device_name +
+                             R"(","type":0,"numa_node":0}]})";
+    ASSERT_TRUE(topology->parse(spec).ok());
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    RdmaTransportTestPeer::initializeContexts(transport);
+    const auto& contexts = RdmaTransportTestPeer::contextSet(transport);
+    ASSERT_EQ(contexts.size(), 1u);
+    RdmaContext& context = *contexts[0];
+    if (context.status() != RdmaContext::DEVICE_ENABLED)
+        GTEST_SKIP() << device_name << " has no usable active port";
+
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    auto* selector = workers->getDeviceSelector();
+    ASSERT_NE(selector, nullptr);
+
+    // Exactly the state IBV_EVENT_PORT_ERR leaves behind, minus the event
+    // that would have undone it.
+    context.pause();
+    ASSERT_EQ(context.status(), RdmaContext::DEVICE_PAUSED);
+    ASSERT_TRUE(selector->setDeviceAvailable(0, false).ok());
+
+    RdmaTransportTestPeer::resumePausedContexts(*workers);
+
+    EXPECT_EQ(context.status(), RdmaContext::DEVICE_ENABLED);
+    EXPECT_TRUE(selector->isDeviceAvailable(0));
 }
 
 TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {

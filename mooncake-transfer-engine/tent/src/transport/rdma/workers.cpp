@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <fstream>
 #include <sstream>
 
@@ -861,14 +862,29 @@ void Workers::workerThread(int thread_id) {
 
 int Workers::handleContextEvents(int dev_id,
                                  std::shared_ptr<RdmaContext>& context) {
-    ibv_async_event event;
-    if (ibv_get_async_event(context->nativeContext(), &event) < 0) return -1;
-    LOG(WARNING) << "Received context async event "
-                 << ibv_event_type_str(event.event_type) << " for context "
-                 << context->name();
-    applyContextEvent(dev_id, *context, event);
-    ibv_ack_async_event(&event);
-    return 0;
+    // The async fd is non-blocking and edge-triggered
+    // (joinNonblockingPollList), and ibv_get_async_event() dequeues one record
+    // per call, so every queued event has to be consumed here: epoll only
+    // reports readiness again once a *new* event arrives. Bursts are routine
+    // (IBV_EVENT_COMM_EST fires once per connection), and a PORT_ACTIVE
+    // stranded behind one keeps the context paused until some unrelated event
+    // happens to release it -- which may be never.
+    while (true) {
+        ibv_async_event event;
+        errno = 0;
+        if (ibv_get_async_event(context->nativeContext(), &event) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;  // drained
+            if (errno == EINTR) continue;
+            PLOG(ERROR) << "ibv_get_async_event for context "
+                        << context->name();
+            return -1;
+        }
+        LOG(WARNING) << "Received context async event "
+                     << ibv_event_type_str(event.event_type) << " for context "
+                     << context->name();
+        applyContextEvent(dev_id, *context, event);
+        ibv_ack_async_event(&event);
+    }
 }
 
 void Workers::applyContextEvent(int dev_id, RdmaContext& context,
@@ -909,12 +925,7 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
                 device_selector_->setDeviceAvailable(dev_id, false);
                 LOG(WARNING) << "Action: " << context.name() << " down";
             } else {
-                context.resume();
-                // The link may have renegotiated while down: re-seed before
-                // the device becomes selectable so no worker scores it on
-                // the old rate.
-                refreshLinkSpeed(dev_id, context);
-                device_selector_->setDeviceAvailable(dev_id, true);
+                activateContext(dev_id, context);
                 LOG(WARNING) << "Action: " << context.name() << " up";
             }
             break;
@@ -931,6 +942,14 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
         default:
             break;
     }
+}
+
+void Workers::activateContext(int dev_id, RdmaContext& context) {
+    context.resume();
+    // The link may have renegotiated while down: re-seed before the device
+    // becomes selectable so no worker scores it on the old rate.
+    refreshLinkSpeed(dev_id, context);
+    if (device_selector_) device_selector_->setDeviceAvailable(dev_id, true);
 }
 
 void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {
@@ -956,6 +975,27 @@ void Workers::reclaimEndpoints() {
     }
 }
 
+void Workers::resumePausedContexts() {
+    for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
+         ++dev_id) {
+        auto& context = transport_->context_set_[dev_id];
+        // Only a paused context is waiting for a recovery event; this also
+        // filters out inert slots, which never leave DEVICE_UNINIT.
+        if (!context || context->status() != RdmaContext::DEVICE_PAUSED)
+            continue;
+        ibv_port_state state;
+        if (context->queryPortState(&state) != 0) continue;  // already logged
+        // Only a fully active port carries traffic. Intermediate states
+        // (INIT/ARMED/ACTIVE_DEFER) mean the link is still settling, so leave
+        // the context paused and re-check on the next tick.
+        if (state != IBV_PORT_ACTIVE) continue;
+        LOG(WARNING) << "Action: " << context->name()
+                     << " up (port reports ACTIVE without an "
+                        "IBV_EVENT_PORT_ACTIVE event)";
+        activateContext(static_cast<int>(dev_id), *context);
+    }
+}
+
 void Workers::monitorThread() {
     // Track time for periodic endpoint reclaim (1 Hz heartbeat)
     auto last_reclaim_time = std::chrono::steady_clock::now();
@@ -971,6 +1011,8 @@ void Workers::monitorThread() {
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
             reclaimEndpoints();
+            // Safety net for a recovery event that never reached us.
+            resumePausedContexts();
             last_reclaim_time = current_time;
         }
 
