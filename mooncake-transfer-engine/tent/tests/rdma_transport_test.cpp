@@ -78,6 +78,15 @@ class RdmaTransportTestPeer {
     static const RdmaContextSet& contextSet(const RdmaTransport& transport) {
         return transport.context_set_;
     }
+
+    using NotifyAction = RdmaTransport::NotifyCompletionAction;
+
+    static NotifyAction classifyNotifyCompletion(ibv_wc_status status,
+                                                 bool endpoint_alive,
+                                                 bool endpoint_ready) {
+        return RdmaTransport::classifyNotifyCompletion(status, endpoint_alive,
+                                                       endpoint_ready);
+    }
 };
 
 namespace {
@@ -221,6 +230,59 @@ TEST(DeviceSelectorTest, PerSliceAllocationHonorsPolicy) {
                         .ok());
         EXPECT_EQ(chosen_device, 2);
     }
+}
+
+// Retiring an endpoint moves its data QPs to ERR and flushes in-flight
+// transfers, so a notify completion error may only do that when it can mean the
+// peer or the path is gone. The notify QP owns its buffers, MRs and CQ, so a
+// local WQE/MR fault says nothing about the data path.
+TEST(RdmaNotifyFaultTriageTest, LocalNotifyFaultsKeepTheDataPath) {
+    using Action = RdmaTransportTestPeer::NotifyAction;
+    const auto classify = &RdmaTransportTestPeer::classifyNotifyCompletion;
+
+    EXPECT_EQ(classify(IBV_WC_LOC_LEN_ERR, true, true),
+              Action::DisableNotification);
+    EXPECT_EQ(classify(IBV_WC_LOC_QP_OP_ERR, true, true),
+              Action::DisableNotification);
+    EXPECT_EQ(classify(IBV_WC_LOC_PROT_ERR, true, true),
+              Action::DisableNotification);
+    EXPECT_EQ(classify(IBV_WC_LOC_ACCESS_ERR, true, true),
+              Action::DisableNotification);
+    EXPECT_EQ(classify(IBV_WC_MW_BIND_ERR, true, true),
+              Action::DisableNotification);
+}
+
+TEST(RdmaNotifyFaultTriageTest, PathAndPeerFaultsRetireTheEndpoint) {
+    using Action = RdmaTransportTestPeer::NotifyAction;
+    const auto classify = &RdmaTransportTestPeer::classifyNotifyCompletion;
+
+    // A restarted peer surfaces here, and the endpoint has to be retired for
+    // the next getEndpoint() to rebuild it with a live notify QP.
+    EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, true, true),
+              Action::RetireEndpoint);
+    EXPECT_EQ(classify(IBV_WC_REM_OP_ERR, true, true), Action::RetireEndpoint);
+    EXPECT_EQ(classify(IBV_WC_REM_ACCESS_ERR, true, true),
+              Action::RetireEndpoint);
+    EXPECT_EQ(classify(IBV_WC_REM_INV_REQ_ERR, true, true),
+              Action::RetireEndpoint);
+    EXPECT_EQ(classify(IBV_WC_FATAL_ERR, true, true), Action::RetireEndpoint);
+    // Nothing put this QP in ERR on our side, so the peer or the path did.
+    EXPECT_EQ(classify(IBV_WC_WR_FLUSH_ERR, true, true),
+              Action::RetireEndpoint);
+}
+
+TEST(RdmaNotifyFaultTriageTest, TeardownFlushesStayQuiet) {
+    using Action = RdmaTransportTestPeer::NotifyAction;
+    const auto classify = &RdmaTransportTestPeer::classifyNotifyCompletion;
+
+    // Every WR still posted on a retiring endpoint's notify QP flushes.
+    // Reporting each one floods the log and re-triggers teardown.
+    EXPECT_EQ(classify(IBV_WC_WR_FLUSH_ERR, true, false), Action::SkipSilently);
+    EXPECT_EQ(classify(IBV_WC_WR_FLUSH_ERR, false, false),
+              Action::SkipSilently);
+    // A real fault surfacing after the endpoint is gone has nothing left to
+    // act on.
+    EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, false, false), Action::ReportOnly);
 }
 
 // context_set_ is subscripted by NicID, so it must keep one slot per NIC even
