@@ -299,9 +299,8 @@ TEST(TransferEngineConfigOverrideTest,
 }
 
 TEST(TransferEngineConfigOverrideTest, LocalHostnameEnvOverridesMcTentConf) {
-    EnvVarGuard conf_guard(
-        "MC_TENT_CONF",
-        R"({"rpc_server_hostname":"10.0.0.1"})");
+    EnvVarGuard conf_guard("MC_TENT_CONF",
+                           R"({"rpc_server_hostname":"10.0.0.1"})");
     EnvVarGuard host_guard("MOONCAKE_LOCAL_HOSTNAME", "10.0.0.2");
 
     Config config;
