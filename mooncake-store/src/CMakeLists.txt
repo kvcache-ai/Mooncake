@@ -87,6 +87,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     shm_helper.cpp
     file_storage.cpp
     config/file_storage_config.cpp
+    config/client_auto_port_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
