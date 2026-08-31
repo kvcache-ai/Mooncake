@@ -511,6 +511,18 @@ if(USE_TPU)
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 endif()
 
+# NOT registered via add_test: the test needs a real CUDA device (it exports
+# a real CUDA IPC handle), so it must be run manually on a GPU host. Only
+# built when CUDA is enabled: the test includes CUDA headers directly.
+if(USE_CUDA)
+  add_executable(tent_nvlink_ipc_handle_sharing_test
+                 nvlink_ipc_handle_sharing_test.cpp)
+  target_link_libraries(tent_nvlink_ipc_handle_sharing_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_nvlink_ipc_handle_sharing_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+endif()
+
 # A peer restart invalidates every connection pooled for it; one failed call
 # must flush the whole pool. Loopback only, no NIC required.
 add_executable(tent_rpc_reconnect_test rpc_reconnect_test.cpp)
