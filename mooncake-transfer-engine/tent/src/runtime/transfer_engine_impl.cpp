@@ -343,8 +343,18 @@ Status TransferEngineImpl::construct() {
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
+    // TCP SendData/RecvData copies are offloaded, but the RPC io_context still
+    // reads the full attachment. One thread serializes concurrent bulk TCP.
+    // Leave RDMA-only at 1; when TCP is on and the user did not set
+    // rpc_server_threads, use several so attachments can be read in parallel.
     size_t rpc_server_threads = 1;
-    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, 1, rpc_server_threads));
+    const size_t rpc_threads_default =
+        conf_->get("transports/tcp/enable", false)
+            ? std::min<size_t>(
+                  8, std::max<size_t>(4, std::thread::hardware_concurrency()))
+            : 1;
+    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, rpc_threads_default,
+                                               rpc_server_threads));
     merge_requests_ = conf_->get("merge_requests", true);
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     enable_auto_failover_on_poll_ =
