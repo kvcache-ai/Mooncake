@@ -1,7 +1,9 @@
 #pragma once
 
+#include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace mooncake {
@@ -58,6 +60,34 @@ inline std::string current_request_id_attachment() {
         return g_current_ctx->request_id;
     }
     return {};
+}
+
+// --- Test/instrumentation seam (process-global; NOT a production hot path) ---
+// Lets an in-process integration test observe the attachment request_id that a
+// master handler actually received, instead of relying on VLOG. A test sets a
+// RequestContext on the calling thread, performs a synchronous single-key read
+// (invoke_rpc sends current_request_id_attachment() out-of-band), then reads
+// LastObservedRequestId(). The mutex is held only across a short std::string
+// copy, and only GetReplicaListRpc/BatchGetReplicaListRpc ever write here.
+inline std::mutex& request_id_instrument_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::string& request_id_instrument_store() {
+    static std::string s;
+    return s;
+}
+inline void RecordObservedRequestId(std::string_view id) {
+    std::lock_guard<std::mutex> lk(request_id_instrument_mutex());
+    request_id_instrument_store() = std::string(id);
+}
+inline std::string LastObservedRequestId() {
+    std::lock_guard<std::mutex> lk(request_id_instrument_mutex());
+    return request_id_instrument_store();
+}
+inline void ClearLastObservedRequestId() {
+    std::lock_guard<std::mutex> lk(request_id_instrument_mutex());
+    request_id_instrument_store().clear();
 }
 
 }  // namespace mooncake

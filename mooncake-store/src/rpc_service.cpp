@@ -1,4 +1,5 @@
 #include "rpc_service.h"
+#include "request_context.h"
 #include <csignal>
 
 #include <ylt/struct_json/json_reader.h>
@@ -493,6 +494,7 @@ WrappedMasterService::GetReplicaListRpc(
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
         VLOG(1) << "GetReplicaList request_id=" << att;
+        RecordObservedRequestId(att);
     }
 
     auto result = GetReplicaList(key, config);
@@ -512,6 +514,7 @@ WrappedMasterService::BatchGetReplicaListRpc(
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
         VLOG(1) << "BatchGetReplicaList request_id=" << att;
+        RecordObservedRequestId(att);
     }
 
     auto results = BatchGetReplicaList(keys, config);
