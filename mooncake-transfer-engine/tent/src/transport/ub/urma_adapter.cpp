@@ -672,9 +672,9 @@ class RealJetty final : public Jetty {
         config.flag.bs.share_jfr = 1;
         config.jfs_cfg.depth = options.depth;
         config.jfs_cfg.trans_mode = URMA_TM_RC;
-        config.jfs_cfg.priority =
-            context_->isBondingDevice() ? context_->ctpPriority()
-                                        : options.priority;
+        config.jfs_cfg.priority = context_->isBondingDevice()
+                                      ? context_->ctpPriority()
+                                      : options.priority;
         if (context_->isBondingDevice()) {
             config.jfs_cfg.flag.bs.multi_path = 1;
         }
@@ -1156,8 +1156,8 @@ class RealUrmaAdapter final : public UrmaAdapter {
                     urma_user_ctl(native_context, &ctl_in, &ctl_out);
                 if (ctl_rc != URMA_SUCCESS) {
                     (void)urma_delete_context(native_context);
-                    return nativeError(
-                        "urma_user_ctl(SET_BONDING_MODE)", ctl_rc);
+                    return nativeError("urma_user_ctl(SET_BONDING_MODE)",
+                                       ctl_rc);
                 }
             }
 
@@ -1192,9 +1192,9 @@ class RealUrmaAdapter final : public UrmaAdapter {
                                         ":eid" +
                                         std::to_string(current.eid_index);
             }
-            output = std::make_shared<RealContext>(std::move(runtime),
-                                                   std::move(current),
-                                                   native_context, ctp_priority);
+            output = std::make_shared<RealContext>(
+                std::move(runtime), std::move(current), native_context,
+                ctp_priority);
             return Status::OK();
         }
         return Status::DeviceNotFound("URMA device not found: " +
@@ -1265,8 +1265,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
             return Status::InvalidArgument("invalid local segment range");
         }
 
-        urma_token_id_t* token_id =
-            urma_alloc_token_id(real_context->native());
+        urma_token_id_t* token_id = urma_alloc_token_id(real_context->native());
         if (token_id == nullptr) {
             return nativePointerError("urma_alloc_token_id");
         }

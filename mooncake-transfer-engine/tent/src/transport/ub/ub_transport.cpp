@@ -214,7 +214,8 @@ struct UbTransport::Impl {
             if (explicit_filter) {
                 selection_log << "UB device selection: mode=explicit-filter";
             } else if (prefer_bonding) {
-                selection_log << "UB device selection: mode=auto-prefer-bonding";
+                selection_log
+                    << "UB device selection: mode=auto-prefer-bonding";
             } else {
                 selection_log << "UB device selection: mode=all-devices";
             }
