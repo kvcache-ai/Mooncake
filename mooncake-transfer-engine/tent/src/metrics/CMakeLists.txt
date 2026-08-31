@@ -1,6 +1,18 @@
 # TENT_METRICS_ENABLED option is declared in tent/CMakeLists.txt.
 file(GLOB TENT_METRICS_SOURCES "*.cpp")
-add_library(tent_metrics STATIC ${TENT_METRICS_SOURCES})
+# Build as a SHARED library so the TentMetrics singleton (the function-local
+# `static TentMetrics instance` in TentMetrics::instance()) is not duplicated
+# across DSOs. When statically linked, the metrics code is copied into every
+# consumer .so (engine.so and store.so), giving each its own TentMetrics
+# instance: a process that loads both modules ends up with two independent
+# metrics singletons, two periodic report threads ("TENT Metrics:" logged
+# twice per interval), and a metrics HTTP port clash (both default to 9100,
+# so only one binds and the other silently degrades to log-only). As a shared
+# library, both modules take a single DT_NEEDED on libtent_metrics.so and
+# share the one process-wide singleton. PIC is already on for the whole tent
+# tree (tent/CMakeLists.txt sets CMAKE_POSITION_INDEPENDENT_CODE ON), so the
+# tent_common OBJECT dependency links cleanly into the shared object.
+add_library(tent_metrics SHARED ${TENT_METRICS_SOURCES})
 # Link yalantinglibs::yalantinglibs for metrics and HTTP server (ylt headers +
 # transitive deps). ODR safety: yalantinglibs bundles ASIO headers but does NOT
 # compile ASIO inline because ASIO_SEPARATE_COMPILATION is set globally. All
@@ -20,3 +32,13 @@ else()
   target_compile_definitions(tent_metrics PUBLIC TENT_METRICS_ENABLED=0)
   message(STATUS "TENT metrics: DISABLED (zero overhead)")
 endif()
+
+# Install to lib/ for libtent_shared.so / system consumers. The python C
+# extensions (engine.so, store.so) resolve it via $ORIGIN, so a second
+# install lands libtent_metrics.so next to them — see
+# mooncake-integration/CMakeLists.txt.
+install(
+  TARGETS tent_metrics
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+  RUNTIME DESTINATION bin)

@@ -49,6 +49,19 @@ target_include_directories(tent_metrics_recording_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_metrics_recording_test COMMAND tent_metrics_recording_test)
 
+# Regression guard: tent_metrics must remain a SHARED dependency so the
+# TentMetrics singleton is shared across DSOs (engine.so / store.so) rather than
+# statically duplicated. Asserts libtent_shared.so imports TentMetrics::instance
+# (undefined, U) from libtent_metrics.so instead of defining it (T). See
+# check_tent_metrics_shared.cmake and docs/tent-metrics-shared-singleton.md.
+if(TARGET tent_shared AND TARGET tent_metrics)
+  add_test(
+    NAME tent_metrics_shared_singleton_check
+    COMMAND ${CMAKE_COMMAND}
+            -DTENT_SHARED_LIB=$<TARGET_FILE:tent_shared>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check_tent_metrics_shared.cmake)
+endif()
+
 add_executable(admission_queue_test admission_queue_test.cpp
                                     ../src/runtime/admission_queue.cpp)
 target_link_libraries(admission_queue_test PRIVATE tent_common gtest gtest_main)
