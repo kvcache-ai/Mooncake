@@ -108,8 +108,10 @@ class FileStorage {
     // friendship, so the dangling-replica tests are friended by their
     // generated class names (plain friend, no gtest include in a production
     // header).
-    friend class FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
-    friend class FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
+    friend class
+        FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
+    friend class
+        FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
