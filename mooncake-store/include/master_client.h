@@ -300,6 +300,13 @@ class MasterClient {
             metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
         }
 
+        // Bypass inject (see invoke_rpc_async_with_pool): snapshot the calling
+        // thread's per-request request_id once at entry and carry it into the
+        // pool-work closure via send_request_with_attachment, so batch master
+        // RPCs (BatchExistKey / BatchPutStart / ...) carry the id out-of-band
+        // just like single-result RPCs. An empty attachment is wire-identical to
+        // a plain send_request and is ignored by non-reading handlers (gray).
+        std::string ctx_attachment = current_request_id_attachment();
         auto start_time = std::chrono::steady_clock::now();
         return async_simple::coro::syncAwait(
             [&]() -> async_simple::coro::Lazy<
@@ -307,7 +314,9 @@ class MasterClient {
                 auto ret = co_await pool->send_request(
                     [&](coro_io::client_reuse_hint,
                         coro_rpc::coro_rpc_client& client) {
-                        return client.send_request<ServiceMethod>(
+                        return client.send_request_with_attachment<ServiceMethod>(
+                            std::string_view(ctx_attachment.data(),
+                                             ctx_attachment.size()),
                             std::forward<Args>(args)...);
                     });
                 if (!ret.has_value()) {
