@@ -283,6 +283,35 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_EQ(config.get("transports/rdma/bind_address", ""), "10.0.0.2");
 }
 
+// MOONCAKE_LOCAL_HOSTNAME is the classic Transfer Engine + store env var that
+// names the local host for RPC binding and segment identity. TENT must honor
+// the same env so a single MOONCAKE_LOCAL_HOSTNAME works across both engines;
+// otherwise TENT's auto-discovery can pick a container/CNI IP (e.g. 10.154.0.1)
+// instead of the RDMA-network IP, breaking cross-node RDMA handshake.
+TEST(TransferEngineConfigOverrideTest,
+     LocalHostnameEnvLoadsIntoRpcServerHostname) {
+    EnvVarGuard guard("MOONCAKE_LOCAL_HOSTNAME", "10.0.0.2");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("rpc_server_hostname", ""), "10.0.0.2");
+}
+
+TEST(TransferEngineConfigOverrideTest, LocalHostnameEnvOverridesMcTentConf) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"rpc_server_hostname":"10.0.0.1"})");
+    EnvVarGuard host_guard("MOONCAKE_LOCAL_HOSTNAME", "10.0.0.2");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    // Legacy env must override MC_TENT_CONF, same precedence as
+    // MC_RDMA_BIND_ADDRESS (env wins so per-pod injection works).
+    EXPECT_EQ(config.get("rpc_server_hostname", ""), "10.0.0.2");
+}
+
 TEST(TransferEngineConfigOverrideTest,
      LegacyRdmaSliceAffinityLogEnvLoadsIntoTentConfig) {
     EnvVarGuard guard("MC_LOG_RDMA_SLICE_AFFINITY", "true");
