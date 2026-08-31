@@ -140,7 +140,7 @@ static int resolveSegTypeParams(const std::string& seg_type,
         }
 #elif defined(USE_HIP)
     } else if (seg_type == "VRAM" || seg_type == "vram") {
-        device_prefix = "rocm";
+        device_prefix = "hip";
         int gpu_count = 0;
         hipGetDeviceCount(&gpu_count);
         start_idx = 0;
@@ -423,7 +423,8 @@ void TENTBenchRunner::pinThread(int thread_id) {
     if (location.type() == "cpu") {
         auto socket_id = location.index();
         bindToSocket(socket_id);
-    } else if (location.type() == "cuda" || location.type() == "rocm") {
+    } else if (location.type() == "cuda" ||
+               isAmdGpuLocationType(location.type())) {
         auto device_id = location.index();
         auto socket_id = getGpuDeviceNumaID(device_id);
         bindToSocket(socket_id);

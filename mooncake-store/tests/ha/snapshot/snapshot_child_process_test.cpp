@@ -246,8 +246,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService* svc, const std::string& key) {
-        const size_t shard_idx =
-            svc->getMetadataShardIndex(TenantId::Default(), key);
+        const size_t shard_idx = svc->getShardIndex(TenantId::Default(), key);
         MasterService::MetadataShardAccessorRO shard(svc, shard_idx);
         const auto tenant_it = shard->tenants.find(TenantId::Default());
         if (tenant_it == shard->tenants.end()) {

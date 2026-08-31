@@ -25,6 +25,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
@@ -584,11 +585,17 @@ Status TransferEngineImpl::deconstruct() {
             }
             Slab<Batch>::Get().deallocate(batch);
         };
-        for (auto& batch : batch_set_.active) release_batch(batch);
-        for (auto& batch : batch_set_.freelist) release_batch(batch);
-        batch_set_.active.clear();
-        batch_set_.freelist.clear();
-        alive_batches_.clear();
+        // Registry state is sharded; collect members under each shard.
+        // Shutdown is quiesced (progress_mutex_ held, no pollers expected),
+        // so a brief per-shard lock per batch is sufficient.
+        for (auto& shard : batch_shards_) {
+            std::lock_guard<std::recursive_mutex> shard_lk(shard.mtx);
+            for (auto* batch : shard.active_batches) release_batch(batch);
+            shard.active_batches.clear();
+            shard.alive_batches.clear();
+        }
+        for (auto* batch : batch_freelist_) release_batch(batch);
+        batch_freelist_.clear();
     }
 
     // Now safe to destroy transports (workers join here)
@@ -957,31 +964,99 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     batch->max_size = batch_size;
     batch->task_list.reserve(batch_size);
     BatchID batch_id = (BatchID)batch;
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    batch_set_.active.insert(batch);
-    alive_batches_.insert(batch_id);
+    // Registry insert under the batch's own shard; no global lock.
+    {
+        BatchShard& shard = batchShard(batch_id);
+        std::lock_guard<std::recursive_mutex> lk(shard.mtx);
+        shard.active_batches.insert(batch);
+        shard.alive_batches.insert(batch_id);
+    }
     return batch_id;
 }
 
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
-        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
-    if (runtime_queue_config_.enabled && batch->queue_token != 0) {
-        auto retire_status = retireQueueForBatch(batch);
-        if (!retire_status.ok() && !retire_status.IsInvalidEntry()) {
-            return retire_status;
+    // Fast path (queue off, no refs, tasks terminal): free under the batch
+    // shard only. tebench / sglang take this path. Shard is released before
+    // the deferred path takes progress_mutex_ (lock-order safety).
+    bool already_requested = false;
+    bool deferred = false;
+    {
+        std::lock_guard<std::recursive_mutex> shard_lk(
+            progressLockFor(batch_id));
+        if (!isBatchAlive(batch_id))
+            return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+        if (!runtime_queue_config_.enabled && batch->runtime_refs == 0 &&
+            !batch->free_requested) {
+            // Only free inline when the final poll succeeds and reports a
+            // terminal state. A poll error defers the batch instead of
+            // failing freeBatch(): the lazy sweep retries, rate-limits and
+            // eventually quarantines a permanently stuck batch.
+            TransferStatus overall_status;
+            auto status = getTransferStatus(batch_id, overall_status);
+            if (status.ok() && overall_status.s != PENDING) {
+                for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                    auto& transport = transport_list_[type];
+                    auto& sub_batch = batch->sub_batch[type];
+                    if (transport && sub_batch)
+                        transport->freeSubBatch(sub_batch);
+                }
+                {
+                    BatchShard& shard = batchShard(batch_id);
+                    std::lock_guard<std::recursive_mutex> shard_reg_lk(
+                        shard.mtx);
+                    shard.active_batches.erase(batch);
+                    shard.alive_batches.erase(batch_id);
+                }
+                Slab<Batch>::Get().deallocate(batch);
+                return Status::OK();
+            }
         }
+        already_requested = batch->free_requested;
+        batch->free_requested = true;
+        deferred = true;
     }
-    if (batch->free_requested) {
+
+    if (deferred) {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        // The shard lock was released before taking progress_mutex_ to keep
+        // the lock order one-way. In the default queue-off mode,
+        // progress_mutex_ does not protect the per-shard registry, so
+        // reacquire that shard before reading alive_batches_. Queue mode
+        // already makes progress_mutex_ the caller's lock and isBatchAlive()
+        // takes the shard for this check.
+        bool batch_alive = false;
+        if (runtime_queue_config_.enabled) {
+            batch_alive = isBatchAlive(batch_id);
+        } else {
+            std::lock_guard<std::recursive_mutex> shard_lk(
+                batchShardMutex(batch_id));
+            batch_alive = isBatchAlive(batch_id);
+        }
+        if (!batch_alive) {
+            // We marked free_requested; another thread already reaped it.
+            return Status::OK();
+        }
+        if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+            auto retire_status = retireQueueForBatch(batch);
+            if (!retire_status.ok() && !retire_status.IsInvalidEntry()) {
+                return retire_status;
+            }
+        }
+        if (!already_requested) {
+            // First free request: accepted unconditionally; the lazy sweep
+            // result is dropped (retry/quarantine happens in background).
+            batch_freelist_.push_back(batch);
+            lazyFreeBatch();
+            return Status::OK();
+        }
+        // Re-free of an already-requested batch: surface the sweep status —
+        // callers polling a stuck batch observe the reclaim error until the
+        // batch is quarantined or reclaimed.
         CHECK_STATUS(lazyFreeBatch());
         return Status::OK();
     }
-    batch->free_requested = true;
-    batch_set_.freelist.push_back(batch);
-    lazyFreeBatch();
     return Status::OK();
 }
 
@@ -996,61 +1071,81 @@ Status TransferEngineImpl::lazyFreeBatch() {
     // also logged here, rate-limited, or a permanently stuck batch would be
     // re-polled forever without a trace.
     Status first_error = Status::OK();
-    for (auto it = batch_set_.freelist.begin();
-         it != batch_set_.freelist.end();) {
+    for (auto it = batch_freelist_.begin(); it != batch_freelist_.end();) {
         auto& batch = *it;
-        if (batch->runtime_refs > 0 || batch->reclaim_abandoned) {
+        if (batch->reclaim_abandoned) {
             it++;
             continue;
         }
-        TransferStatus overall_status;
-        auto status = getTransferStatus((BatchID)batch, overall_status);
-        if (status.ok() && overall_status.s == PENDING) {
-            batch->reclaim_failures = 0;
-            it++;
-            continue;
-        }
-        if (status.ok() && runtime_queue_config_.enabled &&
-            batch->queue_token != 0) {
-            status = retireQueueForBatch(batch);
-        }
-        if (!status.ok()) {
-            if (++batch->reclaim_failures >= kMaxReclaimAttempts) {
-                batch->reclaim_abandoned = true;
-                TENT_RECORD_BATCH_QUARANTINED();
-                LOG(ERROR) << "lazyFreeBatch: batch " << batch << " failed "
-                           << batch->reclaim_failures
-                           << " consecutive reclaim attempts; giving up until "
-                              "engine teardown reclaims it unconditionally. "
-                              "Last error: "
-                           << status.ToString();
-            } else {
-                LOG_EVERY_N(WARNING, 100)
-                    << "lazyFreeBatch: batch " << batch
-                    << " cannot be reclaimed yet, left in freelist: "
-                    << status.ToString();
+        BatchID batch_id = (BatchID)batch;
+        // Hold the shard through deallocate so a poller waiting on the
+        // same shard cannot observe a dangling Batch*. runtime_refs is
+        // read under the shard because retain/release mutate it there.
+        {
+            std::lock_guard<std::recursive_mutex> shard_lk(
+                progressLockFor(batch_id));
+            if (!isBatchAlive(batch_id)) {
+                // Another thread already reaped this batch.
+                it = batch_freelist_.erase(it);
+                continue;
             }
-            if (first_error.ok()) first_error = status;
-            it++;
-            continue;
+            if (batch->runtime_refs > 0) {
+                it++;
+                continue;
+            }
+            TransferStatus overall_status;
+            auto status = getTransferStatus(batch_id, overall_status);
+            if (status.ok() && overall_status.s == PENDING) {
+                batch->reclaim_failures = 0;
+                it++;
+                continue;
+            }
+            if (status.ok() && runtime_queue_config_.enabled &&
+                batch->queue_token != 0) {
+                status = retireQueueForBatch(batch);
+            }
+            if (!status.ok()) {
+                if (++batch->reclaim_failures >= kMaxReclaimAttempts) {
+                    batch->reclaim_abandoned = true;
+                    TENT_RECORD_BATCH_QUARANTINED();
+                    LOG(ERROR) << "lazyFreeBatch: batch " << batch << " failed "
+                               << batch->reclaim_failures
+                               << " consecutive reclaim attempts; giving up "
+                                  "until engine teardown reclaims it "
+                                  "unconditionally. Last error: "
+                               << status.ToString();
+                } else {
+                    LOG_EVERY_N(WARNING, 100)
+                        << "lazyFreeBatch: batch " << batch
+                        << " cannot be reclaimed yet, left in freelist: "
+                        << status.ToString();
+                }
+                if (first_error.ok()) first_error = status;
+                it++;
+                continue;
+            }
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                auto& transport = transport_list_[type];
+                auto& sub_batch = batch->sub_batch[type];
+                if (transport && sub_batch) transport->freeSubBatch(sub_batch);
+            }
+            {
+                BatchShard& shard = batchShard(batch_id);
+                std::lock_guard<std::recursive_mutex> shard_reg_lk(shard.mtx);
+                shard.active_batches.erase(batch);
+                shard.alive_batches.erase(batch_id);
+            }
+            Slab<Batch>::Get().deallocate(batch);
         }
-        for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-            auto& transport = transport_list_[type];
-            auto& sub_batch = batch->sub_batch[type];
-            if (transport && sub_batch) transport->freeSubBatch(sub_batch);
-        }
-        batch_set_.active.erase(batch);
-        alive_batches_.erase((BatchID)batch);
-        Slab<Batch>::Get().deallocate(batch);
-        it = batch_set_.freelist.erase(it);
+        it = batch_freelist_.erase(it);
     }
     return first_error;
 }
 
 Status TransferEngineImpl::retainBatch(BatchID batch_id, Batch*& batch) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id)) {
+    std::lock_guard<std::recursive_mutex> shard_lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id)) {
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     }
     batch = (Batch*)batch_id;
@@ -1063,12 +1158,20 @@ Status TransferEngineImpl::retainBatch(BatchID batch_id, Batch*& batch) {
 
 Status TransferEngineImpl::releaseBatch(Batch* batch) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (batch->runtime_refs == 0) {
-        return Status::InternalError("Batch runtime ref underflow" LOC_MARK);
+    // Refcount under the batch lock; deferred free runs on the global path
+    // after that lock is released (lock-order safety).
+    bool deferred_free = false;
+    {
+        std::lock_guard<std::recursive_mutex> shard_lk(
+            progressLockFor((BatchID)batch));
+        if (batch->runtime_refs == 0) {
+            return Status::InternalError(
+                "Batch runtime ref underflow" LOC_MARK);
+        }
+        --batch->runtime_refs;
+        deferred_free = (batch->runtime_refs == 0 && batch->free_requested);
     }
-    --batch->runtime_refs;
-    if (batch->runtime_refs == 0 && batch->free_requested) {
+    if (deferred_free) {
         CHECK_STATUS(lazyFreeBatch());
     }
     return Status::OK();
@@ -1080,16 +1183,18 @@ void TransferEngineImpl::adoptDeferredStageTeardown(
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     for (auto batch_id : deferred.batches) {
         Batch* batch = (Batch*)batch_id;
-        // Detach from the normal lifecycle: an undrained batch sits in
-        // batch_set_.active, batch_set_.freelist (free_requested, still
-        // referenced) and alive_batches_, so the sweep in deconstruct() would
-        // hand its SubBatch/Slice objects back to the Slab while a transport
-        // worker can still write their status.
-        batch_set_.active.erase(batch);
-        auto it = std::find(batch_set_.freelist.begin(),
-                            batch_set_.freelist.end(), batch);
-        if (it != batch_set_.freelist.end()) batch_set_.freelist.erase(it);
-        alive_batches_.erase(batch_id);
+        // Detach from the normal lifecycle: an undrained batch sits in its
+        // shard's active_batches / alive_batches and possibly
+        // batch_freelist_ (free_requested, still referenced), so the sweep
+        // in deconstruct() would hand its SubBatch/Slice objects back to
+        // the Slab while a transport worker can still write their status.
+        BatchShard& shard = batchShard(batch_id);
+        std::lock_guard<std::recursive_mutex> shard_lk(shard.mtx);
+        shard.active_batches.erase(batch);
+        shard.alive_batches.erase(batch_id);
+        auto it =
+            std::find(batch_freelist_.begin(), batch_freelist_.end(), batch);
+        if (it != batch_freelist_.end()) batch_freelist_.erase(it);
         deferred_stage_teardown_.batches.push_back(batch_id);
     }
     deferred_stage_teardown_.stage_buffers.insert(
@@ -1162,7 +1267,7 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (type == "cpu" || type == "*") return MTYPE_CPU;
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
-    if (type == "rocm") return MTYPE_ROCM;
+    if (isAmdGpuLocationType(type)) return MTYPE_ROCM;
     if (type == "tpu") return MTYPE_TPU;
     return MTYPE_UNKNOWN;
 }
@@ -1394,6 +1499,14 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         }
         // Mixed transport_hint inside one batch must not be merged.
         if (last.req.transport_hint != curr.req.transport_hint) {
+            return false;
+        }
+        // These fields affect transport selection. Merging
+        // requests with different values would silently apply the first
+        // request's policy to the whole combined transfer.
+        if (last.req.priority != curr.req.priority ||
+            last.req.policy_name != curr.req.policy_name ||
+            last.req.intent_type != curr.req.intent_type) {
             return false;
         }
         if (!last.boundary.source_key || !curr.boundary.source_key ||
@@ -1680,14 +1793,15 @@ Status TransferEngineImpl::commitPreparedSubmit(
             "batch public task capacity exceeded" LOC_MARK);
     }
 
-    std::vector<Request> classified_request_list[kSupportedTransportTypes];
-    std::vector<size_t> task_id_list[kSupportedTransportTypes];
+    std::vector<size_t> physical_task_id_list[kSupportedTransportTypes];
     std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
     batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
                             TaskInfo{});
 
-    std::unordered_map<TransportType, size_t> next_sub_task_id;
+    std::unordered_map<size_t, size_t> owner_task_id_by_merged_task;
+    std::unordered_map<size_t, std::vector<size_t>>
+        public_tasks_by_physical_owner;
     for (const auto& task_plan : prepared.tasks) {
         size_t task_id = task_plan.task_id;
         size_t merged_task_id = task_plan.merged_task_index;
@@ -1697,7 +1811,14 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
-            if (task.type != UNSPEC) task_id_list[task.type].push_back(task_id);
+            if (task.type != UNSPEC) {
+                auto owner_it =
+                    owner_task_id_by_merged_task.find(merged_task_id);
+                if (owner_it != owner_task_id_by_merged_task.end()) {
+                    public_tasks_by_physical_owner[owner_it->second].push_back(
+                        task_id);
+                }
+            }
             continue;
         }
 
@@ -1750,47 +1871,109 @@ Status TransferEngineImpl::commitPreparedSubmit(
             attachProgressNotifier(batch, batch->sub_batch[task.type]);
         }
 
-        if (!next_sub_task_id.count(task.type))
-            next_sub_task_id[task.type] = batch->sub_batch[task.type]->size();
-        size_t sub_task_id = next_sub_task_id[task.type];
-        next_sub_task_id[task.type]++;
-
-        classified_request_list[task.type].push_back(merged_request);
-        task.sub_task_id = sub_task_id;
+        task.sub_task_id = -1;
         task.derived = false;
-        task_id_list[task.type].push_back(task_id);
+        physical_task_id_list[task.type].push_back(task_id);
+        owner_task_id_by_merged_task[merged_task_id] = task_id;
+        public_tasks_by_physical_owner[task_id].push_back(task_id);
         merged_task_id_map[merged_task_id] = task;
     }
 
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-        if (classified_request_list[type].empty()) continue;
+        if (physical_task_id_list[type].empty()) continue;
         auto& transport = transport_list_[type];
         auto& sub_batch = batch->sub_batch[type];
 
-        // Set device_mask on SubBatch for RDMA transport
-        if (type == RDMA && !task_id_list[type].empty()) {
-            // Use the device_mask from the first task (we assume all tasks in
-            // this batch should have the same policy)
-            sub_batch->device_mask =
-                batch->task_list[task_id_list[type][0]].device_mask;
-            sub_batch->qp_pool =
-                batch->task_list[task_id_list[type][0]].qp_pool;
+        // SubBatch carries one policy per submit call. Requests using the
+        // same transport may still resolve to different device masks or QP
+        // pools, so RDMA owners must be submitted in homogeneous groups.
+        // RdmaTransport copies these scalar fields into each RdmaTask before
+        // returning, so groups can safely share one SubBatch.
+        std::vector<std::vector<size_t>> submit_groups;
+        if (type == RDMA) {
+            std::map<std::pair<uint64_t, std::string>, size_t> group_by_policy;
+            for (const auto task_id : physical_task_id_list[type]) {
+                const auto& task = batch->task_list[task_id];
+                auto key = std::make_pair(task.device_mask, task.qp_pool);
+                auto [it, inserted] = group_by_policy.emplace(
+                    std::move(key), submit_groups.size());
+                if (inserted) submit_groups.emplace_back();
+                submit_groups[it->second].push_back(task_id);
+            }
+        } else {
+            submit_groups.push_back(physical_task_id_list[type]);
         }
 
-        auto attempt_start = std::chrono::steady_clock::now();
-        for (auto& task_id : task_id_list[type]) {
-            startTransportAttempt(batch->task_list[task_id],
-                                  static_cast<TransportType>(type),
-                                  attempt_start);
-        }
-        auto status = transport->submitTransferTasks(
-            sub_batch, classified_request_list[type]);
-        if (!status.ok()) {
-            auto attempt_end = std::chrono::steady_clock::now();
-            for (auto& task_id : task_id_list[type]) {
-                finishTransportAttempt(batch->task_list[task_id], FAILED,
-                                       attempt_end);
-                batch->task_list[task_id].type = UNSPEC;
+        for (const auto& group : submit_groups) {
+            if (group.empty()) continue;
+
+            // A synchronous failure is allowed to return without appending
+            // anything to the SubBatch. Resolve IDs from the actual current
+            // size for each group so a failed earlier group cannot leave a gap
+            // in the IDs assigned to a later successful group. Propagate the
+            // physical ID to every merged public alias before submission so
+            // synchronous failure handling still sees a consistent mapping.
+            int next_sub_task_id = static_cast<int>(sub_batch->size());
+            for (const auto physical_task_id : group) {
+                for (const auto public_task_id :
+                     public_tasks_by_physical_owner.at(physical_task_id)) {
+                    batch->task_list[public_task_id].sub_task_id =
+                        next_sub_task_id;
+                }
+                ++next_sub_task_id;
+            }
+
+            if (type == RDMA) {
+                const auto& first_task = batch->task_list[group.front()];
+                sub_batch->device_mask = first_task.device_mask;
+                sub_batch->qp_pool = first_task.qp_pool;
+            }
+
+            std::vector<Request> requests;
+            requests.reserve(group.size());
+            for (const auto task_id : group)
+                requests.push_back(batch->task_list[task_id].request);
+
+            auto attempt_start = std::chrono::steady_clock::now();
+            for (const auto task_id : group) {
+                startTransportAttempt(batch->task_list[task_id],
+                                      static_cast<TransportType>(type),
+                                      attempt_start);
+            }
+            auto status = transport->submitTransferTasks(sub_batch, requests);
+            if (!status.ok()) {
+                auto attempt_end = std::chrono::steady_clock::now();
+                for (const auto physical_task_id : group) {
+                    for (const auto public_task_id :
+                         public_tasks_by_physical_owner.at(physical_task_id)) {
+                        finishTransportAttempt(batch->task_list[public_task_id],
+                                               FAILED, attempt_end);
+                    }
+                }
+                // Recover by failing over to the remaining candidate
+                // transports instead of terminal-failing the tasks. Only
+                // physical (owner) tasks carry a submission: resubmitting a
+                // public alias would re-post the merged transfer (see
+                // docs/source/design/tent/failover.md, hazard 1).
+                for (const auto physical_task_id : group) {
+                    attemptSubmitStageFailover(batch, physical_task_id);
+                }
+                // Public aliases mirror their owner's recovered (or
+                // terminally failed) route so per-task status queries observe
+                // the same transport and sub-batch slot as the owner.
+                for (const auto physical_task_id : group) {
+                    const auto& owner_task = batch->task_list[physical_task_id];
+                    for (const auto public_task_id :
+                         public_tasks_by_physical_owner.at(physical_task_id)) {
+                        if (public_task_id == physical_task_id) continue;
+                        auto& task = batch->task_list[public_task_id];
+                        task.type = owner_task.type;
+                        task.sub_task_id = owner_task.sub_task_id;
+                        task.status = owner_task.status;
+                        task.failover_count = owner_task.failover_count;
+                        task.xport_priority = owner_task.xport_priority;
+                    }
+                }
             }
         }
     }
@@ -1946,7 +2129,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto route = resolveTransport(task.request, 0);
     task.type = route.transport;
     task.device_mask = route.device_mask;
-    if (route.qp_pool) task.qp_pool = *route.qp_pool;
+    task.qp_pool = route.qp_pool.value_or("");
     if (task.type == UNSPEC) {
         return finishQueuedOwner(owner_id, FAILED);
     }
@@ -1988,15 +2171,21 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
-        task.type = UNSPEC;
+        // Submit-stage failover: walk the remaining candidate transports
+        // before giving up (the queued path dispatches one owner task at a
+        // time, so there are no derived aliases to mirror here).
+        if (attemptSubmitStageFailover(batch, queued.owner_task_id)) {
+            return markQueuedOwnerSubmitted(owner_id);
+        }
         return finishQueuedOwner(owner_id, FAILED);
     }
     return markQueuedOwnerSubmitted(owner_id);
 }
 
 Status TransferEngineImpl::refillDispatchWindow() {
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    // Queue is off by default; skip the global lock on the poll hot path.
     if (!runtime_queue_config_.enabled) return Status::OK();
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     if (dispatch_inflight_owners_ >=
             runtime_queue_config_.max_dispatch_owners ||
         dispatch_inflight_bytes_ >= runtime_queue_config_.max_dispatch_bytes) {
@@ -2034,7 +2223,7 @@ Status TransferEngineImpl::progressRuntimeQueue() {
         auto& queued = queued_it->second;
         if (!queued.in_dispatch_window) continue;
         auto* batch = queued.batch;
-        if (!batch || !alive_batches_.count((BatchID)batch)) continue;
+        if (!batch || !isBatchAlive((BatchID)batch)) continue;
         if (queued.owner_task_id >= batch->task_list.size()) {
             return Status::InternalError(
                 "queued owner task id out of range" LOC_MARK);
@@ -2170,8 +2359,8 @@ Status TransferEngineImpl::submitTransfer(
 
 Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id)) {
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id)) {
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     }
     auto* batch = reinterpret_cast<Batch*>(batch_id);
@@ -2274,6 +2463,12 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         attachProgressNotifier(batch, batch->sub_batch[type]);
     }
     auto& sub_batch = batch->sub_batch[type];
+    task.device_mask = result.device_mask;
+    task.qp_pool = result.qp_pool.value_or("");
+    if (type == RDMA) {
+        sub_batch->device_mask = task.device_mask;
+        sub_batch->qp_pool = task.qp_pool;
+    }
     task.sub_task_id = sub_batch->size();
     task.type = type;
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
@@ -2282,6 +2477,36 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
     }
     return status;
+}
+
+bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
+                                                    size_t task_id) {
+    auto& task = batch->task_list[task_id];
+    // Mark terminal first so a concurrent poll cannot observe a task that is
+    // half-migrated to its fallback transport (mirrors the poll-time
+    // failover in updateTaskStatusAfterPoll, which sets task.status = FAILED
+    // before calling resubmitTransferTask).
+    task.status = FAILED;
+    for (int attempt = 0; attempt < max_failover_attempts_; ++attempt) {
+        if (resubmitTransferTask(batch, task_id).ok()) {
+            task.status = PENDING;
+            return true;
+        }
+        // resubmitTransferTask() already finished the failed attempt, logged
+        // the reason and advanced the candidate cursor; the next iteration
+        // tries the following transport until the candidates or the failover
+        // budget are exhausted.
+    }
+    // Terminally failed: record the logical outcome here. The poll paths only
+    // record tasks transitioning out of PENDING, so they would never observe
+    // this task's PENDING -> FAILED transition. Record BEFORE resetting
+    // task.type so the failure is attributed to the last attempted transport.
+    recordTaskCompletionMetrics(task, PENDING, FAILED);
+    // Reset to UNSPEC so pollTaskStatus()'s UNSPEC short-circuit applies: the
+    // last failed submit never created a sub-batch entry for this task, so
+    // there is nothing to poll on the transport.
+    task.type = UNSPEC;
+    return false;
 }
 
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
@@ -2418,8 +2643,8 @@ Status TransferEngineImpl::receiveNotification(
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                                              TransferStatus& task_status) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     if (task_id >= batch->task_list.size())
@@ -2479,8 +2704,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
 Status TransferEngineImpl::getTransferStatus(
     BatchID batch_id, std::vector<TransferStatus>& status_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     status_list.clear();
@@ -2496,8 +2721,8 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                                           TransferStatus& overall_status,
                                           bool allow_failover) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     CHECK_STATUS(refillDispatchWindow());
     Batch* batch = (Batch*)(batch_id);
@@ -2781,10 +3006,17 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                     }
                 }
             } else if (new_status == FAILED) {
+                // A task whose type is UNSPEC (no candidate ever resolved,
+                // or a legacy submit-stage failure clobbered it) has lost its
+                // transport attribution; fall back to the last physical
+                // attempt's transport so terminal failures are not
+                // mislabeled "unspec".
+                const auto attributed_type =
+                    task.type != UNSPEC ? task.type : task.attempt_type;
                 if (task.request.opcode == Request::READ) {
-                    TentMetrics::instance().recordReadFailed(task.type);
+                    TentMetrics::instance().recordReadFailed(attributed_type);
                 } else {
-                    TentMetrics::instance().recordWriteFailed(task.type);
+                    TentMetrics::instance().recordWriteFailed(attributed_type);
                 }
             }
             // Observability only (RFC #2519): deadline feasibility. The

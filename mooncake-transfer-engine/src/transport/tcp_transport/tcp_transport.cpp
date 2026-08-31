@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <chrono>
@@ -36,6 +37,7 @@
 #include <mutex>
 #include <optional>
 #include <type_traits>
+#include <vector>
 
 #include "common.h"
 #include "transfer_engine.h"
@@ -57,6 +59,7 @@ using LaneAdmissionHandlerHook = void (*)() noexcept;
 using LaneObserverHook = void (*)(int, size_t, uint64_t, size_t, bool) noexcept;
 using LaneFailureReasonHook = void (*)(int) noexcept;
 using SessionProgressHook = int (*)(int, bool) noexcept;
+using StartTransferMetadataHook = void (*)() noexcept;
 
 std::mutex lane_test_hook_mutex;
 LaneConnectHandlerHook lane_connect_handler_hook = nullptr;
@@ -66,6 +69,21 @@ LaneAdmissionHandlerHook lane_admission_handler_hook = nullptr;
 LaneObserverHook lane_observer_hook = nullptr;
 LaneFailureReasonHook lane_failure_reason_hook = nullptr;
 SessionProgressHook session_progress_hook = nullptr;
+StartTransferMetadataHook start_transfer_metadata_hook = nullptr;
+std::atomic<size_t> staging_buffer_allocation_count{0};
+std::atomic<size_t> staging_device_query_count{0};
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+void recordStagingBufferAllocationForTest() noexcept {
+    staging_buffer_allocation_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void recordStagingDeviceQueryForTest() noexcept {
+    staging_device_query_count.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
 
 enum LaneTestEvent {
     kLaneQueueAdmitted = 1,
@@ -167,6 +185,15 @@ int invokeSessionProgressHook(int event, bool detail) noexcept {
     }
     return hook ? hook(event, detail) : kSessionProgressNoAction;
 }
+
+void invokeStartTransferMetadataHook() noexcept {
+    StartTransferMetadataHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = start_transfer_metadata_hook;
+    }
+    if (hook) hook();
+}
 }  // namespace
 
 void tcpTransportSetLaneConnectHandlerHookForTest(
@@ -210,6 +237,12 @@ void tcpTransportSetSessionProgressHookForTest(
     session_progress_hook = hook;
 }
 
+void tcpTransportSetStartTransferMetadataHookForTest(
+    StartTransferMetadataHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    start_transfer_metadata_hook = hook;
+}
+
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {
     return std::is_move_constructible<TcpTransport::TcpWorkItem>::value &&
            !std::is_copy_constructible<TcpTransport::TcpWorkItem>::value &&
@@ -217,6 +250,19 @@ bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {
            std::is_move_constructible<TcpTransport::TerminalAction>::value &&
            !std::is_copy_constructible<TcpTransport::TerminalAction>::value &&
            !std::is_copy_assignable<TcpTransport::TerminalAction>::value;
+}
+
+void tcpTransportResetStagingStatsForTest() noexcept {
+    staging_buffer_allocation_count.store(0, std::memory_order_relaxed);
+    staging_device_query_count.store(0, std::memory_order_relaxed);
+}
+
+size_t tcpTransportStagingBufferAllocationCountForTest() noexcept {
+    return staging_buffer_allocation_count.load(std::memory_order_relaxed);
+}
+
+size_t tcpTransportStagingDeviceQueryCountForTest() noexcept {
+    return staging_device_query_count.load(std::memory_order_relaxed);
 }
 #endif
 
@@ -319,6 +365,12 @@ TcpTransport::TcpTransport()
             "MC_TCP_ADMISSION_TIMEOUT_MS",
             getenv("MC_TCP_ADMISSION_TIMEOUT_MS"), kDefaultAdmissionTimeoutMs,
             1, kMaxAdmissionTimeoutMs));
+
+    constexpr size_t kDefaultNumIoThreads = 1;
+    constexpr size_t kMaxNumIoThreads = 32;
+    num_io_threads_ = parseBoundedTcpSetting(
+        "MC_NUM_TCP_IO_THREADS", getenv("MC_NUM_TCP_IO_THREADS"),
+        kDefaultNumIoThreads, 1, kMaxNumIoThreads);
 }
 
 TcpTransport::~TcpTransport() {
@@ -373,15 +425,22 @@ int TcpTransport::install(std::string& local_server_name,
     close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
     auto metadata = metadata_;
-    context_ = new TcpContext(tcp_port, [metadata = std::move(metadata)](
-                                            uint64_t addr, uint64_t size) {
-        return validateTcpAddress(metadata, addr, size);
-    });
-    lane_runtime_ =
-        std::make_shared<ConnectionLaneRuntime>(context_->io_context);
+    io_pool_ = std::make_unique<TcpIoPool>(num_io_threads_);
+    context_ = new TcpContext(
+        *io_pool_, tcp_port,
+        [metadata = std::move(metadata)](uint64_t addr, uint64_t size) {
+            return validateTcpAddress(metadata, addr, size);
+        });
+    lane_runtime_ = std::make_shared<ConnectionLaneRuntime>(*io_pool_);
     lane_state_->runtime = lane_runtime_;
     running_ = true;
-    thread_ = std::thread(&TcpTransport::worker, this);
+    // Shard 0 owns the acceptor; arm (and re-arm after a restart) doAccept on
+    // its own thread. Other shards just drain their io_context.
+    io_pool_->start([this](size_t shard) {
+        if (shard == 0) context_->doAccept();
+    });
+    LOG(INFO) << "TcpTransport: I/O pool started with " << num_io_threads_
+              << " thread(s)";
     return 0;
 }
 
@@ -395,6 +454,7 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
 #else
     desc->protocol = "tcp";
 #endif
+    desc->tcp_data_host = metadata_->localRpcMeta().ip_or_host_name;
     desc->tcp_data_port = tcp_data_port;
     // Advertise acknowledged framing (#2086); initiators fall back to v1
     // against descriptors that do not carry the field.
@@ -455,9 +515,16 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    // These counters are updated with __atomic_fetch_add from the I/O
+    // thread(s) in Slice::markSuccess/markFailed; read them atomically here to
+    // match MultiTransport::getTransferStatus and avoid a data race with the
+    // completion path (the read runs on the polling submission thread).
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_ACQUIRE);
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
@@ -618,20 +685,6 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
     (*advance)();
 }
 
-void TcpTransport::worker() {
-    while (running_) {
-        try {
-            context_->doAccept();
-            context_->io_context.run();
-        } catch (std::exception& e) {
-            LOG(ERROR) << "TcpTransport::worker encountered an exception "
-                          "during doAccept/run: "
-                       << e.what();
-            context_->io_context.restart();
-        }
-    }
-}
-
 std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
     const std::string& host, uint16_t port) {
     // The reusable path is owned by fixed connection lanes. This helper is
@@ -677,10 +730,13 @@ void TcpTransport::startTransfer(Slice* slice,
         return;
     }
 
-    TransferMetadata::RpcMetaDesc meta_entry;
-    if (metadata_->getRpcMetaEntry(desc->name, meta_entry)) {
-        LOG(ERROR) << "TcpTransport::startTransfer failed to get RPC meta "
-                      "entry for segment name: "
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    invokeStartTransferMetadataHook();
+#endif
+
+    if (desc->tcp_data_host.empty()) {
+        LOG(ERROR) << "TcpTransport::startTransfer found no TCP data host for "
+                      "segment name: "
                    << desc->name;
         finish(TransferStatusEnum::FAILED);
         return;
@@ -694,7 +750,7 @@ void TcpTransport::startTransfer(Slice* slice,
         return;
     }
 
-    const ConnectionKey key{meta_entry.ip_or_host_name,
+    const ConnectionKey key{desc->tcp_data_host,
                             static_cast<uint16_t>(desc->tcp_data_port)};
     const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
     TcpWorkItem work(slice, use_v2, std::move(continuation));
@@ -703,7 +759,7 @@ void TcpTransport::startTransfer(Slice* slice,
     // disabled. Fixed lanes provide the same serial socket reuse without
     // reviving the old unbounded dynamic pool.
     if (enable_connection_pool_ || reuse_connection) {
-        enqueuePooledTransfer(key, std::move(work));
+        enqueuePooledTransfer(desc->name, key, std::move(work));
         return;
     }
 

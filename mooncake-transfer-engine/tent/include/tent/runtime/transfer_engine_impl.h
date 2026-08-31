@@ -314,8 +314,12 @@ class TransferEngineImpl {
     // Test-only hook: how many batches are still alive. Lets a test assert
     // that a failed transfer released its batch rather than leaking it.
     size_t aliveBatchCountForTest() {
-        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-        return alive_batches_.size();
+        size_t count = 0;
+        for (auto& shard : batch_shards_) {
+            std::lock_guard<std::recursive_mutex> lk(shard.mtx);
+            count += shard.alive_batches.size();
+        }
+        return count;
     }
 
     // Test-only hook: how many undrained staging batches the ProxyManager
@@ -350,6 +354,15 @@ class TransferEngineImpl {
         TransportType request_type);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
+
+    // Submit-stage failover: recover a task whose synchronous
+    // submitTransferTasks() failed by walking the remaining candidate
+    // transports (bounded by max_failover_attempts_), mirroring the poll-time
+    // failover in updateTaskStatusAfterPoll. Returns true when the task is
+    // PENDING again on a fallback transport; otherwise the task is
+    // terminally FAILED with task.type left at the last attempted transport
+    // so failure metrics attribute to a real transport instead of UNSPEC.
+    bool attemptSubmitStageFailover(Batch* batch, size_t task_id);
 
     Status retainBatch(BatchID batch_id, Batch*& batch);
 
@@ -456,11 +469,6 @@ class TransferEngineImpl {
         MemoryOptions options;
     };
 
-    struct BatchSet {
-        std::unordered_set<Batch*> active;
-        std::vector<Batch*> freelist;
-    };
-
     // Staging resources that ProxyManager could not drain before its shutdown
     // deadline. Their slices may still be written by transport workers, so
     // nothing here may be freed before transport_list_ is reset (which joins
@@ -504,8 +512,6 @@ class TransferEngineImpl {
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
 
-    BatchSet batch_set_;
-
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;
 
@@ -526,16 +532,67 @@ class TransferEngineImpl {
     size_t dispatch_inflight_bytes_{0};
     uint64_t next_batch_token_{1};
 
-    // Guards alive_batches_ and serializes pollTaskStatus /
-    // updateTaskStatusAfterPoll / lazyFreeBatch against the optional
-    // ProgressWorker thread. Recursive because freeBatch -> lazyFreeBatch ->
-    // getTransferStatus can re-enter on the same thread. See issue #2116.
+    // Serializes engine-global progress: runtime queue, lazyFreeBatch
+    // freelist, and ProgressWorker. Recursive because freeBatch ->
+    // lazyFreeBatch -> getTransferStatus can re-enter. See issue #2116.
     std::recursive_mutex progress_mutex_;
-    std::unordered_set<BatchID> alive_batches_;
     // Guarded by progress_mutex_. Emptied (abandoned on purpose) at the end of
     // deconstruct(), after the transports have been destroyed.
     DeferredStageTeardown deferred_stage_teardown_;
     std::unique_ptr<ProgressWorker> progress_worker_;
+
+    // Per-batch hot paths (poll / free / retain) lock only the shard for
+    // that BatchID instead of progress_mutex_, so N threads polling N
+    // independent batches do not serialize.
+    //
+    // Exception: enable_runtime_queue=true keeps those paths on
+    // progress_mutex_ because queued_owners_ / dispatch window are
+    // engine-global. The runtime queue is off by default.
+    //
+    // The batch registry (alive / active membership) lives INSIDE the same
+    // shard: membership changes and lookups are O(1) set ops taken while
+    // already holding the shard lock, so no separate global registry lock
+    // sits on the poll/alloc/free hot path.
+    //
+    // Lock order (never reversed):
+    //   progress_mutex_ -> shard
+    // With the runtime queue enabled, hot paths hold progress_mutex_ and
+    // take the shard only for membership ops:
+    //   progress_mutex_ -> shard (membership only)
+    static constexpr size_t kBatchLockShards = 64;
+    struct BatchShard {
+        std::recursive_mutex mtx;
+        std::unordered_set<Batch*> active_batches;
+        std::unordered_set<BatchID> alive_batches;
+    };
+    BatchShard& batchShard(BatchID batch_id) {
+        return batch_shards_[reinterpret_cast<uintptr_t>(batch_id) %
+                             kBatchLockShards];
+    }
+    std::recursive_mutex& batchShardMutex(BatchID batch_id) {
+        return batchShard(batch_id).mtx;
+    }
+    std::recursive_mutex& progressLockFor(BatchID batch_id) {
+        if (runtime_queue_config_.enabled) return progress_mutex_;
+        return batchShardMutex(batch_id);
+    }
+    // Caller must hold progressLockFor(batch_id). In default mode that is
+    // the shard itself, so the membership check is a lock-free read under
+    // an already-held lock. In queue mode the caller holds progress_mutex_
+    // and we take the shard briefly (progress -> shard order is allowed).
+    bool isBatchAlive(BatchID batch_id) {
+        BatchShard& shard = batchShard(batch_id);
+        if (runtime_queue_config_.enabled) {
+            std::lock_guard<std::recursive_mutex> lk(shard.mtx);
+            return shard.alive_batches.count(batch_id) != 0;
+        }
+        return shard.alive_batches.count(batch_id) != 0;
+    }
+    std::array<BatchShard, kBatchLockShards> batch_shards_;
+    // Deferred-free queue, guarded by progress_mutex_. Only used when the
+    // fast path cannot free inline (tasks still in flight, runtime refs,
+    // or runtime queue enabled).
+    std::vector<Batch*> batch_freelist_;
 };
 }  // namespace tent
 }  // namespace mooncake

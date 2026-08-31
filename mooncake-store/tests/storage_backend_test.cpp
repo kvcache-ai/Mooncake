@@ -179,7 +179,9 @@ class StorageBackendTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("StorageBackendTest");
         FLAGS_logtostderr = true;
-        data_path = std::filesystem::current_path().string() + "/data";
+        data_path =
+            (std::filesystem::current_path() / "storage_backend_test_data")
+                .string();
         // Remove all leftover files and subdirectories from previous runs
         if (fs::exists(data_path)) {
             for (const auto& entry : fs::directory_iterator(data_path)) {
@@ -658,16 +660,6 @@ TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
 }
 
 TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
-    std::string data_path = std::filesystem::current_path().string() + "/data";
-    fs::create_directories(data_path);
-
-    // Clean up any existing files
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            fs::remove(entry.path());
-        }
-    }
-
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
@@ -5135,5 +5127,62 @@ TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
 }
 
 #endif
+
+TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Enable datasync-failure injection: WriteBucket's datasync() call will
+    // return a failure, exercising the same !sync_result cleanup path as a
+    // real fdatasync() failure (CleanupOrphanedBucket + error return).
+    storage_backend.SetDatasyncFailureForTest(true);
+
+    std::string key = "datasync_fail_key";
+    std::string value = "datasync_fail_payload";
+    void* buf = nullptr;
+    ASSERT_EQ(posix_memalign(&buf, 4096, value.size()), 0);
+    std::unique_ptr<void, decltype(&std::free)> buf_guard(buf, &std::free);
+    memcpy(buf, value.data(), value.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{buf, value.size()}});
+
+    // BatchOffload must return an error (datasync was injected to fail).
+    auto offload_result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    EXPECT_FALSE(offload_result.has_value());
+    EXPECT_EQ(offload_result.error(), ErrorCode::FILE_WRITE_FAIL);
+
+    // The .bucket file must have been cleaned up by CleanupOrphanedBucket.
+    int orphan_bucket_count = 0;
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        if (entry.path().extension() == ".bucket") {
+            ++orphan_bucket_count;
+        }
+    }
+    EXPECT_EQ(orphan_bucket_count, 0)
+        << "datasync failure must not leave an orphan .bucket file on disk";
+
+    // No .meta file should have been written either (metadata commit comes
+    // after datasync, so it was never reached).
+    int meta_count = 0;
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        if (entry.path().extension() == ".meta") {
+            ++meta_count;
+        }
+    }
+    EXPECT_EQ(meta_count, 0)
+        << "metadata must not be committed when datasync fails";
+
+    // The key must not be queryable.
+    auto exists = storage_backend.IsExist(key);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+}
 
 }  // namespace mooncake::test

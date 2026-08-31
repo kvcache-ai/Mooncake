@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -640,9 +641,20 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     if (iter == memory_region_map_.end()) {
         return 0;
     }
+    // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
+    // reading mr->length (or the cached region length) afterwards is a use-
+    // after-free. We restore fork state on the same range to undo the
+    // MADV_DONTFORK applied at register time (see issue #3639).
+    void *region_addr = iter->second.addr;
+    size_t region_length = iter->second.mr->length;
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
+    }
+    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
+        PLOG(WARNING) << "Failed to restore fork state for memory region at "
+                      << region_addr << " (" << region_length
+                      << " bytes), deregister already succeeded";
     }
     memory_region_map_.erase(iter);
     return 0;
@@ -1409,6 +1421,12 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         lid_ = attr.lid;
         active_mtu_ = attr.active_mtu;
         active_speed_ = attr.active_speed;
+#ifdef HAVE_IBV_ACTIVE_SPEED_EX
+        // XDR (encoding 256) overflows the uint8_t field above, which then
+        // reads 0; the extended field carries it on rdma-core builds that
+        // have one.
+        if (attr.active_speed_ex) active_speed_ = attr.active_speed_ex;
+#endif
         active_width_ = attr.active_width;
         {
             std::lock_guard<std::mutex> guard(gid_lock_);

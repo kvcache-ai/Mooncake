@@ -95,6 +95,15 @@ class Transport {
         return Status::NotImplemented("freeSubBatch not implemented" LOC_MARK);
     }
 
+    // Submission contract (all-or-nothing): on an error return, no request
+    // from request_list may have been dispatched and the sub-batch must be
+    // left exactly as it was before the call (no tasks appended, no work
+    // queued). A transport that starts accepting requests and then hits an
+    // error must roll back its partial state before returning. This lets the
+    // engine fail the whole submission over to another transport without
+    // double-executing an accepted prefix or losing track of the original
+    // sub-batch. Transports that validate requests incrementally must
+    // validate every request before dispatching any of them.
     virtual Status submitTransferTasks(
         SubBatchRef batch, const std::vector<Request>& request_list) {
         return Status::NotImplemented(
