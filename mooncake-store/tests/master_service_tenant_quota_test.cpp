@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "allocation_strategy.h"
+#include "master_metric_manager.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 
@@ -243,6 +244,20 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
                                         TenantQuotaHandle account,
                                         uint64_t bytes) {
         service.ReleaseTenantQuota(account, bytes);
+    }
+
+    size_t CountTenantObjectKeys(MasterService& service,
+                                 const TenantId& tenant_id) {
+        size_t count = 0;
+        for (size_t shard = 0; shard < MasterService::kNumShards; ++shard) {
+            MasterService::MetadataShardAccessorRO accessor(&service, shard);
+            auto it = accessor->tenants.find(tenant_id);
+            if (it == accessor->tenants.end()) {
+                continue;
+            }
+            count += it->second.metadata.size();
+        }
+        return count;
     }
 
     void DiscardExpiredProcessingForTest(MasterService& service,
@@ -1214,6 +1229,112 @@ TEST_F(MasterServiceTenantQuotaTest,
                     .Remove("orphan-key", TenantId("tenant-b"),
                             /*force=*/true)
                     .has_value());
+}
+
+// #3741 case1: when tenant eviction can free lease-expired objects, many Puts
+// succeed (rc=0) while only a small working set remains under the quota.
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantQuotaSilentEvictionKeepsFewResidualsAcrossManyPuts) {
+    const TenantId tenant("tenant-a");
+    constexpr uint64_t kObjectSize = 64;
+    constexpr uint64_t kQuotaBytes = kObjectSize * 5;
+    constexpr int kWrites = 256;
+
+    auto config =
+        MasterServiceConfig::builder()
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WritePolicyFile({{tenant, kQuotaBytes}}))
+            .set_default_kv_lease_ttl(0)
+            // Keep BatchEvict idle so the tenant admission path is the one
+            // that frees space for subsequent Puts.
+            .set_eviction_high_watermark_ratio(1.0)
+            .set_eviction_ratio(0.05)
+            .build();
+    MasterService service(config);
+    UUID client_id = MountSegment(service, /*size=*/1024 * 1024);
+    const int64_t attempts_before =
+        MasterMetricManager::instance().get_eviction_attempts();
+
+    for (int i = 0; i < kWrites; ++i) {
+        const std::string key = "silent-" + std::to_string(i);
+        auto start = service.PutStart(client_id, key, tenant, kObjectSize,
+                                      MemoryConfig());
+        ASSERT_TRUE(start.has_value())
+            << "write " << i << " failed: " << toString(start.error());
+        ASSERT_TRUE(
+            service.PutEnd(client_id, key, tenant, ReplicaType::MEMORY)
+                .has_value());
+    }
+
+    const auto snap = Snapshot(service, tenant);
+    EXPECT_LE(snap.charged_bytes, kQuotaBytes);
+    const size_t remaining = CountTenantObjectKeys(service, tenant);
+    EXPECT_LE(remaining, (kQuotaBytes / kObjectSize) + 2);
+    EXPECT_LT(remaining, static_cast<size_t>(kWrites / 4));
+    EXPECT_GT(MasterMetricManager::instance().get_eviction_attempts(),
+              attempts_before);
+}
+
+// #3741 case2: effective quota sits exactly on the pool watermark. Hard-pinned
+// objects prevent tenant eviction from freeing space, so Puts reject while
+// need_mem_eviction_ is armed for BatchEvict.
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantQuotaWatermarkCollisionArmsNeedMemEvictionOnReject) {
+    const TenantId heavy("tenant-a");
+    const TenantId light("tenant-b");
+    constexpr size_t kSegmentSize = 10000;
+    constexpr double kWatermark = 0.90;
+    // Requested sum == capacity so weights scale: heavy gets 90% of the pool,
+    // matching eviction_high_watermark_ratio * capacity.
+    auto config =
+        MasterServiceConfig::builder()
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WritePolicyFile({{heavy, 9000}, {light, 1000}}))
+            .set_eviction_high_watermark_ratio(kWatermark)
+            .set_eviction_ratio(0.05)
+            .set_default_kv_lease_ttl(60000)
+            .build();
+    MasterService service(config);
+    UUID client_id = MountSegment(service, kSegmentSize);
+
+    const auto heavy_snap = Snapshot(service, heavy);
+    const uint64_t capacity = kSegmentSize;
+    const uint64_t watermark_bytes =
+        static_cast<uint64_t>(static_cast<double>(capacity) * kWatermark);
+    ASSERT_EQ(heavy_snap.effective_quota_bytes, watermark_bytes);
+
+    auto hard_pinned = MemoryConfig();
+    hard_pinned.with_hard_pin = true;
+    constexpr uint64_t kObjectSize = 1000;
+    const int fill_count =
+        static_cast<int>(heavy_snap.effective_quota_bytes / kObjectSize);
+    for (int i = 0; i < fill_count; ++i) {
+        const std::string key = "pin-" + std::to_string(i);
+        auto start =
+            service.PutStart(client_id, key, heavy, kObjectSize, hard_pinned);
+        ASSERT_TRUE(start.has_value()) << toString(start.error());
+        ASSERT_TRUE(
+            service.PutEnd(client_id, key, heavy, ReplicaType::MEMORY)
+                .has_value());
+    }
+    EXPECT_EQ(Snapshot(service, heavy).charged_bytes,
+              static_cast<uint64_t>(fill_count) * kObjectSize);
+
+    service.need_mem_eviction_.store(false, std::memory_order_relaxed);
+    const int64_t attempts_before =
+        MasterMetricManager::instance().get_eviction_attempts();
+
+    auto over = service.PutStart(client_id, "overflow", heavy, kObjectSize,
+                                 MemoryConfig());
+    ASSERT_FALSE(over.has_value());
+    EXPECT_EQ(over.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    EXPECT_TRUE(service.need_mem_eviction_.load(std::memory_order_relaxed));
+    EXPECT_GT(MasterMetricManager::instance().get_eviction_attempts(),
+              attempts_before);
 }
 
 }  // namespace mooncake::test

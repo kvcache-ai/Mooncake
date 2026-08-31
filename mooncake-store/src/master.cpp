@@ -356,6 +356,9 @@ DEFINE_uint64(
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 DEFINE_bool(enable_multi_tenants, false,
             "Enable strict multi-tenant namespace and quota admission");
+DEFINE_bool(tenant_quota_reject_on_exceed, false,
+            "Reject over-quota Puts immediately instead of evicting the "
+            "same tenant's objects to make room");
 DEFINE_string(tenant_quota_connector_type, "file",
               "Tenant quota policy connector type");
 DEFINE_string(tenant_quota_connector_uri, "",
@@ -661,6 +664,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_multi_tenants",
                            &master_config.enable_multi_tenants,
                            FLAGS_enable_multi_tenants);
+    default_config.GetBool("tenant_quota_reject_on_exceed",
+                           &master_config.tenant_quota_reject_on_exceed,
+                           FLAGS_tenant_quota_reject_on_exceed);
     default_config.GetString("tenant_quota_connector_type",
                              &master_config.tenant_quota_connector_type,
                              FLAGS_tenant_quota_connector_type);
@@ -1207,6 +1213,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_multi_tenants = FLAGS_enable_multi_tenants;
+    }
+    if ((google::GetCommandLineFlagInfo("tenant_quota_reject_on_exceed",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.tenant_quota_reject_on_exceed =
+            FLAGS_tenant_quota_reject_on_exceed;
     }
     if ((google::GetCommandLineFlagInfo("tenant_quota_connector_type", &info) &&
          !info.is_default) ||

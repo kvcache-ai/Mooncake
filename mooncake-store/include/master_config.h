@@ -90,6 +90,8 @@ struct MasterConfig {
     bool enable_disk_eviction;
     uint64_t quota_bytes;
     bool enable_multi_tenants = false;
+    // When true, over-quota Puts reject immediately instead of tenant eviction.
+    bool tenant_quota_reject_on_exceed = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
@@ -216,6 +218,8 @@ class MasterServiceSupervisorConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
     bool enable_multi_tenants = false;
+    // When true, over-quota Puts reject immediately instead of tenant eviction.
+    bool tenant_quota_reject_on_exceed = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
@@ -383,6 +387,7 @@ class MasterServiceSupervisorConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_reject_on_exceed = config.tenant_quota_reject_on_exceed;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
 
@@ -538,6 +543,8 @@ class WrappedMasterServiceConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
     bool enable_multi_tenants = false;
+    // When true, over-quota Puts reject immediately instead of tenant eviction.
+    bool tenant_quota_reject_on_exceed = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
@@ -757,6 +764,7 @@ class WrappedMasterServiceConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_reject_on_exceed = config.tenant_quota_reject_on_exceed;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -826,6 +834,7 @@ class MasterServiceConfigBuilder {
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     bool enable_multi_tenants_ = false;
+    bool tenant_quota_reject_on_exceed_ = false;
     std::string tenant_quota_connector_type_ = "file";
     std::string tenant_quota_connector_uri_;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -986,6 +995,11 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allocation_strategy_type(
         AllocationStrategyType type) {
         allocation_strategy_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_tenant_quota_reject_on_exceed(bool enable) {
+        tenant_quota_reject_on_exceed_ = enable;
         return *this;
     }
 
@@ -1215,6 +1229,8 @@ class MasterServiceConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
     bool enable_multi_tenants = false;
+    // When true, over-quota Puts reject immediately instead of tenant eviction.
+    bool tenant_quota_reject_on_exceed = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
@@ -1305,6 +1321,7 @@ class MasterServiceConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
+        tenant_quota_reject_on_exceed = config.tenant_quota_reject_on_exceed;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -1375,6 +1392,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
     config.enable_multi_tenants = enable_multi_tenants_;
+    config.tenant_quota_reject_on_exceed = tenant_quota_reject_on_exceed_;
     config.tenant_quota_connector_type = tenant_quota_connector_type_;
     config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     config.enable_snapshot_restore = enable_snapshot_restore_;

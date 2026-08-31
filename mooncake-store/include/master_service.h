@@ -992,6 +992,9 @@ class MasterService {
     };
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
+    // Warn when tenant effective quotas collide with the pool eviction
+    // watermark or dwarf steady-state charge (operator UX; #3741).
+    void MaybeWarnTenantQuotaConfig(uint64_t allocatable_capacity_bytes);
 
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
@@ -2735,6 +2738,7 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_multi_tenants_;
+    const bool tenant_quota_reject_on_exceed_;
     std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
     mutable std::mutex tenant_quota_policy_mutex_;
     mutable std::mutex tenant_quota_recompute_mutex_;
