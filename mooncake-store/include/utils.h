@@ -262,8 +262,18 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
 // Buffer allocator functions
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
+constexpr size_t SZ_512MB = 512 * 1024 * 1024;
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
+
+// 512MiB hugepages (PMD size on arm64 kernels with 64K base pages) are not
+// defined by older glibc/kernel headers; provide fallbacks.
+#ifndef MAP_HUGE_512M
+#define MAP_HUGE_512M (29 << 26)  // MAP_HUGE_SHIFT = 26
+#endif
+#ifndef MFD_HUGE_512M
+#define MFD_HUGE_512M (29 << 26)  // MFD_HUGE_SHIFT = 26
+#endif
 
 /**
  * @brief Allocates memory for the `BufferAllocator` class.
@@ -286,7 +296,7 @@ inline size_t align_up(size_t size, size_t alignment) {
  * @brief Get hugepage size from env and optionally set the corresponding memfd
  * flags.
  * * @param out_flags Optional pointer to an int. If provided,
- * MAP_HUGETLB and MAP_HUGE_2MB/1GB will be OR-ed into it.
+ * MAP_HUGETLB and MAP_HUGE_2MB/512MB/1GB will be OR-ed into it.
  * @return size_t Hugepage size in bytes, or 0 if disabled.
  */
 [[nodiscard]] inline size_t get_hugepage_size_from_env(
@@ -302,11 +312,12 @@ inline size_t align_up(size_t size, size_t alignment) {
     if (size_env != nullptr) {
         size_t parsed_size = string_to_byte_size(size_env);
 
-        if (parsed_size == SZ_2MB || parsed_size == SZ_1GB) {
+        if (parsed_size == SZ_2MB || parsed_size == SZ_512MB ||
+            parsed_size == SZ_1GB) {
             size = parsed_size;
         } else {
             LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_SIZE='" << size_env
-                         << "'. Supported: 2MB, 1GB. Fallback to 2MB.";
+                         << "'. Supported: 2MB, 512MB, 1GB. Fallback to 2MB.";
             size = SZ_2MB;
         }
     }
@@ -325,6 +336,12 @@ inline size_t align_up(size_t size, size_t alignment) {
             } else {
                 *out_flags |= MAP_HUGE_2MB;
             }
+        } else if (size == SZ_512MB) {
+            if (use_memfd) {
+                *out_flags |= MFD_HUGE_512M;
+            } else {
+                *out_flags |= MAP_HUGE_512M;
+            }
         } else if (size == SZ_1GB) {
             if (use_memfd) {
                 *out_flags |= MFD_HUGE_1GB;
@@ -333,7 +350,9 @@ inline size_t align_up(size_t size, size_t alignment) {
             }
         }
         LOG(INFO) << "Using hugepage size: "
-                  << (size == SZ_2MB ? "2MB" : "1GB");
+                  << (size == SZ_2MB     ? "2MB"
+                      : size == SZ_512MB ? "512MB"
+                                         : "1GB");
     }
 
     return size;

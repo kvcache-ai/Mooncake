@@ -425,6 +425,8 @@ void *allocate_buffer_numa_segments(size_t total_size,
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     if (page_size == SZ_2MB) {
         flags |= MAP_HUGETLB | MAP_HUGE_2MB;
+    } else if (page_size == SZ_512MB) {
+        flags |= MAP_HUGETLB | MAP_HUGE_512M;
     } else if (page_size == SZ_1GB) {
         flags |= MAP_HUGETLB | MAP_HUGE_1GB;
     } else if (page_size != static_cast<size_t>(getpagesize())) {
