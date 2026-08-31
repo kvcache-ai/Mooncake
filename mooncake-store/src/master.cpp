@@ -146,6 +146,17 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in Memory");
+DEFINE_double(tenant_eviction_high_watermark_ratio,
+              mooncake::DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO,
+              "Per-tenant high watermark, as a fraction of that tenant's own "
+              "effective quota, at which background eviction starts for it. "
+              "0 disables it. Only meaningful with -enable_multi_tenants. "
+              "Set this when a tenant's effective quota can sit at or below "
+              "eviction_high_watermark_ratio: such a tenant reaches its own "
+              "ceiling before the pool crosses the pool-wide watermark, so "
+              "the bulk evictor never runs for it and admission falls back "
+              "to a synchronous per-object evict-and-retry that rejects "
+              "writes with TENANT_QUOTA_EXCEEDED");
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -175,6 +186,15 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
+DEFINE_validator(tenant_eviction_high_watermark_ratio,
+                 [](const char* flagname, double value) {
+                     if (value < 0.0 || value > 1.0) {
+                         LOG(FATAL) << "Tenant eviction high watermark ratio "
+                                       "must be between 0.0 and 1.0";
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "NoF eviction ratio must be between 0.0 and 1.0";
@@ -495,6 +515,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble(
+        "tenant_eviction_high_watermark_ratio",
+        &master_config.tenant_eviction_high_watermark_ratio,
+        FLAGS_tenant_eviction_high_watermark_ratio);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -868,6 +892,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.eviction_high_watermark_ratio =
             FLAGS_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("tenant_eviction_high_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.tenant_eviction_high_watermark_ratio =
+            FLAGS_tenant_eviction_high_watermark_ratio;
     }
     if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
          !info.is_default) ||
@@ -1536,6 +1567,8 @@ int main(int argc, char* argv[]) {
         << ", eviction_ratio=" << master_config.eviction_ratio
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
+        << ", tenant_eviction_high_watermark_ratio="
+        << master_config.tenant_eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_oplog=" << master_config.enable_oplog
         << ", enable_offload=" << master_config.enable_offload

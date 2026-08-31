@@ -193,6 +193,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
+      tenant_eviction_high_watermark_ratio_(
+          config.tenant_eviction_high_watermark_ratio),
       nof_eviction_ratio_(config.nof_eviction_ratio),
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
@@ -306,6 +308,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
             << "Eviction high watermark ratio must be between 0.0 and 1.0, "
             << "current value: " << eviction_high_watermark_ratio_;
         throw std::invalid_argument("Invalid eviction high watermark ratio");
+    }
+    if (tenant_eviction_high_watermark_ratio_ < 0.0 ||
+        tenant_eviction_high_watermark_ratio_ > 1.0) {
+        LOG(ERROR) << "Tenant eviction high watermark ratio must be between "
+                      "0.0 and 1.0, current value: "
+                   << tenant_eviction_high_watermark_ratio_;
+        throw std::invalid_argument(
+            "Invalid tenant eviction high watermark ratio");
+    }
+    if (tenant_eviction_high_watermark_ratio_ > 0.0 && !enable_multi_tenants_) {
+        LOG(WARNING) << "tenant_eviction_high_watermark_ratio="
+                     << tenant_eviction_high_watermark_ratio_
+                     << " has no effect without enable_multi_tenants";
     }
 
     // Validate offload tuning knobs here (not only via gflags validator),
@@ -9150,11 +9165,55 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     return {};
 }
 
+void MasterService::EvictTenantsOverWatermark() {
+    if (!enable_multi_tenants_ ||
+        tenant_eviction_high_watermark_ratio_ <= 0.0) {
+        return;
+    }
+
+    // Evict down to (watermark - eviction_ratio) of the tenant's quota,
+    // mirroring what BatchEvict does for the pool: free a slab so subsequent
+    // admissions find room already available, rather than freeing exactly the
+    // deficit of the object currently being admitted.
+    const double target_ratio =
+        std::max(0.0, tenant_eviction_high_watermark_ratio_ - eviction_ratio_);
+
+    for (const auto& snapshot : tenant_quota_table_.ListTenantSnapshots()) {
+        if (snapshot.effective_quota_bytes == 0) {
+            continue;
+        }
+        const double used_ratio =
+            static_cast<double>(snapshot.charged_bytes) /
+            static_cast<double>(snapshot.effective_quota_bytes);
+        if (used_ratio <= tenant_eviction_high_watermark_ratio_) {
+            continue;
+        }
+        const double excess_ratio = used_ratio - target_ratio;
+        const auto target_bytes = static_cast<uint64_t>(
+            excess_ratio * static_cast<double>(snapshot.effective_quota_bytes));
+        if (target_bytes == 0) {
+            continue;
+        }
+
+        LOG(INFO) << "[TENANT-EVICT-TRIGGER] tenant=" << snapshot.tenant_id
+                  << " used_ratio=" << used_ratio
+                  << " high_watermark=" << tenant_eviction_high_watermark_ratio_
+                  << " target_ratio=" << target_ratio
+                  << " target_bytes=" << target_bytes;
+        const TenantQuotaEvictionResult result =
+            EvictTenantMemoryForQuota(snapshot.tenant_id, target_bytes);
+        LOG(INFO) << "[TENANT-EVICT-DONE] tenant=" << snapshot.tenant_id
+                  << " freed_bytes=" << result.freed_bytes
+                  << " evicted_objects=" << result.evicted_objects;
+    }
+}
+
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_tenant_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
@@ -9186,6 +9245,21 @@ void MasterService::EvictionThreadFunc() {
                 ReleaseExpiredDiscardedReplicas(now);
             }
             last_discard_time = now;
+        }
+
+        // Tenant-scoped watermark. Intentionally outside the branch above:
+        // the case this exists for is a tenant over its OWN watermark while
+        // the pool is still under the pool-wide one, so it must not be gated
+        // on the pool-level condition having fired.
+        if (enable_multi_tenants_ &&
+            tenant_eviction_high_watermark_ratio_ > 0.0) {
+            const auto steady_now = std::chrono::steady_clock::now();
+            if (steady_now >= next_tenant_eviction_time) {
+                EvictTenantsOverWatermark();
+                next_tenant_eviction_time =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(kTenantEvictionCheckIntervalMs);
+            }
         }
 
 #ifdef USE_NOF
