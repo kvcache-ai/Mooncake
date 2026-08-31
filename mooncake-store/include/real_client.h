@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -646,6 +647,19 @@ class RealClient : public PyClient {
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+
+    using LocalDiskOffloadObjects =
+        std::unordered_map<std::string, std::vector<Slice>>;
+    using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
+        const std::string &, LocalDiskOffloadObjects &)>;
+
+    // Dependency-injected overload used to verify routing decisions without
+    // requiring multiple live SSD offload servers.
+    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+        const LocalDiskOffloadReader &local_disk_reader);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(

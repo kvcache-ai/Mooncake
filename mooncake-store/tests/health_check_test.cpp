@@ -15,6 +15,7 @@
 #include "default_config.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
+#include "version.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -237,6 +238,27 @@ TEST_F(HealthCheckTest, MetricsEndpointsReturnCorrectData) {
         << "Put summary missing";
     EXPECT_NE(summary_resp.body.find("Get:"), std::string::npos)
         << "Get summary missing";
+
+    py_client_->tearDownAll();
+    master_.Stop();
+}
+
+// Test 8: HTTP /version returns 200 with version information
+TEST_F(HealthCheckTest, VersionEndpointReturnsVersion) {
+    int http_port = getFreeTcpPort();
+    FLAGS_http_port = http_port;
+    ASSERT_EQ(StartMasterAndSetupClient(18930), 0) << "setup_real failed";
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    auto resp = fetch_url(http_port, "/version");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("\"version\""), std::string::npos);
+    EXPECT_NE(resp.body.find("\"display_version\""), std::string::npos);
+    EXPECT_NE(resp.body.find(GetMooncakeStoreVersion()), std::string::npos)
+        << "store version missing from /version response";
+    EXPECT_NE(resp.body.find(MOONCAKE_DISPLAY_VERSION), std::string::npos)
+        << "display version missing from /version response";
 
     py_client_->tearDownAll();
     master_.Stop();

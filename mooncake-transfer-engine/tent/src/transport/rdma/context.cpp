@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "ib_link_speed.h"
 #include "tent/common/status.h"
 #include "tent/transport/rdma/endpoint_store.h"
 
@@ -849,7 +850,39 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
 
     native_context_ = context.release();
     lid_ = port_attr.lid;
+    recordPortSpeed(port_attr);
     return 0;
+}
+
+void RdmaContext::recordPortSpeed(const ibv_port_attr& port_attr) {
+    int speed = port_attr.active_speed;
+#ifdef HAVE_IBV_ACTIVE_SPEED_EX
+    // XDR (encoding 256) overflows the uint8_t field above, which then
+    // reads 0; the extended field carries it on rdma-core builds that have
+    // one.
+    if (port_attr.active_speed_ex) speed = port_attr.active_speed_ex;
+#endif
+    active_speed_.store(speed, std::memory_order_relaxed);
+    active_width_.store(port_attr.active_width, std::memory_order_relaxed);
+}
+
+int RdmaContext::refreshPortAttributes() {
+    if (!native_context_) return -1;
+    ibv_port_attr port_attr;
+    if (verbs_.ibv_query_port_default(native_context_, params_->device.port,
+                                      &port_attr)) {
+        PLOG(WARNING) << "Failed to re-query port "
+                      << static_cast<int>(params_->device.port) << " on "
+                      << device_name_;
+        return -1;
+    }
+    recordPortSpeed(port_attr);
+    return 0;
+}
+
+double RdmaContext::linkSpeedGbps() const {
+    return ibLinkSpeedGbps(active_speed_.load(std::memory_order_relaxed),
+                           active_width_.load(std::memory_order_relaxed));
 }
 }  // namespace tent
 }  // namespace mooncake

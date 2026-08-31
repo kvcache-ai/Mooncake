@@ -14,6 +14,7 @@
 #include <numaif.h>
 #include <sys/mman.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include <gflags/gflags.h>

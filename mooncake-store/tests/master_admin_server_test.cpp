@@ -14,13 +14,14 @@
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
 
+#include "common/network.h"
 #include "ha/ha_types.h"
 #include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
-#include "common/network.h"
+#include "version.h"
 
 #include <ylt/reflection/user_reflect_macro.hpp>
 
@@ -204,6 +205,35 @@ TEST_F(MasterAdminServerTest, HealthEndpointReturns200InServing) {
     auto resp = HttpGet(port, "/health");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("\"role\":\"leader\""), std::string::npos);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, VersionEndpointReturnsVersion) {
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+
+    auto resp = HttpGet(port, "/version");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("\"version\""), std::string::npos);
+    EXPECT_NE(resp.body.find("\"display_version\""), std::string::npos);
+    EXPECT_NE(resp.body.find(GetMooncakeStoreVersion()), std::string::npos);
+    EXPECT_NE(resp.body.find(MOONCAKE_DISPLAY_VERSION), std::string::npos);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, VersionEndpointAvailableInStandby) {
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+
+    auto resp = HttpGet(port, "/version");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find(GetMooncakeStoreVersion()), std::string::npos);
 
     admin.Stop();
 }

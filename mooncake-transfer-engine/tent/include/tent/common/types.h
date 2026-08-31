@@ -167,6 +167,9 @@ struct TransferStatus {
     size_t transferred_bytes;
 };
 
+// One RDMA NIC's load snapshot. Only NICs currently able to carry traffic
+// are reported: a NIC whose context failed to construct or whose port is
+// down is omitted rather than listed with a meaningless bandwidth.
 struct NicLoadStats {
     std::string device_name;
     uint64_t inflight_bytes{0};

@@ -6,12 +6,22 @@
 #include <thread>
 
 #include "bool_parser.h"
-#include "integer_parser.h"
 #include "common/byte_size.h"
+#include "integer_parser.h"
+#include "version.h"
 
 namespace mooncake {
 
 namespace {
+
+// Build info is exposed as an info-style metric, so the version strings live in
+// labels. Caller supplied labels are preserved to keep instance identification.
+std::map<std::string, std::string> WithBuildInfoLabels(
+    std::map<std::string, std::string> labels) {
+    labels["version"] = GetMooncakeStoreVersion();
+    labels["display_version"] = MOONCAKE_DISPLAY_VERSION;
+    return labels;
+}
 
 bool parseMetricsEnabled() {
     const char* metric_env = std::getenv("MC_STORE_CLIENT_METRIC");
@@ -72,10 +82,16 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       master_client_metric(labels),
       transfer_operation_metric(labels),
       ssd_metric(labels),
+      build_info("mooncake_build_info",
+                 "Build version of the running client; the value is always 1 "
+                 "and the version strings are carried by the labels",
+                 WithBuildInfoLabels(labels)),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds),
       bandwidth_reporting_enabled_(bandwidth_reporting_enabled),
       master_rpc_metrics_enabled_(master_rpc_metrics_enabled) {
+    // Set once: the compiled-in version never changes at runtime.
+    build_info.update(1);
     last_report_snapshot_ = TransferSnapshot{
         static_cast<uint64_t>(transfer_metric.total_read_bytes.value()),
         static_cast<uint64_t>(transfer_metric.total_write_bytes.value()),
@@ -117,11 +133,16 @@ void ClientMetric::serialize(std::string& str) {
     }
     transfer_operation_metric.serialize(str);
     ssd_metric.serialize(str);
+    build_info.serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {
     std::stringstream ss;
     ss << "Client Metrics Summary\n";
+    // Identify the build inline so one /metrics/summary request is enough to
+    // tell which binary produced the numbers below.
+    ss << "Version: " << GetMooncakeStoreVersion() << " ("
+       << MOONCAKE_DISPLAY_VERSION << ")\n";
     ss << transfer_metric.summary_metrics(bandwidth_reporting_enabled_);
     ss << "\n";
     if (master_rpc_metrics_enabled_) {

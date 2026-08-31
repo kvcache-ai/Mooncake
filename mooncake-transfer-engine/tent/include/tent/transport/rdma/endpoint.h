@@ -132,6 +132,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     bool sendNotification(const std::string& name, const std::string& msg);
 
+    // Unpublishes the notify QP after a fault confined to it, leaving the data
+    // QPs and the endpoint lifecycle untouched. Notifications stay off for the
+    // remaining lifetime of the endpoint.
+    void disableNotification(const std::string& reason);
+
     // Process RECV completion: parse message and add to transport queue
     // directly
     bool handleNotifyRecv(size_t buffer_idx, size_t byte_len);
