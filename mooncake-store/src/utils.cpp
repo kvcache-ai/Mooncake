@@ -187,7 +187,10 @@ static inline size_t mmap_map_size(size_t total_size, size_t hugepage_size) {
 
 namespace {
 
-size_t touch_thread_count(size_t page_count) {
+size_t touch_thread_count(size_t page_count, size_t requested_threads = 0) {
+    if (requested_threads > 0) {
+        return std::min(requested_threads, page_count);
+    }
     const unsigned int hardware_threads = std::thread::hardware_concurrency();
     const size_t available_threads =
         hardware_threads == 0 ? 1 : std::min<size_t>(hardware_threads, 16);
@@ -205,13 +208,15 @@ void touch_page_range(volatile char *data, size_t page_size, size_t begin_page,
     }
 }
 
-void touch_mmap_pages(void *ptr, size_t map_size, size_t page_size) {
+void touch_mmap_pages(void *ptr, size_t map_size, size_t page_size,
+                      size_t requested_threads = 0) {
     if (ptr == nullptr || map_size == 0 || page_size == 0) {
         return;
     }
 
     const size_t page_count = (map_size + page_size - 1) / page_size;
-    const size_t num_threads = touch_thread_count(page_count);
+    const size_t num_threads =
+        touch_thread_count(page_count, requested_threads);
 
     auto *data = static_cast<volatile char *>(ptr);
     if (num_threads <= 1) {
@@ -285,14 +290,19 @@ void touch_numa_mmap_pages(void *ptr, size_t map_size, size_t page_size,
 
 }  // namespace
 
+void populate_mmap_mapping(void *ptr, size_t total_size, size_t page_size,
+                           size_t thread_count) {
+    touch_mmap_pages(ptr, total_size, page_size, thread_count);
+}
+
 void populate_hugetlb_mapping(void *ptr, size_t total_size) {
     const size_t hugepage_size = get_hugepage_size_from_env();
     if (ptr == nullptr || total_size == 0 || hugepage_size == 0) {
         return;
     }
 
-    touch_mmap_pages(ptr, mmap_map_size(total_size, hugepage_size),
-                     hugepage_size);
+    populate_mmap_mapping(ptr, mmap_map_size(total_size, hugepage_size),
+                          hugepage_size);
 }
 
 void populate_hugetlb_numa_mapping(void *ptr, size_t total_size,

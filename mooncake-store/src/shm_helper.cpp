@@ -1,5 +1,7 @@
 #include "shm_helper.h"
 
+#include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
@@ -20,6 +22,32 @@
 #endif
 
 namespace mooncake {
+
+namespace {
+
+constexpr char kPopulateThreadsEnv[] = "MC_STORE_SHM_POPULATE_THREADS";
+constexpr size_t kMaxPopulateThreads = 256;
+
+size_t get_populate_thread_count() {
+    const char* value = std::getenv(kPopulateThreadsEnv);
+    if (value == nullptr || *value == '\0') {
+        return 0;
+    }
+
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed == 0 ||
+        parsed > kMaxPopulateThreads) {
+        LOG(WARNING) << "Ignoring invalid " << kPopulateThreadsEnv << "="
+                     << value << "; expected an integer in [1, "
+                     << kMaxPopulateThreads << "]";
+        return 0;
+    }
+    return static_cast<size_t>(parsed);
+}
+
+}  // namespace
 
 std::mutex ShmHelper::shm_mutex_;
 
@@ -120,13 +148,42 @@ void* ShmHelper::allocate(size_t size) {
                                  std::string(strerror(errno)));
     }
 
-    void* base_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_POPULATE, fd, 0);
+    const size_t populate_threads = get_populate_thread_count();
+    const bool use_native_population = populate_threads > 0;
+    const int mmap_flags =
+        MAP_SHARED | (use_native_population ? 0 : MAP_POPULATE);
+    const auto populate_start = std::chrono::steady_clock::now();
+    void* base_addr =
+        mmap(nullptr, size, PROT_READ | PROT_WRITE, mmap_flags, fd, 0);
     if (base_addr == MAP_FAILED) {
         close(fd);
         throw std::runtime_error("Failed to map shared memory: " +
                                  std::string(strerror(errno)));
     }
+
+    if (use_native_population) {
+        const size_t page_size = use_hugepage_
+                                     ? get_hugepage_size_from_env()
+                                     : static_cast<size_t>(getpagesize());
+        try {
+            populate_mmap_mapping(base_addr, size, page_size, populate_threads);
+        } catch (...) {
+            munmap(base_addr, size);
+            close(fd);
+            throw;
+        }
+    }
+
+    const auto populate_elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - populate_start)
+            .count();
+    LOG(INFO) << "Shared memory allocation completed: size=" << size
+              << ", mode="
+              << (use_native_population ? "native_parallel_touch"
+                                        : "map_populate")
+              << ", threads=" << (use_native_population ? populate_threads : 1)
+              << ", elapsed_ms=" << populate_elapsed_ms;
 
     auto shm = std::make_shared<ShmSegment>();
     shm->fd = fd;
