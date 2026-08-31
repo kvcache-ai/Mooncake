@@ -268,11 +268,11 @@ constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 
 // 512MiB hugepages (PMD size on arm64 kernels with 64K base pages) are not
 // defined by older glibc/kernel headers; provide fallbacks.
-#ifndef MAP_HUGE_512M
-#define MAP_HUGE_512M (29 << 26)  // MAP_HUGE_SHIFT = 26
+#ifndef MAP_HUGE_512MB
+#define MAP_HUGE_512MB (29 << 26)  // MAP_HUGE_SHIFT = 26
 #endif
-#ifndef MFD_HUGE_512M
-#define MFD_HUGE_512M (29 << 26)  // MFD_HUGE_SHIFT = 26
+#ifndef MFD_HUGE_512MB
+#define MFD_HUGE_512MB (29 << 26)  // MFD_HUGE_SHIFT = 26
 #endif
 
 /**
@@ -338,9 +338,9 @@ inline size_t align_up(size_t size, size_t alignment) {
             }
         } else if (size == SZ_512MB) {
             if (use_memfd) {
-                *out_flags |= MFD_HUGE_512M;
+                *out_flags |= MFD_HUGE_512MB;
             } else {
-                *out_flags |= MAP_HUGE_512M;
+                *out_flags |= MAP_HUGE_512MB;
             }
         } else if (size == SZ_1GB) {
             if (use_memfd) {

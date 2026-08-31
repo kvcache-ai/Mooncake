@@ -277,12 +277,12 @@ TEST(HugepageSizeEnvTest, Accepts512Mb) {
     unsigned int flags = 0;
     EXPECT_EQ(get_hugepage_size_from_env(&flags), SZ_512MB);
     EXPECT_TRUE(flags & MAP_HUGETLB);
-    EXPECT_TRUE(flags & MAP_HUGE_512M);
+    EXPECT_TRUE(flags & MAP_HUGE_512MB);
 
     flags = 0;
     EXPECT_EQ(get_hugepage_size_from_env(&flags, /*use_memfd=*/true), SZ_512MB);
     EXPECT_TRUE(flags & MFD_HUGETLB);
-    EXPECT_TRUE(flags & MFD_HUGE_512M);
+    EXPECT_TRUE(flags & MFD_HUGE_512MB);
 
     unsetenv("MC_STORE_HUGEPAGE_SIZE");
     unsetenv("MC_STORE_USE_HUGEPAGE");
