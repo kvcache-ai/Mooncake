@@ -110,7 +110,18 @@ class RdmaContext {
 
     ibv_pd *nativePD() const { return native_pd_; }
 
-    uint8_t portNum() const { return params_->device.port; }
+    // The one port this context opened; 0 for a slot that never constructed.
+    uint8_t portNum() const { return params_ ? params_->device.port : 0; }
+
+    // Negotiated port speed in Gbps, 0 when it could not be determined.
+    double linkSpeedGbps() const;
+
+    // Re-read the port's negotiated speed and width from the hardware, so
+    // linkSpeedGbps() reflects a renegotiated link. Called from the monitor
+    // thread on IBV_EVENT_PORT_ACTIVE / IBV_EVENT_DEVICE_SPEED_CHANGE.
+    // Returns -1 and leaves the cached values untouched if no device is
+    // open or the query fails.
+    int refreshPortAttributes();
 
     int eventFd() const { return event_fd_; }
 
@@ -128,6 +139,8 @@ class RdmaContext {
 
    private:
     int openDevice(const std::string &device_name, uint8_t port);
+    // Decode one ibv_query_port result into active_speed_/active_width_.
+    void recordPortSpeed(const ibv_port_attr &port_attr);
 
     // Release every resource currently owned by this context. This is
     // intentionally state-independent so it can clean up a partially completed
@@ -151,6 +164,11 @@ class RdmaContext {
     std::vector<ibv_comp_channel *> comp_channel_;
 
     uint16_t lid_ = 0;
+    // Set by openDevice() and refreshed by refreshPortAttributes() on the
+    // monitor thread. Today every runtime reader is that same thread;
+    // atomic so a reader added elsewhere stays well-defined.
+    std::atomic<int> active_speed_{0};
+    std::atomic<int> active_width_{0};
     int gid_index_ = -1;
     ibv_gid gid_;
 

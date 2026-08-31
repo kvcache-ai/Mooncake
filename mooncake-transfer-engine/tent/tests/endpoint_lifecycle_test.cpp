@@ -37,6 +37,14 @@ class EndpointTestAccess {
         endpoint.status_.store(RdmaEndPoint::EP_READY,
                                std::memory_order_relaxed);
     }
+
+    static void markNotifyConnected(RdmaEndPoint& endpoint) {
+        endpoint.notify_connected_.store(true, std::memory_order_relaxed);
+    }
+
+    static bool notifyConnected(const RdmaEndPoint& endpoint) {
+        return endpoint.notify_connected_.load(std::memory_order_relaxed);
+    }
 };
 
 namespace {
@@ -103,6 +111,36 @@ TEST(EndpointLifecycleTest, NotificationFailsWhenEndpointIsNotConnected) {
     RdmaEndPoint endpoint;
 
     EXPECT_FALSE(endpoint.sendNotification("name", "message"));
+}
+
+TEST(EndpointLifecycleTest, NotifyLocalFaultKeepsEndpointServingData) {
+    // A fault confined to the notify QP must not retire the endpoint: doing so
+    // moves every data QP to ERR and flushes in-flight transfers.
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+
+    endpoint.disableNotification("notify QP local completion error");
+
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_READY);
+    EXPECT_FALSE(EndpointTestAccess::notifyConnected(endpoint));
+    // The caller now learns notifications are gone instead of silently posting
+    // to a dead QP.
+    EXPECT_FALSE(endpoint.sendNotification("name", "message"));
+}
+
+TEST(EndpointLifecycleTest, DisableNotificationIsIdempotent) {
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+
+    endpoint.disableNotification("first");
+    endpoint.disableNotification("second");
+
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_READY);
+    EXPECT_FALSE(EndpointTestAccess::notifyConnected(endpoint));
 }
 
 TEST(EndpointLifecycleTest, SharedFromThisUsesRealEndpointOwnership) {
@@ -185,6 +223,10 @@ TEST(EndpointLifecycleTest, BootstrapWithNewPeerQpsRetiresEstablishedEndpoint) {
 
     EXPECT_FALSE(endpoint.accept(peer_desc, local_desc).ok());
     EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
+    // The failed accept does not populate a GID. The transport retries on a
+    // newly inserted endpoint in the same bootstrap RPC so the initiator is
+    // not left with an empty reply.
+    EXPECT_TRUE(local_desc.local_gid.empty());
 }
 
 TEST(EndpointLifecycleTest, ExternalOwnerCanReleaseAfterExplicitDeconstruct) {

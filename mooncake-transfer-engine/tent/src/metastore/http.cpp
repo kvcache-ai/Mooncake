@@ -65,6 +65,7 @@ struct ScopedCurl {
 }  // namespace
 
 Status HttpMetaStore::get(const std::string &key, std::string &value) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
     if (!connected_) {
         return Status::MetadataError("HTTP connection not available" LOC_MARK);
     }
@@ -106,6 +107,7 @@ Status HttpMetaStore::get(const std::string &key, std::string &value) {
 }
 
 Status HttpMetaStore::set(const std::string &key, const std::string &value) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
     if (!connected_) {
         return Status::MetadataError("HTTP connection not available" LOC_MARK);
     }
@@ -153,6 +155,7 @@ Status HttpMetaStore::set(const std::string &key, const std::string &value) {
 }
 
 Status HttpMetaStore::remove(const std::string &key) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
     if (!connected_) {
         return Status::MetadataError("HTTP connection not available" LOC_MARK);
     }

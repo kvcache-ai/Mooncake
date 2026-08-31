@@ -4,7 +4,7 @@
 // Measures H2D, D2H, D2D (same GPU), and GPU-to-GPU (P2P via XGMI)
 // bandwidth across a sweep of transfer sizes.
 //
-// Build:
+// Build (from this directory):
 //   hipcc -O3 -o hip_bandwidth_bench hip_bandwidth_bench.cpp
 //
 // Run:
