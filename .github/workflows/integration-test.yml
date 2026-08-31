@@ -11,11 +11,6 @@ on:
         description: 'PR number (passed from parent workflow for workflow_dispatch)'
         required: false
         type: string
-      testpypi_version:
-        description: 'Exact TestPyPI CUDA 13 package version to test instead of a CI artifact'
-        required: false
-        default: ''
-        type: string
 
 jobs:
   test-sglang-integration:
@@ -23,51 +18,8 @@ jobs:
     env:
       tone_user_name: ${{ secrets.TONE_USER_NAME }}
     steps:
-      - name: Require T-one credentials for the pre-release gate
-        if: ${{ inputs.testpypi_version != '' }}
-        env:
-          TONE_USER_NAME: ${{ secrets.TONE_USER_NAME }}
-          TONE_USER_TOKEN: ${{ secrets.TONE_USER_TOKEN }}
-        run: |
-          if [ -z "$TONE_USER_NAME" ] || [ -z "$TONE_USER_TOKEN" ]; then
-            echo "TONE_USER_NAME and TONE_USER_TOKEN are required for pre-release validation"
-            exit 1
-          fi
-
-      - name: Set up Python for TestPyPI download
-        if: ${{ inputs.testpypi_version != '' }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Download the exact indexed CUDA 13 wheel
-        if: ${{ inputs.testpypi_version != '' }}
-        env:
-          TESTPYPI_VERSION: ${{ inputs.testpypi_version }}
-        run: |
-          python -m pip download \
-            --index-url https://test.pypi.org/simple \
-            --no-cache-dir \
-            --no-deps \
-            --only-binary=:all: \
-            --pre \
-            --dest integration-wheel \
-            "mooncake-transfer-engine-cuda13==${TESTPYPI_VERSION}"
-
-      - name: Stage the indexed wheel for T-one
-        if: ${{ inputs.testpypi_version != '' }}
-        id: testpypi-wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: mooncake-testpypi-tone-${{ inputs.testpypi_version }}
-          path: integration-wheel/*.whl
-          if-no-files-found: error
-          retention-days: 14
-
       - name: trigger T-one test
         if: ${{ env.tone_user_name != '' }}
-        env:
-          TESTPYPI_ARTIFACT_ID: ${{ steps.testpypi-wheel.outputs.artifact-id }}
         run: |
           # Priority: explicit inputs > PR event context > push SHA
           SHA="${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}"
@@ -78,10 +30,9 @@ jobs:
             PR_ID=""
           fi
           echo "PR_ID=${PR_ID}"
-          artifact_id="$TESTPYPI_ARTIFACT_ID"
           max_attempts=120
           attempt=1
-          while [ -z "$artifact_id" ] && [ $attempt -le $max_attempts ]; do
+          while [ $attempt -le $max_attempts ]; do
             echo "Attempt $attempt: Fetching artifact..."
             echo "Target SHA=${SHA}"
             artifact_id=""
@@ -135,9 +86,6 @@ jobs:
           fi
 
           ENV_INFO="ARTIFACT_ID=${artifact_id} GIT_REPO=${{ github.repository }}"
-          if [ -n "${{ inputs.testpypi_version }}" ]; then
-            ENV_INFO="${ENV_INFO} BRANCH=${{ github.ref_name }}"
-          fi
           if [ -n "$PR_ID" ]; then
             ENV_INFO="${ENV_INFO} PR_ID=${PR_ID}"
           fi

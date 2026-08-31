@@ -214,29 +214,11 @@ struct BucketBackendConfig {
     int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
                                  // exceeds this threshold (bytes)
 
-    // Hard cap on *actual on-disk* bytes of the offload directory, measured by
-    // scanning real file allocation (stat st_blocks), NOT the in-memory
-    // total_size_. 0 = disabled.
-    //
-    // Why a separate, disk-measured cap: total_size_ is decremented per object
-    // on eviction/delete, but a 256 MB bucket file is only removed once *all*
-    // its objects are gone — so total_size_ (and any sum over the in-memory
-    // bucket map) reads well below real disk usage under per-object eviction
-    // (cf. unreliable bucket GC, kvcache-ai/Mooncake#3220/#3221). The other
-    // physical guard, std::filesystem::space(), reports the *host* filesystem
-    // under a cgroup / K8s emptyDir sizeLimit rather than the enforced quota,
-    // so it never fires either. This cap scans the actual directory (the same
-    // st_blocks basis kubelet's emptyDir accounting uses), so it matches what
-    // actually triggers pod eviction. Set it to the real quota minus headroom.
+    // Optional hard physical cap for container quotas where fs::space() reports
+    // the host filesystem instead of the volume sizeLimit / cgroup quota.
+    // When > 0, eviction also caps available space using logical used bytes
+    // (total + pending eviction/write). 0 = disabled (rely on fs::space only).
     int64_t max_physical_bytes = 0;
-
-    // How long ActualDiskBytesUsedLocked() caches its directory-scan result
-    // (milliseconds). Bounds scan cost under a high offload rate; larger =
-    // cheaper but a staler physical bound (disk may momentarily exceed the cap
-    // by roughly one interval's worth of writes), smaller = tighter but scans
-    // more often. <=0 disables caching (scan every check). Only relevant when
-    // max_physical_bytes > 0.
-    int64_t disk_scan_cache_ms = 500;
 
     bool Validate() const;
 
@@ -387,8 +369,7 @@ struct FileStorageConfig {
 
 class StorageBackendInterface {
    public:
-    explicit StorageBackendInterface(const FileStorageConfig& config)
-        : file_storage_config_(config) {}
+    StorageBackendInterface(const FileStorageConfig& file_storage_config);
     virtual ~StorageBackendInterface() = default;
 
     using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
@@ -1128,24 +1109,6 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
     SelectEvictionCandidate();
-
-    /**
-     * @brief Actual on-disk bytes of the offload directory, measured by
-     *        summing real file allocation (stat st_blocks * 512) over every
-     *        file under storage_path_.
-     *
-     * This is ground truth — the same block-based accounting kubelet uses for
-     * emptyDir sizeLimit — so it captures bucket files that linger after their
-     * objects are logically evicted (which the in-memory total_size_ misses).
-     * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
-     * the scan cost regardless of offload rate. Caller must hold mutex_.
-     */
-    int64_t ActualDiskBytesUsedLocked() const;
-
-    // Cached result of ActualDiskBytesUsedLocked() and when it was taken.
-    mutable int64_t cached_disk_bytes_ GUARDED_BY(mutex_) = -1;
-    mutable std::chrono::steady_clock::time_point cached_disk_bytes_at_
-        GUARDED_BY(mutex_);
 
     /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted
