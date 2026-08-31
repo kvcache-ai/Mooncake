@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
@@ -126,6 +127,50 @@ def _collective_worker(
     ctx.record_result(payload)
 
 
+def _async_ops_on_independent_streams_worker(
+    ctx: MooncakePGWorkerContext,
+    allow_rank_one_to_start,
+) -> None:
+    device = ctx.init_group()
+    stream_a = torch.cuda.Stream(device=device)
+    stream_b = torch.cuda.Stream(device=device)
+
+    rank_zero_submitted_both = True
+    if ctx.rank == 1:
+        rank_zero_submitted_both = allow_rank_one_to_start.wait(timeout=5.0)
+
+    with torch.cuda.stream(stream_a):
+        tensor_a = torch.tensor(
+            [ctx.rank + 1], dtype=torch.int32, device=device
+        )
+        work_a = dist.all_reduce(
+            tensor_a, op=dist.ReduceOp.SUM, async_op=True
+        )
+    with torch.cuda.stream(stream_b):
+        tensor_b = torch.tensor(
+            [(ctx.rank + 1) * 10], dtype=torch.int32, device=device
+        )
+        work_b = dist.all_reduce(
+            tensor_b, op=dist.ReduceOp.SUM, async_op=True
+        )
+
+    if ctx.rank == 0:
+        # Rank 1 does not submit either operation until both calls on rank 0
+        # return.
+        allow_rank_one_to_start.set()
+
+    work_a.wait()
+    work_b.wait()
+    stream_a.synchronize()
+    stream_b.synchronize()
+    ctx.record_result(
+        {
+            "rank_zero_submitted_both": rank_zero_submitted_both,
+            "values": [int(tensor_a.cpu().item()), int(tensor_b.cpu().item())],
+        }
+    )
+
+
 class _CollectiveTestMixin:
     def test_world_init_without_pg_options(self) -> None:
         rows = self.spawn_backend_and_collect(_collective_worker, "world_init_without_pg_options")
@@ -224,6 +269,23 @@ class TestMooncakePGCollectivesCPU(_CollectiveTestMixin, MooncakePGCPUBackendTes
 
 class TestMooncakePGCollectivesCUDA(_CollectiveTestMixin, MooncakePGCUDABackendTestCase):
     world_size = 2
+
+    def test_async_ops_on_independent_streams(self) -> None:
+        spawn_ctx = mp.get_context("spawn")
+        allow_rank_one_to_start = spawn_ctx.Event()
+        rows = self.spawn_backend_and_collect(
+            _async_ops_on_independent_streams_worker,
+            allow_rank_one_to_start,
+        )
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["values"], [3, 30])
+
+        rank_one = next(row for row in rows if row["rank"] == 1)
+        self.assertTrue(
+            rank_one["rank_zero_submitted_both"],
+            "rank 0 blocked before submitting both async operations",
+        )
 
 
 class TestMooncakePGCollectivesMUSA(_CollectiveTestMixin, MooncakePGMUSABackendTestCase):

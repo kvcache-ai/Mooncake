@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
+#include <array>
 #include <atomic>
 #include <functional>
 
@@ -130,21 +131,24 @@ class MooncakeWorker {
     void waitUntilTasksSubmitted(
         const std::vector<CudaTaskSubmissionToken>& tasks) const;
 
-    static constexpr size_t kNumTasks_ = 4;
+    static constexpr size_t kNumCpuTasks_ = 2;
+    static constexpr size_t kNumCudaTasks_ = 2;
+    static constexpr size_t kCudaTaskOffset_ = kNumCpuTasks_;
+    static constexpr size_t kNumTasks_ = kNumCpuTasks_ + kNumCudaTasks_;
 
     static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
     std::atomic<bool> running_{false};
     std::atomic<bool> started_{false};
     int cuda_device_index_;
-    std::optional<GpuStream> enqueue_stream_;
+    std::array<std::optional<GpuStream>, kNumCudaTasks_> enqueue_streams_;
 
     Task *tasks_, *tasks_device_;
     bool hasCallback_[kNumTasks_]{};
     std::function<void()> callbacks_[kNumTasks_]{};
 
     int cpuTaskCount = 0;
-    int cudaTaskCount = 0;
+    size_t cudaOpCount = 0;
     std::atomic<uint64_t> next_cuda_task_sequence_{1};
     std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
 
