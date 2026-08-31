@@ -98,19 +98,17 @@ class RdmaContextTestPeer {
     static std::unique_lock<std::mutex> tryLockEndpointLifecycle(
         RdmaContext &context, const std::string &peer_nic_path) {
         const int owner_thread = context.postingThreadForPeer(peer_nic_path);
-        if (owner_thread < 0 ||
-            static_cast<size_t>(owner_thread) >=
-                context.endpoint_lifecycle_locks_.size()) {
+        if (owner_thread < 0 || static_cast<size_t>(owner_thread) >=
+                                    context.endpoint_lifecycle_locks_.size()) {
             return std::unique_lock<std::mutex>();
         }
         return std::unique_lock<std::mutex>(
-            *context.endpoint_lifecycle_locks_[owner_thread],
-            std::try_to_lock);
+            *context.endpoint_lifecycle_locks_[owner_thread], std::try_to_lock);
     }
 
-    static void insertEndpointForTest(
-        RdmaContext &context, const std::string &peer_nic_path,
-        std::shared_ptr<RdmaEndPoint> endpoint) {
+    static void insertEndpointForTest(RdmaContext &context,
+                                      const std::string &peer_nic_path,
+                                      std::shared_ptr<RdmaEndPoint> endpoint) {
         auto store = std::dynamic_pointer_cast<SIEVEEndpointStore>(
             context.endpoint_store_);
         ASSERT_NE(store, nullptr);
@@ -244,9 +242,9 @@ void initFakePeer(FakeRdmaPeer &peer, const std::string &server_name,
                                         server_name);
 
     peer.topology = std::make_shared<Topology>();
-    ASSERT_EQ(peer.topology->parse("{\"cpu:0\": [[\"" + device_name +
-                                    "\"], []]}"),
-              0);
+    ASSERT_EQ(
+        peer.topology->parse("{\"cpu:0\": [[\"" + device_name + "\"], []]}"),
+        0);
     RdmaTransportTestPeer::bindTopology(*peer.transport, peer.topology);
 
     peer.context =

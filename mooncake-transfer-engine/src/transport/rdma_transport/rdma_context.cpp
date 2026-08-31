@@ -866,8 +866,9 @@ ibv_cq *RdmaContext::cq(int cq_index) {
 
 int RdmaContext::postingThreadForPeer(const std::string &peer_nic_path) const {
     if (transfer_worker_count_ <= 0) {
-        LOG(ERROR) << "Invalid transfer_worker_count_=" << transfer_worker_count_
-                   << " for endpoint on " << deviceName();
+        LOG(ERROR) << "Invalid transfer_worker_count_="
+                   << transfer_worker_count_ << " for endpoint on "
+                   << deviceName();
         return -1;
     }
     return static_cast<int>(std::hash<std::string>{}(peer_nic_path) %
