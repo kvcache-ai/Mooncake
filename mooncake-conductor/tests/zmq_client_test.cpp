@@ -17,6 +17,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "conductor/zmq/zmq_client.h"
@@ -146,6 +147,27 @@ std::string PackVllmStoredBatch(uint64_t hash, int64_t dp_rank = 3) {
     pk.pack_nil();
     pk.pack(std::string("group_idx"));
     pk.pack_int64(0);
+    pk.pack_int64(dp_rank);
+    return buf.str();
+}
+
+std::string PackSglangStoredBatch(int64_t hash, int64_t dp_rank = 3) {
+    std::stringstream buf;
+    msgpack::packer<std::stringstream> pk(buf);
+    pk.pack_array(3);
+    pk.pack_double(1.25);
+    pk.pack_array(1);
+    pk.pack_array(7);
+    pk.pack(std::string("BlockStored"));
+    pk.pack_array(1);
+    pk.pack_int64(hash);
+    pk.pack_nil();
+    pk.pack_array(2);
+    pk.pack_int32(1);
+    pk.pack_int32(2);
+    pk.pack_int64(2);
+    pk.pack_nil();
+    pk.pack(std::string("GPU"));
     pk.pack_int64(dp_rank);
     return buf.str();
 }
@@ -319,7 +341,6 @@ class MockPublisher {
             replay_requests_.fetch_add(1);
 
             const std::string empty;
-            const std::string topic;
             const uint64_t max_sequence = replay_max_sequence_.load();
             for (uint64_t sequence = from_sequence; sequence <= max_sequence;
                  ++sequence) {
@@ -331,10 +352,11 @@ class MockPublisher {
                     value >>= 8;
                 }
                 const auto payload = PackVllmStoredBatch(sequence);
-                std::array<::zmq::const_buffer, 5> reply = {
+                // Match vLLM/SGLang: DEALER receives
+                // [empty, sequence, payload] after ROUTER removes identity.
+                std::array<::zmq::const_buffer, 4> reply = {
                     ::zmq::buffer(frames[0].data(), frames[0].size()),
                     ::zmq::buffer(empty),
-                    ::zmq::buffer(topic),
                     ::zmq::buffer(sequence_bytes),
                     ::zmq::buffer(payload),
                 };
@@ -348,9 +370,8 @@ class MockPublisher {
             }
             std::array<unsigned char, 8> end_sequence{};
             end_sequence.fill(0xFF);
-            std::array<::zmq::const_buffer, 5> end = {
+            std::array<::zmq::const_buffer, 4> end = {
                 ::zmq::buffer(frames[0].data(), frames[0].size()),
-                ::zmq::buffer(empty),
                 ::zmq::buffer(empty),
                 ::zmq::buffer(end_sequence),
                 ::zmq::buffer(empty),
@@ -440,6 +461,47 @@ TEST(ZMQClient, MooncakeIgnoresVllmReplayEndpoint) {
     ZMQClient client(config, handler);
     ASSERT_EQ(client.Connect(), "");
     EXPECT_FALSE(ZMQClientTestPeer::HasReplaySocket(client));
+    client.Stop();
+}
+
+TEST(ZMQClient, SglangEnablesReplaySocket) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.publisher_kind = PublisherKind::kSglang;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Connect(), "");
+    EXPECT_TRUE(ZMQClientTestPeer::HasReplaySocket(client));
+    client.Stop();
+}
+
+TEST(ZMQClient, SglangRoutesNativeAndMooncakeFallbackEnvelopes) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.publisher_kind = PublisherKind::kSglang;
+    const std::string endpoint = config.endpoint;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+
+    ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
+        publisher.Publish("", PackSglangStoredBatch(-42), 10);
+    }));
+    const auto native = handler->FindBatch(10, endpoint);
+    ASSERT_TRUE(native.has_value());
+    EXPECT_TRUE(std::holds_alternative<conductor::zmq::SglangEventBatch>(
+        native->batch));
+    EXPECT_EQ(native->metadata.publisher_kind, PublisherKind::kSglang);
+
+    ASSERT_TRUE(PublishUntilHandled(*handler, 11, endpoint, [&] {
+        publisher.Publish("", PackMooncakeStoredBatch(9001, 42), 11);
+    }));
+    const auto fallback = handler->FindBatch(11, endpoint);
+    ASSERT_TRUE(fallback.has_value());
+    const auto* stored = GetMooncakeStored(*fallback);
+    ASSERT_NE(stored, nullptr);
+    EXPECT_EQ(stored->fields.event_id, 9001u);
+    EXPECT_EQ(fallback->metadata.publisher_kind, PublisherKind::kSglang);
     client.Stop();
 }
 

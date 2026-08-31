@@ -69,12 +69,11 @@ bool MsgpackInt64(const msgpack::object& value, int64_t* out) {
     return false;
 }
 
-// The HTTP registration contract intentionally exposes only the two vLLM v1
-// recipes.  Validate this at the request boundary before invoking root
-// derivation so an unsupported selector cannot trigger any hash work or state
-// mutation, and so the error is attributed to the algorithm field.
+// Validate the supported vLLM and SGLang recipes at the request boundary
+// before invoking root derivation or mutating subscription state.
 bool IsSupportedHashAlgorithm(std::string_view algorithm) {
-    return algorithm == "sha256" || algorithm == "sha256_cbor";
+    return algorithm == "sha256" || algorithm == "sha256_cbor" ||
+           algorithm == "sha256_raw";
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +220,24 @@ bool RequiredString(const msgpack::object_map& body, const char* field,
     return true;
 }
 
+bool RequiredStringAllowEmpty(const msgpack::object_map& body,
+                              const char* field, coro_http_response& resp,
+                              std::string* out) {
+    const msgpack::object* value = MapFind(body, field);
+    if (value == nullptr) {
+        HttpValidationError(resp, "missing",
+                            std::string(field) + " is required", field);
+        return false;
+    }
+    if (value->type != msgpack::type::STR) {
+        HttpValidationError(resp, "invalid_type",
+                            std::string(field) + " must be a string", field);
+        return false;
+    }
+    *out = std::string(ObjectStr(*value));
+    return true;
+}
+
 bool OptionalStringStrict(const msgpack::object_map& body, const char* field,
                           const std::string& fallback, coro_http_response& resp,
                           std::string* out) {
@@ -309,8 +326,8 @@ bool ParseHashProfileConfig(const msgpack::object_map& body,
     common::HashProfileConfig source;
     if (!RequiredString(profile_map, "strategy", resp, &source.strategy) ||
         !RequiredString(profile_map, "algorithm", resp, &source.algorithm) ||
-        !RequiredString(profile_map, "python_hash_seed", resp,
-                        &source.python_hash_seed) ||
+        !RequiredStringAllowEmpty(profile_map, "python_hash_seed", resp,
+                                  &source.python_hash_seed) ||
         !RequiredString(profile_map, "index_projection", resp,
                         &source.index_projection)) {
         return false;
@@ -361,9 +378,10 @@ std::string ValidateServiceConfig(const common::ServiceConfig& service) {
     if (service.cache_group.has_value() && *service.cache_group != 0) {
         return "only cache group zero is supported";
     }
-    if (service.publisher_kind == common::PublisherKind::kVllm) {
+    if (service.publisher_kind == common::PublisherKind::kVllm ||
+        service.publisher_kind == common::PublisherKind::kSglang) {
         if (service.instance_id.empty()) {
-            return "instance_id is required for vLLM";
+            return "instance_id is required for vLLM/SGLang";
         }
         return prefixindex::PrefixCacheTable::ValidateRegistration(
                    RegistrationFromService(service))
@@ -628,7 +646,7 @@ bool ParseServiceConfigRequest(const msgpack::object_map& body,
     const auto publisher_kind = common::ParsePublisherKind(publisher_type);
     if (!publisher_kind.has_value()) {
         HttpValidationError(resp, "invalid_value",
-                            "type must be vLLM or Mooncake", "type");
+                            "type must be vLLM, Mooncake, or SGLang", "type");
         return false;
     }
     service->publisher_kind = *publisher_kind;
@@ -920,7 +938,8 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     }
 
     bool inserted_registration = false;
-    if (svc.publisher_kind == common::PublisherKind::kVllm) {
+    if (svc.publisher_kind == common::PublisherKind::kVllm ||
+        svc.publisher_kind == common::PublisherKind::kSglang) {
         const auto registration_result =
             indexer_.Register(RegistrationFromService(svc));
         if (!registration_result.error.empty()) {
@@ -1004,7 +1023,8 @@ std::pair<bool, std::string> EventManager::UnsubscribeFromService(
     handler->WaitForIdle();
 
     std::string index_error = handler->InvalidateEndpoint();
-    if (service.publisher_kind == common::PublisherKind::kVllm) {
+    if (service.publisher_kind == common::PublisherKind::kVllm ||
+        service.publisher_kind == common::PublisherKind::kSglang) {
         const std::string unregister_error = indexer_.Unregister(
             ContextFromService(service), service.instance_id, service.dp_rank);
         if (index_error.empty()) {

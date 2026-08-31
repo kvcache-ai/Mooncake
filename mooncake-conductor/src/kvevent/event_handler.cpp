@@ -13,6 +13,8 @@
 #include <variant>
 #include <vector>
 
+#include "conductor/kvevent/object_key_parser.h"
+
 namespace conductor {
 namespace kvevent {
 
@@ -50,13 +52,19 @@ prefixindex::EngineOwner EngineOwnerFromService(
 std::optional<prefixindex::StorageTier> SharedTier(
     const std::optional<std::string>& medium) {
     const std::string normalized = LowerAscii(medium.value_or(""));
-    if (normalized == "cpu") {
+    if (normalized == "cpu" || normalized == "cpu_pinned") {
         return prefixindex::StorageTier::kCpu;
     }
     if (normalized == "disk") {
         return prefixindex::StorageTier::kDisk;
     }
     return std::nullopt;
+}
+
+bool IsSglangGpuMedium(const std::optional<std::string>& medium) {
+    // SGLang's base radix caches omit medium for their engine-local cache.
+    // Explicit CPU_PINNED and DISK values identify HiCache tiers instead.
+    return !medium.has_value() || LowerAscii(*medium) == "gpu";
 }
 
 std::string OriginalMedium(const std::optional<std::string>& medium) {
@@ -294,6 +302,19 @@ std::string KVEventHandler::HandleBatch(const zmq::DecodedBatch& batch,
         }
         return HandleVllmBatch(*vllm_batch, metadata);
     }
+    if (service_.publisher_kind == common::PublisherKind::kSglang) {
+        if (const auto* sglang_batch =
+                std::get_if<zmq::SglangEventBatch>(&batch);
+            sglang_batch != nullptr) {
+            return HandleSglangBatch(*sglang_batch, metadata);
+        }
+        if (const auto* mooncake_batch =
+                std::get_if<zmq::MooncakeEventBatch>(&batch);
+            mooncake_batch != nullptr) {
+            return HandleMooncakeBatch(*mooncake_batch, metadata);
+        }
+        return "registered SGLang source received an unsupported batch";
+    }
     const auto* mooncake_batch = std::get_if<zmq::MooncakeEventBatch>(&batch);
     if (mooncake_batch == nullptr) {
         return "registered Mooncake source received a vLLM batch";
@@ -354,6 +375,359 @@ std::string KVEventHandler::HandleVllmBatch(
                          << " event_index=" << index << " error=" << error;
         }
     }
+    return "";
+}
+
+std::string KVEventHandler::HandleSglangBatch(
+    const zmq::SglangEventBatch& batch,
+    const zmq::MessageMetadata& metadata) {
+    if (batch.data_parallel_rank.has_value() &&
+        *batch.data_parallel_rank != service_.dp_rank) {
+        return "batch data_parallel_rank conflicts with trusted registration";
+    }
+    for (size_t index = 0; index < batch.events.size(); ++index) {
+        const auto& decoded = batch.events[index];
+        if (!decoded.ok()) {
+            LOG(WARNING) << "Rejected SGLang event endpoint="
+                         << service_.endpoint << " event_index=" << index
+                         << " error=" << decoded.error;
+            continue;
+        }
+        std::string error = std::visit(
+            [&](const auto& event) -> std::string {
+                using Event = std::decay_t<decltype(event)>;
+                if constexpr (std::is_same_v<Event, zmq::SglangStoredEvent>) {
+                    return HandleSglangStored(event, metadata);
+                } else if constexpr (std::is_same_v<
+                                         Event, zmq::SglangRemovedEvent>) {
+                    return HandleSglangRemoved(event, metadata);
+                } else {
+                    return HandleSglangCleared(metadata);
+                }
+            },
+            *decoded.event);
+        if (!error.empty()) {
+            LOG(WARNING) << "Rejected SGLang event endpoint="
+                         << service_.endpoint << " event_index=" << index
+                         << " error=" << error;
+        }
+    }
+    return "";
+}
+
+std::string KVEventHandler::HandleSglangStored(
+    const zmq::SglangStoredEvent& event,
+    const zmq::MessageMetadata& metadata) {
+    if (event.block_size <= 0 || event.block_size > service_.block_size) {
+        return "block_size must be in the range [1, " +
+               std::to_string(service_.block_size) + "], got " +
+               std::to_string(event.block_size);
+    }
+    if (event.lora_id.has_value()) {
+        return "lora_id cannot be validated against trusted registration";
+    }
+    std::vector<prefixindex::ProjectedPrefix> prefixes;
+    prefixes.reserve(event.block_hashes.size());
+    for (uint64_t hash : event.block_hashes) {
+        prefixes.push_back({.value = hash});
+    }
+    if (prefixes.empty()) {
+        return "SGLang stored event has no block hashes";
+    }
+
+    if (IsSglangGpuMedium(event.medium)) {
+        return manager_->GetIndexer()->StoreGpu({
+            .context = ContextFromService(service_),
+            .prefixes = std::move(prefixes),
+            .owner = EngineOwnerFromService(service_),
+            .effective_block_size = service_.block_size,
+            .cache_group = service_.cache_group,
+        });
+    }
+    const auto tier = SharedTier(event.medium);
+    if (!tier.has_value()) {
+        return "unsupported SGLang storage medium: " +
+               OriginalMedium(event.medium);
+    }
+
+    const auto context = ContextFromService(service_);
+    const std::string backend = service_.instance_id;
+    std::lock_guard lock(bindings_mu_);
+    for (const auto prefix : prefixes) {
+        const std::string object_id = std::to_string(prefix.value);
+        const PoolObjectKey key{service_.endpoint, backend, service_.tenant_id,
+                                object_id, *tier};
+        const prefixindex::SharedObjectOwner owner{service_.endpoint, backend,
+                                                   object_id};
+        const PoolObjectBinding binding{context, prefix, "", owner,
+                                        service_.tenant_id, ""};
+        auto existing = pool_bindings_.find(key);
+        if (existing != pool_bindings_.end() &&
+            (existing->second.context != binding.context ||
+             existing->second.prefix != binding.prefix ||
+             existing->second.owner != binding.owner)) {
+            return "conflicting active SGLang hash binding";
+        }
+        if (std::string error = manager_->GetIndexer()->StoreShared({
+                .context = context,
+                .prefixes = {prefix},
+                .tier = *tier,
+                .owner = owner,
+                .effective_block_size = context.block_size,
+                .cache_group = std::nullopt});
+            !error.empty()) {
+            return error;
+        }
+        if (existing == pool_bindings_.end()) {
+            pool_bindings_.emplace(key, binding);
+        }
+    }
+    return "";
+}
+
+std::string KVEventHandler::HandleSglangRemoved(
+    const zmq::SglangRemovedEvent& event,
+    const zmq::MessageMetadata& metadata) {
+    std::vector<prefixindex::ProjectedPrefix> prefixes;
+    prefixes.reserve(event.block_hashes.size());
+    for (uint64_t hash : event.block_hashes) {
+        prefixes.push_back({.value = hash});
+    }
+    if (prefixes.empty()) {
+        return "";
+    }
+    if (IsSglangGpuMedium(event.medium)) {
+        return manager_->GetIndexer()->RemoveGpu({
+            .context = ContextFromService(service_),
+            .prefixes = std::move(prefixes),
+            .owner = EngineOwnerFromService(service_),
+            .effective_block_size = service_.block_size,
+            .cache_group = service_.cache_group,
+        });
+    }
+    const auto tier = SharedTier(event.medium);
+    if (!tier.has_value()) {
+        return "unsupported SGLang storage medium: " +
+               OriginalMedium(event.medium);
+    }
+    std::lock_guard lock(bindings_mu_);
+    for (const auto prefix : prefixes) {
+        const std::string object_id = std::to_string(prefix.value);
+        const PoolObjectKey key{service_.endpoint, service_.instance_id,
+                                service_.tenant_id, object_id, *tier};
+        auto binding = pool_bindings_.find(key);
+        if (binding == pool_bindings_.end()) {
+            continue;
+        }
+        if (std::string error = manager_->GetIndexer()->RemoveShared({
+                .context = binding->second.context,
+                .prefixes = {binding->second.prefix},
+                .tier = *tier,
+                .owner = binding->second.owner,
+                .effective_block_size = binding->second.context.block_size,
+                .cache_group = std::nullopt});
+            !error.empty()) {
+            return error;
+        }
+        pool_bindings_.erase(binding);
+    }
+    return "";
+}
+
+std::string KVEventHandler::HandleSglangCleared(
+    const zmq::MessageMetadata& metadata) {
+    if (std::string error = manager_->GetIndexer()->ClearGpu({
+            .context = ContextFromService(service_),
+            .owner = EngineOwnerFromService(service_),
+            .effective_block_size = service_.block_size,
+            .cache_group = service_.cache_group});
+        !error.empty()) {
+        return error;
+    }
+    // Mooncake-backed SGLang events are owned by the event's backend_id,
+    // which is independent of the registered Conductor instance_id.  Clear
+    // every shared binding for this tenant instead of leaving stale entries.
+    return ClearMooncakeBindings(std::nullopt, service_.tenant_id);
+}
+
+std::string KVEventHandler::HandleSglangMooncakeStored(
+    const zmq::MooncakeStoredEvent& event,
+    const zmq::MessageMetadata& metadata) {
+    const auto tier = SharedTier(event.fields.medium);
+    if (!tier.has_value()) {
+        return "";
+    }
+    if (event.fields.backend_id.empty() ||
+        !event.object.object_key.has_value() ||
+        event.object.object_key->empty()) {
+        return "backend_id and object_key are required";
+    }
+    prefixindex::ContextKey context;
+    if (std::string error = ValidateMooncakeContext(event.fields, &context);
+        !error.empty()) {
+        return error;
+    }
+    if (context.model_name != service_.model_name ||
+        context.lora_name != service_.lora_name ||
+        context.block_size != service_.block_size ||
+        context.tenant_id != service_.tenant_id) {
+        return "SGLang Mooncake event context conflicts with registration";
+    }
+    if (std::string error = manager_->GetIndexer()->ValidateProfileBinding(
+            context, ProfileFromService(service_));
+        !error.empty()) {
+        return "SGLang Mooncake profile binding rejected: " + error;
+    }
+
+    ParsedSglangObjectKey parsed;
+    if (std::string error =
+            ParseSglangObjectKey(*event.object.object_key, &parsed);
+        !error.empty()) {
+        return error;
+    }
+    if (event.object.connector_block_hash.has_value()) {
+        ConnectorHash asserted_hash;
+        if (std::string error = DecodeConnectorHash(
+                *event.object.connector_block_hash, &asserted_hash);
+            !error.empty()) {
+            return error;
+        }
+        if (asserted_hash.normalized_hex != parsed.full_hash) {
+            return "connector_block_hash conflicts with SGLang object_key";
+        }
+    }
+    if (!event.object.seq_hashes.empty() &&
+        (event.object.seq_hashes.size() != 1 ||
+         event.object.seq_hashes.front() != parsed.prefix.value)) {
+        return "seq_hashes conflicts with SGLang object_key";
+    }
+
+    const prefixindex::SharedObjectOwner owner{
+        .source_stream = service_.endpoint,
+        .backend_id = event.fields.backend_id,
+        .object_id = parsed.logical_key,
+    };
+    const PoolObjectKey key{service_.endpoint,
+                            event.fields.backend_id,
+                            event.fields.tenant_id,
+                            parsed.logical_key,
+                            *tier};
+    PoolObjectBinding binding{context,
+                              parsed.prefix,
+                              parsed.full_hash,
+                              owner,
+                              event.fields.tenant_id,
+                              event.object.group_id.value_or(""),
+                              {parsed.component_suffix}};
+    std::lock_guard lock(bindings_mu_);
+    auto existing = pool_bindings_.find(key);
+    if (existing != pool_bindings_.end() &&
+        (existing->second.context != binding.context ||
+         existing->second.prefix != binding.prefix ||
+         existing->second.connector_block_hash !=
+             binding.connector_block_hash ||
+         existing->second.owner != binding.owner ||
+         existing->second.group_id != binding.group_id)) {
+        return "conflicting active SGLang logical-hash binding";
+    }
+    if (existing == pool_bindings_.end()) {
+        if (std::string error = manager_->GetIndexer()->StoreShared({
+                .context = context,
+                .prefixes = {parsed.prefix},
+                .tier = *tier,
+                .owner = owner,
+                .effective_block_size = context.block_size,
+                .cache_group = std::nullopt});
+            !error.empty()) {
+            return error;
+        }
+        pool_bindings_.emplace(key, std::move(binding));
+    } else {
+        existing->second.physical_components.insert(parsed.component_suffix);
+    }
+    return "";
+}
+
+std::string KVEventHandler::HandleSglangMooncakeRemoved(
+    const zmq::MooncakeRemovedEvent& event,
+    const zmq::MessageMetadata& metadata) {
+    if (event.fields.backend_id.empty() ||
+        !event.object.object_key.has_value() ||
+        event.object.object_key->empty()) {
+        return "backend_id and object_key are required";
+    }
+    const auto tier = SharedTier(event.fields.medium);
+    if (!tier.has_value()) {
+        return "";
+    }
+    ParsedSglangObjectKey parsed;
+    if (std::string error =
+            ParseSglangObjectKey(*event.object.object_key, &parsed);
+        !error.empty()) {
+        return error;
+    }
+    const PoolObjectKey key{service_.endpoint,
+                            event.fields.backend_id,
+                            event.fields.tenant_id,
+                            parsed.logical_key,
+                            *tier};
+    std::lock_guard lock(bindings_mu_);
+    auto binding = pool_bindings_.find(key);
+    if (binding == pool_bindings_.end()) {
+        return "";
+    }
+    if (event.fields.model_name.has_value() &&
+        *event.fields.model_name != binding->second.context.model_name) {
+        return "model_name conflicts with stored SGLang object binding";
+    }
+    if (event.fields.lora_name.value_or("") !=
+        binding->second.context.lora_name ||
+        (event.fields.block_size.has_value() &&
+         *event.fields.block_size != binding->second.context.block_size)) {
+        return "event context conflicts with stored SGLang object binding";
+    }
+    if (event.object.group_id.has_value() &&
+        *event.object.group_id != binding->second.group_id) {
+        return "group_id conflicts with stored SGLang object binding";
+    }
+    if (!event.object.seq_hashes.empty() &&
+        (event.object.seq_hashes.size() != 1 ||
+         event.object.seq_hashes.front() != binding->second.prefix.value)) {
+        return "seq_hashes conflicts with stored SGLang object binding";
+    }
+    if (event.object.connector_block_hash.has_value()) {
+        ConnectorHash asserted_hash;
+        if (std::string error = DecodeConnectorHash(
+                *event.object.connector_block_hash, &asserted_hash);
+            !error.empty()) {
+            return error;
+        }
+        if (asserted_hash.normalized_hex !=
+            binding->second.connector_block_hash) {
+            return "connector_block_hash conflicts with stored SGLang object "
+                   "binding";
+        }
+    }
+    auto component =
+        binding->second.physical_components.find(parsed.component_suffix);
+    if (component == binding->second.physical_components.end()) {
+        return "";
+    }
+    if (binding->second.physical_components.size() > 1) {
+        binding->second.physical_components.erase(component);
+        return "";
+    }
+    if (std::string error = manager_->GetIndexer()->RemoveShared({
+            .context = binding->second.context,
+            .prefixes = {binding->second.prefix},
+            .tier = *tier,
+            .owner = binding->second.owner,
+            .effective_block_size = binding->second.context.block_size,
+            .cache_group = std::nullopt});
+        !error.empty()) {
+        return error;
+    }
+    pool_bindings_.erase(binding);
     return "";
 }
 
@@ -497,6 +871,9 @@ std::string KVEventHandler::HandleVllmCleared(
 std::string KVEventHandler::HandleMooncakeStored(
     const zmq::MooncakeStoredEvent& event,
     const zmq::MessageMetadata& metadata) {
+    if (service_.publisher_kind == common::PublisherKind::kSglang) {
+        return HandleSglangMooncakeStored(event, metadata);
+    }
     const auto tier = SharedTier(event.fields.medium);
     if (!tier.has_value()) {
         LOG(WARNING) << "Ignoring Mooncake unsupported-medium event endpoint="
@@ -523,9 +900,6 @@ std::string KVEventHandler::HandleMooncakeStored(
         event.object.object_key->empty()) {
         return "object_key is required";
     }
-    if (!event.object.connector_block_hash.has_value()) {
-        return "connector_block_hash is required";
-    }
 
     prefixindex::ContextKey context;
     if (std::string error = ValidateMooncakeContext(event.fields, &context);
@@ -539,10 +913,22 @@ std::string KVEventHandler::HandleMooncakeStored(
     }
 
     ConnectorHash hash;
-    if (std::string error =
-            DecodeConnectorHash(*event.object.connector_block_hash, &hash);
-        !error.empty()) {
-        return error;
+    if (event.object.connector_block_hash.has_value()) {
+        if (std::string error = DecodeConnectorHash(
+                *event.object.connector_block_hash, &hash);
+            !error.empty()) {
+            return error;
+        }
+    } else {
+        ParsedSglangObjectKey parsed;
+        if (std::string error =
+                ParseVllmObjectKey(*event.object.object_key, &parsed);
+            !error.empty()) {
+            return "connector_block_hash is absent and object_key parsing " +
+                   error;
+        }
+        hash.prefix = parsed.prefix;
+        hash.normalized_hex = parsed.full_hash;
     }
     if (std::string error =
             ValidateSeqHashes(event.object.seq_hashes, hash.prefix);
@@ -568,6 +954,7 @@ std::string KVEventHandler::HandleMooncakeStored(
         .connector_block_hash = hash.normalized_hex,
         .owner = owner,
         .tenant_id = event.fields.tenant_id,
+        .group_id = event.object.group_id.value_or(""),
     };
 
     std::lock_guard lock(bindings_mu_);
@@ -602,6 +989,9 @@ std::string KVEventHandler::HandleMooncakeStored(
 std::string KVEventHandler::HandleMooncakeRemoved(
     const zmq::MooncakeRemovedEvent& event,
     const zmq::MessageMetadata& metadata) {
+    if (service_.publisher_kind == common::PublisherKind::kSglang) {
+        return HandleSglangMooncakeRemoved(event, metadata);
+    }
     const auto tier = SharedTier(event.fields.medium);
     if (!tier.has_value()) {
         LOG(WARNING) << "Ignoring Mooncake unsupported-medium event endpoint="
@@ -749,6 +1139,16 @@ std::string KVEventHandler::InvalidateEndpoint() {
             .effective_block_size = service_.block_size,
             .cache_group = service_.cache_group,
         });
+    }
+    if (service_.publisher_kind == common::PublisherKind::kSglang) {
+        if (std::string error = manager_->GetIndexer()->ClearGpu({
+                .context = ContextFromService(service_),
+                .owner = EngineOwnerFromService(service_),
+                .effective_block_size = service_.block_size,
+                .cache_group = service_.cache_group});
+            !error.empty()) {
+            return error;
+        }
     }
     return ClearMooncakeBindings(std::nullopt, std::nullopt);
 }

@@ -48,7 +48,7 @@ endpoint 分别注册。Mooncake 订阅提供共享 CPU 或 Disk 信息，但不
 | 字段 | 必填 | 可接受的值和用途 |
 |---|---|---|
 | `endpoint` | 是 | 非空的 ZeroMQ 实时事件发布地址。该地址不能已被另一条有效注册使用。 |
-| `type` | 是 | 只能是 `vLLM` 或 `Mooncake`。它决定 Conductor 按哪种事件消息格式读取数据。 |
+| `type` | 是 | 只能是 `vLLM`、`SGLang` 或 `Mooncake`。它决定 Conductor 按哪种事件消息格式读取数据，以及使用哪种对象 key 解析器。 |
 | `modelname` | 是 | 非空的注册模型名。对 vLLM，它决定缓存范围；Mooncake 事件会自行携带模型名，决定实际写入哪个共享缓存范围。 |
 | `instance_id` | 是 | 对 vLLM 是非空的推理引擎名称，对 Mooncake 是订阅名称。它是服务键的一部分；Mooncake 的这个值不会成为查询实例。 |
 | `block_size` | 是 | 每个块包含的 token 数，必须为正数。对 vLLM，它决定缓存范围；Mooncake 事件会携带实际的块大小。 |

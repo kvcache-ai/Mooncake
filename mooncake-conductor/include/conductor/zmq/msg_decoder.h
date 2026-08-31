@@ -21,9 +21,11 @@ struct BatchDecodeResult {
 
 using VllmEventBatchResult = BatchDecodeResult<VllmEventBatch>;
 using MooncakeEventBatchResult = BatchDecodeResult<MooncakeEventBatch>;
+using SglangEventBatchResult = BatchDecodeResult<SglangEventBatch>;
 
 VllmEventBatchResult DecodeVllmEventBatch(const char* data, size_t len);
 MooncakeEventBatchResult DecodeMooncakeEventBatch(const char* data, size_t len);
+SglangEventBatchResult DecodeSglangEventBatch(const char* data, size_t len);
 
 }  // namespace zmq
 }  // namespace conductor

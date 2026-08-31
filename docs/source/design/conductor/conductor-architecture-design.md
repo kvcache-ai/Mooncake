@@ -3,21 +3,26 @@
 [中文](../../zh/design/conductor/conductor-architecture-design.md)
 
 Mooncake Conductor reads live key-value (KV) cache events and keeps an
-in-memory cache index for routing decisions. This page explains how vLLM GPU
-information and Mooncake CPU or Disk information enter that index, how query
-tokens become lookup values, and how Low-Rank Adaptation (LoRA) adapters keep
-cache entries separate. It describes the current C++ service, including the
-limits that affect what a cache hit means.
+in-memory cache index for routing decisions. This page explains how vLLM and
+SGLang GPU information, plus Mooncake CPU or Disk information, enter that
+index, how query tokens become lookup values, and how Low-Rank Adaptation
+(LoRA) adapters keep cache entries separate. It describes the current C++
+service, including the limits that affect what a cache hit means.
 
 ## One event-to-result flow
 
 ```mermaid
 flowchart LR
     V["vLLM KV events"] --> VR["Registered as type vLLM"]
+    L["SGLang KV events"] --> LR["Registered as type SGLang"]
     M["Mooncake Master KV events"] --> MR["Registered as type Mooncake"]
     VR --> VD["Read vLLM event maps"]
+    LR --> LD["Read SGLang native arrays"]
+    LR --> LM["Read Mooncake maps with SGLang key parser"]
     MR --> MD["Read Mooncake event maps"]
     VD --> G["GPU blocks for one engine and data-parallel rank"]
+    LD --> G
+    LM --> S["Shared CPU or Disk objects"]
     MD --> S["Shared CPU or Disk objects"]
     G --> I["In-memory cache index<br/>tenant + model + LoRA + block size"]
     S --> I
@@ -31,11 +36,13 @@ The registered `type` decides how Conductor reads a message. Topic text and
 payload shape do not change that choice. Within one source, valid events are
 applied in their received order.
 
-A vLLM event updates GPU information for the registered engine and
-data-parallel (DP) rank. A Mooncake event updates shared CPU or Disk
-information. A query hashes its complete token blocks, looks up each block in
-order for every registered rank, advances only from GPU to shared CPU to
-shared Disk, and stops that rank at its first Disk miss.
+A vLLM or native SGLang event updates GPU information for the registered
+engine and data-parallel (DP) rank. A Mooncake event updates shared CPU or Disk
+information. A SGLang registration can also consume a Mooncake map whose
+object key is parsed with the SGLang handler. A query hashes its complete
+token blocks, looks up each block in order for every registered rank, advances
+only from GPU to shared CPU to shared Disk, and stops that rank at its first
+Disk miss.
 
 ## What can share cache
 
@@ -59,11 +66,12 @@ for the same fields must use the identical strategy, algorithm, exact
 `python_hash_seed` text, derived root digest, and lookup rule. Only cache group
 `0`, or no cache group, is currently supported.
 
-## vLLM GPU and Mooncake CPU/Disk information
+## Engine GPU and Mooncake CPU/Disk information
 
 | Registered source | Accepted cache location | What one stored block means | Where it appears in `/query` |
 |---|---|---|---|
 | `vLLM` | GPU, case-insensitive | This exact registered endpoint, engine, and DP rank reported the block. | Under that engine's `instances` row and DP rank. |
+| `SGLang` | GPU (including `medium=nil`), CPU_PINNED, or Disk for native events; CPU or Disk for Mooncake maps | The registered SGLang endpoint reported the block, or its Mooncake backend stored the parsed logical object. | Native GPU records appear under the engine's `instances` row; shared records extend compatible ranks. |
 | `Mooncake` | CPU or Disk, case-insensitive | A Mooncake object provides the block to every registered engine with the same four cache-sharing fields. | It can extend each compatible rank's cumulative `cpu` or `disk` boundary after higher-tier matching. |
 
 A Mooncake registration is a subscription name, not an inference engine. It
@@ -234,8 +242,9 @@ Cleanup removes only information contributed by the affected source:
   engine, and DP rank. It preserves other ranks, other engines, and shared
   cache information.
 - Mooncake records keep the reporting endpoint, backend, tenant, object key,
-  full connector hash, and CPU or Disk location. Removing one object therefore
-  preserves another object even when their final eight hash bytes match.
+  the hash projected by the registered engine handler, and CPU or Disk
+  location. Removing one object therefore preserves another object even when
+  their final eight hash bytes match.
 - A Mooncake clear affects shared objects from the reporting endpoint, backend,
   and tenant. It preserves vLLM GPU records and other Mooncake sources.
 - Unregistering stops the selected `(instance_id, tenant_id, dp_rank)`
@@ -256,10 +265,13 @@ detailed event validation and cleanup rules.
   replay stream and dispatches the missing events before the live event. A
   failed or incomplete range is retained for a later live-message or reconnect
   retry; recovery is not guaranteed after the publisher evicts the range. The
-  current Mooncake publisher has no replay service.
+  current Mooncake publisher has no replay service. Native SGLang publishers
+  use the same replay transport as vLLM; SGLang-through-Mooncake remains
+  live-only because the Mooncake publisher has no replay service.
 - Conductor processes Mooncake events in received batch order. It does not
   automatically ignore an event merely because its `event_id` repeats.
-- vLLM contributes only GPU information. Mooncake contributes only CPU or Disk
+- vLLM contributes only GPU information. Native SGLang contributes GPU,
+  CPU_PINNED, or Disk records; Mooncake contributes only CPU or Disk
   information. Other cache locations are ignored with a warning.
 - Conductor reads layer and parallel-rank metadata from connector keys, but it
   does not check whether all layers or all tensor-parallel (TP), prefill

@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "kv_event/kv_event_config.h"
-#include "kv_event/key_util.h"
 
 namespace mooncake {
 
@@ -70,32 +69,11 @@ class KvEventPublisher {
         uint64_t published_events{0};
         uint64_t dropped_events{0};
         uint64_t skipped_unparsed_keys{0};
-        uint64_t invalid_event_hashes{0};
     };
     Stats GetStats() const;
 
-    static std::optional<uint64_t> ParseSeqHashFromObjectKey(
-        const std::string& object_key) {
-        return mooncake::ParseSeqHashFromObjectKey(object_key);
-    }
-
    private:
     enum class EventKind { kStored, kRemoved, kCleared };
-
-    struct EventContext {
-        std::string cache_prefix;
-        std::string model_name;
-        std::string connector_block_hash;
-        std::optional<uint64_t> seq_hash;
-        std::optional<int64_t> group_id;
-        std::optional<int64_t> tp_rank;
-        std::optional<int64_t> head_or_tp_rank;
-        std::optional<int64_t> pcp_rank;
-        std::optional<int64_t> dcp_rank;
-        std::optional<int64_t> pp_rank;
-        std::optional<int64_t> layer_id;
-        bool has_explicit_block_hash{false};
-    };
 
     struct PendingEvent {
         EventKind kind;
@@ -103,11 +81,9 @@ class KvEventPublisher {
         std::string medium;
         std::string tenant_id;
         std::string group_id;
-        EventContext context;
     };
 
     struct ObjectEventState {
-        EventContext context;
         std::unordered_set<std::string> media;
     };
 
@@ -133,17 +109,12 @@ class KvEventPublisher {
     std::atomic<uint64_t> published_events_{0};
     std::atomic<uint64_t> dropped_events_{0};
     std::atomic<uint64_t> skipped_unparsed_keys_{0};
-    std::atomic<uint64_t> invalid_event_hashes_{0};
 
     mutable std::mutex state_mutex_;
     std::unordered_map<std::string,
                        std::unordered_map<std::string, ObjectEventState>>
         object_states_;
 
-    EventContext BuildEventContext(const std::string& object_key);
-    static std::string ResolveGroupId(const std::string& group_id,
-                                      const EventContext& context);
-    void RecordInvalidHash(const char* field, const std::string& value);
 };
 
 #else
@@ -175,14 +146,8 @@ class KvEventPublisher {
         uint64_t published_events{0};
         uint64_t dropped_events{0};
         uint64_t skipped_unparsed_keys{0};
-        uint64_t invalid_event_hashes{0};
     };
     Stats GetStats() const { return {}; }
-
-    static std::optional<uint64_t> ParseSeqHashFromObjectKey(
-        const std::string& object_key) {
-        return mooncake::ParseSeqHashFromObjectKey(object_key);
-    }
 
    private:
     KvEventConfig config_;

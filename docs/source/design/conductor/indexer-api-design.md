@@ -51,7 +51,7 @@ information but does not create an inference-instance row in `/query`.
 | Field | Required | Accepted value and when it matters |
 |---|---|---|
 | `endpoint` | Yes | Non-empty ZeroMQ live-publisher endpoint. It must not already belong to another active registration. |
-| `type` | Yes | Exactly `vLLM` or `Mooncake`. It decides which event message format Conductor reads. |
+| `type` | Yes | Exactly `vLLM`, `SGLang`, or `Mooncake`. It decides which event message format and object-key parser Conductor uses. |
 | `modelname` | Yes | Non-empty registered model name. It defines vLLM context; Mooncake events carry the model that selects their actual shared context. |
 | `instance_id` | Yes | Non-empty inference engine name for vLLM, or subscription name for Mooncake. It is part of the service key; a Mooncake value does not become a query instance. |
 | `block_size` | Yes | Positive registered token count per block. It defines vLLM context; Mooncake events carry their actual block size. |

@@ -23,9 +23,7 @@ struct KvEventConfig {
     // full.
     uint32_t queue_capacity{65536};
 
-    // Fixed publisher context. A model parsed from an object key takes
-    // precedence over model_name; model_name is also used for keys without a
-    // recognized connector format and for cleared events.
+    // Fixed publisher context supplied by the Master configuration.
     std::string model_name;
     // Retained for config compatibility. Published tenant_id comes from each
     // object operation so one publisher can preserve tenant isolation.

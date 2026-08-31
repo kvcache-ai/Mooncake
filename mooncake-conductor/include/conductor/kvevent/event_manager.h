@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -65,12 +66,18 @@ class KVEventHandler : public zmq::EventHandler {
         std::string connector_block_hash;
         prefixindex::SharedObjectOwner owner;
         std::string tenant_id;
+        std::string group_id;
+        // One logical SGLang hash may have several physical Mooncake
+        // objects, such as separate key and value components.
+        std::set<std::string> physical_components;
     };
 
     std::string HandleVllmBatch(const zmq::VllmEventBatch& batch,
                                 const zmq::MessageMetadata& metadata);
     std::string HandleMooncakeBatch(const zmq::MooncakeEventBatch& batch,
                                     const zmq::MessageMetadata& metadata);
+    std::string HandleSglangBatch(const zmq::SglangEventBatch& batch,
+                                  const zmq::MessageMetadata& metadata);
     std::string HandleVllmStored(const zmq::VllmStoredEvent& event,
                                  const zmq::MessageMetadata& metadata);
     std::string HandleVllmRemoved(const zmq::VllmRemovedEvent& event,
@@ -80,8 +87,19 @@ class KVEventHandler : public zmq::EventHandler {
                                      const zmq::MessageMetadata& metadata);
     std::string HandleMooncakeRemoved(const zmq::MooncakeRemovedEvent& event,
                                       const zmq::MessageMetadata& metadata);
+    std::string HandleSglangMooncakeStored(
+        const zmq::MooncakeStoredEvent& event,
+        const zmq::MessageMetadata& metadata);
+    std::string HandleSglangMooncakeRemoved(
+        const zmq::MooncakeRemovedEvent& event,
+        const zmq::MessageMetadata& metadata);
     std::string HandleMooncakeCleared(const zmq::MooncakeClearedEvent& event,
                                       const zmq::MessageMetadata& metadata);
+    std::string HandleSglangStored(const zmq::SglangStoredEvent& event,
+                                   const zmq::MessageMetadata& metadata);
+    std::string HandleSglangRemoved(const zmq::SglangRemovedEvent& event,
+                                    const zmq::MessageMetadata& metadata);
+    std::string HandleSglangCleared(const zmq::MessageMetadata& metadata);
     std::string ClearMooncakeBindings(
         const std::optional<std::string>& backend_id,
         const std::optional<std::string>& tenant_id);

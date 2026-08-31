@@ -8,7 +8,7 @@
 namespace conductor {
 namespace common {
 
-enum class PublisherKind { kVllm, kMooncake };
+enum class PublisherKind { kVllm, kMooncake, kSglang };
 
 inline constexpr std::string_view PublisherKindName(PublisherKind kind) {
     switch (kind) {
@@ -16,6 +16,8 @@ inline constexpr std::string_view PublisherKindName(PublisherKind kind) {
             return "vLLM";
         case PublisherKind::kMooncake:
             return "Mooncake";
+        case PublisherKind::kSglang:
+            return "SGLang";
     }
     return "unknown";
 }
@@ -26,6 +28,9 @@ inline std::optional<PublisherKind> ParsePublisherKind(std::string_view value) {
     }
     if (value == "Mooncake") {
         return PublisherKind::kMooncake;
+    }
+    if (value == "SGLang") {
+        return PublisherKind::kSglang;
     }
     return std::nullopt;
 }

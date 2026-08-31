@@ -298,7 +298,8 @@ event context. Use the same context values in the registration as well so
 `/services` is easy to compare with the publisher. Mooncake `instance_id` and
 `dp_rank` identify the subscription for `/services` and `/unregister`; they do
 not create a query instance or override event context. A `stored` event must
-also carry an object key and a usable full connector hash; see the
+also carry an object key. The current publisher leaves connector-derived fields
+empty; Conductor parses the key using the registered publisher type. See the
 [subscriber compatibility guide](../kv-event/subscriber-guide.md) for the
 event checks.
 
@@ -416,8 +417,8 @@ reported by that Mooncake endpoint.
 | Symptom | Check | Action |
 |---|---|---|
 | HTTP requests cannot connect, or the log shows port `0` | Confirm that `CONDUCTOR_CONFIG_PATH` names the file you edited and that it contains numeric `http_server_port`. | Set an absolute config path, add an explicit nonzero port, and restart Conductor. |
-| A source is absent from `/services` | Read the registration response and Conductor log for an unsupported type, nonzero `cache_group`, invalid hash profile, duplicate endpoint, or conflicting service key. | Use only `vLLM` or `Mooncake`, cache group `0` or omission, a unique endpoint, and the exact supported seed-based hash fields. |
+| A source is absent from `/services` | Read the registration response and Conductor log for an unsupported type, nonzero `cache_group`, invalid hash profile, duplicate endpoint, or conflicting service key. | Use `vLLM`, `SGLang`, or `Mooncake`, cache group `0` or omission, a unique endpoint, and the exact supported seed-based hash fields. |
 | `/services` lists a source but hits remain zero | Check whether the publisher emitted events after Conductor connected. `/services` is not proof of event delivery. | Verify the publisher status, keep traffic paused during setup, and start registration before new cache-producing traffic. Earlier Mooncake events are not resent. |
-| Mooncake events do not add CPU or Disk availability | Compare `/global_view` with the tenant, model, LoRA name, and block size carried by Mooncake events; compare the registered hash profiles; check that stored events include object and full connector-hash data. | Register vLLM first, make the event context and hash profile match, and correct the Mooncake publisher/key setup. |
+| Mooncake events do not add CPU or Disk availability | Compare `/global_view` with the tenant, model, LoRA name, and block size carried by Mooncake events; compare the registered hash profiles; check that stored events include an object key in the configured engine format. | Register the compatible engine first, make the event context and hash profile match, and correct the Mooncake publisher/key setup. |
 | `/query` returns an empty `instances` object or shorter hits than expected | Compare `model`, `tenant_id`, `lora_name`, `block_size`, optional `instance_id`, token IDs, and `cache_salt` with the producer. Check for a trailing partial block. | Query the exact registered four-field group, use the producer's salt rule, and send enough tokens for complete blocks. |
 | An HTTP request returns `400` | Read the JSON `reason`, `field`, and optional `index`; malformed register or unregister JSON instead returns plain text. | Remove unsupported fields and correct the named value using the [API field tables](./indexer-api-design.md). |

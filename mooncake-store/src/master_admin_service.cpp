@@ -568,11 +568,9 @@ struct HttpKvEventsStatusResponse {
     uint64_t published_events{0};
     uint64_t dropped_events{0};
     uint64_t skipped_unparsed_keys{0};
-    uint64_t invalid_event_hashes{0};
 };
 YLT_REFL(HttpKvEventsStatusResponse, enabled, published_batches,
-         published_events, dropped_events, skipped_unparsed_keys,
-         invalid_event_hashes);
+         published_events, dropped_events, skipped_unparsed_keys);
 
 void MasterAdminServer::HandleKvEventsStatus(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
@@ -585,7 +583,6 @@ void MasterAdminServer::HandleKvEventsStatus(
             payload.published_events = stats.published_events;
             payload.dropped_events = stats.dropped_events;
             payload.skipped_unparsed_keys = stats.skipped_unparsed_keys;
-            payload.invalid_event_hashes = stats.invalid_event_hashes;
             WriteJsonResponse(resp, coro_http::status_type::ok, payload);
         });
 }

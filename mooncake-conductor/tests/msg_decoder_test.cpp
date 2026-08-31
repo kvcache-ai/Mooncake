@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "conductor/zmq/msg_decoder.h"
+#include "conductor/kvevent/object_key_parser.h"
 
 namespace {
 
@@ -27,6 +28,11 @@ using conductor::zmq::MooncakeStoredEvent;
 using conductor::zmq::VllmClearedEvent;
 using conductor::zmq::VllmRemovedEvent;
 using conductor::zmq::VllmStoredEvent;
+using conductor::zmq::SglangEventBatch;
+using conductor::zmq::SglangStoredEvent;
+using conductor::zmq::SglangRemovedEvent;
+using conductor::zmq::SglangClearedEvent;
+using conductor::zmq::DecodeSglangEventBatch;
 
 using Packer = msgpack::packer<std::stringstream>;
 
@@ -1050,6 +1056,234 @@ TEST(MessagePackEnvelope, RejectsEmptyGarbageAndTrailingBytes) {
         DecodeVllmEventBatch(trailing.data(), trailing.size());
     EXPECT_FALSE(trailing_vllm.ok);
     ExpectErrorContains(trailing_vllm.error, "trailing bytes");
+}
+
+TEST(DecodeSglangEventBatch, DecodesTaggedArrayAndPreservesHashBits) {
+    std::stringstream buffer;
+    Packer packer(buffer);
+    packer.pack_array(3);
+    packer.pack_double(12.5);
+    packer.pack_array(3);
+
+    // BlockStored(tag, block_hashes, parent, token_ids, block_size, lora_id,
+    // medium).  The first hash is -1 on the wire and must become UINT64_MAX.
+    packer.pack_array(7);
+    packer.pack("BlockStored");
+    packer.pack_array(1);
+    packer.pack_int64(-1);
+    packer.pack_nil();
+    packer.pack_array(2);
+    packer.pack_int32(1);
+    packer.pack_int32(2);
+    packer.pack_int64(2);
+    packer.pack_nil();
+    packer.pack("GPU");
+
+    packer.pack_array(3);
+    packer.pack("BlockRemoved");
+    packer.pack_array(1);
+    packer.pack_int64(-1);
+    packer.pack("GPU");
+
+    packer.pack_array(1);
+    packer.pack("AllBlocksCleared");
+    packer.pack_int64(4);
+
+    const std::string payload = buffer.str();
+    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_EQ(result.batch.events.size(), 3u);
+    const auto* stored = std::get_if<SglangStoredEvent>(
+        &*result.batch.events[0].event);
+    ASSERT_NE(stored, nullptr) << result.batch.events[0].error;
+    ASSERT_EQ(stored->block_hashes.size(), 1u);
+    EXPECT_EQ(stored->block_hashes[0], std::numeric_limits<uint64_t>::max());
+    const auto* removed = std::get_if<SglangRemovedEvent>(
+        &*result.batch.events[1].event);
+    ASSERT_NE(removed, nullptr) << result.batch.events[1].error;
+    EXPECT_EQ(removed->block_hashes[0], std::numeric_limits<uint64_t>::max());
+    EXPECT_NE(std::get_if<SglangClearedEvent>(&*result.batch.events[2].event),
+              nullptr);
+}
+
+TEST(DecodeSglangEventBatch, AcceptsOmittedMediumAndBigramTokens) {
+    std::stringstream buffer;
+    Packer packer(buffer);
+    packer.pack_array(3);
+    packer.pack_double(1.0);
+    packer.pack_array(2);
+    packer.pack_array(6);
+    packer.pack("BlockStored");
+    packer.pack_array(1);
+    packer.pack_int64(7);
+    packer.pack_nil();
+    packer.pack_array(1);
+    packer.pack_array(2);
+    packer.pack_int32(11);
+    packer.pack_int32(12);
+    packer.pack_int64(2);
+    packer.pack_nil();
+    packer.pack_array(2);
+    packer.pack("BlockRemoved");
+    packer.pack_array(1);
+    packer.pack_int64(7);
+    packer.pack_int64(0);
+
+    const std::string payload = buffer.str();
+    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_TRUE(result.batch.events[0].ok()) << result.batch.events[0].error;
+    const auto* stored = std::get_if<SglangStoredEvent>(
+        &*result.batch.events[0].event);
+    ASSERT_NE(stored, nullptr);
+    ASSERT_TRUE(stored->token_ids.has_value());
+    EXPECT_EQ(*stored->token_ids, (std::vector<int32_t>{11, 12}));
+    EXPECT_FALSE(stored->medium.has_value());
+    ASSERT_TRUE(result.batch.events[1].ok()) << result.batch.events[1].error;
+    const auto* removed = std::get_if<SglangRemovedEvent>(
+        &*result.batch.events[1].event);
+    ASSERT_NE(removed, nullptr);
+    EXPECT_FALSE(removed->medium.has_value());
+}
+
+TEST(DecodeSglangEventBatch, RejectsMooncakeMapEventsForProtocolFallback) {
+    const std::string payload = PackMooncakeBatch(1, [](Packer& packer) {
+        PackMooncakeStored(packer);
+    });
+
+    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
+    EXPECT_FALSE(result.ok);
+    ExpectErrorContains(result.error, "event entries must be arrays");
+}
+
+TEST(DecodeSglangEventBatch, RejectsUnsignedHashOutsideSignedWireRange) {
+    std::stringstream buffer;
+    Packer packer(buffer);
+    packer.pack_array(3);
+    packer.pack_double(1.0);
+    packer.pack_array(1);
+    packer.pack_array(3);
+    packer.pack("BlockRemoved");
+    packer.pack_array(1);
+    packer.pack_uint64(std::numeric_limits<uint64_t>::max());
+    packer.pack_nil();
+    packer.pack_nil();
+
+    const std::string payload = buffer.str();
+    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_EQ(result.batch.events.size(), 1u);
+    EXPECT_FALSE(result.batch.events[0].ok());
+    ExpectErrorContains(result.batch.events[0].error,
+                        "expected signed 64-bit hash");
+}
+
+TEST(SglangObjectKeyParser, CanonicalizesPhysicalComponents) {
+    const std::string hash =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    conductor::kvevent::ParsedSglangObjectKey key_k;
+    conductor::kvevent::ParsedSglangObjectKey key_v;
+    ASSERT_TRUE(conductor::kvevent::ParseSglangObjectKey(
+                    "backend_model_" + hash + "_0_k", &key_k)
+                    .empty());
+    ASSERT_TRUE(conductor::kvevent::ParseSglangObjectKey(
+                    "backend_model_" + hash + "_0_v", &key_v)
+                    .empty());
+    EXPECT_EQ(key_k.logical_key, key_v.logical_key);
+    EXPECT_EQ(key_k.full_hash, hash);
+    EXPECT_EQ(key_k.prefix.value, key_v.prefix.value);
+    EXPECT_EQ(key_k.component_suffix, "_0_k");
+    EXPECT_EQ(key_v.component_suffix, "_0_v");
+}
+
+TEST(VllmObjectKeyParser, AcceptsOptionalHexPrefixAndRejectsMalformedKeys) {
+    const std::string hash =
+        "0123456789abcdef000000000000002a";
+    conductor::kvevent::ParsedSglangObjectKey parsed;
+    ASSERT_TRUE(conductor::kvevent::ParseVllmObjectKey(
+                    "model-a@tp_rank:0@pcp0@dcp0@pp_rank:0@0x" + hash,
+                    &parsed)
+                    .empty());
+    EXPECT_EQ(parsed.full_hash, hash);
+    EXPECT_EQ(parsed.prefix.value, 0x000000000000002aULL);
+
+    EXPECT_FALSE(conductor::kvevent::ParseVllmObjectKey(
+                     "model-a@tp_rank:0@pcp0", &parsed)
+                     .empty());
+}
+
+TEST(VllmObjectKeyParser, PreservesMultiSegmentCachePrefix) {
+    const std::string hash =
+        "0123456789abcdef000000000000002a";
+    conductor::kvevent::ParsedSglangObjectKey parsed;
+    ASSERT_TRUE(conductor::kvevent::ParseVllmObjectKey(
+                    "prefix-a@prefix-b@model-a@tp_rank:0@pcp0@dcp0@pp_rank:0@" +
+                        hash,
+                    &parsed)
+                    .empty());
+    EXPECT_EQ(parsed.namespace_prefix, "prefix-a@prefix-b");
+    EXPECT_EQ(parsed.full_hash, hash);
+}
+
+TEST(VllmObjectKeyParser, AcceptsCurrentAscendCacheMetadataLayouts) {
+    const std::string hash =
+        "0123456789abcdef000000000000002e";
+    conductor::kvevent::ParsedSglangObjectKey parsed;
+
+    ASSERT_TRUE(conductor::kvevent::ParseVllmObjectKey(
+                    "model-a@pcp1@dcp2@head_or_tp_rank:3@pp_rank:0@"
+                    "group:0@cache_role:kv@cache_family:default@" + hash,
+                    &parsed)
+                    .empty());
+    EXPECT_EQ(parsed.full_hash, hash);
+    EXPECT_EQ(parsed.prefix.value, 0x000000000000002eULL);
+
+    ASSERT_TRUE(conductor::kvevent::ParseVllmObjectKey(
+                    "model-a@pcp1@dcp2@head_or_tp_rank:3@group:0@"
+                    "cache_role:kv@cache_family:c2@layer_id:7@" + hash,
+                    &parsed)
+                    .empty());
+    EXPECT_EQ(parsed.full_hash, hash);
+    EXPECT_EQ(parsed.prefix.value, 0x000000000000002eULL);
+}
+
+TEST(VllmObjectKeyParser, AcceptsCompactAscendLayerwiseLayouts) {
+    const std::string hash =
+        "0123456789abcdef000000000000002f";
+    conductor::kvevent::ParsedSglangObjectKey parsed;
+
+    ASSERT_TRUE(conductor::kvevent::ParseVllmObjectKey(
+                    "model-a@" + hash + "@3", &parsed)
+                    .empty());
+    EXPECT_EQ(parsed.namespace_prefix, "model-a");
+    EXPECT_EQ(parsed.full_hash, hash);
+    EXPECT_EQ(parsed.prefix.value, 0x000000000000002fULL);
+
+    ASSERT_TRUE(conductor::kvevent::ParseVllmObjectKey(
+                    "model-a@7@" + hash + "@3", &parsed)
+                    .empty());
+    EXPECT_EQ(parsed.namespace_prefix, "model-a@7");
+    EXPECT_EQ(parsed.full_hash, hash);
+    EXPECT_EQ(parsed.prefix.value, 0x000000000000002fULL);
+}
+
+TEST(VllmObjectKeyParser, RejectsMalformedNumericMetadata) {
+    const std::string hash =
+        "0123456789abcdef000000000000002e";
+    conductor::kvevent::ParsedSglangObjectKey parsed;
+    const std::array<std::string, 6> malformed = {
+        "model-a@pcp-x@dcp0@head_or_tp_rank:0@pp_rank:0@" + hash,
+        "model-a@pcp0@dcp-1@head_or_tp_rank:0@pp_rank:0@" + hash,
+        "model-a@pcp0@dcp0@head_or_tp_rank:x@pp_rank:0@" + hash,
+        "model-a@pcp0@dcp0@head_or_tp_rank:0@pp_rank:-1@" + hash,
+        "model-a@pcp0@dcp0@head_or_tp_rank:0@group:x@" + hash,
+        "model-a@pcp0@dcp0@head_or_tp_rank:0@layer_id:x@" + hash,
+    };
+    for (const auto& key : malformed) {
+        SCOPED_TRACE(key);
+        EXPECT_FALSE(
+            conductor::kvevent::ParseVllmObjectKey(key, &parsed).empty());
+    }
 }
 
 }  // namespace
