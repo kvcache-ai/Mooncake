@@ -478,8 +478,7 @@ TEST(TransferEngineConfigOverrideTest,
     const auto live_port = reserveUnusedTcpPort();
     TestHttpMetadataServer metadata_server(live_port);
     ASSERT_TRUE(metadata_server.start());
-    const auto live_endpoint =
-        buildHttpMetadataEndpoint(live_port) + "/metadata";
+    const auto live_endpoint = buildHttpMetadataEndpoint(live_port);
 
     auto config = std::make_shared<Config>();
     config->set("metadata_type", "http");
