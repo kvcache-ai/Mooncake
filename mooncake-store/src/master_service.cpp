@@ -1589,9 +1589,9 @@ void MasterService::MaybeWarnTenantQuotaConfig(
     if (allocatable_capacity_bytes == 0) {
         return;
     }
-    const uint64_t watermark_bytes = static_cast<uint64_t>(
-        static_cast<double>(allocatable_capacity_bytes) *
-        eviction_high_watermark_ratio_);
+    const uint64_t watermark_bytes =
+        static_cast<uint64_t>(static_cast<double>(allocatable_capacity_bytes) *
+                              eviction_high_watermark_ratio_);
     for (const auto& snap : tenant_quota_table_.ListTenantSnapshots()) {
         if (!snap.has_explicit_policy) {
             continue;
@@ -1608,8 +1608,7 @@ void MasterService::MaybeWarnTenantQuotaConfig(
                    "the watermark, or rely on need_mem_eviction_ arming.";
         }
         if (snap.charged_bytes > 0 &&
-            snap.effective_quota_bytes >=
-                snap.charged_bytes * 100) {
+            snap.effective_quota_bytes >= snap.charged_bytes * 100) {
             LOG(WARNING)
                 << "[TENANT-QUOTA] tenant=" << snap.tenant_id
                 << " effective_quota_bytes=" << snap.effective_quota_bytes
@@ -10812,8 +10811,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 static_cast<double>(snap->effective_quota_bytes) *
                 eviction_ratio_;
             const uint64_t headroom =
-                headroom_d >=
-                        static_cast<double>(std::numeric_limits<uint64_t>::max())
+                headroom_d >= static_cast<double>(
+                                  std::numeric_limits<uint64_t>::max())
                     ? std::numeric_limits<uint64_t>::max()
                     : static_cast<uint64_t>(headroom_d);
             if (eviction_target >
