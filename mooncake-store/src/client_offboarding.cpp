@@ -41,24 +41,28 @@ void ClientOffboardingWorker::Stop() {
     }
 }
 
-bool ClientOffboardingWorker::Schedule(ClientOffboardingJob job) {
+void ClientOffboardingWorker::ReserveJob() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!running_) {
-            return false;
-        }
-        jobs_.push_back(std::move(job));
+        CHECK(running_);
         pending_jobs_.fetch_add(1, std::memory_order_release);
         MasterMetricManager::instance().inc_client_offboarding_queue_depth();
     }
+}
+
+void ClientOffboardingWorker::ScheduleReserved(ClientOffboardingJob job) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        CHECK(running_);
+        jobs_.push_back(std::move(job));
+    }
     cv_.notify_one();
-    return true;
 }
 
 std::chrono::seconds ClientOffboardingWorker::RetryDelay(uint64_t retry_count) {
     constexpr uint64_t kBackoffs[] = {1, 2, 4, 8, 16, 30};
     const size_t index = static_cast<size_t>(std::min<uint64_t>(
-        retry_count == 0 ? 0 : retry_count - 1, std::size(kBackoffs) - 1));
+        retry_count - 1, std::size(kBackoffs) - 1));
     return std::chrono::seconds(kBackoffs[index]);
 }
 

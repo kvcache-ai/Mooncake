@@ -95,6 +95,19 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_in_flight_.load(std::memory_order_relaxed);
     }
 
+    static void MarkClientOfflineForTesting(MasterService* service,
+                                            const UUID& client_id) {
+        auto record = service->FindClientRecord(client_id);
+        ASSERT_TRUE(record);
+        const auto now = ClientLivenessRecord::Clock::now();
+        ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::seconds::zero()),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+        ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::seconds::zero()),
+                  ClientLivenessTransition::BECAME_OFFLINE);
+    }
+
     static bool HasPromotionTaskForTesting(MasterService* service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
@@ -2436,9 +2449,7 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
 }
 
 // BatchRemove normal-completion path on a key with an in-flight
-// PromotionTask must drop the task entry. ReMountSegment registers the
-// holder in ok_client_ so CleanupStaleHandles returns false and
-// BatchRemove takes the non-stale branch.
+// PromotionTask must drop the task entry while its holder remains Active.
 TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2452,13 +2463,6 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto holder =
         PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
-    {
-        Segment seg_a = MakeSegment("seg_a", kDefaultSegmentBase, seg_size);
-        seg_a.id = holder.segment_id;
-        std::vector<Segment> segs{seg_a};
-        auto remount = service->ReMountSegment(segs, holder.client_id);
-        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
-    }
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_first",
                                        1024, holder.segment_name));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_second",
@@ -2500,11 +2504,8 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     service->RemoveAll(/*force=*/true);
 }
 
-// BatchRemove stale-handle path on a key with an in-flight
-// PromotionTask must drop the task entry. The holder is mounted via
-// PrepareSegment only (no ReMount), so its client is absent from
-// ok_client_; BatchRemove's CleanupStaleHandles then erases the
-// LOCAL_DISK replica and the stale-handle branch fires.
+// BatchRemove stale-handle path on a key with an in-flight PromotionTask must
+// drop the task entry after its holder becomes Offline.
 TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2534,6 +2535,8 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
         EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
+    MarkClientOfflineForTesting(service.get(), holder.client_id);
+
     auto results =
         service->BatchRemove({"k_first"}, TenantId::Default(), /*force=*/true);
     ASSERT_EQ(results.size(), 1u);
@@ -2547,14 +2550,6 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
 
     auto second_holder = PrepareSegment(
         *service, "seg_b", kDefaultSegmentBase + seg_size, seg_size);
-    {
-        Segment seg_b =
-            MakeSegment("seg_b", kDefaultSegmentBase + seg_size, seg_size);
-        seg_b.id = second_holder.segment_id;
-        std::vector<Segment> segs{seg_b};
-        auto remount = service->ReMountSegment(segs, second_holder.client_id);
-        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
-    }
     ASSERT_TRUE(InjectLocalDiskReplica(*service, second_holder.client_id,
                                        "k_second", 1024,
                                        second_holder.segment_name));
