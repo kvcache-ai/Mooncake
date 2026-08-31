@@ -61,21 +61,15 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // unintended synchronization or even deadlocks in downstream
     // components (e.g. mooncake-pg).
     //
-    // The stream must live on the CUDA device that owns the device-side buffer.
-    // cudaMemcpyAsync routes the copy through its stream's device context, so a
-    // stream on the wrong device fails without peer access. Control-plane RPC
-    // worker threads default to cuda:0, but a registered buffer may live on
-    // cuda:R (R != 0); acquiring the stream on the buffer's device makes the
-    // copy route correctly without mutating the calling thread's current
-    // device. Fall back to the current device for host-to-host copies.
-    int device_id = CUDAStreamPool::kCurrentDevice;
-    cudaPointerAttributes attr{};
-    if (cudaPointerGetAttributes(&attr, dst) == cudaSuccess &&
-        attr.type == cudaMemoryTypeDevice) {
-        device_id = attr.device;
-    } else if (cudaPointerGetAttributes(&attr, src) == cudaSuccess &&
-               attr.type == cudaMemoryTypeDevice) {
-        device_id = attr.device;
+    // cudaMemcpyAsync routes the copy through its stream's device context, so
+    // the stream must live on the device owning the device-side buffer.
+    // Control-plane RPC worker threads sit on cuda:0 while a registered buffer
+    // may live on cuda:R; taking the stream from the buffer's device routes the
+    // copy correctly without mutating the calling thread's current device.
+    // Host-only copies keep the current device.
+    int device_id = getPointerDeviceId(dst);
+    if (device_id == CUDAStreamPool::kCurrentDevice) {
+        device_id = getPointerDeviceId(src);
     }
 
     CUDAStreamHandle stream;
