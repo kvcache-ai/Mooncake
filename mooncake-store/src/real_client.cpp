@@ -6192,8 +6192,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         std::string key;
         size_t original_index;
         QueryResult query_result;
-        std::vector<void *> buffers;
-        std::vector<size_t> sizes;
+        std::vector<Slice> slices;
         uint64_t total_size;
         Replica::Descriptor replica;
         bool is_local_disk;  // true=LOCAL_DISK (offload RPC), false=DISK/DFS
@@ -6235,29 +6234,34 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
-        const auto &sizes = all_sizes[i];
-        uint64_t dst_total_size = 0;
-        for (auto &size : sizes) {
-            dst_total_size += size;
-        }
-        if (dst_total_size < total_size) {
-            LOG(ERROR) << "Buffer too small for key '" << key
-                       << "': required=" << total_size
-                       << ", available=" << dst_total_size;
+        if (all_buffers[i].size() != all_sizes[i].size()) {
+            LOG(ERROR) << "Buffer and size count mismatch for key '" << key
+                       << "': buffers=" << all_buffers[i].size()
+                       << ", sizes=" << all_sizes[i].size();
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
-        // Create slices for this key's buffer
+        const auto &sizes = all_sizes[i];
         const auto &buffers = all_buffers[i];
-        std::vector<Slice> key_slices;
-        key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            // MEMORY / NOF: RDMA directly to the user buffers.
-            for (size_t j = 0; j < buffers.size(); ++j) {
-                key_slices.emplace_back(Slice{buffers[j], sizes[j]});
-            }
-        } else if (replica.is_local_disk_replica() ||
-                   replica.is_disk_replica() || replica.is_dfs_replica()) {
+        std::vector<Slice> destination_slices;
+        destination_slices.reserve(buffers.size());
+        uint64_t remaining = total_size;
+        for (size_t j = 0; j < buffers.size() && remaining > 0; ++j) {
+            const size_t slice_size = static_cast<size_t>(
+                std::min<uint64_t>(sizes[j], remaining));
+            if (slice_size == 0) continue;
+            destination_slices.emplace_back(buffers[j], slice_size);
+            remaining -= slice_size;
+        }
+        if (remaining != 0) {
+            LOG(ERROR) << "Buffer too small for key '" << key
+                       << "': required=" << total_size
+                       << ", missing=" << remaining;
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        if (replica.is_local_disk_replica() || replica.is_disk_replica() ||
+            replica.is_dfs_replica()) {
             // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
             // (zero-copy). DISK/DFS use a contiguous temp buffer at read time.
             valid_local_disk_ops.emplace(
@@ -6265,24 +6269,26 @@ RealClient::batch_get_into_multi_buffers_internal(
                 DiskKeyInfo{.key = key,
                             .original_index = i,
                             .query_result = std::move(query_result_values),
-                            .buffers = all_buffers[i],
-                            .sizes = all_sizes[i],
+                            .slices = std::move(destination_slices),
                             .total_size = total_size,
                             .replica = replica,
                             .is_local_disk = replica.is_local_disk_replica()});
             results.emplace_back(static_cast<int64_t>(total_size));
             continue;
-        } else {
+        }
+        if (!replica.is_memory_replica() && !replica.is_nof_replica()) {
             LOG(ERROR) << "Unsupported replica type for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
 
+        // MEMORY / NOF: RDMA directly to the object-sized prefix of the user
+        // buffers.
         valid_operations.push_back(
             {.key = key,
              .original_index = i,
              .query_result = FilterQueryResult(query_result_values, replica),
-             .slices = std::move(key_slices),
+             .slices = std::move(destination_slices),
              .total_size = total_size});
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
@@ -6343,24 +6349,9 @@ RealClient::batch_get_into_multi_buffers_internal(
                         tl::make_unexpected(ErrorCode::INVALID_REPLICA);
                     continue;
                 }
-                std::vector<Slice> user_slices;
-                user_slices.reserve(op.buffers.size());
-                size_t slice_total = 0;
-                for (size_t j = 0; j < op.buffers.size(); ++j) {
-                    user_slices.push_back(Slice{op.buffers[j], op.sizes[j]});
-                    slice_total += op.sizes[j];
-                }
-                if (slice_total < op.total_size) {
-                    LOG(ERROR) << "Slice size too small for key " << key
-                               << ": slices=" << slice_total
-                               << ", total=" << op.total_size;
-                    results[op.original_index] =
-                        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                    continue;
-                }
                 offload_objects[replica.get_local_disk_descriptor()
                                     .transport_endpoint]
-                    .emplace(key, std::move(user_slices));
+                    .emplace(key, std::move(op.slices));
             }
 
             for (auto &[endpoint, objects] : offload_objects) {
@@ -6403,16 +6394,11 @@ RealClient::batch_get_into_multi_buffers_internal(
             auto scatter_to_buffers = [&](const std::string &key, char *src,
                                           const DiskKeyInfo &op) -> bool {
                 size_t offset = 0;
-                for (size_t j = 0; j < op.buffers.size(); ++j) {
-                    if (offset >= op.total_size) break;
-                    size_t sz =
-                        std::min(op.sizes[j],
-                                 static_cast<size_t>(op.total_size - offset));
-                    void *dst = op.buffers[j];
+                for (const auto &slice : op.slices) {
                     const char *replica_type =
                         op.replica.is_dfs_replica() ? "DFS" : "DISK";
                     if (auto r = scatter_host_to_maybe_device(
-                            dst, src + offset, sz,
+                            slice.ptr, src + offset, slice.size,
                             std::string(replica_type) +
                                 " scatter, key: " + key);
                         !r) {
@@ -6420,7 +6406,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                             tl::make_unexpected(r.error());
                         return false;
                     }
-                    offset += sz;
+                    offset += slice.size;
                 }
                 return true;
             };

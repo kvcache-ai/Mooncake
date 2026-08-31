@@ -249,6 +249,125 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
     }
 }
 
+TEST_F(RealClientTest, BatchGetIntoMultiBuffersAcceptsLargerDestination) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t kObjectSize = 100;
+    constexpr size_t kFirstBufferCapacity = 64;
+    constexpr size_t kSecondBufferCapacity = 64;
+    constexpr size_t kBufferCapacity =
+        kFirstBufferCapacity + kSecondBufferCapacity;
+    const std::string key = "batch_get_larger_destination";
+    std::vector<char> source(kObjectSize, 'A');
+    std::vector<char> destination(kBufferCapacity, 'Z');
+    std::fill(source.begin() + kFirstBufferCapacity, source.end(), 'B');
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(
+        py_client_->register_buffer(destination.data(), destination.size()), 0);
+
+    const auto results = py_client_->batch_get_into_multi_buffers(
+        {key},
+        {{destination.data(), destination.data() + kFirstBufferCapacity}},
+        {{kFirstBufferCapacity, kSecondBufferCapacity}}, false);
+
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_EQ(results[0], static_cast<int>(kObjectSize));
+    EXPECT_TRUE(std::equal(source.begin(), source.begin() + kFirstBufferCapacity,
+                           destination.begin()));
+    EXPECT_TRUE(std::equal(source.begin() + kFirstBufferCapacity, source.end(),
+                           destination.begin() + kFirstBufferCapacity));
+    EXPECT_TRUE(std::all_of(destination.begin() + kObjectSize,
+                            destination.end(),
+                            [](char value) { return value == 'Z'; }));
+    ASSERT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+}
+
+TEST_F(RealClientTest,
+       BatchGetIntoMultiBuffersAcceptsLargerDestinationFromLocalDisk) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_batch_get_capacity_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 100;
+    constexpr size_t kFirstBufferCapacity = 64;
+    constexpr size_t kSecondBufferCapacity = 64;
+    constexpr size_t kBufferCapacity =
+        kFirstBufferCapacity + kSecondBufferCapacity;
+    const std::string key = "batch_get_larger_destination_from_local_disk";
+    std::vector<char> source(kObjectSize, 'A');
+    std::vector<char> destination(kBufferCapacity, 'Z');
+    std::fill(source.begin() + kFirstBufferCapacity, source.end(), 'B');
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    bool disk_ready = false;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) disk_ready = true;
+        }
+        if (!disk_ready)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_TRUE(disk_ready);
+
+    bool memory_cleared = false;
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_local_disk_replica());
+    ASSERT_EQ(
+        py_client_->register_buffer(destination.data(), destination.size()), 0);
+
+    const auto results = py_client_->batch_get_into_multi_buffers(
+        {key},
+        {{destination.data(), destination.data() + kFirstBufferCapacity}},
+        {{kFirstBufferCapacity, kSecondBufferCapacity}}, false);
+
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_EQ(results[0], static_cast<int>(kObjectSize));
+    EXPECT_TRUE(std::equal(source.begin(), source.begin() + kFirstBufferCapacity,
+                           destination.begin()));
+    EXPECT_TRUE(std::equal(source.begin() + kFirstBufferCapacity, source.end(),
+                           destination.begin() + kFirstBufferCapacity));
+    EXPECT_TRUE(std::all_of(destination.begin() + kObjectSize,
+                            destination.end(),
+                            [](char value) { return value == 'Z'; }));
+    ASSERT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+}
+
 #ifdef MOONCAKE_TEST_CUDA_H2D
 TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
     int device_count = 0;

@@ -2934,7 +2934,9 @@ List[int]
 **Parameters:**
 - `keys` (List[str]): List of object identifiers
 - `all_buffer_ptrs` (List[int]): List of memory addresses
-- `all_sizes` (List[int]): List of buffer sizes
+- `all_sizes` (List[int]): List of destination buffer capacities. For each key,
+  the capacities must sum to at least the object size; only the object-sized
+  prefix is written.
 
 **Returns:**
 - `List[int]`: List of bytes read for each operation (positive = success, negative = error)

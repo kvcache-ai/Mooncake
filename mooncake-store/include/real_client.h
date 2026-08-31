@@ -164,7 +164,9 @@ class RealClient : public PyClient {
      * @param keys Vector of keys of the objects to get
      * @param all_buffers Vector of vectors of pointers to the pre-allocated
      * buffers
-     * @param all_sizes Vector of vectors of sizes of the buffers
+     * @param all_sizes Vector of vectors of destination buffer capacities. For
+     * each key, the capacities must cover the object; bytes beyond the object
+     * size are not written.
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
      * @note The buffer addresses must resolve to Store-managed registered
