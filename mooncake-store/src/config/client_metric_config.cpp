@@ -1,6 +1,7 @@
 #include "client_metric.h"
 
 #include <glog/logging.h>
+#include <chrono>
 
 #include "bool_parser.h"
 #include "environ.h"
@@ -33,7 +34,7 @@ ClientMetricConfig ClientMetricConfig::FromEnvironment() {
                          << ": " << *interval
                          << ", disabling metrics reporting";
         } else {
-            config.reporting_interval_seconds = *parsed;
+            config.reporting_interval = std::chrono::seconds(*parsed);
             if (*parsed == 0) {
                 LOG(INFO)
                     << "Client metrics reporting disabled (interval=0) via "

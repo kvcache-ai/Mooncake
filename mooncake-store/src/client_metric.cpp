@@ -66,8 +66,10 @@ std::unique_ptr<ClientMetric> ClientMetric::Create(
               << " via MC_STORE_CLIENT_METRIC_BANDWIDTH";
 
     return std::make_unique<ClientMetric>(
-        config.reporting_interval_seconds, labels,
-        config.bandwidth_reporting_enabled, master_rpc_metrics_enabled);
+        std::chrono::duration_cast<std::chrono::seconds>(
+            config.reporting_interval)
+            .count(),
+        labels, config.bandwidth_reporting_enabled, master_rpc_metrics_enabled);
 }
 
 void ClientMetric::serialize(std::string& str) {

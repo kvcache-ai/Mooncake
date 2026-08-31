@@ -655,7 +655,7 @@ struct SsdMetric {
 
 struct ClientMetricConfig {
     bool enabled = true;
-    uint64_t reporting_interval_seconds = 0;
+    std::chrono::milliseconds reporting_interval{0};
     bool bandwidth_reporting_enabled = true;
 
     static ClientMetricConfig FromEnvironment();

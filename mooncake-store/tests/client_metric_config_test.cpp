@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -63,7 +64,7 @@ TEST_F(ClientMetricConfigTest, UsesDefaultsWhenEnvironmentIsUnset) {
     const auto config = ClientMetricConfig::FromEnvironment();
 
     EXPECT_TRUE(config.enabled);
-    EXPECT_EQ(config.reporting_interval_seconds, 0);
+    EXPECT_EQ(config.reporting_interval, std::chrono::milliseconds::zero());
     EXPECT_TRUE(config.bandwidth_reporting_enabled);
 }
 
@@ -77,7 +78,7 @@ TEST_F(ClientMetricConfigTest, ReadsValidEnvironmentValues) {
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_TRUE(config.enabled);
-    EXPECT_EQ(config.reporting_interval_seconds, 15);
+    EXPECT_EQ(config.reporting_interval, std::chrono::seconds(15));
     EXPECT_FALSE(config.bandwidth_reporting_enabled);
     EXPECT_NE(logs.find("Client metrics interval set to 15s via "
                         "MC_STORE_CLIENT_METRIC_INTERVAL"),
@@ -94,7 +95,7 @@ TEST_F(ClientMetricConfigTest, InvalidEnableValueSilentlyDisablesMetrics) {
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_FALSE(config.enabled);
-    EXPECT_EQ(config.reporting_interval_seconds, 0);
+    EXPECT_EQ(config.reporting_interval, std::chrono::milliseconds::zero());
     EXPECT_TRUE(config.bandwidth_reporting_enabled);
     EXPECT_EQ(logs.find("MC_STORE_CLIENT_METRIC_INTERVAL"), std::string::npos);
     EXPECT_EQ(logs.find("MC_STORE_CLIENT_METRIC_BANDWIDTH"), std::string::npos);
@@ -120,7 +121,7 @@ TEST_F(ClientMetricConfigTest, InvalidIntervalValuesUseDefaultAndWarn) {
         const auto config = ClientMetricConfig::FromEnvironment();
         const std::string logs = ::testing::internal::GetCapturedStderr();
 
-        EXPECT_EQ(config.reporting_interval_seconds, 0);
+        EXPECT_EQ(config.reporting_interval, std::chrono::milliseconds::zero());
         EXPECT_NE(logs.find("Failed to parse "
                             "MC_STORE_CLIENT_METRIC_INTERVAL"),
                   std::string::npos);
@@ -151,7 +152,7 @@ TEST_F(ClientMetricConfigTest, ZeroIntervalRemainsEnabled) {
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_TRUE(config.enabled);
-    EXPECT_EQ(config.reporting_interval_seconds, 0);
+    EXPECT_EQ(config.reporting_interval, std::chrono::milliseconds::zero());
     EXPECT_NE(logs.find("Client metrics reporting disabled (interval=0) via "
                         "MC_STORE_CLIENT_METRIC_INTERVAL"),
               std::string::npos);
