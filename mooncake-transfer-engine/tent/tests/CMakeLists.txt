@@ -86,6 +86,13 @@ target_include_directories(promotion_policy_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME promotion_policy_test COMMAND promotion_policy_test)
 
+add_executable(bounded_mpsc_queue_test bounded_mpsc_queue_test.cpp)
+target_link_libraries(bounded_mpsc_queue_test PRIVATE tent_common gtest
+                                                      gtest_main)
+target_include_directories(bounded_mpsc_queue_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME bounded_mpsc_queue_test COMMAND bounded_mpsc_queue_test)
+
 add_executable(rdma_cancel_test rdma_cancel_test.cpp ../src/runtime/slab.cpp)
 target_link_libraries(rdma_cancel_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(rdma_cancel_test
