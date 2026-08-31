@@ -22,11 +22,16 @@ using NodeIndex = uint32;
 class OffsetAllocator;
 class __Allocator;
 
+static constexpr uint32 MANTISSA_BITS = 4;
 static constexpr uint32 NUM_TOP_BINS = 32;
-static constexpr uint32 BINS_PER_LEAF = 8;
-static constexpr uint32 TOP_BINS_INDEX_SHIFT = 3;
-static constexpr uint32 LEAF_BINS_INDEX_MASK = 0x7;
+static constexpr uint32 BINS_PER_LEAF = 1u << MANTISSA_BITS;
+static constexpr uint32 TOP_BINS_INDEX_SHIFT = MANTISSA_BITS;
+static constexpr uint32 LEAF_BINS_INDEX_MASK = BINS_PER_LEAF - 1;
 static constexpr uint32 NUM_LEAF_BINS = NUM_TOP_BINS * BINS_PER_LEAF;
+
+static constexpr uint32 LEGACY_BINS_PER_LEAF = 8;
+static constexpr uint32 LEGACY_NUM_LEAF_BINS =
+    NUM_TOP_BINS * LEGACY_BINS_PER_LEAF;
 
 struct OffsetAllocation {
     static constexpr uint32 NO_SPACE = 0xffffffff;
@@ -267,6 +272,7 @@ class __Allocator {
    private:
     uint32 insertNodeIntoBin(uint32 size, uint32 dataOffset);
     void removeNodeFromBin(uint32 nodeIndex);
+    bool rebuildFreeBins(const NodeIndex* bin_indices, uint32 bin_count);
 
     struct Node {
         static constexpr NodeIndex unused = 0xffffffff;
@@ -286,7 +292,7 @@ class __Allocator {
     uint32 m_freeStorage;
 
     uint32 m_usedBinsTop;
-    uint8 m_usedBins[NUM_TOP_BINS];
+    uint16 m_usedBins[NUM_TOP_BINS];
     NodeIndex m_binIndices[NUM_LEAF_BINS];
 
     std::vector<Node> m_nodes;
@@ -382,49 +388,61 @@ void __Allocator::serialize_to(T& serializer) const {
 
 template <typename T>
 __Allocator::__Allocator(T& serializer) {
-    // serializer.read() will throw an exception if the buffer is corrupted.
     try {
-        // Deserialize basic member variables
         serializer.read(&m_size, sizeof(m_size));
         serializer.read(&m_current_capacity, sizeof(m_current_capacity));
         serializer.read(&m_max_capacity, sizeof(m_max_capacity));
         serializer.read(&m_freeStorage, sizeof(m_freeStorage));
-        serializer.read(&m_usedBinsTop, sizeof(m_usedBinsTop));
-        serializer.read(&m_usedBins, sizeof(m_usedBins));
-        serializer.read(&m_binIndices, sizeof(m_binIndices));
-        serializer.read(&m_freeOffset, sizeof(m_freeOffset));
 
-        // Sanity-check the values that drive the allocations below.  A
-        // corrupt-but-parseable meta could otherwise request billions of
-        // nodes and trigger the OOM killer before bad_alloc is ever
-        // thrown, defeating the "corrupt meta -> fresh start" fallback.
-        // 1<<24 (16.7M) stays above every legitimate configuration (the
-        // storage backend clamps node capacity to ~9.6M).
         static constexpr uint32 kMaxSerializedNodes = 1u << 24;
         if (m_max_capacity == 0 || m_max_capacity > kMaxSerializedNodes ||
-            m_current_capacity > m_max_capacity ||
-            m_freeOffset > m_current_capacity || m_size == 0) {
-            LOG(ERROR) << "Deserializing __Allocator failed: corrupt "
-                          "capacity fields (max_capacity="
-                       << m_max_capacity
-                       << ", current_capacity=" << m_current_capacity
-                       << ", freeOffset=" << m_freeOffset << ", size=" << m_size
-                       << ")";
-            throw std::runtime_error(
-                "Deserializing __Allocator failed: corrupt capacities");
+            m_current_capacity > m_max_capacity || m_size == 0) {
+            throw std::runtime_error("corrupt capacities");
         }
 
-        // Allocate memory for nodes and freeNodes
+        const size_t node_data_size = static_cast<size_t>(m_current_capacity) *
+                                      (sizeof(Node) + sizeof(NodeIndex));
+        const size_t common_tail_size = sizeof(m_freeOffset) + node_data_size;
+        const size_t legacy_tail_size =
+            sizeof(m_usedBinsTop) + NUM_TOP_BINS * sizeof(uint8) +
+            LEGACY_NUM_LEAF_BINS * sizeof(NodeIndex) + common_tail_size;
+        const size_t current_tail_size =
+            sizeof(m_usedBinsTop) + sizeof(m_usedBins) + sizeof(m_binIndices) +
+            common_tail_size;
+        const size_t remaining_size = serializer.remaining_size();
+        const bool legacy_format = remaining_size == legacy_tail_size;
+        if (!legacy_format && remaining_size != current_tail_size) {
+            throw std::runtime_error("unsupported allocator format");
+        }
+
+        NodeIndex legacy_bin_indices[LEGACY_NUM_LEAF_BINS];
+        serializer.read(&m_usedBinsTop, sizeof(m_usedBinsTop));
+        if (legacy_format) {
+            uint8 legacy_used_bins[NUM_TOP_BINS];
+            serializer.read(&legacy_used_bins, sizeof(legacy_used_bins));
+            serializer.read(&legacy_bin_indices, sizeof(legacy_bin_indices));
+        } else {
+            serializer.read(&m_usedBins, sizeof(m_usedBins));
+            serializer.read(&m_binIndices, sizeof(m_binIndices));
+        }
+        serializer.read(&m_freeOffset, sizeof(m_freeOffset));
+        if (m_freeOffset > m_current_capacity) {
+            throw std::runtime_error("corrupt free offset");
+        }
+
         m_nodes.reserve(m_max_capacity);
         m_freeNodes.reserve(m_max_capacity);
-
         m_nodes.resize(m_current_capacity);
         m_freeNodes.resize(m_current_capacity);
 
-        // Deserialize the arrays
         serializer.read(m_nodes.data(), m_current_capacity * sizeof(Node));
         serializer.read(m_freeNodes.data(),
                         m_current_capacity * sizeof(NodeIndex));
+
+        if (legacy_format &&
+            !rebuildFreeBins(legacy_bin_indices, LEGACY_NUM_LEAF_BINS)) {
+            throw std::runtime_error("corrupt legacy free bins");
+        }
     } catch (const std::exception& e) {
         LOG(ERROR) << "Deserializing __Allocator failed, error=" << e.what();
         throw std::runtime_error("Deserializing __Allocator failed");
