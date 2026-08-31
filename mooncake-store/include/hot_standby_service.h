@@ -178,6 +178,17 @@ class HotStandbyService {
                                          std::vector<StandbyObjectEntry>& out);
     void EndBatchOpLogSnapshotCapture(BatchOpLogSnapshotCapture& capture);
 
+    // N06 coordinator seams. These stay inert unless a coordinator is
+    // explicitly constructed by the caller.
+    std::optional<DurablePrefix> GetLastAppliedBatchOpLogSnapshotPrefix() const;
+    void CancelBatchOpLogSnapshotCapture();
+    using SnapshotLifecycleCallback = std::function<void()>;
+    void SetBatchOpLogSnapshotCaptureReleasedCallback(
+        SnapshotLifecycleCallback callback);
+    void SetBatchOpLogSnapshotPromotionCallback(
+        SnapshotLifecycleCallback callback);
+    void SetBatchOpLogSnapshotStopCallback(SnapshotLifecycleCallback callback);
+
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
 
@@ -222,6 +233,8 @@ class HotStandbyService {
     void HandleSnapshotCaptureRequest(
         const OpLogBatchStandbyPollResult& result);
     void CancelSnapshotCapture();
+    void NotifySnapshotPromotion();
+    void NotifySnapshotStop();
 
     // Shared body for Promote() and PromoteAndExportSnapshot(): runs the
     // promotion sequence machine transitions + gap resolution + final
@@ -287,7 +300,11 @@ class HotStandbyService {
     // Synchronization
     mutable std::mutex mutex_;
     mutable std::mutex sync_status_callback_mutex_;
+    mutable std::mutex snapshot_lifecycle_callback_mutex_;
     SyncStatusCallback sync_status_callback_;
+    SnapshotLifecycleCallback snapshot_capture_released_callback_;
+    SnapshotLifecycleCallback snapshot_promotion_callback_;
+    SnapshotLifecycleCallback snapshot_stop_callback_;
 };
 
 }  // namespace mooncake

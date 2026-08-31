@@ -367,6 +367,9 @@ void HotStandbyService::Stop() {
         return;
     }
 
+    if (current_state != StandbyState::PROMOTED) {
+        NotifySnapshotStop();
+    }
     state_machine_.ProcessEvent(StandbyEvent::STOP);
     StopReplicationLoop();
 
@@ -377,6 +380,59 @@ void HotStandbyService::Stop() {
 
     LOG(INFO) << "HotStandbyService stopped, final_state="
               << StandbyStateToString(GetState());
+}
+
+std::optional<DurablePrefix>
+HotStandbyService::GetLastAppliedBatchOpLogSnapshotPrefix() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!batch_standby_reader_) {
+        return std::nullopt;
+    }
+    return batch_standby_reader_->GetLastAppliedDurablePrefix();
+}
+
+void HotStandbyService::CancelBatchOpLogSnapshotCapture() {
+    CancelSnapshotCapture();
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotCaptureReleasedCallback(
+    SnapshotLifecycleCallback callback) {
+    std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+    snapshot_capture_released_callback_ = std::move(callback);
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotPromotionCallback(
+    SnapshotLifecycleCallback callback) {
+    std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+    snapshot_promotion_callback_ = std::move(callback);
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotStopCallback(
+    SnapshotLifecycleCallback callback) {
+    std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+    snapshot_stop_callback_ = std::move(callback);
+}
+
+void HotStandbyService::NotifySnapshotPromotion() {
+    SnapshotLifecycleCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+        callback = snapshot_promotion_callback_;
+    }
+    if (callback) {
+        callback();
+    }
+}
+
+void HotStandbyService::NotifySnapshotStop() {
+    SnapshotLifecycleCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+        callback = snapshot_stop_callback_;
+    }
+    if (callback) {
+        callback();
+    }
 }
 
 StandbySyncStatus HotStandbyService::GetSyncStatus() const {
@@ -560,6 +616,7 @@ ErrorCode HotStandbyService::Promote() {
 
 ErrorCode HotStandbyService::PromoteLockedInternal(
     uint64_t current_applied_seq_id) {
+    NotifySnapshotPromotion();
     StopReplicationLoop();
     ErrorCode catch_up_err =
         FinalCatchUpForPromotionLocked(current_applied_seq_id);
@@ -735,6 +792,15 @@ void HotStandbyService::EndBatchOpLogSnapshotCapture(
     BatchOpLogSnapshotCapture& capture) {
     if (capture.lease_state_ == snapshot_capture_state_) {
         capture.Release();
+        SnapshotLifecycleCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(
+                snapshot_lifecycle_callback_mutex_);
+            callback = snapshot_capture_released_callback_;
+        }
+        if (callback) {
+            callback();
+        }
     }
 }
 
