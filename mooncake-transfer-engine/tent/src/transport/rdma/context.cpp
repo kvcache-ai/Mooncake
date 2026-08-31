@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -34,6 +35,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "ib_link_speed.h"
 #include "tent/common/status.h"
 #include "tent/transport/rdma/endpoint_store.h"
 
@@ -505,10 +507,19 @@ int RdmaContext::pause() {
     return (expected == DEVICE_PAUSED) ? 0 : -1;
 }
 
+void RdmaContext::evictEndpoints() {
+    if (endpoint_store_) endpoint_store_->evictAll();
+}
+
 int RdmaContext::resume() {
     DeviceStatus expected = DEVICE_PAUSED;
     status_.compare_exchange_strong(expected, DEVICE_ENABLED);
-    return (expected == DEVICE_ENABLED) ? 0 : -1;
+    if (expected != DEVICE_PAUSED) return -1;
+    // Port recovered: evict all cached endpoints so stale QPs (which may
+    // have entered IBV_QPS_ERR while the link was down) are torn down and
+    // rebuilt on the next getOrInsert() call.
+    evictEndpoints();
+    return 0;
 }
 
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
@@ -620,14 +631,29 @@ int RdmaContext::unregisterMemReg(MemReg id) {
         return -1;
     }
     auto entry = (ibv_mr*)id;
+    // Cache addr/length before ibv_dereg_mr: entry is freed by dereg_mr, so
+    // reading entry->addr/entry->length afterwards is a use-after-free.
+    void* region_addr = entry->addr;
+    size_t region_length = entry->length;
     mr_set_mutex_.lock();
     mr_set_.erase(entry);
     mr_set_mutex_.unlock();
 
     if (verbs_.ibv_dereg_mr(entry)) {
-        const void* end = static_cast<const char*>(entry->addr) + entry->length;
-        LOG(ERROR) << "Failed to unregister memory from " << entry->addr
+        const void* end = static_cast<const char*>(region_addr) + region_length;
+        LOG(ERROR) << "Failed to unregister memory from " << region_addr
                    << " to " << end << " in RDMA device " << device_name_;
+        return -1;
+    }
+    // Restore mergeability after ibv_dereg_mr. ibv_reg_mr calls
+    // madvise(MADV_DONTFORK) on the registered range when fork protection
+    // is active; failing to undo this on unregister leaves VMAs permanently
+    // split, exhausting vm.max_map_count under high register/unregister churn.
+    // See issue #3639.
+    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
+        PLOG(WARNING) << "Failed to restore fork state for memory region at "
+                      << region_addr << " (" << region_length
+                      << " bytes), deregister already succeeded";
     }
 
     return 0;
@@ -824,7 +850,39 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
 
     native_context_ = context.release();
     lid_ = port_attr.lid;
+    recordPortSpeed(port_attr);
     return 0;
+}
+
+void RdmaContext::recordPortSpeed(const ibv_port_attr& port_attr) {
+    int speed = port_attr.active_speed;
+#ifdef HAVE_IBV_ACTIVE_SPEED_EX
+    // XDR (encoding 256) overflows the uint8_t field above, which then
+    // reads 0; the extended field carries it on rdma-core builds that have
+    // one.
+    if (port_attr.active_speed_ex) speed = port_attr.active_speed_ex;
+#endif
+    active_speed_.store(speed, std::memory_order_relaxed);
+    active_width_.store(port_attr.active_width, std::memory_order_relaxed);
+}
+
+int RdmaContext::refreshPortAttributes() {
+    if (!native_context_) return -1;
+    ibv_port_attr port_attr;
+    if (verbs_.ibv_query_port_default(native_context_, params_->device.port,
+                                      &port_attr)) {
+        PLOG(WARNING) << "Failed to re-query port "
+                      << static_cast<int>(params_->device.port) << " on "
+                      << device_name_;
+        return -1;
+    }
+    recordPortSpeed(port_attr);
+    return 0;
+}
+
+double RdmaContext::linkSpeedGbps() const {
+    return ibLinkSpeedGbps(active_speed_.load(std::memory_order_relaxed),
+                           active_width_.load(std::memory_order_relaxed));
 }
 }  // namespace tent
 }  // namespace mooncake

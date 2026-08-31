@@ -14,6 +14,35 @@
 
 #include "config.h"
 
+// MOONCAKE_GLOG_HAS_IS_INITIALIZED is defined by FindGLOG.cmake via the
+// glog::glog INTERFACE compile definitions. It is set to 1 only when the
+// detected glog version is >= 0.6.0, where google::IsGoogleLoggingInitialized()
+// is publicly exported as a top-level symbol. This defensive fallback keeps the
+// file buildable even if the macro was not propagated for some reason.
+#ifndef MOONCAKE_GLOG_HAS_IS_INITIALIZED
+#define MOONCAKE_GLOG_HAS_IS_INITIALIZED 0
+#endif
+
+#if !MOONCAKE_GLOG_HAS_IS_INITIALIZED
+// glog < 0.6.0 does NOT export google::IsGoogleLoggingInitialized() at the
+// top level; the public declaration was only added in 0.6.0. However, the same
+// function has always existed in these older versions inside the internal
+// namespace google::glog_internal_namespace_ (declared in glog's private
+// header src/utilities.h, which is not installed). The symbol is exported by
+// libglog, so we forward-declare it here to reuse it without depending on any
+// private header. This lets old glog perform a real "already initialized"
+// check instead of blindly re-initializing.
+//
+// NOTE: In glog >= 0.6.0 this internal symbol no longer exists (it was moved
+// to the top-level google:: namespace), which is exactly why this branch is
+// only compiled when MOONCAKE_GLOG_HAS_IS_INITIALIZED == 0.
+namespace google {
+namespace glog_internal_namespace_ {
+bool IsGoogleLoggingInitialized();
+}  // namespace glog_internal_namespace_
+}  // namespace google
+#endif
+
 #include <charconv>
 #include <cstring>
 #include <cstdio>
@@ -443,7 +472,23 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
-        google::InitGoogleLogging("mooncake-transfer-engine");
+        // Only initialize when the caller (upstream program) has not already
+        // initialized glog, to avoid double initialization. On both new and old
+        // glog versions this performs a real "already initialized" check:
+        //   - glog >= 0.6.0: public google::IsGoogleLoggingInitialized()
+        //   - glog <  0.6.0: the equivalent function that lives in the internal
+        //     namespace google::glog_internal_namespace_ (forward-declared at
+        //     the top of this file).
+        // The using-declaration below selects the right overload for the
+        // detected version, so the call site stays identical.
+#if MOONCAKE_GLOG_HAS_IS_INITIALIZED
+        using google::IsGoogleLoggingInitialized;
+#else
+        using google::glog_internal_namespace_::IsGoogleLoggingInitialized;
+#endif
+        if (!IsGoogleLoggingInitialized()) {
+            google::InitGoogleLogging("mooncake-transfer-engine");
+        }
         std::error_code ec;
         if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)

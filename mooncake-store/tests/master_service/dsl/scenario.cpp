@@ -404,9 +404,20 @@ MasterScenario& MasterScenario::WhenPutStart(PutStartActionData action) {
     if (action.group_ids.has_value()) {
         config.group_ids = std::move(action.group_ids);
     }
-    const auto result =
-        service_->PutStart(ActorId(action.actor), action.key,
-                           TenantId(action.tenant), action.size, config);
+    const auto actor_id = ActorId(action.actor);
+    const TenantId tenant_id(action.tenant);
+    const auto deadline =
+        std::chrono::steady_clock::now() + action.eventual_timeout;
+    auto result = service_->PutStart(actor_id, action.key, tenant_id,
+                                     action.size, config);
+    while (!result && action.eventual_timeout.count() > 0 &&
+           (result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED ||
+            result.error() == ErrorCode::NO_AVAILABLE_HANDLE) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        result = service_->PutStart(actor_id, action.key, tenant_id,
+                                    action.size, config);
+    }
     ValidateStartResult("PutStart(" + action.key + ")", action.expected_error,
                         action.expected_replica_count,
                         action.expected_replica_status, result,
@@ -1019,12 +1030,12 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
             return false;
         }
         SpinLocker locker(&metadata_it->second.lock);
-        metadata_it->second.lease_timeout = action.lease_timeout;
+        metadata_it->second.lease_->SetDeadline(action.lease_timeout);
         metadata_it->second.soft_pin_timeout = action.soft_pin_timeout;
         return true;
     };
 
-    const size_t routed = service_->getMetadataShardIndex(tenant, action.key);
+    const size_t routed = service_->getShardIndex(tenant, action.key);
     if (update(routed)) {
         return *this;
     }

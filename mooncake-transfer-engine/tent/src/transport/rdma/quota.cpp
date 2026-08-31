@@ -18,6 +18,8 @@
 #include "tent/common/utils/random.h"
 #include "tent/common/utils/os.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
@@ -31,14 +33,54 @@ Status DeviceSelector::loadTopology(std::shared_ptr<Topology>& local_topology) {
         if (!entry || entry->type != Topology::NIC_RDMA) continue;
         DeviceInfo& info = devices_[dev_id];
         info.dev_id = dev_id;
-        info.bw_gbps = kDefaultBwGbps;
+        info.bw_gbps.store(0.0, std::memory_order_relaxed);  // unknown
         info.numa_id = entry->numa_node;
-        info.ewma_bandwidth_bps.store(info.getTheoreticalBandwidth(),
+        info.ewma_bandwidth_bps.store(theoreticalBandwidth(info),
                                       std::memory_order_relaxed);
     }
     // Initialize device base priorities after all devices are loaded
     fillDevicePriorities();
     return Status::OK();
+}
+
+double DeviceSelector::theoreticalBandwidth(const DeviceInfo& dev) const {
+    const auto& p = sched_params_;
+    double gbps = dev.bw_gbps.load(std::memory_order_relaxed);
+    if (gbps < p.min_bandwidth_gbps || gbps > p.max_bandwidth_gbps)
+        gbps = p.default_bandwidth_gbps;
+    return gbps * 1e9 / 8.0;
+}
+
+Status DeviceSelector::setDeviceBandwidth(int dev_id, double gbps) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end())
+        return Status::InvalidArgument("device not found");
+    auto& dev = it->second;
+    const auto& p = sched_params_;
+    if (gbps < p.min_bandwidth_gbps || gbps > p.max_bandwidth_gbps) {
+        LOG(WARNING) << "Device " << local_topology_->getNicName(dev_id)
+                     << " link speed " << gbps << " Gbps is "
+                     << (gbps <= 0.0 ? "unknown" : "outside the valid range")
+                     << ", assuming " << p.default_bandwidth_gbps << " Gbps";
+    }
+    dev.bw_gbps.store(gbps, std::memory_order_relaxed);
+    // A worker completing between these two stores clamps the old EWMA
+    // against the new rate once; the seed below overwrites it.
+    dev.ewma_bandwidth_bps.store(theoreticalBandwidth(dev),
+                                 std::memory_order_relaxed);
+    return Status::OK();
+}
+
+Status DeviceSelector::setDeviceAvailable(int dev_id, bool available) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end())
+        return Status::InvalidArgument("device not found");
+    it->second.available.store(available, std::memory_order_relaxed);
+    return Status::OK();
+}
+
+bool DeviceSelector::isDeviceAvailable(int dev_id) const {
+    return usable(dev_id);
 }
 
 Status DeviceSelector::enableSharedQuota(const std::string& shm_name) {
@@ -85,7 +127,7 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
             thread_local std::vector<int> tl_eligible;
             tl_eligible.clear();
             for (int dev_id : entry->device_list[rank]) {
-                if (!devices_.count(dev_id)) continue;
+                if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
                 tl_eligible.push_back(dev_id);
             }
@@ -167,7 +209,7 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
     // First pass: filter by device priority (QoS filtering)
     for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
         for (int dev_id : entry->device_list[rank]) {
-            if (!devices_.count(dev_id)) continue;
+            if (!usable(dev_id)) continue;
             if ((device_mask & (1ULL << dev_id)) == 0) continue;
             // QoS: Get device's current priority slot (local, per-process)
             // Device accepts request if dev_priority >= request_priority
@@ -180,11 +222,12 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         }
     }
 
-    // If no devices after filtering, fallback to all devices
+    // If no devices after priority filtering, fall back to every usable
+    // device. Availability is not a QoS filter and is never relaxed here.
     if (candidates.empty()) {
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             for (int dev_id : entry->device_list[rank]) {
-                if (!devices_.count(dev_id)) continue;
+                if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
                 add_candidate(dev_id, rank);
             }
@@ -292,8 +335,15 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
 
 Status DeviceSelector::allocate(uint64_t length, const std::string& location,
                                 int& chosen_dev_id) {
+    return allocate(length, location, chosen_dev_id, PRIO_HIGH, ~0ULL);
+}
+
+Status DeviceSelector::allocate(uint64_t length, const std::string& location,
+                                int& chosen_dev_id, int priority,
+                                uint64_t device_mask) {
     std::vector<int> slice_dev_ids;
-    Status status = allocate(length, 1, length, location, slice_dev_ids, ~0ULL);
+    Status status = allocate(length, 1, length, location, slice_dev_ids,
+                             priority, device_mask);
     if (!status.ok()) return status;
     if (slice_dev_ids.empty()) {
         return Status::DeviceNotFound("allocation failed");
@@ -326,7 +376,7 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     double new_ewma = alpha * current_ewma + (1.0 - alpha) * observed_bw;
 
     // Clamp to [min_multiplier, max_multiplier] of theoretical bandwidth
-    double theoretical_bw = dev.getTheoreticalBandwidth();
+    double theoretical_bw = theoreticalBandwidth(dev);
     new_ewma = std::max(
         sched_params_.ewma_min_multiplier * theoretical_bw,
         std::min(sched_params_.ewma_max_multiplier * theoretical_bw, new_ewma));
@@ -341,6 +391,10 @@ Status DeviceSelector::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     // devices_ is populated during topology load and remains stable while
     // transfers update the per-device atomic counters below.
     for (const auto& [dev_id, dev] : devices_) {
+        // Same rule as the aggregate: a NIC that cannot carry traffic has
+        // no meaningful load or bandwidth to report, and with zero inflight
+        // it would score as the best NIC of the lot.
+        if (!dev.available.load(std::memory_order_relaxed)) continue;
         std::string device_name = local_topology_->getNicName(dev_id);
         if (device_name.empty()) device_name = std::to_string(dev_id);
         stats.push_back(NicLoadStats{
@@ -395,6 +449,7 @@ int DeviceSelector::getDevicePriority(int dev_id) const {
 double DeviceSelector::getAggregateEwmaBandwidth() const {
     double total = 0.0;
     for (const auto& [id, dev] : devices_) {
+        if (!dev.available.load(std::memory_order_relaxed)) continue;
         total += dev.getEwmaBandwidth();
     }
     return total > 0.0 ? total : -1.0;
