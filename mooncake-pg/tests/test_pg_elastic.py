@@ -705,15 +705,14 @@ def _replacement_recovery_worker(
         # Round 1: all healthy
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        # CUDA Work completion orders the current stream without blocking the
+        # host. Finish Round 1 before the broken rank exits so this round is
+        # actually observed as a healthy collective by every participant.
+        ctx.synchronize()
 
         if logical_rank == BROKEN_RANK:
             if graceful_group_destroy:
                 backend = ctx.get_backend()
-                # CUDA Work::wait() orders the current stream but does not
-                # block the host until the collective finishes. Complete
-                # Round 1 before deactivate_ranks changes the active-rank
-                # view used by that collective.
-                ctx.synchronize()
                 resp = pg.deactivate_ranks(backend, [logical_rank])
                 assert resp.status == pg.ProposalStatus.Applied, \
                     "graceful self-deactivation should apply, " \
@@ -737,6 +736,10 @@ def _replacement_recovery_worker(
         # Round 2: run collective without the departed rank.
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        # Control-plane calls are not ordered behind work on the CUDA stream.
+        # Wait until the failed collective's automatic synchronization has
+        # applied the reduced view before starting the replacement workflow.
+        ctx.synchronize()
 
         # Signal that we're ready for replacement
         if logical_rank == 0:
@@ -1068,19 +1071,15 @@ def _manual_deactivate_recovery_worker(
         broken_exited.wait()
 
         # Round 2: rank died, auto_deactivate=False ==> activeRanks unchanged.
-        # local_success=False because the dead rank is still in the group.
-        expected_reduced = expected_all - (BROKEN_RANK + 1)
+        # local_success=False because the dead rank is still in the group. A
+        # failed collective does not promise valid output contents.
         tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
         work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
         work.wait()
-        assert int(tensor.cpu().item()) == expected_reduced
+        # Ring failure hints reflect each rank's local progress observation,
+        # so failed_ranks_hint is not required to agree across survivors.
         assert not pg.get_local_success(work), \
             f"rank {ctx.rank}: round 2 should detect broken rank"
-
-        failed_ranks_hint = pg.get_failed_ranks_hint(work)
-        expected_failed_ranks_hint = [0] * ctx.world_size
-        expected_failed_ranks_hint[BROKEN_RANK] = 1
-        assert failed_ranks_hint.tolist() == expected_failed_ranks_hint
 
         active_ranks = pg.get_active_ranks(backend)
         assert active_ranks.cpu().tolist() == [1] * ctx.world_size
@@ -1291,6 +1290,14 @@ class _ElasticMixin:
 
     def test_inplace_rejoin_collective(self) -> None:
         """Collectives recover when the same live process rejoins."""
+        if (
+            self.device_type == "cuda"
+            and os.environ.get(
+                "MOONCAKE_PG_PREFERRED_GPU_COLLECTIVE_BACKEND"
+            )
+            == "new"
+        ):
+            self.skipTest("fault injection does not support the new path")
         self._run_inplace_rejoin("collective")
 
     def test_inplace_rejoin_p2p(self) -> None:

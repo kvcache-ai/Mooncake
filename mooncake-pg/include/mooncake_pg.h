@@ -80,6 +80,11 @@ typedef enum mooncakePgIdResolvePolicy {
     mooncakePgIdResolveAttachOrExtend = 1,
 } mooncakePgIdResolvePolicy_t;
 
+typedef enum mooncakePgGpuCollectiveBackend {
+    mooncakePgGpuCollectiveBackendLegacy = 0,
+    mooncakePgGpuCollectiveBackendNew = 1,
+} mooncakePgGpuCollectiveBackend_t;
+
 typedef struct mooncakePgCommConfig {
     size_t structSize;
     unsigned int magic;
@@ -101,6 +106,9 @@ typedef struct mooncakePgCommConfig {
     size_t activeRanksMirrorCount;
     int activeRanksMirrorIsDevice;
     int activeRanksMirrorDeviceIndex;
+    /* Local preference for GPU communicators; ignored for CPU communicators.
+     * The config initializer defaults to the legacy backend. */
+    mooncakePgGpuCollectiveBackend_t preferredGpuCollectiveBackend;
 } mooncakePgCommConfig_t;
 
 #define MOONCAKE_PG_COMM_CONFIG_INITIALIZER \
@@ -121,7 +129,8 @@ typedef struct mooncakePgCommConfig {
      NULL,                                  \
      0,                                     \
      0,                                     \
-     MOONCAKE_PG_CONFIG_UNDEF_INT}
+     MOONCAKE_PG_CONFIG_UNDEF_INT,          \
+     mooncakePgGpuCollectiveBackendLegacy}
 
 typedef enum mooncakePgProposalStatus {
     mooncakePgProposalRejected = 0,
