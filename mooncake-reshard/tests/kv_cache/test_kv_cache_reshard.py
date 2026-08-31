@@ -39,6 +39,7 @@ from mooncake.reshard.kv_cache import (
     kv_cache_runtime_binding_to_json,
     kv_cache_snapshot_from_json,
     kv_cache_snapshot_to_json,
+    lower_kv_cache_transfer,
     placement_fragment_id,
     plan_kv_cache_transfer_to_local_target,
     prepare_kv_cache_transfer,
@@ -558,3 +559,67 @@ def test_snapshot_bound_runtime_bindings_are_checked_at_prepare() -> None:
     stale = replace(target_binding, snapshot_digest="0" * 64)
     with pytest.raises(ValueError, match="snapshot digest"):
         prepare_kv_cache_transfer(plan, source_binding, stale)
+
+
+def test_full_row_lowering_coalesces_contiguous_pages() -> None:
+    source = _placement("source", ((0,),), 1)
+    target = _placement("target", ((0,),), 1)
+    plan = _plan(source, target, "target-p0-t0")
+    source_id = plan.source_participant_ids[0]
+    prepared = prepare_kv_cache_transfer(
+        plan.for_source(source_id),
+        _binding(source, source_id, base_address=1_000_000_000),
+        _binding(target, "target-p0-t0", base_address=2_000_000_000),
+    )
+
+    batches = lower_kv_cache_transfer(
+        prepared,
+        source_page_ids=(1, 4),
+        target_page_ids=(5, 9),
+        token_start=3,
+        token_count=18,
+    )
+
+    row_bytes = 4 * 8 * 2
+    assert len(batches) == 1
+    assert batches[0].sizes == (
+        13 * row_bytes,
+        5 * row_bytes,
+        13 * row_bytes,
+        5 * row_bytes,
+    )
+    assert batches[0].source_addresses[0] == 1_000_000_000 + 19 * row_bytes
+    assert batches[0].target_addresses[0] == 2_000_000_000 + 83 * row_bytes
+
+
+def test_sliced_row_lowering_caps_native_batch_operations() -> None:
+    source = _placement("source", ((0,),), 1)
+    target = _placement("target", ((0,),), 2)
+    plan = _plan(source, target, "target-p0-t1")
+    source_id = plan.source_participant_ids[0]
+    prepared = prepare_kv_cache_transfer(
+        plan.for_source(source_id),
+        _binding(source, source_id, base_address=1_000_000_000),
+        _binding(target, "target-p0-t1", base_address=2_000_000_000),
+    )
+
+    batches = lower_kv_cache_transfer(
+        prepared,
+        source_page_ids=(1,),
+        target_page_ids=(2,),
+        token_start=3,
+        token_count=5,
+        max_batch_operations=3,
+    )
+
+    assert tuple(len(batch.sizes) for batch in batches) == (3, 3, 3, 1)
+    assert sum(sum(batch.sizes) for batch in batches) == 5 * 2 * 2 * 8 * 2
+
+    with pytest.raises(ValueError, match="page_ids length"):
+        lower_kv_cache_transfer(
+            prepared,
+            source_page_ids=(),
+            target_page_ids=(2,),
+            token_start=3,
+            token_count=5,
+        )
