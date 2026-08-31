@@ -131,20 +131,26 @@ class StorageBenchmark:
         for access in self.layout.get_operations(req):
             if self.storage.exists(access.page_id):
                 # Page exists, perform READ
-                io_latency_ms += self.storage.read(
+                latency = self.storage.read(
                     access.page_id,
                     offset_in_page=access.offset_in_page,
                     length=access.length
                 )
+                if latency is None:
+                    continue
+                io_latency_ms += latency
                 self.stats['read_pages'] += 1
                 self.stats['page_hits'] += 1
             else:
                 # Page doesn't exist, perform WRITE
-                io_latency_ms += self.storage.write(
+                latency = self.storage.write(
                     access.page_id,
                     offset_in_page=access.offset_in_page,
                     length=access.length
                 )
+                if latency is None:
+                    continue
+                io_latency_ms += latency
                 self.stats['write_pages'] += 1
 
         wall_latency_ms = (time.perf_counter() - request_start) * 1000.0

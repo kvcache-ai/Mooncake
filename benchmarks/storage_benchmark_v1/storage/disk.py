@@ -210,7 +210,7 @@ class DiskHashTable(Storage):
             return latency
         except OSError as e:
             print(f"Read error (page_id={page_id}): {e}")
-            return 0.0
+            return None
         finally:
             if owned and fd is not None:
                 try:
@@ -276,7 +276,7 @@ class DiskHashTable(Storage):
             return latency
         except OSError as e:
             print(f"Write error (page_id={page_id}, offset_in_page={offset_in_page}, length={length}): {e}")
-            return 0.0
+            return None
         finally:
             if owned and fd is not None:
                 try:
