@@ -973,6 +973,78 @@ TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
              {std::nullopt, std::nullopt, size_t{1}, size_t{1}}, true);
 }
 
+namespace {
+
+StandbyObjectEntry MakeStandbyEntry(const std::string& key, uint64_t obj_size,
+                                    uintptr_t addr,
+                                    const std::string& endpoint) {
+    StandbyObjectEntry entry;
+    entry.tenant_id = TenantId::Default().value();
+    entry.key = key;
+    entry.metadata.client_id = generate_uuid();
+    entry.metadata.size = obj_size;
+    AllocatedBuffer::Descriptor buf;
+    buf.size_ = obj_size;
+    buf.buffer_address_ = addr;
+    buf.transport_endpoint_ = endpoint;
+    Replica::Descriptor desc;
+    desc.id = generate_uuid();
+    desc.descriptor_variant = MemoryDescriptor{buf};
+    desc.status = ReplicaStatus::COMPLETE;
+    entry.metadata.replicas.push_back(desc);
+    return entry;
+}
+
+StandbySegmentInfo MakeStandbySegment(const std::string& name,
+                                      const std::string& endpoint,
+                                      uint64_t capacity) {
+    StandbySegmentInfo seg;
+    seg.segment_name = name;
+    seg.transport_endpoint = endpoint;
+    seg.capacity = capacity;
+    seg.is_memory_segment = true;
+    return seg;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
+    // #3760: one bad descriptor must not cost the whole index.
+    MasterService service(MakeStrictTenantConfig({"default"}));
+    const auto seg = MakeStandbySegment("seg", "ep1", 4096);
+    auto good = MakeStandbyEntry("good_key", 128, 0x1000, "ep1");
+    auto bad = MakeStandbyEntry("bad_key", 128, 0x2000, "ep1");
+    bad.metadata.size = 256;  // descriptor size no longer matches metadata
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {good, bad},
+        /*initial_oplog_sequence_id=*/0, {seg});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(
+        service.ExistKey("good_key", TenantId::Default()).value_or(false));
+    EXPECT_FALSE(
+        service.ExistKey("bad_key", TenantId::Default()).value_or(true));
+}
+
+TEST_F(MasterServiceTest, StandbyRestoreKeepsLatestReplayOnOverlap) {
+    // #3760: eviction frees and reallocates a buffer; a standby that missed
+    // the removal replays both replicas at the same address. The later replay
+    // is ground truth and wins.
+    MasterService service(MakeStrictTenantConfig({"default"}));
+    const auto seg = MakeStandbySegment("seg", "ep1", 4096);
+    auto stale = MakeStandbyEntry("stale_key", 128, 0x1000, "ep1");
+    auto fresh = MakeStandbyEntry("fresh_key", 128, 0x1040, "ep1");
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {stale, fresh},
+        /*initial_oplog_sequence_id=*/0, {seg});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(
+        service.ExistKey("stale_key", TenantId::Default()).value_or(true));
+    EXPECT_TRUE(
+        service.ExistKey("fresh_key", TenantId::Default()).value_or(false));
+}
+
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     const TenantId tenant_a("tenant_restore_a");
     const TenantId tenant_b("tenant_restore_b");
