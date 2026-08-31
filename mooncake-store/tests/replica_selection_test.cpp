@@ -97,6 +97,40 @@ TEST_F(ReplicaSelectionTest, LocalMemoryAlwaysWins) {
         "nodeB");  // locality beats protocol
 }
 
+// Regression for issue #3658: a complete local MEMORY replica must win over a
+// complete local NOF replica regardless of the order they appear in the list.
+// ObjectMetadata preserves insertion order, and promotion appends a new MEMORY
+// replica to existing metadata, so a MEMORY replica may legally appear after a
+// NOF replica. The session range-read path is memory-only, so selecting NOF
+// here would regress a session that still has a usable MEMORY replica.
+TEST_F(ReplicaSelectionTest, LocalMemoryBeatsLocalNoFInBothOrders) {
+    std::unordered_set<std::string> local = {"memB", "nofB"};
+
+    // local NOF listed before local MEMORY
+    std::vector<Replica::Descriptor> nof_first = {
+        MakeNoF("nofB"),
+        MakeMemory("memB", "tcp"),
+    };
+    const auto* sel = SelectBestReplica(nof_first, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+    EXPECT_EQ(
+        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "memB");
+
+    // local MEMORY listed before local NOF (the previously-correct order)
+    std::vector<Replica::Descriptor> mem_first = {
+        MakeMemory("memB", "tcp"),
+        MakeNoF("nofB"),
+    };
+    sel = SelectBestReplica(mem_first, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+    EXPECT_EQ(
+        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "memB");
+}
+
 TEST_F(ReplicaSelectionTest, ScoringOffKeepsFirstRemoteMemory) {
     // No scorer injected and env not set -> must return the FIRST remote
     // MEMORY.
