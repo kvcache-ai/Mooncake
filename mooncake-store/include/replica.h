@@ -11,7 +11,6 @@
 #include <optional>
 #include <string_view>
 #include <ostream>
-#include <ylt/struct_pack/compatible.hpp>
 
 #include "types.h"
 #include "allocator.h"

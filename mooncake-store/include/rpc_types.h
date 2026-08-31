@@ -1,8 +1,6 @@
 #pragma once
 
 #include <optional>
-#include <string>
-#include <ylt/struct_pack/compatible.hpp>
 
 #include "types.h"
 #include "replica.h"
