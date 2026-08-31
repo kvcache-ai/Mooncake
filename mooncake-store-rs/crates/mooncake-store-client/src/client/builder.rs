@@ -138,6 +138,8 @@ pub struct StoreClientBuilder {
     cold_tier_offload_mode: ColdTierOffloadMode,
     cold_tier_offload_priority: ColdTierOffloadPriorityConfig,
     cold_tier_shutdown_mode: ColdTierShutdownMode,
+    nof_low_level_targets:
+        BTreeMap<String, crate::client::cold_tier::nof::NofLowLevelTarget>,
     #[cfg(test)]
     cold_tier_backend_overrides: BTreeMap<String, Arc<dyn PersistentStorageBackend>>,
 }
@@ -172,6 +174,7 @@ impl StoreClientBuilder {
             cold_tier_offload_mode: ColdTierOffloadMode::default(),
             cold_tier_offload_priority: ColdTierOffloadPriorityConfig::default(),
             cold_tier_shutdown_mode: ColdTierShutdownMode::default(),
+            nof_low_level_targets: BTreeMap::new(),
             #[cfg(test)]
             cold_tier_backend_overrides: BTreeMap::new(),
         }
@@ -352,6 +355,21 @@ impl StoreClientBuilder {
         self
     }
 
+    /// Uses a physical NoF executor for an existing Cold Tier target.
+    ///
+    /// The matching [`ColdTierTargetConfig`] still supplies device lifecycle, capacity,
+    /// admission, route, replica, and maintenance ownership. Only its physical backend I/O is
+    /// replaced by this target.
+    pub fn nof_low_level_target(
+        mut self,
+        cold_tier_id: impl Into<String>,
+        target: crate::client::cold_tier::nof::NofLowLevelTarget,
+    ) -> Self {
+        self.nof_low_level_targets
+            .insert(cold_tier_id.into(), target);
+        self
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     fn cold_tier_backend_override(
@@ -374,6 +392,17 @@ impl StoreClientBuilder {
             return Err(StoreError::InvalidState(
                 "route_topk must be greater than or equal to 2".to_string(),
             ));
+        }
+        for cold_tier_id in self.nof_low_level_targets.keys() {
+            if !self
+                .cold_tier_targets
+                .iter()
+                .any(|target| &target.cold_tier_id == cold_tier_id)
+            {
+                return Err(StoreError::InvalidState(format!(
+                    "NoF low-level target {cold_tier_id} has no matching Cold Tier target"
+                )));
+            }
         }
         registry::set_process_tenant(&self.default_tenant);
         let lease_ttl_ms = expires_at_ms.saturating_sub(now_ms()).max(1);
@@ -472,6 +501,16 @@ impl StoreClientBuilder {
         } else {
             Vec::new()
         };
+        for cold_tier_id in self.nof_low_level_targets.keys() {
+            if !resolved_cold_tier
+                .iter()
+                .any(|resolved| &resolved.cold_tier_id == cold_tier_id)
+            {
+                return Err(StoreError::InvalidState(format!(
+                    "NoF low-level target {cold_tier_id} has no matching Cold Tier target"
+                )));
+            }
+        }
         let route_directory = build_route_directory(
             effective_route_control,
             effective_route_topk,
@@ -534,7 +573,14 @@ impl StoreClientBuilder {
                     reconcile_devices.push(alias_device);
                 }
             }
-            let backend: Arc<dyn PersistentStorageBackend> = if resolved.kind == ColdTierKind::Ssd
+            let backend: Arc<dyn PersistentStorageBackend> = if let Some(target) =
+                self.nof_low_level_targets.get(&resolved.cold_tier_id).cloned()
+            {
+                Arc::new(NofLowLevelBackend::new(
+                    resolved.cold_tier_id.clone(),
+                    target,
+                )?)
+            } else if resolved.kind == ColdTierKind::Ssd
                 && resolved.ssd_engine == ColdTierSsdEngine::ExtentStore
             {
                 let backend = Arc::new(ExtentStoreStorageBackend::new(

@@ -126,9 +126,11 @@ use cold_tier_storage_backend::*;
 mod extent_store_engine;
 use extent_store_engine::ExtentStoreStorageBackend;
 
+use self::cold_tier::nof::lowlevel::backend::NofLowLevelBackend;
+
 /// Cold tier device management, admission control, offload pipeline, and cleanup.
 #[allow(dead_code)]
-mod cold_tier;
+pub(crate) mod cold_tier;
 use self::cold_tier::{
     backend_load_cold_payload_batch_pinned, backend_remove_pending_source,
     cold_backing_placeholder, payload_checksum, validate_cold_restore_payload,
