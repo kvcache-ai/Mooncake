@@ -1,7 +1,5 @@
 #pragma once
 
-#include <gtest/gtest_prod.h>
-
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
@@ -107,11 +105,11 @@ class FileStorage {
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
     // TEST_F bodies are generated subclasses and do not inherit the fixture's
-    // friendship, so the dangling-replica tests are friended by name.
-    FRIEND_TEST(FileStorageTest,
-                PutAfterPhysicalWipeHealsDanglingLocalDiskReplica);
-    FRIEND_TEST(FileStorageTest,
-                PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket);
+    // friendship, so the dangling-replica tests are friended by their
+    // generated class names (plain friend, no gtest include in a production
+    // header).
+    friend class FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
+    friend class FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
