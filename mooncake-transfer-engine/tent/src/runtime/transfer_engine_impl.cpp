@@ -751,6 +751,10 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
     return Status::InvalidArgument("Address region not registered" LOC_MARK);
 }
 
+// Forward declaration: getTypeEnum() is defined below but is needed by the
+// registerLocalMemory location-override validation.
+static MemoryType getTypeEnum(const std::string& type);
+
 Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
                                                Permission permission) {
     MemoryOptions options;
@@ -831,8 +835,37 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             desc.regions = coalesceRegions(entries);
         }
         desc.ref_count = 1;
-        if (options.location != kWildcardLocation)
-            desc.location = options.location;
+        // The probe is the source of truth for transport selection: it
+        // classifies the memory (cpu/cuda/...). A caller-supplied location
+        // may refine the probe within the SAME memory type (e.g. probe
+        // "cpu:0" -> caller "cpu:1"), but must not replace it with an
+        // incompatible or unknown type. Classic TE encodes NUMA-segmented
+        // host DRAM as "segments:4096:0,1"; that is a TE dialect TENT's
+        // type system does not understand, and blindly adopting it would
+        // make getTypeEnum() return MTYPE_UNKNOWN and break transport
+        // selection. Validate before overriding: keep the probe when the
+        // caller is a wildcard, unknown, or a different type.
+        if (options.location != kWildcardLocation &&
+            !options.location.empty()) {
+            auto probed_type =
+                getTypeEnum(LocationParser(desc.location).type());
+            auto caller_type =
+                getTypeEnum(LocationParser(options.location).type());
+            if (caller_type == MTYPE_UNKNOWN) {
+                LOG(WARNING) << "Ignoring unknown caller location '"
+                             << options.location
+                             << "' for registered memory at " << addr_list[i]
+                             << " (probed '" << desc.location
+                             << "'); keeping probed location";
+            } else if (caller_type != probed_type) {
+                LOG(WARNING) << "Ignoring caller location '" << options.location
+                             << "' (type mismatch with probed '"
+                             << desc.location << "') for registered memory at "
+                             << addr_list[i] << "; keeping probed location";
+            } else {
+                desc.location = options.location;
+            }
+        }
         if (options.internal) desc.internal = options.internal;
         desc_list.push_back(std::move(desc));
     }
@@ -1201,7 +1234,7 @@ static bool checkAvailability(const std::shared_ptr<Transport>& xport,
 }
 
 static MemoryType getTypeEnum(const std::string& type) {
-    if (type == "cpu" || type == "*" || type == "segments") return MTYPE_CPU;
+    if (type == "cpu" || type == "*") return MTYPE_CPU;
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
     if (isAmdGpuLocationType(type)) return MTYPE_ROCM;

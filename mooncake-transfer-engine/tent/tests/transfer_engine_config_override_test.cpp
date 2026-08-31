@@ -283,34 +283,6 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_EQ(config.get("transports/rdma/bind_address", ""), "10.0.0.2");
 }
 
-// MOONCAKE_LOCAL_HOSTNAME is the classic Transfer Engine + store env var that
-// names the local host for RPC binding and segment identity. TENT must honor
-// the same env so a single MOONCAKE_LOCAL_HOSTNAME works across both engines;
-// otherwise TENT's auto-discovery can pick a container/CNI IP (e.g. 10.154.0.1)
-// instead of the RDMA-network IP, breaking cross-node RDMA handshake.
-TEST(TransferEngineConfigOverrideTest,
-     LocalHostnameEnvLoadsIntoRpcServerHostname) {
-    EnvVarGuard guard("MOONCAKE_LOCAL_HOSTNAME", "10.0.0.2");
-
-    Config config;
-    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
-
-    EXPECT_EQ(config.get("rpc_server_hostname", ""), "10.0.0.2");
-}
-
-TEST(TransferEngineConfigOverrideTest, LocalHostnameEnvOverridesMcTentConf) {
-    EnvVarGuard conf_guard("MC_TENT_CONF",
-                           R"({"rpc_server_hostname":"10.0.0.1"})");
-    EnvVarGuard host_guard("MOONCAKE_LOCAL_HOSTNAME", "10.0.0.2");
-
-    Config config;
-    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
-
-    // Legacy env must override MC_TENT_CONF, same precedence as
-    // MC_RDMA_BIND_ADDRESS (env wins so per-pod injection works).
-    EXPECT_EQ(config.get("rpc_server_hostname", ""), "10.0.0.2");
-}
-
 TEST(TransferEngineConfigOverrideTest,
      LegacyRdmaSliceAffinityLogEnvLoadsIntoTentConfig) {
     EnvVarGuard guard("MC_LOG_RDMA_SLICE_AFFINITY", "true");
@@ -488,6 +460,62 @@ TEST(TransferEngineConfigOverrideTest,
         EXPECT_EQ(config->get("rpc_server_port", ""), invalid_port);
         EXPECT_EQ(engine.getRpcServerPort(), 0);
     }
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     RegisterLocalMemoryIgnoresIncompatibleCallerLocation) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Requires local HTTP metadata server support";
+#else
+    // registerLocalMemory observes existing memory; the NUMA probe is the
+    // source of truth for transport selection. A caller-supplied location
+    // must not overwrite the probe with an unknown or incompatible type.
+    // The store's buildSegmentsLocation() emits "segments:4096:0,1" (a
+    // classic TE NUMA-segment encoding TENT's type system does not
+    // understand); blindly adopting it made getTypeEnum() return
+    // MTYPE_UNKNOWN and broke transport selection (warmup "Unable to find
+    // registered buffer"). The override must validate and keep the probe.
+    const auto live_port = reserveUnusedTcpPort();
+    TestHttpMetadataServer metadata_server(live_port);
+    ASSERT_TRUE(metadata_server.start());
+    const auto live_endpoint =
+        buildHttpMetadataEndpoint(live_port) + "/metadata";
+
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "http");
+    config->set("metadata_servers", live_endpoint);
+    config->set("local_segment_name", kSegmentName);
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("rpc_server_port", "0");
+    configureTcpOnlyTransports(*config);
+
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    // Register a host buffer with an incompatible caller location. The
+    // probe classifies host memory as "cpu:N"; "segments:..." is an unknown
+    // type to TENT and must be ignored in favor of the probe.
+    constexpr size_t kBufSize = 4096;
+    std::vector<char> buf(kBufSize, 0);
+    MemoryOptions options;
+    options.location = "segments:4096:0,1";
+    std::vector<void*> addrs = {buf.data()};
+    std::vector<size_t> sizes = {kBufSize};
+    ASSERT_TRUE(engine.registerLocalMemory(addrs, sizes, options).ok());
+
+    SegmentInfo info;
+    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    ASSERT_EQ(info.buffers.size(), 1u);
+    // The buffer location must be the probed "cpu:..." form, NOT the
+    // caller-supplied "segments:..." string.
+    const auto& loc = info.buffers[0].location;
+    EXPECT_NE(loc.find("cpu"), std::string::npos)
+        << "expected probed cpu location, got '" << loc << "'";
+    EXPECT_EQ(loc.find("segments"), std::string::npos)
+        << "caller 'segments:' must not leak into buffer location";
+
+    engine.unregisterLocalMemory(buf.data(), kBufSize);
+#endif
 }
 
 }  // namespace

@@ -109,20 +109,6 @@ TEST(TopologyPriorityMatrixTest, RejectsMalformedMatrixEntries) {
         topology.parsePriorityMatrix(R"({"cpu:0": [[1], ["mlx5_1"]]})").ok());
 }
 
-// "segments" is the location type used for NUMA-segmented host DRAM (e.g.
-// "segments:4096:0,1" = page_size 4096, NUMA nodes 0 and 1), produced by the
-// store's buildSegmentsLocation() for multi-NIC cross-NUMA buffers. It is
-// host memory and must map to MEM_HOST; otherwise transport selection treats
-// it as MEM_UNKNOWN and fails with UNSPEC, breaking transfers to multi-NUMA
-// store segments (the store allocates NUMA-segmented buffers when multiple
-// NIC NUMA nodes are present).
-TEST(TopologyPriorityMatrixTest, SegmentsLocationTreatedAsHostMemory) {
-    EXPECT_EQ(memTypeFromLocation("segments:4096:0,1"), Topology::MEM_HOST);
-    EXPECT_EQ(memTypeFromLocation("segments:4096:0"), Topology::MEM_HOST);
-    EXPECT_EQ(memTypeFromLocation("cpu:0"), Topology::MEM_HOST);
-    EXPECT_EQ(memTypeFromLocation("cuda:0"), Topology::MEM_CUDA);
-}
-
 TEST(TopologyPriorityMatrixTest, AmdGpuLocationUsesHipPrefixAndRocmAlias) {
     EXPECT_EQ(memTypeFromLocation("hip:0"), Topology::MEM_ROCM);
     EXPECT_EQ(memTypeFromLocation("rocm:3"), Topology::MEM_ROCM);
