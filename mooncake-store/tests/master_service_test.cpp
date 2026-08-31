@@ -1011,6 +1011,10 @@ StandbySegmentInfo MakeStandbySegment(const std::string& name,
 TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
     // #3760: one bad descriptor must not cost the whole index.
     MasterService service(MakeStrictTenantConfig({"default"}));
+    // Mount the endpoint live: replicas restored onto an unmounted endpoint
+    // stay unreadable until the segment comes back, which is not what this
+    // test checks.
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
     const auto seg = MakeStandbySegment("seg", "ep1", 4096);
     auto good = MakeStandbyEntry("good_key", 128, 0x1000, "ep1");
     auto bad = MakeStandbyEntry("bad_key", 128, 0x2000, "ep1");
@@ -1031,6 +1035,7 @@ TEST_F(MasterServiceTest, StandbyRestoreKeepsLatestReplayOnOverlap) {
     // the removal replays both replicas at the same address. The later replay
     // is ground truth and wins.
     MasterService service(MakeStrictTenantConfig({"default"}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
     const auto seg = MakeStandbySegment("seg", "ep1", 4096);
     auto stale = MakeStandbyEntry("stale_key", 128, 0x1000, "ep1");
     auto fresh = MakeStandbyEntry("fresh_key", 128, 0x1040, "ep1");
