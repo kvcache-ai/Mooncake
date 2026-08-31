@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 gds = []
+kvcs-capi = []
 
 [dependencies]
 libc = "0.2"

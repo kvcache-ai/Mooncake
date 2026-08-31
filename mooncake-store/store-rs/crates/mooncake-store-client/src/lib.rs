@@ -6,6 +6,14 @@ mod placement;
 mod route_directory;
 mod transport;
 
+#[cfg(feature = "kvcs-capi")]
+pub use client::cold_tier::nof::{KvcsCapiLowLevelExecutor, KvcsCapiStandardExecutor};
+pub use client::cold_tier::nof::{
+    NofHighLevelBackend, NofHighLevelCapabilities, NofHighLevelExecutor, NofHighLevelObject,
+    NofHighLevelObjectMetadata, NofHighLevelRead, NofHighLevelShardPut, NofLowLevelCapabilities,
+    NofLowLevelDeleteRequest, NofLowLevelExecutor, NofLowLevelGetRequest, NofLowLevelTarget,
+    NofOwnership, OpaquePhysicalKey, PhysicalKeyCodec, PhysicalKeyInput, Sha256PhysicalKeyCodec,
+};
 pub use client::{
     stable_phase_spread_ms, BandwidthShaping, ColdTierKind, ColdTierOffloadMode,
     ColdTierShutdownMode, ColdTierSsdEngine, ColdTierTarget, ColdTierTargetConfig,
