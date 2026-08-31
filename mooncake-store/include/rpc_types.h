@@ -34,13 +34,8 @@ struct GetReplicaListRequestConfig {
     static const size_t RETURN_ALL_CANDIDATES = 0;
     size_t max_candidates = RETURN_ALL_CANDIDATES;
     std::optional<P2PGetReplicaListConfigExtra> p2p_config;
-    // Per-request correlation id propagated store -> master (read path).
-    // Carried as a struct_pack::compatible field: forward/backward compatible
-    // on the wire (old peers ignore the extra field; new peers see it null
-    // when absent), so client and master can be upgraded independently (gray).
-    struct_pack::compatible<std::string, 0> request_id;
 };
-YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config, request_id);
+YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config);
 
 // config for filter replicas in read route
 typedef GetReplicaListRequestConfig ReadRouteConfig;

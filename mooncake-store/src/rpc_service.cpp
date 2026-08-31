@@ -305,7 +305,7 @@ WrappedMasterService::GetReplicaList(
     return execute_rpc(
         "GetReplicaList",
         [&] { return GetMasterService().GetReplicaList(key, config); },
-        [&](auto& timer) { timer.LogRequest("key=", key, ", request_id=", config.request_id.value_or("")); },
+        [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
         [] {
             MasterMetricManager::instance().inc_get_replica_list_failures();
@@ -318,7 +318,7 @@ WrappedMasterService::BatchGetReplicaList(
     const GetReplicaListRequestConfig& config) {
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_requests = keys.size();
-    timer.LogRequest("requests_count=", total_requests, ", request_id=", config.request_id.value_or(""));
+    timer.LogRequest("requests_count=", total_requests);
     MasterMetricManager::instance().inc_batch_get_replica_list_requests(
         total_requests);
 
@@ -485,20 +485,17 @@ WrappedMasterService::GetReplicaListRpc(
     std::string_view key, const GetReplicaListRequestConfig& config) {
     // Bypass: the per-request request_id rides the out-of-band request
     // attachment (set client-side from g_current_ctx via
-    // send_request_with_attachment). Fold it into a config copy so the shared
-    // value-returning GetReplicaList body logs/metrics it correctly; falls
-    // back to the struct_pack::compatible config.request_id for the
-    // not-yet-converted dummy hop-A read path (which stamps the field). The
-    // read/log/metric logic is shared with the in-process GetReplicaList used
-    // by HTTP /batch_query_keys and tests; this handler only stamps the
-    // attachment and replies via ctx.response_msg.
-    auto effective_config = config;
+    // send_request_with_attachment). The read struct no longer carries a
+    // request_id field, so this handler logs the id from the attachment and
+    // delegates the read/log/metric logic to the value-returning
+    // GetReplicaList (also used in-process by HTTP /batch_query_keys and
+    // tests), then replies via ctx.response_msg.
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
-        effective_config.request_id = std::string(att);
+        VLOG(1) << "GetReplicaList request_id=" << att;
     }
 
-    auto result = GetReplicaList(key, effective_config);
+    auto result = GetReplicaList(key, config);
     ctx.response_msg(std::move(result));
 }
 
@@ -509,16 +506,15 @@ WrappedMasterService::BatchGetReplicaListRpc(
         ctx,
     const std::vector<std::string_view>& keys,
     const GetReplicaListRequestConfig& config) {
-    // See GetReplicaListRpc: fold the out-of-band attachment request_id into
-    // a config copy, then delegate to the shared value-returning
-    // BatchGetReplicaList (one source of read/log/metric logic).
-    auto effective_config = config;
+    // See GetReplicaListRpc: log the out-of-band attachment request_id, then
+    // delegate to the shared value-returning BatchGetReplicaList (one source
+    // of read/log/metric logic) and reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
-        effective_config.request_id = std::string(att);
+        VLOG(1) << "BatchGetReplicaList request_id=" << att;
     }
 
-    auto results = BatchGetReplicaList(keys, effective_config);
+    auto results = BatchGetReplicaList(keys, config);
     ctx.response_msg(std::move(results));
 }
 
