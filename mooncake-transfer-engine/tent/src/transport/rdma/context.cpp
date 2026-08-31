@@ -883,11 +883,34 @@ int RdmaContext::refreshPortAttributes() {
 }
 
 void RdmaContext::queryEffectiveSpeed() {
+    if (!native_context_ || !verbs_.ibv_query_port_speed) {
+        effective_speed_mbps_.store(0, std::memory_order_relaxed);
+        return;
+    }
     uint64_t speed = 0;
-    if (native_context_ && verbs_.ibv_query_port_speed &&
-        verbs_.ibv_query_port_speed(native_context_, params_->device.port,
-                                    &speed) != 0) {
-        speed = 0;  // verb present but failed: encodings decide
+    int rc = verbs_.ibv_query_port_speed(native_context_, params_->device.port,
+                                         &speed);
+    if (rc != 0) {
+        // Keep the last known value: on a degraded LAG, dropping to the
+        // encoded rate would overstate the port until the next successful
+        // query. Log once per failure episode, not per query.
+        effective_speed_query_failures_.fetch_add(1, std::memory_order_relaxed);
+        if (!effective_speed_query_failing_.exchange(
+                true, std::memory_order_relaxed)) {
+            LOG(WARNING) << "ibv_query_port_speed failed on " << device_name_
+                         << " (rc " << rc << "), keeping "
+                         << effective_speed_mbps_.load(
+                                std::memory_order_relaxed)
+                         << " Mb/s ("
+                         << effective_speed_query_failures_.load(
+                                std::memory_order_relaxed)
+                         << " failures so far)";
+        }
+        return;
+    }
+    if (effective_speed_query_failing_.exchange(false,
+                                                std::memory_order_relaxed)) {
+        LOG(INFO) << "ibv_query_port_speed recovered on " << device_name_;
     }
     // The verb reports 100 Mb/s units; store plain Mb/s.
     effective_speed_mbps_.store(speed * 100, std::memory_order_relaxed);

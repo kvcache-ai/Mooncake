@@ -134,6 +134,18 @@ class RdmaContext {
 
     RdmaParams &params() const { return *params_.get(); }
 
+    // True while linkSpeedGbps() is derived from ibv_query_port_speed()
+    // rather than the encoded speed x width.
+    bool effectiveSpeedKnown() const {
+        return effective_speed_mbps_.load(std::memory_order_relaxed) > 0;
+    }
+
+    // ibv_query_port_speed() errors since the device was opened. The verb
+    // being absent, or reporting 0, is not an error.
+    uint64_t effectiveSpeedQueryFailures() const {
+        return effective_speed_query_failures_.load(std::memory_order_relaxed);
+    }
+
     // PCIe Relaxed Ordering support
     bool isRelaxedOrderingEnabled() const { return relaxed_ordering_enabled_; }
 
@@ -145,7 +157,10 @@ class RdmaContext {
     // Decode one ibv_query_port result into active_speed_/active_width_.
     void recordPortSpeed(const ibv_port_attr &port_attr);
     // Ask ibv_query_port_speed() for the effective speed when the library
-    // has it; records 0 otherwise so linkSpeedGbps() falls back.
+    // has it; records 0 when the verb is absent or reports nothing, so
+    // linkSpeedGbps() falls back. A verb *error* keeps the last known value
+    // instead: on a degraded LAG, falling back would briefly restore the
+    // higher encoded rate. Failures are counted and logged on transition.
     void queryEffectiveSpeed();
 
     // Release every resource currently owned by this context. This is
@@ -177,6 +192,9 @@ class RdmaContext {
     std::atomic<int> active_width_{0};
     // From ibv_query_port_speed(), converted to Mb/s; 0 = unavailable.
     std::atomic<uint64_t> effective_speed_mbps_{0};
+    std::atomic<uint64_t> effective_speed_query_failures_{0};
+    // Whether the last query errored; drives the transition logging.
+    std::atomic<bool> effective_speed_query_failing_{false};
     int gid_index_ = -1;
     ibv_gid gid_;
 

@@ -275,7 +275,10 @@ All slice spraying parameters are configurable via the configuration file:
   reports is preferred: for a VF over LAG that is the bandwidth left after
   a PF drops out of the bond, which the encoded link rate cannot express.
   The verb is resolved as an optional symbol, so older libraries keep
-  working on the encoded rate
+  working on the encoded rate. A query *error* keeps the last known
+  effective speed (falling back would briefly restore the higher encoded
+  rate on a degraded LAG); failures are counted per device and logged once
+  per episode
 - The theoretical rate seeds the EWMA and bounds it to
   `[ewma_min_multiplier, ewma_max_multiplier]` times that rate
 - If a device's port speed cannot be read or is outside [min, max],

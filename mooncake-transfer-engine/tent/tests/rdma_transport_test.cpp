@@ -524,14 +524,37 @@ TEST_F(RdmaContextFakeVerbsTest, EffectiveSpeedPreferredWhenVerbReportsIt) {
     EXPECT_EQ(fake_port.query_speed_calls, 1);
 }
 
-TEST_F(RdmaContextFakeVerbsTest, EncodedRateWhenVerbFails) {
+// A transient verb failure must not revert a degraded LAG to the higher
+// encoded rate: the last known effective speed is held until a query
+// succeeds again (a real recovery re-fires PORT_ACTIVE / SPEED_CHANGE).
+TEST_F(RdmaContextFakeVerbsTest, EffectiveSpeedHeldWhenVerbFails) {
     fake_port.speed_100mbps = 2000;
     ASSERT_EQ(context_->refreshPortAttributes(), 0);
     ASSERT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
-    // The verb starts failing: the stale effective value must not linger.
-    fake_port.query_speed_rc = -1;
+    fake_port.query_speed_rc = EIO;
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+    EXPECT_EQ(context_->effectiveSpeedQueryFailures(), 2u);
+    // Recovery at a new speed is picked up again.
+    fake_port.query_speed_rc = 0;
+    fake_port.speed_100mbps = 4000;
     ASSERT_EQ(context_->refreshPortAttributes(), 0);
     EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);
+    EXPECT_EQ(context_->effectiveSpeedQueryFailures(), 2u);
+}
+
+// A verb that succeeds but reports 0 means "nothing to say", not a failure:
+// the encodings decide, as when the verb is absent.
+TEST_F(RdmaContextFakeVerbsTest, EncodedRateWhenVerbReportsZero) {
+    fake_port.speed_100mbps = 2000;
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    ASSERT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+    fake_port.speed_100mbps = 0;
+    ASSERT_EQ(context_->refreshPortAttributes(), 0);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);
+    EXPECT_EQ(context_->effectiveSpeedQueryFailures(), 0u);
 }
 
 TEST_F(RdmaContextFakeVerbsTest, EncodedRateWhenVerbAbsent) {
