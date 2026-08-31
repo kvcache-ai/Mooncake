@@ -3,18 +3,18 @@
 // way into the master GetReplicaListRpc handler. This makes the attachment
 // round-trip a deterministic CI assertion rather than a VLOG-only observation.
 //
-// Why single-key GetReplicaList and not the batch path: MasterClient::invoke_rpc
-// (single key) snapshots current_request_id_attachment() at entry and sends it
-// via send_request_with_attachment; invoke_batch_rpc does not attach, so the
-// batch handler would observe an empty attachment by design. We only exercise
-// the single-key read route.
+// Both single-key (invoke_rpc) and batch (invoke_batch_rpc) client templates
+// snapshot current_request_id_attachment() at entry and send it via
+// send_request_with_attachment. We exercise the single-key read route
+// (GetReplicaListRpc) and the batch-exist route (BatchExistKeyRpc) to prove the
+// attachment bypass works for both the single and batch invocation templates.
 //
-// The seam: rpc_service.cpp GetReplicaListRpc and BatchGetReplicaListRpc call
-// RecordObservedRequestId(attachment) inside their attachment block. After the
-// synchronous client call returns (syncAwait guarantees the handler already
+// The seam: the *Rpc handlers in rpc_service.cpp / centralized_rpc_service.cpp
+// call RecordObservedRequestId(attachment) inside their attachment block. After
+// the synchronous client call returns (syncAwait guarantees the handler already
 // replied, hence happens-before), the test reads LastObservedRequestId(). A
-// nonexistent key still records the attachment before the OBJECT_NOT_FOUND
-// lookup, so the key need not exist.
+// nonexistent key still records the attachment before the lookup, so the key
+// need not exist.
 
 #include <gtest/gtest.h>
 
@@ -81,6 +81,24 @@ TEST_F(RequestIdAttachmentTest, EmptyAttachmentWhenNoRequestId) {
 
     EXPECT_TRUE(LastObservedRequestId().empty())
         << "expected no observed request_id when none was set on the context";
+}
+
+// The batch-exist route goes through MasterClient::invoke_batch_rpc now using
+// send_request_with_attachment; the BatchExistKeyRpc handler must observe the id.
+TEST_F(RequestIdAttachmentTest, CarriesRequestIdOnBatchExistRoute) {
+    RequestContext ctx;
+    ctx.request_id = "attach-batch-exist";
+    set_current_request_context(std::move(ctx));
+
+    std::string key = "nonexistent_key_batch_exist_attachment_test";
+    std::vector<std::string_view> keys{key};
+    auto result = client_->BatchExistKey(keys);
+    (void)result;  // existence lookup result is irrelevant; the attachment is
+                   // recorded before the lookup.
+
+    EXPECT_EQ(LastObservedRequestId(), "attach-batch-exist")
+        << "request_id was not propagated via the coro_rpc attachment on the "
+           "batch-exist route (invoke_batch_rpc)";
 }
 
 }  // namespace
