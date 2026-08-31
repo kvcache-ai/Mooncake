@@ -144,7 +144,9 @@ def _load_cached_extension(build_dir: Path, is_musa: bool):
     module_name = _adapter_module_name(is_musa)
     spec = importlib.util.spec_from_file_location(module_name, extension_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load cached Mooncake PG adapter: {extension_path}")
+        raise ImportError(
+            f"Unable to load cached Mooncake PG adapter: {extension_path}"
+        )
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     try:
@@ -320,7 +322,10 @@ def _load_jit_adapter():
                         "Mooncake PG Torch adapter JIT requires a CUDA toolkit with nvcc; "
                         "install a CUDA toolkit or use a compatible runtime environment"
                     )
-                if not os.environ.get("TORCH_CUDA_ARCH_LIST") and not torch.cuda.is_available():
+                if (
+                    not os.environ.get("TORCH_CUDA_ARCH_LIST")
+                    and not torch.cuda.is_available()
+                ):
                     raise ImportError(
                         "Mooncake PG CUDA JIT is running without a visible CUDA device. "
                         "Set TORCH_CUDA_ARCH_LIST to a compatible architecture (for example, 8.0) "
@@ -373,7 +378,9 @@ def _compatibility_report() -> int:
     ninja = shutil.which("ninja")
     print(f"  ninja: {ninja or 'missing'}")
     print(f"  cached adapter: {cache_dir if cache_ready else 'missing'}")
-    print(f"  TORCH_CUDA_ARCH_LIST: {os.environ.get('TORCH_CUDA_ARCH_LIST', '<unset>')}")
+    print(
+        f"  TORCH_CUDA_ARCH_LIST: {os.environ.get('TORCH_CUDA_ARCH_LIST', '<unset>')}"
+    )
     if is_musa:
         mcc = _mcc_path()
         print(f"  mcc: {mcc or 'missing'}")
@@ -396,7 +403,11 @@ def _compatibility_report() -> int:
         toolchain_ready = nvcc is not None and nvcc.is_file()
         if not cuda_available and not os.environ.get("TORCH_CUDA_ARCH_LIST"):
             toolchain_ready = False
-    ready &= source_ready and core_ready and (cache_ready or (ninja is not None and toolchain_ready))
+    ready &= (
+        source_ready
+        and core_ready
+        and (cache_ready or (ninja is not None and toolchain_ready))
+    )
     print(f"  source bundle: {source_dir if source_ready else 'missing'}")
     print(f"  PG core library: {core_path if core_ready else 'missing'}")
     print(f"  cache: {_cache_root()}")
@@ -407,8 +418,12 @@ def _compatibility_report() -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Mooncake PG Torch JIT utility")
     action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument("--prebuild", action="store_true", help="build the PG adapter now")
-    action.add_argument("--report", action="store_true", help="print JIT compatibility information")
+    action.add_argument(
+        "--prebuild", action="store_true", help="build the PG adapter now"
+    )
+    action.add_argument(
+        "--report", action="store_true", help="print JIT compatibility information"
+    )
     args = parser.parse_args(argv)
     if args.report:
         return _compatibility_report()
@@ -423,6 +438,9 @@ if __name__ == "__main__":
 else:
     backend_module = _load_jit_adapter()
     globals().update(
-        {key: value for key, value in backend_module.__dict__.items()
-         if not key.startswith("_")}
+        {
+            key: value
+            for key, value in backend_module.__dict__.items()
+            if not key.startswith("_")
+        }
     )
