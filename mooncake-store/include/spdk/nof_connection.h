@@ -21,7 +21,26 @@ namespace mooncake {
 // qpairs are NOT thread-safe.  The pool is intended for use by one
 // dedicated thread (the pipeline loop).  Multi-threaded access requires
 // external synchronisation.
+//
+// Lifecycle state machine (kActive -> kDraining -> kClosed):
+//   - kActive:    normal path.  Submits and CQE callbacks run their full
+//                 bodies.
+//   - kDraining:  any qpair has reported a transport error.  GetNextQpair
+//                 returns nullptr so further submits are rejected.
+//                 CQE callbacks short-circuit and only return the
+//                 SpdkNofSubTask to its pool — they DO NOT touch task
+//                 memory, task-level counters, or call set_completed.
+//                 Final termination is owned by the worker via
+//                 SpdkNofQos::FinalizeAfterDrain once the pool's
+//                 inflight_blocks reach 0.
+//   - kClosed:    destructor has run.  Pure defensive state.
 // ---------------------------------------------------------------------------
+enum class QpairPoolState : uint32_t {
+    kActive = 0,
+    kDraining = 1,
+    kClosed = 2,
+};
+
 class NofQpairPool {
    public:
     /// Takes ownership of an already-allocated qpair vector.
@@ -43,14 +62,40 @@ class NofQpairPool {
     NofQpairPool &operator=(NofQpairPool &&) = delete;
 
     /// Round-robin dispatch — returns the next qpair for I/O submission.
+    /// Returns nullptr once the pool has entered DRAINING (a qpair
+    /// reported a transport error) so that callers cannot submit new
+    /// IO to a half-dead pool.
     spdk_nvme_qpair *GetNextQpair();
+
+    /// Mark the pool as DRAINING.  Idempotent.  After this call:
+    ///   - GetNextQpair() returns nullptr.
+    ///   - The CQE callback (nvmf_io_complete) MUST short-circuit
+    ///     before touching task memory or task-level counters.
+    ///   - TryGrow() returns 0.
+    ///
+    /// The worker calls this when NvmePollProcessCompletion returns a
+    /// negative value (qpair transport error).  The pool stays in
+    /// DRAINING until ~NofQpairPool transitions it to kClosed.
+    void EnterDraining(const char *reason);
+
+    bool IsDraining() const {
+        // True in BOTH kDraining and kClosed states.  Callbacks must
+        // short-circuit once the pool has left kActive, regardless of
+        // whether it's mid-drain or fully torn down.
+        auto s = state_.load(std::memory_order_acquire);
+        return s == QpairPoolState::kDraining || s == QpairPoolState::kClosed;
+    }
+    bool IsClosed() const {
+        return state_.load(std::memory_order_acquire) ==
+               QpairPoolState::kClosed;
+    }
 
     /// Poll all qpairs for completions.
     /// @param max_completions 0 = process everything that is ready.
     /// @return total number of completions processed (or negative on error).
     int32_t PollAll(uint32_t max_completions = 0);
 
-    /// Inflight tracking — true source of truth for "CQE may still fire".
+    /// Inflight tracking — synchronisation fence against late CQEs.
     ///
     /// Pairing contract:
     ///   - IncrementInflight() MUST be called BEFORE spdk_nvme_ns_cmd_*
@@ -61,25 +106,20 @@ class NofQpairPool {
     ///   - InflightCount() == 0 implies no callback is in flight and none
     ///     will be issued (because all submits are accounted for).
     ///
-    /// Memory ordering: release/acquire pair guarantees that InflightCount()
-    /// == 0 forms a synchronizes-with edge with the last DecrementInflight,
-    /// so all release-stores in the callback are visible to a thread that
-    /// observes InflightCount() == 0.
+    /// Memory ordering: release/acquire pair guarantees that
+    /// InflightCount() == 0 forms a synchronizes-with edge with the last
+    /// DecrementInflight, so all release-stores in the callback body
+    /// are visible to a thread that observes InflightCount() == 0.
     ///
-    /// First IncrementInflight sets was_ever_used_with_inflight_ so that
-    /// ~NofQpairPool can distinguish "truly quiescent" from "inflight
-    /// trivially 0 because no submit path uses Increment".
+    /// The counter is pool-level (not per-qpair): every callback
+    /// decrements inflight_count_ on the pool it belongs to, and every
+    /// submit the pool issued is tracked by the same counter.
     ///
-    /// Motivation: transfer paths (PipelineRead/PipelineWrite via the
-    /// worker pool) do NOT call IncrementInflight — they track in-flight
-    /// via task->outstanding_sub_io in the worker loop.  For those
-    /// paths, InflightCount()==0 is trivially satisfied even when real
-    /// I/O is in flight.  Without this metadata, ~NofQpairPool would
-    /// log "InflightCount==0 proven via WaitForInflightCompletion"
-    /// even when nothing was actually proven.  The metadata lets us
-    /// log a different (and accurate) message for the transfer-path
-    /// case: "InflightCount trivially 0; safety relies on caller
-    /// ordering" (see CloseNofSegment's safety contract).
+    /// was_ever_used_with_inflight_ distinguishes a pool that actually
+    /// fired an Increment from one whose submits all synchronously
+    /// failed before reaching the trampoline — both end up with
+    /// InflightCount == 0 but only the former has a meaningful
+    /// release/acquire synchronizes-with edge.
     void IncrementInflight() {
         inflight_count_.fetch_add(1, std::memory_order_release);
         // Set metadata on first Increment.  release (not relaxed) so
@@ -99,14 +139,13 @@ class NofQpairPool {
         return was_ever_used_with_inflight_.load(std::memory_order_acquire);
     }
 
-    /// Synchronization primitive: poll until InflightCount() == 0 or
-    /// budget_us elapses.  Used by ~NofQpairPool as the proof point that
-    /// "no CQE will fire after free_io_qpair".
-    ///
-    /// Returns true iff InflightCount() == 0 was observed within budget_us.
+    /// Spin until InflightCount() == 0 with no time budget.  Used by
+    /// ~NofQpairPool as the proof that no CQE will fire after
+    /// free_io_qpair.  Combined with the abort in EnterDraining, every
+    /// in-flight CQE is delivered before this returns.
     ///
     /// Does NOT modify inflight_count_; only observes it.
-    bool WaitForInflightCompletion(uint32_t budget_us);
+    bool WaitForInflightCompletion();
 
     size_t Size() const { return qpairs_.size(); }
     uint32_t MaxInflight() const {
@@ -130,10 +169,28 @@ class NofQpairPool {
     /// Return the target qpair count requested at construction time.
     uint32_t GetTargetCount() const { return target_count_; }
 
+#ifdef MOONCAKE_TEST_DRAIN
+    // Test-only injection: arm PollAll so that the NEXT call treats
+    // qpairs_[qpair_idx] as if spdk_nvme_qpair_process_completions
+    // returned a negative value.  Sibling qpairs are polled normally so
+    // any in-flight CQE they own fires through the real trampoline.
+    // Single-shot: the arm clears after one consumption.
+    void TestInjectPollErrorOnce(size_t qpair_idx) {
+        pending_inject_error_idx_.store(qpair_idx, std::memory_order_release);
+    }
+    size_t TestPendingInjectErrorIdx() const {
+        return pending_inject_error_idx_.load(std::memory_order_acquire);
+    }
+#endif
+
    private:
     std::vector<spdk_nvme_qpair *> qpairs_;
     std::atomic<uint32_t> round_robin_idx_{0};
     std::atomic<int32_t> inflight_count_{0};
+    // Lifecycle state — see QpairPoolState above.  Transitions:
+    //   kActive -> kDraining on EnterDraining() (qpair transport error)
+    //   kDraining -> kClosed   on ~NofQpairPool
+    std::atomic<QpairPoolState> state_{QpairPoolState::kActive};
     // Set on first IncrementInflight; read by ~NofQpairPool to
     // distinguish "truly quiescent" from "inflight trivially 0".
     std::atomic<bool> was_ever_used_with_inflight_{false};
@@ -149,6 +206,12 @@ class NofQpairPool {
     // so we cannot obtain the controller via qpairs_[0]->ctrlr; the
     // controller pointer must be stored explicitly at construction.
     spdk_nvme_ctrlr *ctrlr_;
+
+#ifdef MOONCAKE_TEST_DRAIN
+    // Test-only single-shot injection arm.  SIZE_MAX means no injection
+    // armed.  See TestInjectPollErrorOnce above.
+    std::atomic<size_t> pending_inject_error_idx_{SIZE_MAX};
+#endif
 };
 
 // ---------------------------------------------------------------------------

@@ -8,9 +8,7 @@
  * as a trampoline pair so the qpair pool can apply this proof
  * synchronously before destruction.
  *
- * The fix upgrades the previously unused inflight_count_ to a real
- * synchronization counter and adds WaitForInflightCompletion(budget_us).
- * ProbeNofSegment now uses IncrementInflight/DecrementInflight as a
+ * ProbeNofSegment uses IncrementInflight/DecrementInflight as a
  * trampoline pair, so the qpair pool can prove "no callback will fire
  * after free_io_qpair".
  *
@@ -132,14 +130,13 @@ TEST(NofQpairInflight, WasEverUsedStaysFalseIfNeverIncremented) {
 
 // ===========================================================================
 // INV-3: WaitForInflightCompletion returns immediately when
-// InflightCount==0.  This is the "happy path" of the fix: Phase 1b
-// finds inflight already 0 and returns true without polling SPDK.
+// InflightCount==0 — happy path: no polling required.
 // ===========================================================================
 
 TEST(NofQpairInflight, WaitReturnsImmediatelyWhenCountIsZero) {
     auto pool = MakeStubPool();
     auto start = std::chrono::steady_clock::now();
-    bool ok = pool->WaitForInflightCompletion(/*budget_us=*/30'000'000);
+    bool ok = pool->WaitForInflightCompletion();
     auto elapsed = std::chrono::steady_clock::now() - start;
     EXPECT_TRUE(ok);
     // Should complete in microseconds, not seconds.
@@ -154,20 +151,20 @@ TEST(NofQpairInflight, WaitReturnsTrueAfterDecrementPair) {
     pool->IncrementInflight();
     pool->DecrementInflight();
     pool->DecrementInflight();
-    EXPECT_TRUE(pool->WaitForInflightCompletion(/*budget_us=*/1'000'000));
+    EXPECT_TRUE(pool->WaitForInflightCompletion());
 }
 
 // ===========================================================================
-// INV-4: WaitForInflightCompletion with very small budget still
-// observes current state when count is already 0.  This guards the
-// fixed 30s budget against misconfiguration where someone passes 0.
+// INV-4: WaitForInflightCompletion has NO budget parameter — it is a
+// strict mechanism-level fence.  This test guards the API shape so
+// future regressions that re-introduce a budget get caught here.
 // ===========================================================================
 
-TEST(NofQpairInflight, WaitZeroBudgetReturnsCurrentState) {
+TEST(NofQpairInflight, WaitReturnsCurrentStateImmediately) {
     auto pool = MakeStubPool();
-    // Even with budget=0, if count is 0 we return true immediately
-    // (the loop body checks count first).
-    EXPECT_TRUE(pool->WaitForInflightCompletion(/*budget_us=*/0));
+    // Even without a budget, if count is 0 we return true immediately
+    // (the loop body checks count first and exits without sleeping).
+    EXPECT_TRUE(pool->WaitForInflightCompletion());
 }
 
 // ===========================================================================

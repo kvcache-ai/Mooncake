@@ -459,9 +459,11 @@ void SpdkWrapper::CloseNofSegment(nof_seg_handle *handle) {
     delete handle;           // alloc'd by OpenNofSegment
     // ~unique_ptr<NofConnection> runs:
     //   ~NofConnection → reset qpair_pool_ →
-    //   ~NofQpairPool → drain + WaitForInflightCompletion (silent
-    //   no-op for transfer paths) + free_io_qpair.
-    // Safety relies on caller having joined the worker pool first.
+    //   ~NofQpairPool → drain + WaitForInflightCompletion + free_io_qpair.
+    // For transfer paths the inflight counter is trivially 0 because
+    // Increment/Decrement is only called from the Probe path.  Real
+    // safety for transfer paths comes from ~TransferSubmitter joining
+    // the worker pool before closing handles.
     open_segments_.erase(it);
 }
 
@@ -652,23 +654,15 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     // defer the conn itself to ProbeCtxRecycler.
     // ──────────────────────────────────────────────────────────────
     if (!probe_ctx->done.load(std::memory_order_acquire)) {
-        constexpr uint32_t kProbeHardBudgetUs = 30'000'000;
-        bool quiescent =
-            conn->GetQpairPool().WaitForInflightCompletion(kProbeHardBudgetUs);
+        // Strict spin on InflightCount == 0.  PushWithConn remains as a
+        // defensive fallback if the counter never reaches 0 (target
+        // crash, SPDK impl bug); the next probe's Drain() will catch
+        // up.
+        bool quiescent = conn->GetQpairPool().WaitForInflightCompletion();
         if (!quiescent) {
-            // 30 s wasn't enough.  Defer the ctx, the conn, AND the
-            // submit wrapper to ProbeCtxRecycler; the next probe's
-            // Drain() will drop them in this order:
-            //   1) ctx (ProbeRequestContext freed first)
-            //   2) conn (~NofConnection → ~NofQpairPool → quiescent
-            //      wait + free_io_qpair)
-            //   3) wrapper (last — only dropped after free_io_qpair)
-            // Closing the window: any callback firing during
-            // step 2 finds a valid wrapper (so ProbeIoTrampoline can
-            // safely access w->pool and w->probe_ctx).
+            // Forward-compatibility guard for a false return.
             LOG(ERROR) << "ProbeNofSegment: qpair pool did not quiesce "
-                          "within 30 s — deferring destruction to "
-                          "next probe";
+                          "— deferring destruction to next probe";
             ProbeCtxRecycler::Instance().PushWithConn(
                 std::move(probe_ctx), std::move(conn),
                 std::move(submit_wrapper_sp));

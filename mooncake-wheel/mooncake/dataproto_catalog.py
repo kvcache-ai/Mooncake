@@ -629,9 +629,7 @@ class DataProtoCatalogTransfer:
             *publication["args"],
             **publication["kwargs"],
         )
-        if publication["method"] == "publish_append" and result.get(
-            "append_rejected"
-        ):
+        if publication["method"] == "publish_append" and result.get("append_rejected"):
             self.transfer.cleanup_dataproto_append(
                 publication["kwargs"]["previous_handle"],
                 publication["kwargs"]["handle"],

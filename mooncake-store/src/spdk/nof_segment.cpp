@@ -144,6 +144,12 @@ int NofSegment::SubmitRead(void *buf, uint64_t lba, uint32_t num_blocks,
     }
     uint64_t abs_lba = start_lba_ + lba;
     auto *qp = conn_->GetQpairPool().GetNextQpair();
+    if (!qp) {
+        // Pool entered DRAINING — refuse the submit so the caller can
+        // fail the transfer instead of letting a late CQE fire on a
+        // task the worker is about to finalise.
+        return -1;
+    }
     return spdk_nvme_ns_cmd_read(conn_->GetNs(), qp, buf, abs_lba, num_blocks,
                                  cb, cb_ctx, 0);
 }
@@ -164,6 +170,10 @@ int NofSegment::SubmitWrite(void *buf, uint64_t lba, uint32_t num_blocks,
     }
     uint64_t abs_lba = start_lba_ + lba;
     auto *qp = conn_->GetQpairPool().GetNextQpair();
+    if (!qp) {
+        // See SubmitRead — same rationale.
+        return -1;
+    }
     return spdk_nvme_ns_cmd_write(conn_->GetNs(), qp, buf, abs_lba, num_blocks,
                                   cb, cb_ctx, 0);
 }
@@ -263,6 +273,13 @@ ssize_t NofSegment::PipelineIO(void *buf, uint64_t lba, uint32_t total_blocks,
             ctx.inflight.fetch_add(1, std::memory_order_relaxed);
 
             auto *qp = pool.GetNextQpair();
+            if (!qp) {
+                // Pool entered DRAINING — back out the inflight bump
+                // and break out of the submit loop.
+                ctx.inflight.fetch_sub(1, std::memory_order_relaxed);
+                ctx.error.store(true, std::memory_order_release);
+                break;
+            }
             int rc;
             if (is_write) {
                 rc = spdk_nvme_ns_cmd_write(ns, qp, ptr, abs_lba + next_block,
