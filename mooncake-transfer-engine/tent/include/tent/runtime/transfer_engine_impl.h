@@ -84,6 +84,14 @@ struct TaskInfo {
     std::chrono::steady_clock::time_point attempt_post_time{};
     TransportType attempt_type{UNSPEC};
     bool attempt_active{false};
+    // Failure attribution for tent_task_failures_total (first failure wins):
+    // -1 = none, 0 = submit-stage, 1 = poll-stage. Set where the failure
+    // originates and never overwritten, so a poll-observed failure stays
+    // "poll" even when a later failover resubmit is synchronously rejected.
+    // Invariant for integrators: mark submit failures before any recovery
+    // attempt, so a task that recovers and later fails at poll still
+    // attributes its root cause to submit.
+    int8_t failure_stage{-1};
 
     TaskInfo() = default;
 
@@ -105,7 +113,8 @@ struct TaskInfo {
           post_time(other.post_time),
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
-          attempt_active(other.attempt_active) {}
+          attempt_active(other.attempt_active),
+          failure_stage(other.failure_stage) {}
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -125,7 +134,8 @@ struct TaskInfo {
           post_time(other.post_time),
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
-          attempt_active(other.attempt_active) {}
+          attempt_active(other.attempt_active),
+          failure_stage(other.failure_stage) {}
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -149,6 +159,7 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+            failure_stage = other.failure_stage;
         }
         return *this;
     }
@@ -175,6 +186,7 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+            failure_stage = other.failure_stage;
         }
         return *this;
     }

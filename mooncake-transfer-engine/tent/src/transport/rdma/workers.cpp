@@ -629,18 +629,6 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
             }
         };
 
-        if (!priority_promotion_per_entry_) {
-            auto* slice = drained.front().first;
-            const bool head_timed_out = slice && slice->enqueue_ts > 0 &&
-                                        current_ts >= slice->enqueue_ts &&
-                                        (current_ts - slice->enqueue_ts) >=
-                                            priority_promotion_timeout_ns_;
-            for (auto& slice_list : drained) {
-                requeue(head_timed_out ? to : from, slice_list);
-            }
-            return head_timed_out;
-        }
-
         std::vector<uint64_t> enqueue_ts;
         enqueue_ts.reserve(drained.size());
         for (auto& slice_list : drained) {
@@ -648,8 +636,12 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
             enqueue_ts.push_back(slice ? slice->enqueue_ts : 0);
         }
 
-        PromotionDecision decision = DecidePromotionPerEntry(
-            enqueue_ts, current_ts, priority_promotion_timeout_ns_);
+        PromotionDecision decision =
+            priority_promotion_per_entry_
+                ? DecidePromotionPerEntry(enqueue_ts, current_ts,
+                                          priority_promotion_timeout_ns_)
+                : DecidePromotionHeadOnly(enqueue_ts, current_ts,
+                                          priority_promotion_timeout_ns_);
 
         if (!decision.promoted_any()) {
             for (auto& slice_list : drained) requeue(from, slice_list);

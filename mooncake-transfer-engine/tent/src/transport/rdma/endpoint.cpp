@@ -19,18 +19,20 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
-#include <sstream>
 #include <iomanip>
-#include <queue>
 #include <mutex>
+#include <queue>
+#include <sstream>
+#include <string_view>
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
-#include "tent/transport/rdma/context.h"
-#include "tent/transport/rdma/endpoint_store.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/runtime/control_plane.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/rdma/context.h"
+#include "tent/transport/rdma/endpoint_store.h"
 
 namespace mooncake {
 namespace tent {
@@ -58,6 +60,18 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    uint16_t pkey_index,
                                    uint8_t service_level = 0,
                                    uint8_t traffic_class = 0);
+
+// A peer that reused the same nic path after restarting retires the stale
+// endpoint on the first bootstrap and expects a retry. Older peers also
+// returned success with an empty GID for that case.
+static bool isStaleEndpointBootstrapError(const Status& status) {
+    if (status.ok()) return false;
+    const std::string_view msg = status.message();
+    return msg.find("retired for reconnection") != std::string_view::npos ||
+           msg.find("Missing peer GID") != std::string_view::npos ||
+           msg.find("Endpoint not in handshaking state") !=
+               std::string_view::npos;
+}
 
 RdmaEndPoint::RdmaEndPoint()
     : status_(EP_UNINIT),
@@ -470,25 +484,53 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         }
         auto bootstrap_status =
             ControlClient::bootstrap(rpc_server_addr, local_desc, peer_desc);
+        auto simultaneousOpenReady = [&]() {
+            RWSpinlock::WriteGuard guard(lock_);
+            const bool same_peer = peer_server_name_ == peer_server_name &&
+                                   peer_nic_name_ == peer_nic_name;
+            const bool same_local_qps = qpNum() == local_desc.qp_num;
+            return status_.load(std::memory_order_relaxed) == EP_READY &&
+                   same_peer && same_local_qps;
+        };
         if (!bootstrap_status.ok()) {
             // With simultaneous open, the peer's bootstrap request may finish
             // our passive setup while this outbound RPC is still in flight.
             // A timeout therefore does not necessarily mean that connection
             // establishment failed. Reuse only the exact endpoint generation
             // that issued this RPC; EP_READY alone is not sufficient.
-            RWSpinlock::WriteGuard guard(lock_);
-            const bool same_peer = peer_server_name_ == peer_server_name &&
-                                   peer_nic_name_ == peer_nic_name;
-            const bool same_local_qps = qpNum() == local_desc.qp_num;
-            if (status_.load(std::memory_order_relaxed) == EP_READY &&
-                same_peer && same_local_qps) {
+            if (simultaneousOpenReady()) {
                 LOG(WARNING)
                     << "Bootstrap RPC failed after simultaneous-open passive "
                        "setup completed; reusing the established endpoint "
                     << endpoint_name_ << ": " << bootstrap_status.ToString();
                 return mooncake::tent::Status::OK();
             }
-            return bootstrap_status;
+            // Target retired a leftover endpoint from a previous peer process.
+            // The first RPC drops it; a second bootstrap creates a new one.
+            // Fixed targets also retry inside the same RPC, so this is the
+            // mixed-version / race fallback.
+            if (isStaleEndpointBootstrapError(bootstrap_status)) {
+                LOG(INFO)
+                    << "Retrying RDMA bootstrap after stale peer endpoint: "
+                    << bootstrap_status.ToString();
+                peer_desc = BootstrapDesc();
+                bootstrap_status = ControlClient::bootstrap(
+                    rpc_server_addr, local_desc, peer_desc);
+                if (!bootstrap_status.ok()) {
+                    if (simultaneousOpenReady()) {
+                        LOG(WARNING)
+                            << "Bootstrap retry failed after simultaneous-open "
+                               "passive setup completed; reusing the "
+                               "established endpoint "
+                            << endpoint_name_ << ": "
+                            << bootstrap_status.ToString();
+                        return mooncake::tent::Status::OK();
+                    }
+                    return bootstrap_status;
+                }
+            } else {
+                return bootstrap_status;
+            }
         }
         qp_num = peer_desc.qp_num;
         peer_gid = peer_desc.local_gid;

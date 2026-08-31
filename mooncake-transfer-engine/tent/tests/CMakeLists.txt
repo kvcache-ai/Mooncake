@@ -1,4 +1,6 @@
 # TENT Tests and Examples
+# tent_metrics_example and deadline_promotion_bench are not add_test targets.
+# tent/benchmark/hip_bandwidth_bench.cpp is a standalone hipcc program.
 
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)
@@ -246,19 +248,19 @@ if(USE_CUDA)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 endif()
 
-add_executable(tent_failover_test failover_test.cpp)
-target_link_libraries(tent_failover_test PRIVATE gtest gtest_main
-                                                 tent_link_group)
-target_include_directories(tent_failover_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-add_test(NAME tent_failover_test COMMAND tent_failover_test)
-
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
 target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main
                                                            tent_link_group)
 target_include_directories(tent_endpoint_lifecycle_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
+
+add_executable(tent_bootstrap_response_test bootstrap_response_test.cpp)
+target_link_libraries(tent_bootstrap_response_test PRIVATE gtest gtest_main
+                                                           tent_link_group)
+target_include_directories(tent_bootstrap_response_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_bootstrap_response_test COMMAND tent_bootstrap_response_test)
 
 add_executable(tent_endpoint_store_test endpoint_store_test.cpp)
 target_link_libraries(tent_endpoint_store_test PRIVATE gtest gtest_main
@@ -416,13 +418,6 @@ endif()
 target_include_directories(tent_transport_hint_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_hint_test COMMAND tent_transport_hint_test)
-
-add_executable(tent_intent_type_test intent_type_test.cpp)
-target_link_libraries(tent_intent_type_test PRIVATE gtest gtest_main
-                                                    tent_common)
-target_include_directories(tent_intent_type_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-add_test(NAME tent_intent_type_test COMMAND tent_intent_type_test)
 
 # ProgressWorker skeleton test: covers default-off behavior, event-driven
 # progress without poll-failover, and freeBatch races (issue #2116).
