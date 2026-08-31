@@ -102,7 +102,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
     server.register_handler<&RealClient::removeAllLocal_internal>(&real_client);
     server.register_handler<&RealClient::removeLocal_internal>(&real_client);
     server.register_handler<&RealClient::isExist_internal>(&real_client);
-    server.register_handler<&RealClient::batchIsExist_internal>(&real_client);
+    server.register_handler<&RealClient::batchIsExist_internal_rpc>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
     server.register_handler<&RealClient::get_buffer_info_dummy_helper>(
         &real_client);

@@ -22,6 +22,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "default_config.h"
+#include "request_context.h"
 
 namespace mooncake {
 
@@ -1074,17 +1075,30 @@ std::vector<int> RealClient::batch_put_from(
     return results;
 }
 
-std::vector<tl::expected<void, ErrorCode>>
+void
 RealClient::batch_put_from_dummy_helper(
+    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& dummy_buffers,
     const std::vector<size_t>& sizes, const WriteConfig& config,
     const UUID& client_id) {
+    // Bridge the per-request id from hop A's out-of-band attachment to hop B:
+    // install it in this (coro_rpc server) thread's g_current_ctx so the
+    // synchronous master RPC below re-attaches the same id.
+    std::optional<CurrentCtxScope> ctx_guard;
+    if (auto att = ctx.get_context_info()->get_request_attachment();
+        !att.empty()) {
+        RequestContext rc;
+        rc.request_id = std::string(att);
+        ctx_guard.emplace(std::move(rc));
+    }
+
     auto context_ptr = find_shm_context(client_id);
     if (!context_ptr) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        ctx.response_msg(std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS)));
+        return;
     }
     // Hold the context lock across translation and the transfer so a concurrent
     // unmap can't munmap the segments mid-transfer.
@@ -1124,11 +1138,12 @@ RealClient::batch_put_from_dummy_helper(
                        << dummy_addr << std::dec << ", size " << size << ") "
                        << "not found in any mapped shared memory for client "
                        << client_id;
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            ctx.response_msg(std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS)));
+            return;
         }
     }
-    return batch_put_from_internal(keys, buffers, sizes, config);
+    ctx.response_msg(batch_put_from_internal(keys, buffers, sizes, config));
 }
 
 std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
@@ -1251,17 +1266,30 @@ std::vector<int64_t> RealClient::batch_get_into(
     return results;
 }
 
-std::vector<tl::expected<int64_t, ErrorCode>>
+void
 RealClient::batch_get_into_dummy_helper(
+    coro_rpc::context<std::vector<tl::expected<int64_t, ErrorCode>>> ctx,
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& dummy_buffers,
     const std::vector<size_t>& sizes, const ReadRouteConfig& config,
     const UUID& client_id) {
+    // Bridge the per-request id from hop A's out-of-band attachment to hop B:
+    // install it in this (coro_rpc server) thread's g_current_ctx so the
+    // synchronous master RPC below re-attaches the same id.
+    std::optional<CurrentCtxScope> ctx_guard;
+    if (auto att = ctx.get_context_info()->get_request_attachment();
+        !att.empty()) {
+        RequestContext rc;
+        rc.request_id = std::string(att);
+        ctx_guard.emplace(std::move(rc));
+    }
+
     auto context_ptr = find_shm_context(client_id);
     if (!context_ptr) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        ctx.response_msg(std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS)));
+        return;
     }
     // Hold the context lock across translation and the transfer so a concurrent
     // unmap can't munmap the segments mid-transfer.
@@ -1301,11 +1329,12 @@ RealClient::batch_get_into_dummy_helper(
                        << dummy_addr << std::dec << ", size " << size << ") "
                        << "not found in any mapped shared memory for client "
                        << client_id;
-            return std::vector<tl::expected<int64_t, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            ctx.response_msg(std::vector<tl::expected<int64_t, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS)));
+            return;
         }
     }
-    return batch_get_into_internal(keys, buffers, sizes, config);
+    ctx.response_msg(batch_get_into_internal(keys, buffers, sizes, config));
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -1356,6 +1385,25 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
 
     // Call client BatchIsExist and return the vector<expected> directly
     return client_service_->BatchIsExist(keys);
+}
+
+void RealClient::batchIsExist_internal_rpc(
+    coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+    const std::vector<std::string>& keys) {
+    // V3 hop A entry (dummy path). Read the out-of-band request attachment and
+    // install a CurrentCtxScope so the synchronous hop B master RPC
+    // (client_service_->BatchIsExist -> master_client_.BatchExistKey, run via
+    // syncAwait on this same coro_rpc server thread) re-attaches the same id.
+    // The value-returning batchIsExist_internal stays the shared body (also used
+    // in-process by the real path).
+    std::optional<CurrentCtxScope> ctx_guard;
+    if (auto att = ctx.get_context_info()->get_request_attachment();
+        !att.empty()) {
+        RequestContext rc;
+        rc.request_id = std::string(att);
+        ctx_guard.emplace(std::move(rc));
+    }
+    ctx.response_msg(batchIsExist_internal(keys));
 }
 
 int RealClient::put_from_with_metadata(const std::string& key, void* buffer,

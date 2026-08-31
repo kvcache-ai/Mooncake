@@ -187,12 +187,20 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
         }
     }
 
+    // Bypass inject: snapshot the calling (Python) thread's per-request
+    // request_id once at entry, then carry it on hop A via
+    // send_request_with_attachment. The hop A server handler reads it back
+    // (when it is a V3 context handler) and bridges it to hop B; non-reading
+    // handlers ignore it. Empty attachment == plain send_request (gray).
+    std::string ctx_attachment = current_request_id_attachment();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
+                    return client.send_request_with_attachment<ServiceMethod>(
+                        std::string_view(ctx_attachment.data(),
+                                         ctx_attachment.size()),
                         std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
@@ -223,13 +231,19 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
         return error_results;
     }
 
+    // Bypass inject (see invoke_rpc): snapshot the per-request request_id on
+    // the calling thread once at entry and carry it on hop A via
+    // send_request_with_attachment.
+    std::string ctx_attachment = current_request_id_attachment();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
+                    return client.send_request_with_attachment<ServiceMethod>(
+                        std::string_view(ctx_attachment.data(),
+                                         ctx_attachment.size()),
                         std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
@@ -557,7 +571,7 @@ int DummyClient::isExist(const std::string& key) {
 std::vector<int> DummyClient::batchIsExist(
     const std::vector<std::string>& keys) {
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batchIsExist_internal, bool>(keys.size(),
+        invoke_batch_rpc<&RealClient::batchIsExist_internal_rpc, bool>(keys.size(),
                                                                    keys);
     std::vector<int> results;
     results.reserve(internal_results.size());
