@@ -332,25 +332,27 @@ void TentMetrics::recordTaskFailure(TransportType tp,
     });
 }
 
+// Gauge updates below deliberately ignore runtime_enabled_: gauges track
+// engine state through paired add/sub operations (attempt start/finish,
+// register/unregister), and skipping one half of a pair across a
+// setEnabled() transition would permanently corrupt the value. Counters and
+// histograms are samples and may be dropped while disabled; gauges are not.
 void TentMetrics::recordInflightAttemptStarted(TransportType tp) {
-    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
-        return;
+    if (!initialized_) return;
     inflight_attempts_.incCached(transportSlot(tp), [tp] {
         return std::array<std::string, 1>{transportTypeName(tp)};
     });
 }
 
 void TentMetrics::recordInflightAttemptFinished(TransportType tp) {
-    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
-        return;
+    if (!initialized_) return;
     inflight_attempts_.incCached(
         transportSlot(tp),
         [tp] { return std::array<std::string, 1>{transportTypeName(tp)}; }, -1);
 }
 
 void TentMetrics::recordRegisteredBufferBytes(TransportType tp, int64_t delta) {
-    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
-        return;
+    if (!initialized_) return;
     registered_buffer_bytes_.incCached(
         transportSlot(tp),
         [tp] { return std::array<std::string, 1>{transportTypeName(tp)}; },

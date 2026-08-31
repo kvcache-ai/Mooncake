@@ -138,12 +138,15 @@ class TentMetrics {
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
-    // is the signature of a stalled pipeline.
+    // is the signature of a stalled pipeline. Gauge updates are paired
+    // add/sub operations, so they execute whenever initialized and ignore
+    // setEnabled(): skipping one half of a pair across an enable/disable
+    // transition would permanently corrupt the gauge.
     void recordInflightAttemptStarted(TransportType tp);
     void recordInflightAttemptFinished(TransportType tp);
 
     // Registered buffer bytes per transport (gauge), maintained on
-    // register/unregisterLocalMemory.
+    // register/unregisterLocalMemory. Same pairing rule as above.
     void recordRegisteredBufferBytes(TransportType tp, int64_t delta);
 
     enum class Stage {

@@ -1260,6 +1260,53 @@ TEST_F(MetricsRecordingTest, PollFailureRecordsTaskFailureWithPollReason) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
 }
 
+// Gauges must stay symmetric across setEnabled() transitions: the runtime
+// switch governs statistical sampling, not state tracking. Skipping one half
+// of a paired add/sub would permanently corrupt the gauge (review feedback).
+TEST_F(MetricsRecordingTest, InflightGaugeSurvivesEnableToggle) {
+    auto& m = TentMetrics::instance();
+    auto before = MetricsSnapshot(m);
+
+    // Enabled at start, disabled before finish.
+    TentMetrics::setEnabled(true);
+    m.recordInflightAttemptStarted(RDMA);
+    TentMetrics::setEnabled(false);
+    m.recordInflightAttemptFinished(RDMA);
+
+    // Disabled at start, enabled before finish (reverse straddle).
+    m.recordInflightAttemptStarted(RDMA);
+    TentMetrics::setEnabled(true);
+    m.recordInflightAttemptFinished(RDMA);
+
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.counter("tent_inflight_attempts") -
+                  before.counter("tent_inflight_attempts"),
+              0);
+    EXPECT_EQ(after.series("tent_inflight_attempts{transport=\"rdma\"}") -
+                  before.series("tent_inflight_attempts{transport=\"rdma\"}"),
+              0);
+}
+
+TEST_F(MetricsRecordingTest, RegisteredBytesGaugeSurvivesEnableToggle) {
+    auto& m = TentMetrics::instance();
+    auto before = MetricsSnapshot(m);
+
+    TentMetrics::setEnabled(true);
+    m.recordRegisteredBufferBytes(RDMA, 4096);
+    TentMetrics::setEnabled(false);
+    m.recordRegisteredBufferBytes(RDMA, -4096);
+    TentMetrics::setEnabled(true);
+
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.counter("tent_registered_buffer_bytes") -
+                  before.counter("tent_registered_buffer_bytes"),
+              0);
+    EXPECT_EQ(
+        after.series("tent_registered_buffer_bytes{transport=\"rdma\"}") -
+            before.series("tent_registered_buffer_bytes{transport=\"rdma\"}"),
+        0);
+}
+
 // ---------------------------------------------------------------------------
 // L2 HTTP integration: scrape the real /metrics, /metrics/json, /health
 // endpoints via coro_http_client and assert on status + body. Validates the
