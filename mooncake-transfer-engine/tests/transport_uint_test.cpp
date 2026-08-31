@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <fstream>
@@ -269,6 +270,38 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
 
    private:
     bool extra_slice_ = false;
+};
+
+class ScriptedScatterTransport : public BatchResultTransport {
+   public:
+    void setStatus(TransferStatusEnum status) { status_.store(status); }
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        submitted_tasks_.fetch_add(tasks.size());
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus& status) override {
+        auto current = status_.load();
+        status.s = current;
+        status.transferred_bytes = 0;
+        if (current != TransferStatusEnum::WAITING &&
+            current != TransferStatusEnum::PENDING) {
+            auto* batch = reinterpret_cast<BatchDesc*>(batch_id);
+            if (task_id >= batch->task_list.size())
+                return Status::InvalidArgument("scripted task out of range");
+            batch->task_list[task_id].is_finished = true;
+        }
+        return Status::OK();
+    }
+
+    size_t submittedTasks() const { return submitted_tasks_.load(); }
+
+   private:
+    std::atomic<TransferStatusEnum> status_{TransferStatusEnum::WAITING};
+    std::atomic<size_t> submitted_tasks_{0};
 };
 
 class TransportTest : public ::testing::Test {
@@ -692,6 +725,183 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2}));
     transport->addExtraSlice();
     EXPECT_EQ(run(), (std::vector<bool>{false, false}));
+}
+
+TEST_F(TransportTest, ScatterLifecycleReportsPhysicalSuccess) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<ScriptedScatterTransport>();
+    transport->setStatus(TransferStatusEnum::COMPLETED);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"scripted", transport}});
+
+    constexpr SegmentID kSegmentId = 13;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "scripted";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                        std::move(descriptor));
+
+    std::array<char, 2> buffer{};
+    std::array<size_t, 2> offsets{0, 1};
+    std::array<size_t, 2> lengths{1, 1};
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete = {},
+    };
+
+    auto operation = engine.submitScatter({range});
+    EXPECT_TRUE(operation.wait().ok());
+    const auto snapshot = operation.snapshot();
+    EXPECT_EQ(snapshot.state, TransferEngine::ScatterTransferState::SUCCEEDED);
+    EXPECT_TRUE(snapshot.first_failure.ok());
+    EXPECT_EQ(snapshot.total_bytes, 2);
+    EXPECT_EQ(snapshot.in_flight_bytes, 0);
+    EXPECT_EQ(snapshot.total_fragments, 2);
+    EXPECT_EQ(snapshot.completed_fragments, 2);
+    EXPECT_EQ(snapshot.late_completions, 0);
+    EXPECT_TRUE(snapshot.physical_complete);
+    EXPECT_TRUE(snapshot.buffer_reusable);
+    EXPECT_GT(snapshot.submit_to_physical_completion.count(), 0);
+    EXPECT_EQ(transport->submittedTasks(), 2);
+}
+
+TEST_F(TransportTest, ScatterLifecycleQuarantinesLateCompletion) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<ScriptedScatterTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"scripted", transport}});
+
+    constexpr SegmentID kSegmentId = 14;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "scripted";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                        std::move(descriptor));
+
+    auto buffer = std::make_shared<std::array<char, 1>>();
+    std::weak_ptr<std::array<char, 1>> weak_buffer = buffer;
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    size_t callback_count = 0;
+    bool callback_timed_out = false;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer->size(),
+        .local_buffer = buffer->data(),
+        .local_capacity = buffer->size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                ++callback_count;
+                callback_timed_out = status.IsClock();
+            },
+    };
+
+    TransferEngine::ScatterTransferOptions options{
+        .local_lifetimes = {buffer},
+    };
+    auto operation = engine.submitScatter({range}, options);
+    options.local_lifetimes.clear();
+    buffer.reset();
+
+    auto status = operation.waitUntil(std::chrono::steady_clock::now());
+    EXPECT_TRUE(status.IsClock());
+    auto snapshot = operation.snapshot();
+    const auto first_failure = snapshot.first_failure.ToString();
+    EXPECT_EQ(snapshot.state, TransferEngine::ScatterTransferState::TIMED_OUT);
+    EXPECT_TRUE(snapshot.first_failure.IsClock());
+    EXPECT_EQ(snapshot.in_flight_bytes, 1);
+    EXPECT_EQ(snapshot.completed_fragments, 0);
+    EXPECT_EQ(snapshot.deadline_timeouts, 1);
+    EXPECT_FALSE(snapshot.physical_complete);
+    EXPECT_FALSE(snapshot.buffer_reusable);
+    EXPECT_EQ(callback_count, 1);
+    EXPECT_TRUE(callback_timed_out);
+    EXPECT_FALSE(weak_buffer.expired());
+
+    status = operation.cancelAndDrainUntil(std::chrono::steady_clock::now());
+    EXPECT_TRUE(status.IsClock());
+    EXPECT_EQ(status.ToString(), first_failure);
+    snapshot = operation.snapshot();
+    EXPECT_EQ(snapshot.state,
+              TransferEngine::ScatterTransferState::QUARANTINED);
+    EXPECT_EQ(snapshot.quarantined_bytes, 1);
+    EXPECT_EQ(snapshot.cancel_requests, 1);
+    EXPECT_EQ(snapshot.drain_attempts, 1);
+    EXPECT_EQ(snapshot.quarantine_events, 1);
+    EXPECT_FALSE(snapshot.buffer_reusable);
+    EXPECT_EQ(snapshot.first_failure.ToString(), first_failure);
+    EXPECT_FALSE(weak_buffer.expired());
+
+    transport->setStatus(TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(operation.wait().IsClock());
+    snapshot = operation.snapshot();
+    EXPECT_EQ(snapshot.state, TransferEngine::ScatterTransferState::DRAINED);
+    EXPECT_EQ(snapshot.in_flight_bytes, 0);
+    EXPECT_EQ(snapshot.quarantined_bytes, 0);
+    EXPECT_EQ(snapshot.completed_fragments, 1);
+    EXPECT_EQ(snapshot.late_completions, 1);
+    EXPECT_TRUE(snapshot.physical_complete);
+    EXPECT_TRUE(snapshot.buffer_reusable);
+    EXPECT_EQ(callback_count, 1);
+    EXPECT_TRUE(weak_buffer.expired());
+}
+
+TEST_F(TransportTest, ScatterLifecyclePreservesFirstPhysicalFailure) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<ScriptedScatterTransport>();
+    transport->setStatus(TransferStatusEnum::FAILED);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"scripted", transport}});
+
+    constexpr SegmentID kSegmentId = 15;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "scripted";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                        std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete = {},
+    };
+
+    auto operation = engine.submitScatter({range});
+    EXPECT_FALSE(operation.wait().ok());
+    const auto snapshot = operation.snapshot();
+    EXPECT_EQ(snapshot.state, TransferEngine::ScatterTransferState::FAILED);
+    EXPECT_TRUE(snapshot.first_failure.IsSocket());
+    EXPECT_TRUE(snapshot.physical_complete);
+    EXPECT_TRUE(snapshot.buffer_reusable);
 }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
