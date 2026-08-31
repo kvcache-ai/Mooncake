@@ -852,11 +852,11 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             auto caller_type =
                 getTypeEnum(LocationParser(options.location).type());
             if (caller_type == MTYPE_UNKNOWN) {
-                LOG(WARNING) << "Ignoring unknown caller location '"
-                             << options.location
-                             << "' for registered memory at " << addr_list[i]
-                             << " (probed '" << desc.location
-                             << "'); keeping probed location";
+                LOG(WARNING)
+                    << "Ignoring unknown caller location '" << options.location
+                    << "' for registered memory at " << addr_list[i]
+                    << " (probed '" << desc.location
+                    << "'); keeping probed location";
             } else if (caller_type != probed_type) {
                 LOG(WARNING) << "Ignoring caller location '" << options.location
                              << "' (type mismatch with probed '"
