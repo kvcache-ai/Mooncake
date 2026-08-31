@@ -267,16 +267,22 @@ ControlService::ControlService(const std::string& type,
         [this](const std::string_view& request, std::string& response) {
             onBootstrapRdma(request, response);
         });
+    // SendData/RecvData copy the full TCP payload. Running them inline on the
+    // io_context serializes every bulk transfer and stalls Probe/Bootstrap
+    // on the same thread. Offload matches Delegate: the connection coroutine
+    // suspends, copies run on the blocking executor, and other RPCs proceed.
     rpc_server_->registerFunction(
         SendData,
         [this](const std::string_view& request, std::string& response) {
             onSendData(request, response);
-        });
+        },
+        /*offload=*/true);
     rpc_server_->registerFunction(
         RecvData,
         [this](const std::string_view& request, std::string& response) {
             onRecvData(request, response);
-        });
+        },
+        /*offload=*/true);
     rpc_server_->registerFunction(
         Notify, [this](const std::string_view& request, std::string& response) {
             onNotify(request, response);
