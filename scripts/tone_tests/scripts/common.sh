@@ -36,6 +36,54 @@ setup_log_directory(){
     echo "Log directory set up at: $log_dir"
 }
 
+prepare_rocm_runtime_cache_args() {
+    local registry_addr=$1
+    local cache_root=${MOONCAKE_RUNTIME_CACHE:-}
+    local cache_key image_cache_dir cache_dir
+
+    if [ -z "$cache_root" ]; then
+        echo "ERROR: MOONCAKE_RUNTIME_CACHE is required for ROCm" >&2
+        return 1
+    fi
+    if ! [[ "$cache_root" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        echo "ERROR: MOONCAKE_RUNTIME_CACHE must be an absolute path without spaces: $cache_root" >&2
+        return 1
+    fi
+    mkdir -p -- "$cache_root" || return 1
+    cache_root=$(cd -P -- "$cache_root" && pwd) || return 1
+    if [ "$cache_root" = "/" ]; then
+        echo "ERROR: MOONCAKE_RUNTIME_CACHE must not resolve to /" >&2
+        return 1
+    fi
+
+    cache_key=${registry_addr##*@sha256:}
+    if [ "$cache_key" = "$registry_addr" ]; then
+        cache_key=$(printf '%s' "$registry_addr" | cksum | awk '{print $1}')
+    fi
+    cache_key=${cache_key:0:16}
+    image_cache_dir="${cache_root}/${cache_key}"
+    for cache_dir in \
+        aiter-jit pip tmp torch-extensions torchinductor triton xdg; do
+        mkdir -p -- "${image_cache_dir}/${cache_dir}" || return 1
+        [ -w "${image_cache_dir}/${cache_dir}" ] || {
+            echo "ERROR: ROCm runtime cache is not writable: ${image_cache_dir}/${cache_dir}" >&2
+            return 1
+        }
+    done
+
+    ROCM_RUNTIME_CACHE_ARGS=(
+        -v "${image_cache_dir}:/runtime-cache"
+        -e AITER_JIT_DIR=/runtime-cache/aiter-jit
+        -e PIP_CACHE_DIR=/runtime-cache/pip
+        -e TMPDIR=/runtime-cache/tmp
+        -e TORCH_EXTENSIONS_DIR=/runtime-cache/torch-extensions
+        -e TORCHINDUCTOR_CACHE_DIR=/runtime-cache/torchinductor
+        -e TRITON_CACHE_DIR=/runtime-cache/triton
+        -e XDG_CACHE_HOME=/runtime-cache/xdg
+    )
+    echo "Using image-scoped ROCm runtime cache: $image_cache_dir"
+}
+
 docker_launch(){
     local registry_addr=$1
     local extra_args=$2
@@ -90,6 +138,8 @@ docker_launch(){
             -v "${BASE_DIR}:/test_run"
             --entrypoint bash
         )
+        prepare_rocm_runtime_cache_args "$registry_addr" || return 1
+        docker_args+=("${ROCM_RUNTIME_CACHE_ARGS[@]}")
         local host_libionic=""
         if command -v ldconfig >/dev/null 2>&1; then
             host_libionic=$(ldconfig -p 2>/dev/null | awk '/libionic[.]so[.]1/{print $NF; exit}')

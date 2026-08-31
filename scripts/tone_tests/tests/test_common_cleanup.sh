@@ -175,6 +175,47 @@ test_rocm_memory_query_requires_every_allocated_gpu() (
         || fail "ROCm memory query accepted an incomplete allocation"
 )
 
+test_rocm_runtime_cache_is_image_scoped() (
+    export CONTAINER_NAME=mooncake-cache-test
+    temp_dir=$(mktemp -d)
+    trap 'rm -rf "$temp_dir"' EXIT
+    export MOONCAKE_RUNTIME_CACHE="$temp_dir/runtime-cache"
+    test_case_name=cleanup_unit
+    # shellcheck disable=SC1090
+    source "$COMMON_SH"
+
+    registry_addr='example/sglang@sha256:0123456789abcdef0123456789abcdef'
+    prepare_rocm_runtime_cache_args "$registry_addr" \
+        || { fail "ROCm runtime cache preparation failed"; return 1; }
+
+    expected_dir="$(cd -P "$MOONCAKE_RUNTIME_CACHE" && pwd)/0123456789abcdef"
+    for cache_dir in \
+        aiter-jit pip tmp torch-extensions torchinductor triton xdg; do
+        [ -d "$expected_dir/$cache_dir" ] \
+            || { fail "missing runtime cache directory: $cache_dir"; return 1; }
+    done
+
+    args=$(printf '%s\n' "${ROCM_RUNTIME_CACHE_ARGS[@]}")
+    printf '%s\n' "$args" | grep -Fxq "$expected_dir:/runtime-cache" \
+        || { fail "runtime cache bind mount is missing"; return 1; }
+    printf '%s\n' "$args" | grep -Fxq 'AITER_JIT_DIR=/runtime-cache/aiter-jit' \
+        || { fail "AITER JIT cache is not redirected"; return 1; }
+    printf '%s\n' "$args" | grep -Fxq 'TRITON_CACHE_DIR=/runtime-cache/triton' \
+        || { fail "Triton cache is not redirected"; return 1; }
+)
+
+test_rocm_runtime_cache_rejects_unsafe_root() (
+    export CONTAINER_NAME=mooncake-cache-test
+    export MOONCAKE_RUNTIME_CACHE=/
+    test_case_name=cleanup_unit
+    # shellcheck disable=SC1090
+    source "$COMMON_SH"
+
+    if prepare_rocm_runtime_cache_args example/sglang:latest; then
+        fail "ROCm runtime cache accepted the filesystem root"
+    fi
+)
+
 test_cuda_cleanup_aggregates_both_nodes() (
     export CI_ACCELERATOR=cuda
     export CONTAINER_NAME=mooncake-cleanup-test
@@ -280,6 +321,8 @@ run_test_case test_rocm_cleanup_is_idempotent
 run_test_case test_remote_rocm_failure_is_aggregated
 run_test_case test_rocm_process_postflight_detects_allocated_device_holder
 run_test_case test_rocm_memory_query_requires_every_allocated_gpu
+run_test_case test_rocm_runtime_cache_is_image_scoped
+run_test_case test_rocm_runtime_cache_rejects_unsafe_root
 run_test_case test_cuda_cleanup_aggregates_both_nodes
 run_test_case test_cuda_process_launch_keeps_legacy_pid_tracking
 run_test_case test_run_all_propagates_cleanup_failure
