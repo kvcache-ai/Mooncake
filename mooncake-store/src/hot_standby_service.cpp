@@ -86,6 +86,10 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     batch_standby_reader_.reset();
     batch_standby_kv_backend_.reset();
     batch_snapshot_baseline_.reset();
+    {
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_.reset();
+    }
 
     last_error_.store(ErrorCode::OK, std::memory_order_release);
 
@@ -300,6 +304,8 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
         if (cursor_error != ErrorCode::OK) {
             return cursor_error;
         }
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_ = *batch_snapshot_baseline_;
     }
 
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
@@ -384,11 +390,8 @@ void HotStandbyService::Stop() {
 
 std::optional<DurablePrefix>
 HotStandbyService::GetLastAppliedBatchOpLogSnapshotPrefix() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!batch_standby_reader_) {
-        return std::nullopt;
-    }
-    return batch_standby_reader_->GetLastAppliedDurablePrefix();
+    std::lock_guard<std::mutex> lock(batch_snapshot_cursor_mutex_);
+    return last_applied_batch_snapshot_prefix_;
 }
 
 void HotStandbyService::CancelBatchOpLogSnapshotCapture() {
@@ -904,6 +907,12 @@ void HotStandbyService::ReplicationLoop() {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
             auto result = batch_standby_reader_->PollOnce();
+            {
+                std::lock_guard<std::mutex> cursor_lock(
+                    batch_snapshot_cursor_mutex_);
+                last_applied_batch_snapshot_prefix_ =
+                    batch_standby_reader_->GetLastAppliedDurablePrefix();
+            }
             HandleSnapshotCaptureRequest(result);
             if (result.durable_prefix_present) {
                 const uint64_t current_primary = primary_seq_id_.load();

@@ -291,6 +291,8 @@ class HotStandbyService {
     std::atomic<bool> replication_loop_running_{false};
     std::mutex replication_loop_mutex_;
     std::condition_variable replication_loop_cv_;
+    mutable std::mutex batch_snapshot_cursor_mutex_;
+    std::optional<DurablePrefix> last_applied_batch_snapshot_prefix_;
 
     std::shared_ptr<BatchOpLogSnapshotCapture::LeaseState>
         snapshot_capture_state_{

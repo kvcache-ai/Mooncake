@@ -344,16 +344,28 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         return result;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        capture_active_ = true;
-    }
     auto capture = standby_.BeginBatchOpLogSnapshotCapture();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         capture_active_ = capture.has_value();
+        if (capture && promotion_requested_) {
+            capture_active_ = false;
+        }
     }
     if (!capture || capture->last_included_batch_id <= *reread_latest) {
+        release_lease();
+        FinishAttempt(ErrorCode::OK, true);
+        return ErrorCode::OK;
+    }
+
+    bool cancel_after_promotion = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancel_after_promotion = promotion_requested_;
+    }
+    if (cancel_after_promotion) {
+        standby_.CancelBatchOpLogSnapshotCapture();
+        standby_.EndBatchOpLogSnapshotCapture(*capture);
         release_lease();
         FinishAttempt(ErrorCode::OK, true);
         return ErrorCode::OK;
