@@ -25,7 +25,7 @@ struct RpcNameTraits<&WrappedMasterService::ExistKey> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
+struct RpcNameTraits<&WrappedMasterService::BatchExistKeyRpc> {
     static constexpr const char* value = "BatchExistKey";
 };
 
@@ -233,7 +233,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKeyRpc, bool>(
         object_keys.size(), object_keys);
     timer.LogResponse("result=", result.size(), " keys");
     return result;

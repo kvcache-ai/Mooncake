@@ -521,6 +521,24 @@ WrappedMasterService::BatchGetReplicaListRpc(
     ctx.response_msg(std::move(results));
 }
 
+void
+WrappedMasterService::BatchExistKeyRpc(
+    coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+    const std::vector<std::string_view>& keys) {
+    // Bypass: the per-request request_id rides the out-of-band attachment set
+    // client-side by invoke_batch_rpc (send_request_with_attachment). Log it
+    // here, then delegate to the value-returning BatchExistKey (shared with
+    // in-process/tests) and reply via ctx.response_msg.
+    if (auto att = ctx.get_context_info()->get_request_attachment();
+        !att.empty()) {
+        VLOG(1) << "BatchExistKey request_id=" << att;
+        RecordObservedRequestId(att);
+    }
+
+    auto result = BatchExistKey(keys);
+    ctx.response_msg(std::move(result));
+}
+
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                         mooncake::WrappedMasterService& wrapped_master_service,
                         bool include_heartbeat) {
@@ -556,7 +574,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnregisterClient>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
+    server.register_handler<&mooncake::WrappedMasterService::BatchExistKeyRpc>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);

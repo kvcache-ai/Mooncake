@@ -37,6 +37,16 @@ class WrappedMasterService {
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string_view>& keys);
 
+    // Bypass (out-of-band attachment) RPC handler for the batch-exist route.
+    // Mirrors GetReplicaListRpc/BatchGetReplicaListRpc: log the per-request
+    // request_id read from the coro_rpc attachment, delegate to the
+    // value-returning BatchExistKey (also used in-process by tests), and reply
+    // via ctx.response_msg. The client invokes this *Rpc variant; the value
+    // body stays untouched for in-process callers.
+    void BatchExistKeyRpc(
+        coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+        const std::vector<std::string_view>& keys);
+
     tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>

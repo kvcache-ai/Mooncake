@@ -29,6 +29,19 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config);
 
+    // Bypass (out-of-band attachment) RPC handler for the batch-put-start route.
+    // Mirrors the read-route *Rpc handlers: log the per-request request_id from
+    // the coro_rpc attachment (set client-side by invoke_batch_rpc), delegate to
+    // the value-returning BatchPutStart (shared with in-process tests), and
+    // reply via ctx.response_msg.
+    void BatchPutStartRpc(
+        coro_rpc::context<std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>>
+            ctx,
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& slice_lengths,
+        const ReplicateConfig& config);
+
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys);
 
