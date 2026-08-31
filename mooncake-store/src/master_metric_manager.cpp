@@ -9,6 +9,7 @@
 
 #include "segment.h"
 #include "utils.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -483,9 +484,17 @@ MasterMetricManager::MasterMetricManager()
           "Total number of MarkTaskToComplete requests received"),
       mark_task_to_complete_failures_(
           "master_update_task_failures_total",
-          "Total number of failed MarkTaskToComplete requests") {
+          "Total number of failed MarkTaskToComplete requests"),
+      build_info_("mooncake_build_info",
+                  "Build version of the running master; the value is always 1 "
+                  "and the version strings are carried by the labels",
+                  {{"version", GetMooncakeStoreVersion()},
+                   {"display_version", MOONCAKE_DISPLAY_VERSION}}) {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
+    // Info-style metric: emit a single series for the build this binary was
+    // compiled from. Set once here because the value never changes at runtime.
+    build_info_.update(1);
 }
 
 // --- Metric Interface Methods ---
@@ -1987,6 +1996,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
+    serialize_metric(build_info_);
 
     // Serialize Snapshot Metrics
     serialize_metric(snapshot_duration_ms_);

@@ -10,7 +10,7 @@ Mooncake Store provides low-level object storage and management capabilities, in
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
-- **Optional object grouping**: Related objects can carry an optional group ID so that the Master can route their metadata to the same shard and apply best-effort shared lifecycle behavior.
+- **Optional object grouping**: Related objects can carry an optional group ID so that the Master applies best-effort shared lifecycle behavior. Object routing stays decoupled from groups (always `hash(tenant, key)`); grouping only carries a shared group TTL.
 - **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure. Each slice within an object is guaranteed to be placed in different segments, while different objects' slices may share segments. Replication operates on a best-effort basis.
 - **Strong consistency**: Mooncake Store guarantees that `Get` operations always return correct and complete data. Once an object has been successfully `Put`, it remains immutable until removal, ensuring that all subsequent `Get` requests retrieve the most recent value.
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
@@ -45,7 +45,7 @@ The `Client` can be used in three ways:
 Mooncake store supports two deployment methods to accommodate different availability requirements:
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
 2. **High availability mode**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
-If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election, ensuring continuous availability.
+If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election. Election alone does not make a node ready to serve: the elected node must complete standby catch-up, export and validate the complete promotion context, restore that context (including a valid empty context), and revalidate leadership. If any step fails, the node remains unavailable rather than serving from unverified or partial metadata.
 
 In both modes, the leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
 
@@ -453,13 +453,14 @@ Mooncake Store remains an object-oriented KV cache: objects are still put, queri
 
 For single-object writes, `group_ids` contains one entry. For batch writes, it must have the same length as the key list, and entry `i` is the group ID for key `i`. An empty string stores that key as ungrouped, and leaving the field unset preserves the legacy ungrouped behavior. For an existing object, group membership is immutable: `Upsert` may preserve the existing group, but it cannot move the object to another group or clear its group while the object exists.
 
-On the Master side, group state is tenant-scoped. Objects with a non-empty group ID are routed to the metadata shard selected by `hash(group_id)`, and the Master keeps a tenant-scoped object-to-group routing index so existing key-based APIs can still locate grouped objects. The Master tracks only the current member set of each group; it does not require an expected member count, a member index, or a commit protocol for group completeness.
+On the Master side, objects are always routed by `hash(tenant, key)` — group membership is an annotation, not a routing key. Group state is tenant-scoped and kept in a separate, single group domain (`group_domain_`) keyed by `scoped(tenant, group_id)`; it holds only the current member key list plus one shared group TTL. Existing key-based APIs locate grouped objects via `hash(tenant, key)` as usual; there is no object-to-group routing index. The Master tracks only the current member set of each group; it does not require an expected member count, a member index, or a commit protocol for group completeness.
 
 Group metadata affects lifecycle behavior on a best-effort basis:
 
-- `ExistKey` and `GetReplicaList` refresh the ordinary read lease for the current members of the group. Object soft-pin deadlines are independent and are not extended.
-- Memory eviction expands a grouped candidate to the group's current members and then applies the existing per-object safety checks. Members with active leases, hard pins, soft pins when soft-pin eviction is disabled, incomplete writes, busy replicas, or unavailable replica states are skipped.
-- Object removal APIs, copy/move tasks, and NoF eviction keep their existing object-level semantics. Group routing and membership metadata are cleaned up when objects are removed.
+- `ExistKey` and `GetReplicaList` refresh the group's shared read TTL. A read of any member extends the same group TTL, so the whole group is protected together; a grouped object's own per-member lease is not authoritative. Object soft-pin deadlines are independent and are not extended.
+- Memory eviction first consults the group's single shared TTL: if the group was read recently it is skipped as a whole; otherwise the group's current members are evicted all-or-none, applying the existing per-object safety checks (hard pins, soft pins when soft-pin eviction is disabled, incomplete writes, busy replicas, unavailable replica states) on a best-effort basis. The number of evicted objects is bounded by the requested eviction ratio.
+- Object removal APIs, copy/move tasks, and NoF eviction keep their existing object-level semantics. Group membership metadata is cleaned up when objects are removed.
+- On snapshot/standby restore, group state is rebuilt from object metadata, preserving the group's maximum restored lease deadline so grouped objects are not dropped as expired. Snapshots produced by a router that placed grouped objects on `hash(group_id)` shards are automatically re-routed to `hash(tenant, key)` on restore (`ReRouteRestoredObjectsByKey`), so they need not be regenerated; current-format snapshots restore correctly.
 
 This design is intentionally lightweight and backward compatible. Grouping should be treated as a lifecycle hint for related objects, not as a transactional guarantee that all members are created, made visible, or evicted atomically.
 

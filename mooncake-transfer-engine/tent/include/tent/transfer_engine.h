@@ -207,6 +207,7 @@ int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
 int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
                           tent_status_t* statuses, size_t* count);
 
+// Only NICs currently able to carry traffic are reported (see NicLoadStats).
 struct tent_nic_load_stat {
     char device_name[64];
     uint64_t inflight_bytes;

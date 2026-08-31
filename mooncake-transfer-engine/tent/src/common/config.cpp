@@ -179,9 +179,11 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // MC_CUSTOM_TOPO_JSON works under MC_USE_TENT. Inline
     // topology/priority_matrix in MC_TENT_CONF still takes precedence.
     setConfig(config, "MC_CUSTOM_TOPO_JSON", "topology/custom_json_path");
-    // TENT RPC server io_context threads. The TCP data-path handlers do
-    // full-payload blocking copies inline, so deployments pushing bulk data
-    // over the TENT TCP transport raise this above the default of 1.
+    // TENT RPC server io_context threads. TCP SendData/RecvData copies are
+    // offloaded onto the blocking executor; this pool still reads the RPC
+    // attachments. When TCP is enabled and this key is unset, the engine
+    // defaults to several threads so concurrent bulk transfers are not
+    // serialized on one io_context.
     setConfig(config, "MC_TENT_RPC_THREADS", "rpc_server_threads");
     return status;
 }

@@ -124,6 +124,7 @@ struct PutStartActionData {
     std::optional<size_t> expected_replica_count{};
     std::optional<ReplicaStatus> expected_replica_status{};
     std::optional<std::vector<std::string>> expected_memory_nodes{};
+    std::chrono::milliseconds eventual_timeout{};
 
     template <PutStartExpectation>
     friend struct PutStartAction;
@@ -240,6 +241,15 @@ struct PutStartAction : PutStartActionData {
     {
         PutStartAction<PutStartExpectation::SUCCESS> action(*this);
         action.expected_memory_nodes.emplace(values.begin(), values.end());
+        return action;
+    }
+
+    auto Eventually(
+        std::chrono::milliseconds timeout = std::chrono::seconds(2)) const
+        requires(expectation != PutStartExpectation::ERROR)
+    {
+        PutStartAction<PutStartExpectation::SUCCESS> action(*this);
+        action.eventual_timeout = timeout;
         return action;
     }
 
