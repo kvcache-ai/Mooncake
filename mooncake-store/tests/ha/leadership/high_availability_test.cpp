@@ -517,6 +517,7 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
     ASSERT_EQ(ha::AcquireLeadershipStatus::CONTENDED, contended->status);
     ASSERT_FALSE(contended->observed_view.has_value());
 
+#ifdef STORE_USE_ETCD
     EtcdLeaseId legacy_lease = 0;
     ASSERT_EQ(ErrorCode::OK,
               EtcdHelper::GrantLease(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC,
@@ -531,6 +532,7 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
                   legacy_address.c_str(), legacy_address.size(), legacy_lease,
                   legacy_revision));
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::RevokeLease(legacy_lease));
+#endif
 
     // The lease-bound placeholder is not exposed as a routable master view.
     current_view = coordinator->ReadCurrentView();
