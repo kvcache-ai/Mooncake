@@ -1,7 +1,9 @@
 #include "offset_allocator/offset_allocator.h"
 #include "mutex.h"
+#include "serialize/serializer.h"
 #include "serializer.h"
 #include "types.h"
+#include "utils/zstd_util.h"
 
 #include <gtest/gtest.h>
 
@@ -531,6 +533,91 @@ class OffsetAllocatorTest : public ::testing::Test {
         return buffer;
     }
 
+    msgpack::sbuffer serializeLegacyAllocatorMsgpack(
+        const std::shared_ptr<OffsetAllocator>& allocator) {
+        MutexLocker lock(&allocator->m_mutex);
+        const auto& inner = *allocator->m_allocator;
+
+        uint32 legacy_used_bins_top = 0;
+        uint8 legacy_used_bins[NUM_TOP_BINS]{};
+        NodeIndex legacy_bin_indices[LEGACY_NUM_LEAF_BINS];
+        std::fill(std::begin(legacy_bin_indices), std::end(legacy_bin_indices),
+                  __Allocator::Node::unused);
+        auto legacy_nodes = inner.m_nodes;
+
+        for (uint32 bin = 0; bin < NUM_LEAF_BINS; ++bin) {
+            NodeIndex node_index = inner.m_binIndices[bin];
+            while (node_index != __Allocator::Node::unused) {
+                const NodeIndex next = inner.m_nodes[node_index].binListNext;
+                auto& node = legacy_nodes[node_index];
+                const uint32 legacy_bin = legacyBinIndex(node.dataSize);
+                EXPECT_LT(legacy_bin, LEGACY_NUM_LEAF_BINS);
+                const uint32 top_bin = legacy_bin >> 3;
+                const uint32 leaf_bin = legacy_bin & 0x7;
+                const NodeIndex current_head = legacy_bin_indices[legacy_bin];
+                node.binListPrev = __Allocator::Node::unused;
+                node.binListNext = current_head;
+                if (current_head != __Allocator::Node::unused) {
+                    legacy_nodes[current_head].binListPrev = node_index;
+                }
+                legacy_bin_indices[legacy_bin] = node_index;
+                legacy_used_bins[top_bin] |= uint8{1} << leaf_bin;
+                legacy_used_bins_top |= uint32{1} << top_bin;
+                node_index = next;
+            }
+        }
+
+        std::vector<uint8_t> serialized_nodes;
+        serialized_nodes.reserve(inner.m_current_capacity * 25);
+        for (uint32 i = 0; i < inner.m_current_capacity; ++i) {
+            const auto& node = legacy_nodes[i];
+            serialized_nodes.push_back(node.used ? 1 : 0);
+            SerializationHelper::serializeUint32(node.dataOffset,
+                                                 serialized_nodes);
+            SerializationHelper::serializeUint32(node.dataSize,
+                                                 serialized_nodes);
+            SerializationHelper::serializeUint32(node.binListPrev,
+                                                 serialized_nodes);
+            SerializationHelper::serializeUint32(node.binListNext,
+                                                 serialized_nodes);
+            SerializationHelper::serializeUint32(node.neighborPrev,
+                                                 serialized_nodes);
+            SerializationHelper::serializeUint32(node.neighborNext,
+                                                 serialized_nodes);
+        }
+
+        std::vector<uint8_t> serialized_free_nodes;
+        serialized_free_nodes.reserve(inner.m_current_capacity * 4);
+        for (uint32 i = 0; i < inner.m_current_capacity; ++i) {
+            SerializationHelper::serializeUint32(inner.m_freeNodes[i],
+                                                 serialized_free_nodes);
+        }
+
+        msgpack::sbuffer buffer;
+        MsgpackPacker packer(&buffer);
+        packer.pack_array(6);
+        packer.pack(allocator->m_base);
+        packer.pack(allocator->m_multiplier_bits);
+        packer.pack(allocator->m_capacity);
+        packer.pack(allocator->m_allocated_size);
+        packer.pack(allocator->m_allocated_num);
+
+        packer.pack_array(10);
+        packer.pack(inner.m_size);
+        packer.pack(inner.m_current_capacity);
+        packer.pack(inner.m_max_capacity);
+        packer.pack(inner.m_freeStorage);
+        packer.pack(legacy_used_bins_top);
+        packer.pack_array(NUM_TOP_BINS);
+        for (uint8 used_bin : legacy_used_bins) packer.pack(used_bin);
+        packer.pack_array(LEGACY_NUM_LEAF_BINS);
+        for (NodeIndex bin_index : legacy_bin_indices) packer.pack(bin_index);
+        packer.pack(zstd_compress(serialized_nodes, 3));
+        packer.pack(zstd_compress(serialized_free_nodes, 3));
+        packer.pack(inner.m_freeOffset);
+        return buffer;
+    }
+
     void testSerializeAllocator(
         const std::shared_ptr<OffsetAllocator>& alloc_a,
         const std::vector<OffsetAllocationHandle>& handles) {
@@ -607,6 +694,50 @@ TEST_F(OffsetAllocatorTest, DeserializesLegacyThreeBitBinLayout) {
     const auto legacy_buffer = serializeLegacyAllocator(allocator);
     auto restored = deserialize_from<OffsetAllocator>(legacy_buffer);
     ASSERT_NE(restored, nullptr);
+
+    const auto restored_metrics = restored->get_metrics();
+    EXPECT_EQ(restored_metrics.allocated_size_,
+              expected_metrics.allocated_size_);
+    EXPECT_EQ(restored_metrics.allocated_num_, expected_metrics.allocated_num_);
+    EXPECT_EQ(restored->storageReport().totalFreeSpace,
+              expected_report.totalFreeSpace);
+    EXPECT_EQ(restored->storageReport().largestFreeRegion,
+              expected_report.largestFreeRegion);
+
+    auto probe = restored->allocate(1500);
+    ASSERT_TRUE(probe.has_value());
+    probe.reset();
+    EXPECT_EQ(restored->storageReport().totalFreeSpace,
+              expected_report.totalFreeSpace);
+
+    auto restored_first = copyHandleWithNewAllocator(*first, restored);
+    auto restored_third = copyHandleWithNewAllocator(*third, restored);
+    restored_first = {};
+    restored_third = {};
+    EXPECT_EQ(restored->get_metrics().allocated_num_, 0);
+    EXPECT_EQ(restored->storageReport().totalFreeSpace, ALLOCATOR_SIZE);
+}
+
+TEST_F(OffsetAllocatorTest, DeserializesLegacyThreeBitMsgpackLayout) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
+    auto allocator = OffsetAllocator::create(0, ALLOCATOR_SIZE, 128, 128);
+    auto first = allocator->allocate(1000);
+    auto released = allocator->allocate(2000);
+    auto third = allocator->allocate(3000);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(released.has_value());
+    ASSERT_TRUE(third.has_value());
+    released.reset();
+
+    const auto expected_metrics = allocator->get_metrics();
+    const auto expected_report = allocator->storageReport();
+    const auto legacy_buffer = serializeLegacyAllocatorMsgpack(allocator);
+    const auto object =
+        msgpack::unpack(legacy_buffer.data(), legacy_buffer.size());
+    auto restored_result =
+        Serializer<OffsetAllocator>::deserialize(object.get());
+    ASSERT_TRUE(restored_result.has_value());
+    auto restored = std::move(restored_result.value());
 
     const auto restored_metrics = restored->get_metrics();
     EXPECT_EQ(restored_metrics.allocated_size_,
