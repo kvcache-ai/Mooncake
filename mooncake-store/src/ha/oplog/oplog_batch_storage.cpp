@@ -1,7 +1,9 @@
 #include "ha/oplog/oplog_batch_storage.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
+#include <string_view>
 
 #include <glog/logging.h>
 
@@ -517,17 +519,26 @@ ErrorCode OpLogBatchStorage::RejectLegacyLayout() const {
     }
 
     entries.clear();
-    err = backend_.Range(root + "snapshot/", root + "snapshot0",
-                         /*limit=*/1, entries);
+    const std::string snapshot_prefix = root + "snapshot/";
+    constexpr std::array<std::string_view, 4> kBatchSnapshotControlKeys{
+        "latest", "fallback", "maintenance", "compaction_floor"};
+    err = backend_.Range(snapshot_prefix, root + "snapshot0",
+                         kBatchSnapshotControlKeys.size() + 1, entries);
     if (err != ErrorCode::OK) {
         return err;
     }
-    if (!entries.empty()) {
-        LOG(ERROR) << "Legacy OpLog snapshot sidecar exists for cluster="
-                   << cluster_id_
-                   << "; clear the legacy OpLog namespace before enabling "
-                      "batch-record OpLog";
-        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    for (const auto& entry : entries) {
+        const std::string_view key(entry.key);
+        const std::string_view suffix = key.substr(snapshot_prefix.size());
+        if (std::find(kBatchSnapshotControlKeys.begin(),
+                      kBatchSnapshotControlKeys.end(),
+                      suffix) == kBatchSnapshotControlKeys.end()) {
+            LOG(ERROR) << "Legacy OpLog snapshot sidecar exists for cluster="
+                       << cluster_id_
+                       << "; clear the legacy OpLog namespace before enabling "
+                          "batch-record OpLog";
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
     }
     return ErrorCode::OK;
 }

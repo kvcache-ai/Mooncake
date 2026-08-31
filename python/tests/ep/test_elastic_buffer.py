@@ -10,7 +10,7 @@ Typical single-node usage:
 
     MOONCAKE_EP_NUM_LOCAL_RANKS=8 \
     torchrun --standalone --nproc_per_node=8 \
-      mooncake-ep/tests/test_elastic_buffer.py --quick
+      python/tests/ep/test_elastic_buffer.py --quick
 
 For multi-node hybrid validation, launch the same script with ``torchrun
 --nnodes`` and set ``MOONCAKE_EP_NUM_LOCAL_RANKS`` to the number of GPUs per
@@ -116,7 +116,9 @@ def make_route_plan(
     if local_experts <= 0:
         raise ValueError("num_experts must be at least world_size")
 
-    expert_offsets = torch.arange(num_topk, device="cuda", dtype=torch.long) % local_experts
+    expert_offsets = (
+        torch.arange(num_topk, device="cuda", dtype=torch.long) % local_experts
+    )
 
     if route == "cross" and buffer.num_scaleout_ranks > 1:
         dst_scaleout = (buffer.scaleout_rank_idx + 1) % buffer.num_scaleout_ranks
@@ -136,7 +138,9 @@ def make_route_plan(
             1,
         )
 
-    dst_ranks = (rank + torch.arange(num_topk, device="cuda", dtype=torch.long)) % world_size
+    dst_ranks = (
+        rank + torch.arange(num_topk, device="cuda", dtype=torch.long)
+    ) % world_size
     choices = dst_ranks * local_experts + expert_offsets
     unique_dst_ranks = int(torch.unique(dst_ranks).numel())
     return RoutePlan(
@@ -181,7 +185,7 @@ def check_dispatch_payload(
 
     base = torch.arange(num_tokens * hidden, device="cuda", dtype=torch.float32)
     base = base.view(num_tokens, hidden)
-    expected = (base[src_token] + src_rank.view(-1, 1).float() * multiplier + addend)
+    expected = base[src_token] + src_rank.view(-1, 1).float() * multiplier + addend
     expected = expected.to(torch.bfloat16)
     if not torch.equal(recv_x[:actual], expected):
         diff = (recv_x[:actual].float() - expected.float()).abs().max().item()
@@ -234,7 +238,9 @@ def main() -> None:
         num_experts=num_experts,
         route=args.route,
     )
-    weights = torch.ones((args.num_tokens, args.num_topk), device="cuda", dtype=torch.float32)
+    weights = torch.ones(
+        (args.num_tokens, args.num_topk), device="cuda", dtype=torch.float32
+    )
 
     # CPU-sync dispatch: exact output extent and CPU-side expert counts.
     x0 = make_input(
@@ -355,7 +361,9 @@ def main() -> None:
         addend=31,
     )
     if handle2.num_recv_tokens_per_expert_list:
-        raise AssertionError(f"rank={rank}: no-CPU-sync path should not return CPU counts")
+        raise AssertionError(
+            f"rank={rank}: no-CPU-sync path should not return CPU counts"
+        )
     combined2, _, event3 = buffer.combine(
         recv2[:actual2].contiguous(),
         handle2,
@@ -382,7 +390,9 @@ def main() -> None:
         async_with_compute_stream=False,
     )
     torch.cuda.synchronize()
-    expanded_actual = int(expanded_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item())
+    expanded_actual = int(
+        expanded_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
+    )
     if expanded_actual != route_plan.expected_recv_tokens:
         raise AssertionError(f"rank={rank}: expanded dispatch received-token mismatch")
     expanded_output = int(expanded_handle.psum_num_recv_tokens_per_expert[-1].item())

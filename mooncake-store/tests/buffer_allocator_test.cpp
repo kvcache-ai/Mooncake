@@ -43,16 +43,12 @@ class BufferAllocatorTest : public ::testing::Test {
         const std::string& segment_name, size_t base_offset, size_t size,
         BufferAllocatorType allocator_type) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
-        switch (allocator_type) {
-            case BufferAllocatorType::CACHELIB:
-                return std::make_shared<CachelibBufferAllocator>(
-                    segment_name, base, size, segment_name);
-            case BufferAllocatorType::OFFSET:
-                return std::make_shared<OffsetBufferAllocator>(
-                    segment_name, base, size, segment_name);
-            default:
-                throw std::invalid_argument("Invalid allocator type");
+        auto allocator = CreateBufferAllocator(allocator_type, segment_name,
+                                               base, size, segment_name);
+        if (!allocator) {
+            throw std::invalid_argument("Invalid allocator test parameters");
         }
+        return std::move(*allocator);
     }
 
     void VerifyAllocatedBuffer(const AllocatedBuffer& bufHandle,
@@ -143,7 +139,7 @@ TEST_F(BufferAllocatorTest, OffsetLargestFreeRegionRemainsExact) {
     EXPECT_EQ(allocator->getLargestFreeRegion(), CAPACITY);
 }
 
-TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
+TEST_F(BufferAllocatorTest, ImportOffsetAllocationsAtOriginalAddresses) {
     constexpr uintptr_t kBase = 0x180000000ULL;
     constexpr size_t kCapacity = 16 * 1024 * 1024;
     const std::string segment = "restore-segment";
@@ -181,21 +177,9 @@ TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
     ASSERT_NE(new_buffer, nullptr);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(new_buffer->data()),
               removed_descriptor.buffer_address_);
-
-    auto duplicate = allocations;
-    duplicate.push_back(allocations.front());
-    EXPECT_FALSE(ImportOffsetBufferAllocator(segment, kBase, kCapacity,
-                                             endpoint, duplicate)
-                     .has_value());
-
-    auto out_of_range = allocations;
-    out_of_range[0].offset_bytes = kCapacity;
-    EXPECT_FALSE(ImportOffsetBufferAllocator(segment, kBase, kCapacity,
-                                             endpoint, out_of_range)
-                     .has_value());
 }
 
-TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsValidatesRangesAndOrder) {
+TEST_F(BufferAllocatorTest, ImportOffsetAllocationsValidatesRangesAndOrder) {
     constexpr uintptr_t kBase = 0x190000000ULL;
     constexpr size_t kCapacity = 4096;
     const std::string segment = "restore-validation";
@@ -211,9 +195,9 @@ TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsValidatesRangesAndOrder) {
     ASSERT_TRUE(restored.has_value());
     ASSERT_EQ(restored->buffers.size(), unsorted.size());
     EXPECT_EQ(reinterpret_cast<uintptr_t>(restored->buffers[0]->data()),
-              kBase + unsorted[0].offset_bytes);
+              kBase + unsorted[0].offset_from_base);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(restored->buffers[1]->data()),
-              kBase + unsorted[1].offset_bytes);
+              kBase + unsorted[1].offset_from_base);
 
     std::vector<LiveAllocation> overlapping = {allocation(kBase + 128, 100),
                                                allocation(kBase + 200, 32)};
@@ -238,7 +222,7 @@ TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsValidatesRangesAndOrder) {
                      .has_value());
 }
 
-TEST_F(BufferAllocatorTest, RestoredOffsetHandleReleasesItsExactAddress) {
+TEST_F(BufferAllocatorTest, ImportedOffsetHandleReleasesItsExactAddress) {
     constexpr uintptr_t kBase = 0x1A0000000ULL;
     constexpr size_t kCapacity = 4096;
     const std::string endpoint = "restore-release";
@@ -251,10 +235,10 @@ TEST_F(BufferAllocatorTest, RestoredOffsetHandleReleasesItsExactAddress) {
     auto replacement = restored->allocator->allocate(64);
     ASSERT_NE(replacement, nullptr);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(replacement->data()),
-              kBase + allocations[0].offset_bytes);
+              kBase + allocations[0].offset_from_base);
 }
 
-TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsHasNoArbitraryGapLimit) {
+TEST_F(BufferAllocatorTest, ImportOffsetAllocationsHasNoArbitraryGapLimit) {
     constexpr uintptr_t kBase = 0x1B0000000ULL;
     constexpr size_t kGapCount = 65537;
     const std::string endpoint = "restore-many-gaps";
@@ -269,16 +253,43 @@ TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsHasNoArbitraryGapLimit) {
     ASSERT_TRUE(restored.has_value());
     EXPECT_EQ(restored->buffers.size(), allocations.size());
     EXPECT_EQ(reinterpret_cast<uintptr_t>(restored->buffers.back()->data()),
-              kBase + allocations.back().offset_bytes);
+              kBase + allocations.back().offset_from_base);
 }
 
-TEST_F(BufferAllocatorTest, RestoreCachelibAllocationsAtOriginalAddresses) {
+TEST_F(BufferAllocatorTest, CachelibCreateRejectsInvalidMemoryLayout) {
+    constexpr size_t kSlabSize = facebook::cachelib::Slab::kSize;
+    constexpr uintptr_t kBase = 0x1C0000000ULL;
+
+    auto expect_invalid = [](size_t base, size_t size) {
+        auto result = CachelibBufferAllocator::Create("cachelib-invalid", base,
+                                                      size, "endpoint");
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    };
+
+    expect_invalid(kBase + 1, kSlabSize);
+    expect_invalid(kBase, kSlabSize + 1);
+    expect_invalid(std::numeric_limits<size_t>::max() - kSlabSize,
+                   2 * kSlabSize);
+    if constexpr (std::numeric_limits<size_t>::max() / kSlabSize >
+                  std::numeric_limits<unsigned int>::max()) {
+        const size_t too_many_slabs =
+            (static_cast<size_t>(std::numeric_limits<unsigned int>::max()) +
+             1) *
+            kSlabSize;
+        expect_invalid(kBase, too_many_slabs);
+    }
+}
+
+TEST_F(BufferAllocatorTest, ImportCachelibAllocationsAtOriginalAddresses) {
     constexpr uintptr_t kBase = 0x1C0000000ULL;
     constexpr size_t kCapacity = 4 * facebook::cachelib::Slab::kSize;
     const std::string segment = "cachelib-restore";
     const std::string endpoint = "cachelib-restore-endpoint";
-    auto original = std::make_shared<CachelibBufferAllocator>(
-        segment, kBase, kCapacity, endpoint);
+    auto created =
+        CachelibBufferAllocator::Create(segment, kBase, kCapacity, endpoint);
+    ASSERT_TRUE(created.has_value());
+    auto original = std::move(*created);
 
     auto small_first = original->allocate(64);
     auto small_hole = original->allocate(64);
@@ -327,38 +338,24 @@ TEST_F(BufferAllocatorTest, RestoreCachelibAllocationsAtOriginalAddresses) {
     EXPECT_EQ(reinterpret_cast<uintptr_t>(replacement->data()), released);
 }
 
-TEST_F(BufferAllocatorTest, RestoreCachelibAllocationsRejectsInvalidLayouts) {
+TEST_F(BufferAllocatorTest, ImportCachelibAllocationsRejectsInvalidLayouts) {
     constexpr uintptr_t kBase = 0x1D0000000ULL;
     constexpr size_t kCapacity = 4 * facebook::cachelib::Slab::kSize;
-    constexpr size_t kSlabSize = facebook::cachelib::Slab::kSize;
     const std::string endpoint = "cachelib-invalid-endpoint";
     auto allocation = [&](uintptr_t address, uint64_t size) {
         return LiveAllocation{address - kBase, size};
     };
-    auto restore = [&](const std::vector<LiveAllocation>& allocations) {
+    auto import = [&](const std::vector<LiveAllocation>& allocations) {
         return ImportCachelibBufferAllocator("cachelib-invalid", kBase,
                                              kCapacity, endpoint, allocations);
     };
 
     EXPECT_FALSE(
-        restore({allocation(kBase, 64), allocation(kBase, 4096)}).has_value());
-    EXPECT_FALSE(restore({allocation(kBase + 1, 64)}).has_value());
+        import({allocation(kBase, 64), allocation(kBase, 4096)}).has_value());
+    EXPECT_FALSE(import({allocation(kBase + 1, 64)}).has_value());
     EXPECT_FALSE(
-        restore({allocation(kBase, 64), allocation(kBase, 64)}).has_value());
-    EXPECT_FALSE(restore({allocation(kBase + kCapacity, 64)}).has_value());
-    EXPECT_FALSE(ImportCachelibBufferAllocator("cachelib-invalid", kBase + 1,
-                                               kCapacity, endpoint, {})
-                     .has_value());
-    EXPECT_FALSE(ImportCachelibBufferAllocator(
-                     "cachelib-invalid",
-                     std::numeric_limits<size_t>::max() - kSlabSize,
-                     2 * kSlabSize, endpoint, {})
-                     .has_value());
-
-    auto valid_after_fail = restore({allocation(kBase + kSlabSize, 4096)});
-    ASSERT_TRUE(valid_after_fail.has_value());
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(valid_after_fail->buffers[0]->data()),
-              kBase + kSlabSize);
+        import({allocation(kBase, 64), allocation(kBase, 64)}).has_value());
+    EXPECT_FALSE(import({allocation(kBase + kCapacity, 64)}).has_value());
 }
 
 TEST_F(BufferAllocatorTest, CachelibImportRejectsChunkInSlabTail) {
@@ -376,7 +373,7 @@ TEST_F(BufferAllocatorTest, CachelibImportRejectsChunkInSlabTail) {
         pool, {{reinterpret_cast<void*>(kBase + kAllocSize), kAllocSize}}));
 }
 
-TEST_F(BufferAllocatorTest, RestoreCachelibRejectsNonMemoryReplicaType) {
+TEST_F(BufferAllocatorTest, CachelibImportRejectsNonMemoryReplicaType) {
     constexpr uintptr_t kBase = 0x1F0000000ULL;
     constexpr size_t kCapacity = 2 * facebook::cachelib::Slab::kSize;
     const std::string endpoint = "cachelib-memory-only";
@@ -386,13 +383,6 @@ TEST_F(BufferAllocatorTest, RestoreCachelibRejectsNonMemoryReplicaType) {
                                                kCapacity, endpoint, allocations,
                                                ReplicaType::NOF_SSD)
                      .has_value());
-
-    auto rdma = ImportCachelibBufferAllocator("cachelib-memory-only", kBase,
-                                              kCapacity, endpoint, allocations);
-    ASSERT_TRUE(rdma.has_value());
-    const auto restored = rdma->buffers[0]->get_descriptor();
-    EXPECT_EQ(restored.buffer_address_, kBase);
-    EXPECT_EQ(restored.transport_endpoint_, endpoint);
 }
 
 // Test allocation request larger than available space

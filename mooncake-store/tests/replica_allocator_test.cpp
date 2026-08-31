@@ -17,19 +17,41 @@ namespace {
 
 constexpr size_t kCapacity = 1U << 20;
 
+class TestPlacementTarget final : public PlacementTarget {
+   public:
+    TestPlacementTarget(std::shared_ptr<TestBufferAllocator> allocator,
+                        bool is_cxl, std::string cxl_binding)
+        : PlacementTarget(std::move(allocator)),
+          is_cxl_(is_cxl),
+          cxl_binding_(std::move(cxl_binding)) {}
+
+    std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
+        auto buffer = allocator().allocate(size);
+        if (buffer && is_cxl_) {
+            buffer->change_to_cxl(cxl_binding_);
+        }
+        return buffer;
+    }
+
+    bool IsCxl() const noexcept override { return is_cxl_; }
+
+   private:
+    bool is_cxl_;
+    std::string cxl_binding_;
+};
+
 class PlacementState {
    public:
-    TestBufferAllocator* Add(
-        std::string name, std::string endpoint, size_t used = 0,
-        AllocationTargetKind kind = AllocationTargetKind::NATIVE,
-        std::string cxl_binding = {}) {
+    TestBufferAllocator* Add(std::string name, std::string endpoint,
+                             size_t used = 0, bool is_cxl = false,
+                             std::string cxl_binding = {}) {
         auto allocator = std::make_shared<TestBufferAllocator>(
             name, std::move(endpoint), kCapacity,
-            kind == AllocationTargetKind::CXL ? DEFAULT_CXL_BASE : next_base_);
+            is_cxl ? DEFAULT_CXL_BASE : next_base_);
         next_base_ += kCapacity + 4096;
         allocator->SetUsed(used);
-        auto target = std::make_unique<AllocationTarget>(
-            allocator.get(), kind, std::move(cxl_binding));
+        auto target = std::make_unique<TestPlacementTarget>(
+            allocator, is_cxl, std::move(cxl_binding));
         EXPECT_TRUE(index.AddTarget(name, target.get()));
         auto* result = allocator.get();
         allocators.push_back(std::move(allocator));
@@ -44,7 +66,7 @@ class PlacementState {
     OwnerClientByGroupName owners;
     LocalSsdManager local_ssd;
     std::vector<std::shared_ptr<TestBufferAllocator>> allocators;
-    std::vector<std::unique_ptr<AllocationTarget>> targets;
+    std::vector<std::unique_ptr<PlacementTarget>> targets;
     std::shared_mutex mutex;
 
    private:
@@ -184,8 +206,7 @@ TEST(ReplicaAllocatorTest, LocalPolicyConsumesHostOrdering) {
 
 TEST(ReplicaAllocatorTest, CxlRequiresPreferenceAndConvertsBuffer) {
     PlacementState state;
-    state.Add("cxl", "global-cxl", 0, AllocationTargetKind::CXL,
-              "client-binding");
+    state.Add("cxl", "global-cxl", 0, true, "client-binding");
     ReplicaAllocator allocator(PlacementPolicyType::CXL);
     {
         auto access = state.Access();

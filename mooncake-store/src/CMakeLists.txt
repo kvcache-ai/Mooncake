@@ -20,7 +20,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_repository.cpp
     master_metric_manager.cpp
     segment/region_driver.cpp
-    segment/region_initial_state.cpp
     placement/index.cpp
     placement/replica_allocator.cpp
     segment.cpp
@@ -44,7 +43,10 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/batch_oplog/codec.cpp
     ha/snapshot/batch_oplog/metadata.cpp
+    ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.cpp
     ha/snapshot/batch_oplog/writer.cpp
+    ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.cpp
+    ha/snapshot/snapshot_maintenance_lease.cpp
     ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/local_ssd_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
@@ -107,7 +109,6 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
 endif()
-
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
 

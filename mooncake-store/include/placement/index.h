@@ -20,7 +20,7 @@ namespace mooncake {
 
 struct PlacementGroup final {
     std::string name;
-    std::vector<AllocationTarget*> targets;
+    std::vector<PlacementTarget*> targets;
 };
 
 class PlacementReadView;
@@ -33,10 +33,10 @@ class PlacementIndex final {
     PlacementIndex(const PlacementIndex&) = delete;
     PlacementIndex& operator=(const PlacementIndex&) = delete;
 
-    bool AddTarget(std::string_view name, AllocationTarget* target);
-    bool RemoveTarget(std::string_view name, AllocationTarget* target);
-    bool ReplaceTarget(std::string_view name, AllocationTarget* expected,
-                       AllocationTarget* replacement);
+    bool AddTarget(std::string_view name, PlacementTarget* target);
+    bool RemoveTarget(std::string_view name, PlacementTarget* target);
+    bool ReplaceTarget(std::string_view name, PlacementTarget* expected,
+                       PlacementTarget* replacement);
     void Clear();
 
     PlacementReadView GetView() const;

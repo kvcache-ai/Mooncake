@@ -19,8 +19,7 @@ void AppendUnique(std::vector<PlacementGroup*>& groups, PlacementGroup* group) {
 
 }  // namespace
 
-bool PlacementIndex::AddTarget(std::string_view name,
-                               AllocationTarget* target) {
+bool PlacementIndex::AddTarget(std::string_view name, PlacementTarget* target) {
     if (name.empty() || !target) {
         return false;
     }
@@ -45,7 +44,7 @@ bool PlacementIndex::AddTarget(std::string_view name,
 }
 
 bool PlacementIndex::RemoveTarget(std::string_view name,
-                                  AllocationTarget* target) {
+                                  PlacementTarget* target) {
     auto it = by_name_.find(name);
     if (it == by_name_.end()) {
         return false;
@@ -80,8 +79,8 @@ bool PlacementIndex::RemoveTarget(std::string_view name,
 }
 
 bool PlacementIndex::ReplaceTarget(std::string_view name,
-                                   AllocationTarget* expected,
-                                   AllocationTarget* replacement) {
+                                   PlacementTarget* expected,
+                                   PlacementTarget* replacement) {
     if (!replacement) {
         return false;
     }

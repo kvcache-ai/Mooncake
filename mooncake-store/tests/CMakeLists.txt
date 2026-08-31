@@ -60,12 +60,21 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_group_test master_service_group_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
 target_link_libraries(master_service_evict_scenario_test
                       PRIVATE master_service_test_dsl)
 add_store_test(master_service_scenario_test master_service_scenario_test.cpp)
 target_link_libraries(master_service_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_group_scenario_test
+               master_service_group_scenario_test.cpp)
+target_link_libraries(master_service_group_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_tenant_scenario_test
+               master_service_tenant_scenario_test.cpp)
+target_link_libraries(master_service_tenant_scenario_test
                       PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
@@ -177,6 +186,10 @@ add_ha_test(batch_oplog_snapshot_codec_test
             ha/snapshot/batch_oplog/codec_test.cpp)
 add_ha_test(batch_oplog_snapshot_writer_test
             ha/snapshot/batch_oplog/writer_test.cpp)
+add_ha_test(batch_oplog_snapshot_provider_test
+            ha/snapshot/batch_oplog/provider_test.cpp)
+add_ha_test(batch_oplog_snapshot_publisher_test
+            ha/snapshot/batch_oplog/publisher_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)

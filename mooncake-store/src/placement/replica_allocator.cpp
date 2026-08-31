@@ -59,13 +59,12 @@ void AppendUnique(std::vector<PlacementGroup*>& groups, PlacementGroup* group) {
 }
 
 template <bool CxlOnly>
-std::unique_ptr<AllocatedBuffer> TryTarget(AllocationTarget* target,
+std::unique_ptr<AllocatedBuffer> TryTarget(PlacementTarget* target,
                                            size_t size) {
     if constexpr (CxlOnly) {
-        if (target->kind() != AllocationTargetKind::CXL) {
+        if (!target->IsCxl()) {
             return nullptr;
         }
-        return target->Allocate(size);
     }
     return target->Allocate(size);
 }

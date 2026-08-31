@@ -13,7 +13,9 @@
 #include <vector>
 
 #include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/capture.h"
 #include "ha/snapshot/snapshot_provider.h"
 #include "ha/standby_metadata_store.h"
@@ -179,6 +181,11 @@ class HotStandbyService {
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
 
+    // Inject the new batch-OpLog bootstrap path. It owns no running state;
+    // Start() gives it temporary stores and installs them only on success.
+    void SetBatchOpLogSnapshotProvider(
+        std::unique_ptr<BatchOpLogSnapshotProvider> provider);
+
     // Notify callers when standby sync status changes. The callback is invoked
     // from existing standby worker threads; no extra monitor thread is created.
     void SetSyncStatusCallback(SyncStatusCallback callback);
@@ -205,6 +212,7 @@ class HotStandbyService {
    private:
     ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode LoadBatchOpLogSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
@@ -238,11 +246,13 @@ class HotStandbyService {
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{
         std::make_unique<NoopSnapshotProvider>()};
+    std::unique_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
 
     // OpLog replication components
     std::unique_ptr<OpLogApplier> oplog_applier_;
     std::shared_ptr<HaKvBackend> batch_standby_kv_backend_;
     std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
+    std::optional<DurablePrefix> batch_snapshot_baseline_;
 
     std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
 

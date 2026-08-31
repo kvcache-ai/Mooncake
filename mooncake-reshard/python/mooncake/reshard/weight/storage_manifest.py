@@ -12,7 +12,13 @@ from typing import Optional, Union, cast
 from .._typing import TypeAlias
 
 from .._compat import _strict_zip
-from ..contracts import ResourceId, ResourceKind, RevisionId, StoredFragmentId, TensorId
+from ..contracts import (
+    ResourceId,
+    ResourceKind,
+    RevisionId,
+    StoredFragmentSnapshotId,
+    TensorId,
+)
 from .serde import _axis_from_wire, _axis_to_wire
 from .types import (
     TensorDescriptor,
@@ -71,15 +77,14 @@ class StoredManifestIdentity:
             _require_nonempty_string(getattr(self, name), name)
         _require_u64(self.weight_generation, "weight_generation")
         if len(self.content_sha256) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in self.content_sha256
+            character not in "0123456789abcdef" for character in self.content_sha256
         ):
             raise ValueError("content_sha256 must be a SHA-256 hex digest")
 
 
 @dataclass(frozen=True)
-class StoredFragment:
-    fragment_id: StoredFragmentId
+class StoredFragmentSnapshot:
+    fragment_id: StoredFragmentSnapshotId
     tensor_id: TensorId
     global_offset: tuple[int, ...]
     local_shape: tuple[int, ...]
@@ -120,7 +125,7 @@ class WeightManifest:
     group_id: str
     manifest_key: str
     tensors: tuple[TensorDescriptor, ...]
-    fragments: tuple[StoredFragment, ...]
+    fragments: tuple[StoredFragmentSnapshot, ...]
     created_at: str
     manifest_digest: str = field(init=False)
 
@@ -153,7 +158,7 @@ class WeightManifest:
             _require_manifest_items(
                 self.fragments,
                 "WeightManifest fragments",
-                StoredFragment,
+                StoredFragmentSnapshot,
             ),
         )
         _require_u64(self.weight_generation, "weight_generation")
@@ -351,7 +356,7 @@ class WeightManifest:
                     parallel_axes=parallel_axes,
                 )
             )
-        fragments: tuple[StoredFragment, ...] = tuple(
+        fragments: tuple[StoredFragmentSnapshot, ...] = tuple(
             _stored_fragment_from_wire(item, fragment_fields)
             for item in _require_sequence(raw["fragments"], "WeightManifest fragments")
         )
@@ -427,10 +432,10 @@ def _optional_integer(
 def _stored_fragment_from_wire(
     value: object,
     fragment_fields: frozenset[str],
-) -> StoredFragment:
+) -> StoredFragmentSnapshot:
     fragment = _require_exact_fields(value, fragment_fields, "stored fragment")
-    return StoredFragment(
-        fragment_id=StoredFragmentId(
+    return StoredFragmentSnapshot(
+        fragment_id=StoredFragmentSnapshotId(
             _require_nonempty_string(
                 fragment["fragment_id"], "stored fragment fragment_id"
             )
@@ -464,7 +469,7 @@ def _stored_fragment_from_wire(
 
 def _validate_stored_fragments(
     tensors: Sequence[TensorDescriptor],
-    fragments: Sequence[StoredFragment],
+    fragments: Sequence[StoredFragmentSnapshot],
 ) -> None:
     tensor_by_id: dict[TensorId, TensorDescriptor] = {}
     for tensor in tensors:
@@ -472,7 +477,7 @@ def _validate_stored_fragments(
             raise ValueError(f"duplicate tensor_id: {tensor.tensor_id}")
         tensor_by_id[tensor.tensor_id] = tensor
 
-    fragment_ids: set[StoredFragmentId] = set()
+    fragment_ids: set[StoredFragmentSnapshotId] = set()
     for fragment in fragments:
         if fragment.fragment_id in fragment_ids:
             raise ValueError(f"duplicate fragment_id: {fragment.fragment_id}")
@@ -491,9 +496,9 @@ def _validate_stored_fragments(
 
 def _validate_stored_coverage(
     tensors: Sequence[TensorDescriptor],
-    fragments: Sequence[StoredFragment],
+    fragments: Sequence[StoredFragmentSnapshot],
 ) -> None:
-    by_tensor: dict[TensorId, list[StoredFragment]] = {}
+    by_tensor: dict[TensorId, list[StoredFragmentSnapshot]] = {}
     geometries: set[StoredGeometryKey] = set()
     for fragment in fragments:
         geometry = (
@@ -534,12 +539,14 @@ def _stored_alias_descriptor_key(
 
 def _validate_stored_aliases(
     tensors: Sequence[TensorDescriptor],
-    fragments: Sequence[StoredFragment],
+    fragments: Sequence[StoredFragmentSnapshot],
 ) -> None:
     tensor_by_id: dict[TensorId, TensorDescriptor] = {
         tensor.tensor_id: tensor for tensor in tensors
     }
-    by_group_and_geometry: dict[StoredAliasGeometryKey, list[StoredFragment]] = {}
+    by_group_and_geometry: dict[
+        StoredAliasGeometryKey, list[StoredFragmentSnapshot]
+    ] = {}
     for fragment in fragments:
         if not fragment.aliases:
             continue
@@ -567,9 +574,9 @@ def _validate_stored_aliases(
 
 
 def _validate_stored_object_ranges(
-    fragments: Sequence[StoredFragment],
+    fragments: Sequence[StoredFragmentSnapshot],
 ) -> None:
-    by_object: dict[str, list[StoredFragment]] = {}
+    by_object: dict[str, list[StoredFragmentSnapshot]] = {}
     for fragment in fragments:
         by_object.setdefault(fragment.object_key, []).append(fragment)
 
@@ -584,7 +591,7 @@ def _validate_stored_object_ranges(
                 )
 
 
-def _has_overlapping_boxes(fragments: Sequence[StoredFragment]) -> bool:
+def _has_overlapping_boxes(fragments: Sequence[StoredFragmentSnapshot]) -> bool:
     if len(fragments) < 2:
         return False
 
@@ -602,7 +609,7 @@ def _has_overlapping_boxes(fragments: Sequence[StoredFragment]) -> bool:
         ),
     )
     ordered = sorted(fragments, key=lambda item: item.global_offset[sweep_dim])
-    active: list[StoredFragment] = []
+    active: list[StoredFragmentSnapshot] = []
     for fragment in ordered:
         begin = fragment.global_offset[sweep_dim]
         active = [
