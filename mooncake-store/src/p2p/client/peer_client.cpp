@@ -34,7 +34,7 @@ PeerClient::AsyncReadRemoteData(const RemoteReadRequest& request) {
 
     auto ret = co_await client_pool_->send_request(
         [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-            return client.send_request_without_attachment<&ClientRpcService::ReadRemoteData>(
+            return client.send_request<&ClientRpcService::ReadRemoteData>(
                 request);
         });
     if (!ret.has_value()) {
@@ -60,7 +60,7 @@ PeerClient::AsyncWriteRemoteData(const RemoteWriteRequest& request) {
 
     auto ret = co_await client_pool_->send_request(
         [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-            return client.send_request_without_attachment<&ClientRpcService::WriteRemoteData>(
+            return client.send_request<&ClientRpcService::WriteRemoteData>(
                 request);
         });
     if (!ret.has_value()) {
@@ -86,7 +86,7 @@ PeerClient::AsyncPreWrite(const PreWriteRequest& request) {
 
     auto ret = co_await client_pool_->send_request(
         [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-            return client.send_request_without_attachment<&ClientRpcService::PreWrite>(request);
+            return client.send_request<&ClientRpcService::PreWrite>(request);
         });
     if (!ret.has_value()) {
         LOG(ERROR) << "AsyncPreWrite: client not available";
@@ -110,7 +110,7 @@ PeerClient::AsyncWriteCommit(const WriteCommitRequest& request) {
 
     auto ret = co_await client_pool_->send_request(
         [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-            return client.send_request_without_attachment<&ClientRpcService::WriteCommit>(request);
+            return client.send_request<&ClientRpcService::WriteCommit>(request);
         });
     if (!ret.has_value()) {
         LOG(ERROR) << "AsyncWriteCommit: client not available";
@@ -135,7 +135,7 @@ PeerClient::AsyncWriteRevoke(const WriteRevokeRequest& request) {
 
     auto ret = co_await client_pool_->send_request(
         [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-            return client.send_request_without_attachment<&ClientRpcService::WriteRevoke>(request);
+            return client.send_request<&ClientRpcService::WriteRevoke>(request);
         });
     if (!ret.has_value()) {
         LOG(ERROR) << "AsyncWriteRevoke: client not available";
@@ -160,7 +160,7 @@ PeerClient::AsyncPinKey(const PinKeyRequest& request) {
 
     auto ret = co_await client_pool_->send_request(
         [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-            return client.send_request_without_attachment<&ClientRpcService::PinKey>(request);
+            return client.send_request<&ClientRpcService::PinKey>(request);
         });
     if (!ret.has_value()) {
         LOG(ERROR) << "AsyncPinKey: client not available";
@@ -184,7 +184,7 @@ PeerClient::AsyncUnPinKey(const UnPinKeyRequest& request) {
 
     auto ret = co_await client_pool_->send_request(
         [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-            return client.send_request_without_attachment<&ClientRpcService::UnPinKey>(request);
+            return client.send_request<&ClientRpcService::UnPinKey>(request);
         });
     if (!ret.has_value()) {
         LOG(ERROR) << "AsyncUnPinKey: client not available";

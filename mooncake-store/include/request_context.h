@@ -51,7 +51,7 @@ inline const std::optional<RequestContext>& get_current_request_context() {
 
 // Bypass (out-of-band) attachment helpers. Client side: this is snapshotted at
 // the entry of the master-client invoke_rpc* templates and handed to
-// coro_rpc_client::send_request so request_id rides the request
+// coro_rpc_client::send_request_with_attachment so request_id rides the request
 // framing rather than a struct field. Server side: read it back via
 // ctx.get_context_info()->get_request_attachment() (a std::string_view); an
 // empty view means no per-request id was supplied.
