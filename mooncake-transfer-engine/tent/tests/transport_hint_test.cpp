@@ -350,15 +350,14 @@ TEST(TransportHint, ResolveExecutionRouteUsesLocalOnlyMnnvlStage) {
     std::vector<uint8_t> source(kBufLen, 0x33);
     std::vector<uint8_t> target(kBufLen, 0x44);
     ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
-    ASSERT_TRUE(registerLocalMemoryAt(server, target.data(), kBufLen, "cuda:0")
-                    .ok());
+    ASSERT_TRUE(
+        registerLocalMemoryAt(server, target.data(), kBufLen, "cuda:0").ok());
 
     SegmentID target_id = 0;
     ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
 
-    auto resolved = client.resolveExecutionRouteForTest(
-        makeRemoteWriteRequest(source.data(), target.data(), kBufLen,
-                               target_id));
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
     EXPECT_TRUE(resolved.staging);
     EXPECT_EQ(resolved.route.transport, MNNVL);
     ASSERT_EQ(resolved.staging_params.size(), 3u);
@@ -398,9 +397,8 @@ TEST(TransportHint, ResolveExecutionRouteUsesRemoteOnlyMnnvlStage) {
     SegmentID target_id = 0;
     ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
 
-    auto resolved = client.resolveExecutionRouteForTest(
-        makeRemoteWriteRequest(source.data(), target.data(), kBufLen,
-                               target_id));
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
     EXPECT_TRUE(resolved.staging);
     EXPECT_EQ(resolved.route.transport, MNNVL);
     ASSERT_EQ(resolved.staging_params.size(), 3u);
@@ -436,9 +434,8 @@ TEST(TransportHint, ResolveExecutionRouteFallsBackToDirectTcpWithoutStage) {
     SegmentID target_id = 0;
     ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
 
-    auto resolved = client.resolveExecutionRouteForTest(
-        makeRemoteWriteRequest(source.data(), target.data(), kBufLen,
-                               target_id));
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
     EXPECT_FALSE(resolved.staging);
     EXPECT_EQ(resolved.route.transport, TCP);
     EXPECT_TRUE(resolved.staging_params.empty());
@@ -474,9 +471,8 @@ TEST(TransportHint, ResolveExecutionRouteReturnsUnspecWithoutFeasiblePath) {
     SegmentID target_id = 0;
     ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
 
-    auto resolved = client.resolveExecutionRouteForTest(
-        makeRemoteWriteRequest(source.data(), target.data(), kBufLen,
-                               target_id));
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
     EXPECT_FALSE(resolved.staging);
     EXPECT_EQ(resolved.route.transport, UNSPEC);
     EXPECT_TRUE(resolved.staging_params.empty());
@@ -496,24 +492,21 @@ TEST(TransportHint, ResolveExecutionRoutePrefersStagedRdmaOverDirectTcp) {
 
     std::shared_ptr<FakeTransport> server_rdma, server_tcp, server_nvlink;
     std::shared_ptr<FakeTransport> client_rdma, client_tcp, client_nvlink;
-    installFakeRdmaTcpAndNvlink(server, server_rdma, server_tcp,
-                                server_nvlink);
-    installFakeRdmaTcpAndNvlink(client, client_rdma, client_tcp,
-                                client_nvlink);
+    installFakeRdmaTcpAndNvlink(server, server_rdma, server_tcp, server_nvlink);
+    installFakeRdmaTcpAndNvlink(client, client_rdma, client_tcp, client_nvlink);
 
     constexpr size_t kBufLen = 4096;
     std::vector<uint8_t> source(kBufLen, 0xBB);
     std::vector<uint8_t> target(kBufLen, 0xCC);
     ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
-    ASSERT_TRUE(registerLocalMemoryAt(server, target.data(), kBufLen, "cuda:0")
-                    .ok());
+    ASSERT_TRUE(
+        registerLocalMemoryAt(server, target.data(), kBufLen, "cuda:0").ok());
 
     SegmentID target_id = 0;
     ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
 
-    auto resolved = client.resolveExecutionRouteForTest(
-        makeRemoteWriteRequest(source.data(), target.data(), kBufLen,
-                               target_id));
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
     EXPECT_TRUE(resolved.staging);
     EXPECT_EQ(resolved.route.transport, RDMA);
     ASSERT_EQ(resolved.staging_params.size(), 3u);
@@ -536,24 +529,21 @@ TEST(TransportHint, ResolveExecutionRouteRespectsPolicyWhitelistForStaging) {
 
     std::shared_ptr<FakeTransport> server_rdma, server_tcp, server_nvlink;
     std::shared_ptr<FakeTransport> client_rdma, client_tcp, client_nvlink;
-    installFakeRdmaTcpAndNvlink(server, server_rdma, server_tcp,
-                                server_nvlink);
-    installFakeRdmaTcpAndNvlink(client, client_rdma, client_tcp,
-                                client_nvlink);
+    installFakeRdmaTcpAndNvlink(server, server_rdma, server_tcp, server_nvlink);
+    installFakeRdmaTcpAndNvlink(client, client_rdma, client_tcp, client_nvlink);
 
     constexpr size_t kBufLen = 4096;
     std::vector<uint8_t> source(kBufLen, 0xDD);
     std::vector<uint8_t> target(kBufLen, 0xEE);
     ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
-    ASSERT_TRUE(registerLocalMemoryAt(server, target.data(), kBufLen, "cuda:0")
-                    .ok());
+    ASSERT_TRUE(
+        registerLocalMemoryAt(server, target.data(), kBufLen, "cuda:0").ok());
 
     SegmentID target_id = 0;
     ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
 
-    auto resolved = client.resolveExecutionRouteForTest(
-        makeRemoteWriteRequest(source.data(), target.data(), kBufLen,
-                               target_id));
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
     EXPECT_FALSE(resolved.staging);
     EXPECT_EQ(resolved.route.transport, TCP);
     EXPECT_TRUE(resolved.staging_params.empty());

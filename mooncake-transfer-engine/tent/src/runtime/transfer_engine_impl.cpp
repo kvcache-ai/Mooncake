@@ -1193,12 +1193,12 @@ static void addStageCandidate(std::vector<StageCandidate>& candidates,
     if (location.empty()) return;
     auto memory_type = getTypeEnum(LocationParser(location).type());
     if (memory_type == MTYPE_UNKNOWN) return;
-    auto duplicate = std::any_of(
-        candidates.begin(), candidates.end(),
-        [&](const StageCandidate& candidate) {
-            return candidate.location == location &&
-                   candidate.memory_type == memory_type;
-        });
+    auto duplicate =
+        std::any_of(candidates.begin(), candidates.end(),
+                    [&](const StageCandidate& candidate) {
+                        return candidate.location == location &&
+                               candidate.memory_type == memory_type;
+                    });
     if (!duplicate) candidates.push_back({location, memory_type});
 }
 
@@ -1623,9 +1623,9 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
                       desc->getMemory().topology.findNearMem(remote));
     addStageCandidate(input.local_stage_candidates,
                       topology_->findNearMem(local, Topology::MEM_CUDA));
-    addStageCandidate(input.remote_stage_candidates,
-                      desc->getMemory().topology.findNearMem(
-                          remote, Topology::MEM_CUDA));
+    addStageCandidate(
+        input.remote_stage_candidates,
+        desc->getMemory().topology.findNearMem(remote, Topology::MEM_CUDA));
 
     std::vector<SelectionResult> cross_node_candidates;
     if (transport_selector_ && !transport_selector_->isLegacyMode()) {
@@ -1690,11 +1690,11 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
     auto path = CapabilityPathSynthesizer::synthesize(input);
     if (!path.found) return resolved;
 
-    auto selected = std::find_if(
-        cross_node_candidates.begin(), cross_node_candidates.end(),
-        [&](const SelectionResult& candidate) {
-            return candidate.transport == path.cross_transport;
-        });
+    auto selected =
+        std::find_if(cross_node_candidates.begin(), cross_node_candidates.end(),
+                     [&](const SelectionResult& candidate) {
+                         return candidate.transport == path.cross_transport;
+                     });
     if (selected == cross_node_candidates.end()) return resolved;
 
     resolved.route = *selected;

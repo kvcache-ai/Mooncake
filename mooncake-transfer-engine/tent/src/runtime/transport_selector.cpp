@@ -629,9 +629,9 @@ SelectionResult TransportSelector::select(
     }
     if (result.transport == UNSPEC) return result;
     VLOG(1) << "Selected transport " << transportTypeName(result.transport)
-            << " at index " << original_index << " (hint="
-            << transportTypeName(hint) << "), device_mask=0x" << std::hex
-            << result.device_mask << std::dec;
+            << " at index " << original_index
+            << " (hint=" << transportTypeName(hint) << "), device_mask=0x"
+            << std::hex << result.device_mask << std::dec;
     return result;
 }
 

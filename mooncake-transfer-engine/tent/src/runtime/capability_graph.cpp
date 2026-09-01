@@ -73,8 +73,7 @@ std::vector<Hop> listTransports(
         }
 
         if (!info.enabled) continue;
-        if (!CapabilityPathSynthesizer::canReach(info.caps, from, to))
-            continue;
+        if (!CapabilityPathSynthesizer::canReach(info.caps, from, to)) continue;
 
         result.push_back(Hop{type, transportCost(type, options)});
     }
@@ -124,32 +123,28 @@ CapabilityPathCandidate makePublicCandidate(
     path.local_transport = c.local_transport;
     path.cross_transport = c.cross_transport;
     path.remote_transport = c.remote_transport;
-    path.local_stage_location =
-        c.has_local_stage ? c.local_stage.location : "";
+    path.local_stage_location = c.has_local_stage ? c.local_stage.location : "";
     path.remote_stage_location =
         c.has_remote_stage ? c.remote_stage.location : "";
     path.estimated_cost = c.cost;
     path.reason = describeCandidate(input, c);
 
-    const auto add_vertex = [&](CapabilityVertex::Side side,
-                                CapabilityVertex::Kind kind,
-                                const std::string& location,
-                                MemoryType memory_type) {
-        path.vertices.push_back(
-            CapabilityVertex{side, kind, location, memory_type});
-        return path.vertices.size() - 1;
-    };
+    const auto add_vertex =
+        [&](CapabilityVertex::Side side, CapabilityVertex::Kind kind,
+            const std::string& location, MemoryType memory_type) {
+            path.vertices.push_back(
+                CapabilityVertex{side, kind, location, memory_type});
+            return path.vertices.size() - 1;
+        };
 
-    size_t current =
-        add_vertex(CapabilityVertex::Side::Local,
-                   CapabilityVertex::Kind::Source, input.local_location,
-                   input.local_memory_type);
+    size_t current = add_vertex(CapabilityVertex::Side::Local,
+                                CapabilityVertex::Kind::Source,
+                                input.local_location, input.local_memory_type);
 
     if (c.has_local_stage) {
-        const size_t next =
-            add_vertex(CapabilityVertex::Side::Local,
-                       CapabilityVertex::Kind::Stage, c.local_stage.location,
-                       c.local_stage.memory_type);
+        const size_t next = add_vertex(
+            CapabilityVertex::Side::Local, CapabilityVertex::Kind::Stage,
+            c.local_stage.location, c.local_stage.memory_type);
         path.edges.push_back(
             CapabilityEdge{current, next, c.local_transport,
                            transportCost(c.local_transport, options)});
@@ -158,26 +153,22 @@ CapabilityPathCandidate makePublicCandidate(
 
     size_t remote_current = 0;
     if (c.has_remote_stage) {
-        remote_current =
-            add_vertex(CapabilityVertex::Side::Remote,
-                       CapabilityVertex::Kind::Stage, c.remote_stage.location,
-                       c.remote_stage.memory_type);
+        remote_current = add_vertex(
+            CapabilityVertex::Side::Remote, CapabilityVertex::Kind::Stage,
+            c.remote_stage.location, c.remote_stage.memory_type);
     } else {
-        remote_current =
-            add_vertex(CapabilityVertex::Side::Remote,
-                       CapabilityVertex::Kind::Target, input.remote_location,
-                       input.remote_memory_type);
+        remote_current = add_vertex(
+            CapabilityVertex::Side::Remote, CapabilityVertex::Kind::Target,
+            input.remote_location, input.remote_memory_type);
     }
-    path.edges.push_back(CapabilityEdge{current, remote_current,
-                                        c.cross_transport,
-                                        transportCost(c.cross_transport,
-                                                      options)});
+    path.edges.push_back(
+        CapabilityEdge{current, remote_current, c.cross_transport,
+                       transportCost(c.cross_transport, options)});
 
     if (c.has_remote_stage) {
-        const size_t target =
-            add_vertex(CapabilityVertex::Side::Remote,
-                       CapabilityVertex::Kind::Target, input.remote_location,
-                       input.remote_memory_type);
+        const size_t target = add_vertex(
+            CapabilityVertex::Side::Remote, CapabilityVertex::Kind::Target,
+            input.remote_location, input.remote_memory_type);
         path.edges.push_back(
             CapabilityEdge{remote_current, target, c.remote_transport,
                            transportCost(c.remote_transport, options)});
@@ -192,8 +183,7 @@ PathSynthesisOptions::PathSynthesisOptions() {
 }
 
 bool CapabilityPathSynthesizer::canReach(const Capabilities& caps,
-                                         MemoryType local,
-                                         MemoryType remote) {
+                                         MemoryType local, MemoryType remote) {
     if (local == MTYPE_CPU && remote == MTYPE_CPU) return caps.dram_to_dram;
     if (isDeviceMemoryType(local) && isDeviceMemoryType(remote))
         return caps.gpu_to_gpu;
@@ -248,11 +238,10 @@ SynthesizedPath CapabilityPathSynthesizer::synthesize(
         for (const auto& remote_stage : remote_options) {
             if (!local_stage && !remote_stage) continue;
 
-            const MemoryType cross_from =
-                local_stage ? local_stage->memory_type : input.local_memory_type;
-            const MemoryType cross_to = remote_stage
-                                            ? remote_stage->memory_type
-                                            : input.remote_memory_type;
+            const MemoryType cross_from = local_stage ? local_stage->memory_type
+                                                      : input.local_memory_type;
+            const MemoryType cross_to = remote_stage ? remote_stage->memory_type
+                                                     : input.remote_memory_type;
 
             auto cross_hops = listTransports(input.transports, cross_from,
                                              cross_to, true, options);
@@ -319,14 +308,13 @@ SynthesizedPath CapabilityPathSynthesizer::synthesize(
             makePublicCandidate(input, candidate, options));
     }
 
-    const auto best =
-        std::min_element(public_candidates.begin(), public_candidates.end(),
-                         [](const CapabilityPathCandidate& a,
-                            const CapabilityPathCandidate& b) {
-                             if (a.estimated_cost != b.estimated_cost)
-                                 return a.estimated_cost < b.estimated_cost;
-                             return a.direct && !b.direct;
-                         });
+    const auto best = std::min_element(
+        public_candidates.begin(), public_candidates.end(),
+        [](const CapabilityPathCandidate& a, const CapabilityPathCandidate& b) {
+            if (a.estimated_cost != b.estimated_cost)
+                return a.estimated_cost < b.estimated_cost;
+            return a.direct && !b.direct;
+        });
     const size_t selected_index =
         static_cast<size_t>(std::distance(public_candidates.begin(), best));
 

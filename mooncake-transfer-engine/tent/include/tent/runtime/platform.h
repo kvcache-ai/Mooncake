@@ -25,9 +25,7 @@ namespace tent {
 // staged through host DRAM by capability path synthesis and ProxyManager.
 enum MemoryType { MTYPE_UNKNOWN, MTYPE_CPU, MTYPE_CUDA, MTYPE_ROCM, MTYPE_TPU };
 
-inline bool isKnownMemoryType(MemoryType type) {
-    return type != MTYPE_UNKNOWN;
-}
+inline bool isKnownMemoryType(MemoryType type) { return type != MTYPE_UNKNOWN; }
 
 inline bool isDeviceMemoryType(MemoryType type) {
     return type == MTYPE_CUDA || type == MTYPE_ROCM || type == MTYPE_TPU;

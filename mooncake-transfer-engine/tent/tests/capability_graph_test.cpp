@@ -180,8 +180,7 @@ TEST(CapabilityGraphTest, ChoosesStagedPathOverSlowDirectTcp) {
     bool saw_direct_tcp = false;
     bool saw_staged_rdma = false;
     for (const auto& candidate : path.candidates) {
-        saw_direct_tcp |=
-            candidate.direct && candidate.cross_transport == TCP;
+        saw_direct_tcp |= candidate.direct && candidate.cross_transport == TCP;
         saw_staged_rdma |= !candidate.direct &&
                            candidate.cross_transport == RDMA &&
                            candidate.local_stage_location == "cpu:0" &&
