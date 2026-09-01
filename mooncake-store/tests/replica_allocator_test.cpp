@@ -99,17 +99,17 @@ TEST(PlacementIndexTest, KeepsPointersStableAndRemovesGroupsWithSwapPop) {
     state.Add("a", "a");
     state.Add("b", "b");
     state.Add("c", "c");
-    auto* a = state.index.Find("a");
-    auto* c = state.index.Find("c");
+    auto* a = state.index.Find("a", PlacementTargetKind::NATIVE);
+    auto* c = state.index.Find("c", PlacementTargetKind::NATIVE);
 
     for (size_t i = 0; i < 64; ++i) {
         state.Add("extra-" + std::to_string(i),
                   "endpoint-" + std::to_string(i));
     }
     ASSERT_TRUE(state.index.RemoveTarget("b", state.targets[1].get()));
-    EXPECT_EQ(state.index.Find("a"), a);
-    EXPECT_EQ(state.index.Find("c"), c);
-    EXPECT_EQ(state.index.Find("b"), nullptr);
+    EXPECT_EQ(state.index.Find("a", PlacementTargetKind::NATIVE), a);
+    EXPECT_EQ(state.index.Find("c", PlacementTargetKind::NATIVE), c);
+    EXPECT_EQ(state.index.Find("b", PlacementTargetKind::NATIVE), nullptr);
 }
 
 TEST(ReplicaAllocatorPolicyTest, NoFOnlyRemapsSsdRanking) {
@@ -226,7 +226,8 @@ TEST(ReplicaAllocatorTest, LocalPolicyConsumesHostOrdering) {
     request.host_affinity.object_key = "key";
     auto access = state.Access();
     std::vector<const PlacementGroup*> expected;
-    access.GetHostOrderedGroups("writer", "key", expected);
+    access.GetHostOrderedGroups("writer", "key", PlacementTargetKind::NATIVE,
+                                expected);
     auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 2U);
@@ -269,6 +270,8 @@ TEST(ReplicaAllocatorTest, PreferredOnlyFiltersTargetKindInMixedGroup) {
     auto* native = state.Add("mixed", "native");
     auto* cxl = state.Add("mixed", "global-cxl", 0, true, "client-binding");
     cxl->SetAlwaysFail();
+    EXPECT_NE(state.index.Find("mixed", PlacementTargetKind::NATIVE),
+              state.index.Find("mixed", PlacementTargetKind::CXL));
 
     auto request = Request();
     request.placement.preferred_group = "mixed";

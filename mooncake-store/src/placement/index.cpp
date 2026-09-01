@@ -7,7 +7,8 @@
 namespace mooncake {
 
 bool PlacementGroup::AddTarget(const PlacementTarget& target) {
-    if (std::find(targets.begin(), targets.end(), &target) != targets.end()) {
+    if (target.Kind() != kind ||
+        std::find(targets.begin(), targets.end(), &target) != targets.end()) {
         return false;
     }
     targets.push_back(&target);
@@ -26,6 +27,9 @@ bool PlacementGroup::RemoveTarget(const PlacementTarget& target) {
 
 bool PlacementGroup::ReplaceTarget(const PlacementTarget& expected,
                                    const PlacementTarget& replacement) {
+    if (expected.Kind() != kind || replacement.Kind() != kind) {
+        return false;
+    }
     auto it = std::find(targets.begin(), targets.end(), &expected);
     if (it == targets.end()) {
         return false;
@@ -39,15 +43,20 @@ bool PlacementIndex::AddTarget(std::string_view name,
     if (name.empty() || !target) {
         return false;
     }
-    auto it = groups_.find(name);
-    if (it != groups_.end()) {
+    const size_t kind_index = KindIndex(target->Kind());
+    if (kind_index >= kTargetKindCount) {
+        return false;
+    }
+    auto& groups = groups_by_kind_[kind_index];
+    auto it = groups.find(name);
+    if (it != groups.end()) {
         return it->second->AddTarget(*target);
     }
 
     auto group = std::make_unique<PlacementGroup>(name, *target);
     const auto* group_ptr = group.get();
-    groups_.emplace(group->name, std::move(group));
-    active_groups_.push_back(group_ptr);
+    groups.emplace(group->name, std::move(group));
+    active_groups_by_kind_[kind_index].push_back(group_ptr);
     return true;
 }
 
@@ -56,8 +65,13 @@ bool PlacementIndex::RemoveTarget(std::string_view name,
     if (!target) {
         return false;
     }
-    auto it = groups_.find(name);
-    if (it == groups_.end() || !it->second->RemoveTarget(*target)) {
+    const size_t kind_index = KindIndex(target->Kind());
+    if (kind_index >= kTargetKindCount) {
+        return false;
+    }
+    auto& groups = groups_by_kind_[kind_index];
+    auto it = groups.find(name);
+    if (it == groups.end() || !it->second->RemoveTarget(*target)) {
         return false;
     }
     if (!it->second->targets.empty()) {
@@ -65,13 +79,14 @@ bool PlacementIndex::RemoveTarget(std::string_view name,
     }
 
     const auto* group = it->second.get();
+    auto& active_groups = active_groups_by_kind_[kind_index];
     auto active_it =
-        std::find(active_groups_.begin(), active_groups_.end(), group);
-    if (active_it != active_groups_.end()) {
-        *active_it = active_groups_.back();
-        active_groups_.pop_back();
+        std::find(active_groups.begin(), active_groups.end(), group);
+    if (active_it != active_groups.end()) {
+        *active_it = active_groups.back();
+        active_groups.pop_back();
     }
-    groups_.erase(it);
+    groups.erase(it);
     return true;
 }
 
@@ -81,32 +96,64 @@ bool PlacementIndex::ReplaceTarget(std::string_view name,
     if (!expected || !replacement) {
         return false;
     }
-    auto it = groups_.find(name);
-    return it != groups_.end() &&
+    if (expected->Kind() != replacement->Kind()) {
+        if (!AddTarget(name, replacement)) {
+            return false;
+        }
+        if (RemoveTarget(name, expected)) {
+            return true;
+        }
+        (void)RemoveTarget(name, replacement);
+        return false;
+    }
+
+    const size_t kind_index = KindIndex(expected->Kind());
+    if (kind_index >= kTargetKindCount) {
+        return false;
+    }
+    auto& groups = groups_by_kind_[kind_index];
+    auto it = groups.find(name);
+    return it != groups.end() &&
            it->second->ReplaceTarget(*expected, *replacement);
 }
 
 void PlacementIndex::Clear() {
-    groups_.clear();
-    active_groups_.clear();
+    for (auto& groups : groups_by_kind_) {
+        groups.clear();
+    }
+    for (auto& active_groups : active_groups_by_kind_) {
+        active_groups.clear();
+    }
 }
 
-const PlacementGroup* PlacementIndex::Find(std::string_view name) const {
-    auto it = groups_.find(name);
-    return it == groups_.end() ? nullptr : it->second.get();
+const PlacementGroup* PlacementIndex::Find(std::string_view name,
+                                           PlacementTargetKind kind) const {
+    const size_t kind_index = KindIndex(kind);
+    if (kind_index >= kTargetKindCount) {
+        return nullptr;
+    }
+    const auto& groups = groups_by_kind_[kind_index];
+    auto it = groups.find(name);
+    return it == groups.end() ? nullptr : it->second.get();
 }
 
 void PlacementIndex::GetActiveGroupNames(
-    std::vector<std::string>& names) const {
+    PlacementTargetKind kind, std::vector<std::string>& names) const {
     names.clear();
-    names.reserve(active_groups_.size());
-    for (const auto* group : active_groups_) {
+    const size_t kind_index = KindIndex(kind);
+    if (kind_index >= kTargetKindCount) {
+        return;
+    }
+    const auto& active_groups = active_groups_by_kind_[kind_index];
+    names.reserve(active_groups.size());
+    for (const auto* group : active_groups) {
         names.push_back(group->name);
     }
 }
 
 void ScopedPlacementReadAccess::GetHostOrderedGroups(
     std::string_view writer_host_id, std::string_view key,
+    PlacementTargetKind target_kind,
     std::vector<const PlacementGroup*>& output) const {
     output.clear();
     if (!regions_by_host_ || writer_host_id.empty() ||
@@ -132,7 +179,8 @@ void ScopedPlacementReadAccess::GetHostOrderedGroups(
             std::advance(group_it, start);
             for (size_t i = 0; i < groups.size(); ++i) {
                 if (!group_it->second.empty()) {
-                    const auto* group = placement_.Find(group_it->first);
+                    const auto* group =
+                        placement_.Find(group_it->first, target_kind);
                     if (group && std::find(output.begin(), output.end(),
                                            group) == output.end()) {
                         output.push_back(group);

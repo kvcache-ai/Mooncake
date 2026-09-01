@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -18,10 +19,13 @@
 
 namespace mooncake {
 
+// A placement group contains allocation-equivalent targets. The index keys
+// groups by both logical name and target kind, so native and CXL targets may
+// share a name without being mixed during allocation.
 struct PlacementGroup final {
     PlacementGroup(std::string_view group_name,
                    const PlacementTarget& first_target)
-        : name(group_name), targets{&first_target} {}
+        : name(group_name), kind(first_target.Kind()), targets{&first_target} {}
 
     bool AddTarget(const PlacementTarget& target);
     bool RemoveTarget(const PlacementTarget& target);
@@ -29,6 +33,7 @@ struct PlacementGroup final {
                        const PlacementTarget& replacement);
 
     std::string name;
+    const PlacementTargetKind kind;
     std::vector<const PlacementTarget*> targets;
 };
 
@@ -46,20 +51,36 @@ class PlacementIndex final {
                        const PlacementTarget* replacement);
     void Clear();
 
-    const PlacementGroup* Find(std::string_view name) const;
-    bool Contains(std::string_view name) const { return Find(name) != nullptr; }
-    void GetActiveGroupNames(std::vector<std::string>& names) const;
-    std::span<const PlacementGroup* const> active_groups() const {
-        return active_groups_;
+    const PlacementGroup* Find(std::string_view name,
+                               PlacementTargetKind kind) const;
+    bool Contains(std::string_view name, PlacementTargetKind kind) const {
+        return Find(name, kind) != nullptr;
     }
-    size_t size() const noexcept { return active_groups_.size(); }
-    bool empty() const noexcept { return active_groups_.empty(); }
+    void GetActiveGroupNames(PlacementTargetKind kind,
+                             std::vector<std::string>& names) const;
+    std::span<const PlacementGroup* const> active_groups(
+        PlacementTargetKind kind) const {
+        return active_groups_by_kind_[KindIndex(kind)];
+    }
+    size_t size(PlacementTargetKind kind) const noexcept {
+        return active_groups_by_kind_[KindIndex(kind)].size();
+    }
+    bool empty(PlacementTargetKind kind) const noexcept {
+        return active_groups_by_kind_[KindIndex(kind)].empty();
+    }
 
    private:
-    std::unordered_map<std::string, std::unique_ptr<PlacementGroup>,
-                       TransparentStringHash, std::equal_to<>>
-        groups_;
-    std::vector<const PlacementGroup*> active_groups_;
+    static constexpr size_t kTargetKindCount = 2;
+    static constexpr size_t KindIndex(PlacementTargetKind kind) noexcept {
+        return static_cast<size_t>(kind);
+    }
+
+    using GroupMap =
+        std::unordered_map<std::string, std::unique_ptr<PlacementGroup>,
+                           TransparentStringHash, std::equal_to<>>;
+    std::array<GroupMap, kTargetKindCount> groups_by_kind_;
+    std::array<std::vector<const PlacementGroup*>, kTargetKindCount>
+        active_groups_by_kind_;
 };
 
 using HostRegionIndex =
@@ -87,6 +108,7 @@ class ScopedPlacementReadAccess final {
 
     void GetHostOrderedGroups(std::string_view writer_host_id,
                               std::string_view key,
+                              PlacementTargetKind target_kind,
                               std::vector<const PlacementGroup*>& output) const;
     std::optional<UUID> GetOwnerClientId(std::string_view group_name) const;
 
