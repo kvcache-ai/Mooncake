@@ -456,8 +456,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
                     toString(connect_err)));
             }
             auto backend = std::make_shared<EtcdHaKvBackend>();
+            // Direct MasterService construction has no leadership session;
+            // supervisor-created services carry a non-zero acquired view.
             ErrorCode err = InitializeBatchOpLogWriter(
-                std::move(backend), /*require_fenced_writer=*/true);
+                std::move(backend),
+                /*require_fenced_writer=*/view_version_ > 0);
             if (err != ErrorCode::OK) {
                 throw std::runtime_error(fmt::format(
                     "failed to create HA batch-record OpLog writer: {}",
