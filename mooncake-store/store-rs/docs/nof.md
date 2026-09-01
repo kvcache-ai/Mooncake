@@ -252,19 +252,79 @@ Any configured Mooncake capacity is a logical admission/load-balancing limit, no
 EFC physical free space and not a request for Mooncake watermark GC. KVCS mountpoint selection is
 supplied to the concrete executor (`MOONCAKE_KVCS_MOUNTPOINT_INDEX`).
 
-## KVCS feature
+## KVCS build and runtime dependencies
 
-The default feature set has no KVCS library dependency. Enable the adapter explicitly:
+The default feature set has no KVCS dependency. `kvcs-capi` also adds no Cargo package: the
+dependency graph and `Cargo.lock` are unchanged because Mooncake uses the SDK's public C ABI
+directly. The existing `libc` crate supplies C-compatible Rust types; the existing protobuf build
+dependencies are unrelated to KVCS.
+
+| Build mode | SDK files required at build time | Linked library | Runtime loader path |
+| --- | --- | --- | --- |
+| default features | none | none | none |
+| `kvcs-capi`, production | `COMMIT_ID`, `C/include/kvcs_capi.h`, `lib/libkvcs.so` and its SONAME chain | dynamic `libkvcs.so.0` | `$KVCS_SDK_ROOT/lib` |
+| `kvcs-capi`, official mock | the same metadata/header plus `mock/lib/libkvcsmock.so` and its SONAME chain | dynamic `libkvcsmock.so.0` | `$KVCS_SDK_ROOT/mock/lib` |
+
+The adapter deliberately does not depend on the SDK's `rust/` path crate, `pkg-config`, `bindgen`,
+the KVCS C++ sources, `libkvcs.a`, or `libstdc++-static`. Those belong to the vendor Rust wrapper's
+default static-link flow, not to Mooncake's C ABI integration. EFC and Redis are runtime services,
+not compilation dependencies: Standard/high-level operations require EFC plus Redis, while
+Low-Level operations require EFC and a configured mountpoint but do not use Redis.
+
+`build.rs` enforces the supported binary boundary before emitting a linker directive:
+
+- Linux GNU target only; musl, macOS and Windows are rejected;
+- Cargo target architecture must be `x86_64` or `aarch64` and must match `arch` in `COMMIT_ID`;
+- `version` in `COMMIT_ID` must be exactly `0.4.0` until another SDK ABI has been reviewed;
+- the public header and the selected unversioned `.so` linker name must both exist.
+
+The metadata check prevents accidental ABI or architecture mismatches; it is not an integrity
+check. Verify the downloaded archive against the SHA-256 snapshot above before installation.
+
+The published x86_64 production library has SONAME `libkvcs.so.0` and directly needs only the GNU
+loader plus glibc's `libc`, `libdl`, `librt`, `libpthread` and `libm`; its newest referenced glibc
+symbol is `GLIBC_2.17`. It has no dynamic `libstdc++`, gRPC, protobuf or OpenSSL dependency. The
+x86_64 mock directly needs the GNU loader, `libc` and `libm`, with `GLIBC_2.14` as its newest
+referenced symbol. These are properties of the inspected 0.4.0 SDK libraries only: the final
+Mooncake binary can require a newer glibc if it is built on a newer baseline.
+
+Mooncake emits a link search path but does not embed an RPATH. Production images must therefore
+install the complete `.so` SONAME chain in the system loader configuration or set
+`LD_LIBRARY_PATH` when starting the process. Do not copy only the unversioned linker symlink.
+
+### Build environment
+
+`KVCS_SDK_ROOT` is a Mooncake build input and defaults to `/opt/kvcs-sdk/latest`.
+`KVCS_SDK_USE_MOCK` is also a build-time switch: unset or `0` selects production, and `1` selects
+the official mock. Any other value is rejected. Cargo reruns the build script when either value
+changes.
+
+The vendor's top-level `env.sh` assigns `KVCS_SDK_ROOT` as a shell variable but does not export it,
+and `mock/env.sh` configures the vendor Rust wrapper through `KVCS_DYNAMIC`. Mooncake does not read
+`KVCS_DYNAMIC`, `KVCS_NO_STDLIB_STATIC`, `PKG_CONFIG_PATH` or `LIBRARY_PATH`, so set the Mooncake
+variables explicitly:
 
 ```text
-source /opt/kvcs-sdk/latest/env.sh
+# Production build.
+export KVCS_SDK_ROOT=/opt/kvcs-sdk/0.4.0
+export KVCS_SDK_USE_MOCK=0
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
-cargo check -p mooncake-store-client --features kvcs-capi --lib --offline
+  cargo build -p mooncake-store-client --features kvcs-capi --offline
+
+# Production runtime or live tests.
+export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Official mock build and test process.
+export KVCS_SDK_USE_MOCK=1
+export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/mock/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo test -p mooncake-store-client --features kvcs-capi --lib \
+  nof:: --offline -- --test-threads=1
 ```
 
-`KVCS_SDK_ROOT` defaults to `/opt/kvcs-sdk/latest`. Set it explicitly when validating another
-extracted version. The build checks for both `C/include/kvcs_capi.h` and `lib/libkvcs.so` before
-linking, so a partial or incorrectly rooted package fails early.
+Build and runtime library selection must agree. `KVCS_SDK_USE_MOCK=1` changes the library recorded
+at link time; changing only `LD_LIBRARY_PATH` is not a supported way to replace a production build
+with the mock.
 
 Public 0.4.0 requires a non-empty Low-Level EFC socket. The executor uses
 `MOONCAKE_KVCS_EFC_SOCKET` when set and otherwise passes the documented
@@ -289,16 +349,18 @@ Offline validation:
 cargo fmt --all -- --check
 cargo test -p mooncake-store-core --offline
 cargo test -p mooncake-store-client --lib --offline -- --test-threads=1
-source /opt/kvcs-sdk/latest/env.sh
+export KVCS_SDK_ROOT=/opt/kvcs-sdk/0.4.0
+export KVCS_SDK_USE_MOCK=0
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
-  cargo check -p mooncake-store-client --features kvcs-capi --lib --offline
+  cargo build -p mooncake-store-client --features kvcs-capi --offline
+export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --features kvcs-capi --lib \
   nof:: --offline -- --test-threads=1
 
 # Exercise both Standard and Low-Level C ABI round trips without live services.
-KVCS_SDK_USE_MOCK=1 \
-LD_LIBRARY_PATH="$KVCS_SDK_ROOT/mock/lib:$LD_LIBRARY_PATH" \
+export KVCS_SDK_USE_MOCK=1
+export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/mock/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --features kvcs-capi --lib \
   kvcs_executor::tests::live_ --offline -- --ignored --test-threads=1
@@ -308,7 +370,9 @@ Live Standard smoke requires EFC plus Redis. Live Low-Level smoke requires EFC a
 mountpoint. Use the same filters without the mock library in `LD_LIBRARY_PATH`:
 
 ```text
-source /opt/kvcs-sdk/latest/env.sh
+export KVCS_SDK_ROOT=/opt/kvcs-sdk/0.4.0
+export KVCS_SDK_USE_MOCK=0
+export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
 cargo test -p mooncake-store-client --features kvcs-capi --lib \
   kvcs_executor::tests::live_ --offline -- \
