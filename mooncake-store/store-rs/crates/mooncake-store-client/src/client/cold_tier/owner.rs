@@ -51,10 +51,6 @@ impl ColdTierDeviceManager {
         )))
     }
 
-    pub(in crate::client) fn locally_owned_nof_target_ids(&self) -> Vec<String> {
-        self.nof_targets.locally_owned_target_ids()
-    }
-
     pub(in crate::client) fn release_nof_ownership_on_shutdown(&self) {
         self.nof_targets.release_ownership_on_shutdown();
     }

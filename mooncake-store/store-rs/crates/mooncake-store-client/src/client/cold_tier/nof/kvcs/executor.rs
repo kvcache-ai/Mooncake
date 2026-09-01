@@ -269,8 +269,7 @@ mod standard {
             let limits = CommonLimits::default();
             let efc_socket = optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")?;
             let redis_password = optional_cstring("MOONCAKE_KVCS_REDIS_PASSWORD")?;
-            let redis_endpoints = std::env::var("MOONCAKE_KVCS_REDIS_ENDPOINTS")
-                .ok()
+            let redis_endpoints = optional_env("MOONCAKE_KVCS_REDIS_ENDPOINTS")?
                 .into_iter()
                 .flat_map(|value| {
                     value

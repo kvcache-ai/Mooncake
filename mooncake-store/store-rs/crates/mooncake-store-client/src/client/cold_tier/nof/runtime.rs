@@ -178,10 +178,6 @@ impl NofTargetManager {
         self.state.owner_for(target_id)
     }
 
-    pub(in crate::client) fn locally_owned_target_ids(&self) -> Vec<String> {
-        self.state.locally_owned_target_ids()
-    }
-
     pub(in crate::client) fn backend_for(
         &self,
         target_id: &str,

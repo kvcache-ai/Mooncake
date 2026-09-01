@@ -36,10 +36,6 @@ impl ValueChunkPlan {
         })
     }
 
-    pub(crate) fn total_len(self) -> u64 {
-        self.total_len
-    }
-
     pub(crate) fn max_chunk_len(self) -> u64 {
         self.max_chunk_len
     }

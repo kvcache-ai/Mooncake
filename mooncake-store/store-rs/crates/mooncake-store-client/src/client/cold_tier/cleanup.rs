@@ -523,7 +523,7 @@ impl StorageOwnerState {
                 cold_tier_device_id(cold_backing)
             )));
         }
-        if !nof_backing && self.cold_backing_still_referenced_by_active_route(cold_backing)? {
+        if self.persistent_backing_still_referenced_by_active_route(cold_backing, nof_backing)? {
             return Ok(crate::control_plane::ColdReclaimResult {
                 skipped_still_referenced: true,
                 ..crate::control_plane::ColdReclaimResult::default()
@@ -571,22 +571,31 @@ impl StorageOwnerState {
         })
     }
 
-    fn cold_backing_still_referenced_by_active_route(
+    fn persistent_backing_still_referenced_by_active_route(
         &self,
-        cold_backing: &mooncake_store_core::ColdBackingRoute,
+        backing: &mooncake_store_core::ColdBackingRoute,
+        nof_backing: bool,
     ) -> Result<bool> {
-        let routes = self.metadata.as_ref().list_object_routes_by_cold_backing(
-            &mooncake_store_core::ColdBackingRouteFilter {
-                device_id: Some(cold_tier_device_id(cold_backing).to_string()),
-                owner: Some(cold_backing.owner.clone()),
-                ..mooncake_store_core::ColdBackingRouteFilter::default()
-            },
-        )?;
+        let routes = if nof_backing {
+            self.metadata.as_ref().list_object_routes_by_nof_backing(
+                &mooncake_store_core::NofBackingRouteFilter {
+                    target_id: Some(cold_tier_device_id(backing).to_string()),
+                    ..mooncake_store_core::NofBackingRouteFilter::default()
+                },
+            )?
+        } else {
+            self.metadata.as_ref().list_object_routes_by_cold_backing(
+                &mooncake_store_core::ColdBackingRouteFilter {
+                    device_id: Some(cold_tier_device_id(backing).to_string()),
+                    owner: Some(backing.owner.clone()),
+                    ..mooncake_store_core::ColdBackingRouteFilter::default()
+                },
+            )?
+        };
         Ok(routes.iter().any(|route| {
             route.state == RouteState::Active
-                && route.cold_backing.as_ref().is_some_and(|current| {
-                    persistent_backing_contains_target(current, cold_backing)
-                })
+                && super::nof::route_backing_as_cold(route)
+                    .is_some_and(|current| persistent_backing_contains_target(&current, backing))
         }))
     }
 

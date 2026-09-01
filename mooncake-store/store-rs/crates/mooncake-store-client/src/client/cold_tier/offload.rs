@@ -29,13 +29,10 @@ pub(in super::super) fn enqueue_pending_offload(
     if super::cold_tier_disabled() {
         return;
     }
-    let Some((cold_backing, _)) = pending_persistent_backing(route) else {
+    let Some((cold_backing, nof_backing)) = pending_persistent_backing(route) else {
         return;
     };
-    if cold_backing.owner != storage_owner.runtime {
-        return;
-    }
-    if cold_backing.state != mooncake_store_core::ColdBackingState::PendingOffload {
+    if !can_materialize_pending_backing(storage_owner, route, &cold_backing, nof_backing) {
         return;
     }
     let _accepted = storage_owner.pending_offloads.push(
@@ -43,6 +40,21 @@ pub(in super::super) fn enqueue_pending_offload(
         route.version,
         Some(cold_backing.length),
     );
+}
+
+fn can_materialize_pending_backing(
+    storage_owner: &StorageOwnerState,
+    route: &ObjectRoute,
+    backing: &mooncake_store_core::ColdBackingRoute,
+    nof_backing: bool,
+) -> bool {
+    if !nof_backing {
+        return backing.owner == storage_owner.runtime;
+    }
+    route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == storage_owner.runtime)
 }
 
 pub(in super::super) fn publish_initial_write_cold_backing(
@@ -462,16 +474,19 @@ pub(in super::super) fn prepare_pending_offload_entry(
         storage_owner.hot_replicas.remove_key(&entry.key.route_key);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     };
-    let refreshed_pending_entry = pending_persistent_backing(&route).and_then(|(backing, _)| {
-        (backing.owner == storage_owner.runtime).then(|| PendingOffloadEntry {
-            key: entry.key.clone(),
-            route_version: route.version,
-            attempts: entry.attempts,
-            not_before: Instant::now(),
-            enqueued_at: entry.enqueued_at,
-            length_bytes: Some(backing.length),
-        })
-    });
+    let refreshed_pending_entry =
+        pending_persistent_backing(&route).and_then(|(backing, nof_backing)| {
+            can_materialize_pending_backing(storage_owner, &route, &backing, nof_backing).then(
+                || PendingOffloadEntry {
+                    key: entry.key.clone(),
+                    route_version: route.version,
+                    attempts: entry.attempts,
+                    not_before: Instant::now(),
+                    enqueued_at: entry.enqueued_at,
+                    length_bytes: Some(backing.length),
+                },
+            )
+        });
     if route.state != RouteState::Active {
         if let Some(refreshed_entry) = refreshed_pending_entry.clone() {
             storage_owner.sync_route(&route);
@@ -492,7 +507,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     };
-    if cold_backing.owner != storage_owner.runtime {
+    if !can_materialize_pending_backing(storage_owner, &route, &cold_backing, nof_backing) {
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     }
@@ -1255,45 +1270,22 @@ fn rebuild_pending_offload_queue_with(
             }
         }
     }
-    let mut nof_routes = Vec::new();
-    for target_id in storage_owner
-        .cold_tier_devices
-        .locally_owned_nof_target_ids()
+    // Pending writes are materialized by the runtime that still owns the hot source. The
+    // target owner is a maintenance/health authority and may not have the source payload.
+    // Reuse the existing replica-owner recovery listing instead of scanning NoF targets.
+    for route in storage_owner
+        .route_ops
+        .list_routes_by_replica_owner(&storage_owner.runtime)?
     {
-        nof_routes.extend(
-            storage_owner
-                .metadata
-                .as_ref()
-                .list_object_routes_by_nof_backing(&mooncake_store_core::NofBackingRouteFilter {
-                    target_id: Some(target_id),
-                    state: Some(mooncake_store_core::NofBackingState::PendingWrite),
-                    ..mooncake_store_core::NofBackingRouteFilter::default()
-                })?,
-        );
-    }
-    // Embedded route control keeps live routes in the shared authority directory rather than
-    // duplicating them into the external metadata table. Pending offloads still have a hot
-    // replica owned by this runtime, so the existing owner listing supplies the same recovery
-    // candidates. Queue insertion deduplicates routes returned by both sources.
-    nof_routes.extend(
-        storage_owner
-            .route_ops
-            .list_routes_by_replica_owner(&storage_owner.runtime)?,
-    );
-    for route in nof_routes {
         let Some(backing) = route.nof_backing.as_ref() else {
             continue;
         };
-        let owns_primary_target = storage_owner
-            .cold_tier_devices
-            .current_target_owner(&backing.target_id, Some(&backing.owner))
-            .is_ok_and(|owner| owner == storage_owner.runtime);
         let owns_hot_source = route
             .replicas
             .iter()
             .any(|replica| replica.owner == storage_owner.runtime);
         if route.state == RouteState::Active
-            && (owns_primary_target || owns_hot_source)
+            && owns_hot_source
             && backing.state == mooncake_store_core::NofBackingState::PendingWrite
             && storage_owner
                 .cold_tier_devices

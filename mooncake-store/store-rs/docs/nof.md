@@ -134,8 +134,10 @@ The primary and every replica in `NofBackingRoute` record the owner elected for 
 the route is published. This field is a routing/audit snapshot, not a second lease. Current
 authority always comes from the live target-owner map, so an ownership change does not scan and
 rewrite every object route. Delete/reclaim resolves the current owner by `target_id`; pending-write
-recovery enumerates the targets currently owned by the client and also retains the existing hot
-replica-owner source for EmbeddedWrh routes.
+materialization remains with the client that owns the hot source replica. The target owner is the
+maintenance and health authority; it is not assumed to hold the source payload. This separation
+lets the existing replica-owner offload queue write directly through the configured NoF backend
+without adding a remote source-transfer protocol.
 
 During graceful client shutdown, the NoF manager removes `nof.target-set.v1` from its existing
 Client lease before longer route and local-device cleanup starts. Other clients observe that
@@ -143,13 +145,14 @@ withdrawal through the normal one-second membership refresh and immediately reco
 For a process or machine crash, takeover follows the existing Client lease expiry and epoch fence;
 NoF does not add a parallel membership or lease service.
 
-Startup recovery requeues `PendingWrite` routes from external metadata and from the existing route
-authority's replica-owner listing. The second source covers the default EmbeddedWrh mode, where
-live routes are not duplicated into the external metadata table. These route indexes are the
-supported recovery source when the SDK has no physical list API. A definite route CAS conflict
-removes every unpublished NoF target. An unknown CAS outcome retains the idempotent locator for
-retry rather than risking an applied route pointing at deleted data; records left by a process
-crash or an outcome that can never be confirmed remain the provider's GC responsibility.
+Startup recovery requeues `PendingWrite` routes through the existing route authority's
+replica-owner listing, keyed by the hot source owner. This works for both metadata-only and the
+default EmbeddedWrh route control and avoids target-by-client scans. `NofBackingRouteFilter`
+remains the target-scoped external metadata index used by reconciliation and reclaim safety; it is
+not a second pending-work queue. A definite route CAS conflict removes every unpublished NoF
+target. An unknown CAS outcome retains the idempotent locator for retry rather than risking an
+applied route pointing at deleted data; records left by a process crash or an outcome that can
+never be confirmed remain the provider's GC responsibility.
 
 ## Module layout
 

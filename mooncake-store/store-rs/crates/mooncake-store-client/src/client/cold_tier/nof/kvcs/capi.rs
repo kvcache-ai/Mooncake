@@ -306,9 +306,18 @@ fn env_u32(name: &str, default: u32) -> Result<u32> {
     }
 }
 
+fn optional_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidState(format!(
+            "{name} is not valid UTF-8"
+        ))),
+    }
+}
+
 fn optional_cstring(name: &str) -> Result<Option<CString>> {
-    std::env::var(name)
-        .ok()
+    optional_env(name)?
         .filter(|value| !value.is_empty())
         .map(|value| {
             CString::new(value)

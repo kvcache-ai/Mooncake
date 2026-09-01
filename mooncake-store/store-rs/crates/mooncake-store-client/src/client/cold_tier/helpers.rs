@@ -165,7 +165,13 @@ pub(in super::super) fn pending_persistent_backing(
 /// Like [`materialized_cold_backing`] but without cloning the backing record —
 /// for hot-path gating that only needs to know whether materialized backing exists.
 pub(in super::super) fn has_materialized_cold_backing(route: &ObjectRoute) -> bool {
-    materialized_cold_backing(route).is_some()
+    route
+        .cold_backing
+        .as_ref()
+        .is_some_and(|backing| backing.state == mooncake_store_core::ColdBackingState::Materialized)
+        || route.nof_backing.as_ref().is_some_and(|backing| {
+            backing.state == mooncake_store_core::NofBackingState::Materialized
+        })
 }
 
 pub(in super::super) fn validate_cold_restore_payload(
