@@ -2306,7 +2306,7 @@ std::unique_ptr<DataManagerV1> MakeDataManagerForTePollTest(
     transfer_config.mode = LocalTransferMode::TE;
     transfer_config.te_async_poll_worker_num = te_async_poll_worker_num;
     return std::make_unique<DataManagerV1>(std::move(backend), std::move(te),
-                                         1024, transfer_config);
+                                           1024, transfer_config);
 }
 
 }  // namespace
@@ -2566,9 +2566,8 @@ TEST_F(DataManagerTest, BuildRemoteBufferDescRejectsUnaddressableBuffer) {
     ASSERT_TRUE(handle.has_value());
     // While still staged the buffer is addressable, so the descriptor builds.
     ASSERT_NE(handle.value()->loc.data.buffer->data(), 0U);
-    EXPECT_TRUE(
-        fixture->data_manager->BuildRemoteBufferDesc(handle.value())
-            .has_value());
+    EXPECT_TRUE(fixture->data_manager->BuildRemoteBufferDesc(handle.value())
+                    .has_value());
 
     const_cast<CacheTier*>(fixture->backend->GetTier(fixture->storage_tier_id))
         ->Flush();

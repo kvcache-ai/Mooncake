@@ -116,8 +116,7 @@ class DataManager {
     virtual std::vector<TierView> GetTierViews() const = 0;
 
     /** All tier ids that currently hold an exact replica of `key`. */
-    virtual std::vector<UUID> GetReplicaTierIds(
-        std::string_view key) const = 0;
+    virtual std::vector<UUID> GetReplicaTierIds(std::string_view key) const = 0;
 
     /**
      * @brief Iterate all local replicas in batches.
@@ -144,9 +143,8 @@ class DataManager {
 
     /** Reverse read: local object -> peer buffers, via TransferEngine. */
     virtual async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
-    ReadRemoteDataAsync(
-        std::string_view key,
-        const std::vector<RemoteBufferDesc>& dest_buffers) = 0;
+    ReadRemoteDataAsync(std::string_view key,
+                        const std::vector<RemoteBufferDesc>& dest_buffers) = 0;
 
     /** Reverse write: peer buffers -> local object. @return target tier id. */
     virtual async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>

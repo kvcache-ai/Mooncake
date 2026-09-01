@@ -184,10 +184,10 @@ ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
 // ================================================================
 
 DataManagerV1::DataManagerV1(std::unique_ptr<TieredBackend> tiered_backend,
-                         std::shared_ptr<TransferEngine> transfer_engine,
-                         size_t lock_shard_count,
-                         const LocalTransferConfig& local_transfer_config,
-                         const KeyLeaseConfig& key_lease_config)
+                             std::shared_ptr<TransferEngine> transfer_engine,
+                             size_t lock_shard_count,
+                             const LocalTransferConfig& local_transfer_config,
+                             const KeyLeaseConfig& key_lease_config)
     : tiered_backend_(std::move(tiered_backend)),
       transfer_engine_(transfer_engine),
       lock_shard_count_(lock_shard_count > 0 ? lock_shard_count : 1024),
@@ -354,7 +354,7 @@ tl::expected<RemoteBufferDesc, ErrorCode> DataManagerV1::BuildRemoteBufferDesc(
 
 template <typename Record>
 size_t DataManagerV1::ScanExpiredRecordShard(RecordShard<Record>& shard,
-                                           TimePoint now) {
+                                             TimePoint now) {
     size_t removed = 0;
     while (!shard.ordered_list.empty()) {
         auto list_it = shard.ordered_list.begin();
@@ -471,8 +471,9 @@ tl::expected<void, ErrorCode> DataManagerV1::AttachPendingWriteHandle(
 
 tl::expected<AllocationHandle, ErrorCode>
 DataManagerV1::ValidatePendingWriteForCommit(PendingWriteShard& shard,
-                                           std::string_view key, TimePoint now,
-                                           const UUID& write_operation_id) {
+                                             std::string_view key,
+                                             TimePoint now,
+                                             const UUID& write_operation_id) {
     // Hold the pending record through Commit so a new PreWrite cannot reserve
     // the same key in the race window before tiered_backend_->Commit finishes.
     std::shared_lock shard_lock(shard.mutex);
@@ -655,7 +656,7 @@ DataManagerV1::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
     // Local Put: pin the local replica to DRAM (strict; evict+retry on a full
     // DRAM, never spill to a slower tier).
     auto prewrite_result = PreWriteInternal(okey.View(), total_size,
-                                           std::nullopt, /*dram_only=*/true);
+                                            std::nullopt, /*dram_only=*/true);
     if (!prewrite_result) {
         LOG(ERROR) << "PutViaTe: PreWrite failed"
                    << ", key=" << key
@@ -916,9 +917,9 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManagerV1::BuildDataCopierViaMemcpy(
     // Own the key: read_fn runs at TaskHandle::Wait() time or on an async
     // memcpy worker, after Get() returned and possibly after the caller's key
     // storage died.
-    auto read_fn = [plan = std::move(plan_result.value()),
-                    key = std::string(key)]() mutable
-        -> tl::expected<void, ErrorCode> {
+    auto read_fn =
+        [plan = std::move(plan_result.value()),
+         key = std::string(key)]() mutable -> tl::expected<void, ErrorCode> {
         ScopedVLogTimer timer(1, "DataManagerV1::BuildDataCopierViaMemcpy");
         timer.LogRequest("key=", key);
         ErrorCode ec = ExecuteLocalCopyPlan(plan);
@@ -1131,7 +1132,7 @@ tl::expected<PreWriteResponse, ErrorCode> DataManagerV1::PreWrite(
 
 tl::expected<DataManagerV1::PreWriteResult, ErrorCode>
 DataManagerV1::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
-                              std::optional<UUID> tier_id, bool dram_only) {
+                                std::optional<UUID> tier_id, bool dram_only) {
     ScopedVLogTimer timer(1, "DataManagerV1::PreWrite");
     timer.LogRequest("key=", ctx.key, "size_bytes=", size_bytes);
 
@@ -1851,7 +1852,7 @@ DataManagerV1::PrepareDRAMTransferBuffer(void* source_ptr,
 tl::expected<std::pair<void*, std::unique_ptr<void, void (*)(void*)>>,
              ErrorCode>
 DataManagerV1::PrepareDRAMReceiveBuffer(void* dest_ptr, MemoryType dest_type,
-                                      size_t total_size) {
+                                        size_t total_size) {
     if (dest_type == MemoryType::DRAM) {
         return std::make_pair(dest_ptr, std::unique_ptr<void, void (*)(void*)>(
                                             nullptr, [](void*) {}));
@@ -1960,7 +1961,7 @@ void DataManagerV1::ReleaseTeWaitInflight() {
 }
 
 bool DataManagerV1::IsTeBatchFullyDrained(Transport::BatchID batch_id,
-                                        size_t num_tasks) {
+                                          size_t num_tasks) {
     for (size_t i = 0; i < num_tasks; ++i) {
         TransferStatus status;
         Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
@@ -2043,8 +2044,8 @@ tl::expected<void, ErrorCode> DataManagerV1::WaitTransferBatch(
 
 async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
 DataManagerV1::WaitTransferBatchCoro(Transport::BatchID batch_id,
-                                   size_t num_tasks,
-                                   std::string segment_endpoint) {
+                                     size_t num_tasks,
+                                     std::string segment_endpoint) {
     auto start_time = std::chrono::steady_clock::now();
     while (true) {
         if (te_wait_stopped_.load(std::memory_order_acquire)) {
@@ -2095,7 +2096,7 @@ DataManagerV1::WaitAllTransferBatchesCoro(
 // is_finished=true. And there is no cancel API in TransferEngine. Thus, we must
 // poll until all tasks reach a terminal state before calling freeBatchID.
 void DataManagerV1::CancelBatchTETask(Transport::BatchID batch_id,
-                                    size_t num_tasks) {
+                                      size_t num_tasks) {
     auto start = std::chrono::steady_clock::now();
     while (true) {
         if (IsTeBatchFullyDrained(batch_id, num_tasks)) {
@@ -2220,8 +2221,8 @@ tl::expected<size_t, ErrorCode> DataManagerV1::QueryObjectSize(
 }
 
 tl::expected<void, ErrorCode> DataManagerV1::Delete(std::string_view key,
-                                                  std::optional<UUID> tier_id,
-                                                  bool notify_master) {
+                                                    std::optional<UUID> tier_id,
+                                                    bool notify_master) {
     ScopedVLogTimer timer(1, "DataManagerV1::Delete");
     timer.LogRequest("key=", key);
 
@@ -2242,7 +2243,7 @@ tl::expected<void, ErrorCode> DataManagerV1::Delete(std::string_view key,
 }
 
 bool DataManagerV1::Exist(std::string_view key,
-                        std::optional<UUID> tier_id) const {
+                          std::optional<UUID> tier_id) const {
     return tiered_backend_->Exist(key, tier_id);
 }
 
@@ -2293,7 +2294,7 @@ std::vector<UUID> DataManagerV1::GetReplicaTierIds(std::string_view key) const {
 // If a client attempts to access data via a read route and the data is not
 // found locally, it calls this function to rectify the stale route in master.
 void DataManagerV1::RectifyReadRoute(std::string_view key,
-                                   std::optional<UUID> tier_id) {
+                                     std::optional<UUID> tier_id) {
     if (!rectify_wrong_route_fn_) return;
 
     tiered_backend_->conditionalExecute(

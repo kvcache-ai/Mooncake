@@ -96,9 +96,9 @@ class HARecoveryManagerTest : public ::testing::Test {
         // Initialise with an empty TieredBackend (no tiers, no keys) and a
         // default TransferEngine (not init()'d — only RDMA ops need it, and
         // the recovery pipeline only iterates metadata which is empty here).
-        data_manager_ = std::make_unique<DataManagerV1>(
-            std::make_unique<TieredBackend>(),
-            std::make_shared<TransferEngine>());
+        data_manager_ =
+            std::make_unique<DataManagerV1>(std::make_unique<TieredBackend>(),
+                                            std::make_shared<TransferEngine>());
         notifier_.reset();
     }
 
