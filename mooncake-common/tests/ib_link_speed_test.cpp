@@ -52,6 +52,23 @@ TEST(IbLinkSpeedTest, ConvertsPortAttrEncodingsToGbps) {
 
 // An encoding the table does not know must not be guessed at: 0 tells the
 // caller the speed is unknown so it can fall back explicitly.
+// ibv_query_port_speed() (rdma-core >= 62) reports the port's *effective*
+// speed in Mb/s: for a VF over LAG that is the bandwidth left
+// after a PF drops out, which the encoded link rate cannot express. When
+// available it wins; otherwise the encodings decide as before.
+TEST(IbLinkSpeedTest, EffectiveSpeedWinsOverEncodedRate) {
+    // 400G link, but the LAG under this VF is down to one 200G PF.
+    EXPECT_DOUBLE_EQ(ibPortSpeedGbps(200'000, 128, 2), 200.0);
+    // Effective speed known, encodings unknown: still usable.
+    EXPECT_DOUBLE_EQ(ibPortSpeedGbps(100'000, 0, 0), 100.0);
+}
+
+TEST(IbLinkSpeedTest, EncodedRateWhenEffectiveSpeedIsUnavailable) {
+    // 0 = the library predates the verb or the driver reported nothing.
+    EXPECT_DOUBLE_EQ(ibPortSpeedGbps(0, 128, 2), 400.0);
+    EXPECT_DOUBLE_EQ(ibPortSpeedGbps(0, 0, 0), 0.0);
+}
+
 TEST(IbLinkSpeedTest, UnknownEncodingsReportZero) {
     EXPECT_DOUBLE_EQ(ibLinkSpeedGbps(0, 2), 0.0);   // speed unset
     EXPECT_DOUBLE_EQ(ibLinkSpeedGbps(32, 0), 0.0);  // width unset

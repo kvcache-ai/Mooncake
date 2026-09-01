@@ -38,6 +38,12 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_USE_URING);
 };
 
+struct ClientAutoPortEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_SETUP_RETRIES);
+    MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MIN_PORT);
+    MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake

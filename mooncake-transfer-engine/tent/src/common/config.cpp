@@ -135,6 +135,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     }
 
     // Legacy keys for backward compatibility (MC_* env vars)
+    setConfig(config, "MOONCAKE_LOCAL_HOSTNAME", "rpc_server_hostname");
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",
               "transports/rdma/device/num_cq_list");
