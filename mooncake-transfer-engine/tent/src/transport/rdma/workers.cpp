@@ -879,9 +879,15 @@ int Workers::handleContextEvents(int dev_id,
                         << context->name();
             return -1;
         }
-        LOG(WARNING) << "Received context async event "
-                     << ibv_event_type_str(event.event_type) << " for context "
-                     << context->name();
+        if (event.event_type == IBV_EVENT_COMM_EST) {
+            VLOG(1) << "Received context async event "
+                    << ibv_event_type_str(event.event_type)
+                    << " for context " << context->name();
+        } else {
+            LOG(WARNING) << "Received context async event "
+                         << ibv_event_type_str(event.event_type)
+                         << " for context " << context->name();
+        }
         applyContextEvent(dev_id, *context, event);
         ibv_ack_async_event(&event);
     }
