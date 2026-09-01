@@ -13,6 +13,9 @@ file(GLOB TENT_METRICS_SOURCES "*.cpp")
 # tree (tent/CMakeLists.txt sets CMAKE_POSITION_INDEPENDENT_CODE ON), so the
 # tent_common OBJECT dependency links cleanly into the shared object.
 add_library(tent_metrics SHARED ${TENT_METRICS_SOURCES})
+set_target_properties(
+  tent_metrics
+  PROPERTIES INSTALL_RPATH "$ORIGIN" BUILD_WITH_INSTALL_RPATH TRUE)
 # Link yalantinglibs::yalantinglibs for metrics and HTTP server (ylt headers +
 # transitive deps). ODR safety: yalantinglibs bundles ASIO headers but does NOT
 # compile ASIO inline because ASIO_SEPARATE_COMPILATION is set globally. All

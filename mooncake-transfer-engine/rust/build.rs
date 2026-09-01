@@ -176,6 +176,7 @@ fn main() {
             build_dir.join("mooncake-common/src"),
             build_dir.join("mooncake-common/etcd"),
             build_dir.join("mooncake-transfer-engine/tent/src"),
+            build_dir.join("mooncake-transfer-engine/tent/src/metrics"),
             build_dir.join("src"),
             build_dir.join("src/common/base"),
         ] {
@@ -200,6 +201,7 @@ fn main() {
         manifest_dir.join("../../build/mooncake-common"),
         manifest_dir.join("../../build/mooncake-common/etcd"),
         manifest_dir.join("../../build/mooncake-transfer-engine/tent/src"),
+        manifest_dir.join("../../build/mooncake-transfer-engine/tent/src/metrics"),
         manifest_dir.join("../tent/build/src"),
     ] {
         push_dir(&mut search_dirs, dir);
@@ -268,6 +270,9 @@ fn main() {
         }
         if has_mooncake_common {
             println!("cargo:rustc-link-arg=-lmooncake_common");
+        }
+        if has_library(&search_dirs, "tent_metrics") {
+            println!("cargo:rustc-link-arg=-ltent_metrics");
         }
         println!("cargo:rustc-link-arg=-Wl,--end-group");
         println!("cargo:rustc-link-lib=dl");

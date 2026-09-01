@@ -131,6 +131,7 @@ target_link_libraries(tent PUBLIC tent_runtime tent_interface)
 
 add_library(tent_shared SHARED ${TENT_ENGINE_SOURCES})
 target_link_libraries(tent_shared PUBLIC tent_runtime tent_interface)
+set_target_properties(tent_shared PROPERTIES INSTALL_RPATH "$ORIGIN")
 
 add_library(tent_link_group INTERFACE)
 target_link_libraries(tent_link_group INTERFACE "-Wl,--start-group" tent)
