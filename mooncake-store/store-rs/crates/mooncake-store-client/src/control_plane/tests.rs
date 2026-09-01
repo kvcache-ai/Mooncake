@@ -12,10 +12,12 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use super::{
     control_address, control_address_label, control_plane_server_threads_from_env, decode_error,
     ensure_batch_len, fail_stream_session, handle_control_stream_request, normalize_control_uri,
-    pb_cas_result, pb_cold_backing_route, pb_compatibility, pb_error, pb_object_route,
+    pb_cas_result, pb_cold_backing_route, pb_compatibility, pb_error, pb_nof_backing_route,
+    pb_object_route,
     pb_replica_route, pb_replica_tier, pb_route_state, pb_runtime_id, pb_segment_reservation,
     status_to_store_error, store_error_from_pb, try_cas_result, try_cold_backing_route,
-    try_compatibility, try_object_route, try_replica_route, try_replica_tier, try_route_state,
+    try_compatibility, try_nof_backing_route, try_object_route, try_replica_route,
+    try_replica_tier, try_route_state,
     try_runtime_id, try_segment_reservation, AllocatorService, AuthorityService,
     ControlPlaneClient, ControlPlaneHandle, ControlStreamSession, EvictionService,
     GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp, RouteTrafficReport,
@@ -27,7 +29,8 @@ use crate::observability::{metrics_test_lock, render_prometheus_metrics, reset_m
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, ColdBackingReplica, ColdBackingRoute, ColdBackingState,
-    CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
+    CompatibilityDescriptor, NamespaceScope, NofBackingReplica, NofBackingRoute,
+    NofBackingState, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
     RouteCasRequest, RouteState, RouteVersion, SegmentName, SegmentReservation, StoreError,
 };
 use tonic::transport::Server;
@@ -1156,6 +1159,7 @@ fn sample_route(key: &str, version: u64, owner: &ClientRuntimeId) -> ObjectRoute
             priority: 1,
         }],
         cold_backing: None,
+        nof_backing: None,
     }
 }
 
@@ -1867,6 +1871,28 @@ fn cold_backing_route_round_trip_preserves_replicas() {
 }
 
 #[test]
+fn nof_backing_route_round_trip_preserves_distinct_targets() {
+    let route = NofBackingRoute {
+        owner: ClientRuntimeId::new("nof-primary", ClientEpoch(3)),
+        target_id: "nof-primary-target".to_string(),
+        object_locator: "nof-ll:v1:i:01".to_string(),
+        length: 4096,
+        checksum: Some(12345),
+        state: NofBackingState::Materialized,
+        replicas: vec![NofBackingReplica {
+            owner: ClientRuntimeId::new("nof-replica", ClientEpoch(4)),
+            target_id: "nof-replica-target".to_string(),
+            object_locator: "nof-ll:v1:i:02".to_string(),
+        }],
+    };
+
+    assert_eq!(
+        try_nof_backing_route(pb_nof_backing_route(&route)).expect("NoF backing should round-trip"),
+        route
+    );
+}
+
+#[test]
 fn object_route_round_trip_preserves_namespace_fields() {
     let owner = sample_owner();
     let route = ObjectRoute {
@@ -1890,6 +1916,7 @@ fn object_route_round_trip_preserves_namespace_fields() {
             priority: 0,
         }],
         cold_backing: None,
+        nof_backing: None,
     };
 
     assert_eq!(
@@ -2015,6 +2042,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             sharing_scope: String::new(),
             qos_tier: String::new(),
             cold_backing: None,
+            nof_backing: None,
         };
 
         let cas_reply = service

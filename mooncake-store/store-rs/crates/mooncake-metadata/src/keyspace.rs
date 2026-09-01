@@ -1,6 +1,6 @@
 use mooncake_store_core::{
-    ClientRuntimeId, ClientStableId, ColdBackingState, ObjectKey, RoutePolicyDomain, SegmentName,
-    TenantPolicyScope,
+    ClientRuntimeId, ClientStableId, ColdBackingState, NofBackingState, ObjectKey,
+    RoutePolicyDomain, SegmentName, TenantPolicyScope,
 };
 use std::borrow::Cow;
 
@@ -238,6 +238,34 @@ impl MetadataKeyspace {
     pub fn object_cold_backing_owner_index(&self, owner: &ClientRuntimeId) -> String {
         format!(
             "{}/indexes/objects/by-cold-backing-owner/{}",
+            self.slot_tag,
+            encode_key_component(&owner.storage_key())
+        )
+    }
+
+    pub fn object_nof_target_index(&self, target_id: &str) -> String {
+        format!(
+            "{}/indexes/objects/by-nof-target/{}",
+            self.slot_tag,
+            encode_key_component(target_id)
+        )
+    }
+
+    pub fn object_nof_backing_state_index(&self, state: NofBackingState) -> String {
+        format!(
+            "{}/indexes/objects/by-nof-backing-state/{}",
+            self.slot_tag,
+            match state {
+                NofBackingState::PendingWrite => "pending_write",
+                NofBackingState::Materialized => "materialized",
+                NofBackingState::PendingDelete => "pending_delete",
+            }
+        )
+    }
+
+    pub fn object_nof_backing_owner_index(&self, owner: &ClientRuntimeId) -> String {
+        format!(
+            "{}/indexes/objects/by-nof-backing-owner/{}",
             self.slot_tag,
             encode_key_component(&owner.storage_key())
         )
@@ -537,8 +565,8 @@ fn parse_runtime_storage_key(storage_key: &str) -> Option<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use mooncake_store_core::{
-        ClientEpoch, ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName,
-        TenantPolicyScope,
+        ClientEpoch, ClientRuntimeId, ClientStableId, NofBackingState, ObjectKey,
+        RoutePolicyDomain, SegmentName, TenantPolicyScope,
     };
 
     use super::{
@@ -846,6 +874,9 @@ mod tests {
             keyspace.client_lease_expiry_time(42, &runtime),
             keyspace.object(&ObjectKey::new("key-1")),
             keyspace.object_index(),
+            keyspace.object_nof_target_index("nof/target-a"),
+            keyspace.object_nof_backing_state_index(NofBackingState::PendingDelete),
+            keyspace.object_nof_backing_owner_index(&runtime),
             keyspace.tenant_eviction_frontier("tenant-a"),
         ];
 

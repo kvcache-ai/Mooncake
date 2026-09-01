@@ -94,6 +94,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
+            nof_backing: None,
         };
         assert_eq!(
             route_logical_object_id(&route).expect("route should parse"),
@@ -135,6 +136,7 @@ mod tests {
                 priority: 0,
             }],
             cold_backing: None,
+            nof_backing: None,
         };
         apply_route_identity(&mut route, &scoped_logical_object_id("tenant-b", "key-b"));
         assert_eq!(route.key.0, "tenant-b::key-b");
@@ -161,6 +163,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
+            nof_backing: None,
         };
         let id = LogicalObjectId::new(
             NamespaceScope::new("tenant-a", "domain-a", "set-a"),
@@ -208,6 +211,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
+            nof_backing: None,
         };
         apply_route_identity(&mut route, &scoped_logical_object_id("tenant-b", "key-b"));
         route.sharing_scope = Some("domain-a".to_string());
@@ -263,6 +267,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
+            nof_backing: None,
         };
         let id = route_logical_object_id(&route).expect("namespace path must win");
         assert_eq!(id.scope.tenant, "explicit-tenant");
@@ -283,6 +288,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
+            nof_backing: None,
         };
         let reuse = route_reuse_identity(&route).expect("fallback build");
         assert_eq!(reuse.sharing_scope, "default");
@@ -302,6 +308,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
+            nof_backing: None,
         };
         apply_route_identity(&mut route, &scoped_logical_object_id("new-t", "new-k"));
         assert_eq!(route.key.0, "new-t::new-k");

@@ -556,6 +556,7 @@ impl StoreClient {
                     })
                     .collect(),
                 cold_backing: None,
+                nof_backing: None,
             };
             mooncake_store_core::apply_route_identity(&mut route, object_id);
             let cas_tracker = OperationTracker::new("put_stage_route_cas")

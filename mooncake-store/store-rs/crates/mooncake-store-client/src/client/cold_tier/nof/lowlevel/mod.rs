@@ -13,6 +13,7 @@ mod executor;
 pub(crate) use executor::repeated_error;
 pub use executor::{
     NofLowLevelCapabilities, NofLowLevelDeleteRequest, NofLowLevelExecutor, NofLowLevelGetRequest,
+    NofLowLevelListPage, NofLowLevelObject, NofLowLevelStorageHealth,
 };
 #[cfg(feature = "kvcs-capi")]
 mod kvcs_executor;
@@ -53,6 +54,6 @@ impl NofLowLevelTarget {
     }
 
     pub fn ownership(&self) -> NofOwnership {
-        NofOwnership::MooncakeColdTier
+        self.executor.ownership()
     }
 }

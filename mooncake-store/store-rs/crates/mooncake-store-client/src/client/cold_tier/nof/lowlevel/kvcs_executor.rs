@@ -10,12 +10,12 @@ use mooncake_store_core::{Result, StoreError};
 use super::super::*;
 use super::{
     NofLowLevelCapabilities, NofLowLevelDeleteRequest, NofLowLevelExecutor, NofLowLevelGetRequest,
-    OpaquePhysicalKey,
+    NofLowLevelStorageHealth, OpaquePhysicalKey,
 };
 
 pub struct KvcsCapiLowLevelExecutor {
     config: KvcsLlConfig,
-    _efc_socket: Option<CString>,
+    _efc_socket: CString,
     _log_path: Option<CString>,
     mountpoint_index: u32,
     client: Mutex<Option<ClientHandle>>,
@@ -28,15 +28,19 @@ unsafe impl Sync for KvcsCapiLowLevelExecutor {}
 impl KvcsCapiLowLevelExecutor {
     pub fn new() -> Result<Self> {
         let limits = CommonLimits::from_env()?;
-        let efc_socket = optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")?;
+        let efc_socket = match optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")? {
+            Some(socket) => socket,
+            None => CString::new("/var/run/kvcs/efc-grpc.sock").map_err(|_| {
+                StoreError::InvalidState("KVCS default EFC socket contains NUL".to_string())
+            })?,
+        };
         let log_path = optional_cstring("MOONCAKE_KVCS_LOG_PATH")?;
         let configured_value = env_u64("MOONCAKE_KVCS_MAX_VALUE_SIZE", 0)?;
         let configured_key = env_u32("MOONCAKE_KVCS_MAX_KEY_SIZE", 0)?;
         let configured_batch = env_u32("MOONCAKE_KVCS_MAX_KEYS_PER_BATCH", 0)?;
         let config = KvcsLlConfig {
-            efc_socket: efc_socket
-                .as_ref()
-                .map_or(ptr::null(), |value| value.as_ptr()),
+            // Public SDK 0.4.0 rejects NULL/empty for the low-level client.
+            efc_socket: efc_socket.as_ptr(),
             max_keys_per_batch: configured_batch.min(c_int::MAX as u32) as c_int,
             iov_size: 0,
             max_value_size: if configured_value == 0 {
@@ -154,6 +158,16 @@ impl NofLowLevelExecutor for KvcsCapiLowLevelExecutor {
             max_batch_items: self.limits.max_batch_items,
             // KVCS documents max_value_size per value and splits large batches internally.
             max_batch_bytes: u64::MAX,
+        }
+    }
+
+    fn ownership(&self) -> NofOwnership {
+        // KVCS Low-Level has raw keys only, so Mooncake owns logical route metadata. EFC/provider
+        // owns physical GC, watermarks, disk lifecycle, and rebuild.
+        NofOwnership {
+            metadata: NofMetadataOwnership::ExternalMetadata,
+            maintenance: NofStorageMaintenance::ProviderManaged,
+            devices: NofDeviceManagement::ProviderManaged,
         }
     }
 
@@ -446,6 +460,122 @@ impl NofLowLevelExecutor for KvcsCapiLowLevelExecutor {
         }
         finish_positional_results(results)
     }
+
+    fn query_batch(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+        let valid = keys
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(index, key)| match encode_physical_key(key, self.limits.max_key_size) {
+                    Ok(key) => Some((index, key)),
+                    Err(error) => {
+                        results[index] = Some(Err(error));
+                        None
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        if valid.is_empty() {
+            return finish_positional_results(results);
+        }
+        let count = match checked_batch_len(valid.len()) {
+            Ok(count) => count,
+            Err(error) => {
+                fill_missing(&mut results, &error);
+                return finish_positional_results(results);
+            }
+        };
+        let client = match self.ensure_client() {
+            Ok(client) => client,
+            Err(error) => {
+                fill_missing(&mut results, &error);
+                return finish_positional_results(results);
+            }
+        };
+        let pointers = valid
+            .iter()
+            .map(|(_, key)| key.as_ptr())
+            .collect::<Vec<_>>();
+        let mut native_results = (0..valid.len())
+            .map(|_| KvcsQueryResult {
+                key: [0; 256],
+                status: [0; 32],
+                total_shard: 0,
+                total_size: 0,
+                meta: ptr::null_mut(),
+                meta_count: 0,
+                shards: ptr::null_mut(),
+                shard_count: 0,
+            })
+            .collect::<Vec<_>>();
+        let options = self.options();
+        let options_ptr = options.as_ref().map_or(ptr::null(), |options| options);
+        let written = unsafe {
+            kvcs_ll_batch_query(
+                client,
+                pointers.as_ptr(),
+                count,
+                native_results.as_mut_ptr(),
+                count,
+                options_ptr,
+            )
+        };
+        if written < 0 {
+            let error = map_call_status(written, "low-level query");
+            fill_missing(&mut results, &error);
+            return finish_positional_results(results);
+        }
+        if written != count {
+            let error = StoreError::Transport(format!(
+                "KVCS low-level query returned {written} results for {count} keys"
+            ));
+            fill_missing(&mut results, &error);
+        } else {
+            for ((request_index, _), native) in valid.iter().zip(&native_results) {
+                results[*request_index] = Some(kvcs_low_level_query_status(&native.status));
+            }
+        }
+        unsafe { kvcs_query_result_free(native_results.as_mut_ptr(), count) };
+        finish_positional_results(results)
+    }
+
+    fn storage_health(&self) -> Result<NofLowLevelStorageHealth> {
+        // `ll_batch_query` is the only low-level ABI operation that provides a cheap liveness
+        // check. A missing probe key is healthy; ENODEV/unavailable is surfaced as an error.
+        let probe = OpaquePhysicalKey::new(b"mooncake:nof:health:v1".to_vec());
+        self.query_batch(&[probe]).pop().ok_or_else(|| {
+            StoreError::Transport("KVCS health query returned no result".into())
+        })??;
+        Ok(NofLowLevelStorageHealth::default())
+    }
+}
+
+fn kvcs_low_level_query_status(status: &[std::ffi::c_char; 32]) -> Result<bool> {
+    let len = status
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(status.len());
+    let bytes = unsafe { std::slice::from_raw_parts(status.as_ptr().cast::<u8>(), len) };
+    match std::str::from_utf8(bytes) {
+        Ok("ok") => Ok(true),
+        Ok("not_found") => Ok(false),
+        Ok("incomplete") => Err(StoreError::Backpressure(
+            "KVCS low-level query returned incomplete".to_string(),
+        )),
+        Ok("unavailable") => Err(StoreError::Transport(
+            "KVCS low-level mountpoint is unavailable".to_string(),
+        )),
+        Ok(other) => Err(StoreError::Transport(format!(
+            "KVCS low-level query returned status {other}"
+        ))),
+        Err(error) => Err(StoreError::Transport(format!(
+            "KVCS low-level query returned invalid status: {error}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +596,10 @@ mod tests {
             .put_batch(&[(key.clone(), value)])
             .remove(0)
             .unwrap();
+        assert!(executor
+            .query_batch(std::slice::from_ref(&key))
+            .remove(0)
+            .unwrap());
         assert_eq!(
             executor
                 .get_batch(&[NofLowLevelGetRequest {
@@ -477,8 +611,21 @@ mod tests {
             Some(value.to_vec())
         );
         executor
-            .delete_batch(&[NofLowLevelDeleteRequest { key }])
+            .delete_batch(&[NofLowLevelDeleteRequest { key: key.clone() }])
             .remove(0)
             .unwrap();
+        assert!(!executor.query_batch(&[key]).remove(0).unwrap());
+        assert_eq!(
+            executor.ownership(),
+            NofOwnership {
+                metadata: NofMetadataOwnership::ExternalMetadata,
+                maintenance: NofStorageMaintenance::ProviderManaged,
+                devices: NofDeviceManagement::ProviderManaged,
+            }
+        );
+        assert_eq!(
+            executor.storage_health().unwrap(),
+            NofLowLevelStorageHealth::default()
+        );
     }
 }

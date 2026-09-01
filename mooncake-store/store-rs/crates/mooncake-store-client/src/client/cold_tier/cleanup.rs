@@ -239,6 +239,10 @@ impl StorageOwnerState {
             ..ColdTierCompactionResult::default()
         };
         for (device_id, stats) in maintenance.devices {
+            if !self.cold_tier_devices.mooncake_manages_storage(&device_id) {
+                result.skipped_devices = result.skipped_devices.saturating_add(1);
+                continue;
+            }
             if stats.extent_dead_bytes == 0 {
                 continue;
             }
@@ -299,6 +303,10 @@ impl StorageOwnerState {
         let mut devices = devices
             .into_iter()
             .filter(|device| device.stable_id == self.runtime.stable_id.0)
+            .filter(|device| {
+                self.cold_tier_devices
+                    .mooncake_manages_storage(&device.device_id)
+            })
             .filter(|device| device.used_bytes.saturating_add(device.reserved_bytes) >= high_bytes)
             .collect::<Vec<_>>();
         devices.sort_by_key(|device| {
@@ -421,6 +429,12 @@ impl StorageOwnerState {
             // Only GC on devices owned by this runtime.
             if device.stable_id != self.runtime.stable_id.0
                 || device.epoch != Some(self.runtime.epoch.0)
+            {
+                continue;
+            }
+            if !self
+                .cold_tier_devices
+                .mooncake_manages_storage(&device.device_id)
             {
                 continue;
             }
@@ -581,9 +595,12 @@ impl StorageOwnerState {
         };
         let mut update = ColdTierDeviceUpdate::new(current_time_ms());
         update.expected_updated_at_ms = Some(device.updated_at_ms);
-        match self.cold_tier_devices.backend_for(&cold_backing) {
-            Ok(backend) => {
-                let health = backend.health()?;
+        match self
+            .cold_tier_devices
+            .backend_for(&cold_backing)
+            .and_then(|backend| backend.health())
+        {
+            Ok(health) => {
                 // Prefer the user-configured capacity (from --cold-tier-capacity-bytes / bootstrap)
                 // over the filesystem-reported capacity.  Only fall back to the disk probe
                 // when no explicit capacity was ever set.
@@ -655,6 +672,10 @@ impl StorageOwnerState {
         for device in devices
             .into_iter()
             .filter(|device| device.stable_id == self.runtime.stable_id.0)
+            .filter(|device| {
+                self.cold_tier_devices
+                    .mooncake_manages_storage(&device.device_id)
+            })
             .filter(|device| device.state == mooncake_store_core::ColdTierDeviceState::Full)
             .filter(|device| device.used_bytes.saturating_add(device.reserved_bytes) <= low_bytes)
         {

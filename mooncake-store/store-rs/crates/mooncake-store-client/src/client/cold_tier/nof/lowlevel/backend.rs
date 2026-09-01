@@ -6,7 +6,10 @@ use std::collections::HashSet;
 use mooncake_store_core::{ColdBackingRoute, ColdBackingState, ObjectRoute, Result, StoreError};
 
 use crate::client::cold_tier::layout::ValueChunkPlan;
-use crate::client::{ColdObjectWrite, PersistentStorageBackend, PersistentStorageBackendHealth};
+use crate::client::{
+    ColdObjectWrite, PersistentStorageBackend, PersistentStorageBackendHealth,
+    PersistentStorageManagement,
+};
 
 use super::super::ensure_batch_len;
 use super::{
@@ -147,6 +150,14 @@ impl NofLowLevelBackend {
         if device_id.is_empty() {
             return Err(StoreError::InvalidState(
                 "NoF low-level device ID must not be empty".to_string(),
+            ));
+        }
+        if target.executor.ownership().metadata
+            != super::super::NofMetadataOwnership::ExternalMetadata
+        {
+            return Err(StoreError::InvalidState(
+                "NoF provider-managed metadata must use the shared high-level metadata path"
+                    .to_string(),
             ));
         }
         let capabilities = target.executor.capabilities().validate()?;
@@ -640,10 +651,26 @@ impl NofLowLevelBackend {
 }
 
 impl PersistentStorageBackend for NofLowLevelBackend {
+    fn storage_management(&self) -> PersistentStorageManagement {
+        match self.target.executor.ownership().maintenance {
+            super::super::NofStorageMaintenance::ProviderManaged => {
+                PersistentStorageManagement::BackendManaged
+            }
+            super::super::NofStorageMaintenance::MooncakeManaged => {
+                PersistentStorageManagement::MooncakeManaged
+            }
+        }
+    }
+
     fn health(&self) -> Result<PersistentStorageBackendHealth> {
+        let health = self
+            .target
+            .executor
+            .storage_health()?
+            .validate(self.target.executor.ownership())?;
         Ok(PersistentStorageBackendHealth {
-            capacity_bytes: None,
-            available_bytes: None,
+            capacity_bytes: health.capacity_bytes,
+            available_bytes: health.available_bytes,
         })
     }
 
@@ -783,7 +810,10 @@ fn bounded_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NofLowLevelExecutor, PhysicalKeyCodec, PhysicalKeyInput};
+    use crate::{
+        NofDeviceManagement, NofLowLevelExecutor, NofMetadataOwnership, NofOwnership,
+        NofStorageMaintenance, PhysicalKeyCodec, PhysicalKeyInput,
+    };
     use mooncake_store_core::{ClientEpoch, ClientRuntimeId, ClientStableId};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -792,6 +822,7 @@ mod tests {
     struct MemoryExecutor {
         values: Mutex<HashMap<OpaquePhysicalKey, Vec<u8>>>,
         fail_manifest: Mutex<bool>,
+        provider_metadata: bool,
     }
 
     impl NofLowLevelExecutor for MemoryExecutor {
@@ -800,6 +831,18 @@ mod tests {
                 max_value_size: 64,
                 max_batch_items: 64,
                 max_batch_bytes: u64::MAX,
+            }
+        }
+
+        fn ownership(&self) -> NofOwnership {
+            NofOwnership {
+                metadata: if self.provider_metadata {
+                    NofMetadataOwnership::ProviderManaged
+                } else {
+                    NofMetadataOwnership::ExternalMetadata
+                },
+                maintenance: NofStorageMaintenance::ProviderManaged,
+                devices: NofDeviceManagement::ProviderManaged,
             }
         }
 
@@ -870,6 +913,19 @@ mod tests {
         assert_eq!(backend.get_object(&materialized).unwrap().unwrap(), payload);
         assert!(backend.delete_object(&materialized).unwrap());
         assert!(executor.values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn provider_metadata_reuses_high_level_path() {
+        let executor = Arc::new(MemoryExecutor {
+            provider_metadata: true,
+            ..MemoryExecutor::default()
+        });
+        assert!(matches!(
+            NofLowLevelBackend::new("nof-test", NofLowLevelTarget::new(executor)),
+            Err(StoreError::InvalidState(message))
+                if message.contains("shared high-level metadata path")
+        ));
     }
 
     #[test]

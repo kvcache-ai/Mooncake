@@ -4,7 +4,10 @@ use mooncake_store_core::{NamespaceScope, Result, StoreError};
 
 use crate::client::cold_tier::layout::ValueChunkPlan;
 
-use super::{ensure_batch_len, NofOwnership};
+use super::{
+    ensure_batch_len, NofDeviceManagement, NofMetadataOwnership, NofOwnership,
+    NofStorageMaintenance,
+};
 
 mod executor;
 #[cfg(feature = "kvcs-capi")]
@@ -34,7 +37,11 @@ impl NofHighLevelBackend {
     }
 
     pub fn ownership(&self) -> NofOwnership {
-        NofOwnership::Provider
+        NofOwnership {
+            metadata: NofMetadataOwnership::ProviderManaged,
+            maintenance: NofStorageMaintenance::ProviderManaged,
+            devices: NofDeviceManagement::ProviderManaged,
+        }
     }
 
     pub fn init_namespace(&self, namespace: &NamespaceScope) -> Result<()> {

@@ -107,6 +107,13 @@ enum ColdBackingState {
   COLD_BACKING_STATE_PENDING_DELETE = 3;
 }
 
+enum NofBackingState {
+  NOF_BACKING_STATE_UNSPECIFIED = 0;
+  NOF_BACKING_STATE_PENDING_WRITE = 1;
+  NOF_BACKING_STATE_MATERIALIZED = 2;
+  NOF_BACKING_STATE_PENDING_DELETE = 3;
+}
+
 message ReplicaRoute {
   ClientRuntimeId owner = 1;
   string segment_name = 2;
@@ -134,6 +141,22 @@ message ColdBackingReplica {
   string object_locator = 3;
 }
 
+message NofBackingRoute {
+  ClientRuntimeId owner = 1;
+  string target_id = 2;
+  string object_locator = 3;
+  uint64 length = 4;
+  optional uint64 checksum = 5;
+  NofBackingState state = 6;
+  repeated NofBackingReplica replicas = 7;
+}
+
+message NofBackingReplica {
+  ClientRuntimeId owner = 1;
+  string target_id = 2;
+  string object_locator = 3;
+}
+
 message ObjectRoute {
   string key = 1;
   uint64 version = 2;
@@ -148,6 +171,7 @@ message ObjectRoute {
   string sharing_scope = 11;
   string qos_tier = 12;
   ColdBackingRoute cold_backing = 13;
+  NofBackingRoute nof_backing = 14;
 }
 
 message CasResult {

@@ -460,6 +460,7 @@ fn route_from_recovered_cold_object(
             state: mooncake_store_core::ColdBackingState::Materialized,
             replicas: Vec::new(),
         }),
+        nof_backing: None,
     }
 }
 
@@ -1441,6 +1442,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
             cold_backing: Some(cold_backing.clone()),
+            nof_backing: None,
         };
         backend
             .put_object_with_route(Some(&route), &cold_backing, payload)

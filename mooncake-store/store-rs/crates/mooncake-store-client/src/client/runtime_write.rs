@@ -1092,6 +1092,7 @@ impl StoreClient {
                             compatibility: self.lease.compatibility.clone(),
                             replicas,
                             cold_backing: None,
+                            nof_backing: None,
                         };
                         mooncake_store_core::apply_route_identity(&mut route, &entry.object_id);
                         route.qos_tier = Some(

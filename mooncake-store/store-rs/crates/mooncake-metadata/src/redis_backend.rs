@@ -1,4 +1,5 @@
 mod cold_tier;
+mod nof;
 
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -9,12 +10,13 @@ use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
     ColdBackingRouteFilter, ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate,
-    ColdTierPutDeviceResult, ColdTierUsageDelta, HandoffPlan, MetadataBackend, ObjectKey,
-    ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError, TenantObjectAccounting,
-    TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome,
-    TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaReservation,
-    TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaState,
+    ColdTierPutDeviceResult, ColdTierUsageDelta, HandoffPlan, MetadataBackend,
+    NofBackingRouteFilter, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
+    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
+    StoreError, TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy,
+    TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
+    TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
+    TenantQuotaReservationRequest, TenantQuotaState,
 };
 use parking_lot::{Mutex, MutexGuard};
 use redis::cmd;
@@ -37,6 +39,12 @@ local old_owner_index = KEYS[5]
 local new_device_index = KEYS[6]
 local new_state_index = KEYS[7]
 local new_owner_index = KEYS[8]
+local old_nof_target_index = KEYS[9]
+local old_nof_state_index = KEYS[10]
+local old_nof_owner_index = KEYS[11]
+local new_nof_target_index = KEYS[12]
+local new_nof_state_index = KEYS[13]
+local new_nof_owner_index = KEYS[14]
 local expected = ARGV[1]
 local next_version = ARGV[2]
 local payload = ARGV[3]
@@ -46,6 +54,12 @@ local has_old_owner_index = ARGV[6]
 local has_new_device_index = ARGV[7]
 local has_new_state_index = ARGV[8]
 local has_new_owner_index = ARGV[9]
+local has_old_nof_target_index = ARGV[10]
+local has_old_nof_state_index = ARGV[11]
+local has_old_nof_owner_index = ARGV[12]
+local has_new_nof_target_index = ARGV[13]
+local has_new_nof_state_index = ARGV[14]
+local has_new_nof_owner_index = ARGV[15]
 
 local current_payload = redis.call('HGET', key, 'payload')
 local current_version = redis.call('HGET', key, 'version')
@@ -63,6 +77,9 @@ end
 if has_old_device_index == '1' then redis.call('SREM', old_device_index, key) end
 if has_old_state_index == '1' then redis.call('SREM', old_state_index, key) end
 if has_old_owner_index == '1' then redis.call('SREM', old_owner_index, key) end
+if has_old_nof_target_index == '1' then redis.call('SREM', old_nof_target_index, key) end
+if has_old_nof_state_index == '1' then redis.call('SREM', old_nof_state_index, key) end
+if has_old_nof_owner_index == '1' then redis.call('SREM', old_nof_owner_index, key) end
 
 if payload == '__delete__' then
     redis.call('DEL', key)
@@ -75,6 +92,9 @@ redis.call('SADD', index, key)
 if has_new_device_index == '1' then redis.call('SADD', new_device_index, key) end
 if has_new_state_index == '1' then redis.call('SADD', new_state_index, key) end
 if has_new_owner_index == '1' then redis.call('SADD', new_owner_index, key) end
+if has_new_nof_target_index == '1' then redis.call('SADD', new_nof_target_index, key) end
+if has_new_nof_state_index == '1' then redis.call('SADD', new_nof_state_index, key) end
+if has_new_nof_owner_index == '1' then redis.call('SADD', new_nof_owner_index, key) end
 return {1, payload}
 "#;
 
@@ -2128,6 +2148,13 @@ impl MetadataBackend for RedisMetadataBackend {
         self.redis_list_object_routes_by_cold_backing(filter)
     }
 
+    fn list_object_routes_by_nof_backing(
+        &self,
+        filter: &NofBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        self.redis_list_object_routes_by_nof_backing(filter)
+    }
+
     fn compare_and_swap_object_route(
         &self,
         key: &ObjectKey,
@@ -3185,10 +3212,11 @@ mod tests {
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
-        ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy,
-        RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
-        SegmentName, StoreError, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope,
-        TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
+        NofBackingRoute, NofBackingRouteFilter, NofBackingState, ObjectKey, ObjectRoute,
+        ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy, RoutePolicyDomain, RouteState,
+        RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
+        TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+        TenantQuotaFinalizeRequest, TenantQuotaPolicy,
         TenantQuotaReservationRequest, TenantQuotaReservationState,
     };
     use redis::Commands;
@@ -3378,6 +3406,7 @@ mod tests {
                 priority: 1,
             }],
             cold_backing: None,
+            nof_backing: None,
         }
     }
 
@@ -4235,6 +4264,86 @@ mod tests {
         let scan_error = scan_keys_bounded(&mut connection, "bounded-scan/*", 1, 64)
             .expect_err("scan should reject more than one result");
         assert!(scan_error.to_string().contains("fixed 1-item bound"));
+    }
+
+    #[test]
+    fn redis_backend_updates_nof_indexes_with_route_cas() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-nof-index");
+        let backend =
+            RedisMetadataBackend::new(RedisMetadataConfig::new(server.url()).keyspace(keyspace))
+                .expect("redis backend should initialize");
+
+        let mut route = sample_route(3);
+        route.nof_backing = Some(NofBackingRoute {
+            owner: sample_runtime(),
+            target_id: "nof-target-a".to_string(),
+            object_locator: "nof-ll:v1:i:01".to_string(),
+            length: 12,
+            checksum: Some(7),
+            state: NofBackingState::Materialized,
+            replicas: Vec::new(),
+        });
+        assert!(
+            backend
+                .compare_and_swap_object_route(&route.key, None, Some(&route))
+                .expect("NoF route create should succeed")
+                .applied
+        );
+
+        let filter = |target_id: &str| NofBackingRouteFilter {
+            target_id: Some(target_id.to_string()),
+            state: None,
+            owner: None,
+            limit: None,
+        };
+        assert_eq!(
+            backend
+                .list_object_routes_by_nof_backing(&filter("nof-target-a"))
+                .expect("NoF target index should list the route"),
+            vec![route.clone()]
+        );
+
+        let mut updated = route.clone();
+        updated.version = RouteVersion(4);
+        let updated_backing = updated.nof_backing.as_mut().expect("NoF backing");
+        updated_backing.target_id = "nof-target-b".to_string();
+        updated_backing.state = NofBackingState::PendingDelete;
+        assert!(
+            backend
+                .compare_and_swap_object_route(&updated.key, Some(route.version), Some(&updated))
+                .expect("NoF route update should succeed")
+                .applied
+        );
+
+        assert!(backend
+            .list_object_routes_by_nof_backing(&filter("nof-target-a"))
+            .expect("old NoF target index should be empty")
+            .is_empty());
+        assert_eq!(
+            backend
+                .list_object_routes_by_nof_backing(&NofBackingRouteFilter {
+                    target_id: Some("nof-target-b".to_string()),
+                    state: Some(NofBackingState::PendingDelete),
+                    owner: Some(sample_runtime()),
+                    limit: None,
+                })
+                .expect("updated NoF indexes should list the route"),
+            vec![updated.clone()]
+        );
+
+        assert!(
+            backend
+                .compare_and_swap_object_route(&updated.key, Some(updated.version), None)
+                .expect("NoF route delete should succeed")
+                .applied
+        );
+        assert!(backend
+            .list_object_routes_by_nof_backing(&filter("nof-target-b"))
+            .expect("deleted NoF route should leave no index entry")
+            .is_empty());
     }
 
     #[test]

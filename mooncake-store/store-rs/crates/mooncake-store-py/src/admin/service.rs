@@ -44,7 +44,8 @@ use super::models::{
     DebugRouteNamespaceResponse, DebugRouteReplicaResponse, DebugRouteResponse,
     DeleteTenantPolicyResponse, GetColdTierObjectResponse, GetTenantObjectAccountingResponse,
     GetTenantPolicyResponse, GetTenantQuotaStateResponse, ListColdTierDevicesResponse,
-    ListColdTierOffloadTasksResponse, ListTenantQuotaReservationsResponse, PolicyPatchInput,
+    ListColdTierOffloadTasksResponse, ListTenantQuotaReservationsResponse,
+    NofObjectBackingResponse, PolicyPatchInput,
     RouteMigrationMode, RouteMigrationTaskListResponse, RouteMigrationTaskState,
     RouteMigrationTaskStatusResponse, RouteMigrationTaskSubmitRequest, RoutePolicyResponse,
     TenantQuotaAbortResponse, TenantQuotaReconcileAction, TenantQuotaReconcileReport,
@@ -1640,6 +1641,20 @@ impl AdminService {
                 })
                 .collect(),
             cold_backing: self.debug_route_cold_backing(self.backend.as_ref(), route),
+            nof_backing: route
+                .nof_backing
+                .as_ref()
+                .map(|backing| NofObjectBackingResponse {
+                    target_id: backing.target_id.clone(),
+                    owner: ColdTierObjectBackingOwnerResponse {
+                        stable_id: backing.owner.stable_id.to_string(),
+                        epoch: backing.owner.epoch.0,
+                    },
+                    state: format!("{:?}", backing.state),
+                    locator: backing.object_locator.clone(),
+                    length: backing.length,
+                    checksum: backing.checksum,
+                }),
         }
     }
 
@@ -3345,6 +3360,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas,
             cold_backing: None,
+            nof_backing: None,
         }
     }
 
@@ -3534,6 +3550,7 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
+            nof_backing: None,
         };
         shared
             .compare_and_swap_object_route(&route.key, None, Some(&route))
@@ -3599,6 +3616,7 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
+            nof_backing: None,
         };
         shared
             .compare_and_swap_object_route(&route.key, None, Some(&route))
@@ -3786,6 +3804,7 @@ mod tests {
                         priority: 0,
                     }],
                     cold_backing: None,
+                    nof_backing: None,
                 }),
             )
             .expect("route cas should succeed");
