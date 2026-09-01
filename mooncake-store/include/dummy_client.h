@@ -222,9 +222,16 @@ class DummyClient : public PyClient {
         size_t size = 0;
         size_t references = 0;
     };
+    using BufferRegistrationMap =
+        std::unordered_map<uintptr_t, ExternalBufferRegistration>;
+    enum class BufferRegistrationAction { kReject, kFirst, kRetained };
+    enum class BufferReleaseAction { kReject, kFinal, kRetained };
+    static BufferRegistrationAction retain_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base, size_t size);
+    static BufferReleaseAction release_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base);
     mutable std::mutex registered_external_buffers_mutex_;
-    std::unordered_map<uintptr_t, ExternalBufferRegistration>
-        registered_external_buffers_;
+    BufferRegistrationMap registered_external_buffers_;
 
     ErrorCode connect(const std::string &server_address);
 
@@ -239,8 +246,9 @@ class DummyClient : public PyClient {
 
     int unregister_device_buffer_for_reconnect(void *buffer);
 
-    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
-    get_registered_device_buffers() const;
+    int reregister_fabric_buffers();
+
+    int reregister_device_buffers();
 #endif
 
     /**
@@ -316,7 +324,7 @@ class DummyClient : public PyClient {
 #if defined(USE_ASCEND_DIRECT)
     mutable std::mutex external_fabric_registration_mutex_;
     mutable std::mutex registered_device_buffers_mutex_;
-    std::unordered_map<uint64_t, size_t> registered_device_buffers_;
+    BufferRegistrationMap registered_device_buffers_;
 #endif
 
     // Ascend physical device id for dummy-real RPC to real, set in setup_dummy

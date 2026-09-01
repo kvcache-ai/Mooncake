@@ -639,9 +639,9 @@ std::optional<size_t> DummyClient::external_buffer_remaining(
     // those mappings as registered external buffers for all transfer paths.
     {
         std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
-        for (const auto& [base, size] : registered_device_buffers_) {
-            if (address >= base && address - base <= size) {
-                return size - (address - base);
+        for (const auto& [base, registration] : registered_device_buffers_) {
+            if (address >= base && address - base <= registration.size) {
+                return registration.size - (address - base);
             }
         }
     }
@@ -656,6 +656,36 @@ bool DummyClient::is_registered_buffer(void* buffer, size_t size) const {
     return remaining.has_value() && size <= *remaining;
 }
 
+DummyClient::BufferRegistrationAction DummyClient::retain_buffer_registration(
+    BufferRegistrationMap& registrations, uintptr_t base, size_t size) {
+    const uintptr_t end = base + size;
+    for (const auto& [other_base, registration] : registrations) {
+        const uintptr_t other_end = other_base + registration.size;
+        if (base < other_end && other_base < end &&
+            (base != other_base || size != registration.size)) {
+            return BufferRegistrationAction::kReject;
+        }
+    }
+
+    auto [it, inserted] =
+        registrations.emplace(base, ExternalBufferRegistration{size, 1});
+    if (inserted) return BufferRegistrationAction::kFirst;
+    if (it->second.references == std::numeric_limits<size_t>::max()) {
+        return BufferRegistrationAction::kReject;
+    }
+    ++it->second.references;
+    return BufferRegistrationAction::kRetained;
+}
+
+DummyClient::BufferReleaseAction DummyClient::release_buffer_registration(
+    BufferRegistrationMap& registrations, uintptr_t base) {
+    auto it = registrations.find(base);
+    if (it == registrations.end()) return BufferReleaseAction::kReject;
+    if (it->second.references == 1) return BufferReleaseAction::kFinal;
+    --it->second.references;
+    return BufferReleaseAction::kRetained;
+}
+
 int DummyClient::register_external_buffer(void* buffer, size_t size) {
     if (buffer == nullptr || size == 0) return -1;
 
@@ -663,22 +693,10 @@ int DummyClient::register_external_buffer(void* buffer, size_t size) {
     if (size > std::numeric_limits<uintptr_t>::max() - base) return -1;
 
     std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
-    for (const auto& [other_base, registration] :
-         registered_external_buffers_) {
-        const uintptr_t other_end = other_base + registration.size;
-        const uintptr_t end = base + size;
-        if (base < other_end && other_base < end &&
-            (base != other_base || size != registration.size)) {
-            LOG(ERROR) << "Overlapping external buffer registration";
-            return -1;
-        }
-    }
-
-    auto [it, inserted] = registered_external_buffers_.emplace(
-        base, ExternalBufferRegistration{size, 1});
-    if (!inserted) {
-        if (it->second.size != size) return -1;
-        ++it->second.references;
+    if (retain_buffer_registration(registered_external_buffers_, base, size) ==
+        BufferRegistrationAction::kReject) {
+        LOG(ERROR) << "Invalid or overlapping external buffer registration";
+        return -1;
     }
     return 0;
 }
@@ -687,14 +705,12 @@ int DummyClient::unregister_external_buffer(void* buffer) {
     if (buffer == nullptr) return -1;
 
     std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
-    auto it =
-        registered_external_buffers_.find(reinterpret_cast<uintptr_t>(buffer));
-    if (it == registered_external_buffers_.end()) return -1;
-    if (it->second.references > 1) {
-        --it->second.references;
-    } else {
-        registered_external_buffers_.erase(it);
-    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(buffer);
+    const auto action =
+        release_buffer_registration(registered_external_buffers_, base);
+    if (action == BufferReleaseAction::kReject) return -1;
+    if (action == BufferReleaseAction::kFinal)
+        registered_external_buffers_.erase(base);
     return 0;
 }
 
@@ -754,71 +770,76 @@ int64_t DummyClient::unregister_shm() {
 #if defined(USE_ASCEND_DIRECT)
 int DummyClient::register_device_buffer_for_reconnect(void* buffer,
                                                       size_t size) {
-    const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
-    if (size == 0 || size > std::numeric_limits<uintptr_t>::max() -
-                                static_cast<uintptr_t>(buffer_addr)) {
+    const auto buffer_addr = reinterpret_cast<uintptr_t>(buffer);
+    if (size == 0 ||
+        size > std::numeric_limits<uintptr_t>::max() - buffer_addr) {
         LOG(ERROR) << "Device buffer registration overflows address range";
         return -1;
     }
-    {
-        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
-        auto it = registered_device_buffers_.find(buffer_addr);
-        if (it != registered_device_buffers_.end() && it->second != size) {
-            LOG(ERROR) << "Device buffer size mismatch for tracked buffer, "
-                       << "buffer=" << buffer << ", size=" << size
-                       << ", tracked_size=" << it->second;
-            return -1;
-        }
+
+    std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+    const auto action = retain_buffer_registration(registered_device_buffers_,
+                                                   buffer_addr, size);
+    if (action == BufferRegistrationAction::kReject) {
+        LOG(ERROR) << "Invalid or overlapping device buffer registration, "
+                   << "buffer=" << buffer << ", size=" << size;
+        return -1;
     }
+    if (action == BufferRegistrationAction::kRetained) return 0;
 
     ShmHelper::ShmSegment shm{};
     shm.base_addr = buffer;
     shm.size = size;
     if (register_ascend_shm(&shm, false) != 0) {
+        registered_device_buffers_.erase(buffer_addr);
         LOG(ERROR) << "Failed to register device buffer, buffer=" << buffer
                    << ", size=" << size;
         return -1;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
-        registered_device_buffers_[buffer_addr] = size;
-    }
     return 0;
 }
 
 int DummyClient::unregister_device_buffer_for_reconnect(void* buffer) {
-    const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
-    {
-        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
-        if (registered_device_buffers_.find(buffer_addr) ==
-            registered_device_buffers_.end()) {
-            LOG(ERROR) << "Device buffer is not registered with RealClient";
-            return -1;
-        }
+    const auto buffer_addr = reinterpret_cast<uintptr_t>(buffer);
+    std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+    const auto action =
+        release_buffer_registration(registered_device_buffers_, buffer_addr);
+    if (action == BufferReleaseAction::kReject) {
+        LOG(ERROR) << "Device buffer is not registered with RealClient";
+        return -1;
     }
+    if (action == BufferReleaseAction::kRetained) return 0;
 
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
-        buffer_addr, client_id_);
-    if (ret.has_value()) {
-        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
-        registered_device_buffers_.erase(buffer_addr);
-    }
+        static_cast<uint64_t>(buffer_addr), client_id_);
+    if (ret.has_value()) registered_device_buffers_.erase(buffer_addr);
     return to_py_ret(ret);
 }
 
-std::vector<ShmHelper::ShmSegment> DummyClient::get_registered_device_buffers()
-    const {
-    std::vector<ShmHelper::ShmSegment> device_buffers;
-    std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
-    device_buffers.reserve(registered_device_buffers_.size());
-    for (const auto& [buffer_addr, size] : registered_device_buffers_) {
+int DummyClient::reregister_fabric_buffers() {
+    std::lock_guard<std::mutex> registration_lock(
+        external_fabric_registration_mutex_);
+    std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
+    for (const auto& [buffer_addr, registration] :
+         registered_external_buffers_) {
         ShmHelper::ShmSegment shm{};
         shm.base_addr = reinterpret_cast<void*>(buffer_addr);
-        shm.size = size;
-        device_buffers.push_back(std::move(shm));
+        shm.size = registration.size;
+        if (register_ascend_shm(&shm, false) != 0) return -1;
     }
-    return device_buffers;
+    return 0;
+}
+
+int DummyClient::reregister_device_buffers() {
+    std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+    for (const auto& [buffer_addr, registration] : registered_device_buffers_) {
+        ShmHelper::ShmSegment shm{};
+        shm.base_addr = reinterpret_cast<void*>(buffer_addr);
+        shm.size = registration.size;
+        if (register_ascend_shm(&shm, false) != 0) return -1;
+    }
+    return 0;
 }
 #endif
 
@@ -918,12 +939,10 @@ int DummyClient::unregister_buffer(void* buffer) {
             const auto address = reinterpret_cast<uintptr_t>(buffer);
             std::lock_guard<std::mutex> lock(
                 registered_external_buffers_mutex_);
-            auto it = registered_external_buffers_.find(address);
-            if (it != registered_external_buffers_.end()) {
-                if (it->second.references > 1) {
-                    --it->second.references;
-                    return 0;
-                }
+            const auto action = release_buffer_registration(
+                registered_external_buffers_, address);
+            if (action != BufferReleaseAction::kReject) {
+                if (action == BufferReleaseAction::kRetained) return 0;
 
                 // Keep the local registration until the real-side mapping is
                 // removed successfully.  This makes a failed unregister
@@ -932,7 +951,8 @@ int DummyClient::unregister_buffer(void* buffer) {
                     invoke_rpc<&RealClient::unregister_shm_buffer_internal,
                                void>(static_cast<uint64_t>(address),
                                      client_id_);
-                if (ret.has_value()) registered_external_buffers_.erase(it);
+                if (ret.has_value())
+                    registered_external_buffers_.erase(address);
                 return to_py_ret(ret);
             }
         }
@@ -1010,8 +1030,12 @@ int DummyClient::upsert(const std::string& key, std::span<const char> value,
 
 int DummyClient::upsert_from(const std::string& key, void* buffer, size_t size,
                              const ReplicateConfig& config) {
-    auto results = batch_upsert_from({key}, {buffer}, {size}, config);
-    return results.empty() ? toInt(ErrorCode::INVALID_PARAMS) : results[0];
+    auto prepared = prepare_buffer(buffer, size, true);
+    if (!prepared) return toInt(ErrorCode::INVALID_PARAMS);
+    const uint64_t dummy_addr = reinterpret_cast<uint64_t>(prepared->dummy);
+    return invoke_observed_void_rpc<&RealClient::upsert_from_dummy_helper>(
+        TransferOperationKind::kWrite, "upsert_from", size, false, key,
+        dummy_addr, size, config, client_id_);
 }
 
 std::vector<int> DummyClient::batch_upsert_from(
@@ -1253,8 +1277,41 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
 
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
-    auto results = batch_get_into({key}, {buffer}, {size});
-    return results.empty() ? toInt(ErrorCode::INVALID_PARAMS) : results[0];
+    if (is_registered_buffer(buffer, size)) {
+        if (auto dst_buffer = try_export_cuda_ipc_buffers({buffer}, {size})) {
+            std::vector<CudaIpcReadRequest> requests{
+                CudaIpcReadRequest{
+                    .key = key,
+                    .destination = (*dst_buffer)[0],
+                    .source_offset = 0,
+                    .size = static_cast<uint64_t>(size),
+                },
+            };
+            auto results = batch_get_into_cuda_ipc(requests);
+            return results.empty() ? toInt(ErrorCode::INVALID_PARAMS)
+                                   : results[0];
+        }
+    }
+
+    auto prepared = prepare_buffer(buffer, size, false, true);
+    if (!prepared) return toInt(ErrorCode::INVALID_PARAMS);
+    const uint64_t dummy_addr = reinterpret_cast<uint64_t>(prepared->dummy);
+    const auto start_time = std::chrono::steady_clock::now();
+    auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
+                             tl::expected<int64_t, ErrorCode>>(
+        key, dummy_addr, 0, 0, size, true, true, client_id_);
+    if (!result) return static_cast<int64_t>(toInt(result.error()));
+
+    const int64_t bytes_read = to_py_ret(*result);
+    if (bytes_read >= 0) {
+        if (!copy_from_staging(*prepared, static_cast<size_t>(bytes_read))) {
+            return toInt(ErrorCode::INTERNAL_ERROR);
+        }
+        ObserveTransferMetric(TransferOperationKind::kRead, "get_into",
+                              static_cast<size_t>(bytes_read),
+                              elapsed_us_since(start_time), false);
+    }
+    return bytes_read;
 }
 
 std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
@@ -1816,17 +1873,16 @@ void DummyClient::ping_thread_main() {
 
 #if defined(USE_ASCEND_DIRECT)
                 if (all_registered && globalConfig().ascend_agent_mode) {
-                    auto device_buffers = get_registered_device_buffers();
-                    for (const auto& device_buffer : device_buffers) {
-                        if (register_ascend_shm(&device_buffer, false) != 0) {
-                            LOG(WARNING)
-                                << "Failed to re-register device buffer "
-                                   "during reconnection, buffer="
-                                << device_buffer.base_addr
-                                << ", size=" << device_buffer.size;
-                            all_registered = false;
-                            break;
-                        }
+                    if (globalConfig().ascend_use_fabric_mem &&
+                        reregister_fabric_buffers() != 0) {
+                        LOG(WARNING) << "Failed to re-register Fabric buffers "
+                                        "during reconnection";
+                        all_registered = false;
+                    }
+                    if (all_registered && reregister_device_buffers() != 0) {
+                        LOG(WARNING) << "Failed to re-register device buffers "
+                                        "during reconnection";
+                        all_registered = false;
                     }
                 }
 #endif

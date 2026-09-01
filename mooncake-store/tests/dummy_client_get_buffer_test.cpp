@@ -471,6 +471,16 @@ TEST_F(DummyClientGetBufferTest, ExternalHostRegistrationLifecycle) {
     ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
 }
 
+TEST_F(DummyClientGetBufferTest,
+       UnregisterMissingRealBufferMappingIsIdempotent) {
+    auto client = RealClient::create();
+    ASSERT_NE(client, nullptr);
+
+    const auto result =
+        client->unregister_shm_buffer_internal(0x1234, UUID{1, 2});
+    EXPECT_TRUE(result.has_value());
+}
+
 TEST_F(DummyClientGetBufferTest, ExternalHostRangedRead) {
     ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
 

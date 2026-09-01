@@ -2757,8 +2757,10 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        // Per-buffer unregistration is idempotent so a DummyClient can safely
+        // retry after the RealClient completed an earlier request but its
+        // response was lost.
+        return {};
     }
     auto &context = it->second;
 
@@ -2773,11 +2775,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     }
 
     if (shm_it == context.mapped_shms.end()) {
-        std::stringstream addr_stream;
-        addr_stream << "0x" << std::hex << dummy_base_addr;
-        LOG(ERROR) << "Share memory not found for dummy address: "
-                   << addr_stream.str() << " (client_id: " << client_id << ")";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return {};
     }
 
     // Unmap and clean up the shm
