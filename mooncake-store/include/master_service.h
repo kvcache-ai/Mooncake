@@ -100,6 +100,10 @@ class MasterServiceProcessingKeyDoubleEraseTest;
 // with a competing mount + register serialized between them, pinning the
 // interleaving instead of hoping a thread scheduler produces it.
 class LocalDiskUnmountInterleavingTest;
+// Friended so the #2997 regression test can call the private
+// PushOffloadingQueue directly with degenerate replica states that the
+// public PutStart/PutEnd path never produces.
+class MasterServiceSSDTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
