@@ -1030,10 +1030,11 @@ TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
         service.ExistKey("bad_key", TenantId::Default()).value_or(true));
 }
 
-TEST_F(MasterServiceTest, StandbyRestoreKeepsLatestReplayOnOverlap) {
+TEST_F(MasterServiceTest, StandbyRestoreDiscardsAmbiguousOverlap) {
     // #3760: eviction frees and reallocates a buffer; a standby that missed
-    // the removal replays both replicas at the same address. The later replay
-    // is ground truth and wins.
+    // the removal replays both replicas at the same address. No replay order
+    // reaches the promotion context, so neither side can prove it is newer:
+    // both are discarded, and with nothing restored the restore fails closed.
     MasterService service(MakeStrictTenantConfig({"default"}));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
     const auto seg = MakeStandbySegment("seg", "ep1", 4096);
@@ -1043,10 +1044,11 @@ TEST_F(MasterServiceTest, StandbyRestoreKeepsLatestReplayOnOverlap) {
     auto result = service.RestoreFromStandbySnapshot(
         {stale, fresh},
         /*initial_oplog_sequence_id=*/0, {seg});
-    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     EXPECT_FALSE(
         service.ExistKey("stale_key", TenantId::Default()).value_or(true));
-    EXPECT_TRUE(
+    EXPECT_FALSE(
         service.ExistKey("fresh_key", TenantId::Default()).value_or(false));
 }
 

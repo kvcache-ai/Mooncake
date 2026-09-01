@@ -1154,14 +1154,16 @@ TEST_F(MasterServiceHATest, RestoreSkipsBadObjectAndKeepsExistingState) {
                         {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
 
-    // #3760: a bad entry is skipped rather than failing the whole restore,
-    // and the previously restored state is untouched.
+    // #3760: a bad entry is skipped and the previously restored state is
+    // untouched, but a snapshot in which nothing lands at all is a failed
+    // restore, not a successful empty one.
     auto invalid =
         MakeStandbyObject("standby_restore_invalid", "unknown_endpoint");
     auto result = service.RestoreFromStandbySnapshot(
         {invalid}, 7, {MakeStandbyMemorySegment(endpoint)});
 
-    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_restore_existing"),
               1);
@@ -1170,6 +1172,32 @@ TEST_F(MasterServiceHATest, RestoreSkipsBadObjectAndKeepsExistingState) {
               0);
     ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
                     .has_value());
+}
+
+TEST_F(MasterServiceHATest, RestoreToleratesBadObjectAlongsideGoodOnes) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_mixed_segment";
+    auto good = MakeStandbyObject("standby_mixed_good", endpoint);
+    good.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto bad = MakeStandbyObject("standby_mixed_bad", "unknown_endpoint");
+
+    // Per-object tolerance holds for a mixed snapshot: the good entry lands,
+    // the bad one is skipped, and the restore succeeds because something
+    // actually restored.
+    auto result = service.RestoreFromStandbySnapshot(
+        {good, bad}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "standby_mixed_good"),
+        1);
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "standby_mixed_bad"),
+        0);
 }
 
 TEST_F(MasterServiceHATest,
@@ -1238,11 +1266,13 @@ TEST_F(MasterServiceHATest, RestoreSkipsDescriptorSizeMismatch) {
         .get_memory_descriptor()
         .buffer_descriptor.size_ = object.metadata.size + 1;
 
-    // #3760: the mismatched entry is skipped rather than failing the restore.
+    // #3760: the mismatched entry is skipped, and since nothing lands from
+    // this snapshot the restore reports failure instead of an empty success.
     auto result = service.RestoreFromStandbySnapshot(
         {object}, 7, {MakeStandbyMemorySegment(endpoint)});
 
-    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_descriptor_mismatch"),
               0);
@@ -1680,7 +1710,7 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
     EXPECT_NE(new_descriptor.buffer_address_, old_descriptor.buffer_address_);
 }
 
-TEST_F(MasterServiceHATest, RestoreKeepsLatestDescriptorOnOverlap) {
+TEST_F(MasterServiceHATest, RestoreDiscardsAmbiguousOverlap) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1695,17 +1725,178 @@ TEST_F(MasterServiceHATest, RestoreKeepsLatestDescriptorOnOverlap) {
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
 
     // #3760: eviction freed and reallocated the buffer, so the standby can
-    // replay two live-looking replicas at one address. The later replay is
-    // ground truth; the earlier one is dropped.
+    // replay two live-looking replicas at one address. The promotion context
+    // carries no replay order, so neither side can prove it is newer: both
+    // descriptors are discarded, and with nothing restored the restore
+    // reports failure instead of an empty-cluster success.
     auto result = service.RestoreFromStandbySnapshot(
         {first, conflicting}, 7, {MakeStandbyMemorySegment(endpoint)});
 
-    ASSERT_TRUE(result.has_value());
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_overlap_first"),
               0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_overlap_second"),
+              0);
+}
+
+TEST_F(MasterServiceHATest, RestoreKeepsIndependentReplicaOfConflictedObject) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_partial_overlap_segment";
+    auto survivor = MakeStandbyObject("standby_overlap_survivor", endpoint);
+    auto conflicting = MakeStandbyObject("standby_overlap_lost", endpoint);
+    // The survivor carries two memory replicas: one collides with the other
+    // object's only replica, the second is independent of the conflict.
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    conflicting.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    // Only the ambiguous descriptors are discarded. The survivor keeps its
+    // independent replica and stays servable; the other object has no
+    // reliable replica left and is dropped.
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, conflicting}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_overlap_survivor"),
+              1);
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "standby_overlap_lost"),
+        0);
+    auto restored = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_overlap_survivor");
+    ASSERT_EQ(restored.size(), 1);
+    EXPECT_EQ(restored.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              kDefaultSegmentBase + 8192);
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardsTransitivelyOverlappingGroup) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_transitive_overlap_segment";
+    auto chain_a = MakeStandbyObject("standby_overlap_chain_a", endpoint);
+    auto chain_b = MakeStandbyObject("standby_overlap_chain_b", endpoint);
+    auto chain_c = MakeStandbyObject("standby_overlap_chain_c", endpoint);
+    auto independent =
+        MakeStandbyObject("standby_overlap_independent", endpoint);
+    chain_a.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    chain_b.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 512;
+    chain_c.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 1024;
+    independent.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+
+    // A overlaps B and B overlaps C, so the chain is one ambiguous group even
+    // though A and C never touch. All three conflicted objects are dropped;
+    // the one outside the group restores normally.
+    auto result = service.RestoreFromStandbySnapshot(
+        {chain_a, chain_b, chain_c, independent}, 7,
+        {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    for (const char* key :
+         {"standby_overlap_chain_a", "standby_overlap_chain_b",
+          "standby_overlap_chain_c"}) {
+        EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 0)
+            << key;
+    }
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_overlap_independent"),
+              1);
+}
+
+TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_stale_range_segment";
+    auto rejected = MakeStandbyObject("standby_stale_range_rejected", endpoint);
+    rejected.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    // The first replica records a valid range, then the second descriptor
+    // fails validation and the object is rejected mid-loop.
+    rejected.metadata.replicas.push_back(
+        MakeStandbyMemoryReplica("unknown_endpoint"));
+    auto clean = MakeStandbyObject("standby_stale_range_clean", endpoint);
+    clean.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 512;
+
+    // The rejected object must leave no range behind: a stale range would
+    // alias the owner index of the next accepted object and drag it into a
+    // phantom overlap. The clean object restores even where it overlaps the
+    // rejected one's recorded address.
+    auto result = service.RestoreFromStandbySnapshot(
+        {rejected, clean}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_stale_range_rejected"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_stale_range_clean"),
+              1);
+}
+
+TEST_F(MasterServiceHATest, RestoreRollsBackAccountingOfRejectedObject) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_accounting_rollback_segment";
+    const size_t capacity = 2048;
+    auto rejected = MakeStandbyObject("standby_accounting_rejected", endpoint);
+    // Three full-size replicas: the third trips the capacity check during
+    // construction, after the first two have already accumulated bytes.
+    rejected.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    rejected.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    rejected.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    rejected.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 1024;
+    rejected.metadata.replicas[2]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 2048;
+    auto clean = MakeStandbyObject("standby_accounting_clean", endpoint);
+    clean.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+
+    // The rejected object's bytes roll back with it: the clean object sees
+    // the real free capacity and restores. With phantom accounting it would
+    // be rejected on capacity it never used.
+    auto result = service.RestoreFromStandbySnapshot(
+        {rejected, clean}, 7, {MakeStandbyMemorySegment(endpoint, capacity)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_accounting_rejected"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_accounting_clean"),
               1);
 }
 
