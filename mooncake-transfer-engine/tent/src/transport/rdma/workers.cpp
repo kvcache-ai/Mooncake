@@ -190,6 +190,7 @@ Workers::Workers(RdmaTransport* transport)
                                           params.max_bandwidth_gbps);
 
     device_selector_->setSchedulingParams(params);
+    device_selector_->auditStrictLocalNuma();
 
     // Seed each device from its context. context_set_ is indexed by NicID,
     // the same id the selector uses. Three cases:
@@ -1097,7 +1098,18 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             const auto& list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
-            slice->target_dev_id = list[SimpleRandom::Get().next(list.size())];
+            size_t start = SimpleRandom::Get().next(list.size());
+            slice->target_dev_id = list[start];
+            // Prefer a same-NUMA peer NIC; do not fail if none exist.
+            if (strictLocalNuma()) {
+                for (size_t i = 0; i < list.size(); ++i) {
+                    int tdev = list[(start + i) % list.size()];
+                    if (!target.topo->isCrossNuma(*target.topo_entry, tdev)) {
+                        slice->target_dev_id = tdev;
+                        break;
+                    }
+                }
+            }
             break;
         }
     }
@@ -1146,6 +1158,11 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     }
 
     return Status::OK();
+}
+
+bool Workers::strictLocalNuma() const {
+    return device_selector_ &&
+           device_selector_->getSchedulingParams().strict_local_numa;
 }
 
 int Workers::getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx) {
@@ -1229,6 +1246,9 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         int sdev = getDeviceByFlatIndex(source, src_idx);
         int tdev = getDeviceByFlatIndex(target, dst_idx);
         if (sdev < 0 || sdev >= 64 || (device_mask & (1ULL << sdev)) == 0)
+            continue;
+        if (strictLocalNuma() &&
+            source.topo->isCrossNuma(*source.topo_entry, sdev))
             continue;
         bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
                                       : rail_mon->available(sdev, tdev);

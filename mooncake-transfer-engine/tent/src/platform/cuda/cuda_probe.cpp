@@ -193,39 +193,29 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry>& nic_list,
         }
         for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
+        int min_distance = INT_MAX;
+        std::unordered_map<int, std::vector<int>> distance_map;
+        for (const auto& device : nic_list) {
+            int dist = getPciDistance(device.pci_bus_id.c_str(), pci_bus_id);
+            distance_map[dist].push_back(&device - &nic_list[0]);
+            min_distance = std::min(min_distance, dist);
+        }
 
         Topology::MemEntry entry;
         entry.name = "cuda:" + std::to_string(i);
         entry.numa_node = numa_node;
         entry.pci_bus_id = pci_bus_id;
         entry.type = Topology::MEM_CUDA;
-
-        // Tier 0 is same-NUMA only; PCIe distance is secondary. Distance can
-        // collapse (ties / realpath failure) and would otherwise pick a remote
-        // NIC. Cross-NUMA NICs are never promoted here: when no same-NUMA NIC
-        // exists rank 0 stays empty and all NICs fall into the cross-NUMA rank,
-        // so strict_local_numa selection can hard-exclude them.
-        int min_distance = INT_MAX;
-        std::unordered_map<int, std::vector<int>> distance_map;
-        int nic_id = 0;
-        for (const auto& device : nic_list) {
-            if (numa_node >= 0 && device.numa_node == numa_node) {
-                int dist =
-                    getPciDistance(device.pci_bus_id.c_str(), pci_bus_id);
-                distance_map[dist].push_back(nic_id);
-                min_distance = std::min(min_distance, dist);
-            }
-            nic_id++;
+        if (distance_map.count(0)) {
+            // Prefer NICs with distance 0 (e.g. same PCIe switch/RC)
+            entry.device_list[0] = std::move(distance_map[0]);
+        } else if (distance_map.count(min_distance)) {
+            // No exact match — fall back to NICs with closest PCIe distance
+            entry.device_list[0] = std::move(distance_map[min_distance]);
         }
-
-        if (!distance_map.empty()) {
-            int pick = distance_map.count(0) ? 0 : min_distance;
-            entry.device_list[0] = std::move(distance_map[pick]);
-        }
-
         std::unordered_set<int> preferred_set;
-        for (const auto& id : entry.device_list[0]) {
-            preferred_set.insert(id);
+        for (const auto& dev_id : entry.device_list[0]) {
+            preferred_set.insert(dev_id);
         }
         int dev_id = 0;
         for (const auto& device : nic_list) {

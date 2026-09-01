@@ -182,8 +182,8 @@ class DeviceSelector {
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};
 
-        // Skip last (cross-NUMA) rank on every selection path; never fall back
-        // to a remote NIC.
+        // Hard-exclude known cross-NUMA NICs; unknown NUMA keeps
+        // numa_tier_weights.
         bool strict_local_numa = false;
 
         // EWMA bandwidth learning rate (0.0 = full adaptation, 1.0 = no
@@ -226,6 +226,9 @@ class DeviceSelector {
         return sched_params_;
     }
 
+    // Startup warning if the flag excludes every NIC or classifies none.
+    void auditStrictLocalNuma() const;
+
    private:
     std::shared_ptr<Topology> local_topology_;
     std::unordered_map<int, DeviceInfo> devices_;
@@ -244,12 +247,17 @@ class DeviceSelector {
                it->second.available.load(std::memory_order_relaxed);
     }
 
-    // Cross-NUMA NICs live in the last priority rank. Under strict_local_numa
-    // they must never be eligible on any selection path (baseline, smart first
-    // pass, and smart fallback all share this rule).
-    bool isNumaRankEligible(size_t rank) const {
-        return !(sched_params_.strict_local_numa &&
-                 rank == Topology::DevicePriorityRanks - 1);
+    const char *noEligibleDeviceReason() const {
+        return sched_params_.strict_local_numa
+                   ? "no eligible devices (strict_local_numa excludes "
+                     "cross-NUMA NICs)"
+                   : "no eligible devices";
+    }
+
+    bool isNumaEligible(const Topology::MemEntry *entry, int dev_id) const {
+        if (!sched_params_.strict_local_numa) return true;
+        if (!entry || !local_topology_) return true;
+        return !local_topology_->isCrossNuma(*entry, dev_id);
     }
 
     Status buildCandidates(const Topology::MemEntry *entry,
