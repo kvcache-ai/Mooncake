@@ -63,6 +63,22 @@ impl NofBackingRoute {
         }));
         targets
     }
+
+    pub fn matches_filter(&self, filter: &NofBackingRouteFilter) -> bool {
+        if filter.state.is_some_and(|state| self.state != state) {
+            return false;
+        }
+        self.all_targets().into_iter().any(|target| {
+            filter
+                .target_id
+                .as_deref()
+                .is_none_or(|target_id| target.target_id == target_id)
+                && filter
+                    .owner
+                    .as_ref()
+                    .is_none_or(|owner| target.owner == owner)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,5 +124,15 @@ mod tests {
 
         assert_eq!(route.all_target_ids(), vec!["nof-a", "nof-b"]);
         assert_eq!(route.all_targets()[1].object_locator, "nof-ll:v1:i:02");
+        assert!(route.matches_filter(&NofBackingRouteFilter {
+            target_id: Some("nof-b".to_string()),
+            owner: Some(owner("replica")),
+            ..NofBackingRouteFilter::default()
+        }));
+        assert!(!route.matches_filter(&NofBackingRouteFilter {
+            target_id: Some("nof-b".to_string()),
+            owner: Some(owner("primary")),
+            ..NofBackingRouteFilter::default()
+        }));
     }
 }

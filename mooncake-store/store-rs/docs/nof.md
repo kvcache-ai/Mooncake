@@ -32,13 +32,20 @@ Redis indexing, protobuf transport, admin output and typed external-metadata ope
 `nof_backing` as its own field. A runtime executor integration must publish and update that field;
 mapping a NoF target into persisted `cold_backing` is not a supported compatibility shortcut.
 
-All low-level executors continue to reuse the Cold Tier orchestration framework for:
+The provider-neutral low-level adapter is implemented against the existing Cold Tier backend
+contract so a runtime binding can reuse:
 
 - device/target registration, offload preparation, reservation and batch scheduling;
 - route CAS and settle, replica selection, restore selection and logical load balancing through
   the NoF external-metadata seam;
 - route deletion and `PendingDelete` convergence through the executor's key-level `delete`;
 - checksum verification, record layout, device fencing and operational entry points.
+
+The current public API exposes the executor contracts, `NofLowLevelTarget`, and typed external
+metadata; the generic backend adapter remains internal. It does not attach a NoF target to
+`StoreClientBuilder`: doing so through the existing Cold Tier target hook would publish
+`cold_backing`, which is invalid for NoF. Runtime offload/restore attachment belongs behind a
+binding that publishes `nof_backing` throughout its route state machine.
 
 Each management group is optional. A Mooncake-maintained storage executor additionally supplies an
 exhaustive paginated object inventory and real capacity/available-space health, allowing the
@@ -59,7 +66,7 @@ records, a small root manifest, and calls to `put/get/delete/flush`. It does not
 scheduler, device-task schema, allocator, or route state machine.
 
 The implementation deliberately reuses the existing `PersistentStorageBackend`,
-`MetadataBackend`, checksum implementation, batching path and builder lifecycle. The external
+`MetadataBackend`, checksum implementation and batching path. The external
 metadata interface is the stable boundary that allows an executor integration to reuse Cold Tier
 orchestration without reusing `ColdBackingRoute` as the persisted NoF schema.
 `ValueChunkPlan` and `PhysicalKeyCodec` are
@@ -109,7 +116,9 @@ Redis or etcd): it exposes NoF get/list/CAS operations, validates that local and
 mutually exclusive, and delegates persistence to the existing backend. It owns no connection,
 cache, journal or keyspace implementation. NoF enumeration uses `NofBackingRouteFilter`; local
 Cold Tier cleanup continues to use `ColdBackingRouteFilter`, so the two maintenance domains
-cannot select each other's objects.
+cannot select each other's objects. Target and owner filters match the same physical primary or
+replica entry, and Redis indexes every primary and replica target rather than only the route's
+primary.
 
 The additive route field is gated by `nof-backing-route-v1`. A writer cannot publish
 `nof_backing` unless its route compatibility descriptor advertises that capability. Operators
@@ -142,7 +151,7 @@ that physical maintenance belongs below the SDK, but they do not make the privat
 CLI output a supported executor ABI. Integrating such a surface later requires a separately
 versioned provider management adapter.
 
-Because the SDK has no physical list, KVCS startup reconciliation is one-way and metadata-driven:
+Because the SDK has no physical list, KVCS supports only one-way, metadata-driven reconciliation:
 enumerate the NoF backing routes for the target, decode each stored NoF
 root locator, and call Low-Level `query`. A missing root invalidates that target reference; a
 healthy replica may be promoted before the stale reference is removed. Physical objects with no
@@ -150,11 +159,11 @@ Mooncake route cannot be discovered through the SDK and are left to provider GC.
 `MooncakeManaged` executor instead supplies a stable paginated list, which enables two-way
 metadata/physical reconciliation and orphan deletion.
 
-The SDK exposes a filesystem/mountpoint target, not EFC's individual NVMe disk identities.
-Mooncake can therefore fence and retire a failed NoF target when query returns `ENODEV` or
-`unavailable`, but individual disk offline/replacement remains an EFC operation. Target metadata
-must be removed only after route references have been promoted or pruned; deleting the device
-record first would create dangling routes.
+The SDK exposes a filesystem/mountpoint target, not EFC's individual NVMe disk identities. A
+runtime binding may fence and retire a failed NoF target when query returns `ENODEV` or
+`unavailable`, but individual disk offline/replacement remains an EFC operation. Such a binding
+must remove target metadata only after route references have been promoted or pruned; deleting a
+target record first would create dangling routes.
 
 ## SDK and EFC downloads
 
@@ -225,32 +234,23 @@ traits.
 
 ## Low-level executor construction
 
-A low-level executor is bound to an existing `ColdTierTargetConfig` with the same ID:
+The implemented public API constructs a provider-neutral target without registering it as a local
+Cold Tier device:
 
 ```rust,ignore
 use std::sync::Arc;
 use mooncake_store_client::{
-    ColdTierKind, ColdTierTargetConfig, KvcsCapiLowLevelExecutor,
-    NofLowLevelTarget, StoreClientBuilder,
+    KvcsCapiLowLevelExecutor, NofLowLevelTarget,
 };
 
 let executor = Arc::new(KvcsCapiLowLevelExecutor::new()?);
-let client = StoreClientBuilder::new(metadata, "runtime")
-    .cold_tier_target(ColdTierTargetConfig::directory(
-        "nof-0",
-        ColdTierKind::Nfs,
-        "/mnt/nof-0",
-    ))
-    .nof_low_level_target("nof-0", NofLowLevelTarget::new(executor))
-    .build(expires_at_ms)?;
+let target = NofLowLevelTarget::new(executor);
 ```
 
-This configuration binds the physical Low-Level I/O target. Route publication is a separate
-external-metadata responsibility: the runtime integration must write `nof_backing`, never encode
-the target in persisted `cold_backing`. Any configured Mooncake capacity is a logical
-admission/load-balancing limit, not a claim about EFC physical free space and not a request for
-Mooncake watermark GC. KVCS mountpoint selection is supplied to the concrete executor
-(`MOONCAKE_KVCS_MOUNTPOINT_INDEX`).
+The runtime binding must write `nof_backing`, never encode the target in persisted `cold_backing`.
+Any configured Mooncake capacity is a logical admission/load-balancing limit, not a claim about
+EFC physical free space and not a request for Mooncake watermark GC. KVCS mountpoint selection is
+supplied to the concrete executor (`MOONCAKE_KVCS_MOUNTPOINT_INDEX`).
 
 ## KVCS feature
 

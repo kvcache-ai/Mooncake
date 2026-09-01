@@ -39,12 +39,6 @@ local old_owner_index = KEYS[5]
 local new_device_index = KEYS[6]
 local new_state_index = KEYS[7]
 local new_owner_index = KEYS[8]
-local old_nof_target_index = KEYS[9]
-local old_nof_state_index = KEYS[10]
-local old_nof_owner_index = KEYS[11]
-local new_nof_target_index = KEYS[12]
-local new_nof_state_index = KEYS[13]
-local new_nof_owner_index = KEYS[14]
 local expected = ARGV[1]
 local next_version = ARGV[2]
 local payload = ARGV[3]
@@ -54,12 +48,9 @@ local has_old_owner_index = ARGV[6]
 local has_new_device_index = ARGV[7]
 local has_new_state_index = ARGV[8]
 local has_new_owner_index = ARGV[9]
-local has_old_nof_target_index = ARGV[10]
-local has_old_nof_state_index = ARGV[11]
-local has_old_nof_owner_index = ARGV[12]
-local has_new_nof_target_index = ARGV[13]
-local has_new_nof_state_index = ARGV[14]
-local has_new_nof_owner_index = ARGV[15]
+local old_nof_index_count = tonumber(ARGV[10])
+local new_nof_index_count = tonumber(ARGV[11])
+local nof_index_start = 9
 
 local current_payload = redis.call('HGET', key, 'payload')
 local current_version = redis.call('HGET', key, 'version')
@@ -77,9 +68,9 @@ end
 if has_old_device_index == '1' then redis.call('SREM', old_device_index, key) end
 if has_old_state_index == '1' then redis.call('SREM', old_state_index, key) end
 if has_old_owner_index == '1' then redis.call('SREM', old_owner_index, key) end
-if has_old_nof_target_index == '1' then redis.call('SREM', old_nof_target_index, key) end
-if has_old_nof_state_index == '1' then redis.call('SREM', old_nof_state_index, key) end
-if has_old_nof_owner_index == '1' then redis.call('SREM', old_nof_owner_index, key) end
+for offset = 0, old_nof_index_count - 1 do
+    redis.call('SREM', KEYS[nof_index_start + offset], key)
+end
 
 if payload == '__delete__' then
     redis.call('DEL', key)
@@ -92,9 +83,9 @@ redis.call('SADD', index, key)
 if has_new_device_index == '1' then redis.call('SADD', new_device_index, key) end
 if has_new_state_index == '1' then redis.call('SADD', new_state_index, key) end
 if has_new_owner_index == '1' then redis.call('SADD', new_owner_index, key) end
-if has_new_nof_target_index == '1' then redis.call('SADD', new_nof_target_index, key) end
-if has_new_nof_state_index == '1' then redis.call('SADD', new_nof_state_index, key) end
-if has_new_nof_owner_index == '1' then redis.call('SADD', new_nof_owner_index, key) end
+for offset = 0, new_nof_index_count - 1 do
+    redis.call('SADD', KEYS[nof_index_start + old_nof_index_count + offset], key)
+end
 return {1, payload}
 "#;
 
@@ -3212,12 +3203,12 @@ mod tests {
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
-        NofBackingRoute, NofBackingRouteFilter, NofBackingState, ObjectKey, ObjectRoute,
-        ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy, RoutePolicyDomain, RouteState,
-        RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
-        TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
-        TenantQuotaFinalizeRequest, TenantQuotaPolicy,
-        TenantQuotaReservationRequest, TenantQuotaReservationState,
+        NofBackingReplica, NofBackingRoute, NofBackingRouteFilter, NofBackingState, ObjectKey,
+        ObjectRoute, ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy, RoutePolicyDomain,
+        RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
+        StoreError, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
+        TenantQuotaReservationState,
     };
     use redis::Commands;
 
@@ -4284,7 +4275,11 @@ mod tests {
             length: 12,
             checksum: Some(7),
             state: NofBackingState::Materialized,
-            replicas: Vec::new(),
+            replicas: vec![NofBackingReplica {
+                owner: ClientRuntimeId::new("replica", ClientEpoch(7)),
+                target_id: "nof-target-replica".to_string(),
+                object_locator: "nof-ll:v1:i:02".to_string(),
+            }],
         });
         assert!(
             backend
@@ -4303,6 +4298,17 @@ mod tests {
             backend
                 .list_object_routes_by_nof_backing(&filter("nof-target-a"))
                 .expect("NoF target index should list the route"),
+            vec![route.clone()]
+        );
+        assert_eq!(
+            backend
+                .list_object_routes_by_nof_backing(&NofBackingRouteFilter {
+                    target_id: Some("nof-target-replica".to_string()),
+                    state: None,
+                    owner: Some(ClientRuntimeId::new("replica", ClientEpoch(7))),
+                    limit: None,
+                })
+                .expect("NoF replica target index should list the route"),
             vec![route.clone()]
         );
 
@@ -4343,6 +4349,10 @@ mod tests {
         assert!(backend
             .list_object_routes_by_nof_backing(&filter("nof-target-b"))
             .expect("deleted NoF route should leave no index entry")
+            .is_empty());
+        assert!(backend
+            .list_object_routes_by_nof_backing(&filter("nof-target-replica"))
+            .expect("deleted NoF route should leave no replica index entry")
             .is_empty());
     }
 

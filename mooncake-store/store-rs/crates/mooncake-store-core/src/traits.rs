@@ -210,21 +210,7 @@ pub trait MetadataBackend: Send + Sync {
             let Some(backing) = route.nof_backing.as_ref() else {
                 continue;
             };
-            if filter
-                .target_id
-                .as_ref()
-                .is_some_and(|target_id| backing.target_id != *target_id)
-            {
-                continue;
-            }
-            if filter.state.is_some_and(|state| backing.state != state) {
-                continue;
-            }
-            if filter
-                .owner
-                .as_ref()
-                .is_some_and(|owner| backing.owner != *owner)
-            {
+            if !backing.matches_filter(filter) {
                 continue;
             }
             routes.push(route);

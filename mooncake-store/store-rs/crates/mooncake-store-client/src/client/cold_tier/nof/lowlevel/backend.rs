@@ -129,10 +129,6 @@ impl WriteLayout<'_> {
             .map(|record| record.key.clone())
             .chain(self.root_record.iter().map(|record| record.key.clone()))
     }
-
-    fn records(&self) -> impl Iterator<Item = &PhysicalRecord<'_>> {
-        self.data_records.iter().chain(self.root_record.iter())
-    }
 }
 
 pub(in crate::client) struct NofLowLevelBackend {
@@ -382,17 +378,6 @@ impl NofLowLevelBackend {
         results
     }
 
-    fn cleanup_records(&self, records: &[&PhysicalRecord<'_>]) {
-        let requests = records
-            .iter()
-            .map(|record| NofLowLevelDeleteRequest {
-                key: record.key.clone(),
-            })
-            .collect::<Vec<_>>();
-        let _ = self.delete_records(&requests);
-        let _ = self.target.executor.flush();
-    }
-
     fn put_objects(&self, writes: &[ColdObjectWrite<'_>]) -> Vec<Result<ColdBackingRoute>> {
         let mut results = (0..writes.len()).map(|_| None).collect::<Vec<_>>();
         let mut layouts = Vec::new();
@@ -448,12 +433,6 @@ impl NofLowLevelBackend {
                 }
             }
         }
-        for (index, layout) in &layouts {
-            if !layout_ok[*index] {
-                self.cleanup_records(&layout.records().collect::<Vec<_>>());
-            }
-        }
-
         let root_positions = layouts
             .iter()
             .enumerate()
@@ -484,23 +463,16 @@ impl NofLowLevelBackend {
                 results[write_index] = Some(Err(error));
             }
         }
-        for (index, layout) in &layouts {
-            if !layout_ok[*index] && layout.root_record.is_some() {
-                self.cleanup_records(&layout.records().collect::<Vec<_>>());
-            }
-        }
-
+        // Physical keys are deterministic so an earlier successful attempt may already be
+        // referenced by metadata. Never blind-delete them after a retry failure. Provider-managed
+        // targets collect unpublished records themselves; Mooncake-managed targets reconcile them
+        // through the executor inventory.
         let successful = layouts
             .iter()
             .filter(|(index, _)| layout_ok[*index])
             .collect::<Vec<_>>();
         if !successful.is_empty() {
             if let Err(error) = self.target.executor.flush() {
-                let cleanup = successful
-                    .iter()
-                    .flat_map(|(_, layout)| layout.records())
-                    .collect::<Vec<_>>();
-                self.cleanup_records(&cleanup);
                 for (index, _) in successful {
                     layout_ok[*index] = false;
                     results[*index] = Some(Err(StoreError::Transport(format!(
@@ -929,14 +901,19 @@ mod tests {
     }
 
     #[test]
-    fn manifest_failure_cleans_unpublished_chunks() {
+    fn failed_retry_does_not_delete_an_existing_materialized_object() {
         let executor = Arc::new(MemoryExecutor::default());
-        *executor.fail_manifest.lock().unwrap() = true;
         let backend =
             NofLowLevelBackend::new("nof-test", NofLowLevelTarget::new(executor.clone())).unwrap();
         let payload = vec![3; 150];
+        let materialized = backend.put_object(&route(&payload), &payload).unwrap();
+        *executor.fail_manifest.lock().unwrap() = true;
         assert!(backend.put_object(&route(&payload), &payload).is_err());
-        assert!(executor.values.lock().unwrap().is_empty());
+        assert_eq!(
+            backend.get_object(&materialized).unwrap(),
+            Some(payload),
+            "failed deterministic retry must not delete records referenced by metadata"
+        );
     }
 
     #[test]

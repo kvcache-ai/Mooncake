@@ -70,6 +70,18 @@ fn rejects_nof_backing_without_route_capability() {
 }
 
 #[test]
+fn rejects_route_without_nof_backing_on_typed_cas() {
+    let metadata = mooncake_metadata::InMemoryMetadataBackend::new();
+    let mut route = nof_route();
+    route.nof_backing = None;
+
+    assert!(matches!(
+        metadata.compare_and_swap_nof_object_route(&route.key, None, Some(&route)),
+        Err(StoreError::InvalidState(message)) if message.contains("requires nof_backing")
+    ));
+}
+
+#[test]
 fn lists_nof_routes_without_returning_local_cold_routes() {
     let metadata = mooncake_metadata::InMemoryMetadataBackend::new();
     let route = nof_route();
