@@ -590,6 +590,11 @@ jobs:
       python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-cu130
       version-override: 0.0.0.dev0
+      # This artifact feeds the T-One e2e pipeline (integration-test.yml picks
+      # the py312/cu130 wheel), which exercises the TENT runtime. Default
+      # engine behavior stays classic; TENT activates via MC_USE_TENT=1 set
+      # by tone_tests/scripts/common.sh.
+      use-tent: true
 
   # arm64 default wheels use a different transport set (USE_MNNVL) than
   # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
