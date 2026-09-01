@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "p2p/client/data_manager_types.h"
 #include "p2p/client/tiered_cache/scheduler/scheduler_policy.h"
 #include "utils.h"
 
@@ -44,34 +45,8 @@ inline size_t DefaultSnapshotLimit() { return 4096; }
 
 }  // namespace detail
 
-/**
- * @enum AccessStatMetric
- * @brief Semantic meaning carried by a stats snapshot.
- */
-enum class AccessStatMetric {
-    kRecentHeat,
-    kRecencyRank,
-    kFrequency,
-};
-
-/**
- * @struct AccessStatEntry
- * @brief Per-key access metadata emitted by a stats collector.
- */
-struct AccessStatEntry {
-    std::string key;
-    double recent_heat_score = 0.0;
-    size_t recency_rank = 0;
-};
-
-/**
- * @struct AccessStats
- * @brief Snapshot of access statistics
- */
-struct AccessStats {
-    AccessStatMetric metric = AccessStatMetric::kRecentHeat;
-    std::vector<AccessStatEntry> hot_keys;
-};
+// AccessStatMetric / AccessStatEntry / AccessStats now live in
+// p2p/client/data_manager_types.h.
 
 /**
  * @class StatsCollector

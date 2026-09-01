@@ -1,657 +1,215 @@
 #pragma once
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <list>
+// The stable DataManager abstraction used by every P2P caller
+// (P2PClientService, ClientRpcService, HARecoveryManager). It carries only
+// methods that have a real production caller, so that an alternative local
+// data plane can be dropped in without touching any of those callers.
+//
+// The only implementation today is DataManagerV1, the TieredBackend-based
+// data plane this interface was extracted from
+// (p2p/client/v1/data_manager_v1.h).
+//
+// Deliberately NOT on this interface:
+//   - ReadRemoteData / WriteRemoteData / TransferData: the synchronous
+//     variants have no production caller (the RPC handlers use the *Async
+//     forms), so they stay as DataManagerV1-only public methods.
+//   - DrainForTest and friends: see p2p/client/data_manager_test_hook.h.
+
+#include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <unordered_map>
+#include <utility>
 #include <vector>
-#include <functional>
+
 #include <async_simple/Executor.h>
 #include <async_simple/Future.h>
 #include <async_simple/coro/Lazy.h>
-#include <ylt/coro_io/io_context_pool.hpp>
 #include <ylt/util/tl/expected.hpp>
-#include "p2p/client/async_memcpy_executor.h"
+
 #include "client_buffer.hpp"
-#include "client_config_builder.h"
+#include "p2p/client/client_rpc_types.h"
+#include "p2p/client/data_manager_types.h"
 #include "p2p/client/task_handle.h"
-#include "p2p/client/tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
 #include "types.h"
-#include "utils.h"
-#include "p2p/client/client_rpc_types.h"
 
 namespace mooncake {
 
 /**
- * @struct ReadTaskHandle
- * @brief Handle for a read operation
- */
-struct ReadTaskHandle {
-    std::unique_ptr<TaskHandle<void>> task_handle;
-    int64_t data_size;
-
-    // if user use zero-copy get(), the var is useless;
-    // if user provides allocator, the var is the buffer allocated by allocator;
-    std::shared_ptr<BufferHandle> read_buf;
-
-    // Whether this handle was served from local storage.
-    bool is_local = false;
-};
-
-/**
- * @struct LocalTransferConfig
- * @brief Configuration for local data transfer operations
- */
-struct LocalTransferConfig {
-    LocalTransferMode mode = LocalTransferMode::TE;
-
-    // When mode == TE, the following parameters are used:
-    std::string te_endpoint;
-
-    // When mode == MEMCPY, the following parameters are used:
-    // 0 means forbid async memcpy (fall back to synchronous).
-    size_t local_memcpy_async_worker_num = 32;
-
-    // Dedicated coro_io pool for TE wait coroutines (poll getTransferStatus,
-    // then co_await sleep_for). Independent of `mode`. 0 keeps synchronous TE
-    // wait on the caller thread.
-    size_t te_async_poll_worker_num = 32;
-};
-
-/**
- * @struct KeyLeaseConfig
- * @brief PreWrite / PinKey key lease timing (independent of local transfer).
- */
-struct KeyLeaseConfig {
-    // Max lifetime (ms) of intermediate lease state on a key. 0 = built-in
-    // default.
-    uint32_t duration_ms = 0;
-    // Background scan interval (ms) for expired leases. 0 = built-in default.
-    uint32_t scan_interval_ms = 0;
-};
-
-/**
  * @class DataManager
- * @brief Manages data access operations using TieredBackend and TransferEngine
+ * @brief Local data plane for one P2P client: local IO, remote IO, the
+ *        PreWrite/Pin forward protocol, topology reporting and route rectify.
  *
- * Provides unified interface for local and remote data operations, handling
- * tiered storage access and zero-copy transfers.
+ * Lifetime rules that both implementations must honour:
+ *  - the destructor is virtual, and `Stop()` / `Destroy()` are idempotent;
+ *  - no `std::string_view` argument may be retained past the call. Task
+ *    handles returned by Put/Get run their work at `Wait()` time and therefore
+ *    own a copy of the key; the caller only has to keep the *slices* alive.
  */
 class DataManager {
-    // Allow test class to access private methods for testing
-    friend class DataManagerTest;
-
    public:
-    using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
-
-    struct PreWriteResult {
-        RemoteBufferDesc remote_buffer;
-        UUID write_operation_id{0, 0};
-        // Filled by PreWriteInternal for in-process callers
-        // (Put/WriteRemoteData). Not exposed on PreWriteResponse (RPC).
-        AllocationHandle handle;
-    };
-
-    struct PinKeyResult {
-        RemoteBufferDesc remote_buffer;
-        UUID read_operation_id{0, 0};
-    };
-
-    /**
-     * @brief Constructor
-     * @param tiered_backend Unique pointer to TieredBackend instance (takes
-     * ownership)
-     * @param transfer_engine Shared pointer to TransferEngine instance (shared
-     * with Client)
-     */
-    DataManager(std::unique_ptr<TieredBackend> tiered_backend,
-                std::shared_ptr<TransferEngine> transfer_engine,
-                size_t lock_shard_count = 1024,
-                const LocalTransferConfig& local_transfer_config = {},
-                const KeyLeaseConfig& key_lease_config = {});
-
-    ~DataManager();
-
-    void Stop();
-
-    /**
-     * @brief Cleanup: delegates to TieredBackend::Destroy().
-     */
-    void Destroy() {
-        if (tiered_backend_) {
-            tiered_backend_->Destroy();
-        }
-    }
+    virtual ~DataManager() = default;
 
     // ================================================================
-    // Public local read/write interface
-    // Internally selects TE or Memcpy path based on config.
+    // Lifecycle
+    // ================================================================
+
+    /** Reject new requests, drain in-flight work, stop background threads. */
+    virtual void Stop() = 0;
+
+    /** Release tiers and notify the external metadata system. After Stop(). */
+    virtual void Destroy() = 0;
+
+    // ================================================================
+    // Local IO
     // ================================================================
 
     // The Put operation consists of three phases:
-    // 1. Allocation: allocate memory from the tiered backend for the data
-    // 2. Write: write the data to the allocated memory
-    // 3. Commit: commit the data to the tiered backend
+    // 1. Allocation: reserve space for the object
+    // 2. Write: write the data into the reserved space
+    // 3. Commit: make the object visible
     //
-    // IMPORTANT: The caller must keep the memory referenced by `slices` alive
-    // from the time Put() returns until TaskHandle::Wait() completes. The
-    // returned TaskHandle may capture raw pointers from the slices for
-    // asynchronous transfer.
-    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> Put(
-        std::string_view key, std::vector<Slice>& slices);
+    // IMPORTANT: the caller must keep the memory referenced by `slices` alive
+    // from the time Put() returns until TaskHandle::Wait() completes. The key
+    // does NOT have to outlive the call: implementations copy it.
+    virtual tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> Put(
+        std::string_view key, std::vector<Slice>& slices) = 0;
 
-    // Attention!!!
-    // Get() method run without key lock.
-    // It works based on two assumptions:
-    // 1. We assume that each key will not be updated after they are created.
-    // 2. The key is acquired by handle which protect the data accessibility
-    //    based on ref count. Once the method acquire handle successfully, the
-    //    accessor can safely access the data until the handle is released.
-    //
-    // IMPORTANT: The caller must keep the memory referenced by `slices` alive
-    // from the time Get() returns until TaskHandle::Wait() completes. The
-    // returned TaskHandle may capture raw pointers from the slices for
-    // asynchronous data copy.
-    tl::expected<ReadTaskHandle, ErrorCode> Get(
-        std::string_view key, const std::vector<Slice>& slices);
+    // IMPORTANT: the caller must keep the memory referenced by `slices` alive
+    // from the time Get() returns until TaskHandle::Wait() completes. The key
+    // does NOT have to outlive the call.
+    virtual tl::expected<ReadTaskHandle, ErrorCode> Get(
+        std::string_view key, const std::vector<Slice>& slices) = 0;
 
-    tl::expected<ReadTaskHandle, ErrorCode> Get(
-        std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator);
+    virtual tl::expected<ReadTaskHandle, ErrorCode> Get(
+        std::string_view key,
+        std::shared_ptr<ClientBufferAllocator> allocator) = 0;
 
-    /**
-     * @brief Query local object metadata
-     */
-    tl::expected<std::pair<UUID, uint64_t>, ErrorCode> Query(
-        std::string_view key);
+    // ================================================================
+    // Metadata
+    // ================================================================
 
-    /**
-     * @brief Query the size of an object.
-     * @param key Object key
-     * @return Object size in bytes, or ErrorCode on failure
-     */
-    tl::expected<size_t, ErrorCode> QueryObjectSize(std::string_view key);
+    /** @return (tier id of a readable replica, object size). */
+    virtual tl::expected<std::pair<UUID, uint64_t>, ErrorCode> Query(
+        std::string_view key) = 0;
 
-    tl::expected<void, ErrorCode> Delete(
+    virtual tl::expected<size_t, ErrorCode> QueryObjectSize(
+        std::string_view key) = 0;
+
+    /** Exact existence check; never satisfied from a cached presence hint. */
+    virtual bool Exist(std::string_view key,
+                       std::optional<UUID> tier_id = std::nullopt) const = 0;
+
+    virtual tl::expected<void, ErrorCode> Delete(
         std::string_view key, std::optional<UUID> tier_id = std::nullopt,
-        bool notify_master = true);
+        bool notify_master = true) = 0;
 
-    /**
-     * @brief Remove ALL local objects (delegates to TieredBackend::RemoveAll).
-     * @return Number of distinct keys removed, or ErrorCode on failure.
-     */
-    tl::expected<long, ErrorCode> RemoveAll();
-
-    /**
-     * @brief Get tier views from underlying tiered storage
-     */
-    std::vector<TierView> GetTierViews() const;
+    /** @return number of distinct keys removed. */
+    virtual tl::expected<long, ErrorCode> RemoveAll() = 0;
 
     // ================================================================
-    // Remote data transfer — called by RPC service layer
+    // Topology / HA
     // ================================================================
 
+    virtual std::vector<TierView> GetTierViews() const = 0;
+
+    /** All tier ids that currently hold an exact replica of `key`. */
+    virtual std::vector<UUID> GetReplicaTierIds(
+        std::string_view key) const = 0;
+
     /**
-     * @brief Iterate all keys in batches.
-     * Delegates to TieredBackend::ForEachKeyBatch().
+     * @brief Iterate all local replicas in batches.
+     *
+     * Granularity is per-replica, not per-key: a key with replicas on N tiers
+     * produces N ReplicaLocation entries. HARecoveryManager resyncs metadata
+     * per (key, tier_id) and GetLocalKeyCount sums batch sizes, so changing
+     * this to per-key would change both. Returning false stops the walk.
      */
-    void ForEachKeyBatch(
+    virtual void ForEachKeyBatch(
         const std::function<bool(std::vector<ReplicaLocation>&&)>& callback)
-        const;
+        const = 0;
 
     /**
-     * @brief Get hot key statistics.
-     * @param hot_key_num Forwarded to TieredBackend::GetHotKeyStats. nullopt
-     *        resolves to the scheduler default (scheduler.hot_key_num, 64); 0
-     *        returns all tracked keys (capped internally).
+     * @param hot_key_num nullopt = implementation default; 0 = all tracked
+     *        keys (subject to an internal snapshot cap).
      */
-    AccessStats GetHotKeyStats(
-        std::optional<size_t> hot_key_num = std::nullopt) const;
+    virtual AccessStats GetHotKeyStats(
+        std::optional<size_t> hot_key_num = std::nullopt) const = 0;
 
-    /**
-     * @brief Get all tier IDs where a key has replicas.
-     */
-    std::vector<UUID> GetReplicaTierIds(std::string_view key) const;
+    // ================================================================
+    // Remote IO
+    // ================================================================
 
-    /**
-     * @brief Read data and transfer to remote destination buffers
-     *
-     * This is the core method for remote data access:
-     * 1. Get data handle from TieredBackend
-     * 2. Use TransferEngine to transfer data via RDMA to destination buffers
-     *
-     * @param key Object key to read
-     * @param dest_buffers Destination buffers on remote client (Client A)
-     * @return ErrorCode indicating success or failure
-     */
-    tl::expected<void, ErrorCode> ReadRemoteData(
+    /** Reverse read: local object -> peer buffers, via TransferEngine. */
+    virtual async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    ReadRemoteDataAsync(
         std::string_view key,
-        const std::vector<RemoteBufferDesc>& dest_buffers);
+        const std::vector<RemoteBufferDesc>& dest_buffers) = 0;
 
-    /** Reverse read with TE wait offloaded when te_poll is enabled. */
-    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> ReadRemoteDataAsync(
-        std::string_view key,
-        const std::vector<RemoteBufferDesc>& dest_buffers);
-
-    /**
-     * @brief Write data from remote source buffers
-     * @param key Object key to write
-     * @param src_buffers Source buffers on remote client (Client A)
-     * @param tier_id Optional tier ID (nullopt = use default tier selection)
-     * @return UUID of the tier (segment) where data was written, or ErrorCode
-     */
-    tl::expected<UUID, ErrorCode> WriteRemoteData(
-        std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
-        std::optional<UUID> tier_id = std::nullopt);
-
-    /** Reverse write with TE wait offloaded when te_poll is enabled. */
-    async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
+    /** Reverse write: peer buffers -> local object. @return target tier id. */
+    virtual async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
     WriteRemoteDataAsync(std::string_view key,
                          const std::vector<RemoteBufferDesc>& src_buffers,
-                         std::optional<UUID> tier_id = std::nullopt);
+                         std::optional<UUID> tier_id = std::nullopt) = 0;
 
-    tl::expected<PreWriteResponse, ErrorCode> PreWrite(
+    // ================================================================
+    // Forward (PreWrite / Pin) protocol
+    // ================================================================
+
+    virtual tl::expected<PreWriteResponse, ErrorCode> PreWrite(
         std::string_view key, size_t size_bytes,
-        std::optional<UUID> tier_id = std::nullopt);
+        std::optional<UUID> tier_id = std::nullopt) = 0;
 
-    tl::expected<void, ErrorCode> WriteCommit(std::string_view key,
-                                              const UUID& write_operation_id);
+    virtual tl::expected<void, ErrorCode> WriteCommit(
+        std::string_view key, const UUID& write_operation_id) = 0;
+
+    virtual tl::expected<void, ErrorCode> WriteRevoke(
+        std::string_view key, const UUID& write_operation_id) = 0;
+
+    virtual tl::expected<PinKeyResponse, ErrorCode> PinKey(
+        std::string_view key, std::optional<UUID> tier_id = std::nullopt) = 0;
+
+    virtual tl::expected<void, ErrorCode> UnPinKey(
+        std::string_view key, const UUID& read_operation_id) = 0;
+
+    // ================================================================
+    // TransferEngine
+    // ================================================================
 
     /**
-     * @brief Remove pending write record for key + token (no tier Commit).
-     *        Used when forward TE fails after PreWrite on the peer.
-     */
-    tl::expected<void, ErrorCode> WriteRevoke(std::string_view key,
-                                              const UUID& write_operation_id);
-
-    tl::expected<PinKeyResponse, ErrorCode> PinKey(
-        std::string_view key, std::optional<UUID> tier_id = std::nullopt);
-
-    tl::expected<void, ErrorCode> UnPinKey(std::string_view key,
-                                           const UUID& read_operation_id);
-
-    /**
-     * @brief Transfer data between local TE-ready memory and remote buffers.
-     *
-     * Caller guarantees `local_transfer_base` covers a contiguous layout of
-     * `total_size` bytes that is valid for TransferEngine (typically registered
-     * DRAM).
-     *
+     * @brief Transfer between local TE-ready memory and remote buffers.
      * @param opcode WRITE: local -> peer_buffers; READ: peer_buffers -> local
-     */
-    tl::expected<void, ErrorCode> TransferData(
-        void* local_transfer_base, size_t total_size,
-        const std::vector<RemoteBufferDesc>& peer_buffers,
-        Transport::TransferRequest::OpCode opcode);
-
-    /**
-     * @brief Same as TransferData, but TE completion polling is offloaded when
-     * `te_async_poll_worker_num > 0`.
      *
-     * Returns a Future (not Lazy) so callers co_await a single Future layer;
-     * avoids nested-coroutine issues with async_simple on some compilers.
+     * The returned Future must always complete, including after Stop().
      */
-    async_simple::Future<tl::expected<void, ErrorCode>> TransferDataAsync(
-        void* local_transfer_base, size_t total_size,
-        const std::vector<RemoteBufferDesc>& peer_buffers,
-        Transport::TransferRequest::OpCode opcode);
+    virtual async_simple::Future<tl::expected<void, ErrorCode>>
+    TransferDataAsync(void* local_transfer_base, size_t total_size,
+                      const std::vector<RemoteBufferDesc>& peer_buffers,
+                      Transport::TransferRequest::OpCode opcode) = 0;
 
-    /**
-     * @brief Dedicated coro_io executor for P2P business Lazys (`via`/`start`)
-     *        and TE-wait hop-back. Independent of RPC's pool and of the TE
-     *        wait pool (`te_wait_pool_`).
-     */
-    async_simple::Executor* GetCoroExecutor() const;
+    /** Never null; owned by the DataManager. */
+    virtual async_simple::Executor* GetCoroExecutor() const = 0;
 
     // ================================================================
-    // Utilities
+    // Route rectification
     // ================================================================
 
     /**
-     * @brief Rectify stale read route via TieredBackend::conditionalExecute:
-     *        if the key is not found locally, remove the replica from master.
+     * @brief Best-effort: when `key` is not found locally, ask Master to drop
+     *        the stale replica route.
      *
-     * @param key Object key to rectify
-     * @param tier_id Optional tier ID. If specified, only checks the given
-     *        tier; if nullopt, checks all tiers.
+     * The miss check and the callback are deliberately not atomic with respect
+     * to a concurrent Put/WriteCommit, so a false positive (a remove for a
+     * replica that has just become visible) is possible and accepted; holding
+     * a metadata lock across a Master RPC costs more.
      */
-    void RectifyReadRoute(std::string_view key,
-                          std::optional<UUID> tier_id = std::nullopt);
+    virtual void RectifyReadRoute(
+        std::string_view key, std::optional<UUID> tier_id = std::nullopt) = 0;
 
-    /**
-     * @brief Set the callback for rectifying read routes in Master.
-     * @param fn Callback invoked when key not found locally.
-     */
-    void SetRectifyCallback(
-        std::function<void(std::string_view, std::optional<UUID>)> fn);
-
-    bool Exist(std::string_view key,
-               std::optional<UUID> tier_id = std::nullopt) const;
-
-   private:
-    void ClearLeaseRecords();
-
-    struct KeyCtx {
-        // Non-owning view; valid only while caller storage (e.g. RPC/coro
-        // request buffers) remains alive. KeyCtx is stack-scoped within
-        // DataManager and must not be stored. Maps copy keys on insert.
-        std::string_view key;
-        size_t hash = 0;
-        size_t pending_write_shard_idx = 0;
-        size_t pinned_key_shard_idx = 0;
-    };
-
-    using OrderedDeadlineList = std::list<std::pair<std::string, TimePoint>>;
-    using OrderedDeadlineListIt = OrderedDeadlineList::iterator;
-
-    struct PendingWriteRecord {
-        UUID write_operation_id{0, 0};
-        TimePoint deadline{};
-        AllocationHandle handle;
-        OrderedDeadlineListIt list_it;
-    };
-
-    struct PinnedKeyRecord {
-        UUID read_operation_id{0, 0};
-        TimePoint deadline{};
-        AllocationHandle handle;
-        uint32_t ref_count = 1;
-        OrderedDeadlineListIt list_it;
-    };
-
-    template <typename Record>
-    struct RecordShard {
-        mutable std::shared_mutex mutex;
-        std::unordered_map<std::string, Record, StringHash, std::equal_to<>>
-            existed_operation_key_map;
-        OrderedDeadlineList ordered_list;
-    };
-
-    using PendingWriteShard = RecordShard<PendingWriteRecord>;
-    using PinnedKeyShard = RecordShard<PinnedKeyRecord>;
-
-    // `key` must point at storage that outlives the returned KeyCtx and any
-    // synchronous use on the current call stack (typically RPC/coro buffers).
-    KeyCtx BuildKeyCtx(std::string_view key) const;
-    PendingWriteShard& GetPendingWriteShard(const KeyCtx& ctx);
-    PinnedKeyShard& GetPinnedKeyShard(const KeyCtx& ctx);
-
-    // When dram_only is true the local replica is pinned to a DRAM/fast tier
-    // (strict allocation with fast-tier eviction + retry; never spills to a
-    // slower tier). When false, allocation is best-effort starting from
-    // tier_id (used by the remote-write path, whose target may be non-DRAM).
-    tl::expected<PreWriteResult, ErrorCode> PreWriteInternal(
-        const KeyCtx& ctx, size_t size_bytes, std::optional<UUID> tier_id,
-        bool dram_only);
-    tl::expected<void, ErrorCode> WriteCommitInternal(
-        const KeyCtx& ctx, const UUID& write_operation_id);
-    tl::expected<PinKeyResult, ErrorCode> PinKeyInternal(
-        const KeyCtx& ctx, std::optional<UUID> tier_id);
-    tl::expected<void, ErrorCode> UnPinKeyInternal(
-        const KeyCtx& ctx, const UUID& read_operation_id);
-    tl::expected<void, ErrorCode> WriteRevokeInternal(
-        const KeyCtx& ctx, const UUID& write_operation_id);
-
-    enum class PendingWriteEraseResult {
-        Erased,
-        NotFound,
-        LeaseExpired,
-        WriteOperationIdMismatch,
-    };
-
-    PendingWriteEraseResult ErasePendingWriteRecord(
-        PendingWriteShard& shard, std::string_view key,
-        const UUID& write_operation_id);
-    tl::expected<void, ErrorCode> ReservePendingWriteSlot(
-        PendingWriteShard& shard, std::string_view key, TimePoint now,
-        TimePoint deadline, const UUID& write_operation_id);
-    tl::expected<void, ErrorCode> AttachPendingWriteHandle(
-        PendingWriteShard& shard, std::string_view key,
-        const UUID& write_operation_id, const AllocationHandle& handle);
-    tl::expected<AllocationHandle, ErrorCode> ValidatePendingWriteForCommit(
-        PendingWriteShard& shard, std::string_view key, TimePoint now,
-        const UUID& write_operation_id);
-
-    /**
-     * @brief Transfer data from local source to remote destination buffers
-     * @param handle Local allocation handle (source)
-     * @param dest_buffers Remote destination buffers
-     * @return ErrorCode indicating success or failure
-     */
-    tl::expected<void, ErrorCode> TransferDataToRemote(
-        AllocationHandle handle,
-        const std::vector<RemoteBufferDesc>& dest_buffers);
-
-    /**
-     * @brief Transfer data from remote source buffers to local allocated space
-     * @param handle Local allocation handle (destination)
-     * @param src_buffers Remote source buffers
-     * @return ErrorCode indicating success or failure. Any segment failure
-     *         will result in error (no partial success).
-     */
-    tl::expected<void, ErrorCode> TransferDataFromRemote(
-        AllocationHandle handle,
-        const std::vector<RemoteBufferDesc>& src_buffers);
-
-    tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopier(
-        const AllocationHandle& handle, std::string_view key,
-        const std::vector<Slice>& slices);
-
-    tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopierViaTe(
-        const AllocationHandle& handle, const std::vector<Slice>& slices);
-
-    tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopierViaMemcpy(
-        const AllocationHandle& handle, std::string_view key,
-        const std::vector<Slice>& slices);
-
-    // --- Put dispatch by transfer mode ---
-    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> PutViaTe(
-        std::string_view key, std::vector<Slice>& slices);
-
-    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> PutViaMemcpy(
-        std::string_view key, std::vector<Slice>& slices);
-
-    // --- Conversion helpers ---
-
-    std::vector<RemoteBufferDesc> SlicesToRemoteBufferDescs(
-        const std::vector<Slice>& slices) const;
-
-    // --- TE transfer helpers ---
-    struct TeSubmitResult {
-        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
-            transfer_batches;
-        // Temp DRAM buffer used when source or destination is non-DRAM.
-        // Non-null means a post-copy (for Write) or pre-copy (for Read) is
-        // required.
-        std::shared_ptr<void> temp_buffer;
-        AllocationHandle handle;  // Ensure local memory is not released
-    };
-
-    // After TE wait for local PutViaTe: optional DRAM staging copy + commit.
-    tl::expected<void, ErrorCode> FinishPutViaTeAfterWait(
-        const KeyCtx& ctx, const UUID& write_operation_id,
-        TeSubmitResult& te_ctx, tl::expected<void, ErrorCode> wait_result);
-
-    tl::expected<TeSubmitResult, ErrorCode> SubmitTeTransferInternal(
-        const AllocationHandle& handle,
-        const std::vector<RemoteBufferDesc>& remote_buffers,
-        Transport::TransferRequest::OpCode opcode);
-
-    tl::expected<
-        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
-        ErrorCode>
-    SubmitTeTransferBatches(void* transfer_ptr, size_t total_data_size,
-                            const std::vector<RemoteBufferDesc>& remote_buffers,
-                            Transport::TransferRequest::OpCode opcode);
-
-    // Validate peer buffers and submit TE batches. Shared by TransferData and
-    // TransferDataAsync; callers only differ in how they wait.
-    tl::expected<
-        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
-        ErrorCode>
-    SubmitTransferData(void* local_transfer_base, size_t total_size,
-                       const std::vector<RemoteBufferDesc>& peer_buffers,
-                       Transport::TransferRequest::OpCode opcode);
-
-    /**
-     * @brief Helper to wait for a transfer batch to complete
-     * @param batch_id Batch ID to poll
-     * @param num_tasks Number of tasks in the batch
-     * @param segment_name Name of the segment for logging
-     * @return ErrorCode indicating success or failure
-     */
-    tl::expected<void, ErrorCode> WaitTransferBatch(
-        Transport::BatchID batch_id, size_t num_tasks,
-        const std::string& segment_endpoint);
-
-    enum class TeBatchPollResult { kPending, kCompleted, kFailed };
-
-    TeBatchPollResult PollTransferBatchOnce(
-        Transport::BatchID batch_id, size_t num_tasks,
-        const std::string& segment_endpoint,
-        std::chrono::steady_clock::time_point start_time);
-
-    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
-    WaitTransferBatchCoro(Transport::BatchID batch_id, size_t num_tasks,
-                          std::string segment_endpoint);
-
-    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
-    WaitAllTransferBatchesCoro(
-        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
-            batches);
-
-    void ReleaseTeWaitInflight();
-    bool IsTeBatchFullyDrained(Transport::BatchID batch_id, size_t num_tasks);
-    async_simple::coro::Lazy<void> CancelBatchTETaskCoro(
-        Transport::BatchID batch_id, size_t num_tasks);
-    async_simple::coro::Lazy<void> CancelTeWaitBatchesCoro(
-        const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
-            batches,
-        size_t from_index);
-
-    /**
-     * @brief Validate remote buffer descriptors
-     * @param buffers Buffer descriptors to validate
-     * @return ErrorCode if validation fails, otherwise OK
-     */
-    tl::expected<void, ErrorCode> ValidateRemoteBuffers(
-        const std::vector<RemoteBufferDesc>& buffers);
-
-    /**
-     * @brief Prepare DRAM buffer for transfer from non-DRAM source
-     * @param source_ptr Source data pointer
-     * @param source_type Source memory type
-     * @param total_size Total data size
-     * @param backend TieredBackend for DataCopier access
-     * @return Pair of (transfer_source_ptr, temp_buffer_owner) or error
-     */
-    tl::expected<std::pair<void*, std::unique_ptr<void, void (*)(void*)>>,
-                 ErrorCode>
-    PrepareDRAMTransferBuffer(void* source_ptr, MemoryType source_type,
-                              size_t total_size, TieredBackend* backend);
-
-    /**
-     * @brief Prepare DRAM buffer for receiving data to non-DRAM destination
-     * @param dest_ptr Destination data pointer
-     * @param dest_type Destination memory type
-     * @param total_size Total data size
-     * @return Pair of (transfer_dest_ptr, temp_buffer_owner) or error
-     */
-    tl::expected<std::pair<void*, std::unique_ptr<void, void (*)(void*)>>,
-                 ErrorCode>
-    PrepareDRAMReceiveBuffer(void* dest_ptr, MemoryType dest_type,
-                             size_t total_size);
-
-    /**
-     * @brief Copy data from DRAM buffer to non-DRAM tier
-     * @param temp_buffer Temp DRAM buffer pointer
-     * @param dest_ptr Destination pointer
-     * @param dest_type Destination memory type
-     * @param total_size Total data size
-     * @param backend TieredBackend for DataCopier access
-     * @return ErrorCode indicating success or failure
-     */
-    tl::expected<void, ErrorCode> CopyFromDRAMBuffer(void* temp_buffer,
-                                                     void* dest_ptr,
-                                                     MemoryType dest_type,
-                                                     size_t total_size,
-                                                     TieredBackend* backend);
-
-    /**
-     * @brief Submit transfer requests for a segment (without waiting)
-     * @param segment_name Segment name (for logging)
-     * @param seg Segment handle (already opened)
-     * @param requests Transfer requests to submit
-     * @return BatchID if successful, or error
-     */
-    tl::expected<Transport::BatchID, ErrorCode> SubmitTransferRequests(
-        const std::string& segment_endpoint, Transport::SegmentHandle seg,
-        const std::vector<Transport::TransferRequest>& requests);
-
-    /**
-     * @brief Wait for multiple transfer batches to complete
-     * @param batches Vector of (batch_id, num_tasks, segment_endpoint) tuples
-     * @return ErrorCode indicating success or failure. If any batch fails,
-     *         remaining batch IDs are freed and error is returned immediately.
-     */
-    tl::expected<void, ErrorCode> WaitAllTransferBatches(
-        const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
-            batches);
-
-    /** TE wait coroutines on te_wait_pool_ when configured. */
-    async_simple::Future<tl::expected<void, ErrorCode>>
-    WaitAllTransferBatchesAsync(
-        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
-            batches);
-
-    // Wait for all tasks to reach a terminal state, then free the batch.
-    void CancelBatchTETask(Transport::BatchID batch_id, size_t num_tasks);
-
-    const std::chrono::milliseconds& lease_duration() const {
-        return lease_duration_;
-    }
-    tl::expected<RemoteBufferDesc, ErrorCode> BuildRemoteBufferDesc(
-        const AllocationHandle& handle) const;
-    void LeaseScannerMain();
-    void ShutdownLeaseScanner();
-    template <typename Record>
-    size_t ScanExpiredRecordShard(RecordShard<Record>& shard, TimePoint now);
-
-    std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
-    std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
-
-    // Shard count for pending-write and pinned-key lease tables (same value as
-    // TieredBackend metadata shard count when set via lock_shard_count).
-    size_t lock_shard_count_;
-    std::vector<PendingWriteShard> pending_write_shards_;
-    std::vector<PinnedKeyShard> pinned_key_shards_;
-
-    // Callback for rectifying stale read routes
-    std::function<void(std::string_view, std::optional<UUID>)>
-        rectify_wrong_route_fn_;
-
-    LocalTransferConfig local_transfer_config_;
-    std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
-    std::shared_ptr<coro_io::io_context_pool> te_wait_pool_;
-    std::mutex te_wait_mutex_;
-    std::condition_variable te_wait_cv_;
-    std::atomic<bool> te_wait_stopped_{false};
-    size_t te_wait_inflight_{0};  // guarded by te_wait_mutex_
-    std::shared_ptr<coro_io::io_context_pool> coro_executor_pool_;
-    std::chrono::milliseconds lease_duration_;
-    std::chrono::milliseconds lease_scan_interval_;
-    std::atomic<bool> lease_scanner_stop_requested_{false};
-    std::condition_variable lease_scanner_cv_;
-    std::mutex lease_scanner_mutex_;
-    std::thread lease_scanner_thread_;
+    /** Later calls replace earlier ones; an empty function disables rectify. */
+    virtual void SetRectifyCallback(RectifyRouteCallback fn) = 0;
 };
 
 }  // namespace mooncake

@@ -30,6 +30,7 @@
 #define private public
 #define protected public
 #include "p2p/ha/ha_recovery_manager.h"
+#include "p2p/client/v1/data_manager_v1.h"
 #undef protected
 #undef private
 
@@ -95,8 +96,9 @@ class HARecoveryManagerTest : public ::testing::Test {
         // Initialise with an empty TieredBackend (no tiers, no keys) and a
         // default TransferEngine (not init()'d — only RDMA ops need it, and
         // the recovery pipeline only iterates metadata which is empty here).
-        data_manager_.emplace(std::make_unique<TieredBackend>(),
-                              std::make_shared<TransferEngine>());
+        data_manager_ = std::make_unique<DataManagerV1>(
+            std::make_unique<TieredBackend>(),
+            std::make_shared<TransferEngine>());
         notifier_.reset();
     }
 
@@ -170,8 +172,9 @@ class HARecoveryManagerTest : public ::testing::Test {
         transfer_config.mode = LocalTransferMode::MEMCPY;
 
         data_manager_.reset();
-        data_manager_.emplace(std::move(tiered_backend), transfer_engine,
-                              /*metadata_shard_count=*/1024, transfer_config);
+        data_manager_ = std::make_unique<DataManagerV1>(
+            std::move(tiered_backend), transfer_engine,
+            /*metadata_shard_count=*/1024, transfer_config);
 
         std::vector<char> buffer(value.begin(), value.end());
         std::vector<Slice> slices = {
@@ -238,7 +241,7 @@ class HARecoveryManagerTest : public ::testing::Test {
     Segment segment_;
     std::unique_ptr<P2PMasterClient> master_client_;
     std::atomic<ViewVersionId> view_version_{0};
-    std::optional<DataManager> data_manager_;
+    std::unique_ptr<DataManager> data_manager_;
     std::unique_ptr<AsyncMetadataNotifier> notifier_;
 };
 

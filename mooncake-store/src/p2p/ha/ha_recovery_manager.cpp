@@ -9,7 +9,7 @@ namespace mooncake {
 
 HARecoveryManager::HARecoveryManager(
     const UUID& client_id, P2PMasterClient& master_client,
-    std::optional<DataManager>& data_manager,
+    std::unique_ptr<DataManager>& data_manager,
     std::unique_ptr<AsyncMetadataNotifier>& notifier,
     std::atomic<ViewVersionId>& view_version, HAClientState initial_state,
     HARecoveryManager::RecoveryMode recovery_mode)
@@ -140,7 +140,7 @@ void HARecoveryManager::StartRecoveryThread() {
 bool HARecoveryManager::WaitForReady(const AbortToken& need_abort) {
     // Wait for P2PClientService::Init to complete (InitStorage initializes
     // data_manager_, and Init calls SetReadyForRecovery() at the end).
-    // This avoids data race on data_manager_ which is an std::optional.
+    // This avoids a data race on the data_manager_ slot.
     while (!ready_for_recovery_.load(std::memory_order_acquire) &&
            !need_abort->load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -151,7 +151,7 @@ bool HARecoveryManager::WaitForReady(const AbortToken& need_abort) {
     }
 
     // After ready_for_recovery_ is set, data_manager_ should be initialized.
-    if (!data_manager_.has_value()) {
+    if (data_manager_ == nullptr) {
         LOG(ERROR) << "DataManager not initialized, cannot run recovery";
         TransitionState(HAClientState::DEGRADED,
                         "data_manager not initialized");
@@ -184,16 +184,16 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
     // Request ALL tracked hot keys (0 == all), not the scheduler's default
     // top-64: recovery must prioritize the entire hot working set, and the
     // count is capped internally by the collector's snapshot limit.
-    auto hot_stats = data_manager_.value().GetHotKeyStats(/*hot_key_num=*/0);
+    auto hot_stats = data_manager_->GetHotKeyStats(/*hot_key_num=*/0);
     std::unordered_set<std::string> synced_keys;
     size_t hot_count = 0;
 
     for (const auto& entry : hot_stats.hot_keys) {
         if (aborted()) return;
-        auto size_result = data_manager_.value().QueryObjectSize(entry.key);
+        auto size_result = data_manager_->QueryObjectSize(entry.key);
         if (!size_result || size_result.value() == 0) continue;
         size_t size = size_result.value();
-        auto tier_ids = data_manager_.value().GetReplicaTierIds(entry.key);
+        auto tier_ids = data_manager_->GetReplicaTierIds(entry.key);
         for (const auto& tier_id : tier_ids) {
             if (notifier_) {
                 // Hot keys go through normal (high-priority) queue
@@ -213,7 +213,7 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
 
     // Phase 2+3: Iterate all keys in batches.
     // DRAM entries enqueued before storage entries within each batch.
-    auto tier_views = data_manager_.value().GetTierViews();
+    auto tier_views = data_manager_->GetTierViews();
     std::unordered_set<UUID, boost::hash<UUID>> dram_tiers;
     for (const auto& tv : tier_views) {
         if (tv.type == MemoryType::DRAM) {
@@ -224,7 +224,7 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
     size_t dram_count = 0, storage_count = 0;
     bool was_aborted = false;
 
-    data_manager_.value().ForEachKeyBatch(
+    data_manager_->ForEachKeyBatch(
         [&](std::vector<ReplicaLocation>&& batch) -> bool {
             if (aborted()) {
                 was_aborted = true;

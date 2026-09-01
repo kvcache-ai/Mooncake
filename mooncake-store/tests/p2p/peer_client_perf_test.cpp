@@ -20,6 +20,7 @@
 #include "p2p/client/client_rpc_service.h"
 #include "p2p/client/client_rpc_types.h"
 #include "p2p/client/data_manager.h"
+#include "p2p/client/v1/data_manager_v1.h"
 #include "p2p/client/peer_client.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "../utils/common.h"
@@ -84,7 +85,7 @@ class PeerClientPerfTest : public ::testing::Test {
         LocalTransferConfig local_transfer_config;
         local_transfer_config.mode = LocalTransferMode::MEMCPY;
         local_transfer_config.local_memcpy_async_worker_num = 32;
-        data_manager_ = std::make_unique<DataManager>(
+        data_manager_ = std::make_unique<DataManagerV1>(
             std::move(tiered_backend_), transfer_engine_, 1024,
             local_transfer_config);
 
@@ -542,7 +543,7 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         LocalTransferConfig local_transfer_config;
         local_transfer_config.mode = LocalTransferMode::MEMCPY;
         local_transfer_config.local_memcpy_async_worker_num = 32;
-        data_manager_ = std::make_unique<DataManager>(
+        data_manager_ = std::make_unique<DataManagerV1>(
             std::move(tiered_backend_), transfer_engine_, 1024,
             local_transfer_config);
 

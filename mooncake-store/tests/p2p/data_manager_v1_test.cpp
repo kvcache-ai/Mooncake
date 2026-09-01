@@ -8,11 +8,12 @@
 #include <cstring>
 #include <unordered_map>
 #include <chrono>
+#include <filesystem>
 #include <mutex>
 
 #define private public
 #define protected public
-#include "p2p/client/data_manager.h"
+#include "p2p/client/v1/data_manager_v1.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "../utils/common.h"
 #include "transfer_engine.h"
@@ -42,7 +43,7 @@ static bool parseJsonString(const std::string& json_str, Json::Value& value,
     return success;
 }
 
-// Test fixture for DataManager tests
+// Test fixture for DataManagerV1 tests
 class DataManagerTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -82,7 +83,7 @@ class DataManagerTest : public ::testing::Test {
             << "Expected 1 tier, got " << tier_views.size();
         saved_tier_id_ = tier_views[0].id;
 
-        // Create DataManager in MEMCPY mode so Put/Get work without RDMA.
+        // Create DataManagerV1 in MEMCPY mode so Put/Get work without RDMA.
         LocalTransferConfig transfer_config;
         transfer_config.mode = LocalTransferMode::MEMCPY;
         transfer_config.local_memcpy_async_worker_num = 32;
@@ -90,11 +91,11 @@ class DataManagerTest : public ::testing::Test {
         // Save raw pointer before move for tests that need direct backend
         // access
         TieredBackend* backend_raw_ptr = tiered_backend_.get();
-        data_manager_ = std::make_unique<DataManager>(
+        data_manager_ = std::make_unique<DataManagerV1>(
             std::move(tiered_backend_), transfer_engine_, metadata_shard_count,
             transfer_config);
         // Keep the raw pointer accessible for tests that need direct backend
-        // access Note: The backend is now owned by DataManager, but tests can
+        // access Note: The backend is now owned by DataManagerV1, but tests can
         // still use it
         tiered_backend_raw_ptr_ = backend_raw_ptr;
     }
@@ -134,7 +135,7 @@ class DataManagerTest : public ::testing::Test {
     // Helper: Put data via public API, returns success/failure synchronously.
     tl::expected<void, ErrorCode> DoPut(const std::string& key, void* ptr,
                                         size_t size,
-                                        DataManager* dm = nullptr) {
+                                        DataManagerV1* dm = nullptr) {
         if (!dm) dm = data_manager_.get();
         std::vector<Slice> slices = {{ptr, size}};
         auto handle = dm->Put(key, slices);
@@ -145,7 +146,7 @@ class DataManagerTest : public ::testing::Test {
     // Helper: Get data via public API into a caller-supplied buffer.
     // Returns true on success.
     bool DoGet(const std::string& key, void* buf, size_t size,
-               DataManager* dm = nullptr) {
+               DataManagerV1* dm = nullptr) {
         if (!dm) dm = data_manager_.get();
         std::vector<Slice> slices = {{buf, size}};
         auto handle = dm->Get(key, slices);
@@ -157,7 +158,7 @@ class DataManagerTest : public ::testing::Test {
     // Internally resolve the key to an AllocationHandle so test bodies
     // never call GetHandle directly.
 
-    std::unique_ptr<DataManager> data_manager_;
+    std::unique_ptr<DataManagerV1> data_manager_;
     std::unique_ptr<TieredBackend> tiered_backend_;
     TieredBackend* tiered_backend_raw_ptr_ =
         nullptr;  // Raw pointer for tests that need direct backend access
@@ -1191,7 +1192,7 @@ TEST_F(DataManagerTest, BoundaryConditionTests) {
 // lock
 TEST_F(DataManagerTest, LockContentionTest) {
     const int num_keys = 1025;
-    // Use the same initialization logic as DataManager
+    // Use the same initialization logic as DataManagerV1
     const size_t kLockShardCount =
         GetEnvOr<size_t>("MOONCAKE_DM_LOCK_SHARD_COUNT", 1024);
 
@@ -1204,7 +1205,7 @@ TEST_F(DataManagerTest, LockContentionTest) {
         keys.push_back(key);
 
         // Calculate which lock shard this key maps to (same logic as
-        // DataManager)
+        // DataManagerV1)
         size_t hash = std::hash<std::string>{}(key);
         size_t lock_index = hash % kLockShardCount;
         lock_usage_count[lock_index]++;
@@ -1319,7 +1320,7 @@ TEST_F(DataManagerTest, LockContentionTest) {
 }
 
 // Test concurrent Get and Delete operations to verify that removing read locks
-// from DataManager::Get is safe. The TieredBackend's internal locking and
+// from DataManagerV1::Get is safe. The TieredBackend's internal locking and
 // shared_ptr reference counting should ensure thread safety.
 TEST_F(DataManagerTest, ConcurrentGetAndDelete) {
     const int num_keys = 50;
@@ -1544,7 +1545,7 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
     }
     LOG(INFO) << "Memory registered for RDMA access";
 
-    // Create TieredBackend and DataManager with RDMA-enabled TransferEngine
+    // Create TieredBackend and DataManagerV1 with RDMA-enabled TransferEngine
     std::string json_config_str = R"({
         "tiers": [
             {
@@ -1568,12 +1569,12 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
 
     LocalTransferConfig local_transfer_config;
     local_transfer_config.mode = LocalTransferMode::MEMCPY;
-    auto rdma_data_manager = std::make_unique<DataManager>(
+    auto rdma_data_manager = std::make_unique<DataManagerV1>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
-    LOG(INFO) << "DataManager created with RDMA-enabled TransferEngine";
+    LOG(INFO) << "DataManagerV1 created with RDMA-enabled TransferEngine";
 
-    // Store data in DataManager (this will be the source for RDMA transfer)
+    // Store data in DataManagerV1 (this will be the source for RDMA transfer)
     const std::string key = "rdma_real_test_key";
     const std::string pattern = "RDMA_REAL_TEST_PATTERN_";
     auto data_copy = std::make_unique<char[]>(test_size);
@@ -1582,9 +1583,9 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
     }
 
     ASSERT_TRUE(DoPut(key, data_copy.get(), test_size, rdma_data_manager.get()))
-        << "Failed to put data into DataManager";
+        << "Failed to put data into DataManagerV1";
     ASSERT_TRUE(rdma_data_manager->Exist(key)) << "Key not found after Put";
-    LOG(INFO) << "Data stored in DataManager";
+    LOG(INFO) << "Data stored in DataManagerV1";
 
     // Use hostname as segment name (this is how TransferEngine registers
     // segments) The destination address must be within the registered memory
@@ -1597,7 +1598,7 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
     LOG(INFO) << "Destination address: 0x" << std::hex
               << reinterpret_cast<uint64_t>(dst_area) << std::dec;
 
-    // Perform RDMA transfer via DataManager
+    // Perform RDMA transfer via DataManagerV1
     auto transfer_result = rdma_data_manager->ReadRemoteData(key, dest_buffers);
 
     if (!transfer_result.has_value()) {
@@ -1704,7 +1705,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchTransfer) {
     }
     LOG(INFO) << "Memory registered for RDMA access";
 
-    // Create TieredBackend and DataManager with RDMA-enabled TransferEngine
+    // Create TieredBackend and DataManagerV1 with RDMA-enabled TransferEngine
     std::string json_config_str = R"({
         "tiers": [
             {
@@ -1728,12 +1729,12 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchTransfer) {
 
     LocalTransferConfig local_transfer_config;
     local_transfer_config.mode = LocalTransferMode::MEMCPY;
-    auto rdma_data_manager = std::make_unique<DataManager>(
+    auto rdma_data_manager = std::make_unique<DataManagerV1>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
-    LOG(INFO) << "DataManager created with RDMA-enabled TransferEngine";
+    LOG(INFO) << "DataManagerV1 created with RDMA-enabled TransferEngine";
 
-    // Store data in DataManager (this will be the source for RDMA transfer)
+    // Store data in DataManagerV1 (this will be the source for RDMA transfer)
     const std::string key = "rdma_multi_batch_test_key";
     const std::string pattern = "RDMA_MULTI_BATCH_PATTERN_";
     const size_t total_data_size = segment_size * num_segments;  // 16MB total
@@ -1744,9 +1745,10 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchTransfer) {
 
     ASSERT_TRUE(
         DoPut(key, data_copy.get(), total_data_size, rdma_data_manager.get()))
-        << "Failed to put data into DataManager";
+        << "Failed to put data into DataManagerV1";
     ASSERT_TRUE(rdma_data_manager->Exist(key)) << "Key not found after Put";
-    LOG(INFO) << "Data stored in DataManager (" << total_data_size << " bytes)";
+    LOG(INFO) << "Data stored in DataManagerV1 (" << total_data_size
+              << " bytes)";
 
     // Use hostname as segment name (this is how TransferEngine registers
     // segments)
@@ -1768,7 +1770,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchTransfer) {
     LOG(INFO) << "Attempting multi-batch RDMA transfer with " << num_segments
               << " segments";
 
-    // Perform RDMA transfer via DataManager
+    // Perform RDMA transfer via DataManagerV1
     // This will submit all batches first, then wait for all to complete
     auto transfer_result = rdma_data_manager->ReadRemoteData(key, dest_buffers);
 
@@ -1895,7 +1897,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchPartialFailure) {
     }
     LOG(INFO) << "Memory registered for RDMA access";
 
-    // Create TieredBackend and DataManager
+    // Create TieredBackend and DataManagerV1
     std::string json_config_str = R"({
         "tiers": [
             {
@@ -1917,10 +1919,10 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchPartialFailure) {
 
     LocalTransferConfig local_transfer_config;
     local_transfer_config.mode = LocalTransferMode::MEMCPY;
-    auto rdma_data_manager = std::make_unique<DataManager>(
+    auto rdma_data_manager = std::make_unique<DataManagerV1>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
-    LOG(INFO) << "DataManager created with RDMA-enabled TransferEngine";
+    LOG(INFO) << "DataManagerV1 created with RDMA-enabled TransferEngine";
 
     // Store test data
     const std::string key = "rdma_partial_failure_test_key";
@@ -1933,9 +1935,10 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchPartialFailure) {
 
     ASSERT_TRUE(
         DoPut(key, data_copy.get(), total_data_size, rdma_data_manager.get()))
-        << "Failed to put data into DataManager";
+        << "Failed to put data into DataManagerV1";
     ASSERT_TRUE(rdma_data_manager->Exist(key)) << "Key not found after Put";
-    LOG(INFO) << "Data stored in DataManager (" << total_data_size << " bytes)";
+    LOG(INFO) << "Data stored in DataManagerV1 (" << total_data_size
+              << " bytes)";
 
     std::string valid_segment = std::string(local_hostname);
     std::string invalid_segment = "non_existent_segment_12345";
@@ -2040,7 +2043,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteData) {
     }
     LOG(INFO) << "Memory registered for RDMA access";
 
-    // Create TieredBackend and DataManager with RDMA-enabled TransferEngine
+    // Create TieredBackend and DataManagerV1 with RDMA-enabled TransferEngine
     std::string json_config_str = R"({
         "tiers": [
             {
@@ -2062,10 +2065,10 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteData) {
 
     LocalTransferConfig local_transfer_config;
     local_transfer_config.mode = LocalTransferMode::MEMCPY;
-    auto rdma_data_manager = std::make_unique<DataManager>(
+    auto rdma_data_manager = std::make_unique<DataManagerV1>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
-    LOG(INFO) << "DataManager created with RDMA-enabled TransferEngine";
+    LOG(INFO) << "DataManagerV1 created with RDMA-enabled TransferEngine";
 
     // Use hostname as segment name (this is how TransferEngine registers
     // segments)
@@ -2088,7 +2091,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteData) {
     LOG(INFO) << "Attempting multi-batch WriteRemoteData with " << num_segments
               << " segments";
 
-    // Perform RDMA write via DataManager
+    // Perform RDMA write via DataManagerV1
     // This will submit all batches first, then wait for all to complete
     auto write_result = rdma_data_manager->WriteRemoteData(key, src_buffers);
 
@@ -2202,7 +2205,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteDataPartialFailure) {
     }
     LOG(INFO) << "Memory registered for RDMA access";
 
-    // Create TieredBackend and DataManager
+    // Create TieredBackend and DataManagerV1
     std::string json_config_str = R"({
         "tiers": [
             {
@@ -2224,10 +2227,10 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteDataPartialFailure) {
 
     LocalTransferConfig local_transfer_config;
     local_transfer_config.mode = LocalTransferMode::MEMCPY;
-    auto rdma_data_manager = std::make_unique<DataManager>(
+    auto rdma_data_manager = std::make_unique<DataManagerV1>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
-    LOG(INFO) << "DataManager created with RDMA-enabled TransferEngine";
+    LOG(INFO) << "DataManagerV1 created with RDMA-enabled TransferEngine";
 
     std::string valid_segment = std::string(local_hostname);
     std::string invalid_segment = "non_existent_segment_12345";
@@ -2277,7 +2280,7 @@ tl::expected<void, ErrorCode> AwaitVoidExpectedFuture(
         }(std::move(fut)));
 }
 
-std::unique_ptr<DataManager> MakeDataManagerForTePollTest(
+std::unique_ptr<DataManagerV1> MakeDataManagerForTePollTest(
     std::shared_ptr<TransferEngine> te, size_t te_async_poll_worker_num) {
     std::string json_config_str = R"({
         "tiers": [
@@ -2302,7 +2305,7 @@ std::unique_ptr<DataManager> MakeDataManagerForTePollTest(
     LocalTransferConfig transfer_config;
     transfer_config.mode = LocalTransferMode::TE;
     transfer_config.te_async_poll_worker_num = te_async_poll_worker_num;
-    return std::make_unique<DataManager>(std::move(backend), std::move(te),
+    return std::make_unique<DataManagerV1>(std::move(backend), std::move(te),
                                          1024, transfer_config);
 }
 
@@ -2405,6 +2408,235 @@ TEST_F(DataManagerTest, TeWaitPoolStopDrainsInflightEmptyWait) {
     dm->Stop();
     auto result = AwaitVoidExpectedFuture(std::move(fut));
     ASSERT_TRUE(result.has_value());
+}
+
+// ============================================================================
+// Regression tests for three V1 defects found while freezing the behaviour
+// that the DataManager interface now documents as the contract.
+// ============================================================================
+
+namespace {
+
+// A DataManagerV1 backed by a DRAM tier (high priority) plus a STORAGE tier, so
+// a replica can be placed on a non-DRAM medium deterministically.
+struct TieredDataManagerFixture {
+    std::unique_ptr<DataManagerV1> data_manager;
+    TieredBackend* backend = nullptr;
+    UUID dram_tier_id{};
+    UUID storage_tier_id{};
+};
+
+std::optional<TieredDataManagerFixture> MakeDramPlusStorageDataManager(
+    std::shared_ptr<TransferEngine> te, const std::string& storage_path) {
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", storage_path.c_str(), 1);
+    std::filesystem::remove_all(storage_path);
+    std::filesystem::create_directories(storage_path);
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 104857600,
+                "priority": 100,
+                "tags": ["dram"],
+                "allocator_type": "OFFSET"
+            },
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 10,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    if (!parseJsonString(json_config_str, config)) return std::nullopt;
+
+    auto backend = std::make_unique<TieredBackend>(64);
+    if (!InitTieredBackendForTest(*backend, config).has_value()) {
+        return std::nullopt;
+    }
+
+    TieredDataManagerFixture fixture;
+    for (const auto& view : backend->GetTierViews()) {
+        if (view.type == MemoryType::DRAM) {
+            fixture.dram_tier_id = view.id;
+        } else if (view.type == MemoryType::NVME) {
+            fixture.storage_tier_id = view.id;
+        }
+    }
+    if (IsZeroUUID(fixture.dram_tier_id) ||
+        IsZeroUUID(fixture.storage_tier_id)) {
+        return std::nullopt;
+    }
+
+    fixture.backend = backend.get();
+    LocalTransferConfig transfer_config;
+    transfer_config.mode = LocalTransferMode::MEMCPY;
+    transfer_config.local_memcpy_async_worker_num = 0;
+    transfer_config.te_async_poll_worker_num = 0;
+    fixture.data_manager = std::make_unique<DataManagerV1>(
+        std::move(backend), std::move(te), 64, transfer_config);
+    return fixture;
+}
+
+// Commits `key` so that its ONLY replica lives on `tier_id`.
+bool CommitOnTier(TieredBackend& backend, const UUID& tier_id,
+                  const std::string& key, const std::string& payload) {
+    auto handle = backend.Allocate(payload.size(), tier_id, /*strict=*/true);
+    if (!handle.has_value()) return false;
+    DataSource source;
+    source.buffer = std::make_unique<RefBuffer>(
+        const_cast<char*>(payload.data()), payload.size());
+    source.type = MemoryType::DRAM;
+    if (!backend.Write(source, handle.value()).has_value()) return false;
+    return backend.Commit(key, handle.value()).has_value();
+}
+
+// Reuses the heap block that just held `key` so a stale std::string_view is
+// very likely to observe garbage rather than the original bytes. Only a hint
+// for non-sanitized builds; ASAN catches the use-after-free directly.
+void ScribbleFreedKeyStorage(size_t key_size) {
+    std::vector<std::string> junk;
+    junk.reserve(64);
+    for (int i = 0; i < 64; ++i) {
+        junk.emplace_back(key_size, static_cast<char>('#'));
+    }
+    // Touch the memory so the compiler cannot elide the allocations.
+    volatile char sink = 0;
+    for (const auto& s : junk) sink = static_cast<char>(sink + s.back());
+    (void)sink;
+}
+
+}  // namespace
+
+// Defect 1: the first-pin path had no medium check, so a replica
+// living only on the storage tier returned OK with an unusable address AND
+// left a real lease behind. It must now be rejected, with no lease created.
+TEST_F(DataManagerTest, PinKeyRejectsNonDramReplicaOnFirstPin) {
+    auto fixture = MakeDramPlusStorageDataManager(
+        transfer_engine_, "/tmp/mooncake_dm_phase0_pinkey");
+    ASSERT_TRUE(fixture.has_value());
+
+    const std::string key = "phase0_storage_only_key";
+    const std::string payload = "payload-on-storage-tier";
+    ASSERT_TRUE(CommitOnTier(*fixture->backend, fixture->storage_tier_id, key,
+                             payload));
+    // The only replica is on the storage tier.
+    ASSERT_TRUE(fixture->backend->Exist(key, fixture->storage_tier_id));
+    ASSERT_FALSE(fixture->backend->Exist(key, fixture->dram_tier_id));
+
+    auto pin = fixture->data_manager->PinKey(key);
+    ASSERT_FALSE(pin.has_value());
+    EXPECT_EQ(pin.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+
+    // No lease may have been created. UnPinKey is idempotent-OK when there is
+    // no record, and returns INVALID_READ when a record exists under a
+    // different token, so an OK here proves the failed pin left nothing behind.
+    auto unpin = fixture->data_manager->UnPinKey(key, generate_uuid());
+    EXPECT_TRUE(unpin.has_value())
+        << "failed PinKey must not leave a pinned-read lease";
+
+    // Same answer after the tier has flushed the staging buffer to disk.
+    const_cast<CacheTier*>(fixture->backend->GetTier(fixture->storage_tier_id))
+        ->Flush();
+    auto pin_after_flush = fixture->data_manager->PinKey(key);
+    ASSERT_FALSE(pin_after_flush.has_value());
+    EXPECT_EQ(pin_after_flush.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+
+    fixture->data_manager->Stop();
+}
+
+// Defect 3: BuildRemoteBufferDesc accepted a buffer object
+// that exposes no addressable memory, producing addr == 0 descriptors. A
+// persisted StorageBuffer is exactly that case.
+TEST_F(DataManagerTest, BuildRemoteBufferDescRejectsUnaddressableBuffer) {
+    auto fixture = MakeDramPlusStorageDataManager(
+        transfer_engine_, "/tmp/mooncake_dm_phase0_desc");
+    ASSERT_TRUE(fixture.has_value());
+
+    const std::string key = "phase0_desc_key";
+    const std::string payload = "payload-for-desc-check";
+    ASSERT_TRUE(CommitOnTier(*fixture->backend, fixture->storage_tier_id, key,
+                             payload));
+
+    auto handle = fixture->backend->Get(key, fixture->storage_tier_id);
+    ASSERT_TRUE(handle.has_value());
+    // While still staged the buffer is addressable, so the descriptor builds.
+    ASSERT_NE(handle.value()->loc.data.buffer->data(), 0U);
+    EXPECT_TRUE(
+        fixture->data_manager->BuildRemoteBufferDesc(handle.value())
+            .has_value());
+
+    const_cast<CacheTier*>(fixture->backend->GetTier(fixture->storage_tier_id))
+        ->Flush();
+    auto flushed = fixture->backend->Get(key, fixture->storage_tier_id);
+    ASSERT_TRUE(flushed.has_value());
+    ASSERT_EQ(flushed.value()->loc.data.buffer->data(), 0U);
+
+    auto desc = fixture->data_manager->BuildRemoteBufferDesc(flushed.value());
+    ASSERT_FALSE(desc.has_value())
+        << "a buffer with no addressable memory must not yield a descriptor";
+    EXPECT_EQ(desc.error(), ErrorCode::INTERNAL_ERROR);
+
+    fixture->data_manager->Stop();
+}
+
+// Defect 2: the deferred Put task captured a KeyCtx
+// holding a std::string_view into the caller's key storage. Put/Get never
+// promised that the key outlives the task, only that the slices do.
+TEST_F(DataManagerTest, PutCompletesAfterCallerKeyStorageIsDestroyed) {
+    // Long enough to defeat std::string SSO, so the bytes really are freed.
+    const std::string key_value(64, 'k');
+    const std::string test_data = "put-outlives-key-storage";
+
+    auto buffer = StringToBuffer(test_data);
+    std::vector<Slice> slices = {{buffer.get(), test_data.size()}};
+
+    auto key_storage = std::make_unique<std::string>(key_value);
+    auto handle = data_manager_->Put(*key_storage, slices);
+    ASSERT_TRUE(handle.has_value());
+
+    key_storage.reset();
+    ScribbleFreedKeyStorage(key_value.size());
+
+    auto wait_result = handle.value()->Wait();
+    ASSERT_TRUE(wait_result.has_value())
+        << "Put failed: " << toString(wait_result.error());
+
+    EXPECT_TRUE(data_manager_->Exist(key_value))
+        << "the object must be committed under the original key";
+    auto read_buf = std::make_unique<char[]>(test_data.size());
+    ASSERT_TRUE(DoGet(key_value, read_buf.get(), test_data.size()));
+    EXPECT_EQ(std::string(read_buf.get(), test_data.size()), test_data);
+}
+
+// The Get side of the same defect. The stale view was only read for logging,
+// so an unsanitized build still produces correct bytes; this test pins the
+// contract and fails loudly under ASAN on the pre-fix code.
+TEST_F(DataManagerTest, GetCompletesAfterCallerKeyStorageIsDestroyed) {
+    const std::string key_value(64, 'g');
+    const std::string test_data = "get-outlives-key-storage";
+
+    auto buffer = StringToBuffer(test_data);
+    ASSERT_TRUE(DoPut(key_value, buffer.get(), test_data.size()).has_value());
+
+    auto read_buf = std::make_unique<char[]>(test_data.size());
+    std::vector<Slice> slices = {{read_buf.get(), test_data.size()}};
+
+    auto key_storage = std::make_unique<std::string>(key_value);
+    auto handle = data_manager_->Get(*key_storage, slices);
+    ASSERT_TRUE(handle.has_value());
+
+    key_storage.reset();
+    ScribbleFreedKeyStorage(key_value.size());
+
+    auto wait_result = handle.value().task_handle->Wait();
+    ASSERT_TRUE(wait_result.has_value())
+        << "Get failed: " << toString(wait_result.error());
+    EXPECT_EQ(std::string(read_buf.get(), test_data.size()), test_data);
 }
 
 }  // namespace mooncake
