@@ -225,6 +225,14 @@ unsafe extern "C" {
         deadline_ns: c_longlong,
         options: *const KvcsLlBatchOptions,
     ) -> c_int;
+    fn kvcs_ll_batch_query(
+        client: *mut KvcsClient,
+        keys: *const *const c_char,
+        count: c_int,
+        results: *mut KvcsQueryResult,
+        capacity: c_int,
+        options: *const KvcsLlBatchOptions,
+    ) -> c_int;
 }
 
 struct ClientHandle(*mut KvcsClient);

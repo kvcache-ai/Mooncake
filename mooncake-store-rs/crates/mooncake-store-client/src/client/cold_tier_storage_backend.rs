@@ -482,6 +482,15 @@ pub(super) struct PersistentStorageBackendHealth {
     pub(super) available_bytes: Option<u64>,
 }
 
+/// Selects who owns automatic physical storage maintenance for a backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PersistentStorageManagement {
+    /// Cold Tier may run physical inventory reconciliation, watermarks, and compaction.
+    MooncakeManaged,
+    /// The backend/provider owns physical inventory, pressure cleanup, and compaction.
+    BackendManaged,
+}
+
 /// Result of a compaction pass on a cold tier backend.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackendCompactionResult {
@@ -518,6 +527,10 @@ pub(crate) struct BackendMaintenanceStats {
 /// that do not need staging (extent store) can override `disable_pending_source()` to return
 /// `true`.
 pub(super) trait PersistentStorageBackend: Send + Sync {
+    fn storage_management(&self) -> PersistentStorageManagement {
+        PersistentStorageManagement::MooncakeManaged
+    }
+
     fn health(&self) -> Result<PersistentStorageBackendHealth> {
         Ok(PersistentStorageBackendHealth {
             capacity_bytes: None,
@@ -713,6 +726,15 @@ impl ColdTierBackendResolver {
 
     pub(super) fn backend_ids(&self) -> Vec<String> {
         self.backends.keys().cloned().collect()
+    }
+
+    pub(super) fn storage_management(
+        &self,
+        cold_tier_id: &str,
+    ) -> Option<PersistentStorageManagement> {
+        self.backends
+            .get(cold_tier_id)
+            .map(|backend| backend.storage_management())
     }
 
     pub(super) fn insert_backend(

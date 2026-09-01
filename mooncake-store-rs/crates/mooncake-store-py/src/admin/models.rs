@@ -483,6 +483,16 @@ pub struct ColdTierObjectBackingResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NofObjectBackingResponse {
+    pub target_id: String,
+    pub owner: ColdTierObjectBackingOwnerResponse,
+    pub state: String,
+    pub locator: String,
+    pub length: u64,
+    pub checksum: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GetColdTierObjectResponse {
     pub key: String,
     pub cold_backing: Option<ColdTierObjectBackingResponse>,
@@ -519,6 +529,8 @@ pub struct DebugRouteResponse {
     pub qos_tier: Option<String>,
     pub replicas: Vec<DebugRouteReplicaResponse>,
     pub cold_backing: Option<ColdTierObjectBackingResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nof_backing: Option<NofObjectBackingResponse>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

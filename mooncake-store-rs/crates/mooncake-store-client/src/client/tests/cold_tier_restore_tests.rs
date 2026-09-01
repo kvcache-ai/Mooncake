@@ -118,6 +118,7 @@ fn legacy_backend_object_route_is_not_restored_on_read_miss() {
             priority: 0,
         }],
         cold_backing: None,
+        nof_backing: None,
     };
     loop {
         let cas = client
@@ -227,6 +228,7 @@ fn cold_restore_checksum_mismatch_does_not_promote() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
         cold_backing: Some(cold_backing.clone()),
+        nof_backing: None,
     };
     metadata
         .compare_and_swap_object_route(&key, None, Some(&route))
@@ -300,6 +302,7 @@ fn cold_restore_missing_backend_object_does_not_promote_or_return_empty() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
         cold_backing: Some(cold_backing),
+        nof_backing: None,
     };
     metadata
         .compare_and_swap_object_route(&key, None, Some(&route))
@@ -364,6 +367,7 @@ fn cold_restore_unknown_cold_tier_id_does_not_use_default_backend() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
         cold_backing: Some(missing_backing),
+        nof_backing: None,
     };
     metadata
         .compare_and_swap_object_route(&key, None, Some(&route))
@@ -427,6 +431,7 @@ fn seed_materialized_cold_only_route(
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
         cold_backing: Some(cold_backing.clone()),
+        nof_backing: None,
     };
     metadata
         .compare_and_swap_object_route(&key, None, Some(&route))
@@ -871,6 +876,7 @@ fn restore_promotion_queue_drains_bounded_batches_without_stalling() {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
             cold_backing: None,
+            nof_backing: None,
         };
         let task = RestorePromotionTask {
             key: RestorePromotionKey {
@@ -960,6 +966,7 @@ fn cold_restore_promotion_enqueues_on_first_cold_hit() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
         cold_backing: Some(cold_backing.clone()),
+        nof_backing: None,
     };
     inner
         .compare_and_swap_object_route(&key, None, Some(&route))
@@ -1046,6 +1053,7 @@ fn cold_restore_promotion_conflict_returns_payload_without_overwrite() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
         cold_backing: Some(cold_backing.clone()),
+        nof_backing: None,
     };
     inner
         .compare_and_swap_object_route(&key, None, Some(&route))
@@ -1507,6 +1515,7 @@ fn concurrent_cold_restore_dedupes_in_flight_promotion() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
         cold_backing: Some(cold_backing.clone()),
+        nof_backing: None,
     };
     inner
         .compare_and_swap_object_route(&key, None, Some(&route))
@@ -1606,6 +1615,7 @@ fn metadata_route_cas_rejects_stale_restore_after_reconnect() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
         cold_backing: Some(cold_backing.clone()),
+        nof_backing: None,
     };
     inner
         .compare_and_swap_object_route(&key, None, Some(&original))
@@ -1721,6 +1731,7 @@ fn cold_restore_delete_race_does_not_republish_deleted_route() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
         cold_backing: Some(cold_backing.clone()),
+        nof_backing: None,
     };
     inner
         .compare_and_swap_object_route(&key, None, Some(&route))
@@ -1847,6 +1858,7 @@ fn test_restore_promotion_task(logical_key: &str) -> RestorePromotionTask {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
             cold_backing: None,
+            nof_backing: None,
         },
         payload: Arc::new(b"payload".to_vec()),
         policy: ReplicationPolicy::new(),

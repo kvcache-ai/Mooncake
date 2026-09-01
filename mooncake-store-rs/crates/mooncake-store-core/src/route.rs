@@ -10,6 +10,7 @@ use crate::identity::{
     DEFAULT_OBJECT_SET,
 };
 use crate::lifecycle::ClientLifecycleState;
+use crate::nof::NofBackingRoute;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ObjectKey(pub String);
@@ -135,6 +136,34 @@ pub struct ObjectRoute {
     pub replicas: Vec<ReplicaRoute>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_backing: Option<ColdBackingRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nof_backing: Option<NofBackingRoute>,
+}
+
+impl ObjectRoute {
+    pub fn has_persistent_backing(&self) -> bool {
+        self.cold_backing.is_some() || self.nof_backing.is_some()
+    }
+
+    pub fn validate_backing_kind(&self) -> crate::Result<()> {
+        if self.cold_backing.is_some() && self.nof_backing.is_some() {
+            return Err(crate::StoreError::InvalidState(
+                "an object route cannot contain both local Cold Tier and NoF backing metadata"
+                    .to_string(),
+            ));
+        }
+        if self.nof_backing.is_some()
+            && !self
+                .compatibility
+                .supports(crate::NOF_BACKING_ROUTE_CAPABILITY)
+        {
+            return Err(crate::StoreError::InvalidState(format!(
+                "NoF backing publication requires capability {}",
+                crate::NOF_BACKING_ROUTE_CAPABILITY
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1219,6 +1248,7 @@ mod tests {
                 priority: 0,
             }],
             cold_backing: None,
+            nof_backing: None,
         };
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
@@ -1268,6 +1298,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
+            nof_backing: None,
         };
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();

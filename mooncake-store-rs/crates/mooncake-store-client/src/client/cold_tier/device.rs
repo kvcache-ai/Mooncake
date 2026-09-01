@@ -687,6 +687,15 @@ impl ColdTierDeviceManager {
         self.resolver.lock().has_any_backend()
     }
 
+    /// Unknown/dynamic backends retain the historical Mooncake-managed behavior. Registered
+    /// provider-managed backends explicitly opt out of automatic physical maintenance.
+    pub(in super::super) fn mooncake_manages_storage(&self, cold_tier_id: &str) -> bool {
+        !matches!(
+            self.resolver.lock().storage_management(cold_tier_id),
+            Some(super::super::PersistentStorageManagement::BackendManaged)
+        )
+    }
+
     /// Returns the set of cold_tier_ids that have local backends registered.
     pub(in super::super) fn local_device_ids(&self) -> Vec<String> {
         self.resolver.lock().backend_ids()

@@ -1140,6 +1140,9 @@ impl MetadataBackend for EtcdMetadataBackend {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
+        if let Some(route) = next {
+            route.validate_backing_kind()?;
+        }
         let key = self.config.keyspace.object(key);
         self.block_on(async {
             let mut client = self.client().await?;
@@ -2656,6 +2659,7 @@ mod tests {
                 priority: 1,
             }],
             cold_backing: None,
+            nof_backing: None,
         }
     }
 

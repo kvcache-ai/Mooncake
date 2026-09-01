@@ -51,7 +51,7 @@ pub(in super::super) fn publish_initial_write_cold_backing(
     if super::cold_tier_disabled() {
         return Ok(None);
     }
-    if route.state != RouteState::Active || route.cold_backing.is_some() {
+    if route.state != RouteState::Active || route.has_persistent_backing() {
         storage_owner.sync_route(route);
         return Ok(None);
     }
@@ -122,7 +122,7 @@ pub(in super::super) fn repair_initial_write_cold_backings(
     let result = storage_owner.route_ops.visit_routes_by_replica_owner(
         &storage_owner.runtime,
         &mut |route| {
-            if route.state != RouteState::Active || route.cold_backing.is_some() {
+            if route.state != RouteState::Active || route.has_persistent_backing() {
                 storage_owner.sync_route(&route);
                 return Ok(());
             }
@@ -159,7 +159,7 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
     if super::cold_tier_disabled() {
         return Ok(None);
     }
-    if route.state != RouteState::Active || route.cold_backing.is_some() {
+    if route.state != RouteState::Active || route.has_persistent_backing() {
         storage_owner.sync_route(route);
         return Ok(None);
     }
