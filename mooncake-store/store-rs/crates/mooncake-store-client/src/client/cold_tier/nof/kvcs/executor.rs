@@ -44,13 +44,6 @@ enum KvcsExecutor {
 }
 
 impl KvcsExecutor {
-    fn mode(&self) -> KvcsMode {
-        match self {
-            Self::Standard(_) => KvcsMode::Standard,
-            Self::LowLevel(_) => KvcsMode::LowLevel,
-        }
-    }
-
     fn standard(&self) -> Option<&standard::StandardExecutor> {
         let Self::Standard(executor) = self else {
             return None;
@@ -82,10 +75,6 @@ impl KvcsCapiExecutor {
             KvcsMode::LowLevel => KvcsExecutor::LowLevel(low_level::LowLevelExecutor::new()?),
         };
         Ok(Self { executor })
-    }
-
-    pub fn mode(&self) -> KvcsMode {
-        self.executor.mode()
     }
 }
 
@@ -162,7 +151,6 @@ mod standard {
 
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::ptr;
-    use std::sync::Mutex;
 
     use libc::size_t;
     use mooncake_store_core::{NamespaceScope, Result, StoreError};
@@ -269,8 +257,7 @@ mod standard {
         _redis_endpoints: Vec<CString>,
         _redis_endpoint_ptrs: Vec<*const c_char>,
         _redis_password: Option<CString>,
-        _log_path: Option<CString>,
-        client: Mutex<Option<ClientHandle>>,
+        client: ClientSlot,
         limits: CommonLimits,
     }
 
@@ -279,10 +266,9 @@ mod standard {
 
     impl StandardExecutor {
         pub(super) fn new() -> Result<Self> {
-            let limits = CommonLimits::from_env()?;
+            let limits = CommonLimits::default();
             let efc_socket = optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")?;
             let redis_password = optional_cstring("MOONCAKE_KVCS_REDIS_PASSWORD")?;
-            let log_path = optional_cstring("MOONCAKE_KVCS_LOG_PATH")?;
             let redis_endpoints = std::env::var("MOONCAKE_KVCS_REDIS_ENDPOINTS")
                 .ok()
                 .into_iter()
@@ -304,9 +290,6 @@ mod standard {
                 .iter()
                 .map(|endpoint| endpoint.as_ptr())
                 .collect::<Vec<_>>();
-            let configured_value = env_u64("MOONCAKE_KVCS_MAX_VALUE_SIZE", 0)?;
-            let configured_key = env_u32("MOONCAKE_KVCS_MAX_KEY_SIZE", 0)?;
-            let configured_batch = env_u32("MOONCAKE_KVCS_MAX_KEYS_PER_BATCH", 0)?;
             let config = KvcsClientConfig {
                 efc_socket: efc_socket
                     .as_ref()
@@ -320,33 +303,17 @@ mod standard {
                 redis_password: redis_password
                     .as_ref()
                     .map_or(ptr::null(), |value| value.as_ptr()),
-                redis_pool_size: env_u32("MOONCAKE_KVCS_REDIS_POOL_SIZE", 0)?.min(c_int::MAX as u32)
-                    as c_int,
-                get_workers: env_u32("MOONCAKE_KVCS_GET_WORKERS", 0)?.min(c_int::MAX as u32)
-                    as c_int,
-                set_workers: env_u32("MOONCAKE_KVCS_SET_WORKERS", 0)?.min(c_int::MAX as u32)
-                    as c_int,
-                simple_workers: env_u32("MOONCAKE_KVCS_SIMPLE_WORKERS", 0)?.min(c_int::MAX as u32)
-                    as c_int,
-                max_keys_per_batch: configured_batch.min(c_int::MAX as u32) as c_int,
+                redis_pool_size: 0,
+                get_workers: 0,
+                set_workers: 0,
+                simple_workers: 0,
+                max_keys_per_batch: 0,
                 iov_size: 0,
-                max_value_size: if configured_value == 0 {
-                    0
-                } else {
-                    limits.max_value_size as i64
-                },
-                max_key_size: if configured_key == 0 {
-                    0
-                } else {
-                    limits.max_key_size.min(c_int::MAX as usize) as c_int
-                },
-                perf_report_interval_sec: env_u32("MOONCAKE_KVCS_PERF_REPORT_INTERVAL_SEC", 0)?
-                    .min(c_int::MAX as u32) as c_int,
-                log_path: log_path
-                    .as_ref()
-                    .map_or(ptr::null(), |value| value.as_ptr()),
-                enable_metrics: env_u32("MOONCAKE_KVCS_ENABLE_METRICS", 0)?.min(c_int::MAX as u32)
-                    as c_int,
+                max_value_size: 0,
+                max_key_size: 0,
+                perf_report_interval_sec: 0,
+                log_path: ptr::null(),
+                enable_metrics: 0,
             };
             Ok(Self {
                 config,
@@ -354,27 +321,22 @@ mod standard {
                 _redis_endpoints: redis_endpoints,
                 _redis_endpoint_ptrs: redis_endpoint_ptrs,
                 _redis_password: redis_password,
-                _log_path: log_path,
-                client: Mutex::new(None),
+                client: ClientSlot::default(),
                 limits,
             })
         }
 
         fn ensure_client(&self) -> Result<*mut KvcsClient> {
-            let mut slot = self.client.lock().map_err(|_| {
-                StoreError::InvalidState("KVCS Standard client lock poisoned".to_string())
-            })?;
-            if let Some(handle) = slot.as_ref() {
-                return Ok(handle.0);
-            }
-            let client = unsafe { kvcs_client_create(&self.config) };
-            if client.is_null() {
-                return Err(StoreError::Transport(
-                    "KVCS Standard client creation failed".to_string(),
-                ));
-            }
-            slot.replace(ClientHandle(client));
-            Ok(client)
+            self.client.get_or_create(
+                "Standard",
+                || unsafe { kvcs_client_create(&self.config) },
+                kvcs_client_destroy,
+            )
+        }
+
+        fn prepare_batch(&self, len: usize) -> Result<(*mut KvcsClient, c_int)> {
+            let count = checked_batch_len(len)?;
+            Ok((self.ensure_client()?, count))
         }
 
         fn namespace(&self, scope: &NamespaceScope) -> Result<CString> {
@@ -465,16 +427,6 @@ mod standard {
         }
     }
 
-    impl Drop for StandardExecutor {
-        fn drop(&mut self) {
-            if let Ok(mut slot) = self.client.lock() {
-                if let Some(handle) = slot.take() {
-                    unsafe { kvcs_client_destroy(handle.0) };
-                }
-            }
-        }
-    }
-
     impl StandardExecutor {
         pub(super) fn capabilities(&self) -> NofObjectLimits {
             NofObjectLimits {
@@ -557,19 +509,9 @@ mod standard {
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
-            let count = match checked_batch_len(valid.len()) {
-                Ok(count) => count,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
-            };
-            let client = match self.ensure_client() {
-                Ok(client) => client,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
+            let (client, count) = match self.prepare_batch(valid.len()) {
+                Ok(prepared) => prepared,
+                Err(error) => return fail_positional_results(results, error),
             };
             let value_ptrs = valid
                 .iter()
@@ -618,9 +560,7 @@ mod standard {
                 )
             };
             if status < 0 {
-                let error = map_call_status(status, "Standard put");
-                fill_missing(&mut results, &error);
-                return finish_positional_results(results);
+                return fail_positional_results(results, map_call_status(status, "Standard put"));
             }
             for ((index, _, _), native) in valid.iter().zip(native_results) {
                 results[*index] = Some(if native.status == 0 {
@@ -842,9 +782,8 @@ mod standard {
 mod low_level {
     //! KVCS Low-Level SDK executor for the NoF physical KV contract.
 
-    use std::ffi::{c_int, c_longlong, c_void, CString};
+    use std::ffi::{c_int, c_void, CString};
     use std::ptr;
-    use std::sync::Mutex;
 
     use libc::size_t;
     use mooncake_store_core::{Result, StoreError};
@@ -859,9 +798,8 @@ mod low_level {
     pub(super) struct LowLevelExecutor {
         config: KvcsLlConfig,
         _efc_socket: CString,
-        _log_path: Option<CString>,
         mountpoint_index: u32,
-        client: Mutex<Option<ClientHandle>>,
+        client: ClientSlot,
         limits: CommonLimits,
     }
 
@@ -870,71 +808,47 @@ mod low_level {
 
     impl LowLevelExecutor {
         pub(super) fn new() -> Result<Self> {
-            let limits = CommonLimits::from_env()?;
+            let limits = CommonLimits::default();
             let efc_socket = match optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")? {
                 Some(socket) => socket,
                 None => CString::new("/var/run/kvcs/efc-grpc.sock").map_err(|_| {
                     StoreError::InvalidState("KVCS default EFC socket contains NUL".to_string())
                 })?,
             };
-            let log_path = optional_cstring("MOONCAKE_KVCS_LOG_PATH")?;
-            let configured_value = env_u64("MOONCAKE_KVCS_MAX_VALUE_SIZE", 0)?;
-            let configured_key = env_u32("MOONCAKE_KVCS_MAX_KEY_SIZE", 0)?;
-            let configured_batch = env_u32("MOONCAKE_KVCS_MAX_KEYS_PER_BATCH", 0)?;
             let config = KvcsLlConfig {
                 // Public SDK 0.4.0 rejects NULL/empty for the low-level client.
                 efc_socket: efc_socket.as_ptr(),
-                max_keys_per_batch: configured_batch.min(c_int::MAX as u32) as c_int,
+                max_keys_per_batch: 0,
                 iov_size: 0,
-                max_value_size: if configured_value == 0 {
-                    0
-                } else {
-                    limits.max_value_size as c_longlong
-                },
-                max_key_size: if configured_key == 0 {
-                    0
-                } else {
-                    limits.max_key_size.min(c_int::MAX as usize) as c_int
-                },
-                log_path: log_path
-                    .as_ref()
-                    .map_or(ptr::null(), |value| value.as_ptr()),
-                get_workers: env_u32("MOONCAKE_KVCS_GET_WORKERS", 0)?.min(c_int::MAX as u32)
-                    as c_int,
-                set_workers: env_u32("MOONCAKE_KVCS_SET_WORKERS", 0)?.min(c_int::MAX as u32)
-                    as c_int,
-                simple_workers: env_u32("MOONCAKE_KVCS_SIMPLE_WORKERS", 0)?.min(c_int::MAX as u32)
-                    as c_int,
-                perf_report_interval_sec: env_u32("MOONCAKE_KVCS_PERF_REPORT_INTERVAL_SEC", 0)?
-                    .min(c_int::MAX as u32) as c_int,
-                enable_metrics: env_u32("MOONCAKE_KVCS_ENABLE_METRICS", 0)?.min(c_int::MAX as u32)
-                    as c_int,
+                max_value_size: 0,
+                max_key_size: 0,
+                log_path: ptr::null(),
+                get_workers: 0,
+                set_workers: 0,
+                simple_workers: 0,
+                perf_report_interval_sec: 0,
+                enable_metrics: 0,
             };
             Ok(Self {
                 config,
                 _efc_socket: efc_socket,
-                _log_path: log_path,
                 mountpoint_index: env_u32("MOONCAKE_KVCS_MOUNTPOINT_INDEX", 0)?,
-                client: Mutex::new(None),
+                client: ClientSlot::default(),
                 limits,
             })
         }
 
         fn ensure_client(&self) -> Result<*mut KvcsClient> {
-            let mut slot = self.client.lock().map_err(|_| {
-                StoreError::InvalidState("KVCS low-level client lock poisoned".to_string())
-            })?;
-            if let Some(handle) = slot.as_ref() {
-                return Ok(handle.0);
-            }
-            let client = unsafe { kvcs_ll_create(&self.config) };
-            if client.is_null() {
-                return Err(StoreError::Transport(
-                    "KVCS low-level client creation failed".to_string(),
-                ));
-            }
-            slot.replace(ClientHandle(client));
-            Ok(client)
+            self.client.get_or_create(
+                "low-level",
+                || unsafe { kvcs_ll_create(&self.config) },
+                kvcs_ll_client_destroy,
+            )
+        }
+
+        fn prepare_batch(&self, len: usize) -> Result<(*mut KvcsClient, c_int)> {
+            let count = checked_batch_len(len)?;
+            Ok((self.ensure_client()?, count))
         }
 
         fn options(&self) -> Option<KvcsLlBatchOptions> {
@@ -986,16 +900,6 @@ mod low_level {
         }
     }
 
-    impl Drop for LowLevelExecutor {
-        fn drop(&mut self) {
-            if let Ok(mut slot) = self.client.lock() {
-                if let Some(handle) = slot.take() {
-                    unsafe { kvcs_ll_client_destroy(handle.0) };
-                }
-            }
-        }
-    }
-
     impl LowLevelExecutor {
         pub(super) fn capabilities(&self) -> NofPhysicalLimits {
             NofPhysicalLimits {
@@ -1041,19 +945,9 @@ mod low_level {
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
-            let count = match checked_batch_len(valid.len()) {
-                Ok(count) => count,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
-            };
-            let client = match self.ensure_client() {
-                Ok(client) => client,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
+            let (client, count) = match self.prepare_batch(valid.len()) {
+                Ok(prepared) => prepared,
+                Err(error) => return fail_positional_results(results, error),
             };
             let pointers = valid
                 .iter()
@@ -1099,9 +993,7 @@ mod low_level {
                 )
             };
             if status < 0 {
-                let error = map_call_status(status, "low-level put");
-                fill_missing(&mut results, &error);
-                return finish_positional_results(results);
+                return fail_positional_results(results, map_call_status(status, "low-level put"));
             }
             for ((index, _, _), native) in valid.iter().zip(native_results) {
                 results[*index] = Some(if native.status == 0 {
@@ -1154,10 +1046,7 @@ mod low_level {
             }
             let client = match self.ensure_client() {
                 Ok(client) => client,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
+                Err(error) => return fail_positional_results(results, error),
             };
             let items = valid
                 .iter()
@@ -1170,10 +1059,7 @@ mod low_level {
             let (mut statuses, mut lengths) = match self.call_get_into(client, &items, &mut buffers)
             {
                 Ok(output) => output,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
+                Err(error) => return fail_positional_results(results, error),
             };
             for index in 0..valid.len() {
                 if statuses[index] == -(libc::ENOSPC as c_int)
@@ -1259,19 +1145,9 @@ mod low_level {
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
-            let count = match checked_batch_len(valid.len()) {
-                Ok(count) => count,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
-            };
-            let client = match self.ensure_client() {
-                Ok(client) => client,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
+            let (client, count) = match self.prepare_batch(valid.len()) {
+                Ok(prepared) => prepared,
+                Err(error) => return fail_positional_results(results, error),
             };
             let pointers = valid
                 .iter()
@@ -1292,9 +1168,10 @@ mod low_level {
                 )
             };
             if status < 0 {
-                let error = map_call_status(status, "low-level delete");
-                fill_missing(&mut results, &error);
-                return finish_positional_results(results);
+                return fail_positional_results(
+                    results,
+                    map_call_status(status, "low-level delete"),
+                );
             }
             for ((request_index, _), status) in valid.iter().zip(statuses) {
                 results[*request_index] = Some(if status == 0 {
@@ -1329,19 +1206,9 @@ mod low_level {
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
-            let count = match checked_batch_len(valid.len()) {
-                Ok(count) => count,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
-            };
-            let client = match self.ensure_client() {
-                Ok(client) => client,
-                Err(error) => {
-                    fill_missing(&mut results, &error);
-                    return finish_positional_results(results);
-                }
+            let (client, count) = match self.prepare_batch(valid.len()) {
+                Ok(prepared) => prepared,
+                Err(error) => return fail_positional_results(results, error),
             };
             let pointers = valid
                 .iter()
@@ -1372,9 +1239,10 @@ mod low_level {
                 )
             };
             if written < 0 {
-                let error = map_call_status(written, "low-level query");
-                fill_missing(&mut results, &error);
-                return finish_positional_results(results);
+                return fail_positional_results(
+                    results,
+                    map_call_status(written, "low-level query"),
+                );
             }
             if written != count {
                 let error = StoreError::Transport(format!(
@@ -1431,7 +1299,7 @@ mod low_level {
         use super::*;
 
         #[test]
-        #[ignore = "requires a live KVCS EFC and configured mountpoint"]
+        #[ignore = "requires a live KVCS EFC and configured mountpoint, or the official SDK mock"]
         fn live_low_level_round_trip_smoke() {
             let executor = super::KvcsCapiExecutor::with_mode(super::KvcsMode::LowLevel).unwrap();
             let nonce = std::time::SystemTime::now()

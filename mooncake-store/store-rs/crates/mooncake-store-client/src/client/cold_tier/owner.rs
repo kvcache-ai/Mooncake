@@ -6,7 +6,7 @@ use std::sync::{
     Arc, OnceLock,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mooncake_store_core::{
     ClientLease, ClientLifecycleState, ClientRuntimeId, MetadataBackend, Result, StoreError,
@@ -20,7 +20,6 @@ use crate::placement::stable_rendezvous_score;
 
 const TARGET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const TARGET_HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
-const TARGET_HEARTBEAT_STOP_POLL: Duration = Duration::from_millis(100);
 pub(in crate::client) const NOF_TARGET_SET_LABEL: &str = "nof.target-set.v1";
 pub(in crate::client) const NOF_UNHEALTHY_TARGETS_LABEL: &str = "nof.unhealthy-targets.v1";
 
@@ -417,9 +416,16 @@ fn remote_unhealthy_targets(
     leases: &[ClientLease],
     local_runtime: &ClientRuntimeId,
 ) -> BTreeSet<String> {
-    let leases = leases
+    let unhealthy_by_owner = leases
         .iter()
-        .map(|lease| (&lease.runtime, lease))
+        .map(|lease| {
+            let unhealthy = lease
+                .endpoints
+                .labels
+                .get(NOF_UNHEALTHY_TARGETS_LABEL)
+                .map(|encoded| serde_json::from_str::<BTreeSet<String>>(encoded));
+            (&lease.runtime, unhealthy)
+        })
         .collect::<BTreeMap<_, _>>();
     owners
         .iter()
@@ -427,14 +433,12 @@ fn remote_unhealthy_targets(
             if owner == local_runtime {
                 return None;
             }
-            let encoded = leases
-                .get(owner)?
-                .endpoints
-                .labels
-                .get(NOF_UNHEALTHY_TARGETS_LABEL)?;
-            match serde_json::from_str::<BTreeSet<String>>(encoded) {
-                Ok(unhealthy) => unhealthy.contains(target_id).then(|| target_id.clone()),
-                Err(_) => Some(target_id.clone()),
+            match unhealthy_by_owner.get(owner) {
+                Some(Some(Ok(unhealthy))) if unhealthy.contains(target_id) => {
+                    Some(target_id.clone())
+                }
+                Some(Some(Err(_))) => Some(target_id.clone()),
+                _ => None,
             }
         })
         .collect()
@@ -498,38 +502,41 @@ fn assign_target_owners<'a>(
         .filter_map(|target_id| {
             candidates
                 .iter()
-                .max_by(|left, right| {
-                    stable_rendezvous_score(
-                        &["nof-target-owner-v1", target_set_fingerprint, target_id],
-                        &left.runtime.stable_id,
+                .map(|owner| {
+                    (
+                        stable_rendezvous_score(
+                            &["nof-target-owner-v1", target_set_fingerprint, target_id],
+                            &owner.runtime.stable_id,
+                        ),
+                        owner,
                     )
-                    .cmp(&stable_rendezvous_score(
-                        &["nof-target-owner-v1", target_set_fingerprint, target_id],
-                        &right.runtime.stable_id,
-                    ))
-                    .then_with(|| right.runtime.cmp(&left.runtime))
                 })
+                .max_by(|(left_score, left), (right_score, right)| {
+                    left_score
+                        .cmp(right_score)
+                        .then_with(|| right.runtime.cmp(&left.runtime))
+                })
+                .map(|(_, owner)| owner)
                 .map(|owner| (target_id.to_string(), owner.runtime.clone()))
         })
         .collect()
 }
 
 pub(super) struct NofHeartbeatMonitor {
-    stop: Arc<AtomicBool>,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl NofHeartbeatMonitor {
     pub(super) fn disabled() -> Self {
         Self {
-            stop: Arc::new(AtomicBool::new(true)),
+            shutdown: None,
             thread: None,
         }
     }
 
     pub(super) fn start(state: Arc<NofOwnerState>) -> Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = stop.clone();
+        let (shutdown, shutdown_rx) = std::sync::mpsc::channel();
         let stable_id = state.local_runtime.stable_id.0.clone();
         let initial_delay = Duration::from_millis(crate::client::stable_phase_spread_ms(
             &stable_id,
@@ -539,13 +546,17 @@ impl NofHeartbeatMonitor {
         let thread = thread::Builder::new()
             .name(format!("nof-owner-{stable_id}"))
             .spawn(move || {
-                if wait_for_heartbeat_stop(&thread_stop, initial_delay) {
+                if !matches!(
+                    shutdown_rx.recv_timeout(initial_delay),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
                     return;
                 }
-                while !thread_stop.load(Ordering::Acquire) {
+                loop {
                     state.heartbeat_owned_targets();
-                    if wait_for_heartbeat_stop(&thread_stop, TARGET_HEARTBEAT_INTERVAL) {
-                        break;
+                    match shutdown_rx.recv_timeout(TARGET_HEARTBEAT_INTERVAL) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
             })
@@ -553,7 +564,7 @@ impl NofHeartbeatMonitor {
                 StoreError::Transport(format!("failed to start NoF owner worker: {error}"))
             })?;
         Ok(Self {
-            stop,
+            shutdown: Some(shutdown),
             thread: Some(thread),
         })
     }
@@ -561,24 +572,12 @@ impl NofHeartbeatMonitor {
 
 impl Drop for NofHeartbeatMonitor {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-    }
-}
-
-fn wait_for_heartbeat_stop(stop: &AtomicBool, duration: Duration) -> bool {
-    let deadline = Instant::now() + duration;
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return true;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        thread::sleep(remaining.min(TARGET_HEARTBEAT_STOP_POLL));
     }
 }
 

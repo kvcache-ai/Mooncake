@@ -1,4 +1,5 @@
 use super::*;
+use crate::{NofObjectDelete, NofObjectQuery, NofObjectRead, NofObjectWrite};
 use std::sync::Mutex;
 
 #[test]
@@ -167,11 +168,11 @@ fn object_query_is_an_optional_post_write_capability() {
 #[test]
 fn external_metadata_is_composed_explicitly() {
     let (_, backend) = recording_backend(false);
-    assert!(NofBacking::metadata(&backend).is_none());
+    assert!(backend.metadata().is_none());
 
     let metadata = Arc::new(mooncake_metadata::InMemoryMetadataBackend::new());
     let backend = backend.external_metadata(metadata);
-    assert!(NofBacking::metadata(&backend).is_some());
+    assert!(backend.metadata().is_some());
 }
 
 #[test]

@@ -3,18 +3,15 @@ use std::sync::Arc;
 use mooncake_store_core::{NamespaceScope, Result, StoreError};
 
 use crate::client::cold_tier::layout::{PhysicalKeyCodec, Sha256PhysicalKeyCodec, ValueChunkPlan};
+use crate::client::{PersistentStorageBackendHealth, PersistentStorageManagement};
 
 use super::backing::NofBacking;
 use super::ensure_batch_len;
 use super::external_metadata::NofExternalMetadata;
 use super::object::{
-    NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata, NofObjectQuery, NofObjectRead,
-    NofObjectShardWrite, NofObjectState, NofObjectWrite,
+    NofObject, NofObjectLimits, NofObjectMetadata, NofObjectShardWrite, NofObjectState,
 };
-use super::physical::{
-    NofDeviceManagement, NofHealth, NofPhysicalDelete, NofPhysicalLimits, NofPhysicalQuery,
-    NofPhysicalRead, NofPhysicalWrite, NofStorageManagement,
-};
+use super::physical::NofPhysicalLimits;
 
 /// Unified NoF facade and capability container.
 ///
@@ -74,6 +71,12 @@ impl NofBackend {
         self
     }
 
+    pub fn metadata(&self) -> Option<&dyn NofExternalMetadata> {
+        self.external_metadata
+            .as_deref()
+            .or_else(|| self.backing.metadata())
+    }
+
     pub fn key_codec(mut self, codec: Arc<dyn PhysicalKeyCodec>) -> Self {
         self.key_codec = codec;
         self
@@ -88,6 +91,30 @@ impl NofBackend {
         }
         self.key_domain = domain;
         Ok(self)
+    }
+
+    pub(in crate::client) fn management_mode(&self) -> PersistentStorageManagement {
+        if self.backing.storage_management().is_some() {
+            PersistentStorageManagement::MooncakeManaged
+        } else {
+            PersistentStorageManagement::BackendManaged
+        }
+    }
+
+    pub(in crate::client) fn health_snapshot(&self) -> Result<PersistentStorageBackendHealth> {
+        let health = if let Some(storage) = self.backing.storage_management() {
+            storage.storage_health()?.validate(true)?
+        } else if let Some(health) = self.backing.health_capability() {
+            health.health()?.validate(false)?
+        } else if let Some(devices) = self.backing.device_management() {
+            devices.device_health()?.validate(false)?
+        } else {
+            Default::default()
+        };
+        Ok(PersistentStorageBackendHealth {
+            capacity_bytes: health.capacity_bytes,
+            available_bytes: health.available_bytes,
+        })
     }
 
     pub fn init_namespace(&self, namespace: &NamespaceScope) -> Result<()> {
@@ -120,36 +147,25 @@ impl NofBackend {
             StoreError::InvalidState("NoF value length does not fit u64".to_string())
         })?;
         let plan = ValueChunkPlan::new(value_len, limits.max_value_size)?;
-        let total_shards = u32::try_from(plan.chunk_count().max(1)).map_err(|_| {
+        let total_shards = u32::try_from(plan.chunk_count()).map_err(|_| {
             StoreError::InvalidState("NoF shard count exceeds provider ABI".to_string())
         })?;
         let mut requests = Vec::with_capacity(total_shards as usize);
-        if plan.chunk_count() == 0 {
+        for shard_id in 0..plan.chunk_count() {
+            let range = plan.range(shard_id)?;
+            let start = usize::try_from(range.start)
+                .map_err(|_| StoreError::InvalidState("NoF shard start overflow".to_string()))?;
+            let end = usize::try_from(range.end)
+                .map_err(|_| StoreError::InvalidState("NoF shard end overflow".to_string()))?;
             requests.push(NofObjectShardWrite {
                 namespace,
                 key,
-                value,
-                shard_id: 0,
-                total_shards: 1,
+                value: &value[start..end],
+                shard_id: u32::try_from(shard_id).map_err(|_| {
+                    StoreError::InvalidState("NoF shard index exceeds provider ABI".to_string())
+                })?,
+                total_shards,
             });
-        } else {
-            for shard_id in 0..plan.chunk_count() {
-                let range = plan.range(shard_id)?;
-                let start = usize::try_from(range.start).map_err(|_| {
-                    StoreError::InvalidState("NoF shard start overflow".to_string())
-                })?;
-                let end = usize::try_from(range.end)
-                    .map_err(|_| StoreError::InvalidState("NoF shard end overflow".to_string()))?;
-                requests.push(NofObjectShardWrite {
-                    namespace,
-                    key,
-                    value: &value[start..end],
-                    shard_id: u32::try_from(shard_id).map_err(|_| {
-                        StoreError::InvalidState("NoF shard index exceeds provider ABI".to_string())
-                    })?,
-                    total_shards,
-                });
-            }
         }
 
         let results = writer.put_shards(&requests);
@@ -227,66 +243,6 @@ impl NofBackend {
             )));
         }
         Ok(())
-    }
-}
-
-impl NofBacking for NofBackend {
-    fn object_limits(&self) -> Option<NofObjectLimits> {
-        self.object_limits
-    }
-
-    fn object_write(&self) -> Option<&dyn NofObjectWrite> {
-        self.backing.object_write()
-    }
-
-    fn object_read(&self) -> Option<&dyn NofObjectRead> {
-        self.backing.object_read()
-    }
-
-    fn object_query(&self) -> Option<&dyn NofObjectQuery> {
-        self.backing.object_query()
-    }
-
-    fn object_delete(&self) -> Option<&dyn NofObjectDelete> {
-        self.backing.object_delete()
-    }
-
-    fn physical_limits(&self) -> Option<NofPhysicalLimits> {
-        self.physical_limits
-    }
-
-    fn physical_write(&self) -> Option<&dyn NofPhysicalWrite> {
-        self.backing.physical_write()
-    }
-
-    fn physical_read(&self) -> Option<&dyn NofPhysicalRead> {
-        self.backing.physical_read()
-    }
-
-    fn physical_query(&self) -> Option<&dyn NofPhysicalQuery> {
-        self.backing.physical_query()
-    }
-
-    fn physical_delete(&self) -> Option<&dyn NofPhysicalDelete> {
-        self.backing.physical_delete()
-    }
-
-    fn metadata(&self) -> Option<&dyn NofExternalMetadata> {
-        self.external_metadata
-            .as_deref()
-            .or_else(|| self.backing.metadata())
-    }
-
-    fn health_capability(&self) -> Option<&dyn NofHealth> {
-        self.backing.health_capability()
-    }
-
-    fn storage_management(&self) -> Option<&dyn NofStorageManagement> {
-        self.backing.storage_management()
-    }
-
-    fn device_management(&self) -> Option<&dyn NofDeviceManagement> {
-        self.backing.device_management()
     }
 }
 

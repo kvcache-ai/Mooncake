@@ -40,16 +40,6 @@ pub struct NofBackingRoute {
 }
 
 impl NofBackingRoute {
-    pub fn all_target_ids(&self) -> Vec<&str> {
-        let mut ids = vec![self.target_id.as_str()];
-        ids.extend(
-            self.replicas
-                .iter()
-                .map(|replica| replica.target_id.as_str()),
-        );
-        ids
-    }
-
     pub fn all_targets(&self) -> Vec<NofTarget<'_>> {
         let mut targets = vec![NofTarget {
             owner: &self.owner,
@@ -122,7 +112,6 @@ mod tests {
             }],
         };
 
-        assert_eq!(route.all_target_ids(), vec!["nof-a", "nof-b"]);
         assert_eq!(route.all_targets()[1].object_locator, "nof-ll:v1:i:02");
         assert!(route.matches_filter(&NofBackingRouteFilter {
             target_id: Some("nof-b".to_string()),

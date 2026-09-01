@@ -17,14 +17,6 @@ fn incomplete_is_not_mapped_to_not_found() {
 }
 
 #[test]
-fn malformed_numeric_configuration_is_rejected() {
-    assert!(matches!(
-        parse_env_number::<u32>("MOONCAKE_KVCS_GET_WORKERS", Some("four".to_string()), 0),
-        Err(StoreError::InvalidState(_))
-    ));
-}
-
-#[test]
 fn capi_config_layout_matches_the_extended_sdk_abi() {
     assert_eq!(std::mem::size_of::<KvcsClientConfig>(), 96);
     assert_eq!(std::mem::size_of::<KvcsLlConfig>(), 72);
