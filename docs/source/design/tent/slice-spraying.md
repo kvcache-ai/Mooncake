@@ -188,7 +188,8 @@ All slice spraying parameters are configurable via the configuration file:
 {
   "transports": {
     "rdma": {
-      "numa_penalties": [1.0, 5.0, 10.0]
+      "numa_penalties": [1.0, 5.0, 10.0],
+      "strict_local_numa": false
     }
   }
 }
@@ -197,11 +198,43 @@ All slice spraying parameters are configurable via the configuration file:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `numa_penalties` | array[float] | `[1.0, 5.0, 10.0]` | Penalty multipliers for each NUMA tier |
+| `strict_local_numa` | bool | `false` | Never select a cross-NUMA NIC instead of penalizing it |
 
 **Guidelines**:
 - Higher values = stronger preference for local devices
 - Set all to `1.0` to disable NUMA awareness
 - Increase remote penalties if cross-NUMA latency is high
+
+### Strict Local NUMA
+
+`numa_penalties` makes a remote NIC expensive but still selectable, so a busy
+local NIC eventually loses to a cross-NUMA one. Set `strict_local_numa` (or the
+`MC_STRICT_LOCAL_NUMA` environment variable, which accepts `1`/`0` and
+`true`/`false`) to remove those NICs from selection entirely.
+
+A NIC is only excluded when the memory location and the NIC **both** report a
+NUMA node and the nodes differ. If either side is unknown the NIC keeps its
+`numa_penalties` weight, because discovery reports `-1` in cases where excluding
+everything would break otherwise working hosts:
+
+- virtual machines and some GPUs, where sysfs exposes no `numa_node`
+- bonded NICs such as `mlx5_bond_0`
+- classic priority-matrix topologies (`MC_CUSTOM_TOPO_JSON`,
+  `topology/priority_matrix`), which carry no NUMA information at all
+
+On those hosts the flag has no effect; a warning is logged at startup so this is
+visible rather than silent. A second warning names any location left without a
+same-NUMA NIC, since transfers from it will fail with `DeviceNotFound`.
+
+**Trade-off**: strict mode converts a performance problem into an availability
+one. Without a local NIC an allocation fails instead of degrading, so enable it
+only where every memory location provably has a same-NUMA rail.
+
+**Scope**: the exclusion is enforced on the local NIC for both the first
+selection and the retry path. For the remote NIC it is only a preference — the
+peer publishes its own topology and may not run this policy, so failing a slice
+because another host has no local rail would turn a local setting into a
+cross-node outage.
 
 ### Bandwidth Estimation
 
