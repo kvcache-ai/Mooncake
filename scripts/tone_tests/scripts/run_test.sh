@@ -187,6 +187,13 @@ is_base_env_prepared() {
         return 1  # self-hosted artifact path mismatch
     fi
 
+    # Check if USE_TENT matches: the runtime selection is part of the
+    # environment identity, so a cached env cannot keep the wrong one.
+    local current_use_tent=$(grep "^export USE_TENT=" "$RUN_DIR/.shrc" | cut -d'=' -f2-)
+    if [ "$current_use_tent" != "${USE_TENT:-false}" ]; then
+        return 1  # USE_TENT mismatch
+    fi
+
     # Check if whl package exists
     local whl_count=$(find "$RUN_DIR/whls/" -name "*.whl" -type f 2>/dev/null | wc -l)
     [ $whl_count -gt 0 ]
@@ -221,6 +228,7 @@ export HUGGINGFACE_MIRROR=${HUGGINGFACE_MIRROR}
 export USE_MODELSCOPE=${USE_MODELSCOPE}
 export ARTIFACT_ID=${ARTIFACT_ID}
 export WHEEL_DIR=${WHEEL_DIR}
+export USE_TENT=${USE_TENT:-false}
 export GIT_REPO=${GIT_REPO}
 export LOCAL_IP=${LOCAL_IP}
 export REMOTE_IP=${REMOTE_IP}
