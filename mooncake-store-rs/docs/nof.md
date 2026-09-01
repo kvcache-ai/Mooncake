@@ -98,7 +98,7 @@ client/
         executor.rs
         backend.rs
         kvcs_executor.rs
-      kvcs_ffi.rs
+      kvcs_capi.rs
 ```
 
 `layout/` owns the Cold Tier-only physical key and value-splitting primitives. The two
@@ -106,9 +106,9 @@ client/
 executor implements. Their neighboring `mod.rs` files only assemble the facade/target and module
 exports. `lowlevel/backend.rs` adapts the low-level contract to the existing Cold Tier
 `PersistentStorageBackend`. The two `kvcs_executor.rs` files contain only concrete KVCS SDK
-behavior. `kvcs_ffi.rs` is private shared raw-ABI plumbing, included by the parent module solely
-to avoid duplicating C declarations between the two KVCS executors; it is not a third NoF
-execution model or a public SDK layer.
+behavior. `kvcs_capi.rs` contains the private shared bindings for the vendor's public C API and is
+included by the parent module solely to avoid duplicating C declarations between the two KVCS
+executors. It is neither a third NoF execution model nor a public SDK layer.
 
 `ExternalMetadata` is an ownership value, not another storage service under `nof/`.
 `external_metadata.rs` is a typed extension over the injected `MetadataBackend` (in-memory,
@@ -389,6 +389,6 @@ Use these checks when changing the NoF implementation:
 1. ownership and reuse: confirm no NoF control plane, allocator, metadata backend, scheduler, GC or
    rebuild loop was introduced, and that provider-managed maintenance is not invoked for KVCS;
 2. correctness and ABI: check positional batches, partial failures, manifest visibility, checksum
-   validation, key/value limits, environment parsing, FFI layouts and the public 0.4.0 SDK/mock;
+   validation, key/value limits, environment parsing, C ABI layouts and the public 0.4.0 SDK/mock;
 3. reproducibility: verify every package URL above, default and `kvcs-capi` builds, tests, clippy
    and formatting.
