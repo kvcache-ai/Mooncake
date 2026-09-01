@@ -1571,7 +1571,7 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
     const Request& req, int transport_index, bool invalidate_on_fail) {
     ResolvedRoute resolved;
 
-    auto collect_candidates = [&]() {
+    auto collect_direct_candidates = [&]() {
         std::vector<SelectionResult> results;
         for (int i = transport_index; i < kSupportedTransportTypes; ++i) {
             auto result = getTransportType(req, i);
@@ -1581,14 +1581,12 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
         return results;
     };
 
-    auto route_candidates = collect_candidates();
-    if (route_candidates.empty() && invalidate_on_fail) {
+    auto direct_candidates = collect_direct_candidates();
+    if (direct_candidates.empty() && invalidate_on_fail) {
         metadata_->segmentManager().invalidateRemote(req.target_id);
-        route_candidates = collect_candidates();
+        direct_candidates = collect_direct_candidates();
     }
-    if (route_candidates.empty()) return resolved;
-
-    resolved.route = route_candidates.front();
+    if (!direct_candidates.empty()) resolved.route = direct_candidates.front();
 
     if (req.target_id == LOCAL_SEGMENT_ID) return resolved;
 
@@ -1629,6 +1627,49 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
                       desc->getMemory().topology.findNearMem(
                           remote, Topology::MEM_CUDA));
 
+    std::vector<SelectionResult> cross_node_candidates;
+    if (transport_selector_ && !transport_selector_->isLegacyMode()) {
+        SelectionContext ctx;
+        ctx.transfer_size = req.length;
+        ctx.priority_level = req.priority;
+        ctx.policy_name = req.policy_name;
+        ctx.intent_type = req.intent_type;
+        ctx.segment_type = SegmentType::Memory;
+        ctx.same_machine = false;
+        if (auto local_desc = metadata_->segmentManager().getLocal()) {
+            ctx.same_machine = !desc->machine_id.empty() &&
+                               !local_desc->machine_id.empty() &&
+                               desc->machine_id == local_desc->machine_id;
+        }
+        ctx.local_memory_type = input.local_memory_type;
+        ctx.remote_memory_type = input.remote_memory_type;
+        ctx.buffer_transports = &entry->transports;
+        cross_node_candidates = transport_selector_->listCandidates(
+            ctx, transport_list_, req.transport_hint,
+            TransportReachabilityMode::InstalledOnly);
+    } else {
+        bool same_machine = (req.target_id == LOCAL_SEGMENT_ID);
+        if (!same_machine) {
+            auto local_desc = metadata_->segmentManager().getLocal();
+            same_machine = local_desc && !desc->machine_id.empty() &&
+                           !local_desc->machine_id.empty() &&
+                           desc->machine_id == local_desc->machine_id;
+        }
+        auto candidates = TransportSelector::reorderWithHint(
+            entry->transports, req.transport_hint);
+        if (candidates) {
+            for (auto type : *candidates) {
+                if (type == UNSPEC || !transport_list_[type]) continue;
+                if ((type == NVLINK || type == SHM || type == TPU) &&
+                    !same_machine)
+                    continue;
+                SelectionResult result;
+                result.transport = type;
+                cross_node_candidates.push_back(std::move(result));
+            }
+        }
+    }
+
     for (int i = 0; i < kSupportedTransportTypes; ++i) {
         if (!transport_list_[i]) continue;
         auto caps = transport_list_[i]->capabilities();
@@ -1637,7 +1678,7 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
         input.transports[i].caps = caps;
     }
 
-    for (const auto& candidate : route_candidates) {
+    for (const auto& candidate : cross_node_candidates) {
         const auto type = candidate.transport;
         if (type == UNSPEC || !transport_list_[type]) continue;
         auto caps = transport_list_[type]->capabilities();
@@ -1650,11 +1691,11 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
     if (!path.found) return resolved;
 
     auto selected = std::find_if(
-        route_candidates.begin(), route_candidates.end(),
+        cross_node_candidates.begin(), cross_node_candidates.end(),
         [&](const SelectionResult& candidate) {
             return candidate.transport == path.cross_transport;
         });
-    if (selected == route_candidates.end()) return resolved;
+    if (selected == cross_node_candidates.end()) return resolved;
 
     resolved.route = *selected;
     resolved.path = std::move(path);
@@ -1665,6 +1706,13 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
                                    resolved.path.remote_stage_location};
     }
     return resolved;
+}
+
+TransferEngineImpl::ResolvedRouteForTest
+TransferEngineImpl::resolveExecutionRouteForTest(const Request& req) {
+    auto resolved = resolveExecutionRoute(req, 0);
+    return ResolvedRouteForTest{resolved.route, resolved.staging,
+                                std::move(resolved.staging_params)};
 }
 
 Status TransferEngineImpl::prepareSubmit(

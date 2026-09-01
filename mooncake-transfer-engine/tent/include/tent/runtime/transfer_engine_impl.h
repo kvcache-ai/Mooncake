@@ -288,6 +288,14 @@ class TransferEngineImpl {
 
     Status unlockStageBuffer(uint64_t addr);
 
+    struct ResolvedRouteForTest {
+        SelectionResult route{};
+        bool staging{false};
+        std::vector<std::string> staging_params;
+    };
+
+    ResolvedRouteForTest resolveExecutionRouteForTest(const Request& req);
+
     // Test-only hook: replace the transport in a given slot after construct().
     // Production code never calls this. Used by failover integration tests to
     // inject a FaultProxyTransport without bypassing resubmitTransferTask,

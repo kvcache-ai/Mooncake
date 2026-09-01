@@ -158,6 +158,11 @@ struct SelectionResult {
     std::optional<std::string> qp_pool;
 };
 
+enum class TransportReachabilityMode {
+    DirectEndpoint,
+    InstalledOnly,
+};
+
 /**
  * @brief Configuration-driven transport selector
  */
@@ -191,6 +196,22 @@ class TransportSelector {
         int transport_index = 0, TransportType hint = UNSPEC);
 
     /**
+     * @brief List policy/hint-authorized candidates in ranking order.
+     *
+     * DirectEndpoint preserves select() behavior by requiring the transport to
+     * reach the request's original source/target memory pair. InstalledOnly
+     * only requires that the transport exists, so callers that synthesize
+     * staged paths can check per-hop reachability after choosing stage memory.
+     */
+    std::vector<SelectionResult> listCandidates(
+        const SelectionContext& context,
+        const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
+            available_transports,
+        TransportType hint = UNSPEC,
+        TransportReachabilityMode reachability =
+            TransportReachabilityMode::DirectEndpoint) const;
+
+    /**
      * @brief Enable legacy mode (skip TransportSelector, use original logic)
      */
     void setLegacyMode(bool enabled) { legacy_mode_ = enabled; }
@@ -215,7 +236,14 @@ class TransportSelector {
                               MemoryType type) const;
     bool matchesPolicy(const SelectionPolicy& policy,
                        const SelectionContext& context) const;
+    const SelectionPolicy* findMatchingPolicy(
+        const SelectionContext& context) const;
+    SelectionResult policyResult(const SelectionContext& context) const;
     bool isTransportAvailable(
+        TransportType type, const SelectionContext& context,
+        const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
+            available_transports) const;
+    bool isTransportInstalled(
         TransportType type, const SelectionContext& context,
         const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
             available_transports) const;
