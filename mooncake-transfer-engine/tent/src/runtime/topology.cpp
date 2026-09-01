@@ -108,11 +108,6 @@ void Topology::print() const {
 }
 
 Status Topology::discover(const std::vector<Platform*>& platforms) {
-    return discover(platforms, false);
-}
-
-Status Topology::discover(const std::vector<Platform*>& platforms,
-                          bool discover_ub) {
     clear();
     for (auto& entry : platforms) {
         CHECK_STATUS(entry->probe(nic_list_, mem_list_));
@@ -121,7 +116,7 @@ Status Topology::discover(const std::vector<Platform*>& platforms,
     // UB discovery is intentionally adapter-backed instead of inferring UB
     // devices from verbs/sysfs names. One topology NIC is emitted per EID and
     // carries both the globally serialized identity and the native URMA name.
-    auto adapter = discover_ub ? ub::createDefaultUrmaAdapter() : nullptr;
+    auto adapter = ub::createDefaultUrmaAdapter();
     if (adapter && adapter->available()) {
         auto status = adapter->initialize();
         if (status.ok()) {
@@ -182,7 +177,6 @@ Status Topology::discover(const std::vector<Platform*>& platforms,
         }
     }
 #endif
-    (void)discover_ub;
     return Status::OK();
 }
 
@@ -354,7 +348,6 @@ Status Topology::parseCustomTopology(const std::string& json_content) {
 
 Status Topology::loadFromConfig(const Config& conf,
                                 const std::vector<Platform*>& platforms) {
-    const bool discover_ub = conf.get("transports/ub/enable", false);
     if (conf.contains("topology/priority_matrix")) {
         std::string matrix_json;
         if (conf.dumpSubtree("topology/priority_matrix", &matrix_json)) {
@@ -366,7 +359,7 @@ Status Topology::loadFromConfig(const Config& conf,
             LOG(WARNING) << "Failed to parse topology/priority_matrix: "
                          << status.ToString()
                          << ", falling back to auto-discover";
-            return discover(platforms, discover_ub);
+            return discover(platforms);
         }
     }
 
@@ -377,7 +370,7 @@ Status Topology::loadFromConfig(const Config& conf,
         if (!file.is_open()) {
             LOG(WARNING) << "Failed to load custom topology from " << path
                          << ", falling back to auto-detect.";
-            return discover(platforms, discover_ub);
+            return discover(platforms);
         }
         std::stringstream buffer;
         buffer << file.rdbuf();
@@ -385,16 +378,16 @@ Status Topology::loadFromConfig(const Config& conf,
         if (content.empty()) {
             LOG(WARNING) << "Failed to load custom topology from " << path
                          << ", falling back to auto-detect.";
-            return discover(platforms, discover_ub);
+            return discover(platforms);
         }
         auto status = parseCustomTopology(content);
         if (status.ok()) return Status::OK();
         LOG(WARNING) << "Failed to parse custom topology from " << path << ": "
                      << status.ToString() << ", falling back to auto-detect.";
-        return discover(platforms, discover_ub);
+        return discover(platforms);
     }
 
-    return discover(platforms, discover_ub);
+    return discover(platforms);
 }
 
 size_t Topology::getNicCount(NicType type) const {

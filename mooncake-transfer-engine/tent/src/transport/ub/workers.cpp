@@ -847,9 +847,23 @@ void UbWorkers::scanTimeouts() {
         forgetEndpointDrain(inflight->endpoint);
         if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
         recordTimeoutOnce(inflight, now);
-        // quiesce() is the proof that retry cannot overlap old DMA. The old
-        // token remains in inflight_ only until its returned/polled completion
-        // is dispatched; a provider-lost token is reclaimed at fenced stop.
+        // quiesce() is the proof that retry cannot overlap old DMA. Reclaim a
+        // provider-lost token here: the successful fence proves the old WR can
+        // no longer touch memory, so releasing outstanding/quota accounting is
+        // safe. releaseInflight() is idempotent against a racing completion.
+        bool erased = false;
+        {
+            std::lock_guard<std::mutex> lock(inflight_mutex_);
+            auto it = inflight_.find(inflight->completion_token);
+            if (it != inflight_.end() && it->second == inflight) {
+                inflight_.erase(it);
+                erased = true;
+            }
+        }
+        if (erased) {
+            inflight_cv_.notify_all();
+            releaseInflight(inflight);
+        }
         resolveInflight(inflight, TIMEOUT, 0, true);
     }
 }
