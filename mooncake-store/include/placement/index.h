@@ -23,9 +23,8 @@ namespace mooncake {
 // groups by both logical name and target kind, so native and CXL targets may
 // share a name without being mixed during allocation.
 struct PlacementGroup final {
-    PlacementGroup(std::string_view group_name,
-                   const PlacementTarget& first_target)
-        : name(group_name), kind(first_target.Kind()), targets{&first_target} {}
+    PlacementGroup(std::string_view group_name, PlacementTargetKind group_kind)
+        : name(group_name), kind(group_kind) {}
 
     bool AddTarget(const PlacementTarget& target);
     bool RemoveTarget(const PlacementTarget& target);
@@ -70,7 +69,6 @@ class PlacementIndex final {
     }
 
    private:
-    static constexpr size_t kTargetKindCount = 2;
     static constexpr size_t KindIndex(PlacementTargetKind kind) noexcept {
         return static_cast<size_t>(kind);
     }
@@ -78,8 +76,8 @@ class PlacementIndex final {
     using GroupMap =
         std::unordered_map<std::string, std::unique_ptr<PlacementGroup>,
                            TransparentStringHash, std::equal_to<>>;
-    std::array<GroupMap, kTargetKindCount> groups_by_kind_;
-    std::array<std::vector<const PlacementGroup*>, kTargetKindCount>
+    std::array<GroupMap, kPlacementTargetKindCount> groups_by_kind_;
+    std::array<std::vector<const PlacementGroup*>, kPlacementTargetKindCount>
         active_groups_by_kind_;
 };
 

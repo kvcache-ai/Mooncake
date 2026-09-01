@@ -13,6 +13,9 @@ enum class PlacementTargetKind {
     CXL,
 };
 
+inline constexpr size_t kPlacementTargetKindCount =
+    static_cast<size_t>(PlacementTargetKind::CXL) + 1;
+
 // A stable allocation endpoint published to PlacementIndex. RegionResource
 // owns the target and must outlive every placement reference to it.
 class PlacementTarget {

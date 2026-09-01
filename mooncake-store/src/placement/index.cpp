@@ -44,7 +44,7 @@ bool PlacementIndex::AddTarget(std::string_view name,
         return false;
     }
     const size_t kind_index = KindIndex(target->Kind());
-    if (kind_index >= kTargetKindCount) {
+    if (kind_index >= kPlacementTargetKindCount) {
         return false;
     }
     auto& groups = groups_by_kind_[kind_index];
@@ -53,7 +53,10 @@ bool PlacementIndex::AddTarget(std::string_view name,
         return it->second->AddTarget(*target);
     }
 
-    auto group = std::make_unique<PlacementGroup>(name, *target);
+    auto group = std::make_unique<PlacementGroup>(name, target->Kind());
+    if (!group->AddTarget(*target)) {
+        return false;
+    }
     const auto* group_ptr = group.get();
     groups.emplace(group->name, std::move(group));
     active_groups_by_kind_[kind_index].push_back(group_ptr);
@@ -66,7 +69,7 @@ bool PlacementIndex::RemoveTarget(std::string_view name,
         return false;
     }
     const size_t kind_index = KindIndex(target->Kind());
-    if (kind_index >= kTargetKindCount) {
+    if (kind_index >= kPlacementTargetKindCount) {
         return false;
     }
     auto& groups = groups_by_kind_[kind_index];
@@ -108,7 +111,7 @@ bool PlacementIndex::ReplaceTarget(std::string_view name,
     }
 
     const size_t kind_index = KindIndex(expected->Kind());
-    if (kind_index >= kTargetKindCount) {
+    if (kind_index >= kPlacementTargetKindCount) {
         return false;
     }
     auto& groups = groups_by_kind_[kind_index];
@@ -129,7 +132,7 @@ void PlacementIndex::Clear() {
 const PlacementGroup* PlacementIndex::Find(std::string_view name,
                                            PlacementTargetKind kind) const {
     const size_t kind_index = KindIndex(kind);
-    if (kind_index >= kTargetKindCount) {
+    if (kind_index >= kPlacementTargetKindCount) {
         return nullptr;
     }
     const auto& groups = groups_by_kind_[kind_index];
@@ -141,7 +144,7 @@ void PlacementIndex::GetActiveGroupNames(
     PlacementTargetKind kind, std::vector<std::string>& names) const {
     names.clear();
     const size_t kind_index = KindIndex(kind);
-    if (kind_index >= kTargetKindCount) {
+    if (kind_index >= kPlacementTargetKindCount) {
         return;
     }
     const auto& active_groups = active_groups_by_kind_[kind_index];
