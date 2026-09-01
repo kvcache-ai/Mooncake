@@ -786,12 +786,23 @@ class Client {
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
     // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
-    // completed replica is a LOCAL_DISK replica owned by this client, and
-    // probe its last byte through the normal read path to prove the backing
-    // file is gone (issue #3709). Only then evict the dangling replica so the
-    // Put can be retried; any other outcome keeps the old idempotent path.
-    // Returns true only when a replica was actually evicted.
+    // completed replica is a LOCAL_DISK replica owned by this client, and ask
+    // the installed probe (FileStorage::Exists over the offload files) whether
+    // the backing file is gone (issue #3709). Only then evict the dangling
+    // replica so the Put can be retried; any other outcome keeps the old
+    // idempotent path. Returns true only when a replica was actually evicted.
     bool healDanglingLocalDiskReplica(const ObjectKey& key);
+    // The BatchPutStart counterpart: heals the OBJECT_ALREADY_EXISTS subset
+    // with one batched replica-list query and one batched evict, then retries
+    // PutStart for just the evicted keys and splices the responses back, so a
+    // healthy idempotent batch pays one extra RPC and no evictions.
+    void healDanglingLocalDiskBatchStarts(
+        std::vector<PutOperation>& ops,
+        const std::vector<size_t>& active_indices,
+        const std::vector<size_t>& already_exists,
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<uint64_t>>& slice_lengths,
+        const ReplicateConfig& config);
     ErrorCode InitTransferEngine(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
