@@ -15,8 +15,9 @@ from .interface import Storage
 def calc_percentiles(data):
     """Calculate latency percentiles"""
     if not data:
-        return {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
+        return {"avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "p99_ms": 0}
     import statistics
+
     sorted_data = sorted(data)
 
     def get_percentile(p):
@@ -29,10 +30,10 @@ def calc_percentiles(data):
         return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
 
     return {
-        'avg_ms': statistics.mean(data),
-        'p50_ms': get_percentile(50),
-        'p95_ms': get_percentile(95),
-        'p99_ms': get_percentile(99),
+        "avg_ms": statistics.mean(data),
+        "p50_ms": get_percentile(50),
+        "p95_ms": get_percentile(95),
+        "p99_ms": get_percentile(99),
     }
 
 
@@ -51,10 +52,15 @@ class DiskHashTable(Storage):
     This allows simulating large traces with limited storage.
     """
 
-    def __init__(self, storage_dir: str, page_size: int,
-                 max_pages: int = 100000,
-                 file_mode: str = 'single',
-                 fsync_mode: str = 'batch', fsync_batch_size: int = 100):
+    def __init__(
+        self,
+        storage_dir: str,
+        page_size: int,
+        max_pages: int = 100000,
+        file_mode: str = "single",
+        fsync_mode: str = "batch",
+        fsync_batch_size: int = 100,
+    ):
         """Initialize disk hash table
 
         Args:
@@ -78,22 +84,22 @@ class DiskHashTable(Storage):
         self.fsync_batch_size = fsync_batch_size
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.storage_file = self.storage_dir / "data.bin"
-        if self.file_mode == 'single':
+        if self.file_mode == "single":
             self._allocate_file()
         self.fd = None
         self._buffer = os.urandom(page_size)
         self.stats = {
-            'read_count': 0,
-            'write_count': 0,
-            'read_bytes': 0,
-            'write_bytes': 0,
-            'read_latencies_ms': [],
-            'write_latencies_ms': [],
-            'read_time_s': 0.0,
-            'write_time_s': 0.0,
-            'sync_count': 0,
-            'hit': 0,
-            'miss': 0,
+            "read_count": 0,
+            "write_count": 0,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "read_latencies_ms": [],
+            "write_latencies_ms": [],
+            "read_time_s": 0.0,
+            "write_time_s": 0.0,
+            "sync_count": 0,
+            "hit": 0,
+            "miss": 0,
         }
         self._pending_syncs = 0
         self._written_pages: set = set()
@@ -103,30 +109,39 @@ class DiskHashTable(Storage):
         file_size = self.max_pages * self.page_size
         if not self.storage_file.exists():
             print(f"  [Storage] Creating file: {self.storage_file}")
-            print(f"  [Storage] Requested size: {file_size / (1024**3):.2f} GB ({self.max_pages:,} pages × {self.page_size} bytes = {file_size:,} bytes)")
+            print(
+                f"  [Storage] Requested size: {file_size / (1024**3):.2f} GB ({self.max_pages:,} pages × {self.page_size} bytes = {file_size:,} bytes)"
+            )
             # Use fallocate for efficient preallocation (Linux)
             fd = os.open(self.storage_file, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
             try:
                 # Try fallocate first (Linux specific, much faster)
                 try:
                     import fcntl
+
                     fcntl.fallocate(fd, 0, file_size)
                     method = "fallocate"
                 except (ImportError, AttributeError, OSError):
                     # Fallback to seek+write method
                     os.lseek(fd, file_size - 1, os.SEEK_SET)
-                    os.write(fd, b'\0')
+                    os.write(fd, b"\0")
                     os.fsync(fd)
                     method = "seek+write"
             finally:
                 os.close(fd)
-            actual_size = self.storage_file.stat().st_size if self.storage_file.exists() else 0
-            print(f"  [Storage] Pre-allocated {actual_size / (1024**3):.2f} GB using {method}")
+            actual_size = (
+                self.storage_file.stat().st_size if self.storage_file.exists() else 0
+            )
+            print(
+                f"  [Storage] Pre-allocated {actual_size / (1024**3):.2f} GB using {method}"
+            )
         else:
             actual_size = self.storage_file.stat().st_size
             actual_pages = actual_size // self.page_size
             print(f"  [Storage] Reusing existing file: {self.storage_file}")
-            print(f"  [Storage] Current file size: {actual_size / (1024**3):.2f} GB ({actual_pages:,} pages × {self.page_size} bytes = {actual_size:,} bytes)")
+            print(
+                f"  [Storage] Current file size: {actual_size / (1024**3):.2f} GB ({actual_pages:,} pages × {self.page_size} bytes = {actual_size:,} bytes)"
+            )
 
     def _get_fd(self):
         if self.fd is None:
@@ -135,7 +150,9 @@ class DiskHashTable(Storage):
             if self.storage_file.exists():
                 actual_size = self.storage_file.stat().st_size
                 actual_pages = actual_size // self.page_size
-                print(f"  [Storage] File size: {actual_size / (1024**3):.2f} GB ({actual_pages:,} pages × {self.page_size} bytes = {actual_size:,} bytes)")
+                print(
+                    f"  [Storage] File size: {actual_size / (1024**3):.2f} GB ({actual_pages:,} pages × {self.page_size} bytes = {actual_size:,} bytes)"
+                )
         return self.fd
 
     # ========================================================================
@@ -165,7 +182,7 @@ class DiskHashTable(Storage):
                   write replaces the whole file.
         """
         physical_page_id = self._map_page_id(page_id)
-        if self.file_mode == 'per-file':
+        if self.file_mode == "per-file":
             path = self.storage_dir / f"page_{physical_page_id}.bin"
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC if write else os.O_RDONLY
             return os.open(str(path), flags, 0o644), 0, True
@@ -187,9 +204,13 @@ class DiskHashTable(Storage):
 
         # Validate parameters
         if offset_in_page < 0 or offset_in_page >= self.page_size:
-            raise ValueError(f"offset_in_page {offset_in_page} out of range [0, {self.page_size})")
+            raise ValueError(
+                f"offset_in_page {offset_in_page} out of range [0, {self.page_size})"
+            )
         if length <= 0 or offset_in_page + length > self.page_size:
-            raise ValueError(f"length {length} invalid with offset_in_page {offset_in_page} (page_size={self.page_size})")
+            raise ValueError(
+                f"length {length} invalid with offset_in_page {offset_in_page} (page_size={self.page_size})"
+            )
 
         start = time.perf_counter()
         fd = None
@@ -202,11 +223,11 @@ class DiskHashTable(Storage):
                 os.close(close_fd)
 
             latency = (time.perf_counter() - start) * 1000.0
-            self.stats['read_count'] += 1
-            self.stats['read_bytes'] += length
-            self.stats['read_latencies_ms'].append(latency)
-            self.stats['read_time_s'] += latency / 1000.0
-            self.stats['hit'] += 1
+            self.stats["read_count"] += 1
+            self.stats["read_bytes"] += length
+            self.stats["read_latencies_ms"].append(latency)
+            self.stats["read_time_s"] += latency / 1000.0
+            self.stats["hit"] += 1
             return latency
         except OSError as e:
             print(f"Read error (page_id={page_id}): {e}")
@@ -234,9 +255,13 @@ class DiskHashTable(Storage):
 
         # Validate parameters
         if offset_in_page < 0 or offset_in_page >= self.page_size:
-            raise ValueError(f"offset_in_page {offset_in_page} out of range [0, {self.page_size})")
+            raise ValueError(
+                f"offset_in_page {offset_in_page} out of range [0, {self.page_size})"
+            )
         if length <= 0 or offset_in_page + length > self.page_size:
-            raise ValueError(f"length {length} invalid with offset_in_page {offset_in_page} (page_size={self.page_size})")
+            raise ValueError(
+                f"length {length} invalid with offset_in_page {offset_in_page} (page_size={self.page_size})"
+            )
 
         start = time.perf_counter()
         fd = None
@@ -248,34 +273,36 @@ class DiskHashTable(Storage):
             write_done = time.perf_counter()
 
             # Fsync
-            if self.fsync_mode == 'always':
+            if self.fsync_mode == "always":
                 os.fsync(fd)
-                self.stats['sync_count'] += 1
+                self.stats["sync_count"] += 1
                 self._pending_syncs = 0
-            elif self.fsync_mode == 'batch':
+            elif self.fsync_mode == "batch":
                 self._pending_syncs += 1
                 if self._pending_syncs >= self.fsync_batch_size:
                     os.fsync(fd)
-                    self.stats['sync_count'] += 1
+                    self.stats["sync_count"] += 1
                     self._pending_syncs = 0
             if owned:
                 close_fd, fd = fd, None
                 os.close(close_fd)
 
-            if self.fsync_mode == 'always' or owned:
+            if self.fsync_mode == "always" or owned:
                 latency = (time.perf_counter() - start) * 1000.0
             else:
                 latency = (write_done - start) * 1000.0
 
             self._written_pages.add(page_id)
-            self.stats['write_count'] += 1
-            self.stats['write_bytes'] += length
-            self.stats['write_latencies_ms'].append(latency)
-            self.stats['write_time_s'] += latency / 1000.0
-            self.stats['miss'] += 1
+            self.stats["write_count"] += 1
+            self.stats["write_bytes"] += length
+            self.stats["write_latencies_ms"].append(latency)
+            self.stats["write_time_s"] += latency / 1000.0
+            self.stats["miss"] += 1
             return latency
         except OSError as e:
-            print(f"Write error (page_id={page_id}, offset_in_page={offset_in_page}, length={length}): {e}")
+            print(
+                f"Write error (page_id={page_id}, offset_in_page={offset_in_page}, length={length}): {e}"
+            )
             return None
         finally:
             if owned and fd is not None:
@@ -317,30 +344,30 @@ class DiskHashTable(Storage):
 
         def calc_stats(latencies):
             if not latencies:
-                return {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
+                return {"avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "p99_ms": 0}
             return {
-                'avg_ms': statistics.mean(latencies),
+                "avg_ms": statistics.mean(latencies),
                 **calc_percentiles(latencies),
             }
 
         return {
-            'read': {
-                'count': self.stats['read_count'],
-                'mb': self.stats['read_bytes'] / 1024 / 1024,
-                'time_s': self.stats['read_time_s'],
-                **calc_stats(self.stats['read_latencies_ms'])
+            "read": {
+                "count": self.stats["read_count"],
+                "mb": self.stats["read_bytes"] / 1024 / 1024,
+                "time_s": self.stats["read_time_s"],
+                **calc_stats(self.stats["read_latencies_ms"]),
             },
-            'write': {
-                'count': self.stats['write_count'],
-                'mb': self.stats['write_bytes'] / 1024 / 1024,
-                'time_s': self.stats['write_time_s'],
-                **calc_stats(self.stats['write_latencies_ms'])
+            "write": {
+                "count": self.stats["write_count"],
+                "mb": self.stats["write_bytes"] / 1024 / 1024,
+                "time_s": self.stats["write_time_s"],
+                **calc_stats(self.stats["write_latencies_ms"]),
             },
-            'sync_count': self.stats['sync_count'],
-            'max_pages': self.max_pages,
-            'written_pages': len(self._written_pages),
-            'page_hits': self.stats['hit'],
-            'page_misses': self.stats['miss'],
+            "sync_count": self.stats["sync_count"],
+            "max_pages": self.max_pages,
+            "written_pages": len(self._written_pages),
+            "page_hits": self.stats["hit"],
+            "page_misses": self.stats["miss"],
         }
 
     # ========================================================================
@@ -349,11 +376,11 @@ class DiskHashTable(Storage):
 
     def close(self, force_sync: bool = True):
         """Close file"""
-        if force_sync and self.fsync_mode in ['end', 'batch']:
+        if force_sync and self.fsync_mode in ["end", "batch"]:
             if self.fd is not None:
                 try:
                     os.fsync(self.fd)
-                    self.stats['sync_count'] += 1
+                    self.stats["sync_count"] += 1
                 except OSError:
                     pass
 
