@@ -599,19 +599,18 @@ TEST(UbNativeDataPathTest,
     ASSERT_TRUE(buffers.addBuffer(recovered_desc, options).ok());
 
     SegmentManager manager(std::make_unique<NullRegistry>());
-    ASSERT_TRUE(manager
-                    .updateLocal([&](SegmentDesc& segment) {
-                        segment.name = "local";
-                        segment.type = SegmentType::Memory;
-                        segment.detail = MemorySegmentDesc{};
-                        auto& memory =
-                            std::get<MemorySegmentDesc>(segment.detail);
-                        memory.topology = *topology;
-                        memory.buffers = {source_desc, target_desc,
-                                          recovered_desc};
-                        return Status::OK();
-                    })
-                    .ok());
+    ASSERT_TRUE(
+        manager
+            .updateLocal([&](SegmentDesc& segment) {
+                segment.name = "local";
+                segment.type = SegmentType::Memory;
+                segment.detail = MemorySegmentDesc{};
+                auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                memory.topology = *topology;
+                memory.buffers = {source_desc, target_desc, recovered_desc};
+                return Status::OK();
+            })
+            .ok());
 
     EndpointStore endpoints(adapter, 16, 1);
     RailMonitor rails;
@@ -708,8 +707,7 @@ TEST(UbNativeDataPathTest,
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     EXPECT_EQ(followup_task->transferStatus().s, COMPLETED);
-    EXPECT_EQ(followup_task->transferStatus().transferred_bytes,
-              source.size());
+    EXPECT_EQ(followup_task->transferStatus().transferred_bytes, source.size());
     EXPECT_EQ(recovered, source);
 
     EXPECT_TRUE(workers.stop().ok());
