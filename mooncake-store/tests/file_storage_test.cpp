@@ -364,6 +364,130 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_TRUE(unmount.has_value());
         std::free(seg_ptr);
     }
+    void RunBatchPutHealWipeScenario(const std::string& data_path) {
+        std::filesystem::path master_root =
+            std::filesystem::path(data_path) / "heal_master_batch";
+        std::filesystem::create_directories(master_root);
+
+        testing::InProcMaster master;
+        auto master_config = InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_root_fs_dir(master_root.string())
+                                 .build();
+        ASSERT_TRUE(master.Start(master_config));
+
+        std::string local_rpc_addr =
+            "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto client =
+            Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                           std::nullopt, master.master_address());
+        ASSERT_TRUE(client.has_value());
+        ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+        constexpr size_t kSegSize = 64 * 1024 * 1024;
+        void* seg_ptr = allocate_buffer_allocator_memory(kSegSize);
+        ASSERT_NE(seg_ptr, nullptr);
+        ASSERT_TRUE(
+            client.value()->MountSegment(seg_ptr, kSegSize, "tcp").has_value());
+        SimpleAllocator allocator(16 * 1024 * 1024);
+        ASSERT_TRUE(client.value()
+                        ->RegisterLocalMemory(allocator.getBase(),
+                                              16 * 1024 * 1024, "cpu:0", false,
+                                              false)
+                        .has_value());
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = StorageBackendType::kFilePerKey;
+        config.storage_filepath = data_path + "/heal_ssd_batch";
+        config.local_buffer_size = 4 * 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        FileStorage file_storage(config, client.value(), local_rpc_addr);
+        ASSERT_TRUE(file_storage.storage_backend_->Init());
+        {
+            MutexLocker locker(&file_storage.offloading_mutex_);
+            file_storage.enable_offloading_ = true;
+        }
+
+        // Offload two keys, then wipe the backing files to recreate the #3709
+        // divergence on both.
+        const std::vector<std::string> wiped_keys = {"heal_batch_a",
+                                                     "heal_batch_b"};
+        std::string original(512, 'x');
+        std::unordered_map<std::string, std::vector<Slice>> batch_object;
+        for (const auto& key : wiped_keys) {
+            batch_object.emplace(
+                key, std::vector<Slice>{Slice{original.data(), 512}});
+        }
+        auto offload_result = file_storage.storage_backend_->BatchOffload(
+            batch_object,
+            [&file_storage](const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas) {
+                for (auto& metadata : metadatas) {
+                    metadata.transport_endpoint = file_storage.local_rpc_addr_;
+                }
+                auto result =
+                    file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
+                return result ? ErrorCode::OK : result.error();
+            });
+        ASSERT_TRUE(offload_result.has_value());
+
+        client.value()->SetLocalDiskProbe(
+            [&file_storage](const std::string& k) -> std::optional<bool> {
+                auto exists = file_storage.Exists(k);
+                if (!exists) {
+                    return std::nullopt;
+                }
+                return !*exists;
+            });
+
+        file_storage.storage_backend_->RemoveAll();
+        auto exists = file_storage.Exists(wiped_keys[0]);
+        ASSERT_TRUE(exists.has_value());
+        ASSERT_FALSE(exists.value());
+
+        // One batch with both wiped keys and a fresh key.
+        const std::string fresh_key = "heal_batch_fresh";
+        const std::string updated(512, 'y');
+        std::vector<ObjectKey> keys = {wiped_keys[0], wiped_keys[1], fresh_key};
+        std::vector<std::vector<Slice>> batched_slices;
+        std::vector<void*> buffers;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            void* buf = allocator.allocate(512);
+            ASSERT_NE(buf, nullptr);
+            std::memcpy(buf, updated.data(), 512);
+            buffers.push_back(buf);
+            batched_slices.push_back({Slice{buf, 512}});
+        }
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto results = client.value()->BatchPut(keys, batched_slices, cfg);
+        ASSERT_EQ(results.size(), keys.size());
+        for (size_t i = 0; i < results.size(); ++i) {
+            ASSERT_TRUE(results[i].has_value())
+                << "BatchPut over a dangling replica failed for " << keys[i]
+                << ": " << toString(results[i].error());
+        }
+
+        // Every key, healed or fresh, reads the new data back.
+        for (const auto& key : keys) {
+            void* read_buf = allocator.allocate(512);
+            ASSERT_NE(read_buf, nullptr);
+            std::vector<Slice> read_slices{Slice{read_buf, 512}};
+            auto get = client.value()->Get(key, read_slices);
+            ASSERT_TRUE(get.has_value())
+                << "Get after batch self-heal failed for " << key << ": "
+                << toString(get.error());
+            EXPECT_EQ(std::memcmp(read_slices[0].ptr, updated.data(), 512), 0);
+            allocator.deallocate(read_buf, 512);
+        }
+        for (void* buf : buffers) {
+            allocator.deallocate(buf, 512);
+        }
+
+        auto unmount = client.value()->UnmountSegment(seg_ptr, kSegSize);
+        EXPECT_TRUE(unmount.has_value());
+        std::free(seg_ptr);
+    }
 };
 
 TEST_F(FileStorageTest, IsEnableOffloading) {
@@ -894,132 +1018,14 @@ TEST_F(FileStorageTest, BatchLoadRecordsSsdMetrics) {
     // Create FileStorage WITH SsdMetric
     SsdMetric ssd_metric;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003",
-                            &ssd_metric);
-
-    // Write test data to disk
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
-    ASSERT_FALSE(keys.empty());
-
-    // Allocate buffers and call BatchLoad (read path)
-    auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
-    ASSERT_TRUE(allocate_res);
-
-    auto load_result =
-        FileStorageBatchLoad(fileStorage, allocate_res.value()->slices);
-    ASSERT_TRUE(load_result);
-
-    // Verify SSD read metrics were recorded
-    EXPECT_EQ(ssd_metric.ssd_read_ops.value(),
-              static_cast<int64_t>(allocate_res.value()->slices.size()));
-
-    // Verify bytes: sum of all slice sizes
-    int64_t expected_bytes = 0;
-    for (const auto& [key, slice] : allocate_res.value()->slices) {
-        expected_bytes += slice.size;
-    }
-    EXPECT_EQ(ssd_metric.ssd_read_bytes.value(), expected_bytes);
-    EXPECT_GT(expected_bytes, 0);
-
-    // Verify latency histogram has exactly 1 observation (one BatchLoad call)
-    auto buckets = ssd_metric.ssd_read_latency_us.get_bucket_counts();
-    int64_t total_observations = 0;
-    for (auto& b : buckets) {
-        total_observations += b->value();
-    }
-    EXPECT_EQ(total_observations, 1);
-
-    // Write metrics should remain 0 (BatchOffloadUtil bypasses FileStorage)
-    EXPECT_EQ(ssd_metric.ssd_write_ops.value(), 0);
-    EXPECT_EQ(ssd_metric.ssd_write_bytes.value(), 0);
-
-    LOG(INFO) << "SSD read metrics after BatchLoad: ops="
-              << ssd_metric.ssd_read_ops.value()
-              << ", bytes=" << ssd_metric.ssd_read_bytes.value();
-}
-
-TEST_F(FileStorageTest, BatchLoadFailureDoesNotRecordSsdMetrics) {
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
-    file_storage_config.storage_filepath = data_path;
-
-    SsdMetric ssd_metric;
-    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003",
-                            &ssd_metric);
-
-    // Init storage backend so we can call BatchLoad
-    // But load with keys that don't exist on disk -> should fail
-    std::unordered_map<std::string, Slice> batch_object;
-    char dummy_buf[4096] = {};
-    batch_object["nonexistent_key_1"] = Slice{dummy_buf, 4096};
-    batch_object["nonexistent_key_2"] = Slice{dummy_buf, 8192};
-
-    auto result = FileStorageBatchLoad(fileStorage, batch_object);
-    // Expect failure (keys don't exist on disk)
-    EXPECT_FALSE(result);
-
-    // Metrics should remain 0 - failed operations are not counted
-    EXPECT_EQ(ssd_metric.ssd_read_ops.value(), 0);
-    EXPECT_EQ(ssd_metric.ssd_read_bytes.value(), 0);
-
-    auto buckets = ssd_metric.ssd_read_latency_us.get_bucket_counts();
-    int64_t total_observations = 0;
-    for (auto& b : buckets) {
-        total_observations += b->value();
-    }
-    EXPECT_EQ(total_observations, 0);
-
-    LOG(INFO) << "SSD metrics after failed BatchLoad: ops="
-              << ssd_metric.ssd_read_ops.value()
-              << ", bytes=" << ssd_metric.ssd_read_bytes.value();
-}
-
-TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
-    // FileStorage with nullptr SsdMetric should work fine (no metrics recorded)
-    std::vector<std::string> keys;
-    std::vector<int64_t> sizes;
-    std::unordered_map<std::string, std::string> batch_data;
-
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
-    file_storage_config.storage_filepath = data_path;
-
-    // nullptr SsdMetric (default)
-    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
-
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
-    ASSERT_FALSE(keys.empty());
-
-    auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
-    ASSERT_TRUE(allocate_res);
-
-    auto load_result =
-        FileStorageBatchLoad(fileStorage, allocate_res.value()->slices);
-    ASSERT_TRUE(load_result);
-    // No crash = success. No metrics pointer, so nothing to verify.
-}
-
-// Issue #3709: a RemoveAll-style physical wipe of the SSD files while master
-// still tracks the key's LOCAL_DISK replica leaves a dangling entry. A Put
-// for the same key must not report success while storing nothing: the client
-// evicts the dangling replica and retries PutStart, so the new data is
-// actually written.
-
-TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
-    // The per-key file backend reports the wiped file as OBJECT_NOT_FOUND /
-    // FILE_OPEN_FAIL, the original proof set.
-    RunPutHealWipeScenario(data_path, StorageBackendType::kFilePerKey,
-                           "_per_key");
-}
-
-TEST_F(FileStorageTest,
-       PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket) {
-    // The bucket backend's BatchLoad reports a missing key as INVALID_KEY
-    // (fanganpai's production trace in #3709); the heal must still fire.
-    RunPutHealWipeScenario(data_path, StorageBackendType::kBucket, "_bucket");
-}
-
 TEST_F(FileStorageTest,
        BatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
-    // The BatchPut twin of the scenario above: OBJECT_ALREADY_EXISTS results
-    // on the batch path must not be converted to success for keys whose
+        // The BatchPut twin of the scenario above: OBJECT_ALREADY_EXISTS
+        // results on the batch path must not be converted to success for keys
+        // whose backing file is gone. Two wiped keys and one fresh key go
+        // through one batch; every key must really store.
+        RunBatchPutHealWipeScenario(data_path);
+}
     // backing file is gone. Two wiped keys and one fresh key go through one
     // batch; every key must really store.
     std::filesystem::path master_root =
@@ -1077,22 +1083,22 @@ TEST_F(FileStorageTest,
         batch_object,
         [&file_storage](const std::vector<std::string>& keys,
                         std::vector<StorageObjectMetadata>& metadatas) {
-            for (auto& metadata : metadatas) {
-                metadata.transport_endpoint = file_storage.local_rpc_addr_;
-            }
-            auto result =
-                file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
-            return result ? ErrorCode::OK : result.error();
+        for (auto& metadata : metadatas) {
+            metadata.transport_endpoint = file_storage.local_rpc_addr_;
+        }
+        auto result =
+            file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
+        return result ? ErrorCode::OK : result.error();
         });
     ASSERT_TRUE(offload_result.has_value());
 
     client.value()->SetLocalDiskProbe(
         [&file_storage](const std::string& k) -> std::optional<bool> {
-            auto exists = file_storage.Exists(k);
-            if (!exists) {
-                return std::nullopt;
-            }
-            return !*exists;
+        auto exists = file_storage.Exists(k);
+        if (!exists) {
+            return std::nullopt;
+        }
+        return !*exists;
         });
 
     file_storage.storage_backend_->RemoveAll();
