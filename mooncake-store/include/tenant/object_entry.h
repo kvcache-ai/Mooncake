@@ -1,20 +1,11 @@
 #pragma once
 
-// ObjectEntry: the tenant-scoped, per-object unit that consolidates the per-key
-// runtime task state that today lives as N separate TenantState maps keyed by the
-// same string. MasterService's redundant per-key maps (replication_tasks,
-// offloading_tasks, promotion_tasks, promotion_candidates,
-// dynamic_replication_pending/leases/cooldowns, processing_keys) collapse into
-// this single record.
-//
-// It is deliberately pointer/value friendly and self-contained: the host still
-// owns ObjectMetadata (the cache/data envelope) alongside it; the metadata
-// envelope is wired in by the caller. The per-object mutex is the mutation
-// boundary.
-//
-// NOTE: reuse of the shared task types (mooncake::ReplicationTask, ...) means
-// this type and MasterService now share a single authoritative definition of the
-// per-key state, rather than duplicating it.
+// ObjectEntry: the per-object unit that consolidates the per-key runtime task
+// state that previously lived as N separate MasterService TenantState maps
+// keyed by the same string. The host still owns ObjectMetadata (the cache/data
+// envelope), wired in by the caller; the per-object mutex is the mutation
+// boundary. Reusing the shared task types avoids a duplicate authoritative
+// definition of the per-key state.
 
 #include <chrono>
 #include <memory>
@@ -60,7 +51,7 @@ class ObjectEntry {
     }
     bool IsGrouped() const { return !group_id_.empty(); }
 
-    // ---- per-key runtime task state (consolidated) ----
+    // Per-key runtime task state.
     bool is_processing{false};
     std::optional<ReplicationTask> replication_task;
     std::optional<OffloadingTask> offloading_task;
@@ -75,12 +66,10 @@ class ObjectEntry {
     // hold after pinning this entry.
     mutable std::shared_mutex mutex;
 
-    // ---- metadata envelope (cache/data) ----
-    // ObjectMetadata is NON-movable / NON-copyable and self-locking, so it is
-    // owned through a pointer here. A live routed object has metadata wired in;
-    // an entry that has not yet materialized metadata (e.g. during teardown, or
-    // a module-level unit test that only exercises task state) has a null
-    // metadata_ and must not be handed out for object work.
+    // Metadata is NON-movable / NON-copyable and self-locking, so it is owned
+    // through a pointer here. A live routed object has metadata wired in; an
+    // entry that has not yet materialized metadata (teardown, or a module-level
+    // unit test exercising only task state) has a null metadata_.
     ObjectMetadata* metadata() const { return metadata_.get(); }
     bool has_metadata() const { return metadata_ != nullptr; }
 

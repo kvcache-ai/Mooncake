@@ -101,9 +101,8 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService::MetadataAccessorRO accessor(
             service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                    .user_key = key});
-        const auto* tenant_state = accessor.GetTenantState();
-        return tenant_state != nullptr &&
-               tenant_state->promotion_tasks.contains(key);
+        auto entry = accessor.GetEntry();
+        return entry != nullptr && entry->promotion_task.has_value();
     }
 
     // std::nullopt when the key has no in-flight promotion task.
@@ -113,15 +112,11 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService::MetadataAccessorRO accessor(
             service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                    .user_key = key});
-        const auto* tenant_state = accessor.GetTenantState();
-        if (tenant_state == nullptr) {
+        auto entry = accessor.GetEntry();
+        if (!entry || !entry->promotion_task.has_value()) {
             return std::nullopt;
         }
-        auto it = tenant_state->promotion_tasks.find(key);
-        if (it == tenant_state->promotion_tasks.end()) {
-            return std::nullopt;
-        }
-        return it->second.execution_failures;
+        return entry->promotion_task->execution_failures;
     }
 
     static bool PromotionAdmissionBlockedByPrimaryWriteForTesting(
@@ -130,7 +125,7 @@ class PromotionOnHitTest : public ::testing::Test {
         const auto result =
             service->TryPushPromotionQueue(MasterService::ObjectIdentity{
                 .tenant_id = tenant_id, .user_key = key});
-        return result == MasterService::PromotionQueueResult::kAlreadyInFlight;
+        return result == PromotionQueueResult::kAlreadyInFlight;
     }
 
     static void MarkReplicaCompleteForTesting(MasterService* service,

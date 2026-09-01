@@ -75,17 +75,16 @@ TEST(TenantContainerTest, RecreatedTenantHasFreshStore) {
     EXPECT_EQ(fresh->GroupCount(), 0u);
 }
 
-TEST(TenantContainerTest, PerTenantStoreCarriesRouteGroupsQuotaAndLeases) {
+TEST(TenantContainerTest, PerTenantStoreCarriesRouteGroupsAndLeases) {
     TenantStorage dir;
     const TenantId tenant("tenant-a");
 
     // A fully-populated per-tenant container: object route + flat group + the
-    // tenant-scoped bookkeeping that does NOT fold into ObjectEntry.
+    // tenant-scoped bookkeeping that does NOT fold into ObjectEntry. Quota and
+    // disk-object counts live in MasterService::TenantState, not here.
     auto store = std::make_shared<TenantStore>();
     store->InsertObject("k1", std::make_shared<ObjectEntry>("k1", "g1"));
     store->InsertObject("k2", std::make_shared<ObjectEntry>("k2", ""));
-    store->quota_account = nullptr;
-    store->disk_object_count = 1;
     store->dynamic_replication_leases[UUID{1, 2}] = ReplicaActionLease{};
     EXPECT_FALSE(store->Empty());
     EXPECT_EQ(store->ObjectCount(), 2u);
@@ -98,7 +97,6 @@ TEST(TenantContainerTest, PerTenantStoreCarriesRouteGroupsQuotaAndLeases) {
     ASSERT_NE(found, nullptr);
     EXPECT_EQ(found->ObjectCount(), 2u);
     EXPECT_EQ(found->GroupCount(), 1u);
-    EXPECT_EQ(found->disk_object_count, 1);
 
     // A sibling tenant stays isolated.
     dir.Upsert(TenantId("tenant-b"), std::make_shared<TenantStore>());

@@ -14,15 +14,12 @@ namespace tenant {
 // that tenant's store.
 //
 // WHY COW: tenants are read-many / write-few. Every object operation resolves
-// its tenant on the hot read path, so the directory read must be lock-free. A
-// reader performs one atomic load of an immutable snapshot, then one unordered
-// map find, and never touches a register/erase lock.
-//
-// Writes (tenant create/remove) are rare: they serialize on a private write
-// mutex, copy the snapshot, apply the delta, and publish a new snapshot
-// atomically. In-flight readers hold a strong std::shared_ptr to the snapshot
-// they loaded, so a concurrent publish never invalidates them and never causes
-// a use-after-free.
+// its tenant on the hot read path, so a read must be lock-free: one atomic load
+// of an immutable snapshot, then one unordered map find. Writes (tenant
+// create/remove) are rare — they serialize on a private mutex, copy the
+// snapshot, apply the delta, and publish a new snapshot atomically. In-flight
+// readers hold a strong shared_ptr to the snapshot they loaded, so a concurrent
+// publish never invalidates them.
 //
 // `Handle` is expected to behave like std::shared_ptr (owning, default-
 // constructible to "absent", async-callback-safe). The directory never owns or
@@ -94,17 +91,9 @@ class TenantDirectory {
     }
 
  private:
-    // NOTE: GCC 11's libstdc++ does not provide the C++20
-    // std::atomic<std::shared_ptr<T>> specialization (it static-asserts that
-    // std::atomic requires a trivially copyable type), so we use the portable
-    // free functions std::atomic_load_explicit / std::atomic_store_explicit on a
-    // plain std::shared_ptr. The read path stays lock-free.
-    //
-    // The frame is stored as non-const only so the atomic_store_explicit
-    // template deduction matches. The directory is a strict copy-on-write
-    // container: a published frame is never mutated in place (every write
-    // copies), so the pointee is effectively immutable and safe for lock-free
-    // readers.
+    // GCC 11's libstdc++ lacks the C++20 std::atomic<std::shared_ptr<T>>
+    // specialization, so use the portable free functions on a plain
+    // std::shared_ptr. The read path stays lock-free.
     std::shared_ptr<Frame> snapshot_{std::make_shared<Frame>()};
     // Serializes the rare create/remove writes; never taken on the read path.
     mutable std::mutex write_mutex_;

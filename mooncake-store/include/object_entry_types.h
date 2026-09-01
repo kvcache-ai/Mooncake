@@ -94,23 +94,13 @@ struct PromotionCandidate {
     uint32_t execution_failures{0};
 };
 
-// NotifyPromotionSuccess should commit, so a concurrent Put on the
-// same key cannot be confused with ours. 0 until
-// PromotionAllocStart records the new replica.
-//
-// start_time is the reaper deadline anchor. Set at task admission
-// and reset at PromotionAllocStart so each phase (queue-wait and
-// active-transfer) gets its own full put_start_release_timeout_sec_
-// window. Without the reset a backlogged task could enter active
-// transfer with little TTL left, and the reaper could free the
-// staged replica via EraseReplicaByID mid-RDMA-write.
-//
-// holder_id is the client owning the source LOCAL_DISK segment and
-// the only one authorized to commit (NotifyPromotionSuccess) or
-// abort (NotifyPromotionFailure) the task. Without it, any client
-// knowing the key could flip the staged PROCESSING replica to
-// COMPLETE before the holder's RDMA write landed, exposing torn
-// data to readers.
+// alloc_id is the new MEMORY replica staged by AllocStart; NotifyPromotionSuccess
+// commits it so a concurrent Put on the same key cannot be confused with ours.
+// start_time anchors the reaper deadline and is reset at AllocStart so each
+// phase (queue-wait and active transfer) gets its own full timeout window.
+// holder_id is the only client authorized to commit/abort the task (the source
+// LOCAL_DISK owner); without it another client could flip the staged PROCESSING
+// replica to COMPLETE before the holder's RDMA write landed.
 struct PromotionTask {
     ReplicaID source_id;    // the LOCAL_DISK replica being promoted
     ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart

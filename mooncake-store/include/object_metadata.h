@@ -334,14 +334,26 @@ class ObjectMetadata {
         lease_->GrantReadLease(ttl);
     }
 
-    // Whether the authoritative lease needs a refresh.
+    // Replace the lease (used to point a grouped object at the group's shared
+    // Lease). Takes the same lock as the other lease accessors.
+    void SetLease(std::shared_ptr<Lease> lease) const {
+        SpinLocker locker(&lock);
+        lease_ = std::move(lease);
+    }
+
+    // Extend the lease deadline (restore path). Locked like the other accessors.
+    void ExtendLeaseDeadline(std::chrono::system_clock::time_point deadline)
+        const {
+        SpinLocker locker(&lock);
+        lease_->ExtendTo(deadline);
+    }
+
     bool NeedsReadLeaseRefresh(std::chrono::milliseconds ttl) const {
         SpinLocker locker(&lock);
         const auto now = std::chrono::system_clock::now();
         return lease_->ExpiresAt() <= now + ttl / 2;
     }
 
-    // Whether the authoritative lease is expired.
     bool IsLeaseExpired() const {
         SpinLocker locker(&lock);
         return lease_->IsExpired(std::chrono::system_clock::now());
@@ -354,6 +366,7 @@ class ObjectMetadata {
 
     // Lease deadline for the eviction census.
     std::chrono::system_clock::time_point EvictionDeadline() const {
+        SpinLocker locker(&lock);
         return lease_->ExpiresAt();
     }
 
@@ -516,9 +529,7 @@ class ObjectMetadata {
 
     bool IsGrouped() const { return !group_id.empty(); }
 
-    // Check if the metadata is valid
-    // Valid means it has at least one valid replica and size is greater
-    // than 0
+    // Valid: >0 size and at least one valid replica.
     bool IsValid() const {
         return size > 0 && HasReplica([](const Replica& replica) {
                    return !replica.is_memory_replica() ||

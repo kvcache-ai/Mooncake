@@ -14,9 +14,9 @@
 #include "lease.h"
 #include "object_entry.h"
 #include "tenant_id.h"
-#include "tenant_quota.h"
 
 namespace mooncake {
+class MasterService;  // friend for the test-only route-lock seam below
 namespace tenant {
 
 // A group is not a container of objects: it is a thin membership table plus a
@@ -104,77 +104,60 @@ class TenantStore {
         return it->second.lease != nullptr && it->second.lease->IsExpired(now);
     }
 
-    // ----- Object route: the tenant-local container of its objects -----
-    // Objects are routed by their own key (independent of group membership).
-    // The route is a flat map key -> strong ObjectEntry handle, sharded across
-    // kRouteShards per-shard locks so unrelated keys never contend on one mutex.
-    // Read pins the entry under the owning shard's shared lock (fast), releases
-    // it, then takes the per-object lock; the strong handle keeps the entry
-    // alive across that handoff.
+    // The object route is a flat map key -> strong ObjectEntry handle. Read
+    // pins the entry under the shared route lock (fast), releases it, then takes
+    // the per-object lock; the strong handle keeps the entry alive across that
+    // handoff.
     std::shared_ptr<ObjectEntry> Pin(const std::string& key) const {
-        const auto& shard = route_shards_[RouteShardIndex(key)];
-        std::shared_lock<std::shared_mutex> lock(shard.route_lock_);
-        auto it = shard.route_.find(key);
-        return it == shard.route_.end() ? nullptr : it->second;
+        std::shared_lock<std::shared_mutex> lock(route_lock_);
+        auto it = route_.find(key);
+        return it == route_.end() ? nullptr : it->second;
     }
 
     // Insert a NEW entry under this tenant. Returns false if a key already
     // exists (caller re-pins instead). The entry's key() must equal `key`.
     bool Insert(std::string key, std::shared_ptr<ObjectEntry> entry) {
-        auto& shard = route_shards_[RouteShardIndex(key)];
-        std::unique_lock<std::shared_mutex> lock(shard.route_lock_);
-        return shard.route_.emplace(std::move(key), std::move(entry)).second;
+        std::unique_lock<std::shared_mutex> lock(route_lock_);
+        return route_.emplace(std::move(key), std::move(entry)).second;
     }
 
     bool Erase(const std::string& key) {
-        auto& shard = route_shards_[RouteShardIndex(key)];
-        std::unique_lock<std::shared_mutex> lock(shard.route_lock_);
-        return shard.route_.erase(key) > 0;
+        std::unique_lock<std::shared_mutex> lock(route_lock_);
+        return route_.erase(key) > 0;
     }
 
     // Insert an object and, if it has a non-empty group_id, join the group:
     // wire the group's shared Lease into the entry and register it as a member.
-    // Returns false if the key already exists.
+    // Returns false if the key already exists. Group membership is wired and
+    // checked before the object is published, and rolled back if the publish
+    // fails, so a concurrently-pinned entry never observes a non-wired grouped
+    // member or a stale membership entry.
     bool InsertObject(std::string key, std::shared_ptr<ObjectEntry> entry) {
-        if (!Insert(std::move(key), entry)) {
-            return false;
+        const std::string group_id = entry->group_id();
+        if (!group_id.empty()) {
+            entry->set_lease(LeaseFor(group_id));
+            if (!AddMember(group_id, entry->key())) {
+                return false;
+            }
         }
-        if (entry->IsGrouped()) {
-            entry->set_lease(LeaseFor(entry->group_id()));
-            AddMember(entry->group_id(), entry->key());
+        if (!Insert(std::move(key), entry)) {
+            if (!group_id.empty()) {
+                RemoveMember(group_id, entry->key());
+            }
+            return false;
         }
         return true;
     }
 
     bool Contains(const std::string& key) const {
-        const auto& shard = route_shards_[RouteShardIndex(key)];
-        std::shared_lock<std::shared_mutex> lock(shard.route_lock_);
-        return shard.route_.find(key) != shard.route_.end();
+        std::shared_lock<std::shared_mutex> lock(route_lock_);
+        return route_.find(key) != route_.end();
     }
 
     size_t ObjectCount() const {
-        size_t count = 0;
-        for (const auto& shard : route_shards_) {
-            std::shared_lock<std::shared_mutex> lock(shard.route_lock_);
-            count += shard.route_.size();
-        }
-        return count;
+        std::shared_lock<std::shared_mutex> lock(route_lock_);
+        return route_.size();
     }
-
-    // Test-support: hold the owning shard's route lock EXCLUSIVELY so concurrent
-    // Pin/Insert/Erase/Contains on `key` block at that route boundary. Used to
-    // deterministically gate a PutStart inside the snapshot barrier.
-    std::unique_lock<std::shared_mutex> LockRouteShardForTesting(
-        const std::string& key) const {
-        const auto& shard = route_shards_[RouteShardIndex(key)];
-        return std::unique_lock<std::shared_mutex>(shard.route_lock_);
-    }
-
-    // ---- tenant-scoped state that is NOT per-object ----
-    TenantQuotaHandle quota_account{nullptr};
-    // Count of this tenant's objects with at least one completed LOCAL_DISK
-    // replica, used to exclude disk-only objects from the eviction denominator.
-    long disk_object_count{0};
 
     // In-flight dynamic-replication leases are keyed by proposal UUID (not by
     // object key), so they cannot fold into a per-object ObjectEntry. Guard with
@@ -190,35 +173,27 @@ class TenantStore {
         if (!groups_.empty() || !dynamic_replication_leases.empty()) {
             return false;
         }
-        for (const auto& shard : route_shards_) {
-            std::shared_lock<std::shared_mutex> rl(shard.route_lock_);
-            if (!shard.route_.empty()) {
-                return false;
-            }
-        }
-        return true;
+        std::shared_lock<std::shared_mutex> rl(route_lock_);
+        return route_.empty();
     }
 
-    // Visit every live object under this tenant. For each shard we collect that
-    // shard's strong handles under its shared lock, then run the visitor after
-    // releasing it, so the visitor never holds a route shard lock and may
-    // freely re-enter route ops. Processing under each ObjectEntry::mutex is
-    // the caller's responsibility.
+    // Visit every live object under this tenant. Collect the strong handles
+    // under the shared route lock, then run the visitor after releasing it, so
+    // the visitor never holds the route lock and may freely re-enter route ops.
+    // Processing under each ObjectEntry::mutex is the caller's responsibility.
     void VisitObjects(
         const std::function<void(const std::shared_ptr<ObjectEntry>&)>&
             visitor) const {
-        for (const auto& shard : route_shards_) {
-            std::vector<std::shared_ptr<ObjectEntry>> entries;
-            {
-                std::shared_lock<std::shared_mutex> lock(shard.route_lock_);
-                entries.reserve(shard.route_.size());
-                for (const auto& [key, entry] : shard.route_) {
-                    entries.push_back(entry);
-                }
+        std::vector<std::shared_ptr<ObjectEntry>> entries;
+        {
+            std::shared_lock<std::shared_mutex> lock(route_lock_);
+            entries.reserve(route_.size());
+            for (const auto& [key, entry] : route_) {
+                entries.push_back(entry);
             }
-            for (const auto& entry : entries) {
-                visitor(entry);
-            }
+        }
+        for (const auto& entry : entries) {
+            visitor(entry);
         }
     }
 
@@ -236,22 +211,19 @@ class TenantStore {
     }
 
  private:
-    // One route shard: an owning lock + the objects hashed onto it. Keys route
-    // to a shard by hash (RouteShardIndex), so unrelated keys never share a
-    // mutex on the read/pin path.
-    struct RouteShard {
-        mutable std::shared_mutex route_lock_;
-        std::unordered_map<std::string, std::shared_ptr<ObjectEntry>> route_;
-    };
+    friend class ::mooncake::MasterService;
 
-    static constexpr size_t kRouteShards = 256;
-
-    static size_t RouteShardIndex(const std::string& key) {
-        return std::hash<std::string>{}(key) % kRouteShards;
+    // Test-only seam: hold the route lock EXCLUSIVELY so concurrent
+    // Pin/Insert/Erase/Contains block at that boundary. Accessed by MasterService
+    // (which friends TenantStore) for the snapshot-barrier test hook.
+    std::unique_lock<std::shared_mutex> LockRouteForTesting() const {
+        return std::unique_lock<std::shared_mutex>(route_lock_);
     }
 
-    std::vector<RouteShard> route_shards_ =
-        std::vector<RouteShard>(kRouteShards);
+    // Object route: the strong entry handles keyed by object key, guarded by a
+    // single shared_mutex. Per-object mutation is finer-grained (ObjectEntry::mutex).
+    mutable std::shared_mutex route_lock_;
+    std::unordered_map<std::string, std::shared_ptr<ObjectEntry>> route_;
 
     mutable std::shared_mutex groups_lock_;
     std::unordered_map<std::string, GroupState> groups_;

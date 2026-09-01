@@ -177,11 +177,16 @@ class DynamicReplicationTest : public ::testing::Test {
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
         auto& tenant_state = accessor.GetTenantState();
         const bool has_lease = std::any_of(
-            tenant_state.dynamic_replication_leases.begin(),
-            tenant_state.dynamic_replication_leases.end(),
+            tenant_state.object_route.dynamic_replication_leases.begin(),
+            tenant_state.object_route.dynamic_replication_leases.end(),
             [&key](const auto& entry) { return entry.second.key == key; });
-        return tenant_state.dynamic_replication_pending.contains(key) ||
-               tenant_state.dynamic_replication_cooldowns.contains(key) ||
+        auto entry = tenant_state.Pin(key);
+        if (!entry) {
+            return has_lease;
+        }
+        return entry->dynamic_replication_pending.has_value() ||
+               (entry->dynamic_replication_cooldown !=
+                std::chrono::steady_clock::time_point{}) ||
                has_lease;
     }
 
@@ -212,9 +217,13 @@ class DynamicReplicationTest : public ::testing::Test {
 
     void DiscardExpiredProcessingReplicas(MasterService& service,
                                           const std::string& key) const {
-        const size_t shard_idx =
-            service.getShardIndex(TenantId::Default(), key);
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        (void)key;
+        auto tenant_handle =
+            service.tenant_directory_.Lookup(TenantId::Default());
+        if (tenant_handle == nullptr) {
+            return;
+        }
+        MasterService::MetadataShardAccessorRW shard(tenant_handle.get());
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::now() + std::chrono::seconds(1));
     }
@@ -254,9 +263,9 @@ class DynamicReplicationTest : public ::testing::Test {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
         auto& tenant_state = accessor.GetTenantState();
-        auto pending_it = tenant_state.dynamic_replication_pending.find(key);
-        ASSERT_NE(pending_it, tenant_state.dynamic_replication_pending.end());
-        pending_it->second.expire_at_ms_epoch = 1;
+        auto entry = tenant_state.Pin(key);
+        ASSERT_TRUE(entry != nullptr && entry->dynamic_replication_pending);
+        entry->dynamic_replication_pending->expire_at_ms_epoch = 1;
     }
 };
 

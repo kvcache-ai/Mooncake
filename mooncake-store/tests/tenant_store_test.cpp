@@ -131,13 +131,6 @@ TEST(TenantStoreTest, WithObjectScopeRespectsPresenceAndAbsence) {
 TEST(TenantStoreTest, EmptyTracksRouteGroupsAndLeases) {
     TenantStore store;
     EXPECT_TRUE(store.Empty());
-    EXPECT_EQ(store.disk_object_count, 0);
-
-    // quota + disk counters alone do NOT make a tenant non-empty (they are
-    // bookkeeping, not object state).
-    store.quota_account = nullptr;
-    store.disk_object_count = 3;
-    EXPECT_TRUE(store.Empty());
 
     // A routed object makes the container non-empty.
     store.Insert("k1", std::make_shared<ObjectEntry>("k1", ""));
