@@ -34,6 +34,8 @@ class TestPlacementTarget final : public PlacementTarget {
         return buffer;
     }
 
+    bool IsCxl() const noexcept override { return is_cxl_; }
+
    private:
     bool is_cxl_;
     std::string cxl_binding_;
@@ -257,6 +259,24 @@ TEST(ReplicaAllocatorTest, PreferredOnlyRequiresAGroup) {
                           .buffer_descriptor;
     EXPECT_EQ(descriptor.protocol_, "cxl");
     EXPECT_EQ(descriptor.transport_endpoint_, "client-binding");
+}
+
+TEST(ReplicaAllocatorTest, PreferredOnlySkipsNativeTargetsInMixedGroup) {
+    PlacementState state;
+    auto* native = state.Add("mixed", "native");
+    auto* cxl = state.Add("mixed", "global-cxl", 0, true, "client-binding");
+    cxl->SetAlwaysFail();
+
+    ReplicaAllocator allocator(PreferredOnlyPlacementPolicy{});
+    auto request = Request();
+    request.placement.preferred_group = "mixed";
+    auto access = state.Access();
+    auto result = allocator.Allocate(access, request);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(native->allocation_calls(), 0U);
+    EXPECT_GT(cxl->allocation_calls(), 0U);
 }
 
 TEST(ReplicaAllocatorTest, AllocateFromResolvesOneGroup) {

@@ -15,6 +15,7 @@ class PlacementTarget {
     virtual ~PlacementTarget() = default;
 
     virtual std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const = 0;
+    virtual bool IsCxl() const noexcept = 0;
 
     size_t Capacity() const { return allocator_->capacity(); }
     size_t Used() const { return allocator_->size(); }

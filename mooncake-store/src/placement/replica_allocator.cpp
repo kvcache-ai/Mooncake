@@ -61,18 +61,28 @@ PlacementScratch& GetPlacementScratch() {
     return scratch;
 }
 
+template <bool CxlOnly = false>
 std::unique_ptr<AllocatedBuffer> TryAllocateFromGroup(
     const PlacementGroup* group, size_t size) {
     if (!group || group->targets.empty()) {
         return nullptr;
     }
+
+    auto try_target = [size](const PlacementTarget* target) {
+        if constexpr (CxlOnly) {
+            if (!target->IsCxl()) {
+                return std::unique_ptr<AllocatedBuffer>{};
+            }
+        }
+        return target->Allocate(size);
+    };
     if (group->targets.size() == 1) {
-        return group->targets.front()->Allocate(size);
+        return try_target(group->targets.front());
     }
 
     size_t index = randomIndex(group->targets.size());
     for (size_t i = 0; i < group->targets.size(); ++i) {
-        if (auto buffer = group->targets[index]->Allocate(size)) [[likely]] {
+        if (auto buffer = try_target(group->targets[index])) [[likely]] {
             return buffer;
         }
         if (++index == group->targets.size()) {
@@ -169,7 +179,7 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
     if (scratch.excluded.Contains(group)) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
-    auto buffer = TryAllocateFromGroup(group, replicas.size);
+    auto buffer = TryAllocateFromGroup<true>(group, replicas.size);
     if (!buffer) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
