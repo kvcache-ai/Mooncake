@@ -3,6 +3,14 @@
 TEST_CASE_RESULT_PATH="run/logs/$test_case_name"
 docker_exec="docker exec ${CONTAINER_NAME} bash -c"
 
+# TENT runtime toggle for the mooncake transfer engine. The CI wheel
+# (build-wheel-cu13 with use-tent: true) carries both engines: without
+# MC_USE_TENT the facade runs classic, with it the TENT runtime activates.
+# The e2e pipeline runs TWO T-One jobs — classic (this unset/false) and TENT
+# (USE_TENT=true passed via env_info) — so classic regression coverage is
+# preserved while TENT is validated in parallel.
+USE_TENT=${USE_TENT:-false}
+
 setup_directory(){
     local dir_path=$1
     
@@ -136,7 +144,24 @@ docker_launch(){
         echo "ERROR: Failed to install Mooncake dependencies" >&2
         return 1
     fi
-    
+
+    # Fail fast if TENT was requested but the installed engine cannot provide
+    # it: MC_USE_TENT=1 against a classic-only engine.so silently falls back
+    # to classic, which would make the test pass without testing TENT at all.
+    if [ "${USE_TENT}" = "true" ]; then
+        echo "=== Verifying TENT runtime in installed mooncake ==="
+        # python3, not python: the vllm/vllm-openai image ships pip for
+        # python3 without a `python` alias, and the check must run there too.
+        if ! ${docker_exec} "p=\$(python3 -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))'); \
+            strings \$p/engine.so | grep -q MC_USE_TENT && \
+            python3 -c 'import mooncake.engine'"; then
+            echo "ERROR: USE_TENT=true but the installed mooncake wheel lacks the TENT runtime." >&2
+            echo "       The CI wheel must be built with -DUSE_TENT=ON (_build-wheel.yaml use-tent: true)." >&2
+            return 1
+        fi
+        echo "TENT runtime verified."
+    fi
+
     return 0
 }
 
@@ -556,6 +581,15 @@ setup_node_env() {
     local extra_args=""
     extra_args="$extra_args -e NCCL_GIN_TYPE=0 "
     extra_args="$extra_args --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 --device=/dev/infiniband/rdma_cm "
+    if [ "${USE_TENT}" = "true" ]; then
+        # Container-level env: every sglang server (and pytest-spawned server)
+        # inside inherits the TENT runtime. Metrics disabled: all ranks in
+        # this single-container topology inherit one TENT_METRICS_HTTP_PORT,
+        # so only one rank (nondeterministic) would ever expose an endpoint
+        # while the rest degrade to log-only. Re-enable together with the
+        # per-rank port assignment (base + gpu_id) in the sglang integration.
+        extra_args="$extra_args -e MC_USE_TENT=1 -e TENT_METRICS_ENABLED=false"
+    fi
     if [ "${USE_HUGGINGFACE_MIRROR}" = "true" ]; then
         extra_args="$extra_args -e HF_ENDPOINT=${HUGGINGFACE_MIRROR} -e HF_HUB_ENABLE_HF_TRANSFER=1"
     fi

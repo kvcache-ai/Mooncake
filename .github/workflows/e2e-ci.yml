@@ -47,6 +47,21 @@ jobs:
       pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
     secrets: inherit
 
+  # Same wheel and test cases as integration-test, but the T-One containers
+  # activate the TENT runtime (MC_USE_TENT=1) instead of the classic engine.
+  # Runs in parallel so classic regression coverage is preserved while TENT
+  # is validated on its way to becoming the default runtime.
+  integration-test-tent:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-e2e-ci'
+    uses: ./.github/workflows/integration-test.yml
+    with:
+      pr_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
+      pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
+      use-tent: true
+    secrets: inherit
+
   e2e-gate:
     name: E2E Gate
     if: >
@@ -56,6 +71,7 @@ jobs:
     needs:
       - ascend-test
       - integration-test
+      - integration-test-tent
     runs-on: ubuntu-latest
     steps:
       - name: Check E2E results
