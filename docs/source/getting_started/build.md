@@ -13,7 +13,7 @@ This document describes how to build Mooncake.
 
 Install common build dependencies first. A stable Internet connection is
 required because the script installs system packages, initializes submodules,
-installs Go, and builds/installs yalantinglibs.
+and installs Go.
 
 ```bash
 sudo bash dependencies.sh
@@ -253,7 +253,7 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_STORE=ON/OFF` | `ON` | Build the Mooncake Store component. |
 | `-DWITH_STORE_GO=ON/OFF` | `OFF` | Build Go bindings for Mooncake Store when `-DWITH_STORE=ON`. |
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
-| `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust interface and sample code. |
+| `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust library (`transfer_engine_rust`), tests, and sample benchmark. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
 | `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.13.0"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
 

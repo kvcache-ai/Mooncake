@@ -623,6 +623,132 @@ TEST_F(MetricsRecordingTest, FailoverResubmitSyncFailureRecordsBothAttempts) {
 }
 
 // ---------------------------------------------------------------------------
+// Submit-stage failover: the primary transport fails synchronously inside
+// submitTransferTasks() and the engine recovers on the secondary. The
+// failover counter must advance and the logical completion must be attributed
+// to the transport that completed the request.
+// ---------------------------------------------------------------------------
+TEST_F(MetricsRecordingTest, SubmitStageFailoverRecordsFailoverAndCompletion) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, /*force_fail=*/false, /*force_submit_fail=*/true);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP, /*force_fail=*/false);
+    installFakeRdma(engine, fake_rdma);
+    installFakeTcp(engine, fake_tcp);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xB7);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0),
+              TransferStatusEnum::COMPLETED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    // Two attempts: RDMA failed synchronously, TCP completed.
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              2);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              1);
+    const std::string rdma_attempt_failures =
+        "tent_transport_attempt_failures_total{transport=\"rdma\",operation="
+        "\"write\"}";
+    EXPECT_EQ(after.series(rdma_attempt_failures) -
+                  before.series(rdma_attempt_failures),
+              1);
+
+    // Exactly one cross-transport failover event rdma -> tcp.
+    const std::string failover =
+        "tent_transport_failover_total{from=\"rdma\",to=\"tcp\"}";
+    EXPECT_EQ(after.series(failover) - before.series(failover), 1);
+
+    // The logical write completed on the fallback transport, attributed to
+    // TCP rather than the failed primary.
+    const std::string tcp_writes =
+        "tent_write_requests_total{transport=\"tcp\"}";
+    EXPECT_EQ(after.series(tcp_writes) - before.series(tcp_writes), 1);
+    EXPECT_EQ(after.counter("tent_write_failures_total") -
+                  before.counter("tent_write_failures_total"),
+              0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
+// Submit-stage failover exhaustion: every candidate transport rejects the
+// submit synchronously. The terminal failure must be attributed to a real
+// transport (the last one attempted), never to "unspec".
+// ---------------------------------------------------------------------------
+TEST_F(MetricsRecordingTest, SubmitStageExhaustionAttributesToRealTransport) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, /*force_fail=*/false, /*force_submit_fail=*/true);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP, /*force_fail=*/false,
+                                                    /*force_submit_fail=*/true);
+    installFakeRdma(engine, fake_rdma);
+    installFakeTcp(engine, fake_tcp);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0x6D);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              2);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              2);
+
+    // The terminal write failure is attributed to the last attempted
+    // transport (tcp), NOT to "unspec".
+    const std::string tcp_write_failures =
+        "tent_write_failures_total{transport=\"tcp\"}";
+    const std::string unspec_write_failures =
+        "tent_write_failures_total{transport=\"unspec\"}";
+    EXPECT_EQ(
+        after.series(tcp_write_failures) - before.series(tcp_write_failures),
+        1);
+    EXPECT_EQ(after.series(unspec_write_failures) -
+                  before.series(unspec_write_failures),
+              0);
+    EXPECT_EQ(after.counter("tent_write_requests_total") -
+                  before.counter("tent_write_requests_total"),
+              1);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
 // Failed transfer increments failures and requests but NOT bytes or size
 // histogram. Uses the direct API so the assertion is deterministic and does
 // not depend on engine failover behavior.
@@ -706,6 +832,73 @@ TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordsSeparateCounter) {
         << "infeasible deadline must not pollute the MLU histogram";
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
+// A batch whose reclaim fails permanently is quarantined by lazyFreeBatch
+// after kMaxReclaimAttempts (4096) consecutive failures, and that event is
+// counted in tent_quarantined_batches_total. Drives the real sweep path.
+// ---------------------------------------------------------------------------
+
+// FakeTransport whose poll fails permanently once poisoned.
+class PoisonedPollFakeTransport : public FakeTransport {
+   public:
+    explicit PoisonedPollFakeTransport(TransportType type)
+        : FakeTransport(type) {}
+
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus& status) override {
+        if (poisoned.load(std::memory_order_acquire)) {
+            return Status::InternalError(
+                "injected permanent poll failure" LOC_MARK);
+        }
+        return FakeTransport::getTransferStatus(batch, task_id, status);
+    }
+
+    std::atomic<bool> poisoned{false};
+};
+
+TEST_F(MetricsRecordingTest, QuarantinedBatchIncrementsCounter) {
+    constexpr size_t kMaxReclaimAttempts = 4096;  // mirrors the impl constant
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<PoisonedPollFakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xAB);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    fake->poisoned.store(true, std::memory_order_release);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    // Each freeBatch call on an already free-requested batch runs one sweep.
+    ASSERT_TRUE(engine.freeBatch(batch).ok());
+    for (size_t i = 0; i + 1 < kMaxReclaimAttempts; ++i) {
+        (void)engine.freeBatch(batch);
+    }
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(after.counter("tent_quarantined_batches_total") -
+                  before.counter("tent_quarantined_batches_total"),
+              1)
+        << "quarantining a batch must increment "
+           "tent_quarantined_batches_total exactly once";
+    // Prometheus endpoint carries the series too.
+    EXPECT_EQ(after.series("tent_quarantined_batches_total") -
+                  before.series("tent_quarantined_batches_total"),
+              1);
+
+    // Unpoison so teardown drains cleanly; the batch itself is reclaimed by
+    // the engine destructor regardless.
+    fake->poisoned.store(false, std::memory_order_release);
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
 }
 
@@ -865,6 +1058,253 @@ TEST_F(MetricsRecordingTest, BucketsAreCompileTimeDefaults) {
                                      50000, 100000, 500000, 1000000};
     EXPECT_EQ(keys, expected)
         << "latency buckets must be the compile-time defaults";
+}
+
+// Concurrency guard for the cached-cell hot path: several threads hammering
+// overlapping (transport, operation) labels must produce exactly the summed
+// counts — including the first-use window where multiple threads resolve the
+// same label cell concurrently. Exercises every hot-path metric family
+// (per-transport counters, N=2 attempt counters/histogram, stage histograms).
+TEST_F(MetricsRecordingTest, ConcurrentRecordsAcrossTransportsAreExact) {
+    constexpr int kThreads = 8;
+    constexpr int kIters = 2000;
+    constexpr size_t kBytes = 4096;
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([t] {
+            for (int i = 0; i < kIters; ++i) {
+                // Even threads write to rdma, odd threads to nvlink, so both
+                // transports' cells are resolved concurrently.
+                TransportType tp = (t % 2 == 0) ? RDMA : NVLINK;
+                Request::OpCode op =
+                    (i % 2 == 0) ? Request::WRITE : Request::READ;
+                TentMetrics::instance().recordTransportAttemptStarted(tp, op);
+                TentMetrics::instance().recordTransportAttemptFinished(
+                    tp, op, TransferStatusEnum::COMPLETED, 150.0);
+                if (op == Request::WRITE) {
+                    TentMetrics::instance().recordWriteCompleted(tp, kBytes,
+                                                                 0.002);
+                } else {
+                    TentMetrics::instance().recordReadCompleted(tp, kBytes,
+                                                                0.002);
+                }
+                TentMetrics::instance().recordStageLatency(
+                    TentMetrics::Stage::Transport, tp, 120.0);
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    auto after = MetricsSnapshot(TentMetrics::instance());
+    const int64_t total = kThreads * kIters;  // all attempts
+    const int64_t writes = total / 2;         // half the iterations
+    const int64_t bytes = writes * static_cast<int64_t>(kBytes);
+
+    EXPECT_EQ(after.counter("tent_write_bytes_total") -
+                  before.counter("tent_write_bytes_total"),
+              bytes);
+    EXPECT_EQ(after.counter("tent_read_bytes_total") -
+                  before.counter("tent_read_bytes_total"),
+              bytes);
+    EXPECT_EQ(after.counter("tent_write_requests_total") -
+                  before.counter("tent_write_requests_total"),
+              writes);
+    EXPECT_EQ(after.counter("tent_read_requests_total") -
+                  before.counter("tent_read_requests_total"),
+              writes);
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              total);
+    EXPECT_EQ(after.histogramCount("tent_transport_attempt_latency_us") -
+                  before.histogramCount("tent_transport_attempt_latency_us"),
+              total);
+    EXPECT_EQ(after.histogramCount("tent_write_latency_us") -
+                  before.histogramCount("tent_write_latency_us"),
+              writes);
+    EXPECT_EQ(after.histogramCount("tent_stage_transport_us") -
+                  before.histogramCount("tent_stage_transport_us"),
+              total);
+    // Per-label Prometheus series must also be exact: 4 threads per transport,
+    // half of their iterations are writes.
+    const double per_transport_bytes =
+        static_cast<double>(kThreads / 2) * (kIters / 2) * kBytes;
+    EXPECT_EQ(after.series("tent_write_bytes_total{transport=\"rdma\"}") -
+                  before.series("tent_write_bytes_total{transport=\"rdma\"}"),
+              per_transport_bytes);
+    EXPECT_EQ(after.series("tent_write_bytes_total{transport=\"nvlink\"}") -
+                  before.series("tent_write_bytes_total{transport=\"nvlink\"}"),
+              per_transport_bytes);
+    EXPECT_EQ(after.series("tent_transport_attempts_total{transport=\"nvlink\","
+                           "operation=\"read\"}") -
+                  before.series("tent_transport_attempts_total{transport="
+                                "\"nvlink\",operation=\"read\"}"),
+              static_cast<double>(kThreads / 2) * (kIters / 2));
+    EXPECT_EQ(after.counter("tent_write_failures_total") -
+                  before.counter("tent_write_failures_total"),
+              0);
+    EXPECT_EQ(after.counter("tent_read_failures_total") -
+                  before.counter("tent_read_failures_total"),
+              0);
+}
+
+// Task failure with reason="submit": a synchronously rejected submit fails
+// the attempt at the submit site, so recordTaskCompletionMetrics sees
+// attempt_active == false. The counter must attribute the failure to the
+// attempt transport (rdma) even though task.type is UNSPEC by then — the
+// attribution leak the reason counter must not reproduce.
+TEST_F(MetricsRecordingTest, SubmitFailureRecordsTaskFailureWithSubmitReason) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/false,
+                                                /*force_submit_fail=*/true);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xCD);
+    auto before_register = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    auto after_register = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(after_register.series(
+                  "tent_registered_buffer_bytes{transport=\"rdma\"}") -
+                  before_register.series(
+                      "tent_registered_buffer_bytes{transport=\"rdma\"}"),
+              static_cast<double>(kLen));
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(
+        after.series(
+            "tent_task_failures_total{transport=\"rdma\",reason=\"submit"
+            "\"}") -
+            before.series("tent_task_failures_total{transport=\"rdma\",reason="
+                          "\"submit\"}"),
+        1);
+    EXPECT_EQ(
+        after.series(
+            "tent_task_failures_total{transport=\"rdma\",reason=\"poll\"}") -
+            before.series(
+                "tent_task_failures_total{transport=\"rdma\",reason=\""
+                "poll\"}"),
+        0);
+    // In-flight gauge returns to zero after the terminal failure.
+    EXPECT_EQ(after.counter("tent_inflight_attempts") -
+                  before.counter("tent_inflight_attempts"),
+              0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+    auto after_unregister = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(after_unregister.series(
+                  "tent_registered_buffer_bytes{transport=\"rdma\"}"),
+              0);
+}
+
+// Task failure with reason="poll": the transport accepted the request and
+// reported FAILED from getTransferStatus, so the attempt is still active when
+// recordTaskCompletionMetrics runs.
+TEST_F(MetricsRecordingTest, PollFailureRecordsTaskFailureWithPollReason) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/true,
+                                                /*force_submit_fail=*/false);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xAB);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(
+        after.series(
+            "tent_task_failures_total{transport=\"rdma\",reason=\"poll\"}") -
+            before.series(
+                "tent_task_failures_total{transport=\"rdma\",reason=\""
+                "poll\"}"),
+        1);
+    EXPECT_EQ(
+        after.series(
+            "tent_task_failures_total{transport=\"rdma\",reason=\"submit"
+            "\"}") -
+            before.series("tent_task_failures_total{transport=\"rdma\",reason="
+                          "\"submit\"}"),
+        0);
+    EXPECT_EQ(after.counter("tent_inflight_attempts") -
+                  before.counter("tent_inflight_attempts"),
+              0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+}
+
+// Gauges must stay symmetric across setEnabled() transitions: the runtime
+// switch governs statistical sampling, not state tracking. Skipping one half
+// of a paired add/sub would permanently corrupt the gauge (review feedback).
+TEST_F(MetricsRecordingTest, InflightGaugeSurvivesEnableToggle) {
+    auto& m = TentMetrics::instance();
+    auto before = MetricsSnapshot(m);
+
+    // Enabled at start, disabled before finish.
+    TentMetrics::setEnabled(true);
+    m.recordInflightAttemptStarted(RDMA);
+    TentMetrics::setEnabled(false);
+    m.recordInflightAttemptFinished(RDMA);
+
+    // Disabled at start, enabled before finish (reverse straddle).
+    m.recordInflightAttemptStarted(RDMA);
+    TentMetrics::setEnabled(true);
+    m.recordInflightAttemptFinished(RDMA);
+
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.counter("tent_inflight_attempts") -
+                  before.counter("tent_inflight_attempts"),
+              0);
+    EXPECT_EQ(after.series("tent_inflight_attempts{transport=\"rdma\"}") -
+                  before.series("tent_inflight_attempts{transport=\"rdma\"}"),
+              0);
+}
+
+TEST_F(MetricsRecordingTest, RegisteredBytesGaugeSurvivesEnableToggle) {
+    auto& m = TentMetrics::instance();
+    auto before = MetricsSnapshot(m);
+
+    TentMetrics::setEnabled(true);
+    m.recordRegisteredBufferBytes(RDMA, 4096);
+    TentMetrics::setEnabled(false);
+    m.recordRegisteredBufferBytes(RDMA, -4096);
+    TentMetrics::setEnabled(true);
+
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.counter("tent_registered_buffer_bytes") -
+                  before.counter("tent_registered_buffer_bytes"),
+              0);
+    EXPECT_EQ(
+        after.series("tent_registered_buffer_bytes{transport=\"rdma\"}") -
+            before.series("tent_registered_buffer_bytes{transport=\"rdma\"}"),
+        0);
 }
 
 // ---------------------------------------------------------------------------

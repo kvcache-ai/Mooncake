@@ -95,7 +95,22 @@ class Workers {
     // failure load.
     void reclaimEndpoints();
 
-    int handleContextEvents(std::shared_ptr<RdmaContext>& context);
+    // dev_id is the NicID (context_set_ index), which is also the
+    // DeviceSelector id, so port events can flip that device's availability.
+    int handleContextEvents(int dev_id, std::shared_ptr<RdmaContext>& context);
+
+    // The decision half of handleContextEvents, kept apart from
+    // ibv_get_async_event/ibv_ack_async_event so a synthesized event can
+    // drive it in tests. Port events (PORT_ERR/PORT_ACTIVE) name their port;
+    // a device's async fd delivers them for every port of the device, and a
+    // context opens exactly one, so events for another port are ignored.
+    void applyContextEvent(int dev_id, RdmaContext& context,
+                           const ibv_async_event& event);
+
+    // Re-read the link speed after a port event and re-seed the selector if
+    // it changed; a link that returns at the same speed keeps what it
+    // learned.
+    void refreshLinkSpeed(int dev_id, RdmaContext& context);
 
     Status generatePostPath(RdmaSlice* slice);
 
@@ -121,6 +136,8 @@ class Workers {
                                 RdmaSlice* slice);
 
     int getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx);
+
+    bool strictLocalNuma() const;
 
     // True if the (sdev -> tdev) NIC pair is known-unable to GPUDirect-DMA to
     // the source/target GPU (learned from prior completion errors). Used to
@@ -232,6 +249,14 @@ class Workers {
         // Next time to check for priority promotions (nanoseconds)
         uint64_t next_promotion_check_ns = 0;
 
+        // Tick-internal re-enqueues that found their target queue full
+        // (target priority, entry). Parked items stay counted in
+        // inflight_slices, which both keeps the accounting continuous and
+        // keeps the worker from suspending while they are pending. The
+        // asyncPostSend drain consumes this list before the shared queues,
+        // so parked entries can never starve behind contending producers.
+        std::vector<std::pair<int, RdmaSliceList>> requeue_overflow;
+
         // Values are held via unique_ptr so that map rehashing does not
         // invalidate pointers into RailMonitor stored on in-flight slices
         // (see RdmaSlice::rail_monitor).
@@ -243,13 +268,17 @@ class Workers {
     // Promote timed-out low priority requests to higher priority queues
     void promoteTimedOutRequests(WorkerContext& worker);
 
+    // Tick-internal re-enqueue: the worker thread must never block on its own
+    // queue (issue #3637), so these park into requeue_overflow on a full queue
+    // and the asyncPostSend drain consumes them first.
+    void submitFromTick(WorkerContext& worker, RdmaSlice* slice);
+
     WorkerContext* worker_context_;
     uint64_t slice_timeout_ns_;
     uint64_t priority_promotion_timeout_ns_;  // Timeout for priority promotion
     // Opt-in (issue #2528): when true, a promotion pass promotes exactly the
-    // entries that have themselves timed out, instead of promoting the whole
-    // queue whenever only the head has timed out. Default false keeps the
-    // historical "flush the tier" behavior.
+    // entries that have themselves timed out (DecidePromotionPerEntry).
+    // Default false keeps DecidePromotionHeadOnly ("flush the tier").
     bool priority_promotion_per_entry_ = false;
 
     std::unique_ptr<DeviceSelector> device_selector_;

@@ -24,7 +24,7 @@
 #include "config.h"
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
-#include "environ.h"
+#include "client_auto_port_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
@@ -37,6 +37,7 @@
 #include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "version.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -814,25 +815,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         client_ = *client_opt;
     } else {
         // Auto port binding with retry on metadata registration failure
-        const int kMaxRetries =
-            Environ::GetInt("MC_STORE_CLIENT_SETUP_RETRIES", 20);
-        const int rawMinPort =
-            Environ::GetInt("MC_STORE_CLIENT_MIN_PORT", 12300);
-        const int rawMaxPort =
-            Environ::GetInt("MC_STORE_CLIENT_MAX_PORT", 14300);
-        constexpr int kDefaultMinPort = 12300;
-        constexpr int kDefaultMaxPort = 14300;
-        auto [minPort, maxPort] = ValidatePortRange(
-            rawMinPort, rawMaxPort, kDefaultMinPort, kDefaultMaxPort);
+        const auto auto_port_config = ClientAutoPortConfig::FromEnvironment();
         bool success = false;
 
-        for (int retry = 0; retry < kMaxRetries; ++retry) {
+        for (int retry = 0; retry < auto_port_config.max_retries; ++retry) {
             // Create port binder to hold a port
-            port_binder_ = std::make_unique<AutoPortBinder>(minPort, maxPort);
+            port_binder_ = std::make_unique<AutoPortBinder>(
+                auto_port_config.min_port, auto_port_config.max_port);
             int port = port_binder_->getPort();
             if (port < 0) {
-                LOG(WARNING) << "Failed to bind available port, retry "
-                             << (retry + 1) << "/" << kMaxRetries;
+                LOG(WARNING)
+                    << "Failed to bind available port, retry " << (retry + 1)
+                    << "/" << auto_port_config.max_retries;
                 port_binder_.reset();
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
@@ -856,14 +850,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             // Failed to create client (possibly due to metadata registration
             // conflict), release port and retry with a different port
             LOG(WARNING) << "Failed to create client on port " << port
-                         << ", retry " << (retry + 1) << "/" << kMaxRetries;
+                         << ", retry " << (retry + 1) << "/"
+                         << auto_port_config.max_retries;
             port_binder_.reset();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         if (!success) {
-            LOG(ERROR) << "Failed to create client after " << kMaxRetries
-                       << " retries";
+            LOG(ERROR) << "Failed to create client after "
+                       << auto_port_config.max_retries << " retries";
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
@@ -1832,6 +1827,21 @@ int RealClient::unmountAndFreeSegment(
     return first_error;
 }
 
+int RealClient::drainLocalDiskSegment(uint64_t grace_period_seconds) {
+    if (!client_) {
+        LOG(ERROR) << "Client not initialized";
+        return -1;
+    }
+    if (!file_storage_) {
+        LOG(WARNING) << "action=drain_local_disk_segment, "
+                        "warn=ssd_offload_not_enabled";
+        return 0;
+    }
+    auto result =
+        file_storage_->DrainLocalDiskSegment(grace_period_seconds * 1000);
+    return result ? 0 : -1;
+}
+
 int RealClient::health_check() {
     if (closed_.load()) return HC_NOT_INITIALIZED;
     if (!client_) return HC_NOT_INITIALIZED;
@@ -1909,6 +1919,15 @@ int RealClient::start_http_server(int port) {
             }
             resp.add_header("Content-Type", "text/plain");
             resp.set_status_and_content(status_type::ok, std::move(*result));
+        });
+
+    http_server_->set_http_handler<GET>(
+        "/version", [](coro_http_request &req, coro_http_response &resp) {
+            std::string body = "{\"version\":\"" + GetMooncakeStoreVersion() +
+                               "\",\"display_version\":\"" +
+                               std::string(MOONCAKE_DISPLAY_VERSION) + "\"}";
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(status_type::ok, std::move(body));
         });
 
     auto ec = http_server_->async_start();
@@ -5030,6 +5049,36 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
+                   << ", buffers=" << buffers.size()
+                   << ", sizes=" << sizes.size();
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (keys.empty()) {
+        return {};
+    }
+
+    const auto query_results = client_->BatchQuery(keys);
+    return batch_get_into_internal(
+        keys, buffers, sizes, query_results,
+        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
+            return batch_get_into_offload_object_internal(endpoint, objects);
+        });
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_internal(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+    const LocalDiskOffloadReader &local_disk_reader) {
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
@@ -5038,10 +5087,12 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+    if (keys.size() != buffers.size() || keys.size() != sizes.size() ||
+        keys.size() != query_results.size()) {
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
                    << ", buffers=" << buffers.size()
-                   << ", sizes=" << sizes.size();
+                   << ", sizes=" << sizes.size()
+                   << ", query_results=" << query_results.size();
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -5053,14 +5104,19 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         return results;
     }
 
-    // Query metadata for all keys
-    const auto query_results = client_->BatchQuery(keys);
-
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;
         size_t original_index;
         QueryResult query_result;
+        std::vector<Slice> slices;
+        uint64_t total_size;
+    };
+    struct ValidLocalDiskKeyInfo {
+        std::string key;
+        size_t original_index;
+        QueryResult query_result;
+        Replica::Descriptor replica;
         std::vector<Slice> slices;
         uint64_t total_size;
     };
@@ -5074,7 +5130,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     };
 
     std::vector<ValidKeyInfo> valid_operations;
-    std::unordered_map<std::string, ValidKeyInfo> valid_local_disk_operations;
+    std::unordered_map<std::string, ValidLocalDiskKeyInfo>
+        valid_local_disk_operations;
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
@@ -5129,12 +5186,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             std::vector<Slice> key_slices;
             allocateSlices(key_slices, replica, buffers[i]);
             valid_local_disk_operations.emplace(
-                key,
-                ValidKeyInfo{.key = key,
-                             .original_index = i,
-                             .query_result = std::move(query_result_values),
-                             .slices = std::move(key_slices),
-                             .total_size = total_size});
+                key, ValidLocalDiskKeyInfo{
+                         .key = key,
+                         .original_index = i,
+                         .query_result = std::move(query_result_values),
+                         .replica = replica,
+                         .slices = std::move(key_slices),
+                         .total_size = total_size});
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
@@ -5274,21 +5332,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         offload_objects;
 
     for (const auto &op_it : valid_local_disk_operations) {
-        // Find the LOCAL_DISK replica from the list — replicas may be in
-        // any order from Master.
-        const Replica::Descriptor *replica_ptr = nullptr;
-        for (const auto &r : op_it.second.query_result.replicas) {
-            if (r.is_local_disk_replica()) {
-                replica_ptr = &r;
-                break;
-            }
-        }
-        if (!replica_ptr) {
-            LOG(ERROR) << "No LOCAL_DISK replica found for key: "
-                       << op_it.first;
-            continue;
-        }
-        const auto &replica = *replica_ptr;
+        const auto &replica = op_it.second.replica;
         auto [store_segment_it, _] = offload_objects.try_emplace(
             replica.get_local_disk_descriptor().transport_endpoint);
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
@@ -5299,7 +5343,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::chrono::steady_clock::now();
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        auto batch_get_offload_result = batch_get_into_offload_object_internal(
+        auto batch_get_offload_result = local_disk_reader(
             offload_objects_it.first, offload_objects_it.second);
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
@@ -6926,6 +6970,13 @@ ClientRequester::ClientRequester() {
     pool_conf.reconnect_wait_time = std::chrono::milliseconds{1000};
     pool_conf.host_alive_detect_duration = std::chrono::milliseconds{0};
 
+    // Honour the same timeout overrides as the master pool. Without this the
+    // connect timeout stays at coro_rpc's built-in 30s, so a read that picks a
+    // peer which is gone blocks for connect_retry_count * 30s plus the waits
+    // between retries -- 91s with the defaults above -- and no configuration
+    // can shorten it. Defaults are unchanged when the variables are unset.
+    detail::ApplyRpcTimeoutEnvOverrides(pool_conf.client_config);
+
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
             pool_conf, GetStoreRpcClientIoContextPool());
@@ -6981,6 +7032,10 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
             }
             auto result = co_await std::move(ret.value());
             if (!result) {
+                if (result.error().code == coro_rpc::errc::timed_out) {
+                    LOG(ERROR) << "RPC call timed out: " << result.error().msg;
+                    co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                }
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }

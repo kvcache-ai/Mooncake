@@ -260,6 +260,29 @@ Basic health check endpoint for service availability verification.
 curl http://localhost:8080/health
 ```
 
+#### `/version`
+Report the master version. Always available, including while the master is in
+standby.
+
+**Method**: `GET`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with:
+- `version` (string): Store version used for RPC handshake compatibility
+- `display_version` (string): Human-readable release plus short git hash
+
+**Example**:
+```bash
+curl http://localhost:8080/version
+```
+
+```json
+{"version":"2.0.0","display_version":"0.3.12.post1 (git: f9e8311f)"}
+```
+
+Real clients expose the same `/version` payload on their own client HTTP port
+when `enable_client_http_server` is on. See
+[Client Metrics Endpoint](../../getting_started/observability.md#client-metrics-endpoint).
+
 ## Store REST API Endpoints
 
 The following endpoints are served by the Python store REST service, which wraps
@@ -441,4 +464,55 @@ curl -X POST http://localhost:8080/api/unmount \
   -H "Content-Type: application/json" \
   -d '{"segment_ids": ["00000000-0000-0000-0000-000000000002"],
        "grace_period_seconds": 30}'
+```
+
+### `/api/unmount_local_disk`
+Deregister this store's SSD offload tier from the master before the process
+goes away. Intended for a shutdown hook.
+
+The master stops naming this store as the owner of the keys it offloaded, so a
+reader gets a clean miss instead of a peer that is about to disappear. Without
+this, a `LOCAL_DISK` segment leaves the master only when the client expires —
+one `client_ttl` after the store stops pinging — and reads that pick up the
+stale owner in that window block on the connect retries (see
+`MC_RPC_CONNECT_TIMEOUT_MS`) before missing.
+
+The call then holds for `grace_period_seconds` before returning. Unlike a memory
+replica, which the NIC serves without help from the store process, a disk
+replica is read and pushed by that process, so it has to stay alive for the
+reads the master handed out before the deregistration. Offloading is stopped for
+good when this is called; the store is expected to exit afterwards.
+
+Returns success and does nothing when SSD offload is not enabled on this store.
+Safe to call more than once.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "grace_period_seconds": 30
+}
+```
+
+`grace_period_seconds` is optional and defaults to `0`, which returns as soon as
+the master has dropped the segment. Must be a non-negative integer no greater
+than 3600 (1 hour); a malformed body or an out-of-range value gets a `400`
+without touching the store, so a mistake here (seconds where milliseconds were
+meant, say) cannot block a preStop hook for hours.
+
+**Success Response**:
+```json
+{
+  "status": "success"
+}
+```
+
+**Example** — as a Kubernetes preStop hook, with a
+`terminationGracePeriodSeconds` longer than the grace period:
+```bash
+curl -X POST http://localhost:8080/api/unmount_local_disk \
+  -H "Content-Type: application/json" \
+  -d '{"grace_period_seconds": 30}'
 ```

@@ -71,6 +71,9 @@ DEFINE_double(qos_link_capacity_gbps, 0.0,
               "Link capacity in GB/s for total utilization (0 reports N/A).");
 DEFINE_string(qos_output_jsonl, "",
               "Append versioned QoS metric records to this JSONL file.");
+DEFINE_string(result_output_jsonl, "",
+              "Append versioned benchmark result records, including "
+              "per-target metrics, to this JSONL file.");
 DEFINE_uint64(request_interval_us, 0,
               "Per-thread delay before issuing each transfer batch, in "
               "microseconds. 0 disables pacing.");
@@ -94,7 +97,8 @@ DEFINE_int32(
     rpc_server_port, 0,
     "RPC server port used for p2p metadata service (0 = auto-select).");
 DEFINE_string(xport_type, "",
-              "Transport type: rdma|shm|mnnvl|gds|iouring|sunrise_link|mpcomm");
+              "Transport type: "
+              "rdma|shm|mnnvl|gds|iouring|sunrise_link|mpcomm|flagcx");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
@@ -131,6 +135,7 @@ std::string XferBenchConfig::qos_classes_json;
 std::string XferBenchConfig::workload_classes_json;
 double XferBenchConfig::qos_link_capacity_gbps = 0.0;
 std::string XferBenchConfig::qos_output_jsonl;
+std::string XferBenchConfig::result_output_jsonl;
 uint64_t XferBenchConfig::request_interval_us = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
@@ -170,6 +175,7 @@ void XferBenchConfig::loadFromFlags() {
     workload_classes_json = FLAGS_workload_classes_json;
     qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
     qos_output_jsonl = FLAGS_qos_output_jsonl;
+    result_output_jsonl = FLAGS_result_output_jsonl;
     request_interval_us = FLAGS_request_interval_us;
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;

@@ -51,6 +51,10 @@ using RdmaTaskStorage = Slab<RdmaTask>;
 struct RdmaTask {
     int num_slices;
     Request request;
+    // Resolved by TransportSelector and copied from RdmaSubBatch. The
+    // per-slice path runs later on worker threads, so it must carry the same
+    // device policy as the aggregate allocation path.
+    uint64_t device_mask{~0ULL};
     // Named QP pool this task's slices should use (RFC #2568 step 3). Empty =
     // no pool selected: slices spray across all data QPs as before. Resolved
     // from SelectionResult.qp_pool at task creation.

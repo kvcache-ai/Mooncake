@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -646,6 +647,19 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
 
+    using LocalDiskOffloadObjects =
+        std::unordered_map<std::string, std::vector<Slice>>;
+    using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
+        const std::string &, LocalDiskOffloadObjects &)>;
+
+    // Dependency-injected overload used to verify routing decisions without
+    // requiring multiple live SSD offload servers.
+    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+        const LocalDiskOffloadReader &local_disk_reader);
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
         const std::vector<std::string> &keys,
@@ -834,6 +848,14 @@ class RealClient : public PyClient {
      */
     int unmountAndFreeSegment(const std::vector<std::string> &segment_ids,
                               uint64_t grace_period_seconds = 0);
+
+    /**
+     * @brief Deregister this store's disk tier from the master and wait out a
+     * grace period, so a planned shutdown stops being advertised as an owner
+     * of offloaded keys before it stops serving them. No-op when SSD offload
+     * is not enabled on this client.
+     */
+    int drainLocalDiskSegment(uint64_t grace_period_seconds = 0);
 
     struct MountedSegmentRecord {
         void *mmap_base = nullptr;

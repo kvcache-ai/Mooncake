@@ -43,29 +43,52 @@ struct RpcHandlerScope {
 
 class ClientPool {
    public:
-    std::unique_ptr<coro_rpc_client> acquire() {
+    struct Lease {
+        std::unique_ptr<coro_rpc_client> client;
+        // Which generation the client was drawn from. Flushing is keyed on
+        // this: see clearIfCurrent().
+        uint64_t generation = 0;
+    };
+
+    Lease acquire() {
         std::lock_guard<std::mutex> guard(lock_);
         if (!idle_clients_.empty()) {
             auto client = std::move(idle_clients_.back());
             idle_clients_.pop_back();
-            return client;
+            return Lease{std::move(client), generation_};
         }
-        return nullptr;
+        return Lease{nullptr, generation_};
     }
 
+    // A client is only released after a call succeeded on it, which proves it
+    // is alive, so it goes back regardless of which generation it came from.
     void release(std::unique_ptr<coro_rpc_client> client) {
         if (!client) return;
         std::lock_guard<std::mutex> guard(lock_);
         idle_clients_.push_back(std::move(client));
     }
 
+    // Drop every idle client, but only on behalf of a caller that is still
+    // looking at the generation it drew from. Several callers notice a peer
+    // restart at once; without this, the second one to fail would throw away
+    // the connections the first one has already re-established, and the pool
+    // would churn for as long as stale clients keep surfacing.
+    void clearIfCurrent(uint64_t generation) {
+        std::lock_guard<std::mutex> guard(lock_);
+        if (generation != generation_) return;
+        ++generation_;
+        idle_clients_.clear();
+    }
+
     void clear() {
         std::lock_guard<std::mutex> guard(lock_);
+        ++generation_;
         idle_clients_.clear();
     }
 
    private:
     std::mutex lock_;
+    uint64_t generation_ = 0;
     std::vector<std::unique_ptr<coro_rpc_client>> idle_clients_;
 };
 
@@ -187,6 +210,26 @@ std::shared_ptr<ClientPool> CoroRpcAgent::getOrCreatePool(
     return it->second;
 }
 
+namespace {
+
+// True when the failure came back from the peer as a reply, which means the
+// connection carried a full round trip and is still usable. Every other
+// failure leaves the connection in an unknown state.
+bool peerAnswered(coro_rpc::errc ec) {
+    switch (ec) {
+        case coro_rpc::errc::rpc_throw_exception:
+        case coro_rpc::errc::function_not_registered:
+        case coro_rpc::errc::invalid_rpc_arguments:
+        case coro_rpc::errc::invalid_rpc_result:
+        case coro_rpc::errc::message_too_large:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
 Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     std::string server_addr, int func_id, std::string request) {
     if (tl_inside_rpc_handler) {
@@ -197,7 +240,10 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     }
 
     auto pool = getOrCreatePool(server_addr);
-    ClientLease lease{pool->acquire(), pool, false};
+    auto acquired = pool->acquire();
+    const uint64_t generation = acquired.generation;
+    ClientLease lease{std::move(acquired.client), pool, false};
+    const bool from_pool = lease.client != nullptr;
 
     if (!lease.client) {
         lease.client = std::make_unique<coro_rpc_client>(
@@ -219,6 +265,21 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
 
     if (!call_result.has_value()) {
         lease.broken = true;
+        // An idle pooled connection only learns that its peer restarted when
+        // it is next used, and every other connection pooled for that peer is
+        // just as stale. Discarding only this one leaves the rest to fail the
+        // same way, one wasted attempt each, and callers above get few
+        // attempts: TcpTransport allows max_retry_count, so a peer that is
+        // already back up can still fail a transfer outright. Drop the whole
+        // pool instead, so the next attempt starts from a fresh connection.
+        //
+        // Only for failures that leave the connection unusable. If the peer
+        // answered -- a handler exception, an unknown function id, a rejected
+        // argument -- the socket is fine, and so are the connections the other
+        // callers of this address are holding.
+        if (from_pool && !peerAnswered(call_result.error().code)) {
+            pool->clearIfCurrent(generation);
+        }
         auto msg = "Failed to call RPC function. server: " + server_addr +
                    ", func_id: " + std::to_string(func_id) +
                    ", message: " + std::string{call_result.error().msg};

@@ -304,8 +304,11 @@ When the Primary fails, the Standby is promoted through the following steps:
    - `applied_seq_id`: The latest applied OpLog sequence ID.
    - `objects`: All object metadata from the in-memory store.
    - `segments`: All segment registry entries.
-4. **State Restoration**: The new Primary restores its state from the `PromotionContext`, populating metadata shards and the segment manager.
-5. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
+4. **State Restoration**: The new Primary restores and validates the complete `PromotionContext`, populating metadata shards and the segment manager. A context with zero objects and segments still passes through restoration so that unsupported recovery modes cannot bypass validation.
+5. **Serving Gate**: The supervisor revalidates leadership and exposes the RPC service only after restoration succeeds. Promotion, restoration, or leadership validation failure leaves `service_ready=false`, keeps data endpoints unavailable, and releases leadership. Failure to release leadership does not make the candidate serviceable.
+6. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
+
+This fail-closed behavior is intentional. Older versions could log a restoration error and continue serving from empty or partially restored metadata. That behavior was a correctness bug, not a supported availability fallback: the serving state could disagree with the durable OpLog and poison later recovery attempts. Mooncake does not automatically discard snapshots, OpLog records, or metadata after a recovery error.
 
 ### Example: HA Deployment with etcd
 
@@ -356,6 +359,18 @@ mooncake_master --config_path=primary.yaml
 # Start Standby
 mooncake_master --config_path=standby.yaml
 ```
+
+### Recovery from Unusable HA State
+
+First repair temporary backend, configuration, or snapshot-access failures and restart the affected Standby. If the recovery history is confirmed unusable and losing all cached metadata is acceptable, start a new empty cluster explicitly:
+
+1. Stop every Primary and Standby process that uses the old `cluster_id`.
+2. Confirm that losing the old cache metadata and snapshots is acceptable.
+3. Change every node to a new, previously unused `cluster_id`.
+4. Start the new cluster and allow applications to repopulate the cache.
+5. Keep the old namespace for diagnosis, then remove it separately after confirming that no old process can reconnect.
+
+Using a new `cluster_id` isolates the new cluster from the old OpLog, durable prefix, producer view, and snapshot namespace. Do not delete individual recovery keys or reuse the old `cluster_id` while any old process may still run. There is no automatic reset-on-restore-failure option.
 
 ### Resetting a Legacy OpLog Namespace
 
@@ -914,7 +929,23 @@ allocation_strategy: "local_first"
 
 When enabled, the master applies local-first allocation only for memory replicas with `replica_num == 1`. Explicit `preferred_segment` or `preferred_segments` are tried first; if they are unavailable or full, Mooncake falls back through active hosts in cyclic lexicographic host-id order, starting from the writer host when it has active segments, or otherwise from the next greater active host id. Within the same host, segment names are sorted and rotated by key hash so multiple segments on one host do not always receive the first allocation attempt.
 
-The client derives the host id from `local_hostname` by removing the port. For example, `host-a:50051` and `host-a:50052` map to the same host id, `host-a`. For local-first allocation to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique host part in `local_hostname`. In deployments with multiple NIC IPs, hostname aliases, or container/pod networking, choose one canonical host name or IP and use it consistently across processes on that host. Empty, loopback, and wildcard values such as `localhost`, `127.0.0.1`, `0.0.0.0`, `::1`, and `::` are treated as unknown and do not trigger automatic local-first placement for that client.
+By default, the client derives the host id from `local_hostname` by removing the port. For example, `host-a:50051` and `host-a:50052` map to the same host id, `host-a`. Set `MOONCAKE_HOST_ID` to override this derived value with a stable, globally unique node identifier. The override is read directly by the C++ client, so it applies to every client initialization method. It must be set before creating the client, and all writer and store processes on the same physical or logical host must use the same value. An empty or whitespace-only override falls back to `local_hostname`. Loopback and wildcard values such as `localhost`, `127.0.0.1`, `0.0.0.0`, `::1`, and `::` are treated as unknown and do not trigger automatic local-first placement.
+
+In Kubernetes, keep `MOONCAKE_LOCAL_HOSTNAME` as the routable pod IP for the transfer endpoint and use `spec.nodeName` as the shared placement identity:
+
+```yaml
+env:
+  - name: MOONCAKE_LOCAL_HOSTNAME
+    valueFrom:
+      fieldRef:
+        fieldPath: status.podIP
+  - name: MOONCAKE_HOST_ID
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.nodeName
+```
+
+Apply the same `MOONCAKE_HOST_ID` mapping to every writer and store pod. This separates the per-pod network address from the node-level placement identity, allowing colocated pods with different IPs to match for local-first allocation.
 
 ---
 
@@ -947,7 +978,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `enable_ssd_offload` | bool | `false` | *(advanced)* Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
 | `ssd_offload_path` | str | empty | *(advanced)* FileStorage path; with the distributed backend, DFS data uses `MOONCAKE_DFS_ROOT_DIR` |
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
-| `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
 
 ```{note}
@@ -978,7 +1009,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; DFS shard data uses `MOONCAKE_DFS_ROOT_DIR` with the distributed backend |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
-| `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
 
@@ -1047,8 +1078,11 @@ mooncake_client \
 | `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
-| `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |
+
+`mooncake_client --version` prints the release version plus the short git hash,
+and the same value is logged at startup.
 
 ### Client HTTP Health and Metrics Endpoint
 
@@ -1075,9 +1109,18 @@ For `mooncake_store_service`, use `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER=true` and 
 | `GET /health` | Client health check |
 | `GET /metrics` | Prometheus-format client metrics |
 | `GET /metrics/summary` | Human-readable client metrics summary |
+| `GET /version` | Client version as JSON (`version` for RPC handshake compatibility, `display_version` for release plus short git hash) |
+
+```bash
+curl http://<client-host>:9300/version
+```
+
+```json
+{"version":"2.0.0","display_version":"0.3.12.post1 (git: f9e8311f)"}
+```
 
 ```{note}
-`MC_STORE_CLIENT_METRIC` controls whether client metrics are collected. If the client HTTP server is enabled but `MC_STORE_CLIENT_METRIC=0`, `/metrics` and `/metrics/summary` return HTTP 503 with `metrics not available`.
+`MC_STORE_CLIENT_METRIC` controls whether client metrics are collected. If the client HTTP server is enabled but `MC_STORE_CLIENT_METRIC=0`, `/metrics` and `/metrics/summary` return HTTP 503 with `metrics not available`. `/health` and `/version` are unaffected.
 ```
 
 ### Engine Runtime Tuning (`MC_*`)
@@ -1089,8 +1132,8 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp` or `rdma` |
-| `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for all client→master RPCs. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
-| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client |
+| `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for client→master RPCs and for store→store SSD offload reads. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
+| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
 | `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
 | `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |

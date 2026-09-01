@@ -310,6 +310,26 @@ MemoryType CudaPlatform::getMemoryType(void* addr) {
     return MTYPE_CPU;
 }
 
+int CudaPlatform::getPointerDeviceId(void* addr) {
+    // Same guards as getMemoryType(): the cudaPointerAttributes layout changes
+    // across CUDA majors, so the struct must not be read on a runtime whose ABI
+    // does not match what we built against.
+    if (!cudaDevicePresent() || !cudaAbiMatches()) {
+        return CUDAStreamPool::kCurrentDevice;
+    }
+    cudaPointerAttributes attributes{};
+    if (cudaPointerGetAttributes(&attributes, addr) != cudaSuccess) {
+        // Clear the latched error so it cannot surface at an unrelated
+        // cudaGetLastError() call site.
+        cudaGetLastError();
+        return CUDAStreamPool::kCurrentDevice;
+    }
+    if (attributes.type != cudaMemoryTypeDevice) {
+        return CUDAStreamPool::kCurrentDevice;
+    }
+    return attributes.device;
+}
+
 static inline uintptr_t alignPage(uintptr_t address) {
     const static size_t kPageSize = 4096;
     return address & ~(kPageSize - 1);

@@ -172,6 +172,83 @@ class RealClientTest : public ::testing::Test {
     }
 };
 
+TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t object_size = 16;
+    auto make_local_disk = [object_size](const std::string& endpoint,
+                                         ReplicaStatus status) {
+        Replica::Descriptor replica;
+        LocalDiskDescriptor descriptor;
+        descriptor.client_id = generate_uuid();
+        descriptor.object_size = object_size;
+        descriptor.transport_endpoint = endpoint;
+        replica.descriptor_variant = std::move(descriptor);
+        replica.status = status;
+        return replica;
+    };
+
+    struct TestCase {
+        std::string name;
+        std::vector<Replica::Descriptor> replicas;
+        std::string expected_endpoint;
+    };
+    std::vector<TestCase> test_cases;
+    // SelectBestReplica currently chooses the last COMPLETE LOCAL_DISK
+    // descriptor. Both list orders make a first-vs-last mismatch observable.
+    test_cases.push_back(
+        {.name = "a_then_b",
+         .replicas = {make_local_disk("endpoint-a", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-b", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-b"});
+    test_cases.push_back(
+        {.name = "b_then_a",
+         .replicas = {make_local_disk("endpoint-b", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-a", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-a"});
+    test_cases.push_back(
+        {.name = "not_ready_then_complete",
+         .replicas = {make_local_disk("endpoint-not-ready",
+                                      ReplicaStatus::PROCESSING),
+                      make_local_disk("endpoint-complete",
+                                      ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-complete"});
+
+    for (auto& test_case : test_cases) {
+        SCOPED_TRACE(test_case.name);
+        std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+        query_results.emplace_back(QueryResult(
+            std::move(test_case.replicas),
+            std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+
+        std::vector<char> destination(object_size);
+        std::string visited_endpoint;
+        // Stop at the offload RPC boundary after recording its destination.
+        // The injected error also prevents checksum verification of the
+        // intentionally untouched destination buffer.
+        auto local_disk_reader = [&visited_endpoint](
+                                     const std::string& endpoint,
+                                     RealClient::LocalDiskOffloadObjects&)
+            -> tl::expected<void, ErrorCode> {
+            visited_endpoint = endpoint;
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        };
+
+        std::vector<tl::expected<int64_t, ErrorCode>> results;
+        {
+            GLogMuter muter;
+            results = py_client_->batch_get_into_internal(
+                {"endpoint-selection-key"}, {destination.data()},
+                {destination.size()}, query_results, local_disk_reader);
+        }
+
+        EXPECT_EQ(visited_endpoint, test_case.expected_endpoint);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::RPC_FAIL);
+    }
+}
+
 #ifdef MOONCAKE_TEST_CUDA_H2D
 TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
     int device_count = 0;
