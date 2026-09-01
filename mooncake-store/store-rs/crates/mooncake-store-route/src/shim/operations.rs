@@ -138,6 +138,34 @@ impl RouteOperations {
         self.compare_and_swap_route(key, expected, None)
     }
 
+    /// Delete an existing route after advancing its version floor.
+    ///
+    /// A plain delete records the deleted route's version. That permits a
+    /// legitimate successor write, but it also means an asynchronous update
+    /// prepared from the deleted route can publish `version.next()` and
+    /// accidentally resurrect it. Publishing a tombstone at `version.next()`
+    /// first makes such stale updates conflict while preserving normal
+    /// recreate-after-delete semantics.
+    pub fn delete_route_with_version_fence(&self, current: &ObjectRoute) -> Result<CasResult> {
+        let mut tombstone = current.clone();
+        tombstone.version = current.version.next();
+        tombstone.state = RouteState::Tombstone;
+        tombstone.replicas.clear();
+        tombstone.cold_backing = None;
+        tombstone.nof_backing = None;
+
+        let result =
+            self.compare_and_swap_route(&current.key, Some(current.version), Some(&tombstone))?;
+        if result.applied {
+            // Mesh authorities store tombstones as delete markers. Metadata-only
+            // directories may retain the tombstone as a route, so compact it when
+            // possible. The version fence remains authoritative if cleanup races
+            // with a newer writer or its outcome is unknown.
+            let _ = self.compare_and_swap_route(&current.key, Some(tombstone.version), None);
+        }
+        Ok(result)
+    }
+
     pub fn compare_and_swap_route(
         &self,
         key: &ObjectKey,

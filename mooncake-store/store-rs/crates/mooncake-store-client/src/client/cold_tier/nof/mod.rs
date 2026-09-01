@@ -12,6 +12,7 @@ pub(in crate::client) mod external_metadata;
 mod object;
 mod physical;
 pub(in crate::client) mod physical_adapter;
+mod runtime;
 
 #[cfg(feature = "kvcs-capi")]
 mod kvcs;
@@ -27,6 +28,10 @@ pub use physical::{
     NofDeviceManagement, NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits,
     NofPhysicalListPage, NofPhysicalObject, NofPhysicalQuery, NofPhysicalRead,
     NofPhysicalReadRequest, NofPhysicalWrite, NofStorageHealth, NofStorageManagement,
+};
+pub use runtime::NofTargetConfig;
+pub(in crate::client) use runtime::{
+    cold_as_nof, nof_as_cold, route_backing_as_cold, NofTargetManager,
 };
 
 pub use crate::client::cold_tier::layout::{

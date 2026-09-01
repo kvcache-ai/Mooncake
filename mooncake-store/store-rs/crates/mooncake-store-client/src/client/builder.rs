@@ -133,6 +133,8 @@ pub struct StoreClientBuilder {
     execution_fairness: Option<ExecutionFairness>,
     bandwidth_shaping: Option<BandwidthShaping>,
     cold_tier_targets: Vec<ColdTierTargetConfig>,
+    nof_targets: Vec<cold_tier::nof::NofTargetConfig>,
+    nof_replica_count: usize,
     cold_tier_watermarks: ColdTierWatermarkConfig,
     cold_tier_rate_limits: ColdTierRateLimitConfig,
     cold_tier_offload_mode: ColdTierOffloadMode,
@@ -167,6 +169,8 @@ impl StoreClientBuilder {
             execution_fairness: None,
             bandwidth_shaping: None,
             cold_tier_targets: Vec::new(),
+            nof_targets: Vec::new(),
+            nof_replica_count: 1,
             cold_tier_watermarks: ColdTierWatermarkConfig::default(),
             cold_tier_rate_limits: ColdTierRateLimitConfig::default(),
             cold_tier_offload_mode: ColdTierOffloadMode::default(),
@@ -327,6 +331,28 @@ impl StoreClientBuilder {
         self
     }
 
+    /// Configures a single remote NoF target (replaces any previously configured NoF targets).
+    pub fn nof_target(mut self, target: cold_tier::nof::NofTargetConfig) -> Self {
+        self.nof_targets = vec![target];
+        self
+    }
+
+    /// Configures remote NoF targets (replaces any previously configured NoF targets).
+    pub fn nof_targets<I>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = cold_tier::nof::NofTargetConfig>,
+    {
+        self.nof_targets = targets.into_iter().collect();
+        self
+    }
+
+    /// Sets Mooncake-managed replication for physical-KV NoF targets.
+    /// Logical-object providers keep ownership of their internal replication.
+    pub fn nof_replica_count(mut self, replica_count: usize) -> Self {
+        self.nof_replica_count = replica_count.clamp(1, 8);
+        self
+    }
+
     pub fn cold_tier_watermarks(mut self, watermarks: ColdTierWatermarkConfig) -> Self {
         self.cold_tier_watermarks = watermarks;
         self
@@ -464,6 +490,7 @@ impl StoreClientBuilder {
             route_write_gate: route_write_gate.clone(),
         });
         let cold_tier_enabled = cold_tier::cold_tier_enabled();
+        let nof_configured = !self.nof_targets.is_empty();
         let resolved_cold_tier = if cold_tier_enabled {
             self.cold_tier_targets
                 .iter()
@@ -484,7 +511,7 @@ impl StoreClientBuilder {
         // Pre-populate the live client cache before cold tier bootstrap so that
         // route_directory queries (which call cached_live_client_snapshot) do not
         // fail with "snapshot not initialized".
-        if !resolved_cold_tier.is_empty() {
+        if !resolved_cold_tier.is_empty() || nof_configured {
             prewarm_live_client_cache(
                 runtime_metadata.as_ref(),
                 &live_client_cache,
@@ -567,6 +594,15 @@ impl StoreClientBuilder {
         }
         let cold_tier_resolver =
             ColdTierBackendResolver::from_handles(default_cold_tier_id, cold_tier_handles);
+        let nof_targets =
+            cold_tier::nof::NofTargetManager::new(self.nof_targets, self.nof_replica_count)?;
+        for target_id in nof_targets.target_ids() {
+            if cold_tier_resolver.has_backend(&target_id) {
+                return Err(StoreError::InvalidState(format!(
+                    "persistent target ID {target_id} is configured as both local Cold Tier and NoF"
+                )));
+            }
+        }
         let storage_owner = Arc::new(StorageOwnerState::new(
             runtime.clone(),
             mooncake_store_route::RouteOperations::new(
@@ -578,6 +614,7 @@ impl StoreClientBuilder {
             state.clone(),
             StorageOwnerColdTierConfig {
                 resolver: cold_tier_resolver,
+                nof_targets,
                 devices: cold_tier_device_cache.clone(),
                 watermarks: self.cold_tier_watermarks,
                 rate_limits: self.cold_tier_rate_limits,
@@ -713,7 +750,8 @@ impl StoreClientBuilder {
             control_client.clone(),
             live_client_cache.clone(),
         )?;
-        let cold_tier_configured = cold_tier_enabled && !resolved_cold_tier.is_empty();
+        let cold_tier_configured =
+            cold_tier_enabled && (!resolved_cold_tier.is_empty() || nof_configured);
         let restore_promotions = Arc::new(RestorePromotionQueue::new(1024, 32, 32));
         let cold_restore_flights = Arc::new(ColdRestoreSingleflight::default());
         let cold_tier = if cold_tier_configured {

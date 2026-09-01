@@ -61,14 +61,6 @@ pub(in super::super) fn backend_remove_cold_payload(
 }
 
 #[allow(dead_code)]
-pub(in super::super) fn backend_remove_cold_payload_batch(
-    backend: &dyn PersistentStorageBackend,
-    cold_backings: &[&mooncake_store_core::ColdBackingRoute],
-) -> Vec<Result<bool>> {
-    backend.delete_objects_batch(cold_backings)
-}
-
-#[allow(dead_code)]
 pub(in super::super) fn backend_store_pending_source(
     backend: &dyn PersistentStorageBackend,
     cold_backing: &mooncake_store_core::ColdBackingRoute,
@@ -103,6 +95,39 @@ pub(in super::super) fn same_cold_payload(
         && left.object_locator == right.object_locator
 }
 
+pub(in super::super) fn persistent_backing_targets(
+    backing: &mooncake_store_core::ColdBackingRoute,
+) -> Vec<mooncake_store_core::ColdBackingRoute> {
+    let mut targets = Vec::with_capacity(1 + backing.replicas.len());
+    let mut primary = backing.clone();
+    primary.replicas.clear();
+    targets.push(primary);
+    targets.extend(
+        backing
+            .replicas
+            .iter()
+            .map(|replica| mooncake_store_core::ColdBackingRoute {
+                owner: replica.owner.clone(),
+                cold_tier_id: replica.cold_tier_id.clone(),
+                object_locator: replica.object_locator.clone(),
+                length: backing.length,
+                checksum: backing.checksum,
+                state: backing.state,
+                replicas: Vec::new(),
+            }),
+    );
+    targets
+}
+
+pub(in super::super) fn persistent_backing_contains_target(
+    backing: &mooncake_store_core::ColdBackingRoute,
+    target: &mooncake_store_core::ColdBackingRoute,
+) -> bool {
+    persistent_backing_targets(backing)
+        .iter()
+        .any(|candidate| same_cold_payload(candidate, target) && candidate.length == target.length)
+}
+
 #[allow(dead_code)]
 pub(in super::super) fn materialized_cold_backing(
     route: &ObjectRoute,
@@ -111,15 +136,36 @@ pub(in super::super) fn materialized_cold_backing(
         .cold_backing
         .clone()
         .filter(|cold| cold.state == mooncake_store_core::ColdBackingState::Materialized)
+        .or_else(|| {
+            route
+                .nof_backing
+                .as_ref()
+                .filter(|nof| nof.state == mooncake_store_core::NofBackingState::Materialized)
+                .map(super::nof::nof_as_cold)
+        })
+}
+
+pub(in super::super) fn pending_persistent_backing(
+    route: &ObjectRoute,
+) -> Option<(mooncake_store_core::ColdBackingRoute, bool)> {
+    route
+        .cold_backing
+        .clone()
+        .filter(|cold| cold.state == mooncake_store_core::ColdBackingState::PendingOffload)
+        .map(|backing| (backing, false))
+        .or_else(|| {
+            route
+                .nof_backing
+                .as_ref()
+                .filter(|nof| nof.state == mooncake_store_core::NofBackingState::PendingWrite)
+                .map(|nof| (super::nof::nof_as_cold(nof), true))
+        })
 }
 
 /// Like [`materialized_cold_backing`] but without cloning the backing record —
 /// for hot-path gating that only needs to know whether materialized backing exists.
 pub(in super::super) fn has_materialized_cold_backing(route: &ObjectRoute) -> bool {
-    route
-        .cold_backing
-        .as_ref()
-        .is_some_and(|cold| cold.state == mooncake_store_core::ColdBackingState::Materialized)
+    materialized_cold_backing(route).is_some()
 }
 
 pub(in super::super) fn validate_cold_restore_payload(

@@ -1327,7 +1327,7 @@ impl StorageOwnerState {
 
     fn has_usable_cold_tier_device(&self) -> Result<bool> {
         if !self.has_local_cold_tier_work() {
-            return Ok(false);
+            return Ok(!self.cold_tier_devices.nof_targets.is_empty());
         }
         self.cold_tier_devices
             .has_usable_device(self.metadata.as_ref())
@@ -1421,11 +1421,7 @@ impl StorageOwnerState {
             return Ok(None);
         };
         self.sync_route(&route);
-        if route.state == RouteState::Active
-            && route.cold_backing.as_ref().is_some_and(|cold_backing| {
-                cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
-            })
-        {
+        if route.state == RouteState::Active && cold_tier::has_materialized_cold_backing(&route) {
             Ok(Some(route))
         } else {
             Ok(None)

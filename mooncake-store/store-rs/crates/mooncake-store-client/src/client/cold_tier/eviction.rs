@@ -479,10 +479,7 @@ fn debug_route_after_replica_eviction(
 pub(in super::super) fn should_delete_route_after_last_replica_eviction(
     route: &ObjectRoute,
 ) -> bool {
-    !route
-        .cold_backing
-        .as_ref()
-        .is_some_and(|backing| backing.state == mooncake_store_core::ColdBackingState::Materialized)
+    !super::has_materialized_cold_backing(route)
 }
 
 pub(in super::super) fn route_after_replica_eviction(
@@ -515,7 +512,7 @@ impl StorageOwnerState {
         &self,
         route: &ObjectRoute,
     ) -> Result<Option<ObjectRoute>> {
-        let cold_state = route.cold_backing.as_ref().map(|backing| backing.state);
+        let cold_state = super::nof::route_backing_as_cold(route).map(|backing| backing.state);
         match cold_state {
             Some(mooncake_store_core::ColdBackingState::Materialized) => Ok(Some(route.clone())),
             Some(mooncake_store_core::ColdBackingState::PendingOffload) => {

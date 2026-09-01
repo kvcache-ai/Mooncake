@@ -843,7 +843,7 @@ impl StoreClient {
         cold_backing: &mooncake_store_core::ColdBackingRoute,
     ) -> Result<()> {
         let mut groups = BTreeMap::<ClientRuntimeId, Vec<mooncake_store_core::ColdBackingRoute>>::new();
-        for target in Self::cold_reclaim_targets(cold_backing) {
+        for target in cold_tier::persistent_backing_targets(cold_backing) {
             groups.entry(target.owner.clone()).or_default().push(target);
         }
         let namespace = self.metadata.route_namespace();
@@ -909,27 +909,6 @@ impl StoreClient {
         Ok(())
     }
 
-    fn cold_reclaim_targets(
-        cold_backing: &mooncake_store_core::ColdBackingRoute,
-    ) -> Vec<mooncake_store_core::ColdBackingRoute> {
-        let mut targets = Vec::with_capacity(1 + cold_backing.replicas.len());
-        let mut primary = cold_backing.clone();
-        primary.replicas.clear();
-        targets.push(primary);
-        for replica in &cold_backing.replicas {
-            targets.push(mooncake_store_core::ColdBackingRoute {
-                owner: replica.owner.clone(),
-                cold_tier_id: replica.cold_tier_id.clone(),
-                object_locator: replica.object_locator.clone(),
-                length: cold_backing.length,
-                checksum: cold_backing.checksum,
-                state: cold_backing.state,
-                replicas: Vec::new(),
-            });
-        }
-        targets
-    }
-
     fn cold_reclaim_still_targets_route(
         &self,
         reclaim: &PendingReclaim,
@@ -938,7 +917,8 @@ impl StoreClient {
         let Some(current) = self.route_ops().load_route(&reclaim.route_key)? else {
             return Ok(true);
         };
-        Ok(current.state != RouteState::Active || current.cold_backing.as_ref() != Some(cold_backing))
+        Ok(current.state != RouteState::Active
+            || cold_tier::nof::route_backing_as_cold(&current).as_ref() != Some(cold_backing))
     }
 
     fn reclaim_policy_rank(qos_tier: &str) -> u8 {

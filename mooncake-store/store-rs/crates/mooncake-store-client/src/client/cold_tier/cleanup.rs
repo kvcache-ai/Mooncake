@@ -7,7 +7,9 @@ use super::super::{
     DEFAULT_COLD_TIER_CLEANUP_VICTIM_BATCH, DEFAULT_OFFLOAD_MATERIALIZE_BATCH,
     DEFAULT_PENDING_DELETE_GC_BATCH,
 };
-use super::{backend_remove_cold_payload, backend_remove_pending_source};
+use super::{
+    backend_remove_cold_payload, backend_remove_pending_source, persistent_backing_contains_target,
+};
 use mooncake_store_core::ColdTierDeviceRecord;
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -505,14 +507,20 @@ impl StorageOwnerState {
                 self.runtime
             )));
         }
-        let Some(_) = self.ensure_cold_tier_device_loaded(cold_tier_device_id(cold_backing))?
-        else {
+        let nof_backing = self
+            .cold_tier_devices
+            .has_nof_backend(cold_tier_device_id(cold_backing));
+        if !nof_backing
+            && self
+                .ensure_cold_tier_device_loaded(cold_tier_device_id(cold_backing))?
+                .is_none()
+        {
             return Err(StoreError::NotFound(format!(
                 "cold tier device {} not found",
                 cold_tier_device_id(cold_backing)
             )));
-        };
-        if self.cold_backing_still_referenced_by_active_route(cold_backing)? {
+        }
+        if !nof_backing && self.cold_backing_still_referenced_by_active_route(cold_backing)? {
             return Ok(crate::control_plane::ColdReclaimResult {
                 skipped_still_referenced: true,
                 ..crate::control_plane::ColdReclaimResult::default()
@@ -535,6 +543,7 @@ impl StorageOwnerState {
                 }
             };
         if removed_cold_payload
+            && !nof_backing
             && cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
         {
             self.apply_cold_tier_usage_delta(
@@ -573,7 +582,7 @@ impl StorageOwnerState {
         Ok(routes.iter().any(|route| {
             route.state == RouteState::Active
                 && route.cold_backing.as_ref().is_some_and(|current| {
-                    cold_backing_route_contains_target(current, cold_backing)
+                    persistent_backing_contains_target(current, cold_backing)
                 })
         }))
     }
@@ -904,20 +913,4 @@ impl StorageOwnerState {
             }
         }
     }
-}
-
-fn cold_backing_route_contains_target(
-    current: &mooncake_store_core::ColdBackingRoute,
-    target: &mooncake_store_core::ColdBackingRoute,
-) -> bool {
-    (current.owner == target.owner
-        && current.cold_tier_id == target.cold_tier_id
-        && current.object_locator == target.object_locator
-        && current.length == target.length)
-        || current.replicas.iter().any(|replica| {
-            replica.owner == target.owner
-                && replica.cold_tier_id == target.cold_tier_id
-                && replica.object_locator == target.object_locator
-                && current.length == target.length
-        })
 }

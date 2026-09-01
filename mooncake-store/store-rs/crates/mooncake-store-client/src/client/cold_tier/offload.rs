@@ -11,8 +11,9 @@ use super::super::{
     DEFAULT_PENDING_OFFLOAD_RETRY_MAX_MS,
 };
 use super::{
-    backend_remove_cold_payload_batch, backend_remove_pending_source,
-    backend_store_cold_payload_batch, backend_store_pending_source, local_hot_replica_checksum,
+    backend_remove_cold_payload, backend_remove_pending_source, backend_store_cold_payload_batch,
+    backend_store_pending_source, local_hot_replica_checksum, materialized_cold_backing,
+    pending_persistent_backing, persistent_backing_contains_target, persistent_backing_targets,
     read_local_hot_replica_payload, same_cold_payload,
 };
 use parking_lot::Mutex;
@@ -28,7 +29,7 @@ pub(in super::super) fn enqueue_pending_offload(
     if super::cold_tier_disabled() {
         return;
     }
-    let Some(cold_backing) = route.cold_backing.as_ref() else {
+    let Some((cold_backing, _)) = pending_persistent_backing(route) else {
         return;
     };
     if cold_backing.owner != storage_owner.runtime {
@@ -68,7 +69,7 @@ pub(in super::super) fn publish_initial_write_cold_backing(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(cold_backing) = storage_owner.cold_backing_for_route(
+    let Some(backing) = storage_owner.backing_for_route(
         route,
         storage_owner.runtime.clone(),
         replica.length,
@@ -80,7 +81,7 @@ pub(in super::super) fn publish_initial_write_cold_backing(
     };
     let mut next = route.clone();
     next.version = next.version.next();
-    next.cold_backing = Some(cold_backing);
+    backing.publish(&mut next);
     let cas = storage_owner.route_ops.compare_and_swap_route(
         &route.key,
         Some(route.version),
@@ -108,10 +109,7 @@ pub(in super::super) fn repair_initial_write_cold_backings(
 ) -> Result<usize> {
     if super::cold_tier_disabled()
         || storage_owner.offload_mode != ColdTierOffloadMode::Passthrough
-        || storage_owner
-            .cold_tier_devices
-            .local_device_ids()
-            .is_empty()
+        || !storage_owner.cold_tier_devices.has_any_persistent_backend()
     {
         return Ok(0);
     }
@@ -176,7 +174,7 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(cold_backing) = storage_owner.pending_cold_backing_for_route(
+    let Some(backing) = storage_owner.pending_backing_for_route(
         route,
         storage_owner.runtime.clone(),
         replica.length,
@@ -188,7 +186,7 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
     };
     let mut next = route.clone();
     next.version = next.version.next();
-    next.cold_backing = Some(cold_backing);
+    backing.publish(&mut next);
     let cas = storage_owner.route_ops.compare_and_swap_route(
         &route.key,
         Some(route.version),
@@ -402,18 +400,22 @@ pub(in super::super) fn prepare_pending_offload_entries(
             .map(|entry| entry.key.route_key.clone())
             .collect::<Vec<_>>(),
     )?;
-    let devices = match storage_owner.cold_tier_devices.devices.lock().snapshot() {
-        Some(devices) => devices,
-        None => refresh_cold_tier_device_cache(
-            storage_owner.metadata.as_ref(),
-            &storage_owner.cold_tier_devices.devices,
-            "cold_tier_device_snapshot_offload_prepare",
-        )?,
+    let devices = if storage_owner.cold_tier_devices.has_any_local_backend() {
+        let devices = match storage_owner.cold_tier_devices.devices.lock().snapshot() {
+            Some(devices) => devices,
+            None => refresh_cold_tier_device_cache(
+                storage_owner.metadata.as_ref(),
+                &storage_owner.cold_tier_devices.devices,
+                "cold_tier_device_snapshot_offload_prepare",
+            )?,
+        };
+        devices
+            .into_iter()
+            .map(|device| (device.device_id.clone(), device))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
     };
-    let devices = devices
-        .into_iter()
-        .map(|device| (device.device_id.clone(), device))
-        .collect::<BTreeMap<_, _>>();
     let mut prepared = Vec::new();
     for index in 0..entries.len() {
         let entry = entries[index].clone();
@@ -471,17 +473,15 @@ pub(in super::super) fn prepare_pending_offload_entry(
         storage_owner.hot_replicas.remove_key(&entry.key.route_key);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     };
-    let refreshed_pending_entry = route.cold_backing.as_ref().and_then(|cold_backing| {
-        (cold_backing.owner == storage_owner.runtime
-            && cold_backing.state == mooncake_store_core::ColdBackingState::PendingOffload)
-            .then(|| PendingOffloadEntry {
-                key: entry.key.clone(),
-                route_version: route.version,
-                attempts: entry.attempts,
-                not_before: Instant::now(),
-                enqueued_at: entry.enqueued_at,
-                length_bytes: Some(cold_backing.length),
-            })
+    let refreshed_pending_entry = pending_persistent_backing(&route).and_then(|(backing, _)| {
+        (backing.owner == storage_owner.runtime).then(|| PendingOffloadEntry {
+            key: entry.key.clone(),
+            route_version: route.version,
+            attempts: entry.attempts,
+            not_before: Instant::now(),
+            enqueued_at: entry.enqueued_at,
+            length_bytes: Some(backing.length),
+        })
     });
     if route.state != RouteState::Active {
         if let Some(refreshed_entry) = refreshed_pending_entry.clone() {
@@ -499,13 +499,11 @@ pub(in super::super) fn prepare_pending_offload_entry(
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     }
-    let Some(cold_backing) = route.cold_backing.clone() else {
+    let Some((cold_backing, nof_backing)) = pending_persistent_backing(&route) else {
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     };
-    if cold_backing.owner != storage_owner.runtime
-        || cold_backing.state != mooncake_store_core::ColdBackingState::PendingOffload
-    {
+    if cold_backing.owner != storage_owner.runtime {
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     }
@@ -519,38 +517,44 @@ pub(in super::super) fn prepare_pending_offload_entry(
         return Ok(PendingOffloadPrepareOutcome::Retry(entry));
     };
     let device_id = cold_tier_device_id(&cold_backing);
-    let Some(device) = devices.get(device_id).cloned() else {
-        clear_unavailable_pending_cold_backing(
-            storage_owner,
-            &route,
-            &cold_backing,
-            "missing_device",
-            None,
-        )?;
-        return Ok(PendingOffloadPrepareOutcome::Skipped);
+    let device = if nof_backing {
+        None
+    } else {
+        let Some(device) = devices.get(device_id).cloned() else {
+            clear_unavailable_pending_cold_backing(
+                storage_owner,
+                &route,
+                &cold_backing,
+                nof_backing,
+                "missing_device",
+                None,
+            )?;
+            return Ok(PendingOffloadPrepareOutcome::Skipped);
+        };
+        if storage_owner.cold_tier_device_crosses_critical(&device, cold_backing.length) {
+            let mut update = mooncake_store_core::ColdTierDeviceUpdate::new(current_time_ms());
+            update.expected_updated_at_ms = Some(device.updated_at_ms);
+            update.state = Some(mooncake_store_core::ColdTierDeviceState::Full);
+            let updated = storage_owner
+                .metadata
+                .as_ref()
+                .update_cold_tier_device(device_id, update)?;
+            storage_owner.cold_tier_devices.upsert(updated);
+            return Ok(PendingOffloadPrepareOutcome::Retry(entry));
+        }
+        if !storage_owner
+            .cold_tier_devices
+            .accepts_offload(&device, cold_backing.length)
+        {
+            return Ok(PendingOffloadPrepareOutcome::Retry(entry));
+        }
+        Some(device)
     };
-    if storage_owner.cold_tier_device_crosses_critical(&device, cold_backing.length) {
-        let mut update = mooncake_store_core::ColdTierDeviceUpdate::new(current_time_ms());
-        update.expected_updated_at_ms = Some(device.updated_at_ms);
-        update.state = Some(mooncake_store_core::ColdTierDeviceState::Full);
-        let updated = storage_owner
-            .metadata
-            .as_ref()
-            .update_cold_tier_device(device_id, update)?;
-        storage_owner.cold_tier_devices.upsert(updated);
-        return Ok(PendingOffloadPrepareOutcome::Retry(entry));
-    }
-    if !storage_owner
-        .cold_tier_devices
-        .accepts_offload(&device, cold_backing.length)
-    {
-        return Ok(PendingOffloadPrepareOutcome::Retry(entry));
-    }
     let permit = match storage_owner
         .cold_tier_devices
         .try_acquire_offload(device_id)
     {
-        Ok(permit) => permit,
+        Ok(permit) => Some(permit),
         Err(reason) => {
             registry::record_cold_tier_operation(
                 "offload",
@@ -570,6 +574,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
                 storage_owner,
                 &route,
                 &cold_backing,
+                nof_backing,
                 "missing_backend",
                 Some(&error),
             )?;
@@ -588,6 +593,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
             entry,
             route,
             cold_backing,
+            nof_backing,
             payload,
             device,
             permit,
@@ -599,12 +605,17 @@ pub(in super::super) fn clear_unavailable_pending_cold_backing(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
     cold_backing: &mooncake_store_core::ColdBackingRoute,
+    nof_backing: bool,
     reason: &'static str,
     error: Option<&StoreError>,
 ) -> Result<()> {
     let mut next = route.clone();
     next.version = next.version.next();
-    next.cold_backing = None;
+    if nof_backing {
+        next.nof_backing = None;
+    } else {
+        next.cold_backing = None;
+    }
     let cas = storage_owner.route_ops.compare_and_swap_route(
         &route.key,
         Some(route.version),
@@ -666,7 +677,7 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
         )?;
         return Err(error);
     }
-    let (ready, reserved_release_bytes) =
+    let (mut ready, reserved_release_bytes) =
         match write_pending_offload_payloads(storage_owner, backend.as_ref(), pending, first_error)
         {
             Ok(result) => result,
@@ -687,7 +698,7 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
     }
     // Write to replica backends (best-effort — failures are logged but don't
     // block the primary offload).
-    write_pending_offload_replicas(storage_owner, pending, &ready);
+    write_pending_offload_replicas(storage_owner, pending, &mut ready);
     let cas_tracker = OperationTracker::new("cold_offload_route_cas_batch");
     let cas_results = match cas_pending_offload_routes(storage_owner, pending, &ready) {
         Ok(results) => {
@@ -716,9 +727,8 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
         reserved_release_bytes,
         first_error,
     )?;
-    if !outcome.cleanup.is_empty() {
-        let cleanup = outcome.cleanup.iter().collect::<Vec<_>>();
-        let _ = backend_remove_cold_payload_batch(backend.as_ref(), &cleanup);
+    for backing in &outcome.cleanup {
+        remove_unpublished_persistent_backing(storage_owner, backing);
     }
     if let Err(error) = settle_pending_offload_batch(
         storage_owner,
@@ -815,11 +825,18 @@ fn write_pending_offload_payloads(
     let mut ready = Vec::new();
     for (index, (prepared, write_result)) in pending.iter().zip(write_results).enumerate() {
         match write_result {
-            Ok(materialized_cold_backing) => {
-                prepared.permit.complete_ok();
+            Ok(mut materialized_cold_backing) => {
+                if let Some(permit) = prepared.permit.as_ref() {
+                    permit.complete_ok();
+                }
+                materialized_cold_backing.replicas.clear();
                 let mut next_route = prepared.route.clone();
                 next_route.version = next_route.version.next();
-                next_route.cold_backing = Some(materialized_cold_backing.clone());
+                publish_materialized_backing(
+                    &mut next_route,
+                    &materialized_cold_backing,
+                    prepared.nof_backing,
+                );
                 ready.push(PendingOffloadReadyRoute {
                     index,
                     materialized_cold_backing,
@@ -827,7 +844,9 @@ fn write_pending_offload_payloads(
                 });
             }
             Err(error) => {
-                prepared.permit.complete_error();
+                if let Some(permit) = prepared.permit.as_ref() {
+                    permit.complete_error();
+                }
                 reserved_release_bytes = record_failed_pending_offload_write(
                     storage_owner,
                     prepared,
@@ -847,13 +866,14 @@ fn write_pending_offload_payloads(
 fn write_pending_offload_replicas(
     storage_owner: &StorageOwnerState,
     pending: &[PendingOffloadMaterialization],
-    ready: &[PendingOffloadReadyRoute],
+    ready: &mut [PendingOffloadReadyRoute],
 ) {
     for ready_route in ready {
         let prepared = &pending[ready_route.index];
         if prepared.cold_backing.replicas.is_empty() {
             continue;
         }
+        let mut materialized_replicas = Vec::new();
         for replica in &prepared.cold_backing.replicas {
             // Build a temporary ColdBackingRoute pointing to the replica's
             // owner + device so that backend_for() resolves the correct backend.
@@ -885,16 +905,45 @@ fn write_pending_offload_replicas(
             }];
             let results = backend_store_cold_payload_batch(replica_backend.as_ref(), &writes);
             for result in results {
-                if let Err(error) = result {
-                    tracing::warn!(
-                        cold_tier_id = %replica.cold_tier_id,
-                        error = %error,
-                        key = %prepared.route.key.0,
-                        "cold_offload_replica_write_failed"
-                    );
+                match result {
+                    Ok(materialized) => {
+                        materialized_replicas.push(mooncake_store_core::ColdBackingReplica {
+                            owner: materialized.owner,
+                            cold_tier_id: materialized.cold_tier_id,
+                            object_locator: materialized.object_locator,
+                        })
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            cold_tier_id = %replica.cold_tier_id,
+                            error = %error,
+                            key = %prepared.route.key.0,
+                            "cold_offload_replica_write_failed"
+                        );
+                    }
                 }
             }
         }
+        ready_route.materialized_cold_backing.replicas = materialized_replicas;
+        publish_materialized_backing(
+            &mut ready_route.next_route,
+            &ready_route.materialized_cold_backing,
+            prepared.nof_backing,
+        );
+    }
+}
+
+fn publish_materialized_backing(
+    route: &mut ObjectRoute,
+    backing: &mooncake_store_core::ColdBackingRoute,
+    nof_backing: bool,
+) {
+    if nof_backing {
+        route.cold_backing = None;
+        route.nof_backing = Some(super::nof::cold_as_nof(backing));
+    } else {
+        route.nof_backing = None;
+        route.cold_backing = Some(backing.clone());
     }
 }
 
@@ -921,12 +970,14 @@ fn rollback_ready_pending_offloads(
     ready: &[PendingOffloadReadyRoute],
     mut reserved_release_bytes: i64,
 ) -> Result<i64> {
-    let cleanup = ready
-        .iter()
-        .map(|ready| &ready.materialized_cold_backing)
-        .collect::<Vec<_>>();
-    let _ = backend_remove_cold_payload_batch(backend, &cleanup);
     for ready in ready {
+        // A failed batch call has an unknown publication outcome. Provider-managed NoF
+        // locators are idempotent and have no Mooncake capacity reservation, so retain them
+        // for route confirmation/retry rather than risking an applied route pointing at data
+        // we just deleted. Local Cold Tier keeps its established reservation rollback path.
+        if !pending[ready.index].nof_backing {
+            remove_unpublished_persistent_backing(storage_owner, &ready.materialized_cold_backing);
+        }
         reserved_release_bytes = checked_add_cold_tier_bytes(
             reserved_release_bytes,
             pending_offload_payload_len_i64(&pending[ready.index])?,
@@ -1002,18 +1053,21 @@ fn apply_pending_offload_cas_result(
             storage_owner.pending_offloads.complete(&pending.entry.key);
         }
         Ok(cas) => {
-            let current_backing = cas
-                .current
+            let current_backing = cas.current.as_ref().and_then(materialized_cold_backing);
+            if let Some(current) = current_backing
                 .as_ref()
-                .and_then(|current| current.cold_backing.as_ref());
-            if current_backing
-                .is_some_and(|current| same_cold_payload(current, &ready.materialized_cold_backing))
+                .filter(|current| same_cold_payload(current, &ready.materialized_cold_backing))
             {
+                context.outcome.cleanup.extend(
+                    persistent_backing_targets(&ready.materialized_cold_backing)
+                        .into_iter()
+                        .filter(|target| !persistent_backing_contains_target(current, target)),
+                );
                 tracing::warn!(
                     route_key = %pending.route.key.0,
                     cold_tier_id = %ready.materialized_cold_backing.cold_tier_id,
                     object_locator = %ready.materialized_cold_backing.object_locator,
-                    current_state = ?current_backing.map(|current| current.state),
+                    current_state = ?current_backing.as_ref().map(|current| current.state),
                     expected_version = pending.route.version.0,
                     current_version = ?cas.current.as_ref().map(|c| c.version.0),
                     "offload CAS conflict kept payload because current route already references it"
@@ -1031,10 +1085,15 @@ fn apply_pending_offload_cas_result(
             storage_owner.pending_offloads.complete(&pending.entry.key);
         }
         Err(error) => {
-            context
-                .outcome
-                .cleanup
-                .push(ready.materialized_cold_backing.clone());
+            // Per-item errors can also represent a lost CAS reply. See the batch-error path
+            // above for why provider-managed NoF payloads are retained until retry confirms the
+            // route; definite conflicts are handled by the preceding branch and cleaned up.
+            if !pending.nof_backing {
+                context
+                    .outcome
+                    .cleanup
+                    .push(ready.materialized_cold_backing.clone());
+            }
             registry::record_cold_tier_operation(
                 "offload",
                 "error",
@@ -1049,10 +1108,33 @@ fn apply_pending_offload_cas_result(
     Ok(reserved_release_bytes)
 }
 
+pub(in super::super) fn remove_unpublished_persistent_backing(
+    storage_owner: &StorageOwnerState,
+    backing: &mooncake_store_core::ColdBackingRoute,
+) {
+    for target in persistent_backing_targets(backing) {
+        let result = storage_owner
+            .cold_tier_devices
+            .backend_for(&target)
+            .and_then(|backend| backend_remove_cold_payload(backend.as_ref(), &target));
+        if let Err(error) = result {
+            tracing::warn!(
+                cold_tier_id = %target.cold_tier_id,
+                object_locator = %target.object_locator,
+                error = %error,
+                "failed to remove unpublished persistent backing target"
+            );
+        }
+    }
+}
+
 fn reserve_pending_offload_batch(
     storage_owner: &StorageOwnerState,
     pending: &[PendingOffloadMaterialization],
 ) -> Result<()> {
+    if pending[0].nof_backing {
+        return Ok(());
+    }
     let reserved_bytes = sum_pending_offload_payload_bytes(pending)?;
     storage_owner.apply_cold_tier_usage_delta(
         cold_tier_device_id(&pending[0].cold_backing),
@@ -1084,6 +1166,7 @@ fn record_failed_pending_offload_write(
             storage_owner,
             &prepared.route,
             &prepared.cold_backing,
+            prepared.nof_backing,
             "checksum_mismatch",
             Some(&error),
         )?;
@@ -1091,13 +1174,15 @@ fn record_failed_pending_offload_write(
         storage_owner.pending_offloads.complete(&prepared.entry.key);
         return Ok(reserved_release_bytes);
     }
-    let mut update = mooncake_store_core::ColdTierDeviceUpdate::new(current_time_ms());
-    update.failure_count = Some(prepared.device.failure_count.saturating_add(1));
-    update.last_error = Some(Some(error.to_string()));
-    let _ = storage_owner
-        .metadata
-        .as_ref()
-        .update_cold_tier_device(cold_tier_device_id(&prepared.cold_backing), update);
+    if let Some(device) = prepared.device.as_ref() {
+        let mut update = mooncake_store_core::ColdTierDeviceUpdate::new(current_time_ms());
+        update.failure_count = Some(device.failure_count.saturating_add(1));
+        update.last_error = Some(Some(error.to_string()));
+        let _ = storage_owner
+            .metadata
+            .as_ref()
+            .update_cold_tier_device(cold_tier_device_id(&prepared.cold_backing), update);
+    }
     registry::record_cold_tier_operation(
         "offload",
         "error",
@@ -1116,6 +1201,9 @@ fn settle_pending_offload_batch(
     used_add_bytes: i64,
     reserved_release_bytes: i64,
 ) -> Result<()> {
+    if pending[0].nof_backing {
+        return Ok(());
+    }
     storage_owner.apply_cold_tier_usage_delta(
         cold_tier_device_id(&pending[0].cold_backing),
         used_add_bytes,
@@ -1176,6 +1264,38 @@ fn rebuild_pending_offload_queue_with(
             {
                 queue.push(route.key.clone(), route.version, Some(cold_backing.length));
             }
+        }
+    }
+    let mut nof_routes = storage_owner
+        .metadata
+        .as_ref()
+        .list_object_routes_by_nof_backing(&mooncake_store_core::NofBackingRouteFilter {
+            state: Some(mooncake_store_core::NofBackingState::PendingWrite),
+            owner: Some(storage_owner.runtime.clone()),
+            ..mooncake_store_core::NofBackingRouteFilter::default()
+        })?;
+    // Embedded route control keeps live routes in the shared authority directory rather than
+    // duplicating them into the external metadata table. Pending offloads still have a hot
+    // replica owned by this runtime, so the existing owner listing supplies the same recovery
+    // candidates. Queue insertion deduplicates routes returned by both sources.
+    nof_routes.extend(
+        storage_owner
+            .route_ops
+            .list_routes_by_replica_owner(&storage_owner.runtime)?,
+    );
+    for route in nof_routes {
+        let Some(backing) = route.nof_backing.as_ref() else {
+            continue;
+        };
+        if route.state == RouteState::Active
+            && backing.owner == storage_owner.runtime
+            && backing.state == mooncake_store_core::NofBackingState::PendingWrite
+            && storage_owner
+                .cold_tier_devices
+                .nof_targets
+                .contains(&backing.target_id)
+        {
+            queue.push(route.key.clone(), route.version, Some(backing.length));
         }
     }
     let len = queue.len();
