@@ -455,20 +455,6 @@ enum class AllocationStrategyType {
 };
 
 /**
- * @brief Placement policy used by the new replica allocation mechanism.
- *
- * This remains separate from AllocationStrategyType until MasterService
- * switches to the new path in the final stacked change.
- */
-enum class PlacementPolicyType {
-    RANDOM = 0,
-    FREE_RATIO_FIRST,
-    CXL,
-    SSD_FREE_RATIO_FIRST,
-    LOCAL_FIRST,
-};
-
-/**
  * @brief Represents a contiguous NoF ssd region
  */
 struct NoFSegment {

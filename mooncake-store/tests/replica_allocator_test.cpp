@@ -1,4 +1,4 @@
-#include "placement/replica_allocator.h"
+#include "placement/domain.h"
 
 #include <gtest/gtest.h>
 
@@ -6,6 +6,7 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "local_ssd/manager.h"
@@ -33,8 +34,6 @@ class TestPlacementTarget final : public PlacementTarget {
         return buffer;
     }
 
-    bool IsCxl() const noexcept override { return is_cxl_; }
-
    private:
     bool is_cxl_;
     std::string cxl_binding_;
@@ -60,6 +59,7 @@ class PlacementState {
     }
 
     ScopedPlacementReadAccess Access() { return {index, hosts, owners, mutex}; }
+    ScopedPlacementReadAccess AcquirePlacementAccess() { return Access(); }
 
     PlacementIndex index;
     HostRegionIndex hosts;
@@ -75,8 +75,8 @@ class PlacementState {
 
 ReplicaAllocationRequest Request(size_t replica_count = 1) {
     ReplicaAllocationRequest request;
-    request.size = 4096;
-    request.replica_count = replica_count;
+    request.replicas.size = 4096;
+    request.replicas.count = replica_count;
     return request;
 }
 
@@ -95,17 +95,43 @@ TEST(PlacementIndexTest, KeepsPointersStableAndRemovesGroupsWithSwapPop) {
     state.Add("a", "a");
     state.Add("b", "b");
     state.Add("c", "c");
-    auto* a = state.index.GetView().Find("a");
-    auto* c = state.index.GetView().Find("c");
+    auto* a = state.index.Find("a");
+    auto* c = state.index.Find("c");
 
     for (size_t i = 0; i < 64; ++i) {
         state.Add("extra-" + std::to_string(i),
                   "endpoint-" + std::to_string(i));
     }
     ASSERT_TRUE(state.index.RemoveTarget("b", state.targets[1].get()));
-    EXPECT_EQ(state.index.GetView().Find("a"), a);
-    EXPECT_EQ(state.index.GetView().Find("c"), c);
-    EXPECT_EQ(state.index.GetView().Find("b"), nullptr);
+    EXPECT_EQ(state.index.Find("a"), a);
+    EXPECT_EQ(state.index.Find("c"), c);
+    EXPECT_EQ(state.index.Find("b"), nullptr);
+}
+
+TEST(ReplicaAllocatorPolicyTest, NoFOnlyRemapsSsdRanking) {
+    PlacementState state;
+    const SsdFreeRatioFirstPlacementPolicy ssd_policy{
+        LocalSSDMetricsView(state.local_ssd)};
+    const LocalFirstPlacementPolicy local_policy;
+
+    const auto nof_ssd_policy = MakeNoFPlacementPolicy(ssd_policy);
+    const auto nof_local_policy = MakeNoFPlacementPolicy(local_policy);
+
+    static_assert(
+        std::is_same_v<decltype(nof_ssd_policy), const RandomPlacementPolicy>);
+    static_assert(std::is_same_v<decltype(nof_local_policy),
+                                 const LocalFirstPlacementPolicy>);
+}
+
+TEST(ReplicaPlacementTest, BindsSourceToPolicy) {
+    PlacementState state;
+    state.Add("group", "endpoint");
+    ReplicaPlacement placement(state, RandomPlacementPolicy{});
+
+    auto result = placement.Allocate(Request());
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaEndpoint(result->front()), "endpoint");
 }
 
 TEST(ReplicaAllocatorTest, SameNameFallbackStaysWithinOneLogicalGroup) {
@@ -115,7 +141,7 @@ TEST(ReplicaAllocatorTest, SameNameFallbackStaysWithinOneLogicalGroup) {
     state.Add("shared", "good");
     state.Add("other", "other");
 
-    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
+    ReplicaAllocator allocator(RandomPlacementPolicy{});
     for (size_t i = 0; i < 64; ++i) {
         auto access = state.Access();
         auto result = allocator.Allocate(access, Request(2));
@@ -133,10 +159,10 @@ TEST(ReplicaAllocatorTest, FailedPreferencesFallBackBestEffort) {
     std::vector<std::string> preferred{"failed", "preferred"};
     std::vector<std::string> excluded{"unused"};
 
-    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
+    ReplicaAllocator allocator(RandomPlacementPolicy{});
     auto request = Request(3);
-    request.preferred_groups = preferred;
-    request.excluded_groups = excluded;
+    request.placement.preferred_groups = preferred;
+    request.placement.excluded_groups = excluded;
     auto access = state.Access();
     auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
@@ -151,7 +177,7 @@ TEST(ReplicaAllocatorTest, RankedPoliciesUseFreeCapacityFeedback) {
     state.Add("second", "second", kCapacity / 2);
     best->SetAlwaysFail();
 
-    ReplicaAllocator allocator(PlacementPolicyType::FREE_RATIO_FIRST);
+    ReplicaAllocator allocator(FreeRatioFirstPlacementPolicy{});
     auto access = state.Access();
     auto result = allocator.Allocate(access, Request());
     ASSERT_TRUE(result.has_value());
@@ -174,8 +200,8 @@ TEST(ReplicaAllocatorTest, SsdPolicyUsesLogicalGroupOwner) {
     ASSERT_TRUE(state.local_ssd.AdjustUsedBytes(low, 900));
     ASSERT_TRUE(state.local_ssd.AdjustUsedBytes(high, 100));
 
-    ReplicaAllocator allocator(PlacementPolicyType::SSD_FREE_RATIO_FIRST,
-                               LocalSSDMetricsView(state.local_ssd));
+    ReplicaAllocator allocator(
+        SsdFreeRatioFirstPlacementPolicy(LocalSSDMetricsView(state.local_ssd)));
     auto access = state.Access();
     auto result = allocator.Allocate(access, Request());
     ASSERT_TRUE(result.has_value());
@@ -190,12 +216,12 @@ TEST(ReplicaAllocatorTest, LocalPolicyConsumesHostOrdering) {
     state.hosts["writer"]["local-a"].insert(generate_uuid());
     state.hosts["writer"]["local-b"].insert(generate_uuid());
 
-    ReplicaAllocator allocator(PlacementPolicyType::LOCAL_FIRST);
+    ReplicaAllocator allocator(LocalFirstPlacementPolicy{});
     auto request = Request(2);
-    request.writer_host_id = "writer";
-    request.object_key = "key";
+    request.host_affinity.writer_host_id = "writer";
+    request.host_affinity.object_key = "key";
     auto access = state.Access();
-    std::vector<PlacementGroup*> expected;
+    std::vector<const PlacementGroup*> expected;
     access.GetHostOrderedGroups("writer", "key", expected);
     auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
@@ -204,10 +230,16 @@ TEST(ReplicaAllocatorTest, LocalPolicyConsumesHostOrdering) {
     EXPECT_EQ(ReplicaEndpoint((*result)[1]), expected[1]->name);
 }
 
-TEST(ReplicaAllocatorTest, CxlRequiresPreferenceAndConvertsBuffer) {
+TEST(ReplicaAllocatorTest, PreferredOnlyRequiresAGroup) {
     PlacementState state;
+    ReplicaAllocator allocator(PreferredOnlyPlacementPolicy{});
+    {
+        auto access = state.Access();
+        EXPECT_EQ(allocator.Allocate(access, Request()).error(),
+                  ErrorCode::INVALID_PARAMS);
+    }
+
     state.Add("cxl", "global-cxl", 0, true, "client-binding");
-    ReplicaAllocator allocator(PlacementPolicyType::CXL);
     {
         auto access = state.Access();
         EXPECT_EQ(allocator.Allocate(access, Request()).error(),
@@ -215,7 +247,7 @@ TEST(ReplicaAllocatorTest, CxlRequiresPreferenceAndConvertsBuffer) {
     }
 
     auto request = Request();
-    request.preferred_group = "cxl";
+    request.placement.preferred_group = "cxl";
     auto access = state.Access();
     auto result = allocator.Allocate(access, request);
     ASSERT_TRUE(result.has_value());
@@ -231,7 +263,7 @@ TEST(ReplicaAllocatorTest, AllocateFromResolvesOneGroup) {
     PlacementState state;
     state.Add("logical", "bad")->SetAlwaysFail();
     state.Add("logical", "good");
-    ReplicaAllocator allocator(PlacementPolicyType::RANDOM);
+    ReplicaAllocator allocator(RandomPlacementPolicy{});
     auto access = state.Access();
     auto result = allocator.AllocateFrom(access, 4096, "logical");
     ASSERT_TRUE(result.has_value());

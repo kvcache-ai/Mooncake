@@ -1,129 +1,113 @@
 #include "placement/index.h"
 
 #include <algorithm>
+#include <functional>
 #include <iterator>
 
 namespace mooncake {
-namespace {
 
-bool Contains(const std::vector<PlacementGroup*>& groups,
-              const PlacementGroup* group) {
-    return std::find(groups.begin(), groups.end(), group) != groups.end();
-}
-
-void AppendUnique(std::vector<PlacementGroup*>& groups, PlacementGroup* group) {
-    if (group && !Contains(groups, group)) {
-        groups.push_back(group);
+bool PlacementGroup::AddTarget(const PlacementTarget& target) {
+    if (std::find(targets.begin(), targets.end(), &target) != targets.end()) {
+        return false;
     }
+    targets.push_back(&target);
+    return true;
 }
 
-}  // namespace
+bool PlacementGroup::RemoveTarget(const PlacementTarget& target) {
+    auto it = std::find(targets.begin(), targets.end(), &target);
+    if (it == targets.end()) {
+        return false;
+    }
+    *it = targets.back();
+    targets.pop_back();
+    return true;
+}
 
-bool PlacementIndex::AddTarget(std::string_view name, PlacementTarget* target) {
+bool PlacementGroup::ReplaceTarget(const PlacementTarget& expected,
+                                   const PlacementTarget& replacement) {
+    auto it = std::find(targets.begin(), targets.end(), &expected);
+    if (it == targets.end()) {
+        return false;
+    }
+    *it = &replacement;
+    return true;
+}
+
+bool PlacementIndex::AddTarget(std::string_view name,
+                               const PlacementTarget* target) {
     if (name.empty() || !target) {
         return false;
     }
-    auto it = by_name_.find(name);
-    PlacementGroup* group = nullptr;
-    if (it == by_name_.end()) {
-        auto owned = std::make_unique<PlacementGroup>();
-        owned->name = name;
-        group = owned.get();
-        owned_groups_.push_back(std::move(owned));
-        by_name_.emplace(group->name, group);
-        active_groups_.push_back(group);
-    } else {
-        group = it->second;
+    auto it = groups_.find(name);
+    if (it != groups_.end()) {
+        return it->second->AddTarget(*target);
     }
-    if (std::find(group->targets.begin(), group->targets.end(), target) !=
-        group->targets.end()) {
-        return false;
-    }
-    group->targets.push_back(target);
+
+    auto group = std::make_unique<PlacementGroup>(name, *target);
+    const auto* group_ptr = group.get();
+    groups_.emplace(group->name, std::move(group));
+    active_groups_.push_back(group_ptr);
     return true;
 }
 
 bool PlacementIndex::RemoveTarget(std::string_view name,
-                                  PlacementTarget* target) {
-    auto it = by_name_.find(name);
-    if (it == by_name_.end()) {
+                                  const PlacementTarget* target) {
+    if (!target) {
         return false;
     }
-    PlacementGroup* group = it->second;
-    auto target_it =
-        std::find(group->targets.begin(), group->targets.end(), target);
-    if (target_it == group->targets.end()) {
+    auto it = groups_.find(name);
+    if (it == groups_.end() || !it->second->RemoveTarget(*target)) {
         return false;
     }
-    *target_it = group->targets.back();
-    group->targets.pop_back();
-    if (!group->targets.empty()) {
+    if (!it->second->targets.empty()) {
         return true;
     }
 
+    const auto* group = it->second.get();
     auto active_it =
         std::find(active_groups_.begin(), active_groups_.end(), group);
     if (active_it != active_groups_.end()) {
         *active_it = active_groups_.back();
         active_groups_.pop_back();
     }
-    by_name_.erase(it);
-    auto owned_it =
-        std::find_if(owned_groups_.begin(), owned_groups_.end(),
-                     [&](const auto& owned) { return owned.get() == group; });
-    if (owned_it != owned_groups_.end()) {
-        *owned_it = std::move(owned_groups_.back());
-        owned_groups_.pop_back();
-    }
+    groups_.erase(it);
     return true;
 }
 
 bool PlacementIndex::ReplaceTarget(std::string_view name,
-                                   PlacementTarget* expected,
-                                   PlacementTarget* replacement) {
-    if (!replacement) {
+                                   const PlacementTarget* expected,
+                                   const PlacementTarget* replacement) {
+    if (!expected || !replacement) {
         return false;
     }
-    auto it = by_name_.find(name);
-    if (it == by_name_.end()) {
-        return false;
-    }
-    auto target_it = std::find(it->second->targets.begin(),
-                               it->second->targets.end(), expected);
-    if (target_it == it->second->targets.end()) {
-        return false;
-    }
-    *target_it = replacement;
-    return true;
+    auto it = groups_.find(name);
+    return it != groups_.end() &&
+           it->second->ReplaceTarget(*expected, *replacement);
 }
 
 void PlacementIndex::Clear() {
-    by_name_.clear();
+    groups_.clear();
     active_groups_.clear();
-    owned_groups_.clear();
 }
 
-PlacementReadView PlacementIndex::GetView() const {
-    return PlacementReadView(*this);
+const PlacementGroup* PlacementIndex::Find(std::string_view name) const {
+    auto it = groups_.find(name);
+    return it == groups_.end() ? nullptr : it->second.get();
 }
 
-PlacementGroup* PlacementReadView::Find(std::string_view name) const {
-    auto it = index_.by_name_.find(name);
-    return it == index_.by_name_.end() ? nullptr : it->second;
-}
-
-void PlacementReadView::GetActiveGroupNames(
+void PlacementIndex::GetActiveGroupNames(
     std::vector<std::string>& names) const {
     names.clear();
-    names.reserve(index_.active_groups_.size());
-    for (const auto* group : index_.active_groups_) {
+    names.reserve(active_groups_.size());
+    for (const auto* group : active_groups_) {
         names.push_back(group->name);
     }
 }
 
 void ScopedPlacementReadAccess::GetHostOrderedGroups(
     std::string_view writer_host_id, std::string_view key,
-    std::vector<PlacementGroup*>& output) const {
+    std::vector<const PlacementGroup*>& output) const {
     output.clear();
     if (!regions_by_host_ || writer_host_id.empty() ||
         regions_by_host_->empty()) {
@@ -138,7 +122,6 @@ void ScopedPlacementReadAccess::GetHostOrderedGroups(
         }
     }
 
-    auto placement = GetView();
     for (size_t host_index = 0; host_index < regions_by_host_->size();
          ++host_index) {
         const auto& groups = host_it->second;
@@ -149,7 +132,11 @@ void ScopedPlacementReadAccess::GetHostOrderedGroups(
             std::advance(group_it, start);
             for (size_t i = 0; i < groups.size(); ++i) {
                 if (!group_it->second.empty()) {
-                    AppendUnique(output, placement.Find(group_it->first));
+                    const auto* group = placement_.Find(group_it->first);
+                    if (group && std::find(output.begin(), output.end(),
+                                           group) == output.end()) {
+                        output.push_back(group);
+                    }
                 }
                 ++group_it;
                 if (group_it == groups.end()) {

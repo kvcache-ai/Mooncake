@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <optional>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -12,20 +11,14 @@ namespace mooncake {
 
 // Binds replica allocation to a concrete placement source without virtual
 // dispatch. PlacementSource must provide AcquirePlacementAccess().
-template <typename PlacementSource>
+template <typename PlacementSource, ReplicaPlacementPolicy Policy>
 class ReplicaPlacement final {
    public:
-    ReplicaPlacement(
-        PlacementSource& source, PlacementPolicyType policy_type,
-        std::optional<LocalSSDMetricsView> local_ssd_metrics = std::nullopt)
-        : source_(&source),
-          allocator_(policy_type, std::move(local_ssd_metrics)) {}
+    ReplicaPlacement(PlacementSource& source, Policy policy)
+        : source_(&source), allocator_(std::move(policy)) {}
 
-    PlacementPolicyType policy_type() const noexcept {
-        return allocator_.policy_type();
-    }
-    bool UsesHostAffinity() const noexcept {
-        return policy_type() == PlacementPolicyType::LOCAL_FIRST;
+    static constexpr bool UsesHostAffinity() noexcept {
+        return ReplicaAllocator<Policy>::UsesHostAffinity();
     }
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
@@ -44,7 +37,7 @@ class ReplicaPlacement final {
 
    private:
     PlacementSource* source_;
-    ReplicaAllocator allocator_;
+    ReplicaAllocator<Policy> allocator_;
 };
 
 }  // namespace mooncake

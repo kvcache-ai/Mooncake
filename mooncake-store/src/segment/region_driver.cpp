@@ -26,8 +26,6 @@ class NativePlacementTarget final : public PlacementTarget {
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
         return allocator().allocate(size);
     }
-
-    bool IsCxl() const noexcept override { return false; }
 };
 
 class CxlPlacementTarget final : public PlacementTarget {
@@ -44,8 +42,6 @@ class CxlPlacementTarget final : public PlacementTarget {
         }
         return buffer;
     }
-
-    bool IsCxl() const noexcept override { return true; }
 
    private:
     std::string cxl_binding_name_;

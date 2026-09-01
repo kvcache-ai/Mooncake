@@ -19,11 +19,18 @@
 namespace mooncake {
 
 struct PlacementGroup final {
-    std::string name;
-    std::vector<PlacementTarget*> targets;
-};
+    PlacementGroup(std::string_view group_name,
+                   const PlacementTarget& first_target)
+        : name(group_name), targets{&first_target} {}
 
-class PlacementReadView;
+    bool AddTarget(const PlacementTarget& target);
+    bool RemoveTarget(const PlacementTarget& target);
+    bool ReplaceTarget(const PlacementTarget& expected,
+                       const PlacementTarget& replacement);
+
+    std::string name;
+    std::vector<const PlacementTarget*> targets;
+};
 
 class PlacementIndex final {
    public:
@@ -33,41 +40,26 @@ class PlacementIndex final {
     PlacementIndex(const PlacementIndex&) = delete;
     PlacementIndex& operator=(const PlacementIndex&) = delete;
 
-    bool AddTarget(std::string_view name, PlacementTarget* target);
-    bool RemoveTarget(std::string_view name, PlacementTarget* target);
-    bool ReplaceTarget(std::string_view name, PlacementTarget* expected,
-                       PlacementTarget* replacement);
+    bool AddTarget(std::string_view name, const PlacementTarget* target);
+    bool RemoveTarget(std::string_view name, const PlacementTarget* target);
+    bool ReplaceTarget(std::string_view name, const PlacementTarget* expected,
+                       const PlacementTarget* replacement);
     void Clear();
 
-    PlacementReadView GetView() const;
-
-   private:
-    std::unordered_map<std::string, PlacementGroup*, TransparentStringHash,
-                       std::equal_to<>>
-        by_name_;
-    std::vector<PlacementGroup*> active_groups_;
-    std::vector<std::unique_ptr<PlacementGroup>> owned_groups_;
-
-    friend class PlacementReadView;
-};
-
-class PlacementReadView final {
-   public:
-    PlacementGroup* Find(std::string_view name) const;
+    const PlacementGroup* Find(std::string_view name) const;
     bool Contains(std::string_view name) const { return Find(name) != nullptr; }
     void GetActiveGroupNames(std::vector<std::string>& names) const;
-    std::span<PlacementGroup* const> active_groups() const {
-        return index_.active_groups_;
+    std::span<const PlacementGroup* const> active_groups() const {
+        return active_groups_;
     }
-    size_t size() const noexcept { return index_.active_groups_.size(); }
-    bool empty() const noexcept { return index_.active_groups_.empty(); }
+    size_t size() const noexcept { return active_groups_.size(); }
+    bool empty() const noexcept { return active_groups_.empty(); }
 
    private:
-    explicit PlacementReadView(const PlacementIndex& index) : index_(index) {}
-
-    const PlacementIndex& index_;
-
-    friend class PlacementIndex;
+    std::unordered_map<std::string, std::unique_ptr<PlacementGroup>,
+                       TransparentStringHash, std::equal_to<>>
+        groups_;
+    std::vector<const PlacementGroup*> active_groups_;
 };
 
 using HostRegionIndex =
@@ -91,11 +83,11 @@ class ScopedPlacementReadAccess final {
           owner_client_by_group_name_(&owner_client_by_group_name),
           lock_(mutex) {}
 
-    PlacementReadView GetView() const { return placement_.GetView(); }
+    const PlacementIndex& GetView() const { return placement_; }
 
     void GetHostOrderedGroups(std::string_view writer_host_id,
                               std::string_view key,
-                              std::vector<PlacementGroup*>& output) const;
+                              std::vector<const PlacementGroup*>& output) const;
     std::optional<UUID> GetOwnerClientId(std::string_view group_name) const;
 
    private:

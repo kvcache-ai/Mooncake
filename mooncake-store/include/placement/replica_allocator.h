@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <cstddef>
 #include <optional>
 #include <span>
@@ -29,28 +30,57 @@ class LocalSSDMetricsView final {
     const LocalSsdManager* local_ssd_;
 };
 
-struct ReplicaAllocationRequest final {
+struct ReplicaRequirements final {
     size_t size{0};
-    size_t replica_count{1};
+    size_t count{1};
+    ReplicaType type{ReplicaType::MEMORY};
+};
+
+struct PlacementConstraints final {
     std::string_view preferred_group;
     std::span<const std::string> preferred_groups;
     std::span<const std::string> excluded_groups;
-    ReplicaType replica_type{ReplicaType::MEMORY};
+};
+
+struct HostAffinity final {
     std::string_view writer_host_id;
     std::string_view object_key;
+};
+
+struct ReplicaAllocationRequest final {
+    ReplicaRequirements replicas;
+    PlacementConstraints placement;
+    HostAffinity host_affinity;
 };
 
 struct PlacementDiagnostics final {
     bool has_sufficient_active_group_count{false};
 };
 
+struct RandomPlacementPolicy final {};
+struct FreeRatioFirstPlacementPolicy final {};
+struct LocalFirstPlacementPolicy final {};
+struct PreferredOnlyPlacementPolicy final {};
+
+struct SsdFreeRatioFirstPlacementPolicy final {
+    explicit SsdFreeRatioFirstPlacementPolicy(LocalSSDMetricsView metrics_view)
+        : metrics(std::move(metrics_view)) {}
+
+    LocalSSDMetricsView metrics;
+};
+
+template <typename Policy>
+concept ReplicaPlacementPolicy =
+    std::same_as<Policy, RandomPlacementPolicy> ||
+    std::same_as<Policy, FreeRatioFirstPlacementPolicy> ||
+    std::same_as<Policy, SsdFreeRatioFirstPlacementPolicy> ||
+    std::same_as<Policy, LocalFirstPlacementPolicy> ||
+    std::same_as<Policy, PreferredOnlyPlacementPolicy>;
+
+template <ReplicaPlacementPolicy Policy>
 class ReplicaAllocator final {
    public:
-    explicit ReplicaAllocator(
-        PlacementPolicyType policy_type,
-        std::optional<LocalSSDMetricsView> local_ssd_metrics = std::nullopt)
-        : policy_type_(policy_type),
-          local_ssd_metrics_(std::move(local_ssd_metrics)) {}
+    explicit ReplicaAllocator(Policy policy) : policy_(std::move(policy)) {}
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         ScopedPlacementReadAccess& placement,
@@ -62,14 +92,28 @@ class ReplicaAllocator final {
         std::string_view group_name,
         ReplicaType replica_type = ReplicaType::MEMORY) const;
 
-    PlacementPolicyType policy_type() const noexcept { return policy_type_; }
+    static constexpr bool UsesHostAffinity() noexcept {
+        return std::same_as<Policy, LocalFirstPlacementPolicy>;
+    }
 
    private:
-    PlacementPolicyType policy_type_;
-    std::optional<LocalSSDMetricsView> local_ssd_metrics_;
+    Policy policy_;
 };
 
-PlacementPolicyType EffectiveNoFPlacementPolicy(
-    PlacementPolicyType memory_policy);
+extern template class ReplicaAllocator<RandomPlacementPolicy>;
+extern template class ReplicaAllocator<FreeRatioFirstPlacementPolicy>;
+extern template class ReplicaAllocator<SsdFreeRatioFirstPlacementPolicy>;
+extern template class ReplicaAllocator<LocalFirstPlacementPolicy>;
+extern template class ReplicaAllocator<PreferredOnlyPlacementPolicy>;
+
+inline RandomPlacementPolicy MakeNoFPlacementPolicy(
+    const SsdFreeRatioFirstPlacementPolicy&) {
+    return {};
+}
+
+template <ReplicaPlacementPolicy Policy>
+Policy MakeNoFPlacementPolicy(const Policy& memory_policy) {
+    return memory_policy;
+}
 
 }  // namespace mooncake
