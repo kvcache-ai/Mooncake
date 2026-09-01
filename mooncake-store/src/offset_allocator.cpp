@@ -7,8 +7,8 @@
 #include <iomanip>
 #include <iostream>
 
+#include "common/byte_size.h"
 #include "mutex.h"
-#include "utils.h"
 
 #ifdef DEBUG
 #include <assert.h>

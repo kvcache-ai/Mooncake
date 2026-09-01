@@ -5,7 +5,7 @@
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
 #include "master_service.h"
-#include "utils/zstd_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake {
 

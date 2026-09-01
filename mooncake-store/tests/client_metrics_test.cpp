@@ -11,9 +11,9 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_metric.h"
+#include "common/network.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
-#include "utils.h"
 #include "version.h"
 
 namespace mooncake::test {

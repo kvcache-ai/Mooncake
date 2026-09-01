@@ -18,7 +18,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "test_server_helpers.h"
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 
 namespace mooncake::test {
 

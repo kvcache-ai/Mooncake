@@ -21,7 +21,7 @@
 #include "allocator.h"
 #include "client_service.h"
 #include "types.h"
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
 #include "crc_checksum.h"

@@ -21,8 +21,8 @@
 #include "serialize/serializer.h"
 #include "segment.h"
 #include "task_manager.h"
-#include "utils/file_util.h"
-#include "utils/zstd_util.h"
+#include "common/file_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake {
 

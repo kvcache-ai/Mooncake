@@ -27,7 +27,7 @@
 
 #include "tenant_quota_policy_store.h"
 #include "types.h"
-#include "utils.h"
+#include "common/network.h"
 #include "master_service_test_fixture.h"
 
 namespace mooncake::test {

@@ -14,7 +14,8 @@
 #include "client_service.h"
 #include "test_server_helpers.h"
 #include "types.h"
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
+#include "common/network.h"
 
 namespace mooncake {
 namespace testing {

@@ -10,7 +10,6 @@
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
-#include "utils.h"
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif

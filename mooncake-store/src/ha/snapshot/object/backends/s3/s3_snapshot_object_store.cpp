@@ -8,7 +8,7 @@
 
 #include <glog/logging.h>
 
-#include "utils/s3_helper.h"
+#include "common/s3_helper.h"
 
 namespace mooncake {
 

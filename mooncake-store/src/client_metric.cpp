@@ -6,6 +6,7 @@
 #include <thread>
 
 #include "bool_parser.h"
+#include "common/byte_size.h"
 #include "integer_parser.h"
 #include "version.h"
 

@@ -5,6 +5,7 @@
 #include "client_service.h"
 #include "common.h"
 #include "config.h"
+#include "common/byte_size.h"
 #include "real_client.h"
 #include "version.h"
 

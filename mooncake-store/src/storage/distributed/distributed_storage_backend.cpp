@@ -8,7 +8,6 @@
 #include "environ.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "types.h"
-#include "utils.h"
 
 namespace mooncake {
 
