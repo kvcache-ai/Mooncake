@@ -1,83 +1,81 @@
 # NoF architecture
 
-The current implementation adds two deliberately separate provider seams under the existing
-Cold Tier subsystem. It does not add a separate NoF control plane.
+NoF is one capability-based framework under the existing Cold Tier subsystem. It has no separate
+control plane and no high-level/low-level framework split. `NofBacking` is the runtime composition
+trait; a backing exposes only the capability traits that Mooncake is allowed to call.
 
-## Ownership
+## Capability model
 
-Logical metadata, physical-storage maintenance, and physical-device management are independent.
-`NofOwnership` records all three dimensions instead of treating high-level and low-level as two
-indivisible ownership modes:
+The capabilities are independent:
 
-| Execution mode | Logical metadata | GC/watermarks/compaction | disks/health/rebuild |
+| Capability | Trait | Purpose |
+| --- | --- | --- |
+| logical object write/read/query/delete | `NofObjectWrite`, `NofObjectRead`, `NofObjectQuery`, `NofObjectDelete` | provider object APIs with namespaces and native manifests |
+| physical KV write/read/query/delete | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | raw key/value APIs used by the shared physical adapter |
+| external logical metadata | `NofExternalMetadata` | typed NoF get/list/CAS over the existing `MetadataBackend` |
+| backing health | `NofHealth` | liveness and optional capacity without claiming storage or device ownership |
+| storage maintenance | `NofStorageManagement` | physical inventory and capacity needed by Mooncake GC/watermarks |
+| device lifecycle | `NofDeviceManagement` | provider-supported health and device lifecycle integration |
+
+Capability absence is authoritative. It means the provider owns the responsibility internally or
+does not expose it through a supported API. Mooncake does not infer capabilities from a mode name
+and does not emulate a missing SDK function with an undocumented CLI or private service API.
+
+`NofBackend` is the single public facade. It contains an `Arc<dyn NofBacking>`, validates the
+limits advertised for the selected data plane, performs the existing provider-neutral shard/key
+planning, and optionally composes `NofExternalMetadata`. A backing may expose object I/O, physical
+I/O, health, or management-only capabilities without creating another framework branch.
+
+The current KVCS mapping is:
+
+| `MOONCAKE_KVCS_MODE` | Exposed data-plane traits | External metadata | Health/management traits |
 | --- | --- | --- | --- |
-| Standard/high-level SDK | `ProviderManaged` | `ProviderManaged` | `ProviderManaged` |
-| KVCS Low-Level SDK | `ExternalMetadata` | `ProviderManaged` | `ProviderManaged` |
-| Full raw low-level executor | `ExternalMetadata` | `MooncakeManaged` | `MooncakeManaged` |
+| `standard` | object read/write/query/delete | absent; KVCS owns namespace and manifest metadata | absent; EFC owns physical maintenance and disks |
+| `low-level` (default) | physical read/write/query/delete | composed from Mooncake's existing metadata backend by the runtime binding | query-backed `NofHealth`; storage/device management absent because EFC owns them |
 
-`NofHighLevelBackend` is for a Standard/object SDK. The provider owns namespaces, manifests,
-placement, replicas, object visibility, capacity policy, and physical maintenance. Mooncake only
-plans native SDK shard ranges and forwards object operations; it does not publish a second Cold
-Tier route or run disk management for this path.
+Both modes use one `KvcsCapiExecutor`. Mode selection initializes only the corresponding SDK
+client configuration and controls which `NofBacking` capability accessors return `Some`. Calling a
+trait from the wrong mode is rejected; it never silently crosses into the other SDK API.
 
-`NofLowLevelTarget` is for physical KV I/O. Low-Level operations have no namespace, route,
-version, owner, checksum, or replica fields, so Mooncake's existing `MetadataBackend` remains the
-external logical metadata authority. The persistence service is shared, but the data model is
-not: local disks use `ObjectRoute.cold_backing: ColdBackingRoute`, while NoF uses
-`ObjectRoute.nof_backing: NofBackingRoute`. A route cannot contain both. This is not a second
-Redis/etcd implementation and it does not encode a remote NoF target as a local `cold_tier_id`.
+## Persisted backing metadata
 
-The metadata boundary is complete independently of a concrete data-plane executor: core types,
-Redis indexing, protobuf transport, admin output and typed external-metadata operations all retain
-`nof_backing` as its own field. A runtime executor integration must publish and update that field;
-mapping a NoF target into persisted `cold_backing` is not a supported compatibility shortcut.
+The runtime `NofBacking` trait is deliberately separate from the persisted `NofBackingRoute`
+record. Traits cannot be a stable Redis/protobuf schema. Local disks use
+`ObjectRoute.cold_backing: ColdBackingRoute`, while NoF uses
+`ObjectRoute.nof_backing: NofBackingRoute`; a route cannot contain both. A remote NoF target is
+never encoded as a local `cold_tier_id`.
 
-The provider-neutral low-level adapter is implemented against the existing Cold Tier backend
-contract so a runtime binding can reuse:
+Core types, Redis indexing, protobuf transport, admin output and `NofExternalMetadata` retain
+`nof_backing` as its own field. The metadata trait is a typed extension over the injected
+`MetadataBackend` (in-memory, Redis or etcd); it owns no connection, cache, journal or second
+keyspace implementation. NoF enumeration uses `NofBackingRouteFilter`, while local Cold Tier
+cleanup continues to use `ColdBackingRouteFilter`.
 
-- device/target registration, offload preparation, reservation and batch scheduling;
-- route CAS and settle, replica selection, restore selection and logical load balancing through
-  the NoF external-metadata seam;
-- route deletion and `PendingDelete` convergence through the executor's key-level `delete`;
-- checksum verification, record layout, device fencing and operational entry points.
+The additive route field is gated by `nof-backing-route-v1`. A writer cannot publish
+`nof_backing` unless its route compatibility descriptor advertises that capability. Operators
+must enable NoF only after every control-plane node that may decode and rewrite routes supports
+the field.
 
-The current public API exposes the executor contracts, `NofLowLevelTarget`, and typed external
-metadata; the generic backend adapter remains internal. It does not attach a NoF target to
-`StoreClientBuilder`: doing so through the existing Cold Tier target hook would publish
-`cold_backing`, which is invalid for NoF. Runtime offload/restore attachment belongs behind a
-binding that publishes `nof_backing` throughout its route state machine.
+## Reuse of Cold Tier
 
-Each management group is optional. A Mooncake-maintained storage executor additionally supplies an
-exhaustive paginated object inventory and real capacity/available-space health, allowing the
-existing Cold Tier reconciliation, watermark cleanup and compaction paths to operate. A
-provider-maintained storage executor does not need those methods: the provider owns physical orphan
-collection, watermarks and compaction. Device management is declared separately; a
-provider-managed device layer owns discovery, capacity/health reporting, offline/recovery and
-rebuild. Mooncake must not emulate a missing SDK method by spawning an undocumented provider CLI.
+The physical adapter reuses `PersistentStorageBackend`, `MetadataBackend`, checksum validation,
+`ValueChunkPlan`, `PhysicalKeyCodec` and the existing Cold Tier batching/maintenance entry points.
+It adds only collision-resistant physical keys, value chunk records, a small root manifest and
+calls to the backing's physical `put/get/delete/flush` traits. It does not add a scheduler,
+allocator, buffer pool, metadata service, GC loop or device manager.
 
-If a backend owns logical object metadata, it uses the shared high-level metadata/object seam;
-the low-level `PersistentStorageBackend` adapter is only valid with `ExternalMetadata`. This keeps
-provider metadata handling in one place instead of creating a second low-level manifest database.
-The three-way declaration still lets a new backend independently choose provider or Mooncake
-ownership for metadata, storage maintenance, and devices.
+If `NofStorageManagement` is present, the existing Cold Tier reconciliation and watermark paths
+may use its exhaustive list and real capacity values. If it is absent, the provider owns orphan
+collection, watermarks and compaction. `NofDeviceManagement` is evaluated independently. KVCS
+exposes neither management trait because its public 0.4.0 client ABI does not provide those
+operations. KVCS Low-Level does expose `NofHealth`: it sends a side-effect-free existence query to
+the selected mountpoint, while leaving capacity unknown because the SDK has no capacity API.
 
-The generic low-level adapter adds only a collision-resistant physical key codec, value chunk
-records, a small root manifest, and calls to `put/get/delete/flush`. It does not define a
-scheduler, device-task schema, allocator, or route state machine.
-
-The implementation deliberately reuses the existing `PersistentStorageBackend`,
-`MetadataBackend`, checksum implementation and batching path. The external
-metadata interface is the stable boundary that allows an executor integration to reuse Cold Tier
-orchestration without reusing `ColdBackingRoute` as the persisted NoF schema.
-`ValueChunkPlan` and `PhysicalKeyCodec` are
-small primitives owned by the Cold Tier layout layer and consumed where needed by the NoF
-execution modes; they are not global store-core concepts. No second allocator, buffer pool,
-metadata backend, GC loop or device manager is introduced.
+The internal physical adapter is not yet attached to `StoreClientBuilder`: the existing local
+Cold Tier hook publishes `cold_backing`, while a NoF runtime binding must publish `nof_backing`
+throughout offload, restore, replica and delete state transitions.
 
 ## Module layout
-
-NoF belongs to the existing Cold Tier subsystem. High-level and low-level are its two execution
-models; a concrete SDK appears only as an executor at the leaf of one of those models:
 
 ```text
 client/
@@ -88,43 +86,24 @@ client/
       value_chunk.rs
     nof/
       mod.rs
-      external_metadata.rs
-      highlevel/
+      backing.rs
+      backend.rs
+      object.rs
+      physical.rs
+      physical_adapter.rs
+      external_metadata/
+        mod.rs
+        tests.rs
+      kvcs/
         mod.rs
         executor.rs
-        kvcs_executor.rs
-      lowlevel/
-        mod.rs
-        executor.rs
-        backend.rs
-        kvcs_executor.rs
-      kvcs_capi.rs
+        capi.rs
+        capi_tests.rs
 ```
 
-`layout/` owns the Cold Tier-only physical key and value-splitting primitives. The two
-`executor.rs` files are the provider-neutral contracts that any new high-level or low-level
-executor implements. Their neighboring `mod.rs` files only assemble the facade/target and module
-exports. `lowlevel/backend.rs` adapts the low-level contract to the existing Cold Tier
-`PersistentStorageBackend`. The two `kvcs_executor.rs` files contain only concrete KVCS SDK
-behavior. `kvcs_capi.rs` contains the private shared bindings for the vendor's public C API and is
-included by the parent module solely to avoid duplicating C declarations between the two KVCS
-executors. It is neither a third NoF execution model nor a public SDK layer.
-
-`ExternalMetadata` is an ownership value, not another storage service under `nof/`.
-`external_metadata.rs` is a typed extension over the injected `MetadataBackend` (in-memory,
-Redis or etcd): it exposes NoF get/list/CAS operations, validates that local and NoF backing are
-mutually exclusive, and delegates persistence to the existing backend. It owns no connection,
-cache, journal or keyspace implementation. NoF enumeration uses `NofBackingRouteFilter`; local
-Cold Tier cleanup continues to use `ColdBackingRouteFilter`, so the two maintenance domains
-cannot select each other's objects. Target and owner filters match the same physical primary or
-replica entry, and Redis indexes every primary and replica target rather than only the route's
-primary.
-
-The additive route field is gated by `nof-backing-route-v1`. A writer cannot publish
-`nof_backing` unless its route compatibility descriptor advertises that capability. Operators
-must enable NoF only after every control-plane node that may decode and rewrite routes supports
-the field; otherwise an older protobuf endpoint could discard the unknown field during a
-read-modify-write cycle.
+Public provider-neutral traits live directly under `nof/`. All KVCS-specific configuration, C API
+calls and tests live under `nof/kvcs/`. `executor.rs` contains one mode-selecting KVCS executor;
+`capi.rs` is the private binding for the vendor's public C ABI.
 
 ## KVCS Low-Level capability boundary
 
@@ -232,19 +211,19 @@ C ABI. It does not copy SDK algorithms or provider control-plane code. If a stab
 becomes available, the C declarations can be replaced by that dependency without changing the NoF
 traits.
 
-## Low-level executor construction
+## KVCS executor construction
 
-The implemented public API constructs a provider-neutral target without registering it as a local
-Cold Tier device:
+`KvcsCapiExecutor::new` reads `MOONCAKE_KVCS_MODE`; unset defaults to `low-level`. Tests and
+embedding code may select the same behavior explicitly with `with_mode`:
 
 ```rust,ignore
 use std::sync::Arc;
 use mooncake_store_client::{
-    KvcsCapiLowLevelExecutor, NofLowLevelTarget,
+    KvcsCapiExecutor, KvcsMode, NofBackend,
 };
 
-let executor = Arc::new(KvcsCapiLowLevelExecutor::new()?);
-let target = NofLowLevelTarget::new(executor);
+let executor = Arc::new(KvcsCapiExecutor::with_mode(KvcsMode::LowLevel)?);
+let backend = NofBackend::new(executor)?;
 ```
 
 The runtime binding must write `nof_backing`, never encode the target in persisted `cold_backing`.
@@ -268,7 +247,7 @@ dependencies are unrelated to KVCS.
 The adapter deliberately does not depend on the SDK's `rust/` path crate, `pkg-config`, `bindgen`,
 the KVCS C++ sources, `libkvcs.a`, or `libstdc++-static`. Those belong to the vendor Rust wrapper's
 default static-link flow, not to Mooncake's C ABI integration. EFC and Redis are runtime services,
-not compilation dependencies: Standard/high-level operations require EFC plus Redis, while
+not compilation dependencies: Standard-mode operations require EFC plus Redis, while
 Low-Level operations require EFC and a configured mountpoint but do not use Redis.
 
 `build.rs` enforces the supported binary boundary before emitting a linker directive:
@@ -297,7 +276,9 @@ install the complete `.so` SONAME chain in the system loader configuration or se
 `KVCS_SDK_ROOT` is a Mooncake build input and defaults to `/opt/kvcs-sdk/latest`.
 `KVCS_SDK_USE_MOCK` is also a build-time switch: unset or `0` selects production, and `1` selects
 the official mock. Any other value is rejected. Cargo reruns the build script when either value
-changes.
+changes. `MOONCAKE_KVCS_MODE` is a runtime construction parameter: `standard` exposes only the
+logical-object traits, while `low-level` exposes only the physical-KV traits; unset defaults to
+`low-level`.
 
 The vendor's top-level `env.sh` assigns `KVCS_SDK_ROOT` as a shell variable but does not export it,
 and `mock/env.sh` configures the vendor Rust wrapper through `KVCS_DYNAMIC`. Mooncake does not read
@@ -363,7 +344,7 @@ export KVCS_SDK_USE_MOCK=1
 export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/mock/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --features kvcs-capi --lib \
-  kvcs_executor::tests::live_ --offline -- --ignored --test-threads=1
+  live_ --offline -- --ignored --test-threads=1
 ```
 
 Live Standard smoke requires EFC plus Redis. Live Low-Level smoke requires EFC and a configured
@@ -375,7 +356,7 @@ export KVCS_SDK_USE_MOCK=0
 export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
 cargo test -p mooncake-store-client --features kvcs-capi --lib \
-  kvcs_executor::tests::live_ --offline -- \
+  live_ --offline -- \
   --ignored --test-threads=1
 ```
 
@@ -386,8 +367,8 @@ separately.
 
 Use these checks when changing the NoF implementation:
 
-1. ownership and reuse: confirm no NoF control plane, allocator, metadata backend, scheduler, GC or
-   rebuild loop was introduced, and that provider-managed maintenance is not invoked for KVCS;
+1. capabilities and reuse: confirm no NoF control plane, allocator, metadata backend, scheduler,
+   GC or rebuild loop was introduced, and that absent KVCS management traits are not invoked;
 2. correctness and ABI: check positional batches, partial failures, manifest visibility, checksum
    validation, key/value limits, environment parsing, C ABI layouts and the public 0.4.0 SDK/mock;
 3. reproducibility: verify every package URL above, default and `kvcs-capi` builds, tests, clippy

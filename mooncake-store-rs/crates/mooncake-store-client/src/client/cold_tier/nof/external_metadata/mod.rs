@@ -12,7 +12,7 @@ use mooncake_store_core::{
 /// This extension adds no database, journal, or cache. It provides a typed NoF
 /// boundary and prevents a route from being published as both a local Cold Tier
 /// backing and a NoF backing.
-pub trait NofExternalMetadata {
+pub trait NofExternalMetadata: Send + Sync {
     fn get_nof_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>>;
 
     fn list_nof_object_routes(&self, filter: &NofBackingRouteFilter) -> Result<Vec<ObjectRoute>>;

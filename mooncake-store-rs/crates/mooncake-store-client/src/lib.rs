@@ -7,14 +7,15 @@ mod route_directory;
 mod transport;
 
 #[cfg(feature = "kvcs-capi")]
-pub use client::cold_tier::nof::{KvcsCapiLowLevelExecutor, KvcsCapiStandardExecutor};
+pub use client::cold_tier::nof::{KvcsCapiExecutor, KvcsMode};
 pub use client::cold_tier::nof::{
-    NofDeviceManagement, NofExternalMetadata, NofHighLevelBackend, NofHighLevelCapabilities,
-    NofHighLevelExecutor, NofHighLevelObject, NofHighLevelObjectMetadata, NofHighLevelRead,
-    NofHighLevelShardPut, NofLowLevelCapabilities, NofLowLevelDeleteRequest, NofLowLevelExecutor,
-    NofLowLevelGetRequest, NofLowLevelListPage, NofLowLevelObject, NofLowLevelStorageHealth,
-    NofLowLevelTarget, NofMetadataOwnership, NofOwnership, NofStorageMaintenance,
-    OpaquePhysicalKey, PhysicalKeyCodec, PhysicalKeyInput, Sha256PhysicalKeyCodec,
+    NofBackend, NofBacking, NofDeviceManagement, NofExternalMetadata, NofHealth, NofObject,
+    NofObjectDelete, NofObjectLimits, NofObjectMetadata, NofObjectQuery, NofObjectRead,
+    NofObjectShardWrite, NofObjectState, NofObjectWrite, NofPhysicalDelete,
+    NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalListPage, NofPhysicalObject,
+    NofPhysicalQuery, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofStorageHealth,
+    NofStorageManagement, OpaquePhysicalKey, PhysicalKeyCodec, PhysicalKeyInput,
+    Sha256PhysicalKeyCodec,
 };
 pub use client::{
     stable_phase_spread_ms, BandwidthShaping, ColdTierKind, ColdTierOffloadMode,
