@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -11,17 +12,21 @@
 #include <utility>
 #include <vector>
 
+#include <boost/functional/hash.hpp>
+
 #include "lease.h"
 #include "object_entry.h"
-#include "tenant_id.h"
+#include "rpc_types.h"
+#include "tenant/tenant_id.h"
 
 namespace mooncake {
 class MasterService;  // friend for the test-only route-lock seam below
 namespace tenant {
 
 // A group is not a container of objects: it is a thin membership table plus a
-// single shared Lease, consulted only at eviction (all-or-none). The read path
-// never touches this.
+// single shared Lease. The lease is the all-or-none unit consulted by eviction
+// (the per-member ObjectMetadata entry points at it); the read path extends
+// that shared lease on a member hit without touching this table.
 struct GroupState {
     std::unordered_set<std::string> member_keys;
     std::shared_ptr<Lease> lease;
@@ -82,28 +87,6 @@ class TenantStore {
         return {it->second.member_keys.begin(), it->second.member_keys.end()};
     }
 
-    bool HasGroup(const std::string& group_id) const {
-        std::shared_lock<std::shared_mutex> lock(groups_lock_);
-        return groups_.find(group_id) != groups_.end();
-    }
-
-    size_t GroupCount() const {
-        std::shared_lock<std::shared_mutex> lock(groups_lock_);
-        return groups_.size();
-    }
-
-    // Empty a previously-empty group: only call with a valid group that has
-    // members. Returns true when the group exists and is fully expired.
-    bool AllExpired(const std::string& group_id,
-                    const std::chrono::system_clock::time_point now) const {
-        std::shared_lock<std::shared_mutex> lock(groups_lock_);
-        auto it = groups_.find(group_id);
-        if (it == groups_.end()) {
-            return false;
-        }
-        return it->second.lease != nullptr && it->second.lease->IsExpired(now);
-    }
-
     // The object route is a flat map key -> strong ObjectEntry handle. Read
     // pins the entry under the shared route lock (fast), releases it, then takes
     // the per-object lock; the strong handle keeps the entry alive across that
@@ -159,12 +142,6 @@ class TenantStore {
         return route_.size();
     }
 
-    // In-flight dynamic-replication leases are keyed by proposal UUID (not by
-    // object key), so they cannot fold into a per-object ObjectEntry. Guard with
-    // leases_lock().
-    std::unordered_map<UUID, ReplicaActionLease, boost::hash<UUID>>
-        dynamic_replication_leases;
-
     // True when the tenant holds no object route, no group membership, and no
     // in-flight dynamic-replication lease. Callers hold no locks when invoking.
     bool Empty() const {
@@ -197,10 +174,11 @@ class TenantStore {
         }
     }
 
-    // Callback-scoped point accessor: pin the entry by key, then run `fn`
-    // against its metadata while the per-object `mutex` is held. The metadata
-    // reference must not escape the callback. No-op when the key is absent or
-    // the entry has no metadata yet.
+    // Callback-scoped test/diagnostic access; production paths pin + lock
+    // explicitly. Pin the entry by key, then run `fn` against its metadata
+    // while the per-object `mutex` is held. The metadata reference must not
+    // escape the callback. No-op when the key is absent or the entry has no
+    // metadata yet.
     template <typename Fn>
     void WithObject(const std::string& key, Fn&& fn) const {
         auto entry = Pin(key);
@@ -208,6 +186,73 @@ class TenantStore {
             return;
         }
         entry->WithMetadata(std::forward<Fn>(fn));
+    }
+
+    // --- Dynamic-replication lease table (locked accessors) ---
+    // In-flight dynamic-replication leases are keyed by proposal UUID (not by
+    // object key), so they do not fold into a per-object ObjectEntry. The map is
+    // private and reached only through these locked accessors.
+
+    // Find a lease by proposal id. Returns a copy so the returned lease stays
+    // valid after the lock is released. std::nullopt when absent.
+    std::optional<ReplicaActionLease> FindDynamicReplicationLease(
+        const UUID& proposal_id) const {
+        std::shared_lock<std::shared_mutex> lock(leases_lock_);
+        auto it = dynamic_replication_leases.find(proposal_id);
+        return it == dynamic_replication_leases.end()
+                   ? std::nullopt
+                   : std::make_optional<ReplicaActionLease>(it->second);
+    }
+
+    // Remove a lease by proposal id. Returns true if one was removed.
+    bool RemoveDynamicReplicationLease(const UUID& proposal_id) {
+        std::unique_lock<std::shared_mutex> lock(leases_lock_);
+        return dynamic_replication_leases.erase(proposal_id) > 0;
+    }
+
+    // Record (or overwrite) a lease for a proposal id.
+    void PutDynamicReplicationLease(const UUID& proposal_id,
+                                    ReplicaActionLease lease) {
+        std::unique_lock<std::shared_mutex> lock(leases_lock_);
+        dynamic_replication_leases[proposal_id] = std::move(lease);
+    }
+
+    // Remove every lease whose object key matches `key`.
+    void EraseDynamicReplicationLeasesForObject(const std::string& key) {
+        std::unique_lock<std::shared_mutex> lock(leases_lock_);
+        for (auto it = dynamic_replication_leases.begin();
+             it != dynamic_replication_leases.end();) {
+            if (it->second.key == key) {
+                it = dynamic_replication_leases.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Remove every lease that has expired (expire_at_ms_epoch < now_ms).
+    void EraseExpiredDynamicReplicationLeases(int64_t now_ms) {
+        std::unique_lock<std::shared_mutex> lock(leases_lock_);
+        for (auto it = dynamic_replication_leases.begin();
+             it != dynamic_replication_leases.end();) {
+            if (it->second.expire_at_ms_epoch < now_ms) {
+                it = dynamic_replication_leases.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Test-only: true when any lease references `key`. Production does not
+    // consult the lease table by object key.
+    bool HasDynamicReplicationLeaseForKeyForTest(const std::string& key) const {
+        std::shared_lock<std::shared_mutex> lock(leases_lock_);
+        for (const auto& [_, lease] : dynamic_replication_leases) {
+            if (lease.key == key) {
+                return true;
+            }
+        }
+        return false;
     }
 
  private:
@@ -228,9 +273,12 @@ class TenantStore {
     mutable std::shared_mutex groups_lock_;
     std::unordered_map<std::string, GroupState> groups_;
 
-    // Guards dynamic_replication_leases (public member). Accessed rarely
-    // (dynamic-replication admission + expiry sweep), so a dedicated lock.
+    // In-flight dynamic-replication leases, keyed by proposal UUID (not by
+    // object key), so they cannot fold into a per-object ObjectEntry. Guarded by
+    // leases_lock_ and reached only through the locked accessors above.
     mutable std::shared_mutex leases_lock_;
+    std::unordered_map<UUID, ReplicaActionLease, boost::hash<UUID>>
+        dynamic_replication_leases;
 };
 
 }  // namespace tenant

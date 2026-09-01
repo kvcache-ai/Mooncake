@@ -102,35 +102,12 @@ class MasterServiceTest : public ::testing::Test {
         service.CleanupExpiredSoftPins(now);
     }
 
-    size_t MetadataShardIndex(MasterService& service, const std::string& key,
-                              const TenantId& tenant_id = TenantId::Default()) {
-        return service.getShardIndex(tenant_id, key);
-    }
-
-    size_t MetadataBucketCount(
-        MasterService& service, size_t shard_idx,
-        const TenantId& tenant_id = TenantId::Default()) {
-        // The tenant's metadata lives in one container, so the bucket count is
-        // read from that tenant (shard_idx is only the legacy routing hint,
-        // which no longer partitions a tenant's objects).
-        (void)shard_idx;
-        auto tenant_handle = service.tenant_directory_.Lookup(tenant_id);
-        if (!tenant_handle) {
-            return 0;
-        }
-        // There is no tenant-level lock; ObjectCount() takes the route lock
-        // itself. The bucket count read is a proxy for the object-route's live
-        // tables; here the meaningful "size" is the object count.
-        return tenant_handle->ObjectCount();
-    }
-
     void SetSoftPinDeadlineForTest(
         MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        const size_t shard_idx = service.getShardIndex(normalized_tenant, key);
         auto tenant_handle = service.GetOrCreateTenantStateHandle(normalized_tenant);
         auto entry = tenant_handle->Pin(key);
         ASSERT_TRUE(entry != nullptr && entry->has_metadata());
@@ -141,7 +118,7 @@ class MasterServiceTest : public ::testing::Test {
             metadata.soft_pin_timeout = deadline;
         }
         service.soft_pin_deadline_index_.Upsert(
-            normalized_tenant.MakeScopedKey(key), shard_idx, deadline);
+            normalized_tenant.MakeScopedKey(key), deadline);
     }
 
     size_t SoftPinDeadlineHeapSize(MasterService& service) {
@@ -205,12 +182,54 @@ class MasterServiceTest : public ::testing::Test {
         return service.getShardIndex(tenant_id, key);
     }
 
+    // Regression: MetadataAccessorRW::Create() used to ignore InsertObject()'s
+    // return value. If a concurrent writer inserted the key first, Create()
+    // would bind to an orphan entry not in the route. It must re-Pin the
+    // existing entry instead. Lives on the fixture (a MasterService friend) so
+    // it can reach the private MetadataAccessorRW.
+    void AccessorCreateRePinsWinnerEntry(MasterService& service) {
+        const UUID client_id = generate_uuid();
+        const std::string key = "accessor_create_repin_winner";
+        const TenantId tenant_id("tenant_accessor_create_repin");
+        const MasterService::ObjectIdentity object_id =
+            service.MakeObjectIdentityForRequest(key, tenant_id);
+        const TenantId normalized = object_id.tenant_id;
+
+        // Build the accessor while the object does not yet exist.
+        MasterService::MetadataAccessorRW accessor(&service, object_id);
+        ASSERT_FALSE(accessor.Exists());
+
+        // A concurrent writer wins and publishes the key first, with valid
+        // metadata (a LOCAL_DISK replica keeps IsValid() true).
+        auto winner = std::make_shared<mooncake::tenant::ObjectEntry>(key, "");
+        std::vector<Replica> winner_replicas;
+        winner_replicas.emplace_back(
+            Replica(client_id, 4096, "host:port", ReplicaStatus::COMPLETE));
+        winner->SetMetadata(std::make_unique<ObjectMetadata>(
+            client_id, std::chrono::system_clock::now(), 4096,
+            std::move(winner_replicas)));
+        auto tenant_handle = service.GetOrCreateTenantStateHandle(normalized);
+        ASSERT_TRUE(tenant_handle->InsertObject(key, winner));
+
+        // Create() must re-Pin the route winner, not bind the orphan.
+        accessor.Create(client_id, 4096, std::vector<Replica>{});
+
+        EXPECT_TRUE(accessor.Exists());
+        EXPECT_EQ(accessor.GetEntry(), winner);
+        EXPECT_EQ(accessor.Get().GetAllReplicas().size(), 1u);
+        // The route holds exactly one entry for the key (the winner).
+        auto pinned = tenant_handle->Pin(key);
+        ASSERT_NE(pinned, nullptr);
+        EXPECT_EQ(pinned, winner);
+        EXPECT_EQ(tenant_handle->ObjectCount(), 1u);
+    }
+
     void UpsertSoftPinDeadlineIndexForTest(
-        MasterService& service, const std::string& key, size_t shard_idx,
+        MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,
         const std::string& tenant_id = "default") {
         service.soft_pin_deadline_index_.Upsert(
-            TenantId(tenant_id).MakeScopedKey(key), shard_idx, deadline);
+            TenantId(tenant_id).MakeScopedKey(key), deadline);
     }
 
     size_t PopExpiredSoftPinDeadlinesForTest(
@@ -497,7 +516,7 @@ class MasterServiceTest : public ::testing::Test {
                     [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
                             entry) { objs.push_back(entry); });
                 for (const auto& entry : objs) {
-                    if (entry->IsGrouped()) {
+                    if (!entry->group_id().empty()) {
                         tenant_state.object_route.RemoveMember(
                             entry->group_id(), entry->key());
                     }

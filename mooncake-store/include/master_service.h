@@ -43,9 +43,9 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
-#include "object_entry_types.h"
+#include "tenant/object_entry_types.h"
 #include "object_metadata.h"
-#include "tenant/tenant_dir.h"
+#include "tenant/tenant_directory.h"
 #include "tenant/tenant_store.h"
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -113,25 +113,6 @@ class MasterServiceSSDTest;
 namespace benchmarks {
 class BatchEvictBench;
 }  // namespace benchmarks
-
-// std::unordered_map/set never shrink their bucket array on erase, so a
-// container that once held millions of entries keeps its high-water bucket
-// memory (8 bytes per bucket) forever. ShrinkBucketsIfSparse rehashes a
-// container down to roughly twice its live size once the bucket array is
-// both large enough to matter and less than a quarter full. The bucket
-// floor avoids rehash churn on small containers; the 2x headroom keeps a
-// freshly shrunk container from growing again right away.
-// Rehashing invalidates iterators: callers must hold the lock guarding the
-// container and must not be iterating it.
-inline constexpr size_t kShrinkMinBucketCount = 1024;
-
-template <typename UnorderedContainer>
-void ShrinkBucketsIfSparse(UnorderedContainer& container) {
-    if (container.bucket_count() > kShrinkMinBucketCount &&
-        container.size() < container.bucket_count() / 4) {
-        container.rehash(container.size() * 2);
-    }
-}
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -1107,6 +1088,8 @@ class MasterService {
                 visitor) const {
             object_route.VisitObjects(visitor);
         }
+        // Callback-scoped test/diagnostic access; production paths pin + lock
+        // explicitly.
         template <typename Fn>
         void WithObject(const std::string& key, Fn&& fn) const {
             object_route.WithObject(key, std::forward<Fn>(fn));
@@ -1131,14 +1114,12 @@ class MasterService {
 
         struct Entry {
             TimePoint deadline;
-            size_t shard_idx;
             std::string scoped_key;
         };
 
-        void Upsert(std::string scoped_key, size_t shard_idx,
-                    const TimePoint& deadline);
+        void Upsert(std::string scoped_key, const TimePoint& deadline);
         void Remove(const std::string& scoped_key);
-        void RemoveIfMatches(const std::string& scoped_key, size_t shard_idx,
+        void RemoveIfMatches(const std::string& scoped_key,
                              const TimePoint& deadline);
         std::vector<Entry> PopExpired(const TimePoint& now);
         void Clear();
@@ -1149,7 +1130,6 @@ class MasterService {
        private:
         struct Registration {
             TimePoint deadline;
-            size_t shard_idx;
         };
 
         struct EarlierDeadline {
@@ -1203,9 +1183,9 @@ class MasterService {
     // Thin, non-locking per-tenant helper; it only maintains the tenant-scoped
     // atomic disk_object_count. Object metadata is guarded by the per-object
     // ObjectEntry::mutex and the route by TenantStore::route_lock_.
-    class MetadataShardAccessorRW {
+    class TenantStateAccessorRW {
        public:
-        explicit MetadataShardAccessorRW(TenantState* tenant_state)
+        explicit TenantStateAccessorRW(TenantState* tenant_state)
             : state_(tenant_state) {}
 
         TenantState* operator->() { return state_; }
@@ -1250,21 +1230,6 @@ class MasterService {
         TenantState* state_{nullptr};
     };
 
-    // Thin, non-locking per-tenant read helper (see MetadataShardAccessorRW).
-    class MetadataShardAccessorRO {
-       public:
-        explicit MetadataShardAccessorRO(const TenantState* tenant_state)
-            : state_(tenant_state) {}
-
-        const TenantState* operator->() const { return state_; }
-
-        const TenantState& get() const { return *state_; }
-
-        const TenantState* state() const { return state_; }
-
-       private:
-        const TenantState* state_{nullptr};
-    };
 
     static ObjectIdentity MakeObjectIdentity(const std::string& user_key,
                                              TenantId tenant_id) {
@@ -1344,7 +1309,7 @@ class MasterService {
         std::chrono::system_clock::time_point now,
         const std::function<EvictMemberOutcome(
             const std::string&, ObjectMetadata&, TenantState&,
-            MetadataShardAccessorRW&)>& evict_one_member);
+            TenantStateAccessorRW&)>& evict_one_member);
 
     // Erase an object's entry + all per-key state. The entry-based form is the
     // single choke-point for stripping per-key state; the key-based overload
@@ -1362,7 +1327,7 @@ class MasterService {
                        const std::shared_ptr<mooncake::tenant::ObjectEntry>&
                            entry,
                        const TenantId& tenant_id, QuotaEraseMode quota_mode,
-                       MetadataShardAccessorRW* shard,
+                       TenantStateAccessorRW* shard,
                        const std::vector<std::string>& previous_media_hint = {});
     void EraseMetadata(TenantState& tenant_state,
                        const std::shared_ptr<mooncake::tenant::ObjectEntry>&
@@ -1370,7 +1335,7 @@ class MasterService {
                        const TenantId& tenant_id, QuotaEraseMode quota_mode);
     void EraseMetadata(TenantState& tenant_state, const std::string& key,
                        const TenantId& tenant_id, QuotaEraseMode quota_mode,
-                       MetadataShardAccessorRW* shard);
+                       TenantStateAccessorRW* shard);
     void EraseMetadata(TenantState& tenant_state, const std::string& key,
                        const TenantId& tenant_id);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
@@ -1435,7 +1400,6 @@ class MasterService {
     // shards. No-op for correctly-routed snapshots.
     void ReRouteRestoredObjectsByKey();
     static void ApplySoftPinMetricDelta(int metric_delta);
-    size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
         const ObjectMetadata::SoftPinEvaluation& result) const;
@@ -1453,7 +1417,7 @@ class MasterService {
         const std::string& key, const TenantId& tenant_id,
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-        MetadataShardAccessorRW* shard = nullptr);
+        TenantStateAccessorRW* shard = nullptr);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (quota release, promotion-task cancellation, disk-replica
     // shard bookkeeping) instead of duplicating it.
@@ -1461,7 +1425,7 @@ class MasterService {
         const std::string& key, const TenantId& tenant_id,
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale,
-        MetadataShardAccessorRW* shard = nullptr);
+        TenantStateAccessorRW* shard = nullptr);
 
     // True when client_id currently has a LOCAL_DISK registration.
     // Momentarily takes the LocalSsdManager registry lock, so callers must not
@@ -1475,7 +1439,7 @@ class MasterService {
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
     auto AllocateAndInsertMetadata(
-        MetadataShardAccessorRW& shard, const UUID& client_id,
+        TenantStateAccessorRW& shard, const UUID& client_id,
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& writer_host_id,
         const std::string& group_id, const TenantId& tenant_id,
@@ -1490,7 +1454,7 @@ class MasterService {
      * @brief Helper to discard expired processing keys.
      */
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& shard,
+        TenantStateAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
@@ -1569,7 +1533,6 @@ class MasterService {
     void ClearCandidatesForReload();
     std::chrono::milliseconds CandidateBackoff(uint32_t retry_count) const;
     bool IsTransientResult(PromotionQueueResult result) const;
-    size_t RunPromotionCandidateRetry(size_t max_shards_to_scan);
     size_t RunPromotionCandidateRetry();
     size_t RunPromotionCandidateRetryForTesting();
     size_t CountCandidatesForTesting(const TenantId& tenant_id);
@@ -1730,7 +1693,7 @@ class MasterService {
             return entry_ != nullptr && entry_->replication_task.has_value();
         }
 
-        MetadataShardAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
+        TenantStateAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
             return shard_guard_;
         }
 
@@ -1796,7 +1759,22 @@ class MasterService {
                 client_id, now, total_length, std::move(replicas), std::nullopt,
                 enable_hard_pin, data_type, group_id, object_id_.tenant_id,
                 object_id_.user_key));
-            tenant_state_->InsertObject(object_id_.user_key, entry);
+            if (!tenant_state_->InsertObject(object_id_.user_key, entry)) {
+                // A concurrent writer already inserted this key. Re-pin the
+                // existing entry and use it instead of the orphan we built.
+                // Drop any lock EnsureTenantState() took first, or the same
+                // thread would re-lock a mutex it already holds.
+                lock_ = std::unique_lock<std::shared_mutex>();
+                entry_.reset();
+                entry_ = tenant_state_->Pin(object_id_.user_key);
+                if (entry_ == nullptr) {
+                    throw std::logic_error(
+                        "Create(): winner entry disappeared after failed "
+                        "insert");
+                }
+                lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
+                return;
+            }
             // Create() is only used by the offload replica-registration path,
             // which materializes a completed LOCAL_DISK object (not a primary
             // write in flight), so it must not be marked processing. Primary
@@ -1822,7 +1800,7 @@ class MasterService {
             tenant_handle_ =
                 service_->GetOrCreateTenantStateHandle(object_id_.tenant_id);
             tenant_state_ = tenant_handle_.get();
-            shard_guard_ = MetadataShardAccessorRW(tenant_state_);
+            shard_guard_ = TenantStateAccessorRW(tenant_state_);
             entry_ = tenant_state_->Pin(object_id_.user_key);
             if (entry_ != nullptr) {
                 lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
@@ -1837,7 +1815,7 @@ class MasterService {
             tenant_state_ = nullptr;
             entry_.reset();
             lock_ = std::unique_lock<std::shared_mutex>();
-            shard_guard_ = MetadataShardAccessorRW(nullptr);
+            shard_guard_ = TenantStateAccessorRW(nullptr);
         }
 
         MasterService* service_;
@@ -1847,7 +1825,7 @@ class MasterService {
         std::shared_ptr<TenantState> tenant_handle_;
         TenantState* tenant_state_;
         // Non-locking disk-count helper bound to tenant_state_.
-        MetadataShardAccessorRW shard_guard_;
+        TenantStateAccessorRW shard_guard_;
         // Pinned ObjectEntry (keeps the object alive) whose per-object mutex is
         // held for the accessor's lifetime.
         std::shared_ptr<mooncake::tenant::ObjectEntry> entry_;
@@ -1906,7 +1884,6 @@ class MasterService {
               tenant_handle_(
                   service_->tenant_directory_.Lookup(object_id_.tenant_id)),
               tenant_state_(tenant_handle_ ? tenant_handle_.get() : nullptr),
-              shard_guard_(tenant_state_),
               entry_(tenant_state_ != nullptr
                          ? tenant_state_->Pin(object_id_.user_key)
                          : nullptr),
@@ -1929,10 +1906,6 @@ class MasterService {
             return *entry_->metadata();
         }
 
-        MetadataShardAccessorRO& GetShard() NO_THREAD_SAFETY_ANALYSIS {
-            return shard_guard_;
-        }
-
         const TenantState* GetTenantState() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_;
         }
@@ -1947,8 +1920,6 @@ class MasterService {
         const ObjectIdentity object_id_;
         std::shared_ptr<TenantState> tenant_handle_;
         const TenantState* tenant_state_;
-        // Non-locking read helper bound to tenant_state_.
-        MetadataShardAccessorRO shard_guard_;
         std::shared_ptr<mooncake::tenant::ObjectEntry> entry_;
         std::shared_lock<std::shared_mutex> lock_;
     };
@@ -2039,7 +2010,6 @@ class MasterService {
     // bounds how long an unread key can keep a slot.
     static constexpr uint32_t kPromotionCandidateMaxRetries = 64;
     static constexpr size_t kPromotionRetryBatchSize = 128;
-    static constexpr size_t kPromotionRetryShardBatch = 64;
     static constexpr std::chrono::milliseconds kPromotionCandidateTtl{300000};
     static constexpr std::chrono::milliseconds
         kPromotionCandidateInitialBackoff{10};

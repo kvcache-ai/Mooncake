@@ -176,10 +176,9 @@ class DynamicReplicationTest : public ::testing::Test {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
         auto& tenant_state = accessor.GetTenantState();
-        const bool has_lease = std::any_of(
-            tenant_state.object_route.dynamic_replication_leases.begin(),
-            tenant_state.object_route.dynamic_replication_leases.end(),
-            [&key](const auto& entry) { return entry.second.key == key; });
+        const bool has_lease =
+            tenant_state.object_route.HasDynamicReplicationLeaseForKeyForTest(
+                key);
         auto entry = tenant_state.Pin(key);
         if (!entry) {
             return has_lease;
@@ -223,7 +222,7 @@ class DynamicReplicationTest : public ::testing::Test {
         if (tenant_handle == nullptr) {
             return;
         }
-        MasterService::MetadataShardAccessorRW shard(tenant_handle.get());
+        MasterService::TenantStateAccessorRW shard(tenant_handle.get());
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::now() + std::chrono::seconds(1));
     }

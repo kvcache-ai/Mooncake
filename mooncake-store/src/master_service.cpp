@@ -1740,7 +1740,7 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     std::chrono::system_clock::time_point now,
     const std::function<MasterService::EvictMemberOutcome(
         const std::string&, ObjectMetadata&, TenantState&,
-        MetadataShardAccessorRW&)>& evict_one_member) {
+        TenantStateAccessorRW&)>& evict_one_member) {
     GroupEvictionResult result;
 
     // All members of a tenant live in a single tenant container, so look up
@@ -1750,7 +1750,7 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     if (!tenant_handle) {
         return result;
     }
-    MetadataShardAccessorRW shard(tenant_handle.get());
+    TenantStateAccessorRW shard(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
 
     std::vector<std::string> member_keys =
@@ -1980,7 +1980,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (!tenant_handle) {
         return;
     }
-    MetadataShardAccessorRW shard(tenant_handle.get());
+    TenantStateAccessorRW shard(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     auto object_entry = tenant_state.Pin(durable_entry.object_key);
     if (!object_entry || !object_entry->has_metadata()) {
@@ -2071,7 +2071,7 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
     if (!tenant_handle) {
         return;
     }
-    MetadataShardAccessorRW shard(tenant_handle.get());
+    TenantStateAccessorRW shard(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     EraseMetadata(tenant_state, durable_entry.object_key, tenant_id, quota_mode,
                   &shard);
@@ -2286,7 +2286,7 @@ void MasterService::EraseMetadata(
 void MasterService::EraseMetadata(
     TenantState& tenant_state, const std::string& key,
     const TenantId& tenant_id, QuotaEraseMode quota_mode,
-    MetadataShardAccessorRW* shard) {
+    TenantStateAccessorRW* shard) {
     auto entry = tenant_state.Pin(key);
     if (!entry) {
         return;
@@ -2313,8 +2313,8 @@ void MasterService::EraseMetadata(
     TenantState& tenant_state,
     const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
     const TenantId& tenant_id, QuotaEraseMode quota_mode,
-    MetadataShardAccessorRW* shard,
-    const std::vector<std::string>& previous_media_hint = {}) {
+    TenantStateAccessorRW* shard,
+    const std::vector<std::string>& previous_media_hint) {
     if (!entry || !entry->has_metadata()) {
         return;
     }
@@ -2533,25 +2533,23 @@ void MasterService::SoftPinDeadlineIndex::MaybeCompactLocked() {
     decltype(heap_) rebuilt;
     for (const auto& [scoped_key, registration] : registrations_) {
         rebuilt.push(
-            Entry{registration.deadline, registration.shard_idx, scoped_key});
+            Entry{registration.deadline, scoped_key});
     }
     heap_.swap(rebuilt);
 }
 
 void MasterService::SoftPinDeadlineIndex::Upsert(std::string scoped_key,
-                                                 size_t shard_idx,
                                                  const TimePoint& deadline) {
     std::lock_guard lock(mutex_);
     const auto it = registrations_.find(scoped_key);
-    if (it != registrations_.end() && it->second.deadline == deadline &&
-        it->second.shard_idx == shard_idx) {
+    if (it != registrations_.end() && it->second.deadline == deadline) {
         return;
     }
 
     auto [registration_it, inserted] = registrations_.insert_or_assign(
-        scoped_key, Registration{deadline, shard_idx});
+        scoped_key, Registration{deadline});
     (void)inserted;
-    heap_.push(Entry{deadline, shard_idx, registration_it->first});
+    heap_.push(Entry{deadline, registration_it->first});
     MaybeCompactLocked();
 }
 
@@ -2564,12 +2562,10 @@ void MasterService::SoftPinDeadlineIndex::Remove(
 }
 
 void MasterService::SoftPinDeadlineIndex::RemoveIfMatches(
-    const std::string& scoped_key, size_t shard_idx,
-    const TimePoint& deadline) {
+    const std::string& scoped_key, const TimePoint& deadline) {
     std::lock_guard lock(mutex_);
     const auto it = registrations_.find(scoped_key);
-    if (it != registrations_.end() && it->second.deadline == deadline &&
-        it->second.shard_idx == shard_idx) {
+    if (it != registrations_.end() && it->second.deadline == deadline) {
         registrations_.erase(it);
         MaybeCompactLocked();
     }
@@ -2585,8 +2581,7 @@ MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now) {
 
         const auto it = registrations_.find(entry.scoped_key);
         if (it == registrations_.end() ||
-            it->second.deadline != entry.deadline ||
-            it->second.shard_idx != entry.shard_idx) {
+            it->second.deadline != entry.deadline) {
             continue;
         }
         registrations_.erase(it);
@@ -2651,14 +2646,6 @@ void MasterService::ApplySoftPinMetricDelta(int metric_delta) {
     }
 }
 
-size_t MasterService::GetMetadataShardIndex(
-    const ObjectMetadata& metadata) const {
-    // The soft-pin deadline index keys on the tenant-scoped key (MakeScopedKey),
-    // which is unique per
-    // tenant, so the former shard index is a constant no-op here.
-    return 0;
-}
-
 void MasterService::ApplySoftPinEvaluation(
     const ObjectMetadata& metadata,
     const ObjectMetadata::SoftPinEvaluation& result) const {
@@ -2667,13 +2654,11 @@ void MasterService::ApplySoftPinEvaluation(
         return;
     }
 
-    const size_t shard_idx = GetMetadataShardIndex(metadata);
     const auto scoped_key = metadata.tenant_id.MakeScopedKey(metadata.user_key);
     if (result.deadline_to_index) {
-        soft_pin_deadline_index_.Upsert(scoped_key, shard_idx,
-                                        *result.deadline_to_index);
+        soft_pin_deadline_index_.Upsert(scoped_key, *result.deadline_to_index);
     } else if (result.removed_deadline) {
-        soft_pin_deadline_index_.RemoveIfMatches(scoped_key, shard_idx,
+        soft_pin_deadline_index_.RemoveIfMatches(scoped_key,
                                                  *result.removed_deadline);
     }
     ApplySoftPinMetricDelta(result.metric_delta);
@@ -2747,7 +2732,7 @@ void MasterService::ClearStaleHandles(
     tenant_directory_.Visit(
         [&](const TenantId& tenant_id,
             const std::shared_ptr<TenantState>& handle) {
-            MetadataShardAccessorRW shard(handle.get());
+            TenantStateAccessorRW shard(handle.get());
             auto& tenant_state = *handle;
             // Collect handles, then lock each per-object.
             std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
@@ -4195,7 +4180,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 }
 
 auto MasterService::AllocateAndInsertMetadata(
-    MetadataShardAccessorRW& shard, const UUID& client_id,
+    TenantStateAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config, const std::string& writer_host_id,
     const std::string& group_id, const TenantId& tenant_id,
@@ -4451,7 +4436,6 @@ auto MasterService::AllocateAndInsertMetadata(
                                           std::move(eligible_replica_ids));
     if (deadline_to_index) {
         soft_pin_deadline_index_.Upsert(tenant_id.MakeScopedKey(key),
-                                        GetMetadataShardIndex(*entry->metadata()),
                                         *deadline_to_index);
     }
     // Wire grouped objects to the group's shared lease; ungrouped objects keep
@@ -4570,7 +4554,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             }
             auto tenant_handle =
                 GetOrCreateTenantStateHandle(object_id.tenant_id);
-            MetadataShardAccessorRW shard(tenant_handle.get());
+            TenantStateAccessorRW shard(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto admission_result =
                 ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state), 0);
@@ -5230,7 +5214,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // not affect routing.
             auto tenant_handle =
                 GetOrCreateTenantStateHandle(object_id.tenant_id);
-            MetadataShardAccessorRW shard(tenant_handle.get());
+            TenantStateAccessorRW shard(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto admission_result =
                 ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state), 0);
@@ -6663,7 +6647,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
     if (tenant_handle) {
-        MetadataShardAccessorRW shard(tenant_handle.get());
+        TenantStateAccessorRW shard(tenant_handle.get());
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
         tenant_handle->VisitObjects(
@@ -6756,8 +6740,8 @@ long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     int64_t total_freed_size = 0;
     // There is no per-tenant mutex; RemoveAll must remain atomic (two
-    // concurrent RemoveAlls must not both count/tear down the same object), so
-    // serialize it with an EXCLUSIVE snapshot lock.
+    // concurrent RemoveAll calls must not both count/tear down the same
+    // object), so serialize it with an EXCLUSIVE snapshot lock.
     std::unique_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
     // Tracking which tenants ended up empty costs a hash insert per visited
@@ -6782,7 +6766,7 @@ long MasterService::RemoveAll(bool force) {
     tenant_directory_.Visit(
         [&](const TenantId& tenant_id,
             const std::shared_ptr<TenantState>& handle) {
-            MetadataShardAccessorRW shard(handle.get());
+            TenantStateAccessorRW shard(handle.get());
             auto& tenant_state = *handle;
             std::vector<std::string> keys;
             handle->VisitObjects(
@@ -6901,7 +6885,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     long removed_count = 0;
     int64_t total_freed_size = 0;
     // There is no per-tenant mutex; serialize RemoveAll with an exclusive
-    // snapshot lock so concurrent RemoveAlls do not double-count/tear down.
+    // snapshot lock so concurrent RemoveAll calls do not double-count/tear down.
     std::unique_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
@@ -6923,7 +6907,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
 
     auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
     if (tenant_handle) {
-        MetadataShardAccessorRW shard(tenant_handle.get());
+        TenantStateAccessorRW shard(tenant_handle.get());
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
         tenant_handle->VisitObjects(
@@ -7028,7 +7012,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
     if (tenant_handle) {
-        MetadataShardAccessorRW shard(tenant_handle.get());
+        TenantStateAccessorRW shard(tenant_handle.get());
         auto& tenant_state = *tenant_handle;
         auto now = std::chrono::system_clock::now();
 
@@ -7187,7 +7171,7 @@ bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id,
     TenantState& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-    MetadataShardAccessorRW* shard) {
+    TenantStateAccessorRW* shard) {
     // Removes replicas with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner client is no longer alive.
     // Kept as a thin wrapper over the predicate form so the owner-targeted
@@ -7208,7 +7192,7 @@ bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id,
     TenantState& tenant_state, ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& is_stale,
-    MetadataShardAccessorRW* shard) {
+    TenantStateAccessorRW* shard) {
     const auto previous_kv_media = KvMediaSnapshot(metadata);
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
@@ -7347,8 +7331,9 @@ void MasterService::RunDfsEviction() {
                         return matches_candidate(replica, candidate) &&
                                !replica.is_processing();
                     });
-                if (erased > 0) {
-                    PublishKvRemovedAfterEvict(candidate.key, erased, "disk",
+                if (erased > 0 && !metadata.IsValid()) {
+                    PublishKvRemovedAfterEvict(candidate.key,
+                                               metadata.size * erased, "disk",
                                                metadata, tenant_id);
                     // Release the object lock before the route mutation.
                     entry_lock.unlock();
@@ -7906,7 +7891,7 @@ void MasterService::EraseCandidate(TenantState& tenant_state,
 void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
     auto tenant_handle = tenant_directory_.Lookup(object_id.tenant_id);
     if (!tenant_handle) return;
-    MetadataShardAccessorRW shard(tenant_handle.get());
+    TenantStateAccessorRW shard(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     EraseCandidate(tenant_state, object_id.user_key);
     if (tenant_state.Empty()) {
@@ -7996,7 +7981,7 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
     const auto now = std::chrono::steady_clock::now();
     auto tenant_handle = tenant_directory_.Lookup(object_id.tenant_id);
     if (!tenant_handle) return;
-    MetadataShardAccessorRW shard(tenant_handle.get());
+    TenantStateAccessorRW shard(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     auto object_entry = tenant_state.Pin(object_id.user_key);
     if (!object_entry || !object_entry->promotion_candidate.has_value()) {
@@ -8050,12 +8035,8 @@ void MasterService::ClearCandidatesForReload() {
     promotion_in_flight_.store(0, std::memory_order_relaxed);
 }
 
-size_t MasterService::RunPromotionCandidateRetry() {
-    return RunPromotionCandidateRetry(kPromotionRetryShardBatch);
-}
-
 size_t MasterService::RunPromotionCandidateRetryForTesting() {
-    return RunPromotionCandidateRetry(kNumShards);
+    return RunPromotionCandidateRetry();
 }
 
 size_t MasterService::CountCandidatesForTesting(const TenantId& tenant_id) {
@@ -8098,7 +8079,7 @@ void MasterService::ResetCandidateBackoffsForTesting() {
         });
 }
 
-size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
+size_t MasterService::RunPromotionCandidateRetry() {
     if (!promotion_on_hit_ ||
         promotion_candidate_count_.load(std::memory_order_relaxed) == 0) {
         return 0;
@@ -8110,7 +8091,6 @@ size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
 
     // All of a tenant's candidates live in one tenant container, so there is no
     // shard-based partitioning; the batch size bounds the scan.
-    (void)max_shards_to_scan;
 
     std::vector<TenantId> empty_tenants;
     {
@@ -8454,16 +8434,8 @@ void MasterService::ClearDynamicReplicationStateForKey(
         entry->dynamic_replication_pending.reset();
         entry->dynamic_replication_cooldown =
             std::chrono::steady_clock::time_point{};
-        entry->dynamic_replication_leases.clear();
     }
-    auto& leases = tenant_state.object_route.dynamic_replication_leases;
-    for (auto it = leases.begin(); it != leases.end();) {
-        if (it->second.key == key) {
-            it = leases.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    tenant_state.object_route.EraseDynamicReplicationLeasesForObject(key);
 }
 
 void MasterService::CleanupExpiredDynamicReplicationState() {
@@ -8475,7 +8447,7 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
     tenant_directory_.Visit(
         [&](const TenantId& tenant_id,
             const std::shared_ptr<TenantState>& handle) {
-            MetadataShardAccessorRW shard(handle.get());
+            TenantStateAccessorRW shard(handle.get());
             auto& tenant_state = *handle;
             // Collect handles, then lock each per-object.
             std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
@@ -8504,15 +8476,8 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
                 }
                 ClearDynamicReplicationStateForKey(tenant_state, key);
             }
-            auto& leases =
-                tenant_state.object_route.dynamic_replication_leases;
-            for (auto lease_it = leases.begin(); lease_it != leases.end();) {
-                if (lease_it->second.expire_at_ms_epoch < now_ms) {
-                    lease_it = leases.erase(lease_it);
-                } else {
-                    ++lease_it;
-                }
-            }
+            tenant_state.object_route.EraseExpiredDynamicReplicationLeases(
+                now_ms);
             if (tenant_state.Empty()) {
                 empty_tenants.push_back(tenant_id);
             }
@@ -8718,27 +8683,28 @@ MasterService::SubmitReplicaActionProposalLocked(
 
     auto& tenant_state = accessor.GetTenantState();
     auto object_entry = accessor.GetEntry();
-    auto& tenant_leases = tenant_state.object_route.dynamic_replication_leases;
-    auto lease_it = tenant_leases.find(proposal_id);
-    if (lease_it != tenant_leases.end()) {
-        if (lease_it->second.expire_at_ms_epoch >= now_ms) {
-            const auto& lease = lease_it->second;
+    auto existing_lease =
+        tenant_state.object_route.FindDynamicReplicationLease(proposal_id);
+    if (existing_lease.has_value()) {
+        if (existing_lease->expire_at_ms_epoch >= now_ms) {
             const bool same_request =
-                lease.action == proposal.action &&
-                lease.tenant_id == object_id.tenant_id.value() &&
-                lease.key == object_id.user_key &&
+                existing_lease->action == proposal.action &&
+                existing_lease->tenant_id == object_id.tenant_id.value() &&
+                existing_lease->key == object_id.user_key &&
                 (proposal.observed_version_epoch == 0 ||
-                 lease.version_epoch == proposal.observed_version_epoch) &&
+                 existing_lease->version_epoch ==
+                     proposal.observed_version_epoch) &&
                 (!proposal.preferred_target_segment.has_value() ||
-                 lease.target_segment == *proposal.preferred_target_segment) &&
+                 existing_lease->target_segment ==
+                     *proposal.preferred_target_segment) &&
                 (proposal.target_domain.empty() ||
-                 lease.target_domain == proposal.target_domain);
+                 existing_lease->target_domain == proposal.target_domain);
             if (!same_request) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            return lease_it->second;
+            return *existing_lease;
         }
-        tenant_leases.erase(lease_it);
+        tenant_state.object_route.RemoveDynamicReplicationLease(proposal_id);
     }
 
     if (!DynamicReplicationHeatAdmitted(object_id)) {
@@ -8830,7 +8796,7 @@ MasterService::SubmitReplicaActionProposalLocked(
         object_entry->dynamic_replication_cooldown =
             std::chrono::steady_clock::now() + kDynamicReplicationActionCooldown;
     }
-    tenant_leases[proposal_id] = lease;
+    tenant_state.object_route.PutDynamicReplicationLease(proposal_id, lease);
     return lease;
 }
 
@@ -9407,7 +9373,7 @@ void MasterService::EvictionThreadFunc() {
                 tenant_directory_.Visit(
                     [&](const TenantId& tenant_id,
                         const std::shared_ptr<TenantState>& handle) {
-                        MetadataShardAccessorRW shard(handle.get());
+                        TenantStateAccessorRW shard(handle.get());
                         DiscardExpiredProcessingReplicas(shard, now);
                         if (handle->Empty()) {
                             empty_tenants.push_back(tenant_id);
@@ -9458,7 +9424,7 @@ void MasterService::EvictionThreadFunc() {
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
-    MetadataShardAccessorRW& shard,
+    TenantStateAccessorRW& shard,
     const std::chrono::system_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
 
@@ -10194,7 +10160,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             if (!tenant_handle) {
                 return {};
             }
-            MetadataShardAccessorRW shard(tenant_handle.get());
+            TenantStateAccessorRW shard(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto object_entry = tenant_state.Pin(key);
             if (!object_entry || !object_entry->has_metadata()) {
@@ -10252,7 +10218,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         auto evict_one_member =
             [&, this](const std::string& member_key,
                       ObjectMetadata& member_metadata, TenantState& state,
-                      MetadataShardAccessorRW& accessor) -> EvictMemberOutcome {
+                      TenantStateAccessorRW& accessor) -> EvictMemberOutcome {
             (void)accessor;
             const uint64_t freed = try_evict_or_offload(
                 member_key, member_metadata, state, deferred_replicas);
@@ -10281,7 +10247,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         {
             auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
             if (tenant_handle) {
-                MetadataShardAccessorRW shard(tenant_handle.get());
+                TenantStateAccessorRW shard(tenant_handle.get());
                 auto& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Pin(key);
                 if (object_entry && object_entry->has_metadata()) {
@@ -10316,7 +10282,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         std::vector<std::vector<Replica>> deferred_replicas;
         std::vector<std::string> candidate_keys;
         {
-            MetadataShardAccessorRW shard(tenant_handle.get());
+            TenantStateAccessorRW shard(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             candidate_keys.reserve(tenant_state.ObjectCount());
             // Collect handles, then lock each per-object.
@@ -10620,7 +10586,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             if (!tenant_handle) {
                 return {};
             }
-            MetadataShardAccessorRW shard(tenant_handle.get());
+            TenantStateAccessorRW shard(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto object_entry = tenant_state.Pin(key);
             if (!object_entry || !object_entry->has_metadata()) {
@@ -10683,7 +10649,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         auto evict_one_member =
             [&, this](const std::string& member_key,
                       ObjectMetadata& member_metadata, TenantState& state,
-                      MetadataShardAccessorRW& accessor) -> EvictMemberOutcome {
+                      TenantStateAccessorRW& accessor) -> EvictMemberOutcome {
             (void)accessor;
             auto submission = persist_evict_oplog_or_skip(tenant_id, member_key,
                                                           member_metadata);
@@ -10717,7 +10683,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         {
             auto tenant_handle = tenant_directory_.Lookup(tenant_id);
             if (tenant_handle) {
-                MetadataShardAccessorRW shard(tenant_handle.get());
+                TenantStateAccessorRW shard(tenant_handle.get());
                 auto& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Pin(key);
                 if (!enable_oplog_ && object_entry &&
@@ -10776,7 +10742,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     tenant_directory_.Visit(
         [&](const TenantId& tenant_id,
             const std::shared_ptr<TenantState>& handle) {
-            MetadataShardAccessorRW shard(handle.get());
+            TenantStateAccessorRW shard(handle.get());
             DiscardExpiredProcessingReplicas(shard, now);
 
             auto& tenant_state = *handle;
@@ -10849,7 +10815,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         tenant_directory_.Visit(
             [&](const TenantId& tenant_id,
                 const std::shared_ptr<TenantState>& handle) {
-                MetadataShardAccessorRW shard(handle.get());
+                TenantStateAccessorRW shard(handle.get());
                 auto& tenant_state = *handle;
                 // Collect handles, then lock each per-object.
                 std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
@@ -11036,7 +11002,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (target_evict_num <= 0 || stop_eviction_scan) {
                             return;
                         }
-                        MetadataShardAccessorRW shard(handle.get());
+                        TenantStateAccessorRW shard(handle.get());
                         auto& tenant_state = *handle;
                         tenant_state.VisitObjects(
                             [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
@@ -11093,7 +11059,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (target_evict_num <= 0 || stop_eviction_scan) {
                             return;
                         }
-                        MetadataShardAccessorRW shard(handle.get());
+                        TenantStateAccessorRW shard(handle.get());
                         auto& tenant_state = *handle;
                         tenant_state.VisitObjects(
                             [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
@@ -11257,7 +11223,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 if (evicted_count >= ideal_evict_num) {
                     return;
                 }
-                MetadataShardAccessorRW shard(handle.get());
+                TenantStateAccessorRW shard(handle.get());
                 auto& tenant_state = *handle;
                 std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
                     objects;

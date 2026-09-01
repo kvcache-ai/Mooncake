@@ -253,7 +253,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         if (tenant_handle == nullptr) {
             return;
         }
-        MasterService::MetadataShardAccessorRW shard(tenant_handle.get());
+        MasterService::TenantStateAccessorRW shard(tenant_handle.get());
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::time_point::max());
     }

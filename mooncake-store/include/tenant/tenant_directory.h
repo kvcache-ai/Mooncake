@@ -5,7 +5,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 
 namespace mooncake {
 namespace tenant {
@@ -62,19 +62,6 @@ class TenantDirectory {
         std::atomic_store_explicit(&snapshot_, std::move(next),
                                    std::memory_order_release);
     }
-
-    bool Contains(const TenantId& tenant_id) const {
-        auto frame =
-            std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
-        return frame->find(tenant_id) != frame->end();
-    }
-
-    size_t Size() const {
-        return std::atomic_load_explicit(&snapshot_, std::memory_order_acquire)
-            ->size();
-    }
-
-    bool Empty() const { return Size() == 0; }
 
     // Snapshot-consistent visit of every (tenant, handle). The visitor runs
     // while a strong snapshot is held, so a concurrent COW publish cannot

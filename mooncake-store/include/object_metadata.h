@@ -26,7 +26,7 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "replica.h"
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 #include "tenant_quota_ledger.h"
 #include "types.h"
 
@@ -346,12 +346,6 @@ class ObjectMetadata {
         const {
         SpinLocker locker(&lock);
         lease_->ExtendTo(deadline);
-    }
-
-    bool NeedsReadLeaseRefresh(std::chrono::milliseconds ttl) const {
-        SpinLocker locker(&lock);
-        const auto now = std::chrono::system_clock::now();
-        return lease_->ExpiresAt() <= now + ttl / 2;
     }
 
     bool IsLeaseExpired() const {

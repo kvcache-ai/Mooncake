@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <memory>
-#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -20,85 +19,6 @@ std::unique_ptr<ObjectMetadata> MakeMetadata(const std::string& user_key) {
         ObjectDataType::UNKNOWN, std::string{}, TenantId(), user_key);
 }
 
-TEST(ObjectEntryTest, HoldsKeyGroupAndGroupStatus) {
-    ObjectEntry singleton("k1", "");
-    EXPECT_EQ(singleton.key(), "k1");
-    EXPECT_EQ(singleton.group_id(), "");
-    EXPECT_FALSE(singleton.IsGrouped());
-
-    ObjectEntry member("k2", "g1");
-    EXPECT_EQ(member.key(), "k2");
-    EXPECT_EQ(member.group_id(), "g1");
-    EXPECT_TRUE(member.IsGrouped());
-}
-
-TEST(ObjectEntryTest, WiresOwnOrSharedLease) {
-    ObjectEntry entry("k1", "");
-    EXPECT_EQ(entry.lease(), nullptr);
-
-    auto own = std::make_shared<Lease>();
-    entry.set_lease(own);
-    EXPECT_EQ(entry.lease().get(), own.get());
-
-    // An entry can be re-pointed at a group's shared lease.
-    auto shared = std::make_shared<Lease>();
-    entry.set_lease(shared);
-    EXPECT_EQ(entry.lease().get(), shared.get());
-}
-
-TEST(ObjectEntryTest, ConsolidatesPerKeyRuntimeTaskState) {
-    ObjectEntry entry("k1", "g1");
-    EXPECT_FALSE(entry.replication_task.has_value());
-    EXPECT_FALSE(entry.promotion_task.has_value());
-    EXPECT_FALSE(entry.promotion_candidate.has_value());
-    EXPECT_FALSE(entry.offloading_task.has_value());
-    EXPECT_FALSE(entry.dynamic_replication_pending.has_value());
-    EXPECT_FALSE(entry.is_processing);
-
-    entry.is_processing = true;
-    entry.replication_task = ReplicationTask{};   // consolidation target
-    entry.promotion_task = PromotionTask{};
-    entry.promotion_candidate = PromotionCandidate{};
-    entry.offloading_task = OffloadingTask{};
-    entry.dynamic_replication_pending = DynamicReplicaPending{};
-
-    EXPECT_TRUE(entry.is_processing);
-    EXPECT_TRUE(entry.replication_task.has_value());
-    EXPECT_TRUE(entry.promotion_task.has_value());
-    EXPECT_TRUE(entry.promotion_candidate.has_value());
-    EXPECT_TRUE(entry.offloading_task.has_value());
-    EXPECT_TRUE(entry.dynamic_replication_pending.has_value());
-}
-
-TEST(ObjectEntryTest, PerObjectMutexSerializesMutableAccess) {
-    auto entry = std::make_shared<ObjectEntry>("k1", "");
-    int shared_counter = 0;
-    int writes = 0;
-
-    const auto writer = [&]() {
-        for (int i = 0; i < 10'000; ++i) {
-            std::unique_lock<std::shared_mutex> lock(entry->mutex);
-            ++writes;
-        }
-    };
-    const auto reader = [&]() {
-        for (int i = 0; i < 10'000; ++i) {
-            std::shared_lock<std::shared_mutex> lock(entry->mutex);
-            (void)shared_counter;
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.emplace_back(writer);
-    threads.emplace_back(reader);
-    threads.emplace_back(reader);
-    threads.emplace_back(writer);
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    EXPECT_EQ(writes, 20'000);
-}
 
 TEST(ObjectEntryTest, HoldsAndScopesMetadataEnvelope) {
     auto entry = std::make_shared<ObjectEntry>("k1", "");

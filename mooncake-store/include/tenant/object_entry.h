@@ -12,16 +12,12 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
-#include <unordered_map>
 #include <utility>
 
-#include <boost/functional/hash.hpp>
-
 #include "lease.h"
-#include "object_entry_types.h"
+#include "tenant/object_entry_types.h"
 #include "object_metadata.h"
 #include "replica.h"
-#include "rpc_types.h"
 #include "types.h"
 
 namespace mooncake {
@@ -42,14 +38,11 @@ class ObjectEntry {
     const std::string& key() const { return key_; }
     const std::string& group_id() const { return group_id_; }
 
-    // Authoritative lease. A singleton owns one Lease; a grouped member points
-    // at the group's shared Lease so the read path can extend the group TTL
-    // without touching the group table. Never null after being wired.
+    // Authoritative lease. A singleton never sets one (lease() stays null); a
+    // grouped member points at the group's shared Lease so the read path can
+    // extend the group TTL without touching the group table.
     std::shared_ptr<Lease> lease() const { return lease_; }
-    void set_lease(std::shared_ptr<Lease> lease) {
-        lease_ = std::move(lease);
-    }
-    bool IsGrouped() const { return !group_id_.empty(); }
+    void set_lease(std::shared_ptr<Lease> lease) { lease_ = std::move(lease); }
 
     // Per-key runtime task state.
     bool is_processing{false};
@@ -58,12 +51,12 @@ class ObjectEntry {
     std::optional<PromotionTask> promotion_task;
     std::optional<PromotionCandidate> promotion_candidate;
     std::optional<DynamicReplicaPending> dynamic_replication_pending;
-    std::unordered_map<UUID, ReplicaActionLease, boost::hash<UUID>>
-        dynamic_replication_leases;
     std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
 
     // Per-object mutation boundary: the narrowest lock a point operation may
-    // hold after pinning this entry.
+    // hold after pinning this entry. ObjectMetadata has its own SpinLock for its
+    // enclosed lease/soft-pin state; a path that touches both holds this mutex
+    // and then takes the metadata lock (never the reverse).
     mutable std::shared_mutex mutex;
 
     // Metadata is NON-movable / NON-copyable and self-locking, so it is owned
@@ -84,9 +77,10 @@ class ObjectEntry {
         return std::move(metadata_);
     }
 
-    // Callback-scoped access to the metadata. Runs `fn(*metadata())` while the
-    // per-object mutex is held; the metadata reference must not escape the
-    // callback scope. No-op when metadata is not yet wired.
+    // Callback-scoped test/diagnostic access; production paths pin + lock
+    // explicitly. Runs `fn(*metadata())` while the per-object mutex is held;
+    // the metadata reference must not escape the callback scope. No-op when
+    // metadata is not yet wired.
     template <typename Fn>
     void WithMetadata(Fn&& fn) const {
         std::unique_lock<std::shared_mutex> lock(mutex);

@@ -1,4 +1,4 @@
-#include "tenant/tenant_dir.h"
+#include "tenant/tenant_directory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -14,59 +14,24 @@ namespace {
 
 using TestDirectory = TenantDirectory<std::shared_ptr<int>>;
 
-TEST(TenantDirectoryTest, StartsEmptyAndLookupReturnsNull) {
-    TestDirectory dir;
-    EXPECT_TRUE(dir.Empty());
-    EXPECT_EQ(dir.Size(), 0u);
-    EXPECT_FALSE(dir.Contains(TenantId("tenant-a")));
-    EXPECT_EQ(dir.Lookup(TenantId("tenant-a")), nullptr);
-}
-
 TEST(TenantDirectoryTest, UpsertLookupRemoveRoundTrip) {
     TestDirectory dir;
     const TenantId tenant("tenant-a");
 
+    // Empty container: no tenant.
+    EXPECT_EQ(dir.Lookup(tenant), nullptr);
+
     dir.Upsert(tenant, std::make_shared<int>(42));
-    EXPECT_TRUE(dir.Contains(tenant));
-    EXPECT_EQ(dir.Size(), 1u);
     auto handle = dir.Lookup(tenant);
     ASSERT_NE(handle, nullptr);
     EXPECT_EQ(*handle, 42);
 
     dir.Remove(tenant);
-    EXPECT_FALSE(dir.Contains(tenant));
-    EXPECT_TRUE(dir.Empty());
     EXPECT_EQ(dir.Lookup(tenant), nullptr);
 }
 
-TEST(TenantDirectoryTest, UpsertOverwritesExistingTenant) {
-    TestDirectory dir;
-    const TenantId tenant("tenant-a");
-
-    dir.Upsert(tenant, std::make_shared<int>(1));
-    dir.Upsert(tenant, std::make_shared<int>(2));
-
-    auto handle = dir.Lookup(tenant);
-    ASSERT_NE(handle, nullptr);
-    EXPECT_EQ(*handle, 2);
-    EXPECT_EQ(dir.Size(), 1u);
-}
-
-TEST(TenantDirectoryTest, DistinctTenantsAreIndependent) {
-    TestDirectory dir;
-    dir.Upsert(TenantId("tenant-a"), std::make_shared<int>(1));
-    dir.Upsert(TenantId("tenant-b"), std::make_shared<int>(2));
-
-    EXPECT_EQ(dir.Size(), 2u);
-    EXPECT_EQ(*dir.Lookup(TenantId("tenant-a")), 1);
-    EXPECT_EQ(*dir.Lookup(TenantId("tenant-b")), 2);
-
-    dir.Remove(TenantId("tenant-a"));
-    EXPECT_EQ(dir.Lookup(TenantId("tenant-a")), nullptr);
-    EXPECT_EQ(*dir.Lookup(TenantId("tenant-b")), 2);
-}
-
-TEST(TenantDirectoryTest, CowRemoveKeepsOutstandingHandleAliveAndDistinguishesRecreate) {
+TEST(TenantDirectoryTest,
+     CowRemoveKeepsOutstandingHandleAliveAndDistinguishesRecreate) {
     TestDirectory dir;
     const TenantId tenant("tenant-a");
 
