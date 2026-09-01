@@ -622,6 +622,22 @@ TEST(EngineFailoverE2E, OverallStatusUsesWorstFailureNotGenericFailed) {
         engine.unregisterLocalMemory(completed_buf.data(), kBufLen).ok());
 }
 
+TEST(TransferStatusSeverityTest, KnownRanksMatchFormerMap) {
+    EXPECT_EQ(transferStatusSeverity(INITIAL), 0);
+    EXPECT_EQ(transferStatusSeverity(PENDING), 0);
+    EXPECT_EQ(transferStatusSeverity(COMPLETED), 0);
+    EXPECT_EQ(transferStatusSeverity(INVALID), 1);
+    EXPECT_EQ(transferStatusSeverity(CANCELED), 2);
+    EXPECT_EQ(transferStatusSeverity(TIMEOUT), 3);
+    EXPECT_EQ(transferStatusSeverity(FAILED), 4);
+}
+
+TEST(TransferStatusSeverityTest, UnknownValueRanksWithFailedAndDoesNotThrow) {
+    auto unknown = static_cast<TransferStatusEnum>(99);
+    EXPECT_EQ(transferStatusSeverity(unknown), transferStatusSeverity(FAILED));
+    EXPECT_GT(transferStatusSeverity(unknown), transferStatusSeverity(TIMEOUT));
+}
+
 TEST(EngineFailoverE2E,
      WaitTransferCompletionUsesProgressBatchWhenPollDisabled) {
     auto cfg = makeMinimalP2PConfig();

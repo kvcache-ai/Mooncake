@@ -2659,11 +2659,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
     size_t total_tasks = 0;
     TransferStatusEnum worst_failure = PENDING;
     auto isWorse = [](TransferStatusEnum cur, TransferStatusEnum best) {
-        static const std::unordered_map<TransferStatusEnum, int> severity = {
-            {INITIAL, 0},  {PENDING, 0}, {COMPLETED, 0}, {INVALID, 1},
-            {CANCELED, 2}, {TIMEOUT, 3}, {FAILED, 4},
-        };
-        return severity.at(cur) > severity.at(best);
+        return transferStatusSeverity(cur) > transferStatusSeverity(best);
     };
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         auto& task = batch->task_list[task_id];

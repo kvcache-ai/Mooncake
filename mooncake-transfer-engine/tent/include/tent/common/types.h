@@ -162,6 +162,27 @@ enum TransferStatusEnum {
     FAILED
 };
 
+// Rank for aggregating batch status. Unknown values rank with FAILED so
+// getBatchStatus never throws from unordered_map::at during teardown.
+inline int transferStatusSeverity(TransferStatusEnum s) {
+    switch (s) {
+        case INITIAL:
+        case PENDING:
+        case COMPLETED:
+            return 0;
+        case INVALID:
+            return 1;
+        case CANCELED:
+            return 2;
+        case TIMEOUT:
+            return 3;
+        case FAILED:
+            return 4;
+        default:
+            return 4;
+    }
+}
+
 struct TransferStatus {
     TransferStatusEnum s;
     size_t transferred_bytes;
