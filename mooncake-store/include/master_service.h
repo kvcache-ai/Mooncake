@@ -2004,10 +2004,12 @@ class MasterService {
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const TenantId& tenant_id, QuotaEraseMode quota_mode,
-        MetadataShardAccessorRW* shard);
+        MetadataShardAccessorRW* shard,
+        const std::vector<std::string>& previous_media_hint = {});
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
+        const std::vector<std::string>& previous_media_hint = {});
     void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
                                            QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
@@ -2055,6 +2057,7 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client is no longer alive.
     bool CleanupStaleHandles(
+        const std::string& key, const TenantId& tenant_id,
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
         MetadataShardAccessorRW* shard = nullptr);
@@ -2062,6 +2065,7 @@ class MasterService {
     // accounting (quota release, promotion-task cancellation, disk-replica
     // shard bookkeeping) instead of duplicating it.
     bool CleanupStaleHandles(
+        const std::string& key, const TenantId& tenant_id,
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale,
         MetadataShardAccessorRW* shard = nullptr);
@@ -2270,6 +2274,12 @@ class MasterService {
             if (!(service_->enable_ha_ && service_->enable_oplog_) &&
                 tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
+                // Gate the snapshot on the publisher being live: this runs on
+                // every read-write metadata access, and the VisitReplicas walk
+                // plus vector allocation is pure overhead when KV events are
+                // off (the default).
+                const auto previous_kv_media =
+                    service_->KvMediaSnapshot(it_->second);
                 // Erase invalid memory replicas (those with unmounted
                 // segments). No client_mutex_ needed since we only check memory
                 // replicas.
@@ -2300,6 +2310,9 @@ class MasterService {
                             << ", bytes=" << before_charge - after_charge;
                     }
                 }
+                service_->SyncKvObjectState(object_id_.user_key, it_->second,
+                                            object_id_.tenant_id,
+                                            previous_kv_media);
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
                     // NOTE: Erase() -> EraseMetadata() already removes the key
@@ -2352,9 +2365,11 @@ class MasterService {
         }
 
         // Delete current metadata (for PutRevoke or Remove operations)
-        void Erase() NO_THREAD_SAFETY_ANALYSIS {
+        void Erase(const std::vector<std::string>& previous_media_hint = {})
+            NO_THREAD_SAFETY_ANALYSIS {
             service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id,
-                                    QuotaEraseMode::kFull, &shard_guard_);
+                                    QuotaEraseMode::kFull, &shard_guard_,
+                                    previous_media_hint);
             it_ = tenant_state_->metadata.end();
             MaybeEraseEmptyTenant();
         }
@@ -2886,23 +2901,48 @@ class MasterService {
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 
+    // Gated snapshots for the call sites that capture a pre-mutation medium set.
+    // They run on hot metadata paths, so skip the VisitReplicas walk entirely
+    // when no publisher is listening.
+    std::vector<std::string> KvMediaSnapshot(const ObjectMetadata& metadata) {
+        return KvEventsEnabled() ? KvMediaForMetadata(metadata)
+                                 : std::vector<std::string>{};
+    }
+    std::vector<std::string> KvRemovalSnapshot(const ObjectMetadata& metadata) {
+        return KvEventsEnabled() ? KvMediaForRemoval(metadata)
+                                 : std::vector<std::string>{};
+    }
+
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
-    static std::string MediumForReplicaType(ReplicaType replica_type);
-    static std::string MediumForMetadata(const ObjectMetadata& metadata);
-    void PublishKvStored(const std::string& key, ReplicaType replica_type,
+    static std::vector<std::string> KvMediaForMetadata(
+        const ObjectMetadata& metadata);
+    // Removal paths may run after replicas have transitioned to PROCESSING or
+    // REMOVED. Keep their former medium visible as a conservative hint even
+    // though only COMPLETE replicas count as currently available media.
+    static std::vector<std::string> KvMediaForRemoval(
+        const ObjectMetadata& metadata);
+    // The medium is derived from the object's full replica set, not from the
+    // replica type that triggered the commit, so no replica type is taken.
+    void PublishKvStored(const std::string& key,
                          const ObjectMetadata& metadata,
                          const TenantId& tenant_id);
-    void PublishKvRemoved(const std::string& key,
-                          const ObjectMetadata& metadata,
-                          const TenantId& tenant_id);
-    void PublishKvRemoved(const std::string& key, const std::string& medium,
-                          const TenantId& tenant_id,
-                          const std::string& group_id);
+    void SyncKvObjectState(
+        const std::string& key, const ObjectMetadata& metadata,
+        const TenantId& tenant_id,
+        const std::vector<std::string>& previous_media_hint = {});
+    void PublishKvRemoved(
+        const std::string& key, const ObjectMetadata& metadata,
+        const TenantId& tenant_id,
+        const std::vector<std::string>& previous_media_hint = {});
+    // evicted_replica_count is the number of replicas the caller actually
+    // dropped. It is deliberately not a byte count: a zero-length object still
+    // needs its removal announced.
     void PublishKvRemovedAfterEvict(const std::string& key,
-                                    uint64_t freed_bytes,
+                                    size_t evicted_replica_count,
                                     const std::string& medium,
                                     const ObjectMetadata& metadata,
                                     const TenantId& tenant_id);
+    void PublishKvCleared(const TenantId& tenant_id);
 
     // OpLog publishing
     std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;

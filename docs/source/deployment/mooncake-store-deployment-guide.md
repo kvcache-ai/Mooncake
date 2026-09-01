@@ -500,15 +500,21 @@ master publisher <mooncake-store-master-publisher>` reference.
 | `--kv_events_bind_endpoint` | empty | ZMQ PUB bind endpoint, for example `tcp://0.0.0.0:5557`; required when enabled |
 | `--kv_events_backend_id` | empty | Cache-owner identity emitted as `backend_id`; required when enabled |
 | `--kv_events_emit_legacy_compat` | `true` | Include vLLM/SGLang-compatible aliases such as `type` and `block_hashes` |
-| `--kv_events_emit_object_key` | `true` | Include the Mooncake `object_key`; unparsable sequence hashes are still published when this is enabled |
-| `--kv_events_queue_capacity` | `65536` | Maximum pending events; the publisher drops the oldest event when the queue is full. Set to `0` for an unbounded queue |
+| `--kv_events_emit_object_key` | `true` | Emit the raw Mooncake `object_key`. Setting this to `false` suppresses `stored` and `removed` entirely, since those events then carry no object identity; `cleared` is unaffected |
+| `--kv_events_queue_capacity` | `65536` | Maximum pending events; the publisher drops the oldest event when the queue is full and reserves its sequence number so the loss stays visible. Set to `0` for an unbounded queue |
 
-The legacy flags `--kv_events_model_name`, `--kv_events_tenant_id`,
-`--kv_events_additional_salt`, `--kv_events_lora_name`,
-`--kv_events_block_size`, and `--kv_events_dp_rank` are retained for config
-compatibility but are not emitted in event payloads. Supply model, block-size,
-hash-namespace, LoRA, and data-parallel metadata when registering the publisher
-with the indexer; each event carries its object's tenant ID.
+One master publisher serves one fixed model and parallel context, so the
+remaining flags below are emitted verbatim in every event envelope. Empty
+strings and `--kv_events_block_size=0` are encoded as nil.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--kv_events_model_name` | empty | Emitted as `model_name` |
+| `--kv_events_additional_salt` | empty | Emitted as `additional_salt`; the hash namespace this publisher's keys belong to |
+| `--kv_events_lora_name` | empty | Emitted as `lora_name` |
+| `--kv_events_block_size` | `0` | Emitted as `block_size` |
+| `--kv_events_dp_rank` | `0` | Emitted as `dp_rank`, both per event and in the batch trailer |
+| `--kv_events_tenant_id` | `default` | Accepted for configuration compatibility but not emitted. Every event carries the tenant of the Store operation that produced it |
 
 ### HTTP Metadata Server (Embedded)
 
