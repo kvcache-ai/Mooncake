@@ -34,16 +34,16 @@ class WrappedMasterService {
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
-    std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyInternal(
         const std::vector<std::string_view>& keys);
 
     // Bypass (out-of-band attachment) RPC handler for the batch-exist route.
-    // Mirrors GetReplicaListRpc/BatchGetReplicaListRpc: log the per-request
+    // Mirrors GetReplicaList/BatchGetReplicaList: log the per-request
     // request_id read from the coro_rpc attachment, delegate to the
-    // value-returning BatchExistKey (also used in-process by tests), and reply
-    // via ctx.response_msg. The client invokes this *Rpc variant; the value
+    // value-returning BatchExistKeyInternal (also used in-process by tests), and reply
+    // via ctx.response_msg. The client invokes this context-handler entry; the value
     // body stays untouched for in-process callers.
-    void BatchExistKeyRpc(
+    void BatchExistKey(
         coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
         const std::vector<std::string_view>& keys);
 
@@ -57,28 +57,28 @@ class WrappedMasterService {
         ErrorCode>
     GetReplicaListByRegex(const std::string& str);
 
-    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListInternal(
         std::string_view key, const GetReplicaListRequestConfig& config =
                                   GetReplicaListRequestConfig());
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string_view>& keys,
+    BatchGetReplicaListInternal(const std::vector<std::string_view>& keys,
                         const GetReplicaListRequestConfig& config =
                             GetReplicaListRequestConfig());
 
     // Bypass (out-of-band attachment) RPC handlers for the read route. They
-    // delegate to the value-returning GetReplicaList / BatchGetReplicaList
+    // delegate to the value-returning GetReplicaListInternal / BatchGetReplicaListInternal
     // (also used in-process by tests and HTTP /batch_query_keys), so the read,
     // logging and metrics logic lives in one place. These handlers only: log
     // the per-request request_id (read from the coro_rpc out-of-band
     // attachment set client-side), invoke the shared body, and reply via
     // ctx.response_msg. The read request struct carries no request_id field.
-    void GetReplicaListRpc(
+    void GetReplicaList(
         coro_rpc::context<tl::expected<GetReplicaListResponse, ErrorCode>> ctx,
         std::string_view key, const GetReplicaListRequestConfig& config =
                                   GetReplicaListRequestConfig());
 
-    void BatchGetReplicaListRpc(
+    void BatchGetReplicaList(
         coro_rpc::context<
             std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>
             ctx,

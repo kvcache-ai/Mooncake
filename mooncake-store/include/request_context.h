@@ -68,7 +68,7 @@ inline std::string current_request_id_attachment() {
 // RequestContext on the calling thread, performs a synchronous single-key read
 // (invoke_rpc sends current_request_id_attachment() out-of-band), then reads
 // LastObservedRequestId(). The mutex is held only across a short std::string
-// copy, and only GetReplicaListRpc/BatchGetReplicaListRpc ever write here.
+// copy, and only GetReplicaList/BatchGetReplicaList ever write here.
 inline std::mutex& request_id_instrument_mutex() {
     static std::mutex m;
     return m;

@@ -1,15 +1,15 @@
 // Integration test: prove a per-request `request_id` set on the calling
 // thread is carried through the coro_rpc out-of-band request attachment all the
-// way into the master GetReplicaListRpc handler. This makes the attachment
+// way into the master GetReplicaList handler. This makes the attachment
 // round-trip a deterministic CI assertion rather than a VLOG-only observation.
 //
 // Both single-key (invoke_rpc) and batch (invoke_batch_rpc) client templates
 // snapshot current_request_id_attachment() at entry and send it via
 // send_request. We exercise the single-key read route
-// (GetReplicaListRpc) and the batch-exist route (BatchExistKeyRpc) to prove the
+// (GetReplicaList) and the batch-exist route (BatchExistKey) to prove the
 // attachment bypass works for both the single and batch invocation templates.
 //
-// The seam: the *Rpc handlers in rpc_service.cpp / centralized_rpc_service.cpp
+// The seam: the context-handler overloads in rpc_service.cpp / centralized_rpc_service.cpp
 // call RecordObservedRequestId(attachment) inside their attachment block. After
 // the synchronous client call returns (syncAwait guarantees the handler already
 // replied, hence happens-before), the test reads LastObservedRequestId(). A
@@ -84,7 +84,7 @@ TEST_F(RequestIdAttachmentTest, EmptyAttachmentWhenNoRequestId) {
 }
 
 // The batch-exist route goes through MasterClient::invoke_batch_rpc now using
-// send_request; the BatchExistKeyRpc handler must observe the id.
+// send_request; the BatchExistKey handler must observe the id.
 TEST_F(RequestIdAttachmentTest, CarriesRequestIdOnBatchExistRoute) {
     RequestContext ctx;
     ctx.request_id = "attach-batch-exist";

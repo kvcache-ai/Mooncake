@@ -11,7 +11,7 @@ struct RpcNameTraits<&WrappedCentralizedMasterService::PutStart> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedCentralizedMasterService::BatchPutStartRpc> {
+struct RpcNameTraits<&WrappedCentralizedMasterService::BatchPutStart> {
     static constexpr const char* value = "BatchPutStart";
 };
 
@@ -155,7 +155,7 @@ CentralizedMasterClient::BatchPutStart(
     }
 
     auto result =
-        invoke_batch_rpc<&WrappedCentralizedMasterService::BatchPutStartRpc,
+        invoke_batch_rpc<&WrappedCentralizedMasterService::BatchPutStart,
                          std::vector<Replica::Descriptor>>(
             keys.size(), client_id_, keys, total_slice_lengths, config);
     timer.LogResponse("result=", result.size(), " operations");

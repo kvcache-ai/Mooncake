@@ -25,7 +25,7 @@ struct RpcNameTraits<&WrappedMasterService::ExistKey> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchExistKeyRpc> {
+struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
     static constexpr const char* value = "BatchExistKey";
 };
 
@@ -45,12 +45,12 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::GetReplicaListRpc> {
+struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListRpc> {
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
     static constexpr const char* value = "BatchGetReplicaList";
 };
 
@@ -233,7 +233,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKeyRpc, bool>(
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
         object_keys.size(), object_keys);
     timer.LogResponse("result=", result.size(), " keys");
     return result;
@@ -244,7 +244,7 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", key);
 
-    auto result = invoke_rpc<&WrappedMasterService::GetReplicaListRpc,
+    auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
                              GetReplicaListResponse>(key, config);
     timer.LogResponseExpected(result);
     return result;
@@ -254,7 +254,7 @@ async_simple::coro::Lazy<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::AsyncGetReplicaList(std::string_view key,
                                   const GetReplicaListRequestConfig& config) {
     auto result =
-        co_await invoke_rpc_async<&WrappedMasterService::GetReplicaListRpc,
+        co_await invoke_rpc_async<&WrappedMasterService::GetReplicaList,
                                   GetReplicaListResponse>(key, config);
     co_return result;
 }
@@ -270,7 +270,7 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string_view>& keys,
     }
 
     auto result = invoke_rpc<
-        &WrappedMasterService::BatchGetReplicaListRpc,
+        &WrappedMasterService::BatchGetReplicaList,
         std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>(keys, config);
     if (result.has_value()) {
         timer.LogResponse("result=", result.value().size(), " requests");

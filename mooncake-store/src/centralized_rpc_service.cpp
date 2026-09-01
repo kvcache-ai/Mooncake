@@ -153,7 +153,7 @@ tl::expected<void, ErrorCode> WrappedCentralizedMasterService::PutRevoke(
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-WrappedCentralizedMasterService::BatchPutStart(
+WrappedCentralizedMasterService::BatchPutStartInternal(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "BatchPutStart");
@@ -233,7 +233,7 @@ WrappedCentralizedMasterService::BatchPutStart(
 }
 
 void
-WrappedCentralizedMasterService::BatchPutStartRpc(
+WrappedCentralizedMasterService::BatchPutStart(
     coro_rpc::context<std::vector<
         tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>>
         ctx,
@@ -242,14 +242,14 @@ WrappedCentralizedMasterService::BatchPutStartRpc(
     // Bypass: log the per-request request_id carried in the out-of-band
     // attachment (set client-side by invoke_batch_rpc via
     // send_request), delegate to the value-returning
-    // BatchPutStart, and reply via ctx.response_msg.
+    // BatchPutStartInternal, and reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
         VLOG(1) << "BatchPutStart request_id=" << att;
         RecordObservedRequestId(att);
     }
 
-    auto result = BatchPutStart(client_id, keys, slice_lengths, config);
+    auto result = BatchPutStartInternal(client_id, keys, slice_lengths, config);
     ctx.response_msg(std::move(result));
 }
 
@@ -661,7 +661,7 @@ void RegisterCentralizedRpcService(
         &mooncake::WrappedCentralizedMasterService::PutRevoke>(
         &wrapped_master_service);
     server.register_handler<
-        &mooncake::WrappedCentralizedMasterService::BatchPutStartRpc>(
+        &mooncake::WrappedCentralizedMasterService::BatchPutStart>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedCentralizedMasterService::BatchPutEnd>(
