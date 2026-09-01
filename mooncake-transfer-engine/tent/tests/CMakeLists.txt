@@ -1,6 +1,6 @@
-# TENT Tests and Examples
-# tent_metrics_example and deadline_promotion_bench are not add_test targets.
-# tent/benchmark/hip_bandwidth_bench.cpp is a standalone hipcc program.
+# TENT Tests and Examples tent_metrics_example and deadline_promotion_bench are
+# not add_test targets. tent/benchmark/hip_bandwidth_bench.cpp is a standalone
+# hipcc program.
 
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)
@@ -125,9 +125,9 @@ add_test(NAME tent_ip_utils_test COMMAND tent_ip_utils_test)
 # values with embedded NULs. Only built when hiredis is available.
 if(TARGET metastore_redis)
   add_executable(tent_redis_metastore_test redis_metastore_test.cpp)
-  target_link_libraries(tent_redis_metastore_test
-                        PRIVATE metastore_redis tent_common gtest gtest_main
-                                glog)
+  target_link_libraries(
+    tent_redis_metastore_test PRIVATE metastore_redis tent_common gtest
+                                      gtest_main glog)
   target_include_directories(tent_redis_metastore_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_redis_metastore_test COMMAND tent_redis_metastore_test)
@@ -286,14 +286,13 @@ add_test(NAME tent_rdma_transport_test COMMAND tent_rdma_transport_test)
 # Regression test for the edge-triggered async event fd: one epoll wakeup must
 # drain the whole queue. Wraps ibv_get_async_event to script the event source,
 # so it needs no RDMA device. -Wl,--wrap is a GNU ld / lld feature that Apple's
-# linker lacks, and the test is meaningless without it, so skip the target
-# there rather than build one that calls the real symbols.
+# linker lacks, and the test is meaningless without it, so skip the target there
+# rather than build one that calls the real symbols.
 if(UNIX AND NOT APPLE)
   add_executable(tent_rdma_async_event_drain_test
                  rdma_async_event_drain_test.cpp)
-  target_link_libraries(
-    tent_rdma_async_event_drain_test PRIVATE gtest gtest_main tent_link_group
-                                             ibverbs)
+  target_link_libraries(tent_rdma_async_event_drain_test
+                        PRIVATE gtest gtest_main tent_link_group ibverbs)
   target_include_directories(tent_rdma_async_event_drain_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   target_link_options(
@@ -577,9 +576,9 @@ if(USE_TPU)
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 endif()
 
-# NOT registered via add_test: the test needs a real CUDA device (it exports
-# a real CUDA IPC handle), so it must be run manually on a GPU host. Only
-# built when CUDA is enabled: the test includes CUDA headers directly.
+# NOT registered via add_test: the test needs a real CUDA device (it exports a
+# real CUDA IPC handle), so it must be run manually on a GPU host. Only built
+# when CUDA is enabled: the test includes CUDA headers directly.
 if(USE_CUDA)
   add_executable(tent_nvlink_ipc_handle_sharing_test
                  nvlink_ipc_handle_sharing_test.cpp)

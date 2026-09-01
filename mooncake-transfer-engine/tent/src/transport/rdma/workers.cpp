@@ -881,8 +881,8 @@ int Workers::handleContextEvents(int dev_id,
         }
         if (event.event_type == IBV_EVENT_COMM_EST) {
             VLOG(1) << "Received context async event "
-                    << ibv_event_type_str(event.event_type)
-                    << " for context " << context->name();
+                    << ibv_event_type_str(event.event_type) << " for context "
+                    << context->name();
         } else {
             LOG(WARNING) << "Received context async event "
                          << ibv_event_type_str(event.event_type)

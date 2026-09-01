@@ -895,6 +895,8 @@ int RdmaContext::queryPortState(ibv_port_state* state) const {
     // No recordPortSpeed() here on purpose -- see the header.
     *state = port_attr.state;
     return 0;
+}
+
 void RdmaContext::queryEffectiveSpeed() {
     if (!native_context_ || !verbs_.ibv_query_port_speed) {
         effective_speed_mbps_.store(0, std::memory_order_relaxed);
