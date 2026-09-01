@@ -17,8 +17,10 @@
 // means nothing-to-warm rather than failure, and a transport that genuinely
 // fails is reported even when another succeeded.
 //
-// These use fake transports. The RDMA implementation needs a NIC and a peer,
-// so it is not exercised here.
+// These use fake transports. Enumerating RDMA endpoint pairs needs a NIC and a
+// peer, so that part is not exercised here; the rule that turns a pass over
+// those pairs into a result is split out as RdmaTransport::warmupPassResult()
+// and covered at the bottom of this file.
 
 #include <gtest/gtest.h>
 
@@ -28,6 +30,7 @@
 
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transport/rdma/rdma_transport.h"
 
 namespace mooncake {
 namespace tent {
@@ -170,6 +173,63 @@ TEST(WarmupSegmentTest, FirstFailureIsReported) {
     ASSERT_FALSE(status.ok());
     EXPECT_NE(status.ToString().find("first failure"), std::string::npos)
         << status.ToString();
+}
+
+// The per-pair rule inside RDMA, which has to match the per-transport rule
+// above: a pass that leaves any pair cold is a failure, because the data path
+// may route a later slice over any of them.
+//
+// warmupPassResult() takes the counts the enumeration produces, so these cases
+// are "one pair already ready and one failing", "both failing", and so on,
+// without needing a NIC to produce them.
+
+// Every pair came up: nothing is left cold, so the caller got what it paid
+// for.
+TEST(RdmaWarmupPassResultTest, AllPairsReadyIsSuccess) {
+    EXPECT_TRUE(RdmaTransport::warmupPassResult(3, 3, Status::OK()).ok());
+}
+
+// One pair ready, the rest failed. This used to return OK, because only an
+// all-failed pass was reported - which handed back a target whose first
+// transfer could still stall on one of the cold pairs.
+TEST(RdmaWarmupPassResultTest, PartialWarmupIsNotReportedAsComplete) {
+    auto status = RdmaTransport::warmupPassResult(
+        3, 1, Status::InternalError("endpoint 2 unreachable"));
+    ASSERT_FALSE(status.ok()) << "a partly warmed target must not report OK";
+    EXPECT_NE(status.ToString().find("endpoint 2 unreachable"),
+              std::string::npos)
+        << status.ToString();
+}
+
+// One cold pair out of many is still a cold pair.
+TEST(RdmaWarmupPassResultTest, ASingleColdPairIsReported) {
+    auto status = RdmaTransport::warmupPassResult(
+        8, 7, Status::InternalError("last pair refused"));
+    EXPECT_FALSE(status.ok()) << status.ToString();
+}
+
+// With several failures the first is what the caller sees, matching how the
+// engine aggregates transports.
+TEST(RdmaWarmupPassResultTest, FirstPairFailureIsReported) {
+    auto status = RdmaTransport::warmupPassResult(
+        4, 0, Status::InternalError("first pair failure"));
+    ASSERT_FALSE(status.ok());
+    EXPECT_NE(status.ToString().find("first pair failure"), std::string::npos)
+        << status.ToString();
+}
+
+// No enabled local context means there was no pair to warm at all, which is
+// the same "nothing to warm" answer a peer advertising no RDMA device gets -
+// not a failure.
+TEST(RdmaWarmupPassResultTest, NothingAttemptedIsNotAFailure) {
+    auto status = RdmaTransport::warmupPassResult(0, 0, Status::OK());
+    EXPECT_TRUE(status.IsNotImplemented()) << status.ToString();
+}
+
+// Defensive: a cold pair that somehow recorded no error is still a cold pair,
+// so the result must not be OK just because the error slot is empty.
+TEST(RdmaWarmupPassResultTest, ColdPairWithoutARecordedErrorStillFails) {
+    EXPECT_FALSE(RdmaTransport::warmupPassResult(2, 1, Status::OK()).ok());
 }
 
 }  // namespace

@@ -811,7 +811,7 @@ Status RdmaTransport::warmupSegment(SegmentID target_id) {
     // route a slice over any of these pairs, and bootstrapping also brings
     // up the notification QP that rides on the same endpoint.
     size_t attempted = 0, ready = 0;
-    Status last_error = Status::OK();
+    Status first_error = Status::OK();
     for (auto& ctx : context_set_) {
         if (!ctx || ctx->status() != RdmaContext::DEVICE_ENABLED) continue;
         for (const auto& dev_name : target_dev_names) {
@@ -819,8 +819,10 @@ Status RdmaTransport::warmupSegment(SegmentID target_id) {
             std::string peer_name = MakeNicPath(target_nic_path_name, dev_name);
             auto endpoint = ctx->endpointStore()->getOrInsert(peer_name);
             if (!endpoint) {
-                last_error = Status::InternalError("Cannot allocate endpoint " +
-                                                   peer_name + LOC_MARK);
+                if (first_error.ok()) {
+                    first_error = Status::InternalError(
+                        "Cannot allocate endpoint " + peer_name + LOC_MARK);
+                }
                 continue;
             }
             if (endpoint->status() == RdmaEndPoint::EP_READY) {
@@ -832,20 +834,33 @@ Status RdmaTransport::warmupSegment(SegmentID target_id) {
             if (connect_status.ok()) {
                 ++ready;
             } else {
-                last_error = connect_status;
+                if (first_error.ok()) first_error = connect_status;
                 LOG(WARNING) << "RDMA warmup: endpoint " << peer_name
                              << " not ready: " << connect_status.ToString();
             }
         }
     }
-    if (attempted == 0) {
-        // No enabled local context: nothing to warm from, same as above.
-        return Status::NotImplemented("No enabled RDMA context" LOC_MARK);
-    }
     LOG(INFO) << "RDMA warmup towards segment " << target_seg_name << ": "
               << ready << "/" << attempted << " endpoints ready";
-    if (ready == 0) return last_error;
-    return Status::OK();
+    return warmupPassResult(attempted, ready, first_error);
+}
+
+Status RdmaTransport::warmupPassResult(size_t attempted, size_t ready,
+                                       const Status& first_error) {
+    if (attempted == 0) {
+        // No enabled local context, so there was no pair to warm. Nothing to
+        // warm is not a failure, the same answer a peer that advertises no
+        // RDMA device gets.
+        return Status::NotImplemented("No enabled RDMA context" LOC_MARK);
+    }
+    if (ready == attempted) return Status::OK();
+    // Some pairs are still cold. Reporting OK here would hand back a target
+    // whose first transfer can still stall - the data path may route a slice
+    // over any pair, so one warm pair does not stand for the rest, and that
+    // stall is exactly what the caller paid this call to avoid. The engine
+    // level aggregates transports by the same rule.
+    if (!first_error.ok()) return first_error;
+    return Status::InternalError("RDMA warmup left endpoints cold" LOC_MARK);
 }
 
 Status RdmaTransport::sendNotification(SegmentID target_id,
