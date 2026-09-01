@@ -158,6 +158,8 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
 
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
+        tasks_[i].activeRanksMirrorRequestGeneration = 0;
+        tasks_[i].activeRanksMirrorAppliedGeneration = 0;
         tasks_[i].submitSequence = 0;
         tasks_[i].failedRanksHint = nullptr;
         tasks_[i].resetFailedRanksHint = false;
@@ -292,10 +294,11 @@ void MooncakeWorker::putTaskCuda(
 
         hasCallback_[taskId] = false;
 
-        launchEnqueueTaskKernel((int)opType, realSize, broadcastRoot,
-                                bufferOffset, taskSequence, failed_ranks_hint,
-                                pos == 0, meta.get(), tasks_device_, taskId,
-                                enq_stream.get());
+        launchEnqueueTaskKernel(
+            (int)opType, realSize, broadcastRoot, bufferOffset, taskSequence,
+            failed_ranks_hint, pos == 0, meta.get(), meta->activeRanksDevice,
+            meta->activeRanksMirrorDevice, meta->maxGroupSize, tasks_device_,
+            taskId, enq_stream.get());
         copyFromRecvBuffer(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
             pos, realSize, enq_stream.get());

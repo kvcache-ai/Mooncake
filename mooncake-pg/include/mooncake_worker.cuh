@@ -68,6 +68,7 @@ struct TransferGroupMeta {
 
     bool* activeRanks;
     bool* activeRanksDevice;
+    int32_t* activeRanksMirrorDevice = nullptr;
     bool* maybeActivatable;
     RankState rankStates[kMaxNumRanks];  // per GlobalRank
     uint64_t rankEpochs[kMaxNumRanks];
@@ -112,6 +113,8 @@ class MooncakeWorker {
 
     void Start();
 
+    bool hasPendingActiveRanksMirrorUpdate(const TransferGroupMeta* meta) const;
+
     /**
      * @brief Waits for all active collective tasks for the given communicator
      * to complete.
@@ -150,6 +153,7 @@ class MooncakeWorker {
     int cpuTaskCount = 0;
     size_t cudaOpCount = 0;
     std::atomic<uint64_t> next_cuda_task_sequence_{1};
+    std::atomic<uint64_t> next_active_ranks_mirror_generation_{1};
     std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
 
     std::thread worker_thread_;
