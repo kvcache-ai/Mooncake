@@ -486,7 +486,7 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
     max_size_gb = max_pages * page_size_bytes / (1024**3)
     trace_size_gb = max_pages_needed * page_size_bytes / (1024**3)
 
-    print(f"\n[Storage Configuration]")
+    print("\n[Storage Configuration]")
     print(f"  Max page_id in trace:             {max_page_id:,}")
     print(f"  Pages needed (trace):             {max_pages_needed:,}")
     print(f"  Trace storage size:               {trace_size_gb:.2f} GB")
@@ -538,7 +538,7 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
                 result = run_multi_thread(benchmarks, requests, replay_scale)
     except KeyboardInterrupt:
         print(f"\n\n{'='*80}")
-        print(f"Interrupted! Showing partial results:")
+        print("Interrupted! Showing partial results:")
         print(f"{'='*80}")
         result = result if 'result' in locals() else {
             'completed': 0,
@@ -592,7 +592,7 @@ def format_storage_stats(stats: Dict, title: str = "Storage"):
     output.append(f"\n[{title}]")
 
     # General info
-    output.append(f"\n[General]")
+    output.append("\n[General]")
     output.append(f"  Model:            {stats.get('model', 'N/A')}")
     output.append(f"  Threads:          {stats.get('threads', 1)}")
     replay_scale = stats.get('replay_scale', 0)
@@ -604,48 +604,48 @@ def format_storage_stats(stats: Dict, title: str = "Storage"):
     output.append(f"  Hit Rate:         {stats.get('page_hit_rate', 0):.2%}")
 
     # Request Stats
-    output.append(f"\n[Request Wall Latency]")
+    output.append("\n[Request Wall Latency]")
     output.append(f"  Avg:              {request_wall.get('avg_ms', 0):.3f} ms")
     output.append(f"  P50:              {request_wall.get('p50_ms', 0):.3f} ms")
     output.append(f"  P95:              {request_wall.get('p95_ms', 0):.3f} ms")
     output.append(f"  P99:              {request_wall.get('p99_ms', 0):.3f} ms")
 
-    output.append(f"\n[Request Storage I/O Latency]")
+    output.append("\n[Request Storage I/O Latency]")
     output.append(f"  Avg:              {request_io.get('avg_ms', 0):.3f} ms")
     output.append(f"  P50:              {request_io.get('p50_ms', 0):.3f} ms")
     output.append(f"  P95:              {request_io.get('p95_ms', 0):.3f} ms")
     output.append(f"  P99:              {request_io.get('p99_ms', 0):.3f} ms")
 
     # Read Stats
-    output.append(f"\n[Read Operations]")
+    output.append("\n[Read Operations]")
     output.append(f"  Count:            {read_stats.get('count', 0):,}")
     output.append(f"  Data Volume:      {read_stats.get('mb', 0):.2f} MB")
     read_time = read_stats.get('time_s', 0)
     read_mbps = read_stats.get('mb', 0) / read_time if read_time > 0 else 0
     output.append(f"  Total Time:       {read_time:.3f} s")
     output.append(f"  Bandwidth:        {read_mbps:.2f} MB/s")
-    output.append(f"  Latency:")
+    output.append("  Latency:")
     output.append(f"    Avg:            {read_stats.get('avg_ms', 0):.3f} ms")
     output.append(f"    P50:            {read_stats.get('p50_ms', 0):.3f} ms")
     output.append(f"    P95:            {read_stats.get('p95_ms', 0):.3f} ms")
     output.append(f"    P99:            {read_stats.get('p99_ms', 0):.3f} ms")
 
     # Write Stats
-    output.append(f"\n[Write Operations]")
+    output.append("\n[Write Operations]")
     output.append(f"  Count:            {write_stats.get('count', 0):,}")
     output.append(f"  Data Volume:      {write_stats.get('mb', 0):.2f} MB")
     write_time = write_stats.get('time_s', 0)
     write_mbps = write_stats.get('mb', 0) / write_time if write_time > 0 else 0
     output.append(f"  Total Time:       {write_time:.3f} s")
     output.append(f"  Bandwidth:        {write_mbps:.2f} MB/s")
-    output.append(f"  Latency:")
+    output.append("  Latency:")
     output.append(f"    Avg:            {write_stats.get('avg_ms', 0):.3f} ms")
     output.append(f"    P50:            {write_stats.get('p50_ms', 0):.3f} ms")
     output.append(f"    P95:            {write_stats.get('p95_ms', 0):.3f} ms")
     output.append(f"    P99:            {write_stats.get('p99_ms', 0):.3f} ms")
 
     # Storage Info
-    output.append(f"\n[Storage Info]")
+    output.append("\n[Storage Info]")
     output.append(f"  Max Pages:        {storage.get('max_pages', 0):,}")
     output.append(f"  Written Pages:    {storage.get('written_pages', 0):,}")
     output.append(f"  Sync Count:       {storage.get('sync_count', 0):,}")
