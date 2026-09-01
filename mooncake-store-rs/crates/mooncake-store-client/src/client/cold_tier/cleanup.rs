@@ -499,17 +499,20 @@ impl StorageOwnerState {
         &self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
     ) -> Result<crate::control_plane::ColdReclaimResult> {
-        if cold_backing.owner != self.runtime {
-            return Err(StoreError::InvalidState(format!(
-                "cold backing {} belongs to runtime {}, not {}",
-                cold_tier_device_id(cold_backing),
-                cold_backing.owner,
-                self.runtime
-            )));
-        }
         let nof_backing = self
             .cold_tier_devices
             .has_nof_backend(cold_tier_device_id(cold_backing));
+        let expected_owner = self
+            .cold_tier_devices
+            .current_target_owner(cold_tier_device_id(cold_backing), Some(&cold_backing.owner))?;
+        if expected_owner != self.runtime {
+            return Err(StoreError::InvalidState(format!(
+                "cold backing {} belongs to runtime {}, not {}",
+                cold_tier_device_id(cold_backing),
+                expected_owner,
+                self.runtime
+            )));
+        }
         if !nof_backing
             && self
                 .ensure_cold_tier_device_loaded(cold_tier_device_id(cold_backing))?
@@ -912,5 +915,9 @@ impl StorageOwnerState {
                 }
             }
         }
+    }
+
+    pub(crate) fn release_nof_ownership_on_shutdown(&self) {
+        self.cold_tier_devices.release_nof_ownership_on_shutdown();
     }
 }

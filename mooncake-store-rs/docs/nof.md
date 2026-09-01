@@ -78,7 +78,8 @@ may use its exhaustive list and real capacity values. If it is absent, the provi
 collection, watermarks and compaction. `NofDeviceManagement` is evaluated independently. KVCS
 exposes neither management trait because its public 0.4.0 client ABI does not provide those
 operations. KVCS Low-Level does expose `NofHealth`: it sends a side-effect-free existence query to
-the selected mountpoint, while leaving capacity unknown because the SDK has no capacity API.
+the selected mountpoint from the background heartbeat worker, while leaving capacity unknown
+because the SDK has no capacity API.
 
 `StoreClientBuilder::nof_target(s)` registers the runtime backends. The binding reuses the existing
 Cold Tier state machine in this order: select target, publish `PendingWrite`, enqueue, pin/read the
@@ -94,6 +95,9 @@ local disk.
 
 Target selection is capability driven:
 
+- Cold Tier resolves target authority in one shared `owner` module. A local-disk backing is fixed
+  to the runtime that selected the device and persists that runtime as its authoritative owner;
+  only NoF targets use distributed ownership and treat the route owner as a snapshot;
 - a logical-object target is selected once; namespace metadata, placement and replication remain
   provider owned; Mooncake derives a versioned provider object key with the existing SHA-256 key
   codec so delayed reclamation of an overwritten route cannot delete the replacement value;
@@ -101,11 +105,40 @@ Target selection is capability driven:
   successful target write contributes its real locator to `NofBackingRoute.replicas`;
 - single and batch reads use the same inflight/batch/global counters to choose among runtime-local
   replicas;
-- target health uses a one-second runtime snapshot instead of adding an SDK probe to every object;
+- NoF-enabled clients publish a `nof.target-set.v1` lease label. The value fingerprints the sorted
+  target IDs and selected data plane, so a client with a different NoF configuration is never made
+  owner of an incompatible target;
+- all clients derive the same `target_id -> ClientRuntimeId` ownership map from the existing live
+  client cache and the existing Rendezvous placement hash. The stable client ID is the hash
+  candidate: targets are statistically spread across clients, an epoch restart keeps the same
+  placement, and removing one client remaps only the targets that it owned;
+- one background owner worker runs per NoF-enabled client. Once per second it refreshes the map
+  from the local membership snapshot and probes only the targets currently owned by that client.
+  Request paths never call the SDK health operation; a local owner uses its executor-health
+  snapshot, while another client requires the elected owner's Client lease to remain live and
+  consumes its `nof.unhealthy-targets.v1` snapshot;
+- the owner updates that health label only when the unhealthy set changes. Normal Client heartbeat
+  publication preserves the two NoF-managed labels, so no target-by-client polling or per-request
+  metadata read is introduced;
+- a target remains eligible through two transient heartbeat failures and is excluded after the
+  third consecutive failure; the first successful heartbeat makes it eligible again immediately;
   a cold restore filters unavailable targets, promotes a healthy replica and publishes the pruned
   `nof_backing` through the existing restore CAS;
 - NoF-only operation does not load `ColdTierDeviceRecord`, run local watermarks, or update local
   disk capacity accounting.
+
+The primary and every replica in `NofBackingRoute` record the owner elected for that target when
+the route is published. This field is a routing/audit snapshot, not a second lease. Current
+authority always comes from the live target-owner map, so an ownership change does not scan and
+rewrite every object route. Delete/reclaim resolves the current owner by `target_id`; pending-write
+recovery enumerates the targets currently owned by the client and also retains the existing hot
+replica-owner source for EmbeddedWrh routes.
+
+During graceful client shutdown, the NoF manager removes `nof.target-set.v1` from its existing
+Client lease before longer route and local-device cleanup starts. Other clients observe that
+withdrawal through the normal one-second membership refresh and immediately recompute ownership.
+For a process or machine crash, takeover follows the existing Client lease expiry and epoch fence;
+NoF does not add a parallel membership or lease service.
 
 Startup recovery requeues `PendingWrite` routes from external metadata and from the existing route
 authority's replica-owner listing. The second source covers the default EmbeddedWrh mode, where
@@ -124,6 +157,7 @@ client/
       mod.rs
       physical_key.rs
       value_chunk.rs
+    owner.rs
     nof/
       mod.rs
       backing.rs

@@ -5,25 +5,24 @@
 //! internal I/O envelope. Persisted metadata remains `NofBackingRoute` throughout.
 
 use std::collections::BTreeMap;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
-use std::time::{Duration, Instant};
+use std::sync::{atomic::Ordering, Arc};
 
 use mooncake_store_core::{
-    route_logical_object_id, ClientRuntimeId, ColdBackingRoute, ColdBackingState, NamespaceScope,
-    NofBackingReplica, NofBackingRoute, NofBackingState, ObjectRoute, Result, StoreError,
+    route_logical_object_id, ClientRuntimeId, ColdBackingRoute, ColdBackingState, MetadataBackend,
+    NamespaceScope, NofBackingReplica, NofBackingRoute, NofBackingState, ObjectRoute, Result,
+    StoreError,
 };
 
 use crate::client::cold_tier::layout::{
     decode_hex, encode_hex, PhysicalKeyCodec, PhysicalKeyInput, Sha256PhysicalKeyCodec,
 };
+use crate::client::cold_tier::owner::{NofHeartbeatMonitor, NofOwnerState, NofRuntimeTarget};
 use crate::client::cold_tier::replica_policy::{
     ReplicaLoadBalanceStrategy, ReplicaWriteCandidate, DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY,
 };
 use crate::client::{
     PersistentStorageBackend, PersistentStorageBackendHealth, PersistentStorageManagement,
+    SharedLiveClientCache,
 };
 
 use super::object::NofObjectState;
@@ -32,7 +31,6 @@ use super::physical_adapter::NofPhysicalAdapter;
 use super::NofBackend;
 
 const OBJECT_LOCATOR_PREFIX: &str = "nof-object:v1:";
-const TARGET_HEALTH_CACHE_TTL: Duration = Duration::from_secs(1);
 
 /// One NoF target registered on `StoreClientBuilder`.
 #[derive(Clone)]
@@ -57,42 +55,60 @@ impl NofTargetConfig {
     }
 }
 
+pub(in crate::client) fn target_set_fingerprint(
+    configs: &[NofTargetConfig],
+) -> Result<Option<String>> {
+    if configs.is_empty() {
+        return Ok(None);
+    }
+    let mut targets = configs
+        .iter()
+        .map(|config| {
+            Ok((
+                config.target_id.as_str(),
+                runtime_data_plane(&config.backend)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    targets.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let mut encoded_fields = Vec::<Vec<u8>>::with_capacity(targets.len() * 2);
+    for (target_id, data_plane) in targets {
+        encoded_fields.push(match data_plane {
+            NofDataPlane::Object => b"object".to_vec(),
+            NofDataPlane::Physical => b"physical".to_vec(),
+        });
+        encoded_fields.push(target_id.as_bytes().to_vec());
+    }
+    let fields = encoded_fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let fingerprint = Sha256PhysicalKeyCodec.encode(PhysicalKeyInput {
+        domain: b"nof-target-set-v1",
+        fields: &fields,
+        chunk_index: None,
+    })?;
+    Ok(Some(fingerprint.to_hex()))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NofDataPlane {
     Object,
     Physical,
 }
 
-struct NofRuntimeTarget {
-    backend: Arc<dyn PersistentStorageBackend>,
-    accumulated_writes: AtomicU64,
-    health: parking_lot::Mutex<Option<(Instant, Result<PersistentStorageBackendHealth>)>>,
-}
-
-impl NofRuntimeTarget {
-    fn health(&self) -> Result<PersistentStorageBackendHealth> {
-        let mut cached = self.health.lock();
-        if let Some((observed_at, health)) = cached.as_ref() {
-            if observed_at.elapsed() < TARGET_HEALTH_CACHE_TTL {
-                return health.clone();
-            }
-        }
-        let health = self.backend.health();
-        *cached = Some((Instant::now(), health.clone()));
-        health
-    }
-}
-
 pub(in crate::client) struct NofTargetManager {
     data_plane: Option<NofDataPlane>,
     replica_count: usize,
-    targets: BTreeMap<String, NofRuntimeTarget>,
+    state: Arc<NofOwnerState>,
+    _heartbeat: NofHeartbeatMonitor,
 }
 
 impl NofTargetManager {
     pub(in crate::client) fn new(
         configs: Vec<NofTargetConfig>,
         replica_count: usize,
+        local_runtime: ClientRuntimeId,
+        metadata: Arc<dyn MetadataBackend>,
+        live_clients: SharedLiveClientCache,
+        target_set_fingerprint: String,
     ) -> Result<Self> {
         let mut data_plane = None;
         let mut targets = BTreeMap::new();
@@ -115,11 +131,7 @@ impl NofTargetManager {
             if targets
                 .insert(
                     config.target_id.clone(),
-                    NofRuntimeTarget {
-                        backend,
-                        accumulated_writes: AtomicU64::new(0),
-                        health: parking_lot::Mutex::new(None),
-                    },
+                    Arc::new(NofRuntimeTarget::new(backend)),
                 )
                 .is_some()
             {
@@ -129,36 +141,57 @@ impl NofTargetManager {
                 )));
             }
         }
+        let state = Arc::new(NofOwnerState::new(
+            local_runtime,
+            metadata,
+            live_clients,
+            target_set_fingerprint,
+            targets,
+        ));
+        state.refresh_ownership();
+        let heartbeat = if state.targets.is_empty() {
+            NofHeartbeatMonitor::disabled()
+        } else {
+            NofHeartbeatMonitor::start(state.clone())?
+        };
         Ok(Self {
             data_plane,
             replica_count: replica_count.clamp(1, 8),
-            targets,
+            state,
+            _heartbeat: heartbeat,
         })
     }
 
     pub(in crate::client) fn is_empty(&self) -> bool {
-        self.targets.is_empty()
+        self.state.targets.is_empty()
     }
 
     pub(in crate::client) fn contains(&self, target_id: &str) -> bool {
-        self.targets.contains_key(target_id)
+        self.state.targets.contains_key(target_id)
     }
 
     pub(in crate::client) fn available_for_io(&self, target_id: &str) -> bool {
-        self.targets
-            .get(target_id)
-            .is_some_and(|target| target.health().is_ok())
+        self.state.health_snapshot(target_id).is_ok()
     }
 
     pub(in crate::client) fn target_ids(&self) -> Vec<String> {
-        self.targets.keys().cloned().collect()
+        self.state.targets.keys().cloned().collect()
+    }
+
+    pub(in crate::client) fn owner_for(&self, target_id: &str) -> Option<ClientRuntimeId> {
+        self.state.owner_for(target_id)
+    }
+
+    pub(in crate::client) fn locally_owned_target_ids(&self) -> Vec<String> {
+        self.state.locally_owned_target_ids()
     }
 
     pub(in crate::client) fn backend_for(
         &self,
         target_id: &str,
     ) -> Result<Arc<dyn PersistentStorageBackend>> {
-        self.targets
+        self.state
+            .targets
             .get(target_id)
             .map(|target| target.backend.clone())
             .ok_or_else(|| {
@@ -171,16 +204,15 @@ impl NofTargetManager {
     pub(in crate::client) fn pending_backing(
         &self,
         route: &ObjectRoute,
-        owner: ClientRuntimeId,
         length: u64,
         checksum: u64,
     ) -> Result<Option<NofBackingRoute>> {
         let Some(data_plane) = self.data_plane else {
             return Ok(None);
         };
-        let mut scored = Vec::with_capacity(self.targets.len());
-        for (target_id, target) in &self.targets {
-            let health = match target.health() {
+        let mut scored = Vec::with_capacity(self.state.targets.len());
+        for (target_id, target) in &self.state.targets {
+            let health = match self.state.health_snapshot(target_id) {
                 Ok(health) => health,
                 Err(error) => {
                     tracing::warn!(target_id, error = %error, "NoF target excluded from offload");
@@ -221,7 +253,7 @@ impl NofTargetManager {
             return Ok(None);
         };
         for index in &selected {
-            if let Some(target) = self.targets.get(scored[*index].0) {
+            if let Some(target) = self.state.targets.get(scored[*index].0) {
                 target.accumulated_writes.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -234,16 +266,27 @@ impl NofTargetManager {
             route.version.0
         );
         let primary_id = scored[primary_index].0.to_string();
+        let primary_owner = self.state.owner_for(&primary_id).ok_or_else(|| {
+            StoreError::Transport(format!("NoF target {primary_id} has no live owner"))
+        })?;
         let replicas = selected[1..]
             .iter()
-            .map(|index| NofBackingReplica {
-                owner: owner.clone(),
-                target_id: scored[*index].0.to_string(),
-                object_locator: locator.clone(),
+            .map(|index| {
+                let target_id = scored[*index].0.to_string();
+                self.state
+                    .owner_for(&target_id)
+                    .map(|owner| NofBackingReplica {
+                        owner,
+                        target_id,
+                        object_locator: locator.clone(),
+                    })
+                    .ok_or_else(|| {
+                        StoreError::Transport("NoF replica target has no live owner".to_string())
+                    })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Some(NofBackingRoute {
-            owner,
+            owner: primary_owner,
             target_id: primary_id,
             object_locator: locator,
             length,
@@ -251,6 +294,12 @@ impl NofTargetManager {
             state: NofBackingState::PendingWrite,
             replicas,
         }))
+    }
+
+    pub(in crate::client) fn release_ownership_on_shutdown(&self) {
+        if !self.is_empty() {
+            self.state.release();
+        }
     }
 }
 
@@ -540,4 +589,135 @@ pub(in crate::client) fn route_backing_as_cold(route: &ObjectRoute) -> Option<Co
         .cold_backing
         .clone()
         .or_else(|| route.nof_backing.as_ref().map(nof_as_cold))
+}
+
+#[cfg(test)]
+mod tests {
+    use mooncake_metadata::InMemoryMetadataBackend;
+    use mooncake_store_core::{
+        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientStableId,
+        CompatibilityDescriptor, ObjectKey, RouteState, RouteVersion,
+    };
+
+    use super::*;
+    use crate::client::cold_tier::owner::NOF_TARGET_SET_LABEL;
+    use crate::client::LiveClientCache;
+
+    struct FakeBackend;
+
+    impl PersistentStorageBackend for FakeBackend {
+        fn health(&self) -> Result<PersistentStorageBackendHealth> {
+            unreachable!("disabled owner worker does not probe the test backend")
+        }
+
+        fn put_object(
+            &self,
+            _backing: &ColdBackingRoute,
+            _payload: &[u8],
+        ) -> Result<ColdBackingRoute> {
+            unreachable!("heartbeat test does not write objects")
+        }
+
+        fn get_object(&self, _backing: &ColdBackingRoute) -> Result<Option<Vec<u8>>> {
+            unreachable!("heartbeat test does not read objects")
+        }
+
+        fn delete_object(&self, _backing: &ColdBackingRoute) -> Result<bool> {
+            unreachable!("heartbeat test does not delete objects")
+        }
+
+        fn put_pending_source(&self, _backing: &ColdBackingRoute, _payload: &[u8]) -> Result<()> {
+            unreachable!("heartbeat test does not stage objects")
+        }
+
+        fn get_pending_source(&self, _backing: &ColdBackingRoute) -> Result<Option<Vec<u8>>> {
+            unreachable!("heartbeat test does not read staged objects")
+        }
+
+        fn delete_pending_source(&self, _backing: &ColdBackingRoute) -> Result<bool> {
+            unreachable!("heartbeat test does not delete staged objects")
+        }
+    }
+
+    fn owner_lease(stable_id: &str, epoch: u64, fingerprint: &str) -> ClientLease {
+        let mut endpoints = ClientEndpointSet::default();
+        endpoints
+            .labels
+            .insert(NOF_TARGET_SET_LABEL.to_string(), fingerprint.to_string());
+        ClientLease {
+            runtime: ClientRuntimeId {
+                stable_id: ClientStableId::new(stable_id),
+                epoch: ClientEpoch(epoch),
+            },
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints,
+            expires_at_ms: u64::MAX,
+        }
+    }
+
+    fn route(key: &str) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new(key),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(7),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::new(),
+            cold_backing: None,
+            nof_backing: None,
+        }
+    }
+
+    #[test]
+    fn pending_route_records_each_targets_elected_owner() {
+        let local = owner_lease("client-a", 1, "same-target-set");
+        let remote = owner_lease("client-b", 1, "same-target-set");
+        let live_clients = Arc::new(parking_lot::Mutex::new(LiveClientCache::default()));
+        live_clients
+            .lock()
+            .store(vec![local.clone(), remote.clone()]);
+        let targets = (0..64)
+            .map(|index| {
+                let target_id = format!("nof-{index:04}");
+                let backend = Arc::new(FakeBackend);
+                (target_id, Arc::new(NofRuntimeTarget::new(backend)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let state = Arc::new(NofOwnerState::new(
+            local.runtime.clone(),
+            Arc::new(InMemoryMetadataBackend::new()),
+            live_clients,
+            "same-target-set".to_string(),
+            targets,
+        ));
+        state.refresh_ownership();
+        let manager = NofTargetManager {
+            data_plane: Some(NofDataPlane::Physical),
+            replica_count: 8,
+            state: state.clone(),
+            _heartbeat: NofHeartbeatMonitor::disabled(),
+        };
+
+        let backing = manager
+            .pending_backing(&route("owned-route"), 4, 9)
+            .expect("pending backing should build")
+            .expect("pending backing should be selected");
+        let mut saw_remote_owner = false;
+        for target in backing.all_targets() {
+            let expected = manager
+                .owner_for(target.target_id)
+                .expect("selected target should have an owner");
+            assert_eq!(*target.owner, expected);
+            saw_remote_owner |= target.owner == &remote.runtime;
+        }
+        assert!(
+            saw_remote_owner,
+            "test selection should cover a remote owner"
+        );
+    }
 }
