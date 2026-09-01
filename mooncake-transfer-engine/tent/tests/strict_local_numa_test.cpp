@@ -265,7 +265,7 @@ TEST_F(StrictLocalNumaEnvTest, AcceptsNumericAndTextualBooleans) {
     }
 }
 
-// Unparseable env must not overwrite an existing JSON value.
+// Unparsable env must not overwrite an existing JSON value.
 TEST_F(StrictLocalNumaEnvTest, UnrecognizedValueKeepsConfiguredValue) {
     setenv("MC_STRICT_LOCAL_NUMA", "maybe", 1);
     ConfigHelper helper;
