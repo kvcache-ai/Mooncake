@@ -27,7 +27,9 @@ class NativePlacementTarget final : public PlacementTarget {
         return allocator().allocate(size);
     }
 
-    bool IsCxl() const noexcept override { return false; }
+    PlacementTargetKind Kind() const noexcept override {
+        return PlacementTargetKind::NATIVE;
+    }
 };
 
 class CxlPlacementTarget final : public PlacementTarget {
@@ -45,7 +47,9 @@ class CxlPlacementTarget final : public PlacementTarget {
         return buffer;
     }
 
-    bool IsCxl() const noexcept override { return true; }
+    PlacementTargetKind Kind() const noexcept override {
+        return PlacementTargetKind::CXL;
+    }
 
    private:
     std::string cxl_binding_name_;

@@ -61,18 +61,17 @@ PlacementScratch& GetPlacementScratch() {
     return scratch;
 }
 
-template <bool CxlOnly = false>
-std::unique_ptr<AllocatedBuffer> TryAllocateFromGroup(
-    const PlacementGroup* group, size_t size) {
+template <typename TargetPredicate>
+std::unique_ptr<AllocatedBuffer> TryAllocateFromGroupIf(
+    const PlacementGroup* group, size_t size,
+    const TargetPredicate& accepts_target) {
     if (!group || group->targets.empty()) {
         return nullptr;
     }
 
-    auto try_target = [size](const PlacementTarget* target) {
-        if constexpr (CxlOnly) {
-            if (!target->IsCxl()) {
-                return std::unique_ptr<AllocatedBuffer>{};
-            }
+    auto try_target = [size, &accepts_target](const PlacementTarget* target) {
+        if (!accepts_target(*target)) {
+            return std::unique_ptr<AllocatedBuffer>{};
         }
         return target->Allocate(size);
     };
@@ -90,6 +89,12 @@ std::unique_ptr<AllocatedBuffer> TryAllocateFromGroup(
         }
     }
     return nullptr;
+}
+
+std::unique_ptr<AllocatedBuffer> TryAllocateFromGroup(
+    const PlacementGroup* group, size_t size) {
+    return TryAllocateFromGroupIf(group, size,
+                                  [](const PlacementTarget&) { return true; });
 }
 
 double GetFreeRatio(const PlacementGroup& group) {
@@ -160,7 +165,7 @@ void ResolveGroups(const PlacementIndex& index,
 
 tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
     const PlacementIndex& index, const ReplicaAllocationRequest& request,
-    PlacementScratch& scratch) {
+    PlacementTargetKind required_kind, PlacementScratch& scratch) {
     const auto& replicas = request.replicas;
     if (replicas.size == 0 || replicas.count == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -179,7 +184,10 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
     if (scratch.excluded.Contains(group)) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
-    auto buffer = TryAllocateFromGroup<true>(group, replicas.size);
+    auto buffer = TryAllocateFromGroupIf(
+        group, replicas.size, [required_kind](const PlacementTarget& target) {
+            return target.Kind() == required_kind;
+        });
     if (!buffer) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
@@ -342,14 +350,14 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateUsingRanker(
 
 tl::expected<std::vector<Replica>, ErrorCode> AllocateUsingPreferences(
     ScopedPlacementReadAccess& placement,
-    const ReplicaAllocationRequest& request,
-    PlacementDiagnostics* diagnostics) {
+    const ReplicaAllocationRequest& request, PlacementDiagnostics* diagnostics,
+    PlacementTargetKind required_kind) {
     const auto& index = placement.GetView();
     UpdateDiagnostics(index, request, diagnostics);
 
     auto& scratch = GetPlacementScratch();
     ResolveGroups(index, request.placement, {}, scratch);
-    return AllocatePreferredOnly(index, request, scratch);
+    return AllocatePreferredOnly(index, request, required_kind, scratch);
 }
 
 tl::expected<Replica, ErrorCode> AllocateFromNamedGroup(
@@ -389,7 +397,8 @@ ReplicaAllocator<Policy>::Allocate(ScopedPlacementReadAccess& placement,
                                    const ReplicaAllocationRequest& request,
                                    PlacementDiagnostics* diagnostics) const {
     if constexpr (std::same_as<Policy, PreferredOnlyPlacementPolicy>) {
-        return AllocateUsingPreferences(placement, request, diagnostics);
+        return AllocateUsingPreferences(placement, request, diagnostics,
+                                        policy_.required_kind);
     } else if constexpr (std::same_as<Policy, FreeRatioFirstPlacementPolicy>) {
         return AllocateUsingRanker(placement, request, diagnostics,
                                    FreeRatioRanker{}, false);

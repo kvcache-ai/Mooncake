@@ -11,6 +11,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
+#include "placement/target.h"
 #include "replica.h"
 #include "types.h"
 
@@ -60,7 +61,13 @@ struct PlacementDiagnostics final {
 struct RandomPlacementPolicy final {};
 struct FreeRatioFirstPlacementPolicy final {};
 struct LocalFirstPlacementPolicy final {};
-struct PreferredOnlyPlacementPolicy final {};
+
+struct PreferredOnlyPlacementPolicy final {
+    explicit PreferredOnlyPlacementPolicy(PlacementTargetKind required_kind)
+        : required_kind(required_kind) {}
+
+    PlacementTargetKind required_kind;
+};
 
 struct SsdFreeRatioFirstPlacementPolicy final {
     explicit SsdFreeRatioFirstPlacementPolicy(LocalSSDMetricsView metrics_view)
