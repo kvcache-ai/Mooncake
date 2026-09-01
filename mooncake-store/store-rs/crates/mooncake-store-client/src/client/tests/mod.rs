@@ -2865,7 +2865,15 @@ fn test_storage_owner_state(
         Arc::new(Mutex::new(StoreState::default())),
         StorageOwnerColdTierConfig {
             resolver: ColdTierBackendResolver::from_handles(String::new(), BTreeMap::new()),
-            nof_targets: cold_tier::nof::NofTargetManager::new(Vec::new(), 1).unwrap(),
+            nof_targets: cold_tier::nof::NofTargetManager::new(
+                Vec::new(),
+                1,
+                runtime.clone(),
+                metadata.clone(),
+                live_client_cache,
+                String::new(),
+            )
+            .unwrap(),
             devices: shared_cold_tier_device_cache("test"),
             watermarks: ColdTierWatermarkConfig::default(),
             rate_limits: ColdTierRateLimitConfig::default(),
@@ -2889,7 +2897,15 @@ fn test_storage_owner_state_with_route_directory(
         client.state.clone(),
         StorageOwnerColdTierConfig {
             resolver: ColdTierBackendResolver::from_handles(String::new(), BTreeMap::new()),
-            nof_targets: cold_tier::nof::NofTargetManager::new(Vec::new(), 1).unwrap(),
+            nof_targets: cold_tier::nof::NofTargetManager::new(
+                Vec::new(),
+                1,
+                client.runtime_id().clone(),
+                client.metadata.clone(),
+                client.live_client_cache.clone(),
+                String::new(),
+            )
+            .unwrap(),
             devices: shared_cold_tier_device_cache("test"),
             watermarks: ColdTierWatermarkConfig::default(),
             rate_limits: ColdTierRateLimitConfig::default(),

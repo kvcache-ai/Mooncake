@@ -17,6 +17,9 @@ mod runtime;
 #[cfg(feature = "kvcs-capi")]
 mod kvcs;
 
+pub(in crate::client) use super::owner::{
+    upsert_client_lease_preserving_nof_labels, NOF_TARGET_SET_LABEL,
+};
 pub use backend::NofBackend;
 pub use backing::NofBacking;
 pub use external_metadata::NofExternalMetadata;
@@ -31,7 +34,7 @@ pub use physical::{
 };
 pub use runtime::NofTargetConfig;
 pub(in crate::client) use runtime::{
-    cold_as_nof, nof_as_cold, route_backing_as_cold, NofTargetManager,
+    cold_as_nof, nof_as_cold, route_backing_as_cold, target_set_fingerprint, NofTargetManager,
 };
 
 pub use crate::client::cold_tier::layout::{

@@ -407,6 +407,14 @@ impl StoreClientBuilder {
         let mut endpoints = self.endpoints;
         normalize_storage_label(&self.local_memory, &mut endpoints.labels)?;
         normalize_route_label(&self.local_memory, &mut endpoints.labels);
+        let nof_target_set_fingerprint =
+            cold_tier::nof::target_set_fingerprint(&self.nof_targets)?;
+        if let Some(fingerprint) = nof_target_set_fingerprint.as_ref() {
+            endpoints.labels.insert(
+                cold_tier::nof::NOF_TARGET_SET_LABEL.to_string(),
+                fingerprint.clone(),
+            );
+        }
         if let Some(transport) = self.transport.as_ref() {
             if endpoints.rpc_address.is_empty() {
                 let (host, port) = transport.rpc_server_address()?;
@@ -594,8 +602,14 @@ impl StoreClientBuilder {
         }
         let cold_tier_resolver =
             ColdTierBackendResolver::from_handles(default_cold_tier_id, cold_tier_handles);
-        let nof_targets =
-            cold_tier::nof::NofTargetManager::new(self.nof_targets, self.nof_replica_count)?;
+        let nof_targets = cold_tier::nof::NofTargetManager::new(
+            self.nof_targets,
+            self.nof_replica_count,
+            runtime.clone(),
+            runtime_metadata.clone(),
+            live_client_cache.clone(),
+            nof_target_set_fingerprint.unwrap_or_default(),
+        )?;
         for target_id in nof_targets.target_ids() {
             if cold_tier_resolver.has_backend(&target_id) {
                 return Err(StoreError::InvalidState(format!(

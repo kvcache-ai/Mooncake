@@ -844,7 +844,11 @@ impl StoreClient {
     ) -> Result<()> {
         let mut groups = BTreeMap::<ClientRuntimeId, Vec<mooncake_store_core::ColdBackingRoute>>::new();
         for target in cold_tier::persistent_backing_targets(cold_backing) {
-            groups.entry(target.owner.clone()).or_default().push(target);
+            let owner = self
+                .storage_owner
+                .cold_tier_devices
+                .current_target_owner(&target.cold_tier_id, Some(&target.owner))?;
+            groups.entry(owner).or_default().push(target);
         }
         let namespace = self.metadata.route_namespace();
         for (owner, targets) in groups {

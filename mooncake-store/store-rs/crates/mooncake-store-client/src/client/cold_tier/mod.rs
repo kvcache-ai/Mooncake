@@ -7,6 +7,7 @@ pub(crate) mod layout;
 mod metrics;
 pub(crate) mod nof;
 mod offload;
+mod owner;
 mod replica_policy;
 mod resolve;
 mod restore;

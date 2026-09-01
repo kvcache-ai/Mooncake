@@ -389,7 +389,7 @@ impl HealthUpdate {
     pub fn publish(self) -> Result<()> {
         let Self {
             metadata,
-            lease,
+            mut lease,
             kind,
         } = self;
         match kind {
@@ -401,7 +401,10 @@ impl HealthUpdate {
                 )
                 .entered();
                 let tracker = OperationTracker::new("heartbeat");
-                let result = metadata.upsert_client_lease(&lease);
+                let result = cold_tier::nof::upsert_client_lease_preserving_nof_labels(
+                    metadata.as_ref(),
+                    &mut lease,
+                );
                 tracker.finish(&result, 0);
                 result
             }
@@ -414,7 +417,10 @@ impl HealthUpdate {
                 )
                 .entered();
                 let tracker = OperationTracker::new(operation);
-                let result = metadata.upsert_client_lease(&lease);
+                let result = cold_tier::nof::upsert_client_lease_preserving_nof_labels(
+                    metadata.as_ref(),
+                    &mut lease,
+                );
                 tracker.finish(&result, 0);
                 result
             }

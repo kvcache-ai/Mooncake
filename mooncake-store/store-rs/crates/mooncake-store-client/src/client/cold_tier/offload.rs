@@ -69,13 +69,7 @@ pub(in super::super) fn publish_initial_write_cold_backing(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(backing) = storage_owner.backing_for_route(
-        route,
-        storage_owner.runtime.clone(),
-        replica.length,
-        checksum,
-    )?
-    else {
+    let Some(backing) = storage_owner.backing_for_route(route, replica.length, checksum)? else {
         storage_owner.sync_route(route);
         return Ok(None);
     };
@@ -174,12 +168,7 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(backing) = storage_owner.pending_backing_for_route(
-        route,
-        storage_owner.runtime.clone(),
-        replica.length,
-        checksum,
-    )?
+    let Some(backing) = storage_owner.pending_backing_for_route(route, replica.length, checksum)?
     else {
         storage_owner.sync_route(route);
         return Ok(None);
@@ -1266,14 +1255,22 @@ fn rebuild_pending_offload_queue_with(
             }
         }
     }
-    let mut nof_routes = storage_owner
-        .metadata
-        .as_ref()
-        .list_object_routes_by_nof_backing(&mooncake_store_core::NofBackingRouteFilter {
-            state: Some(mooncake_store_core::NofBackingState::PendingWrite),
-            owner: Some(storage_owner.runtime.clone()),
-            ..mooncake_store_core::NofBackingRouteFilter::default()
-        })?;
+    let mut nof_routes = Vec::new();
+    for target_id in storage_owner
+        .cold_tier_devices
+        .locally_owned_nof_target_ids()
+    {
+        nof_routes.extend(
+            storage_owner
+                .metadata
+                .as_ref()
+                .list_object_routes_by_nof_backing(&mooncake_store_core::NofBackingRouteFilter {
+                    target_id: Some(target_id),
+                    state: Some(mooncake_store_core::NofBackingState::PendingWrite),
+                    ..mooncake_store_core::NofBackingRouteFilter::default()
+                })?,
+        );
+    }
     // Embedded route control keeps live routes in the shared authority directory rather than
     // duplicating them into the external metadata table. Pending offloads still have a hot
     // replica owned by this runtime, so the existing owner listing supplies the same recovery
@@ -1287,8 +1284,16 @@ fn rebuild_pending_offload_queue_with(
         let Some(backing) = route.nof_backing.as_ref() else {
             continue;
         };
+        let owns_primary_target = storage_owner
+            .cold_tier_devices
+            .current_target_owner(&backing.target_id, Some(&backing.owner))
+            .is_ok_and(|owner| owner == storage_owner.runtime);
+        let owns_hot_source = route
+            .replicas
+            .iter()
+            .any(|replica| replica.owner == storage_owner.runtime);
         if route.state == RouteState::Active
-            && backing.owner == storage_owner.runtime
+            && (owns_primary_target || owns_hot_source)
             && backing.state == mooncake_store_core::NofBackingState::PendingWrite
             && storage_owner
                 .cold_tier_devices

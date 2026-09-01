@@ -1995,6 +1995,12 @@ impl StoreClient {
 
 impl Drop for StoreClient {
     fn drop(&mut self) {
+        if self.owns_cold_tier_lifecycle {
+            // Withdraw the NoF-manager label first. Other clients can take over
+            // targets while this client completes potentially longer route and
+            // local-device cleanup.
+            self.storage_owner.release_nof_ownership_on_shutdown();
+        }
         self.membership_sync.shutdown();
         self._async_eviction.shutdown();
         self.async_replica_tracking.shutdown();

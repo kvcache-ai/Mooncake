@@ -391,7 +391,18 @@ fn unavailable_physical_nof_target_is_pruned_after_replica_restore() {
     );
 
     primary.available.store(false, Ordering::Relaxed);
-    sleep(Duration::from_millis(1_100));
+    let health_deadline = Instant::now() + Duration::from_secs(5);
+    while client
+        .storage_owner
+        .cold_tier_devices
+        .runtime_backend_available("nof-physical-a")
+    {
+        assert!(
+            Instant::now() < health_deadline,
+            "NoF owner heartbeat did not fence the failed target"
+        );
+        sleep(Duration::from_millis(50));
+    }
     force_cold_only_route(&client, "physical-nof-health-key");
     assert_eq!(
         client
@@ -421,6 +432,93 @@ fn unavailable_physical_nof_target_is_pruned_after_replica_restore() {
         );
         sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn nof_target_owner_handoff_reclaims_routes_with_stale_owner_snapshot() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let backend = Arc::new(FakePhysicalNof::default());
+    let target = NofTargetConfig::new(
+        "nof-handoff-target",
+        NofBackend::new(backend.clone()).expect("handoff NoF backend should build"),
+    )
+    .expect("handoff NoF target should build");
+    let build = |stable_id: &str, segment: &str| {
+        let client = StoreClientBuilder::new(metadata.clone(), stable_id)
+            .state(ClientLifecycleState::Active)
+            .label("storage", "true")
+            .route_control(RouteControlMode::MetadataOnly)
+            .transport(Arc::new(TestTransport::new(segment)))
+            .local_memory(storage_config_with_bytes(512))
+            .nof_target(target.clone())
+            .build(test_future_expiry_ms())
+            .expect("handoff client should build");
+        client
+            .register_local_memory()
+            .expect("handoff client memory should register");
+        client
+    };
+    let client_a = build("nof-handoff-a", "nof-handoff-segment-a");
+    let client_b = build("nof-handoff-b", "nof-handoff-segment-b");
+
+    client_a
+        .put("nof-handoff-key", &[13u8; 150])
+        .expect("handoff NoF put should succeed");
+    client_a
+        .storage_owner
+        .materialize_pending_offloads_bounded(32)
+        .expect("handoff NoF offload should run");
+    let route = wait_for_materialized_nof_backing(&client_a, "nof-handoff-key");
+    force_cold_only_route(&client_a, "nof-handoff-key");
+    let initial_owner = route
+        .nof_backing
+        .as_ref()
+        .expect("handoff route should have NoF backing")
+        .owner
+        .clone();
+    let (departed, survivor) = if initial_owner == *client_a.runtime_id() {
+        (client_a, client_b)
+    } else {
+        assert_eq!(initial_owner, *client_b.runtime_id());
+        (client_b, client_a)
+    };
+    let departed_runtime = departed.runtime_id().clone();
+    drop(departed);
+
+    let handoff_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let current = survivor
+            .storage_owner
+            .cold_tier_devices
+            .current_target_owner("nof-handoff-target", None)
+            .ok();
+        if current.as_ref() == Some(survivor.runtime_id()) {
+            break;
+        }
+        assert!(
+            Instant::now() < handoff_deadline,
+            "NoF target owner was not handed off after graceful exit: {current:?}"
+        );
+        sleep(Duration::from_millis(25));
+    }
+    let stale_route = survivor
+        .query_route("nof-handoff-key")
+        .expect("handoff route query should succeed")
+        .expect("handoff route should remain");
+    assert_eq!(
+        stale_route.nof_backing.as_ref().unwrap().owner,
+        departed_runtime,
+        "route owner is intentionally a lazy snapshot"
+    );
+
+    survivor
+        .remove("nof-handoff-key", true)
+        .expect("current target owner should reclaim a stale-owner route");
+    assert!(
+        wait_for_nof_reclaims(&survivor, || backend.records.lock().is_empty()),
+        "NoF target data remained after owner handoff reclaim"
+    );
 }
 
 #[test]

@@ -124,13 +124,12 @@ impl StorageOwnerState {
     pub(in super::super) fn backing_for_route(
         &self,
         route: &ObjectRoute,
-        owner: ClientRuntimeId,
         length: u64,
         checksum: u64,
     ) -> Result<Option<super::super::PendingBackingRoute>> {
         match self.offload_mode {
             super::super::ColdTierOffloadMode::Passthrough => {
-                self.pending_backing_for_route(route, owner, length, checksum)
+                self.pending_backing_for_route(route, length, checksum)
             }
             super::super::ColdTierOffloadMode::EvictTriggered => Ok(None),
         }
@@ -139,7 +138,6 @@ impl StorageOwnerState {
     pub(in super::super) fn pending_backing_for_route(
         &self,
         route: &ObjectRoute,
-        owner: ClientRuntimeId,
         length: u64,
         checksum: u64,
     ) -> Result<Option<super::super::PendingBackingRoute>> {
@@ -148,7 +146,7 @@ impl StorageOwnerState {
             let backing = self
                 .cold_tier_devices
                 .nof_targets
-                .pending_backing(route, owner, length, checksum)?;
+                .pending_backing(route, length, checksum)?;
             if backing.is_some() {
                 self.cold_tier_devices.pressure_increment_pending();
             }
@@ -173,7 +171,7 @@ impl StorageOwnerState {
             if let Some(backing) = self
                 .cold_tier_devices
                 .nof_targets
-                .pending_backing(route, owner, length, checksum)?
+                .pending_backing(route, length, checksum)?
             {
                 self.cold_tier_devices.pressure_increment_pending();
                 return Ok(Some(super::super::PendingBackingRoute::Nof(backing)));
@@ -194,14 +192,21 @@ impl StorageOwnerState {
                 .unwrap_or_else(|| route.key.0.clone()),
             route.version.0,
         );
+        let owner = self
+            .cold_tier_devices
+            .current_target_owner(&primary.device_id, None)?;
         let replicas = devices[1..]
             .iter()
-            .map(|device| mooncake_store_core::ColdBackingReplica {
-                owner: self.runtime.clone(),
-                cold_tier_id: device.device_id.clone(),
-                object_locator: object_locator.clone(),
+            .map(|device| {
+                self.cold_tier_devices
+                    .current_target_owner(&device.device_id, None)
+                    .map(|owner| mooncake_store_core::ColdBackingReplica {
+                        owner,
+                        cold_tier_id: device.device_id.clone(),
+                        object_locator: object_locator.clone(),
+                    })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         if !replicas.is_empty() {
             tracing::debug!(
                 runtime = %self.runtime,

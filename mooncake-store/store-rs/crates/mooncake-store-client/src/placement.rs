@@ -378,13 +378,20 @@ fn rendezvous_score(
     key: &str,
     runtime: &ClientRuntimeId,
 ) -> u64 {
+    stable_rendezvous_score(&[tenant, domain, object_set, qos_tier, key], runtime)
+}
+
+/// Shared deterministic score for stable, minimally disruptive placement.
+///
+/// Callers choose which candidate identity participates in the hash. Object
+/// placement uses the full runtime epoch; long-lived resource ownership may
+/// use only the stable client identity.
+pub(crate) fn stable_rendezvous_score<T: Hash + ?Sized>(parts: &[&str], candidate: &T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    tenant.hash(&mut hasher);
-    domain.hash(&mut hasher);
-    object_set.hash(&mut hasher);
-    qos_tier.hash(&mut hasher);
-    key.hash(&mut hasher);
-    runtime.hash(&mut hasher);
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    candidate.hash(&mut hasher);
     hasher.finish()
 }
 
