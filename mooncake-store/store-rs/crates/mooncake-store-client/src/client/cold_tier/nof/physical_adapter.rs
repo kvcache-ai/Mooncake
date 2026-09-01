@@ -1,20 +1,22 @@
-//! NoF low-level adapter for the existing Cold Tier backend contract.
+//! NoF physical adapter for the existing Cold Tier backend contract.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
 
 use mooncake_store_core::{ColdBackingRoute, ColdBackingState, ObjectRoute, Result, StoreError};
 
-use crate::client::cold_tier::layout::ValueChunkPlan;
+use crate::client::cold_tier::layout::{OpaquePhysicalKey, PhysicalKeyInput, ValueChunkPlan};
 use crate::client::{
     ColdObjectWrite, PersistentStorageBackend, PersistentStorageBackendHealth,
     PersistentStorageManagement,
 };
 
-use super::super::ensure_batch_len;
-use super::{
-    repeated_error, NofLowLevelCapabilities, NofLowLevelDeleteRequest, NofLowLevelGetRequest,
-    NofLowLevelTarget, OpaquePhysicalKey, PhysicalKeyInput,
+use super::backend::NofBackend;
+use super::ensure_batch_len;
+use super::object::repeated_error;
+use super::physical::{
+    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalRead,
+    NofPhysicalReadRequest, NofPhysicalWrite, NofStorageHealth,
 };
 
 const LOCATOR_PREFIX: &str = "nof-ll:v1:";
@@ -43,7 +45,7 @@ impl LayoutKind {
             "i" => Ok(Self::Inline),
             "c" => Ok(Self::Chunked),
             _ => Err(StoreError::InvalidState(
-                "NoF low-level locator has an unknown layout marker".to_string(),
+                "NoF physical locator has an unknown layout marker".to_string(),
             )),
         }
     }
@@ -73,7 +75,7 @@ impl ChunkManifest {
     fn decode(bytes: &[u8], route: &ColdBackingRoute) -> Result<Self> {
         if bytes.len() != MANIFEST_LEN || &bytes[..8] != MANIFEST_MAGIC {
             return Err(StoreError::InvalidState(
-                "NoF low-level chunk manifest has invalid length or magic".to_string(),
+                "NoF physical chunk manifest has invalid length or magic".to_string(),
             ));
         }
         if bytes[8] != MANIFEST_VERSION
@@ -81,7 +83,7 @@ impl ChunkManifest {
             || bytes[10..16].iter().any(|byte| *byte != 0)
         {
             return Err(StoreError::InvalidState(
-                "NoF low-level chunk manifest has unsupported flags or version".to_string(),
+                "NoF physical chunk manifest has unsupported flags or version".to_string(),
             ));
         }
         let read_u64 = |offset: usize| {
@@ -97,13 +99,13 @@ impl ChunkManifest {
         };
         if manifest.logical_len != route.length || manifest.checksum != route.checksum {
             return Err(StoreError::InvalidState(
-                "NoF low-level manifest does not match Cold Tier route metadata".to_string(),
+                "NoF physical manifest does not match Cold Tier route metadata".to_string(),
             ));
         }
         let plan = ValueChunkPlan::new(manifest.logical_len, manifest.chunk_size)?;
         if plan.chunk_count() != manifest.chunk_count || manifest.chunk_count == 0 {
             return Err(StoreError::InvalidState(
-                "NoF low-level manifest has an inconsistent chunk count".to_string(),
+                "NoF physical manifest has an inconsistent chunk count".to_string(),
             ));
         }
         Ok(manifest)
@@ -131,37 +133,59 @@ impl WriteLayout<'_> {
     }
 }
 
-pub(in crate::client) struct NofLowLevelBackend {
+pub(in crate::client) struct NofPhysicalAdapter {
     device_id: String,
-    target: NofLowLevelTarget,
-    capabilities: NofLowLevelCapabilities,
+    target: NofBackend,
+    capabilities: NofPhysicalLimits,
 }
 
-impl NofLowLevelBackend {
-    pub(in crate::client) fn new(
-        device_id: impl Into<String>,
-        target: NofLowLevelTarget,
-    ) -> Result<Self> {
+impl NofPhysicalAdapter {
+    pub(in crate::client) fn new(device_id: impl Into<String>, target: NofBackend) -> Result<Self> {
         let device_id = device_id.into();
         if device_id.is_empty() {
             return Err(StoreError::InvalidState(
-                "NoF low-level device ID must not be empty".to_string(),
+                "NoF physical device ID must not be empty".to_string(),
             ));
         }
-        if target.executor.ownership().metadata
-            != super::super::NofMetadataOwnership::ExternalMetadata
+        if target.backing.physical_write().is_none()
+            || target.backing.physical_read().is_none()
+            || target.backing.physical_delete().is_none()
         {
             return Err(StoreError::InvalidState(
-                "NoF provider-managed metadata must use the shared high-level metadata path"
-                    .to_string(),
+                "NoF physical adapter requires read, write and delete capabilities".to_string(),
             ));
         }
-        let capabilities = target.executor.capabilities().validate()?;
+        let capabilities = target.physical_limits.ok_or_else(|| {
+            StoreError::InvalidState(
+                "NoF physical adapter requires advertised physical limits".to_string(),
+            )
+        })?;
         Ok(Self {
             device_id,
             target,
             capabilities,
         })
+    }
+
+    fn writer(&self) -> &dyn NofPhysicalWrite {
+        self.target
+            .backing
+            .physical_write()
+            .expect("physical write capability was checked during construction")
+    }
+
+    fn reader(&self) -> &dyn NofPhysicalRead {
+        self.target
+            .backing
+            .physical_read()
+            .expect("physical read capability was checked during construction")
+    }
+
+    fn deleter(&self) -> &dyn NofPhysicalDelete {
+        self.target
+            .backing
+            .physical_delete()
+            .expect("physical delete capability was checked during construction")
     }
 
     fn root_key(
@@ -223,7 +247,7 @@ impl NofLowLevelBackend {
     fn decode_locator(locator: &str) -> Result<(LayoutKind, OpaquePhysicalKey)> {
         let encoded = locator.strip_prefix(LOCATOR_PREFIX).ok_or_else(|| {
             StoreError::InvalidState(format!(
-                "NoF low-level locator has an unknown prefix: {locator}"
+                "NoF physical locator has an unknown prefix: {locator}"
             ))
         })?;
         let mut fields = encoded.split(':');
@@ -231,7 +255,7 @@ impl NofLowLevelBackend {
         let key = fields.next().unwrap_or_default();
         if fields.next().is_some() {
             return Err(StoreError::InvalidState(
-                "NoF low-level locator has trailing fields".to_string(),
+                "NoF physical locator has trailing fields".to_string(),
             ));
         }
         let kind = LayoutKind::from_marker(marker)?;
@@ -262,7 +286,7 @@ impl NofLowLevelBackend {
         let plan = ValueChunkPlan::new(cold_backing.length, self.capabilities.max_value_size)?;
         if self.capabilities.max_value_size < MANIFEST_LEN as u64 {
             return Err(StoreError::InvalidState(format!(
-                "NoF low-level value limit {} cannot hold the {MANIFEST_LEN}-byte chunk manifest",
+                "NoF physical value limit {} cannot hold the {MANIFEST_LEN}-byte chunk manifest",
                 self.capabilities.max_value_size
             )));
         }
@@ -326,8 +350,8 @@ impl NofLowLevelBackend {
                 .iter()
                 .map(|record| (record.key.clone(), record.value.as_ref()))
                 .collect::<Vec<_>>();
-            let batch = self.target.executor.put_batch(&requests);
-            if let Err(error) = ensure_batch_len("low-level put", requests.len(), batch.len()) {
+            let batch = self.writer().put_batch(&requests);
+            if let Err(error) = ensure_batch_len("physical put", requests.len(), batch.len()) {
                 results.extend(repeated_error(requests.len(), error));
             } else {
                 results.extend(batch);
@@ -336,7 +360,7 @@ impl NofLowLevelBackend {
         results
     }
 
-    fn get_records(&self, requests: &[NofLowLevelGetRequest]) -> Vec<Result<Option<Vec<u8>>>> {
+    fn get_records(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
         let sizes = requests
             .iter()
             .map(|request| request.expected_value_size as u64)
@@ -347,8 +371,8 @@ impl NofLowLevelBackend {
         };
         let mut results = Vec::with_capacity(requests.len());
         for range in ranges {
-            let batch = self.target.executor.get_batch(&requests[range.clone()]);
-            if let Err(error) = ensure_batch_len("low-level get", range.len(), batch.len()) {
+            let batch = self.reader().get_batch(&requests[range.clone()]);
+            if let Err(error) = ensure_batch_len("physical get", range.len(), batch.len()) {
                 results.extend(repeated_error(range.len(), error));
             } else {
                 results.extend(batch);
@@ -357,7 +381,7 @@ impl NofLowLevelBackend {
         results
     }
 
-    fn delete_records(&self, requests: &[NofLowLevelDeleteRequest]) -> Vec<Result<()>> {
+    fn delete_records(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
         let sizes = requests
             .iter()
             .map(|request| request.key.as_bytes().len() as u64)
@@ -368,8 +392,8 @@ impl NofLowLevelBackend {
         };
         let mut results = Vec::with_capacity(requests.len());
         for range in ranges {
-            let batch = self.target.executor.delete_batch(&requests[range.clone()]);
-            if let Err(error) = ensure_batch_len("low-level delete", range.len(), batch.len()) {
+            let batch = self.deleter().delete_batch(&requests[range.clone()]);
+            if let Err(error) = ensure_batch_len("physical delete", range.len(), batch.len()) {
                 results.extend(repeated_error(range.len(), error));
             } else {
                 results.extend(batch);
@@ -472,11 +496,11 @@ impl NofLowLevelBackend {
             .filter(|(index, _)| layout_ok[*index])
             .collect::<Vec<_>>();
         if !successful.is_empty() {
-            if let Err(error) = self.target.executor.flush() {
+            if let Err(error) = self.writer().flush() {
                 for (index, _) in successful {
                     layout_ok[*index] = false;
                     results[*index] = Some(Err(StoreError::Transport(format!(
-                        "NoF low-level flush failed before route publication: {error}"
+                        "NoF physical flush failed before route publication: {error}"
                     ))));
                 }
             }
@@ -493,7 +517,7 @@ impl NofLowLevelBackend {
             .map(|result| {
                 result.unwrap_or_else(|| {
                     Err(StoreError::Transport(
-                        "NoF low-level write omitted a positional result".to_string(),
+                        "NoF physical write omitted a positional result".to_string(),
                     ))
                 })
             })
@@ -508,7 +532,7 @@ impl NofLowLevelBackend {
             })?,
             LayoutKind::Chunked => MANIFEST_LEN,
         };
-        let mut root_result = self.get_records(&[NofLowLevelGetRequest {
+        let mut root_result = self.get_records(&[NofPhysicalReadRequest {
             key: root_key.clone(),
             expected_value_size: root_hint,
         }]);
@@ -535,7 +559,7 @@ impl NofLowLevelBackend {
                 .end
                 .checked_sub(range.start)
                 .ok_or_else(|| StoreError::InvalidState("NoF chunk range underflow".to_string()))?;
-            requests.push(NofLowLevelGetRequest {
+            requests.push(NofPhysicalReadRequest {
                 key: self.chunk_key(&root_key, index)?,
                 expected_value_size: usize::try_from(length).map_err(|_| {
                     StoreError::InvalidState("NoF chunk length does not fit usize".to_string())
@@ -575,7 +599,7 @@ impl NofLowLevelBackend {
                 StoreError::InvalidState("NoF inline length does not fit usize".to_string())
             })?
         };
-        let mut root_result = self.get_records(&[NofLowLevelGetRequest {
+        let mut root_result = self.get_records(&[NofPhysicalReadRequest {
             key: root_key.clone(),
             expected_value_size: root_hint,
         }]);
@@ -592,7 +616,7 @@ impl NofLowLevelBackend {
                     StoreError::InvalidState("NoF chunk count does not fit usize".to_string())
                 })?);
             for index in 0..manifest.chunk_count {
-                chunk_requests.push(NofLowLevelDeleteRequest {
+                chunk_requests.push(NofPhysicalDeleteRequest {
                     key: self.chunk_key(&root_key, index)?,
                 });
             }
@@ -607,11 +631,11 @@ impl NofLowLevelBackend {
             validate_payload(cold_backing, &root)?;
         }
         match self
-            .delete_records(&[NofLowLevelDeleteRequest { key: root_key }])
+            .delete_records(&[NofPhysicalDeleteRequest { key: root_key }])
             .pop()
         {
             Some(Ok(())) | Some(Err(StoreError::NotFound(_))) => {
-                self.target.executor.flush()?;
+                self.writer().flush()?;
                 Ok(true)
             }
             Some(Err(error)) => Err(error),
@@ -622,24 +646,25 @@ impl NofLowLevelBackend {
     }
 }
 
-impl PersistentStorageBackend for NofLowLevelBackend {
+impl PersistentStorageBackend for NofPhysicalAdapter {
     fn storage_management(&self) -> PersistentStorageManagement {
-        match self.target.executor.ownership().maintenance {
-            super::super::NofStorageMaintenance::ProviderManaged => {
-                PersistentStorageManagement::BackendManaged
-            }
-            super::super::NofStorageMaintenance::MooncakeManaged => {
-                PersistentStorageManagement::MooncakeManaged
-            }
+        if self.target.backing.storage_management().is_some() {
+            PersistentStorageManagement::MooncakeManaged
+        } else {
+            PersistentStorageManagement::BackendManaged
         }
     }
 
     fn health(&self) -> Result<PersistentStorageBackendHealth> {
-        let health = self
-            .target
-            .executor
-            .storage_health()?
-            .validate(self.target.executor.ownership())?;
+        let health = if let Some(storage) = self.target.backing.storage_management() {
+            storage.storage_health()?.validate(true)?
+        } else if let Some(health) = self.target.backing.health_capability() {
+            health.health()?.validate(false)?
+        } else if let Some(devices) = self.target.backing.device_management() {
+            devices.device_health()?.validate(false)?
+        } else {
+            NofStorageHealth::default()
+        };
         Ok(PersistentStorageBackendHealth {
             capacity_bytes: health.capacity_bytes,
             available_bytes: health.available_bytes,
@@ -729,7 +754,7 @@ fn decode_hex(encoded: &str, field: &str, max_bytes: usize) -> Result<Vec<u8>> {
         || encoded.len() / 2 > max_bytes
     {
         return Err(StoreError::InvalidState(format!(
-            "NoF low-level locator has invalid hex {field} length"
+            "NoF physical locator has invalid hex {field} length"
         )));
     }
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
@@ -737,7 +762,7 @@ fn decode_hex(encoded: &str, field: &str, max_bytes: usize) -> Result<Vec<u8>> {
         bytes.push(
             u8::from_str_radix(&encoded[offset..offset + 2], 16).map_err(|_| {
                 StoreError::InvalidState(format!(
-                    "NoF low-level locator contains non-hex {field} bytes"
+                    "NoF physical locator contains non-hex {field} bytes"
                 ))
             })?,
         );
@@ -747,7 +772,7 @@ fn decode_hex(encoded: &str, field: &str, max_bytes: usize) -> Result<Vec<u8>> {
 
 fn bounded_ranges(
     item_sizes: &[u64],
-    capabilities: NofLowLevelCapabilities,
+    capabilities: NofPhysicalLimits,
 ) -> Result<Vec<std::ops::Range<usize>>> {
     if item_sizes.is_empty() {
         return Ok(Vec::new());
@@ -783,8 +808,8 @@ fn bounded_ranges(
 mod tests {
     use super::*;
     use crate::{
-        NofDeviceManagement, NofLowLevelExecutor, NofMetadataOwnership, NofOwnership,
-        NofStorageMaintenance, PhysicalKeyCodec, PhysicalKeyInput,
+        NofBacking, NofHealth, NofPhysicalDelete, NofPhysicalRead, NofPhysicalWrite,
+        PhysicalKeyCodec, PhysicalKeyInput,
     };
     use mooncake_store_core::{ClientEpoch, ClientRuntimeId, ClientStableId};
     use std::collections::HashMap;
@@ -794,30 +819,41 @@ mod tests {
     struct MemoryExecutor {
         values: Mutex<HashMap<OpaquePhysicalKey, Vec<u8>>>,
         fail_manifest: Mutex<bool>,
-        provider_metadata: bool,
     }
 
-    impl NofLowLevelExecutor for MemoryExecutor {
-        fn capabilities(&self) -> NofLowLevelCapabilities {
-            NofLowLevelCapabilities {
+    impl NofBacking for MemoryExecutor {
+        fn physical_limits(&self) -> Option<NofPhysicalLimits> {
+            Some(NofPhysicalLimits {
                 max_value_size: 64,
                 max_batch_items: 64,
                 max_batch_bytes: u64::MAX,
-            }
+            })
         }
 
-        fn ownership(&self) -> NofOwnership {
-            NofOwnership {
-                metadata: if self.provider_metadata {
-                    NofMetadataOwnership::ProviderManaged
-                } else {
-                    NofMetadataOwnership::ExternalMetadata
-                },
-                maintenance: NofStorageMaintenance::ProviderManaged,
-                devices: NofDeviceManagement::ProviderManaged,
-            }
+        fn physical_write(&self) -> Option<&dyn NofPhysicalWrite> {
+            Some(self)
         }
 
+        fn physical_read(&self) -> Option<&dyn NofPhysicalRead> {
+            Some(self)
+        }
+
+        fn physical_delete(&self) -> Option<&dyn NofPhysicalDelete> {
+            Some(self)
+        }
+
+        fn health_capability(&self) -> Option<&dyn NofHealth> {
+            Some(self)
+        }
+    }
+
+    impl NofHealth for MemoryExecutor {
+        fn health(&self) -> Result<NofStorageHealth> {
+            Ok(NofStorageHealth::default())
+        }
+    }
+
+    impl NofPhysicalWrite for MemoryExecutor {
         fn put_batch(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
             let mut values = self.values.lock().unwrap();
             requests
@@ -835,16 +871,20 @@ mod tests {
                 })
                 .collect()
         }
+    }
 
-        fn get_batch(&self, requests: &[NofLowLevelGetRequest]) -> Vec<Result<Option<Vec<u8>>>> {
+    impl NofPhysicalRead for MemoryExecutor {
+        fn get_batch(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
             let values = self.values.lock().unwrap();
             requests
                 .iter()
                 .map(|request| Ok(values.get(&request.key).cloned()))
                 .collect()
         }
+    }
 
-        fn delete_batch(&self, requests: &[NofLowLevelDeleteRequest]) -> Vec<Result<()>> {
+    impl NofPhysicalDelete for MemoryExecutor {
+        fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
             let mut values = self.values.lock().unwrap();
             requests
                 .iter()
@@ -878,7 +918,8 @@ mod tests {
     fn chunks_large_values_and_reassembles_them() {
         let executor = Arc::new(MemoryExecutor::default());
         let backend =
-            NofLowLevelBackend::new("nof-test", NofLowLevelTarget::new(executor.clone())).unwrap();
+            NofPhysicalAdapter::new("nof-test", NofBackend::new(executor.clone()).unwrap())
+                .unwrap();
         let payload = vec![7; 150];
         let materialized = backend.put_object(&route(&payload), &payload).unwrap();
         assert!(materialized.object_locator.starts_with("nof-ll:v1:c:"));
@@ -888,23 +929,26 @@ mod tests {
     }
 
     #[test]
-    fn provider_metadata_reuses_high_level_path() {
-        let executor = Arc::new(MemoryExecutor {
-            provider_metadata: true,
-            ..MemoryExecutor::default()
-        });
-        assert!(matches!(
-            NofLowLevelBackend::new("nof-test", NofLowLevelTarget::new(executor)),
-            Err(StoreError::InvalidState(message))
-                if message.contains("shared high-level metadata path")
-        ));
+    fn backing_health_does_not_claim_mooncake_storage_management() {
+        let executor = Arc::new(MemoryExecutor::default());
+        let backend =
+            NofPhysicalAdapter::new("nof-test", NofBackend::new(executor).unwrap()).unwrap();
+
+        assert_eq!(
+            backend.storage_management(),
+            PersistentStorageManagement::BackendManaged
+        );
+        let health = backend.health().unwrap();
+        assert_eq!(health.capacity_bytes, None);
+        assert_eq!(health.available_bytes, None);
     }
 
     #[test]
     fn failed_retry_does_not_delete_an_existing_materialized_object() {
         let executor = Arc::new(MemoryExecutor::default());
         let backend =
-            NofLowLevelBackend::new("nof-test", NofLowLevelTarget::new(executor.clone())).unwrap();
+            NofPhysicalAdapter::new("nof-test", NofBackend::new(executor.clone()).unwrap())
+                .unwrap();
         let payload = vec![3; 150];
         let materialized = backend.put_object(&route(&payload), &payload).unwrap();
         *executor.fail_manifest.lock().unwrap() = true;
@@ -920,7 +964,7 @@ mod tests {
     fn malformed_locator_fails_closed() {
         let executor = Arc::new(MemoryExecutor::default());
         let backend =
-            NofLowLevelBackend::new("nof-test", NofLowLevelTarget::new(executor)).unwrap();
+            NofPhysicalAdapter::new("nof-test", NofBackend::new(executor).unwrap()).unwrap();
         let mut backing = route(b"value");
         backing.object_locator = "file:v1:abcd".to_string();
         assert!(matches!(
@@ -940,8 +984,10 @@ mod tests {
     #[test]
     fn codec_collision_is_rejected_before_any_physical_write() {
         let executor = Arc::new(MemoryExecutor::default());
-        let target = NofLowLevelTarget::new(executor.clone()).key_codec(Arc::new(CollidingCodec));
-        let backend = NofLowLevelBackend::new("nof-test", target).unwrap();
+        let target = NofBackend::new(executor.clone())
+            .unwrap()
+            .key_codec(Arc::new(CollidingCodec));
+        let backend = NofPhysicalAdapter::new("nof-test", target).unwrap();
         let payload = vec![9; 150];
         assert!(matches!(
             backend.put_object(&route(&payload), &payload),
