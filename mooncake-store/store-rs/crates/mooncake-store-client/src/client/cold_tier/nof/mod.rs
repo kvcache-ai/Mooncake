@@ -70,9 +70,9 @@ pub(crate) fn ensure_batch_len(operation: &str, expected: usize, actual: usize) 
 
 // The raw C ABI is shared by the two KVCS executors. It is included in this parent module so
 // highlevel/kvcs_executor.rs and lowlevel/kvcs_executor.rs can reuse one set of declarations
-// without exposing FFI details as a public NoF layer.
+// without exposing the C API bindings as a public NoF layer.
 #[cfg(feature = "kvcs-capi")]
-include!("kvcs_ffi.rs");
+include!("kvcs_capi.rs");
 
 #[cfg(all(test, feature = "kvcs-capi"))]
-mod kvcs_ffi_tests;
+mod kvcs_capi_tests;

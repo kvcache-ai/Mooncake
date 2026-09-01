@@ -25,7 +25,7 @@ fn malformed_numeric_configuration_is_rejected() {
 }
 
 #[test]
-fn ffi_config_layout_matches_the_extended_sdk_abi() {
+fn capi_config_layout_matches_the_extended_sdk_abi() {
     assert_eq!(std::mem::size_of::<KvcsClientConfig>(), 96);
     assert_eq!(std::mem::size_of::<KvcsLlConfig>(), 72);
 }
