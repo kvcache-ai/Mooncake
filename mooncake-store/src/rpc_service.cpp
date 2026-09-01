@@ -486,7 +486,7 @@ WrappedMasterService::GetReplicaListRpc(
     std::string_view key, const GetReplicaListRequestConfig& config) {
     // Bypass: the per-request request_id rides the out-of-band request
     // attachment (set client-side from g_current_ctx via
-    // send_request_with_attachment). The read struct no longer carries a
+    // send_request). The read struct no longer carries a
     // request_id field, so this handler logs the id from the attachment and
     // delegates the read/log/metric logic to the value-returning
     // GetReplicaList (also used in-process by HTTP /batch_query_keys and
@@ -526,7 +526,7 @@ WrappedMasterService::BatchExistKeyRpc(
     coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
     const std::vector<std::string_view>& keys) {
     // Bypass: the per-request request_id rides the out-of-band attachment set
-    // client-side by invoke_batch_rpc (send_request_with_attachment). Log it
+    // client-side by invoke_batch_rpc (send_request). Log it
     // here, then delegate to the value-returning BatchExistKey (shared with
     // in-process/tests) and reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->get_request_attachment();

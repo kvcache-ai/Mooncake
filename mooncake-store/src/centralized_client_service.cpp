@@ -2241,7 +2241,7 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
             auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
+                    return client.send_request_without_attachment<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {

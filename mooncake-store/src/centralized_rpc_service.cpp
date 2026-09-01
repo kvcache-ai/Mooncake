@@ -241,7 +241,7 @@ WrappedCentralizedMasterService::BatchPutStartRpc(
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config) {
     // Bypass: log the per-request request_id carried in the out-of-band
     // attachment (set client-side by invoke_batch_rpc via
-    // send_request_with_attachment), delegate to the value-returning
+    // send_request), delegate to the value-returning
     // BatchPutStart, and reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {

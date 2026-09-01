@@ -5,7 +5,7 @@
 //
 // Both single-key (invoke_rpc) and batch (invoke_batch_rpc) client templates
 // snapshot current_request_id_attachment() at entry and send it via
-// send_request_with_attachment. We exercise the single-key read route
+// send_request. We exercise the single-key read route
 // (GetReplicaListRpc) and the batch-exist route (BatchExistKeyRpc) to prove the
 // attachment bypass works for both the single and batch invocation templates.
 //
@@ -84,7 +84,7 @@ TEST_F(RequestIdAttachmentTest, EmptyAttachmentWhenNoRequestId) {
 }
 
 // The batch-exist route goes through MasterClient::invoke_batch_rpc now using
-// send_request_with_attachment; the BatchExistKeyRpc handler must observe the id.
+// send_request; the BatchExistKeyRpc handler must observe the id.
 TEST_F(RequestIdAttachmentTest, CarriesRequestIdOnBatchExistRoute) {
     RequestContext ctx;
     ctx.request_id = "attach-batch-exist";

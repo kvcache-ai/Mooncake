@@ -242,13 +242,13 @@ class MasterClient {
         // (empty when no per-request context is set) ONCE at entry, then carry
         // it into the pool-work closure. We never read g_current_ctx from a
         // (possibly different) pool worker thread. An empty attachment is
-        // wire-identical to a plain send_request; non-reading server handlers
+        // wire-identical to a plain send_request_without_attachment; non-reading server handlers
         // ignore it, so this is gray across all master RPCs.
         std::string ctx_attachment = current_request_id_attachment();
         auto start_time = std::chrono::steady_clock::now();
         auto ret = co_await pool->send_request(
             [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-                return client.send_request_with_attachment<ServiceMethod>(
+                return client.send_request<ServiceMethod>(
                     std::string_view(ctx_attachment.data(),
                                      ctx_attachment.size()),
                     std::forward<Args>(args)...);
@@ -302,10 +302,10 @@ class MasterClient {
 
         // Bypass inject (see invoke_rpc_async_with_pool): snapshot the calling
         // thread's per-request request_id once at entry and carry it into the
-        // pool-work closure via send_request_with_attachment, so batch master
+        // pool-work closure via send_request, so batch master
         // RPCs (BatchExistKey / BatchPutStart / ...) carry the id out-of-band
         // just like single-result RPCs. An empty attachment is wire-identical to
-        // a plain send_request and is ignored by non-reading handlers (gray).
+        // a plain send_request_without_attachment and is ignored by non-reading handlers (gray).
         std::string ctx_attachment = current_request_id_attachment();
         auto start_time = std::chrono::steady_clock::now();
         return async_simple::coro::syncAwait(
@@ -314,7 +314,7 @@ class MasterClient {
                 auto ret = co_await pool->send_request(
                     [&](coro_io::client_reuse_hint,
                         coro_rpc::coro_rpc_client& client) {
-                        return client.send_request_with_attachment<ServiceMethod>(
+                        return client.send_request<ServiceMethod>(
                             std::string_view(ctx_attachment.data(),
                                              ctx_attachment.size()),
                             std::forward<Args>(args)...);
