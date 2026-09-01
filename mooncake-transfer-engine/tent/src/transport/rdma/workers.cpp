@@ -969,7 +969,10 @@ void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {
     // configured default and warns, the same as at startup.
     if (after == before) return;
     LOG(WARNING) << context.name() << " link speed " << before << " -> "
-                 << after << " Gbps, re-seeding its bandwidth estimate";
+                 << after << " Gbps ("
+                 << (context.effectiveSpeedKnown() ? "effective speed"
+                                                   : "encoded rate")
+                 << "), re-seeding its bandwidth estimate";
     device_selector_->setDeviceBandwidth(dev_id, after);
 }
 

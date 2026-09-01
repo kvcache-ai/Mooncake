@@ -46,6 +46,7 @@ class RdmaTransport;
 class RdmaContext {
     friend class RdmaCQ;
     friend class RdmaEndPoint;
+    friend class RdmaContextTestPeer;
 
    public:
     RdmaContext(RdmaTransport &transport);
@@ -113,7 +114,9 @@ class RdmaContext {
     // The one port this context opened; 0 for a slot that never constructed.
     uint8_t portNum() const { return params_ ? params_->device.port : 0; }
 
-    // Negotiated port speed in Gbps, 0 when it could not be determined.
+    // Port speed in Gbps: the effective speed from ibv_query_port_speed()
+    // where the library provides it (LAG-aware), otherwise the negotiated
+    // link rate. 0 when neither could be determined.
     double linkSpeedGbps() const;
 
     // Re-read the port's negotiated speed and width from the hardware, so
@@ -140,6 +143,18 @@ class RdmaContext {
 
     RdmaParams &params() const { return *params_.get(); }
 
+    // True while linkSpeedGbps() is derived from ibv_query_port_speed()
+    // rather than the encoded speed x width.
+    bool effectiveSpeedKnown() const {
+        return effective_speed_mbps_.load(std::memory_order_relaxed) > 0;
+    }
+
+    // ibv_query_port_speed() errors since the device was opened. The verb
+    // being absent, or reporting 0, is not an error.
+    uint64_t effectiveSpeedQueryFailures() const {
+        return effective_speed_query_failures_.load(std::memory_order_relaxed);
+    }
+
     // PCIe Relaxed Ordering support
     bool isRelaxedOrderingEnabled() const { return relaxed_ordering_enabled_; }
 
@@ -150,6 +165,12 @@ class RdmaContext {
     int openDevice(const std::string &device_name, uint8_t port);
     // Decode one ibv_query_port result into active_speed_/active_width_.
     void recordPortSpeed(const ibv_port_attr &port_attr);
+    // Ask ibv_query_port_speed() for the effective speed when the library
+    // has it; records 0 when the verb is absent or reports nothing, so
+    // linkSpeedGbps() falls back. A verb *error* keeps the last known value
+    // instead: on a degraded LAG, falling back would briefly restore the
+    // higher encoded rate. Failures are counted and logged on transition.
+    void queryEffectiveSpeed();
 
     // Release every resource currently owned by this context. This is
     // intentionally state-independent so it can clean up a partially completed
@@ -178,6 +199,11 @@ class RdmaContext {
     // atomic so a reader added elsewhere stays well-defined.
     std::atomic<int> active_speed_{0};
     std::atomic<int> active_width_{0};
+    // From ibv_query_port_speed(), converted to Mb/s; 0 = unavailable.
+    std::atomic<uint64_t> effective_speed_mbps_{0};
+    std::atomic<uint64_t> effective_speed_query_failures_{0};
+    // Whether the last query errored; drives the transition logging.
+    std::atomic<bool> effective_speed_query_failing_{false};
     int gid_index_ = -1;
     ibv_gid gid_;
 
@@ -193,7 +219,11 @@ class RdmaContext {
     // PCIe Relaxed Ordering support
     bool relaxed_ordering_enabled_ = false;
 
-    const IbvSymbols &verbs_;
+    // The context's own copy of the loader's verbs table (copied once at
+    // construction, read-only afterwards). A copy rather than a reference so
+    // tests can substitute individual entries and drive the port-attribute
+    // and event paths without an RNIC.
+    IbvSymbols verbs_;
 };
 
 }  // namespace tent

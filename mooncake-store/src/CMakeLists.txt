@@ -44,6 +44,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.cpp
     ha/snapshot/batch_oplog/writer.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.cpp
+    ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.cpp
     ha/snapshot/snapshot_maintenance_lease.cpp
     ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/local_ssd_codec.cpp
@@ -90,6 +91,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     shm_helper.cpp
     file_storage.cpp
     config/file_storage_config.cpp
+    config/client_auto_port_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
