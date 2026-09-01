@@ -17,7 +17,9 @@
 #include <sys/epoll.h>
 
 #include <cassert>
+#include <chrono>
 #include <functional>
+#include <future>
 
 #include "config.h"
 #include "memory_location.h"
@@ -55,11 +57,21 @@ struct ActiveEndpointSetupResult {
 static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
     RdmaContext &context, const std::string &peer_nic_path,
     const std::shared_ptr<RdmaEndPoint> &endpoint,
-    std::unique_lock<std::mutex> &endpoint_lifecycle_lock) {
+    std::unique_lock<std::mutex> &endpoint_lifecycle_lock,
+    const std::function<void()> &drain_cq_while_waiting) {
     const bool had_lifecycle_gate = endpoint_lifecycle_lock.owns_lock();
     if (had_lifecycle_gate) endpoint_lifecycle_lock.unlock();
 
-    int ret = endpoint->setupConnectionsByActive();
+    // The owner worker also polls this peer's CQ. Keep it draining while the
+    // active handshake can block on TCP connect/read timeouts.
+    auto setup_future = std::async(std::launch::async, [endpoint] {
+        return endpoint->setupConnectionsByActive();
+    });
+    while (setup_future.wait_for(std::chrono::milliseconds(1)) !=
+           std::future_status::ready) {
+        drain_cq_while_waiting();
+    }
+    int ret = setup_future.get();
 
     if (had_lifecycle_gate) endpoint_lifecycle_lock.lock();
     auto current_endpoint = context.findEndpoint(peer_nic_path);
@@ -455,7 +467,11 @@ void WorkerPool::performPostSend(int thread_id) {
         }
         if (!endpoint->connected()) {
             auto setup_result = setupEndpointByActiveOutsideLifecycleGate(
-                context_, entry.first, endpoint, endpoint_lifecycle_lock);
+                context_, entry.first, endpoint, endpoint_lifecycle_lock,
+                [this, thread_id] {
+                    if (hasOutstandingCq(thread_id))
+                        performPollCq(thread_id, true);
+                });
             if (!setup_result.endpoint_current) {
                 LOG(WARNING)
                     << "Worker: Endpoint changed while active handshake was "
@@ -559,7 +575,7 @@ void WorkerPool::performPostSend(int thread_id) {
     }
 }
 
-void WorkerPool::performPollCq(int thread_id) {
+void WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     if (context_.cqCount() <= 0) return;
     if (thread_id < 0 || thread_id >= worker_count_) return;
 
@@ -582,6 +598,7 @@ void WorkerPool::performPollCq(int thread_id) {
     std::vector<ibv_wc> wc_list;
     const int cq_index = cqIndexForPostingThread(thread_id);
     if (cq_index < 0) return;
+    if (!context_.cq(cq_index)) return;
     ibv_wc wc[kPollCount];
     int nr_poll = context_.poll(kPollCount, wc, cq_index);
     if (nr_poll < 0) {
@@ -614,11 +631,13 @@ void WorkerPool::performPollCq(int thread_id) {
     for (auto &entry : qp_depth_set)
         entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
 
-    if (!wc_list.empty()) processCompletions(thread_id, wc_list);
+    if (!wc_list.empty())
+        processCompletions(thread_id, wc_list, defer_local_redispatch);
 }
 
 void WorkerPool::processCompletions(int thread_id,
-                                    const std::vector<ibv_wc> &wc_list) {
+                                    const std::vector<ibv_wc> &wc_list,
+                                    bool defer_local_redispatch) {
     // Slices this call drove to a terminal state, successes and
     // retry-exhausted failures alike; folded into processed_slice_count_,
     // which gates worker parking. Every terminal outcome below goes through
@@ -756,15 +775,18 @@ void WorkerPool::processCompletions(int thread_id,
     if (succeeded_slice_count) markContextSuccess();
 
     if (!local_failed_slice_list.empty()) {
-        redispatch(local_failed_slice_list, thread_id, true);
+        redispatch(local_failed_slice_list, thread_id, true,
+                   defer_local_redispatch);
     }
     if (!failed_slice_list.empty()) {
-        redispatch(failed_slice_list, thread_id);
+        redispatch(failed_slice_list, thread_id, false,
+                   defer_local_redispatch);
     }
 }
 
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
-                            int thread_id, bool handoff_to_local_worker) {
+                            int thread_id, bool handoff_to_local_worker,
+                            bool defer_local_redispatch) {
     std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
         segment_desc_map;
     int shared_redispatch_count = 0;
@@ -878,7 +900,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             }
             slice->ts = 0;
             const int owner_thread = postingThreadForPeer(peer_nic_path);
-            if (owner_thread == thread_id) {
+            if (owner_thread == thread_id && !defer_local_redispatch) {
                 collective_slice_queue_[thread_id][peer_nic_path].push_back(
                     slice);
             } else {
