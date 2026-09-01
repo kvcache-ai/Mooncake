@@ -2917,7 +2917,8 @@ class MasterService {
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::vector<Replica::Descriptor>& replicas) const;
-    ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
+    ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend,
+                                         bool require_fenced_writer);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);
