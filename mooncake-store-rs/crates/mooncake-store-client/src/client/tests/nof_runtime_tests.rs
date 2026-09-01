@@ -462,21 +462,50 @@ fn nof_target_owner_handoff_reclaims_routes_with_stale_owner_snapshot() {
     let client_a = build("nof-handoff-a", "nof-handoff-segment-a");
     let client_b = build("nof-handoff-b", "nof-handoff-segment-b");
 
-    client_a
+    let owner_deadline = Instant::now() + Duration::from_secs(3);
+    let initial_owner = loop {
+        let owner_a = client_a
+            .storage_owner
+            .cold_tier_devices
+            .current_target_owner("nof-handoff-target", None)
+            .ok();
+        let owner_b = client_b
+            .storage_owner
+            .cold_tier_devices
+            .current_target_owner("nof-handoff-target", None)
+            .ok();
+        if owner_a.is_some() && owner_a == owner_b {
+            break owner_a.expect("converged owner should exist");
+        }
+        assert!(
+            Instant::now() < owner_deadline,
+            "NoF target owner views did not converge: a={owner_a:?} b={owner_b:?}"
+        );
+        sleep(Duration::from_millis(25));
+    };
+    let writer = if initial_owner == *client_a.runtime_id() {
+        &client_b
+    } else {
+        assert_eq!(initial_owner, *client_b.runtime_id());
+        &client_a
+    };
+    writer
         .put("nof-handoff-key", &[13u8; 150])
         .expect("handoff NoF put should succeed");
-    client_a
+    writer
         .storage_owner
         .materialize_pending_offloads_bounded(32)
-        .expect("handoff NoF offload should run");
-    let route = wait_for_materialized_nof_backing(&client_a, "nof-handoff-key");
-    force_cold_only_route(&client_a, "nof-handoff-key");
-    let initial_owner = route
-        .nof_backing
-        .as_ref()
-        .expect("handoff route should have NoF backing")
-        .owner
-        .clone();
+        .expect("non-owner writer should run the NoF offload");
+    let route = wait_for_materialized_nof_backing(writer, "nof-handoff-key");
+    force_cold_only_route(writer, "nof-handoff-key");
+    assert_eq!(
+        route
+            .nof_backing
+            .as_ref()
+            .expect("handoff route should have NoF backing")
+            .owner,
+        initial_owner
+    );
     let (departed, survivor) = if initial_owner == *client_a.runtime_id() {
         (client_a, client_b)
     } else {

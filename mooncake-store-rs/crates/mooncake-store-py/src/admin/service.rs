@@ -1650,7 +1650,12 @@ impl AdminService {
                         stable_id: backing.owner.stable_id.to_string(),
                         epoch: backing.owner.epoch.0,
                     },
-                    state: format!("{:?}", backing.state),
+                    state: match backing.state {
+                        mooncake_store_core::NofBackingState::PendingWrite => "pending_write",
+                        mooncake_store_core::NofBackingState::Materialized => "materialized",
+                        mooncake_store_core::NofBackingState::PendingDelete => "pending_delete",
+                    }
+                    .to_string(),
                     locator: backing.object_locator.clone(),
                     length: backing.length,
                     checksum: backing.checksum,
