@@ -110,6 +110,45 @@ TEST(BoundedMPSCQueueTest, PushStillAcceptsAndEmptyPushIsANoop) {
     EXPECT_EQ(queue.pop().num_slices, 0);
 }
 
+// Regression for issue #3636 (production/initial-submit path). Models the
+// admission contract of Workers::submit(): when the target worker queue is
+// full the initial submit — which runs on the caller's thread — must report
+// the rejection WITHOUT blocking and WITHOUT counting the slices as inflight,
+// so RdmaTransport::submitTransferTasks() can cancel the task and terminate
+// the batch instead of leaving it PENDING forever or spinning. The prior code
+// called the blocking push() and always returned OK, so this sequence would
+// wedge the caller.
+TEST(BoundedMPSCQueueTest, InitialSubmitRejectionTerminatesBatch) {
+    Queue queue;
+    for (int i = 0; i < 8; ++i) {
+        auto item = entry(1);
+        ASSERT_TRUE(queue.try_push(item));  // queue now at capacity
+    }
+
+    // Mirror Workers::submit(): admit via try_push, only bump inflight on
+    // success, and surface a TooManyRequests-equivalent failure otherwise.
+    long inflight = 0;
+    auto submit = [&](SliceList& list) -> bool {
+        if (!queue.try_push(list)) return false;  // admission rejected
+        inflight += list.num_slices;
+        return true;
+    };
+
+    auto rejected = entry(4);
+    const bool admitted = submit(rejected);
+
+    // The batch neither pends nor spins: submit returns a hard failure and no
+    // phantom inflight count is left behind for the rejected slices.
+    EXPECT_FALSE(admitted);
+    EXPECT_EQ(inflight, 0);
+
+    // Once the consumer drains one slot, a retry of the same batch succeeds —
+    // proving the rejection is transient backpressure, not a lost batch.
+    EXPECT_EQ(queue.pop().num_slices, 1);
+    EXPECT_TRUE(submit(rejected));
+    EXPECT_EQ(inflight, 4);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

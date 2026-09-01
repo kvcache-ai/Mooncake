@@ -289,7 +289,16 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
         priority = slice_list.first->priority;
     }
 
-    worker.queues[priority].push(slice_list);
+    // Non-blocking admission (issue #3636): if the worker queue is full we
+    // must NOT block here. The initial submit runs on the caller's thread, so
+    // spinning on a full queue would wedge that thread while the sole consumer
+    // drains. Report the rejection so submitTransferTasks() can cancel the
+    // task instead of leaving the batch PENDING forever. inflight_slices is
+    // incremented only after a successful admission, so a rejected submit
+    // leaves no phantom inflight count.
+    if (!worker.queues[priority].try_push(slice_list)) {
+        return Status::TooManyRequests("Worker queue full" LOC_MARK);
+    }
     if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
