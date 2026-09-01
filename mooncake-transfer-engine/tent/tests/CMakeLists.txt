@@ -515,6 +515,18 @@ target_include_directories(tent_runtime_queue_dispatch_test
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
 
+add_executable(tent_local_memory_lifecycle_test
+               local_memory_lifecycle_test.cpp)
+target_link_libraries(tent_local_memory_lifecycle_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_local_memory_lifecycle_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_local_memory_lifecycle_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_local_memory_lifecycle_test
+         COMMAND tent_local_memory_lifecycle_test)
+
 # Causal chain stage decomposition: validates that dispatch_time and post_time
 # timestamps are populated on both queue and direct-commit paths.
 add_executable(causal_chain_test causal_chain_test.cpp)
