@@ -67,7 +67,7 @@ class ChildProcessGuard {
     int stop_fd_;
 };
 
-std::shared_ptr<Config> MakeHpConfig() {
+std::shared_ptr<Config> MakeHpConfig(bool multi_rail) {
     auto config = std::make_shared<Config>();
     config->set("metadata_type", "p2p");
     config->set("metadata_servers", "P2PHANDSHAKE");
@@ -83,6 +83,11 @@ std::shared_ptr<Config> MakeHpConfig() {
     config->set("transports/hp_tcp/max_transfer_bytes", 8ULL << 20);
     config->set("transports/hp_tcp/connect_timeout_ms", 2000);
     config->set("transports/hp_tcp/progress_timeout_ms", 5000);
+    if (multi_rail) {
+        config->set("transports/hp_tcp/bind_address", "");
+        config->set("transports/hp_tcp/rail_addresses",
+                    std::vector<std::string>{"127.0.0.1", "127.0.0.2"});
+    }
     config->set("transports/rdma/enable", false);
     config->set("transports/shm/enable", false);
     config->set("rpc_server_threads", 1);
@@ -103,7 +108,7 @@ bool WaitBatchDone(TransferEngine& engine, BatchID batch) {
     return false;
 }
 
-void RunWriteThenReadAcrossProcesses(size_t task_count) {
+void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail) {
     const size_t remote_buffer_length = task_count * kDataLength;
     const size_t local_buffer_length = 2 * remote_buffer_length;
 
@@ -120,7 +125,7 @@ void RunWriteThenReadAcrossProcesses(size_t task_count) {
 
         int exit_code = 0;
         {
-            TransferEngine server(MakeHpConfig());
+            TransferEngine server(MakeHpConfig(multi_rail));
             if (!server.available()) {
                 exit_code = 2;
             } else {
@@ -178,7 +183,7 @@ void RunWriteThenReadAcrossProcesses(size_t task_count) {
     }
     close(ready_pipe[0]);
 
-    TransferEngine client(MakeHpConfig());
+    TransferEngine client(MakeHpConfig(multi_rail));
     ASSERT_TRUE(client.available());
     std::vector<uint8_t> local(local_buffer_length, 0);
     for (size_t task = 0; task < task_count; ++task) {
@@ -256,7 +261,11 @@ void RunWriteThenReadAcrossProcesses(size_t task_count) {
 }
 
 TEST(HighPerformanceTcpE2eTest, WriteThenReadConcurrency16) {
-    RunWriteThenReadAcrossProcesses(16);
+    RunWriteThenReadAcrossProcesses(16, false);
+}
+
+TEST(HighPerformanceTcpE2eTest, WriteThenReadAcrossTwoRails) {
+    RunWriteThenReadAcrossProcesses(16, true);
 }
 
 }  // namespace

@@ -49,6 +49,24 @@ Status ReadString(const json& object, std::string_view key,
     return Status::OK();
 }
 
+Status ReadStringList(const json& object, std::string_view key,
+                      std::vector<std::string>* output) {
+    auto it = object.find(std::string(key));
+    if (it == object.end()) return Status::OK();
+    if (!it->is_array()) {
+        return Invalid("transports/hp_tcp/" + std::string(key),
+                       "must be an array of strings");
+    }
+    for (const auto& item : *it) {
+        if (!item.is_string()) {
+            return Invalid("transports/hp_tcp/" + std::string(key),
+                           "must be an array of strings");
+        }
+        output->push_back(item.get<std::string>());
+    }
+    return Status::OK();
+}
+
 }  // namespace
 
 Status ParseHpTcpTransportConfig(const Config& config,
@@ -86,6 +104,8 @@ Status ParseHpTcpTransportConfig(const Config& config,
         ReadString(hp_tcp, "bind_address", &parsed.params.bind_address));
     CHECK_STATUS(ReadString(hp_tcp, "advertise_address",
                             &parsed.params.advertise_address));
+    CHECK_STATUS(ReadStringList(hp_tcp, "rail_addresses",
+                                &parsed.params.rail_addresses));
     CHECK_STATUS(ReadUnsigned(hp_tcp, "port", &parsed.params.port));
     CHECK_STATUS(
         ReadUnsigned(hp_tcp, "worker_count", &parsed.params.worker_count));
@@ -111,7 +131,6 @@ Status ParseHpTcpTransportConfig(const Config& config,
         return Invalid("transports/hp_tcp",
                        "contains zero or inconsistent limits");
     }
-
     if (parsed.enabled && config.get("transports/tcp/enable", true)) {
         return Invalid("transports",
                        "tcp and hp_tcp cannot be enabled together");

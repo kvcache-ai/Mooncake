@@ -201,19 +201,23 @@ const char* HighPerformanceTcpPermissionName(Permission permission) {
 Status EncodeHighPerformanceTcpEndpointAttr(
     const HighPerformanceTcpEndpointAttr& attr, std::string* encoded) {
     if (encoded == nullptr || !IsHex128(attr.incarnation) ||
-        attr.host.empty() || attr.port == 0 || attr.max_transfer_bytes == 0) {
+        attr.endpoints.empty() || attr.max_transfer_bytes == 0) {
         return InvalidAttr("endpoint");
     }
 
-    json object = {
-        {"protocol", "tent_hp_tcp"},
-        {"version", kHighPerformanceTcpVersion},
-        {"incarnation", attr.incarnation},
-        {"endpoints",
-         json::array({{{"host", attr.host}, {"port", attr.port}}})},
-        {"max_transfer_bytes", attr.max_transfer_bytes},
-    };
-    *encoded = object.dump();
+    json endpoints = json::array();
+    for (const auto& endpoint : attr.endpoints) {
+        if (endpoint.host.empty() || endpoint.port == 0) {
+            return InvalidAttr("endpoint");
+        }
+        endpoints.push_back({{"host", endpoint.host}, {"port", endpoint.port}});
+    }
+    *encoded = json{{"protocol", "tent_hp_tcp"},
+                    {"version", kHighPerformanceTcpVersion},
+                    {"incarnation", attr.incarnation},
+                    {"endpoints", std::move(endpoints)},
+                    {"max_transfer_bytes", attr.max_transfer_bytes}}
+                   .dump();
     return Status::OK();
 }
 
@@ -230,20 +234,27 @@ Status DecodeHighPerformanceTcpEndpointAttr(
         const std::string incarnation = object.value("incarnation", "");
         const auto endpoints = object.find("endpoints");
         if (!IsHex128(incarnation) || endpoints == object.end() ||
-            !endpoints->is_array() || endpoints->size() != 1 ||
-            !(*endpoints)[0].is_object())
+            !endpoints->is_array() || endpoints->empty())
             return InvalidAttr("endpoint identity/list");
-        const json& endpoint = (*endpoints)[0];
-        const std::string host = endpoint.value("host", "");
-        uint64_t port = 0;
+
+        std::vector<HighPerformanceTcpEndpoint> decoded_endpoints;
+        decoded_endpoints.reserve(endpoints->size());
+        for (const auto& endpoint : *endpoints) {
+            if (!endpoint.is_object()) return InvalidAttr("endpoint address");
+            const std::string host = endpoint.value("host", "");
+            uint64_t port = 0;
+            if (host.empty() || !ReadPositiveUint64(endpoint, "port", &port) ||
+                port > 65535) {
+                return InvalidAttr("endpoint address");
+            }
+            decoded_endpoints.push_back({host, static_cast<uint16_t>(port)});
+        }
+
         uint64_t max_transfer_bytes = 0;
-        if (host.empty() || !ReadPositiveUint64(endpoint, "port", &port) ||
-            port > 65535 ||
-            !ReadPositiveUint64(object, "max_transfer_bytes",
+        if (!ReadPositiveUint64(object, "max_transfer_bytes",
                                 &max_transfer_bytes))
             return InvalidAttr("endpoint address/limit");
-        *attr = {incarnation, host, static_cast<uint16_t>(port),
-                 max_transfer_bytes};
+        *attr = {incarnation, std::move(decoded_endpoints), max_transfer_bytes};
         return Status::OK();
     } catch (const std::exception& error) {
         return Status::MalformedJson(
