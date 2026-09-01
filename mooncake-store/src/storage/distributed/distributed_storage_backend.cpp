@@ -46,10 +46,14 @@ bool DistributedStorageConfig::Validate() const {
             << fsdir;
         return false;
     }
-    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix") {
+    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix" &&
+        fs_adapter_type != "oss") {
         LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
                    << fs_adapter_type;
         return false;
+    }
+    if (fs_adapter_type == "oss") {
+        return true;
     }
     if (shard_count <= 0) {
         LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
@@ -77,6 +81,11 @@ bool DistributedStorageConfig::Validate() const {
 
 bool DistributedStorageConfig::ValidateForAllocator() const {
     if (!Validate()) return false;
+    if (fs_adapter_type == "oss") {
+        LOG(ERROR) << "DistributedStorageConfig: DFS allocator requires a "
+                      "filesystem adapter";
+        return false;
+    }
 
     if (eviction_low_watermark < 0.0 || eviction_low_watermark > 1.0 ||
         eviction_high_watermark < 0.0 || eviction_high_watermark > 1.0 ||
@@ -198,6 +207,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     if (UsesObjectStorage()) {
         auto init_result = object_storage_adapter_->Init();
         if (!init_result) return init_result;
+        if (distributed_config_.enable_health_check) {
+            auto health_result = object_storage_adapter_->CheckHealth();
+            if (!health_result) {
+                LOG(ERROR) << "Object storage health check failed, adapter="
+                           << object_storage_adapter_->GetName() << ", error="
+                           << static_cast<int>(health_result.error());
+                return health_result;
+            }
+        }
         initialized_ = true;
         LOG(INFO) << "DistributedStorageBackend initialized, object adapter="
                   << object_storage_adapter_->GetName();
