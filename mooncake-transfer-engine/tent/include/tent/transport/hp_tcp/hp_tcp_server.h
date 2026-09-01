@@ -1,6 +1,6 @@
 // Copyright 2026 KVCache.AI
-#ifndef TENT_HIGH_PERFORMANCE_TCP_SERVER_H_
-#define TENT_HIGH_PERFORMANCE_TCP_SERVER_H_
+#ifndef TENT_HP_TCP_SERVER_H_
+#define TENT_HP_TCP_SERVER_H_
 
 #include <asio.hpp>
 
@@ -17,8 +17,8 @@
 #include <vector>
 
 #include "tent/common/status.h"
-#include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
-#include "tent/transport/tcp/high_performance_tcp_workers.h"
+#include "tent/transport/hp_tcp/hp_tcp_buffer_registry.h"
+#include "tent/transport/hp_tcp/hp_tcp_workers.h"
 
 namespace mooncake::tent {
 
@@ -84,4 +84,4 @@ class HighPerformanceTcpServer {
 
 }  // namespace mooncake::tent
 
-#endif  // TENT_HIGH_PERFORMANCE_TCP_SERVER_H_
+#endif  // TENT_HP_TCP_SERVER_H_

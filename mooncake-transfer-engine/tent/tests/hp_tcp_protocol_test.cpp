@@ -3,7 +3,7 @@
 
 #include <limits>
 
-#include "tent/transport/tcp/high_performance_tcp_protocol.h"
+#include "tent/transport/hp_tcp/hp_tcp_protocol.h"
 
 namespace mooncake::tent {
 namespace {

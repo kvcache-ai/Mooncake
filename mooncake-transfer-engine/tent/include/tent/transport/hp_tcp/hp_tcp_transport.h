@@ -1,6 +1,6 @@
 // Copyright 2026 KVCache.AI
-#ifndef TENT_HIGH_PERFORMANCE_TCP_TRANSPORT_H_
-#define TENT_HIGH_PERFORMANCE_TCP_TRANSPORT_H_
+#ifndef TENT_HP_TCP_TRANSPORT_H_
+#define TENT_HP_TCP_TRANSPORT_H_
 
 #include <atomic>
 #include <memory>
@@ -11,11 +11,11 @@
 
 #include "tent/runtime/hp_tcp_transport_config.h"
 #include "tent/runtime/transport.h"
-#include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
-#include "tent/transport/tcp/high_performance_tcp_client.h"
-#include "tent/transport/tcp/high_performance_tcp_server.h"
-#include "tent/transport/tcp/high_performance_tcp_task.h"
-#include "tent/transport/tcp/high_performance_tcp_workers.h"
+#include "tent/transport/hp_tcp/hp_tcp_buffer_registry.h"
+#include "tent/transport/hp_tcp/hp_tcp_client.h"
+#include "tent/transport/hp_tcp/hp_tcp_server.h"
+#include "tent/transport/hp_tcp/hp_tcp_task.h"
+#include "tent/transport/hp_tcp/hp_tcp_workers.h"
 
 namespace mooncake::tent {
 
@@ -101,4 +101,4 @@ class HighPerformanceTcpTransport final : public Transport {
 
 }  // namespace mooncake::tent
 
-#endif  // TENT_HIGH_PERFORMANCE_TCP_TRANSPORT_H_
+#endif  // TENT_HP_TCP_TRANSPORT_H_

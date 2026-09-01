@@ -1,5 +1,5 @@
 // Copyright 2026 KVCache.AI
-#include "tent/transport/tcp/high_performance_tcp_client.h"
+#include "tent/transport/hp_tcp/hp_tcp_client.h"
 
 #include <algorithm>
 #include <array>

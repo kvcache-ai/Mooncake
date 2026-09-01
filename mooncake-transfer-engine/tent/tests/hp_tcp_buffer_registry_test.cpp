@@ -5,7 +5,7 @@
 #include <atomic>
 #include <thread>
 
-#include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
+#include "tent/transport/hp_tcp/hp_tcp_buffer_registry.h"
 
 namespace mooncake::tent {
 namespace {

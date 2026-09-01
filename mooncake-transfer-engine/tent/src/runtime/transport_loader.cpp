@@ -15,7 +15,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/shm/shm_transport.h"
 #include "tent/transport/tcp/tcp_transport.h"
-#include "tent/transport/tcp/high_performance_tcp_transport.h"
+#include "tent/transport/hp_tcp/hp_tcp_transport.h"
 
 #ifdef USE_RDMA
 #include "tent/transport/rdma/rdma_transport.h"

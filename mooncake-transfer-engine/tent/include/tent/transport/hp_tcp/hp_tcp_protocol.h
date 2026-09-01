@@ -1,6 +1,6 @@
 // Copyright 2026 KVCache.AI
-#ifndef TENT_HIGH_PERFORMANCE_TCP_PROTOCOL_H_
-#define TENT_HIGH_PERFORMANCE_TCP_PROTOCOL_H_
+#ifndef TENT_HP_TCP_PROTOCOL_H_
+#define TENT_HP_TCP_PROTOCOL_H_
 
 #include <array>
 #include <cstddef>
@@ -86,4 +86,4 @@ const char* HighPerformanceTcpPermissionName(Permission permission);
 
 }  // namespace mooncake::tent
 
-#endif  // TENT_HIGH_PERFORMANCE_TCP_PROTOCOL_H_
+#endif  // TENT_HP_TCP_PROTOCOL_H_

@@ -1,6 +1,6 @@
 // Copyright 2026 KVCache.AI
-#ifndef TENT_HIGH_PERFORMANCE_TCP_WORKERS_H_
-#define TENT_HIGH_PERFORMANCE_TCP_WORKERS_H_
+#ifndef TENT_HP_TCP_WORKERS_H_
+#define TENT_HP_TCP_WORKERS_H_
 
 #include <asio.hpp>
 
@@ -116,4 +116,4 @@ class HighPerformanceTcpWorkers {
 
 }  // namespace mooncake::tent
 
-#endif  // TENT_HIGH_PERFORMANCE_TCP_WORKERS_H_
+#endif  // TENT_HP_TCP_WORKERS_H_

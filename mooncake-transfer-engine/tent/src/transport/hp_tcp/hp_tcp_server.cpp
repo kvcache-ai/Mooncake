@@ -1,5 +1,5 @@
 // Copyright 2026 KVCache.AI
-#include "tent/transport/tcp/high_performance_tcp_server.h"
+#include "tent/transport/hp_tcp/hp_tcp_server.h"
 
 #include <algorithm>
 #include <array>
@@ -10,7 +10,7 @@
 
 #include <glog/logging.h>
 
-#include "tent/transport/tcp/high_performance_tcp_protocol.h"
+#include "tent/transport/hp_tcp/hp_tcp_protocol.h"
 
 namespace mooncake::tent {
 

@@ -1,4 +1,5 @@
 add_subdirectory(tcp)
+add_subdirectory(hp_tcp)
 add_subdirectory(rdma)
 add_subdirectory(shm)
 add_subdirectory(nvlink)

@@ -1,5 +1,5 @@
 // Copyright 2026 KVCache.AI
-#include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
+#include "tent/transport/hp_tcp/hp_tcp_buffer_registry.h"
 
 #include <limits>
 #include <random>

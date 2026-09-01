@@ -9,8 +9,8 @@
 #include <optional>
 #include <thread>
 
-#include "tent/transport/tcp/high_performance_tcp_client.h"
-#include "tent/transport/tcp/high_performance_tcp_server.h"
+#include "tent/transport/hp_tcp/hp_tcp_client.h"
+#include "tent/transport/hp_tcp/hp_tcp_server.h"
 
 namespace mooncake::tent {
 namespace {

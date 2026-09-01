@@ -8,9 +8,9 @@
 #include <stdexcept>
 #include <thread>
 
-#include "tent/transport/tcp/high_performance_tcp_buffer_registry.h"
-#include "tent/transport/tcp/high_performance_tcp_task.h"
-#include "tent/transport/tcp/high_performance_tcp_workers.h"
+#include "tent/transport/hp_tcp/hp_tcp_buffer_registry.h"
+#include "tent/transport/hp_tcp/hp_tcp_task.h"
+#include "tent/transport/hp_tcp/hp_tcp_workers.h"
 
 namespace mooncake::tent {
 namespace {

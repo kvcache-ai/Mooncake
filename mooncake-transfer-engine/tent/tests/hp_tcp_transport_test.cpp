@@ -19,8 +19,8 @@
 #include <vector>
 
 #include "tent/runtime/control_plane.h"
-#include "tent/transport/tcp/high_performance_tcp_protocol.h"
-#include "tent/transport/tcp/high_performance_tcp_transport.h"
+#include "tent/transport/hp_tcp/hp_tcp_protocol.h"
+#include "tent/transport/hp_tcp/hp_tcp_transport.h"
 
 namespace mooncake::tent {
 
