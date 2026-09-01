@@ -5,7 +5,9 @@ use std::collections::HashSet;
 
 use mooncake_store_core::{ColdBackingRoute, ColdBackingState, ObjectRoute, Result, StoreError};
 
-use crate::client::cold_tier::layout::{OpaquePhysicalKey, PhysicalKeyInput, ValueChunkPlan};
+use crate::client::cold_tier::layout::{
+    decode_hex, OpaquePhysicalKey, PhysicalKeyInput, ValueChunkPlan,
+};
 use crate::client::{
     ColdObjectWrite, PersistentStorageBackend, PersistentStorageBackendHealth,
     PersistentStorageManagement,
@@ -47,6 +49,15 @@ impl LayoutKind {
             _ => Err(StoreError::InvalidState(
                 "NoF physical locator has an unknown layout marker".to_string(),
             )),
+        }
+    }
+
+    fn root_value_size(self, logical_len: u64) -> Result<usize> {
+        match self {
+            Self::Inline => usize::try_from(logical_len).map_err(|_| {
+                StoreError::InvalidState("NoF inline length does not fit usize".to_string())
+            }),
+            Self::Chunked => Ok(MANIFEST_LEN),
         }
     }
 }
@@ -259,7 +270,7 @@ impl NofPhysicalAdapter {
             ));
         }
         let kind = LayoutKind::from_marker(marker)?;
-        let key = decode_hex(key, "key", usize::MAX)?;
+        let key = decode_hex(key, "NoF physical locator key")?;
         Ok((kind, OpaquePhysicalKey::new(key)))
     }
 
@@ -335,71 +346,62 @@ impl NofPhysicalAdapter {
         materialized
     }
 
-    fn put_records(&self, records: &[&PhysicalRecord<'_>]) -> Vec<Result<()>> {
-        let sizes = records
-            .iter()
-            .map(|record| record.value.len() as u64)
-            .collect::<Vec<_>>();
+    fn run_batches<T, U>(
+        &self,
+        operation: &str,
+        requests: &[T],
+        size_of: impl Fn(&T) -> u64,
+        mut run: impl FnMut(&[T]) -> Vec<Result<U>>,
+    ) -> Vec<Result<U>> {
+        let sizes = requests.iter().map(size_of).collect::<Vec<_>>();
         let ranges = match bounded_ranges(&sizes, self.capabilities) {
             Ok(ranges) => ranges,
-            Err(error) => return repeated_error(records.len(), error),
+            Err(error) => return repeated_error(requests.len(), error),
         };
-        let mut results = Vec::with_capacity(records.len());
+        let mut results = Vec::with_capacity(requests.len());
         for range in ranges {
-            let requests = records[range.clone()]
-                .iter()
-                .map(|record| (record.key.clone(), record.value.as_ref()))
-                .collect::<Vec<_>>();
-            let batch = self.writer().put_batch(&requests);
-            if let Err(error) = ensure_batch_len("physical put", requests.len(), batch.len()) {
-                results.extend(repeated_error(requests.len(), error));
+            let expected = range.len();
+            let batch = run(&requests[range]);
+            if let Err(error) = ensure_batch_len(operation, expected, batch.len()) {
+                results.extend(repeated_error(expected, error));
             } else {
                 results.extend(batch);
             }
         }
         results
+    }
+
+    fn put_records(&self, records: &[&PhysicalRecord<'_>]) -> Vec<Result<()>> {
+        self.run_batches(
+            "physical put",
+            records,
+            |record| record.value.len() as u64,
+            |records| {
+                let requests = records
+                    .iter()
+                    .map(|record| (record.key.clone(), record.value.as_ref()))
+                    .collect::<Vec<_>>();
+                self.writer().put_batch(&requests)
+            },
+        )
     }
 
     fn get_records(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
-        let sizes = requests
-            .iter()
-            .map(|request| request.expected_value_size as u64)
-            .collect::<Vec<_>>();
-        let ranges = match bounded_ranges(&sizes, self.capabilities) {
-            Ok(ranges) => ranges,
-            Err(error) => return repeated_error(requests.len(), error),
-        };
-        let mut results = Vec::with_capacity(requests.len());
-        for range in ranges {
-            let batch = self.reader().get_batch(&requests[range.clone()]);
-            if let Err(error) = ensure_batch_len("physical get", range.len(), batch.len()) {
-                results.extend(repeated_error(range.len(), error));
-            } else {
-                results.extend(batch);
-            }
-        }
-        results
+        self.run_batches(
+            "physical get",
+            requests,
+            |request| request.expected_value_size as u64,
+            |requests| self.reader().get_batch(requests),
+        )
     }
 
     fn delete_records(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
-        let sizes = requests
-            .iter()
-            .map(|request| request.key.as_bytes().len() as u64)
-            .collect::<Vec<_>>();
-        let ranges = match bounded_ranges(&sizes, self.capabilities) {
-            Ok(ranges) => ranges,
-            Err(error) => return repeated_error(requests.len(), error),
-        };
-        let mut results = Vec::with_capacity(requests.len());
-        for range in ranges {
-            let batch = self.deleter().delete_batch(&requests[range.clone()]);
-            if let Err(error) = ensure_batch_len("physical delete", range.len(), batch.len()) {
-                results.extend(repeated_error(range.len(), error));
-            } else {
-                results.extend(batch);
-            }
-        }
-        results
+        self.run_batches(
+            "physical delete",
+            requests,
+            |request| request.key.as_bytes().len() as u64,
+            |requests| self.deleter().delete_batch(requests),
+        )
     }
 
     fn put_objects(&self, writes: &[ColdObjectWrite<'_>]) -> Vec<Result<ColdBackingRoute>> {
@@ -524,22 +526,21 @@ impl NofPhysicalAdapter {
             .collect()
     }
 
-    fn get_one(&self, cold_backing: &ColdBackingRoute) -> Result<Option<Vec<u8>>> {
+    fn read_root(
+        &self,
+        cold_backing: &ColdBackingRoute,
+    ) -> Result<Option<(LayoutKind, OpaquePhysicalKey, Vec<u8>)>> {
         let (kind, root_key) = Self::decode_locator(&cold_backing.object_locator)?;
-        let root_hint = match kind {
-            LayoutKind::Inline => usize::try_from(cold_backing.length).map_err(|_| {
-                StoreError::InvalidState("NoF inline length does not fit usize".to_string())
-            })?,
-            LayoutKind::Chunked => MANIFEST_LEN,
-        };
-        let mut root_result = self.get_records(&[NofPhysicalReadRequest {
+        let request = NofPhysicalReadRequest {
             key: root_key.clone(),
-            expected_value_size: root_hint,
-        }]);
-        let Some(root) = root_result.pop().ok_or_else(|| {
-            StoreError::Transport("NoF root read returned no result".to_string())
-        })??
-        else {
+            expected_value_size: kind.root_value_size(cold_backing.length)?,
+        };
+        let root = one_batch_result("physical root read", self.get_records(&[request]))?;
+        Ok(root.map(|value| (kind, root_key, value)))
+    }
+
+    fn get_one(&self, cold_backing: &ColdBackingRoute) -> Result<Option<Vec<u8>>> {
+        let Some((kind, root_key, root)) = self.read_root(cold_backing)? else {
             return Ok(None);
         };
         if kind == LayoutKind::Inline {
@@ -591,22 +592,7 @@ impl NofPhysicalAdapter {
     }
 
     fn delete_one(&self, cold_backing: &ColdBackingRoute) -> Result<bool> {
-        let (kind, root_key) = Self::decode_locator(&cold_backing.object_locator)?;
-        let root_hint = if kind == LayoutKind::Chunked {
-            MANIFEST_LEN
-        } else {
-            usize::try_from(cold_backing.length).map_err(|_| {
-                StoreError::InvalidState("NoF inline length does not fit usize".to_string())
-            })?
-        };
-        let mut root_result = self.get_records(&[NofPhysicalReadRequest {
-            key: root_key.clone(),
-            expected_value_size: root_hint,
-        }]);
-        let Some(root) = root_result.pop().ok_or_else(|| {
-            StoreError::Transport("NoF delete lookup returned no result".to_string())
-        })??
-        else {
+        let Some((kind, root_key, root)) = self.read_root(cold_backing)? else {
             return Ok(false);
         };
         if kind == LayoutKind::Chunked {
@@ -630,18 +616,15 @@ impl NofPhysicalAdapter {
         } else {
             validate_payload(cold_backing, &root)?;
         }
-        match self
-            .delete_records(&[NofPhysicalDeleteRequest { key: root_key }])
-            .pop()
-        {
-            Some(Ok(())) | Some(Err(StoreError::NotFound(_))) => {
+        match one_batch_result(
+            "physical root delete",
+            self.delete_records(&[NofPhysicalDeleteRequest { key: root_key }]),
+        ) {
+            Ok(()) | Err(StoreError::NotFound(_)) => {
                 self.writer().flush()?;
                 Ok(true)
             }
-            Some(Err(error)) => Err(error),
-            None => Err(StoreError::Transport(
-                "NoF root delete returned no result".to_string(),
-            )),
+            Err(error) => Err(error),
         }
     }
 }
@@ -685,13 +668,14 @@ impl PersistentStorageBackend for NofPhysicalAdapter {
         cold_backing: &ColdBackingRoute,
         payload: &[u8],
     ) -> Result<ColdBackingRoute> {
-        self.put_objects(&[ColdObjectWrite {
-            route,
-            cold_backing,
-            payload,
-        }])
-        .pop()
-        .ok_or_else(|| StoreError::Transport("NoF single put returned no result".to_string()))?
+        one_batch_result(
+            "single put",
+            self.put_objects(&[ColdObjectWrite {
+                route,
+                cold_backing,
+                payload,
+            }]),
+        )
     }
 
     fn put_objects_batch_profiled(
@@ -747,27 +731,12 @@ fn validate_payload(route: &ColdBackingRoute, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn decode_hex(encoded: &str, field: &str, max_bytes: usize) -> Result<Vec<u8>> {
-    if encoded.is_empty()
-        || !encoded.len().is_multiple_of(2)
-        || !encoded.is_ascii()
-        || encoded.len() / 2 > max_bytes
-    {
-        return Err(StoreError::InvalidState(format!(
-            "NoF physical locator has invalid hex {field} length"
-        )));
-    }
-    let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    for offset in (0..encoded.len()).step_by(2) {
-        bytes.push(
-            u8::from_str_radix(&encoded[offset..offset + 2], 16).map_err(|_| {
-                StoreError::InvalidState(format!(
-                    "NoF physical locator contains non-hex {field} bytes"
-                ))
-            })?,
-        );
-    }
-    Ok(bytes)
+fn one_batch_result<T>(operation: &str, results: Vec<Result<T>>) -> Result<T> {
+    ensure_batch_len(operation, 1, results.len())?;
+    results
+        .into_iter()
+        .next()
+        .ok_or_else(|| StoreError::Transport(format!("NoF {operation} returned no result")))?
 }
 
 fn bounded_ranges(

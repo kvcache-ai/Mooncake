@@ -20,13 +20,34 @@ impl OpaquePhysicalKey {
     }
 
     pub fn to_hex(&self) -> String {
-        let mut encoded = String::with_capacity(self.0.len().saturating_mul(2));
-        for byte in &self.0 {
-            use std::fmt::Write;
-            let _ = write!(encoded, "{byte:02x}");
-        }
-        encoded
+        encode_hex(&self.0)
     }
+}
+
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+pub(crate) fn decode_hex(encoded: &str, description: &str) -> Result<Vec<u8>> {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(2) || !encoded.is_ascii() {
+        return Err(StoreError::InvalidState(format!(
+            "{description} has invalid hex length"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for offset in (0..encoded.len()).step_by(2) {
+        bytes.push(
+            u8::from_str_radix(&encoded[offset..offset + 2], 16).map_err(|_| {
+                StoreError::InvalidState(format!("{description} contains non-hex bytes"))
+            })?,
+        );
+    }
+    Ok(bytes)
 }
 
 /// Borrowed, length-delimited identity fields for one physical key.

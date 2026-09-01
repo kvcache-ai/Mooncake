@@ -71,7 +71,7 @@ impl StoreClient {
 
     pub(in super::super) fn resolve_cold_backing_read(
         &self,
-        route: ObjectRoute,
+        mut route: ObjectRoute,
         tenant: &str,
         logical_key: &str,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
@@ -87,12 +87,45 @@ impl StoreClient {
             )));
         };
         select_cold_backing_target(&mut cold_backing, |id| {
-            self.storage_owner.cold_tier_devices.has_local_backend(id)
+            self.storage_owner
+                .cold_tier_devices
+                .runtime_backend_available(id)
         });
+        if self
+            .storage_owner
+            .cold_tier_devices
+            .has_runtime_backend(&cold_backing.cold_tier_id)
+        {
+            if !self
+                .storage_owner
+                .cold_tier_devices
+                .runtime_backend_available(&cold_backing.cold_tier_id)
+            {
+                return Err(StoreError::NotFound(format!(
+                    "tenant={tenant} key={logical_key}: persistent target {} is unavailable",
+                    cold_backing.cold_tier_id
+                )));
+            }
+            cold_backing.replicas.retain(|replica| {
+                self.storage_owner
+                    .cold_tier_devices
+                    .runtime_backend_available(&replica.cold_tier_id)
+            });
+            let mut selector = super::target_selection::ReplicaTargetSelector::new(
+                self.storage_owner.cold_tier_devices.admission(),
+            );
+            let selected = selector.select_target(&cold_backing);
+            super::target_selection::promote_cold_backing_target(&mut cold_backing, &selected);
+            if route.nof_backing.is_some() {
+                route.nof_backing = Some(super::nof::cold_as_nof(&cold_backing));
+            } else {
+                route.cold_backing = Some(cold_backing.clone());
+            }
+        }
         if !self
             .storage_owner
             .cold_tier_devices
-            .has_local_backend(&cold_backing.cold_tier_id)
+            .has_runtime_backend(&cold_backing.cold_tier_id)
         {
             if self
                 .storage_owner

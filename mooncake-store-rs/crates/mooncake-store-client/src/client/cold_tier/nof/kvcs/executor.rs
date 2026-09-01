@@ -1,4 +1,4 @@
-use mooncake_store_core::{NamespaceScope, Result, StoreError};
+use mooncake_store_core::{Result, StoreError};
 
 use super::super::backend::encode_namespace;
 use super::super::object::repeated_error;
@@ -43,6 +43,29 @@ enum KvcsExecutor {
     LowLevel(low_level::LowLevelExecutor),
 }
 
+impl KvcsExecutor {
+    fn mode(&self) -> KvcsMode {
+        match self {
+            Self::Standard(_) => KvcsMode::Standard,
+            Self::LowLevel(_) => KvcsMode::LowLevel,
+        }
+    }
+
+    fn standard(&self) -> Option<&standard::StandardExecutor> {
+        let Self::Standard(executor) = self else {
+            return None;
+        };
+        Some(executor)
+    }
+
+    fn low_level(&self) -> Option<&low_level::LowLevelExecutor> {
+        let Self::LowLevel(executor) = self else {
+            return None;
+        };
+        Some(executor)
+    }
+}
+
 /// KVCS C API executor whose exposed NoF traits are selected by `MOONCAKE_KVCS_MODE`.
 pub struct KvcsCapiExecutor {
     executor: KvcsExecutor,
@@ -62,178 +85,76 @@ impl KvcsCapiExecutor {
     }
 
     pub fn mode(&self) -> KvcsMode {
-        match &self.executor {
-            KvcsExecutor::Standard(_) => KvcsMode::Standard,
-            KvcsExecutor::LowLevel(_) => KvcsMode::LowLevel,
-        }
+        self.executor.mode()
     }
 }
 
 impl NofBacking for KvcsCapiExecutor {
     fn object_limits(&self) -> Option<NofObjectLimits> {
-        match &self.executor {
-            KvcsExecutor::Standard(executor) => Some(executor.capabilities()),
-            KvcsExecutor::LowLevel(_) => None,
-        }
+        self.executor
+            .standard()
+            .map(standard::StandardExecutor::capabilities)
     }
 
     fn object_write(&self) -> Option<&dyn NofObjectWrite> {
-        (self.mode() == KvcsMode::Standard).then_some(self)
+        self.executor
+            .standard()
+            .map(|executor| executor as &dyn NofObjectWrite)
     }
 
     fn object_read(&self) -> Option<&dyn NofObjectRead> {
-        (self.mode() == KvcsMode::Standard).then_some(self)
+        self.executor
+            .standard()
+            .map(|executor| executor as &dyn NofObjectRead)
     }
 
     fn object_query(&self) -> Option<&dyn NofObjectQuery> {
-        (self.mode() == KvcsMode::Standard).then_some(self)
+        self.executor
+            .standard()
+            .map(|executor| executor as &dyn NofObjectQuery)
     }
 
     fn object_delete(&self) -> Option<&dyn NofObjectDelete> {
-        (self.mode() == KvcsMode::Standard).then_some(self)
+        self.executor
+            .standard()
+            .map(|executor| executor as &dyn NofObjectDelete)
     }
 
     fn physical_limits(&self) -> Option<NofPhysicalLimits> {
-        match &self.executor {
-            KvcsExecutor::Standard(_) => None,
-            KvcsExecutor::LowLevel(executor) => Some(executor.capabilities()),
-        }
+        self.executor
+            .low_level()
+            .map(low_level::LowLevelExecutor::capabilities)
     }
 
     fn physical_write(&self) -> Option<&dyn NofPhysicalWrite> {
-        (self.mode() == KvcsMode::LowLevel).then_some(self)
+        self.executor
+            .low_level()
+            .map(|executor| executor as &dyn NofPhysicalWrite)
     }
 
     fn physical_read(&self) -> Option<&dyn NofPhysicalRead> {
-        (self.mode() == KvcsMode::LowLevel).then_some(self)
+        self.executor
+            .low_level()
+            .map(|executor| executor as &dyn NofPhysicalRead)
     }
 
     fn physical_query(&self) -> Option<&dyn NofPhysicalQuery> {
-        (self.mode() == KvcsMode::LowLevel).then_some(self)
+        self.executor
+            .low_level()
+            .map(|executor| executor as &dyn NofPhysicalQuery)
     }
 
     fn physical_delete(&self) -> Option<&dyn NofPhysicalDelete> {
-        (self.mode() == KvcsMode::LowLevel).then_some(self)
+        self.executor
+            .low_level()
+            .map(|executor| executor as &dyn NofPhysicalDelete)
     }
 
     fn health_capability(&self) -> Option<&dyn NofHealth> {
-        (self.mode() == KvcsMode::LowLevel).then_some(self)
+        self.executor
+            .low_level()
+            .map(|executor| executor as &dyn NofHealth)
     }
-}
-
-impl NofObjectWrite for KvcsCapiExecutor {
-    fn init_namespace(&self, namespace: &NamespaceScope) -> Result<()> {
-        match &self.executor {
-            KvcsExecutor::Standard(executor) => executor.init_namespace(namespace),
-            KvcsExecutor::LowLevel(_) => Err(wrong_mode(self.mode(), "logical-object writes")),
-        }
-    }
-
-    fn put_shards(&self, requests: &[NofObjectShardWrite<'_>]) -> Vec<Result<()>> {
-        match &self.executor {
-            KvcsExecutor::Standard(executor) => executor.put_shards(requests),
-            KvcsExecutor::LowLevel(_) => repeated_error(
-                requests.len(),
-                wrong_mode(self.mode(), "logical-object writes"),
-            ),
-        }
-    }
-}
-
-impl NofObjectRead for KvcsCapiExecutor {
-    fn get_object(
-        &self,
-        namespace: &NamespaceScope,
-        key: &str,
-    ) -> Result<NofObjectState<NofObject>> {
-        match &self.executor {
-            KvcsExecutor::Standard(executor) => executor.get_object(namespace, key),
-            KvcsExecutor::LowLevel(_) => Err(wrong_mode(self.mode(), "logical-object reads")),
-        }
-    }
-}
-
-impl NofObjectQuery for KvcsCapiExecutor {
-    fn query_object(
-        &self,
-        namespace: &NamespaceScope,
-        key: &str,
-    ) -> Result<NofObjectState<NofObjectMetadata>> {
-        match &self.executor {
-            KvcsExecutor::Standard(executor) => executor.query_object(namespace, key),
-            KvcsExecutor::LowLevel(_) => Err(wrong_mode(self.mode(), "logical-object query")),
-        }
-    }
-}
-
-impl NofObjectDelete for KvcsCapiExecutor {
-    fn delete_object(&self, namespace: &NamespaceScope, key: &str) -> Result<NofObjectState<()>> {
-        match &self.executor {
-            KvcsExecutor::Standard(executor) => executor.delete_object(namespace, key),
-            KvcsExecutor::LowLevel(_) => Err(wrong_mode(self.mode(), "logical-object deletion")),
-        }
-    }
-}
-
-impl NofPhysicalWrite for KvcsCapiExecutor {
-    fn put_batch(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
-        match &self.executor {
-            KvcsExecutor::Standard(_) => {
-                repeated_error(requests.len(), wrong_mode(self.mode(), "physical writes"))
-            }
-            KvcsExecutor::LowLevel(executor) => executor.put_batch(requests),
-        }
-    }
-}
-
-impl NofPhysicalRead for KvcsCapiExecutor {
-    fn get_batch(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
-        match &self.executor {
-            KvcsExecutor::Standard(_) => {
-                repeated_error(requests.len(), wrong_mode(self.mode(), "physical reads"))
-            }
-            KvcsExecutor::LowLevel(executor) => executor.get_batch(requests),
-        }
-    }
-}
-
-impl NofPhysicalQuery for KvcsCapiExecutor {
-    fn query_batch(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
-        match &self.executor {
-            KvcsExecutor::Standard(_) => {
-                repeated_error(keys.len(), wrong_mode(self.mode(), "physical query"))
-            }
-            KvcsExecutor::LowLevel(executor) => executor.query_batch(keys),
-        }
-    }
-}
-
-impl NofPhysicalDelete for KvcsCapiExecutor {
-    fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
-        match &self.executor {
-            KvcsExecutor::Standard(_) => {
-                repeated_error(requests.len(), wrong_mode(self.mode(), "physical deletion"))
-            }
-            KvcsExecutor::LowLevel(executor) => executor.delete_batch(requests),
-        }
-    }
-}
-
-impl NofHealth for KvcsCapiExecutor {
-    fn health(&self) -> Result<NofStorageHealth> {
-        let KvcsExecutor::LowLevel(executor) = &self.executor else {
-            return Err(wrong_mode(self.mode(), "backing health"));
-        };
-        let probe = OpaquePhysicalKey::new(b"mooncake:nof:health:v1".to_vec());
-        executor.query_batch(&[probe]).pop().ok_or_else(|| {
-            StoreError::Transport("KVCS health query returned no result".to_string())
-        })??;
-        Ok(NofStorageHealth::default())
-    }
-}
-
-fn wrong_mode(mode: KvcsMode, capability: &str) -> StoreError {
-    StoreError::Unsupported(format!("KVCS mode {mode:?} does not expose {capability}"))
 }
 
 mod standard {
@@ -248,8 +169,9 @@ mod standard {
 
     use super::super::*;
     use super::{
-        encode_namespace, repeated_error, NofObject, NofObjectLimits, NofObjectMetadata,
-        NofObjectShardWrite, NofObjectState,
+        encode_namespace, repeated_error, NofObject, NofObjectDelete, NofObjectLimits,
+        NofObjectMetadata, NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState,
+        NofObjectWrite,
     };
 
     struct RawQuery {
@@ -560,8 +482,10 @@ mod standard {
                 max_key_size: self.limits.max_key_size as u64,
             }
         }
+    }
 
-        pub(super) fn init_namespace(&self, namespace: &NamespaceScope) -> Result<()> {
+    impl NofObjectWrite for StandardExecutor {
+        fn init_namespace(&self, namespace: &NamespaceScope) -> Result<()> {
             let client = self.ensure_client()?;
             let namespace = self.namespace(namespace)?;
             let options = KvcsCreateNamespaceOptions {
@@ -577,7 +501,7 @@ mod standard {
             }
         }
 
-        pub(super) fn put_shards(&self, requests: &[NofObjectShardWrite<'_>]) -> Vec<Result<()>> {
+        fn put_shards(&self, requests: &[NofObjectShardWrite<'_>]) -> Vec<Result<()>> {
             if requests.is_empty() {
                 return Vec::new();
             }
@@ -707,8 +631,10 @@ mod standard {
             }
             finish_positional_results(results)
         }
+    }
 
-        pub(super) fn query_object(
+    impl NofObjectQuery for StandardExecutor {
+        fn query_object(
             &self,
             namespace: &NamespaceScope,
             key: &str,
@@ -717,8 +643,10 @@ mod standard {
                 .query_raw(namespace, key, false)?
                 .map(|query| query.metadata))
         }
+    }
 
-        pub(super) fn get_object(
+    impl NofObjectRead for StandardExecutor {
+        fn get_object(
             &self,
             namespace: &NamespaceScope,
             key: &str,
@@ -810,8 +738,10 @@ mod standard {
                 value,
             }))
         }
+    }
 
-        pub(super) fn delete_object(
+    impl NofObjectDelete for StandardExecutor {
+        fn delete_object(
             &self,
             namespace: &NamespaceScope,
             key: &str,
@@ -921,7 +851,9 @@ mod low_level {
 
     use super::super::*;
     use super::{
-        NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalReadRequest, OpaquePhysicalKey,
+        NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits,
+        NofPhysicalQuery, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite,
+        NofStorageHealth, OpaquePhysicalKey,
     };
 
     pub(super) struct LowLevelExecutor {
@@ -1073,8 +1005,10 @@ mod low_level {
                 max_batch_bytes: u64::MAX,
             }
         }
+    }
 
-        pub(super) fn put_batch(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
+    impl NofPhysicalWrite for LowLevelExecutor {
+        fn put_batch(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
             if requests.is_empty() {
                 return Vec::new();
             }
@@ -1178,11 +1112,10 @@ mod low_level {
             }
             finish_positional_results(results)
         }
+    }
 
-        pub(super) fn get_batch(
-            &self,
-            requests: &[NofPhysicalReadRequest],
-        ) -> Vec<Result<Option<Vec<u8>>>> {
+    impl NofPhysicalRead for LowLevelExecutor {
+        fn get_batch(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
             if requests.is_empty() {
                 return Vec::new();
             }
@@ -1301,11 +1234,10 @@ mod low_level {
             }
             finish_positional_results(results)
         }
+    }
 
-        pub(super) fn delete_batch(
-            &self,
-            requests: &[NofPhysicalDeleteRequest],
-        ) -> Vec<Result<()>> {
+    impl NofPhysicalDelete for LowLevelExecutor {
+        fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
             if requests.is_empty() {
                 return Vec::new();
             }
@@ -1373,8 +1305,10 @@ mod low_level {
             }
             finish_positional_results(results)
         }
+    }
 
-        pub(super) fn query_batch(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
+    impl NofPhysicalQuery for LowLevelExecutor {
+        fn query_batch(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
             if keys.is_empty() {
                 return Vec::new();
             }
@@ -1457,6 +1391,16 @@ mod low_level {
         }
     }
 
+    impl NofHealth for LowLevelExecutor {
+        fn health(&self) -> Result<NofStorageHealth> {
+            let probe = OpaquePhysicalKey::new(b"mooncake:nof:health:v1".to_vec());
+            self.query_batch(&[probe]).pop().ok_or_else(|| {
+                StoreError::Transport("KVCS health query returned no result".to_string())
+            })??;
+            Ok(NofStorageHealth::default())
+        }
+    }
+
     fn kvcs_low_level_query_status(status: &[std::ffi::c_char; 32]) -> Result<bool> {
         let len = status
             .iter()
@@ -1483,10 +1427,7 @@ mod low_level {
 
     #[cfg(test)]
     mod tests {
-        use super::super::{
-            NofBacking, NofHealth, NofPhysicalDelete, NofPhysicalQuery, NofPhysicalRead,
-            NofPhysicalWrite, NofStorageHealth,
-        };
+        use super::super::{NofBacking, NofStorageHealth};
         use super::*;
 
         #[test]
@@ -1500,15 +1441,21 @@ mod low_level {
             let key = OpaquePhysicalKey::new(format!("mooncake-smoke-{nonce}").into_bytes());
             let value = b"kvcs-capi-smoke";
             executor
+                .physical_write()
+                .unwrap()
                 .put_batch(&[(key.clone(), value)])
                 .remove(0)
                 .unwrap();
             assert!(executor
+                .physical_query()
+                .unwrap()
                 .query_batch(std::slice::from_ref(&key))
                 .remove(0)
                 .unwrap());
             assert_eq!(
                 executor
+                    .physical_read()
+                    .unwrap()
                     .get_batch(&[NofPhysicalReadRequest {
                         key: key.clone(),
                         expected_value_size: value.len(),
@@ -1518,16 +1465,23 @@ mod low_level {
                 Some(value.to_vec())
             );
             executor
+                .physical_delete()
+                .unwrap()
                 .delete_batch(&[NofPhysicalDeleteRequest { key: key.clone() }])
                 .remove(0)
                 .unwrap();
-            assert!(!executor.query_batch(&[key]).remove(0).unwrap());
+            assert!(!executor
+                .physical_query()
+                .unwrap()
+                .query_batch(&[key])
+                .remove(0)
+                .unwrap());
             assert!(executor.physical_read().is_some());
             assert!(executor.physical_write().is_some());
             assert!(executor.physical_query().is_some());
             assert!(executor.health_capability().is_some());
             assert_eq!(
-                NofHealth::health(&executor).unwrap(),
+                executor.health_capability().unwrap().health().unwrap(),
                 NofStorageHealth::default()
             );
             assert!(executor.object_read().is_none());

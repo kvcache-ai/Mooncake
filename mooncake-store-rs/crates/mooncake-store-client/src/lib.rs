@@ -14,7 +14,7 @@ pub use client::cold_tier::nof::{
     NofObjectShardWrite, NofObjectState, NofObjectWrite, NofPhysicalDelete,
     NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalListPage, NofPhysicalObject,
     NofPhysicalQuery, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofStorageHealth,
-    NofStorageManagement, OpaquePhysicalKey, PhysicalKeyCodec, PhysicalKeyInput,
+    NofStorageManagement, NofTargetConfig, OpaquePhysicalKey, PhysicalKeyCodec, PhysicalKeyInput,
     Sha256PhysicalKeyCodec,
 };
 pub use client::{

@@ -179,11 +179,7 @@ impl ColdTierHandle {
         storage_owner: &StorageOwnerState,
         pending_offloads: usize,
     ) -> bool {
-        storage_owner
-            .cold_tier_devices
-            .local_device_ids()
-            .is_empty()
-            && pending_offloads == 0
+        !storage_owner.cold_tier_devices.has_any_persistent_backend() && pending_offloads == 0
     }
 
     fn run_cleanup_jobs(storage_owner: &StorageOwnerState) {

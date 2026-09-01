@@ -1072,8 +1072,13 @@ fn restore_batch_payloads_from_cold_backing_grouped(
     // appear to have zero inflight and win unfairly, but cannot be read
     // via local SSD — they require the remote gRPC path.
     {
-        let is_local = |id: &str| client.storage_owner.cold_tier_devices.has_local_backend(id);
-        let mut selector = super::target_selection::ColdTierTargetSelector::new(
+        let is_local = |id: &str| {
+            client
+                .storage_owner
+                .cold_tier_devices
+                .has_runtime_backend(id)
+        };
+        let mut selector = super::target_selection::ReplicaTargetSelector::new(
             client.storage_owner.cold_tier_devices.admission(),
         );
         for (_, cold_backing, _) in &mut leaders {
@@ -1084,11 +1089,11 @@ fn restore_batch_payloads_from_cold_backing_grouped(
                 select_cold_backing_target(cold_backing, |id| is_local(id));
                 cold_backing.replicas.retain(|r| is_local(&r.cold_tier_id));
                 let result = selector.select_target(cold_backing);
-                if result.cold_tier_id != cold_backing.cold_tier_id
+                if result.target_id != cold_backing.cold_tier_id
                     || result.owner != cold_backing.owner
                 {
                     cold_backing.owner = result.owner;
-                    cold_backing.cold_tier_id = result.cold_tier_id;
+                    cold_backing.cold_tier_id = result.target_id;
                     cold_backing.object_locator = result.object_locator;
                 }
             }
@@ -1314,15 +1319,14 @@ fn restore_batch_leaders_from_same_cold_tier(
     Ok(promotion_payloads)
 }
 
-fn owner_materialized_cold_backing<'a>(
+fn owner_materialized_cold_backing(
     storage_owner: &StorageOwnerState,
-    route: &'a ObjectRoute,
-) -> Option<&'a mooncake_store_core::ColdBackingRoute> {
-    route.cold_backing.as_ref().filter(|cold_backing| {
+    route: &ObjectRoute,
+) -> Option<mooncake_store_core::ColdBackingRoute> {
+    super::materialized_cold_backing(route).filter(|cold_backing| {
         route.state == RouteState::Active
             && route.replicas.is_empty()
             && cold_backing.owner == storage_owner.runtime
-            && cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
     })
 }
 
@@ -1480,10 +1484,10 @@ fn promote_materialized_cold_backing(
         // Resolve backend and read SSD directly into segment memory.
         let backend = storage_owner.cold_tier_devices.backend_for_with_refresh(
             storage_owner.metadata.as_ref(),
-            cold_backing,
+            &cold_backing,
             "cold_restore_owner_direct_to_segment",
         )?;
-        let read_result = backend.get_object_into(cold_backing, dst)?;
+        let read_result = backend.get_object_into(&cold_backing, dst)?;
         let bytes_read = read_result.ok_or_else(|| {
             StoreError::NotFound(format!(
                 "route {} cold backing payload is unavailable (direct read)",
@@ -1540,14 +1544,14 @@ fn promote_materialized_cold_backing(
             storage_owner,
             route,
             &object_id,
-            cold_backing,
+            &cold_backing,
             &reservation,
         );
         let Some(current) = cas_owner_restored_route(storage_owner, route, &next)? else {
             return Ok(true);
         };
         if route_restore_race_resolved(storage_owner, &current)
-            || current.cold_backing.as_ref() != Some(cold_backing)
+            || super::nof::route_backing_as_cold(&current).as_ref() != Some(&cold_backing)
         {
             return Ok(false);
         }
@@ -1555,7 +1559,7 @@ fn promote_materialized_cold_backing(
             storage_owner,
             &current,
             &object_id,
-            cold_backing,
+            &cold_backing,
             &reservation,
         );
         Ok(cas_owner_restored_route(storage_owner, &current, &next)?.is_none())
@@ -2360,7 +2364,7 @@ pub(in super::super) fn execute_owner_cold_restore_cas_phase(
             return Ok(true);
         };
         if route_restore_race_resolved(storage_owner, &current)
-            || current.cold_backing.as_ref() != Some(&ctx.cold_backing)
+            || super::nof::route_backing_as_cold(&current).as_ref() != Some(&ctx.cold_backing)
         {
             return Ok(false);
         }

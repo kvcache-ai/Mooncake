@@ -58,11 +58,20 @@ the field.
 
 ## Reuse of Cold Tier
 
-The physical adapter reuses `PersistentStorageBackend`, `MetadataBackend`, checksum validation,
-`ValueChunkPlan`, `PhysicalKeyCodec` and the existing Cold Tier batching/maintenance entry points.
+The physical adapter reuses the internal `PersistentStorageBackend` I/O envelope,
+`MetadataBackend`, checksum validation, `ValueChunkPlan`, `PhysicalKeyCodec` and the existing Cold
+Tier batching entry points.
 It adds only collision-resistant physical keys, value chunk records, a small root manifest and
 calls to the backing's physical `put/get/delete/flush` traits. It does not add a scheduler,
 allocator, buffer pool, metadata service, GC loop or device manager.
+
+Multi-replica placement and read balancing share the provider-neutral
+`ReplicaLoadBalanceStrategy`. Both `ColdBackingRoute` and `NofBackingRoute` implement the same
+`ReplicaTargetSet`: write placement keeps the existing provider-computed score ordering and uses
+the accumulated write count to spread equal-score targets, while reads keep the existing
+`(inflight_io, batch_ios, global_accum_ios)` ordering. Backings still own
+eligibility and capacity inputs, so sharing the strategy does not make a NoF mountpoint a local disk
+or opt it into local-disk maintenance.
 
 If `NofStorageManagement` is present, the existing Cold Tier reconciliation and watermark paths
 may use its exhaustive list and real capacity values. If it is absent, the provider owns orphan
@@ -71,9 +80,40 @@ exposes neither management trait because its public 0.4.0 client ABI does not pr
 operations. KVCS Low-Level does expose `NofHealth`: it sends a side-effect-free existence query to
 the selected mountpoint, while leaving capacity unknown because the SDK has no capacity API.
 
-The internal physical adapter is not yet attached to `StoreClientBuilder`: the existing local
-Cold Tier hook publishes `cold_backing`, while a NoF runtime binding must publish `nof_backing`
-throughout offload, restore, replica and delete state transitions.
+`StoreClientBuilder::nof_target(s)` registers the runtime backends. The binding reuses the existing
+Cold Tier state machine in this order: select target, publish `PendingWrite`, enqueue, pin/read the
+hot payload, batch write, flush, publish the materialized route by CAS, and roll back an unpublished
+payload on conflict. The same restore singleflight, batch grouping, checksum validation, promotion
+and delayed-delete machinery handles NoF routes. Only the provider-specific I/O call changes.
+
+The old backend trait still accepts a `ColdBackingRoute`, so the runtime creates a short-lived
+in-memory envelope when invoking it. That envelope is never written to metadata. Every route CAS
+for a NoF object writes `ObjectRoute.nof_backing`, and restore/delete convert it only at the I/O
+boundary. This keeps the mature orchestration without pretending that a remote NoF target is a
+local disk.
+
+Target selection is capability driven:
+
+- a logical-object target is selected once; namespace metadata, placement and replication remain
+  provider owned; Mooncake derives a versioned provider object key with the existing SHA-256 key
+  codec so delayed reclamation of an overwritten route cannot delete the replacement value;
+- physical-KV targets use `nof_replica_count` and the shared `ReplicaLoadBalanceStrategy`; each
+  successful target write contributes its real locator to `NofBackingRoute.replicas`;
+- single and batch reads use the same inflight/batch/global counters to choose among runtime-local
+  replicas;
+- target health uses a one-second runtime snapshot instead of adding an SDK probe to every object;
+  a cold restore filters unavailable targets, promotes a healthy replica and publishes the pruned
+  `nof_backing` through the existing restore CAS;
+- NoF-only operation does not load `ColdTierDeviceRecord`, run local watermarks, or update local
+  disk capacity accounting.
+
+Startup recovery requeues `PendingWrite` routes from external metadata and from the existing route
+authority's replica-owner listing. The second source covers the default EmbeddedWrh mode, where
+live routes are not duplicated into the external metadata table. These route indexes are the
+supported recovery source when the SDK has no physical list API. A definite route CAS conflict
+removes every unpublished NoF target. An unknown CAS outcome retains the idempotent locator for
+retry rather than risking an applied route pointing at deleted data; records left by a process
+crash or an outcome that can never be confirmed remain the provider's GC responsibility.
 
 ## Module layout
 
@@ -91,6 +131,7 @@ client/
       object.rs
       physical.rs
       physical_adapter.rs
+      runtime.rs
       external_metadata/
         mod.rs
         tests.rs
@@ -224,9 +265,18 @@ use mooncake_store_client::{
 
 let executor = Arc::new(KvcsCapiExecutor::with_mode(KvcsMode::LowLevel)?);
 let backend = NofBackend::new(executor)?;
+let target = mooncake_store_client::NofTargetConfig::new("kvcs-mount-0", backend)?;
+
+let client = mooncake_store_client::StoreClientBuilder::new(metadata, "storage-0")
+    .nof_target(target)
+    // Used only by physical-KV targets; Standard/provider-object mode ignores it.
+    .nof_replica_count(2)
+    .build(expires_at_ms)?;
 ```
 
-The runtime binding must write `nof_backing`, never encode the target in persisted `cold_backing`.
+NoF uses the existing `MC_STORE_RS_ENABLE_COLD_TIER=1` lifecycle switch because it reuses the Cold
+Tier offload/restore workers. The runtime binding writes `nof_backing`, never the target in
+persisted `cold_backing`.
 Any configured Mooncake capacity is a logical admission/load-balancing limit, not a claim about
 EFC physical free space and not a request for Mooncake watermark GC. KVCS mountpoint selection is
 supplied to the concrete executor (`MOONCAKE_KVCS_MOUNTPOINT_INDEX`).

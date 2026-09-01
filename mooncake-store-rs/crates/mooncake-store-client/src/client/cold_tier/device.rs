@@ -6,6 +6,9 @@ use super::super::{
     ObjectRoute, PersistentStorageBackend, Result, StorageOwnerColdTierConfig, StorageOwnerState,
     StoreError, DEFAULT_TRANSFER_STALL_TIMEOUT,
 };
+use super::replica_policy::{
+    ReplicaLoadBalanceStrategy, ReplicaWriteCandidate, DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY,
+};
 use mooncake_store_core::{ColdTierDeviceRecord, ColdTierUsageDelta};
 use std::collections::BTreeMap;
 use std::sync::{
@@ -118,29 +121,39 @@ impl StorageOwnerState {
         self.cold_tier_devices.crosses_critical(device, length)
     }
 
-    pub(in super::super) fn cold_backing_for_route(
+    pub(in super::super) fn backing_for_route(
         &self,
         route: &ObjectRoute,
         owner: ClientRuntimeId,
         length: u64,
         checksum: u64,
-    ) -> Result<Option<mooncake_store_core::ColdBackingRoute>> {
+    ) -> Result<Option<super::super::PendingBackingRoute>> {
         match self.offload_mode {
             super::super::ColdTierOffloadMode::Passthrough => {
-                self.pending_cold_backing_for_route(route, owner, length, checksum)
+                self.pending_backing_for_route(route, owner, length, checksum)
             }
             super::super::ColdTierOffloadMode::EvictTriggered => Ok(None),
         }
     }
 
-    pub(in super::super) fn pending_cold_backing_for_route(
+    pub(in super::super) fn pending_backing_for_route(
         &self,
         route: &ObjectRoute,
         owner: ClientRuntimeId,
         length: u64,
         checksum: u64,
-    ) -> Result<Option<mooncake_store_core::ColdBackingRoute>> {
+    ) -> Result<Option<super::super::PendingBackingRoute>> {
         let replica_count = cold_tier_replica_count();
+        if !self.cold_tier_devices.has_any_local_backend() {
+            let backing = self
+                .cold_tier_devices
+                .nof_targets
+                .pending_backing(route, owner, length, checksum)?;
+            if backing.is_some() {
+                self.cold_tier_devices.pressure_increment_pending();
+            }
+            return Ok(backing.map(super::super::PendingBackingRoute::Nof));
+        }
         let select_devices = |s: &Self| -> Result<Vec<ColdTierDeviceRecord>> {
             if replica_count > 1 {
                 s.select_cold_tier_devices(length, replica_count)
@@ -157,6 +170,14 @@ impl StorageOwnerState {
             }
         }
         let Some(primary) = devices.first() else {
+            if let Some(backing) = self
+                .cold_tier_devices
+                .nof_targets
+                .pending_backing(route, owner, length, checksum)?
+            {
+                self.cold_tier_devices.pressure_increment_pending();
+                return Ok(Some(super::super::PendingBackingRoute::Nof(backing)));
+            }
             tracing::debug!(
                 runtime = %self.runtime,
                 key = %route.key.0,
@@ -193,15 +214,17 @@ impl StorageOwnerState {
         // Signal that a new entry needs offload — pressure tracker uses this
         // to throttle restore concurrency when the backlog grows.
         self.cold_tier_devices.pressure_increment_pending();
-        Ok(Some(mooncake_store_core::ColdBackingRoute {
-            cold_tier_id: primary.device_id.clone(),
-            owner,
-            object_locator,
-            length,
-            checksum: Some(checksum),
-            state: mooncake_store_core::ColdBackingState::PendingOffload,
-            replicas,
-        }))
+        Ok(Some(super::super::PendingBackingRoute::Cold(
+            mooncake_store_core::ColdBackingRoute {
+                cold_tier_id: primary.device_id.clone(),
+                owner,
+                object_locator,
+                length,
+                checksum: Some(checksum),
+                state: mooncake_store_core::ColdBackingState::PendingOffload,
+                replicas,
+            },
+        )))
     }
 
     pub(in super::super) fn reserve_owner_restore_space(
@@ -663,6 +686,7 @@ impl ColdTierDeviceManager {
     pub(in super::super) fn new(config: StorageOwnerColdTierConfig) -> Self {
         Self {
             resolver: parking_lot::Mutex::new(config.resolver),
+            nof_targets: config.nof_targets,
             devices: config.devices,
             watermarks: config.watermarks,
             admission: Arc::new(ColdTierAdmission::new(config.rate_limits)),
@@ -685,6 +709,22 @@ impl ColdTierDeviceManager {
     /// Returns true if this runtime has at least one local cold-tier backend.
     pub(in super::super) fn has_any_local_backend(&self) -> bool {
         self.resolver.lock().has_any_backend()
+    }
+
+    pub(in super::super) fn has_any_persistent_backend(&self) -> bool {
+        self.has_any_local_backend() || !self.nof_targets.is_empty()
+    }
+
+    pub(in super::super) fn has_nof_backend(&self, target_id: &str) -> bool {
+        self.nof_targets.contains(target_id)
+    }
+
+    pub(in super::super) fn has_runtime_backend(&self, target_id: &str) -> bool {
+        self.has_local_backend(target_id) || self.has_nof_backend(target_id)
+    }
+
+    pub(in super::super) fn runtime_backend_available(&self, target_id: &str) -> bool {
+        self.has_local_backend(target_id) || self.nof_targets.available_for_io(target_id)
     }
 
     /// Unknown/dynamic backends retain the historical Mooncake-managed behavior. Registered
@@ -789,31 +829,7 @@ impl ColdTierDeviceManager {
         devices: Vec<ColdTierDeviceRecord>,
         length: u64,
     ) -> Option<ColdTierDeviceRecord> {
-        if devices.is_empty() {
-            return None;
-        }
-        // IO-aware device selection: pick the device that best balances free
-        // capacity and current restore read load.  This steers offload writes
-        // away from SSDs that are busy serving restore reads, reducing read/write
-        // contention on the same physical disk.
-        //
-        // Score = 0.3 × capacity_score + 0.7 × io_score
-        //   capacity_score = free_percentage / 100.0          (0.0 – 1.0)
-        //   io_score       = 1.0 / (1.0 + restore_in_flight) (0.0 – 1.0)
-        //
-        // When no restore reads are active on any device, the formula degrades
-        // gracefully to pure free-percentage selection (the prior behaviour).
-        devices
-            .into_iter()
-            .filter(|device| self.offload_rejection_reason(device, length).is_none())
-            .max_by(|left, right| {
-                let left_score = self.device_offload_score(left);
-                let right_score = self.device_offload_score(right);
-                left_score
-                    .partial_cmp(&right_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| right.device_id.cmp(&left.device_id))
-            })
+        self.select_n_from(devices, length, 1).into_iter().next()
     }
 
     /// Select up to `n` distinct devices for multi-replica offload, ordered by
@@ -827,20 +843,23 @@ impl ColdTierDeviceManager {
         if devices.is_empty() || n == 0 {
             return Vec::new();
         }
-        let mut eligible: Vec<_> = devices
+        let eligible: Vec<_> = devices
             .into_iter()
             .filter(|device| self.offload_rejection_reason(device, length).is_none())
             .collect();
-        // Sort descending by offload score (best first).
-        eligible.sort_by(|a, b| {
-            let sa = self.device_offload_score(a);
-            let sb = self.device_offload_score(b);
-            sb.partial_cmp(&sa)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.device_id.cmp(&b.device_id))
-        });
-        eligible.truncate(n);
-        eligible
+        let candidates = eligible
+            .iter()
+            .map(|device| ReplicaWriteCandidate {
+                target_id: &device.device_id,
+                score: self.device_offload_score(device),
+                accumulated_writes: 0,
+            })
+            .collect::<Vec<_>>();
+        DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY
+            .select_write_targets(&candidates, n)
+            .into_iter()
+            .map(|index| eligible[index].clone())
+            .collect()
     }
 
     /// Compute a composite score for how suitable a device is for offload writes.
@@ -961,6 +980,9 @@ impl ColdTierDeviceManager {
         &self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
     ) -> Result<Arc<dyn PersistentStorageBackend>> {
+        if self.nof_targets.contains(&cold_backing.cold_tier_id) {
+            return self.nof_targets.backend_for(&cold_backing.cold_tier_id);
+        }
         self.backend_for_from_snapshot(cold_backing, self.devices.lock().snapshot())
     }
 
@@ -970,6 +992,9 @@ impl ColdTierDeviceManager {
         cold_backing: &mooncake_store_core::ColdBackingRoute,
         operation: &'static str,
     ) -> Result<Arc<dyn PersistentStorageBackend>> {
+        if self.nof_targets.contains(&cold_backing.cold_tier_id) {
+            return self.nof_targets.backend_for(&cold_backing.cold_tier_id);
+        }
         match self.backend_for(cold_backing) {
             Ok(backend) => Ok(backend),
             Err(first_error) => {

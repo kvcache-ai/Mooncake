@@ -306,7 +306,9 @@ impl StoreClient {
             attempt = attempt.saturating_add(1);
             let quota_reservation =
                 self.reserve_tenant_quota_for_delete(object_id, object_key, &route)?;
-            let cas = self.route_ops().delete_route(object_key, Some(route.version))?;
+            let cas = self
+                .route_ops()
+                .delete_route_with_version_fence(&route)?;
             if cas.applied {
                 self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
                 if let Err(error) = self.schedule_route_reclaim(&route) {
@@ -317,6 +319,22 @@ impl StoreClient {
                         error = %error,
                         "route delete reclaim scheduling failed after authoritative delete"
                     );
+                }
+                if let Some(nof_backing) = route.nof_backing.as_ref() {
+                    let mut nof_backing_route = route.clone();
+                    nof_backing_route.replicas.clear();
+                    nof_backing_route.nof_backing = None;
+                    nof_backing_route.cold_backing =
+                        Some(cold_tier::nof::nof_as_cold(nof_backing));
+                    if let Err(error) = self.schedule_route_reclaim(&nof_backing_route) {
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            tenant,
+                            key,
+                            error = %error,
+                            "NoF backing reclaim scheduling failed after authoritative delete"
+                        );
+                    }
                 }
                 return Ok(());
             }

@@ -2832,6 +2832,7 @@ fn wait_for_route_replica_on_owner(
 }
 
 include!("cold_tier_restore_flow_tests.rs");
+include!("nof_runtime_tests.rs");
 
 fn test_storage_owner_state(
     runtime: &ClientRuntimeId,
@@ -2864,6 +2865,7 @@ fn test_storage_owner_state(
         Arc::new(Mutex::new(StoreState::default())),
         StorageOwnerColdTierConfig {
             resolver: ColdTierBackendResolver::from_handles(String::new(), BTreeMap::new()),
+            nof_targets: cold_tier::nof::NofTargetManager::new(Vec::new(), 1).unwrap(),
             devices: shared_cold_tier_device_cache("test"),
             watermarks: ColdTierWatermarkConfig::default(),
             rate_limits: ColdTierRateLimitConfig::default(),
@@ -2887,6 +2889,7 @@ fn test_storage_owner_state_with_route_directory(
         client.state.clone(),
         StorageOwnerColdTierConfig {
             resolver: ColdTierBackendResolver::from_handles(String::new(), BTreeMap::new()),
+            nof_targets: cold_tier::nof::NofTargetManager::new(Vec::new(), 1).unwrap(),
             devices: shared_cold_tier_device_cache("test"),
             watermarks: ColdTierWatermarkConfig::default(),
             rate_limits: ColdTierRateLimitConfig::default(),

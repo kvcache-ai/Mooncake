@@ -126,6 +126,7 @@ pub(crate) fn shared_cold_tier_device_cache(namespace: &str) -> SharedColdTierDe
 
 struct StorageOwnerColdTierConfig {
     resolver: ColdTierBackendResolver,
+    nof_targets: cold_tier::nof::NofTargetManager,
     devices: SharedColdTierDeviceCache,
     watermarks: ColdTierWatermarkConfig,
     rate_limits: ColdTierRateLimitConfig,
@@ -136,6 +137,7 @@ struct StorageOwnerColdTierConfig {
 
 struct ColdTierDeviceManager {
     resolver: Mutex<ColdTierBackendResolver>,
+    nof_targets: cold_tier::nof::NofTargetManager,
     devices: SharedColdTierDeviceCache,
     watermarks: ColdTierWatermarkConfig,
     admission: Arc<ColdTierAdmission>,
@@ -520,9 +522,24 @@ struct PendingOffloadMaterialization {
     entry: PendingOffloadEntry,
     route: ObjectRoute,
     cold_backing: mooncake_store_core::ColdBackingRoute,
+    nof_backing: bool,
     payload: PendingOffloadPayload,
-    device: ColdTierDeviceRecord,
-    permit: ColdTierAdmissionPermit,
+    device: Option<ColdTierDeviceRecord>,
+    permit: Option<ColdTierAdmissionPermit>,
+}
+
+enum PendingBackingRoute {
+    Cold(mooncake_store_core::ColdBackingRoute),
+    Nof(mooncake_store_core::NofBackingRoute),
+}
+
+impl PendingBackingRoute {
+    fn publish(self, route: &mut ObjectRoute) {
+        match self {
+            Self::Cold(backing) => route.cold_backing = Some(backing),
+            Self::Nof(backing) => route.nof_backing = Some(backing),
+        }
+    }
 }
 
 struct PendingOffloadPayload(Vec<u8>);

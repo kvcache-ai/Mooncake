@@ -1151,6 +1151,7 @@ impl StoreClient {
                         next.version = current.version.next();
                         next.replicas = vec![target];
                         next.cold_backing = None;
+                        next.nof_backing = None;
                         Self::normalize_route_replica_priorities(&mut next.replicas);
                         next
                     }
@@ -1195,6 +1196,7 @@ impl StoreClient {
                 removed_source.cold_backing = current.cold_backing.clone();
             } else {
                 removed_source.cold_backing = None;
+                removed_source.nof_backing = None;
             }
             if let Err(error) = self.reclaim_route(&removed_source, ReclaimMode::Immediate) {
                 warn!(
@@ -2893,10 +2895,10 @@ impl StoreClient {
             .enumerate()
             .filter_map(|(index, entry)| {
                 (cold_tier::resolved_uses_cold_backing(entry)
-                    && entry.route.cold_backing.as_ref().is_some_and(|cb| {
+                    && cold_tier::materialized_cold_backing(&entry.route).is_some_and(|cb| {
                         self.storage_owner
                             .cold_tier_devices
-                            .has_local_backend(&cb.cold_tier_id)
+                            .has_runtime_backend(&cb.cold_tier_id)
                     }))
                 .then_some(index)
             })
@@ -3028,10 +3030,10 @@ impl StoreClient {
             .enumerate()
             .filter_map(|(index, entry)| {
                 (cold_tier::resolved_uses_cold_backing(entry)
-                    && !entry.route.cold_backing.as_ref().is_some_and(|cb| {
+                    && !cold_tier::materialized_cold_backing(&entry.route).is_some_and(|cb| {
                         self.storage_owner
                             .cold_tier_devices
-                            .has_local_backend(&cb.cold_tier_id)
+                            .has_runtime_backend(&cb.cold_tier_id)
                     }))
                 .then_some(index)
             })
