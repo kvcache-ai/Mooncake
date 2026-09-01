@@ -1,6 +1,7 @@
-# NoF architecture and phased delivery
+# NoF architecture
 
-Phase 1 adds two deliberately separate provider seams. It does not add a NoF control plane.
+The current implementation adds two deliberately separate provider seams under the existing
+Cold Tier subsystem. It does not add a separate NoF control plane.
 
 ## Ownership
 
@@ -26,25 +27,6 @@ builder lifecycle. `ValueChunkPlan` and `PhysicalKeyCodec` are small primitives 
 Tier layout layer and consumed where needed by the NoF execution modes; they are not global
 store-core concepts. No second allocator, buffer pool, GC loop or device manager is introduced.
 
-## Pull request boundary
-
-This work is intentionally split into two stacked pull requests:
-
-1. **PR 1 — NoF framework and KVCS executors:** high-level and low-level provider contracts,
-   high-level object delegation, key-addressed physical KV adaptation, KVCS C ABI executors, and reuse
-   of the existing Cold Tier control plane, disk management, load balancing, watermarks, GC, and
-   rebuild paths.
-2. **PR 2 — ExtentStore and SPDK NVMe-oF:** location-addressed low-level requests, persistence of
-   provider locators in Cold Tier routes, route-authoritative allocator recovery and hole reuse,
-   the ExtentStore executor, the reused `mooncake-nof-sys` SPDK wrapper, and its Rust block-device
-   adapter. PR 2 is based on PR 1 and is not part of the PR 1 diff.
-
-The pre-split functional accounting was `+532` implementation / `+161` tests for the ExtentStore
-executor and its route-authoritative recovery support, and `+1297` implementation / `+12` tests
-for SPDK transport plus the Rust block adapter. Of the SPDK implementation, 1,152 lines are the
-existing wrapper reused from the earlier prototype and 145 lines are the new adapter. Final PR
-accounting must still be measured independently against each PR's actual base.
-
 ## Module layout
 
 NoF belongs to the existing Cold Tier subsystem. High-level and low-level are its two execution
@@ -68,8 +50,6 @@ client/
         executor.rs
         backend.rs
         kvcs_executor.rs
-        extent_store_executor.rs  # PR 2
-        spdk_executor.rs          # PR 2
       kvcs_ffi.rs
 ```
 
@@ -80,15 +60,14 @@ exports. `lowlevel/backend.rs` adapts the low-level contract to the existing Col
 `PersistentStorageBackend`. The two `kvcs_executor.rs` files contain only concrete KVCS SDK
 behavior. `kvcs_ffi.rs` is private shared raw-ABI plumbing, included by the parent module solely
 to avoid duplicating C declarations between the two KVCS executors; it is not a third NoF
-execution model or a public SDK layer. The PR 2 leaf files shown above are the final target layout
-and are not part of the PR 1 diff.
+execution model or a public SDK layer.
 
 ## SDK and EFC downloads
 
-The supported public baseline for PR 1 is KVCS **0.3.2**. On 2026-08-31 both SDK archives below
-were downloaded, their C headers were compared with the development header, and the x86_64
-archive was linked against this PR on the `.5` validation container. One SDK archive contains all
-of the following; there are no separate C, Python, Go or Rust downloads:
+The supported public KVCS baseline is **0.3.2**. On 2026-08-31 both SDK archives below were
+downloaded, their C headers were compared with the development header, and the x86_64 archive was
+linked with the current implementation on the `.5` validation container. One SDK archive contains
+all of the following; there are no separate C, Python, Go or Rust downloads:
 
 - `C/include/kvcs_capi.h`, `lib/libkvcs.so` and pkg-config metadata;
 - the official Rust path crate under `rust/`;
@@ -107,9 +86,9 @@ Versioned SDK archives:
 | x86_64 | [kvcs-sdk-0.3.2-x86_64.tar.gz](https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-0.3.2-x86_64.tar.gz) | `c14be14fb56e758ec6efa2d63417a3e6329164c61b6ba1aa7151dbae29c411b4` |
 | aarch64 | [kvcs-sdk-0.3.2-aarch64.tar.gz](https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-0.3.2-aarch64.tar.gz) | `b222a07536aa007ac1083b3c720cb763725ffeee782086a7acc07a0f0f62aee3` |
 
-The official 0.3.2 `.sha256` sidecar URLs currently return 404, so the hashes above are review-time
-snapshots, not a vendor-signed checksum channel. Recheck the archive hash when the artifact is
-refreshed. The versioned download URLs themselves returned HTTP 200 during review.
+The official 0.3.2 `.sha256` sidecar URLs currently return 404, so the hashes above are locally
+recorded snapshots, not a vendor-signed checksum channel. Recheck the archive hash when the
+artifact is refreshed. The versioned download URLs returned HTTP 200 when last verified.
 
 Live tests also require the matching EFC service. The official installer chooses the correct
 package automatically. These are the direct 0.3.2 package addresses used by that installer:
@@ -120,7 +99,7 @@ package automatically. These are the direct 0.3.2 package addresses used by that
 | DEB | [amd64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc_0.3.2_amd64.deb) | [arm64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc_0.3.2_arm64.deb) |
 | tarball | [x86_64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-deploy-0.3.2-x86_64.tar.gz) | [aarch64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-deploy-0.3.2-aarch64.tar.gz) |
 
-The review container also has internal development SDK `0.4.0-dev.cad6271`, commit
+The validation container also has internal development SDK `0.4.0-dev.cad6271`, commit
 `cad62716d51fd0d22091f7440e97d4d5736aba47`, installed at
 `/opt/kvcs-sdk-0.4.0-dev.cad6271`. Its Aone artifact names are `kvcs-sdk-x86_64` and
 `kvcs-sdk-aarch64`. That development version is **not** published under the public OSS paths above;
@@ -155,10 +134,11 @@ sudo bash install-kvcs.sh
 
 The SDK ships an official Rust crate, but it is currently documented only as a local path
 dependency (`/opt/kvcs-sdk/latest/rust`), not as a registry coordinate. Adding that absolute path
-to this workspace would make even default Cargo metadata depend on a host installation. PR 1
-therefore keeps the opt-in feature portable and links the SDK's sole supported public C ABI. It
-does not copy SDK algorithms or provider control-plane code. If a stable registry package becomes
-available, the C declarations can be replaced by that dependency without changing the NoF traits.
+to this workspace would make even default Cargo metadata depend on a host installation. The
+integration therefore keeps the opt-in feature portable and links the SDK's sole supported public
+C ABI. It does not copy SDK algorithms or provider control-plane code. If a stable registry package
+becomes available, the C declarations can be replaced by that dependency without changing the NoF
+traits.
 
 ## Low-level builder wiring
 
@@ -243,14 +223,14 @@ cargo test -p mooncake-store-client --features kvcs-capi --lib \
 An SDK-linked build is not a live EFC/Redis/NVMe end-to-end result; record those outcomes
 separately.
 
-## Review checklist
+## Implementation verification checklist
 
-PR 1 is reviewed in three passes before handoff:
+Use these checks when changing the NoF implementation:
 
 1. ownership and reuse: confirm no NoF control plane, allocator, scheduler, GC or rebuild loop was
    introduced, and that the low-level target is only a `PersistentStorageBackend` replacement;
 2. correctness and ABI: check positional batches, partial failures, manifest visibility, checksum
    validation, key/value limits, environment parsing, FFI layouts and both 0.3.2/development SDK
    linking;
-3. reproducibility: verify every package URL above, default and `kvcs-capi` builds, tests, clippy,
-   formatting and the final patch against the actual PR base.
+3. reproducibility: verify every package URL above, default and `kvcs-capi` builds, tests, clippy
+   and formatting.
