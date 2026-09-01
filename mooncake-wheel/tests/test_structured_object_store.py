@@ -69,6 +69,7 @@ class InMemoryStore:
         self.active_gets = 0
         self.get_into_calls = 0
         self.get_into_ranges_calls = 0
+        self.get_into_ranges_requests: list[tuple[object, ...]] = []
         self.batch_get_into_calls = 0
         self.batch_put_from_calls = 0
         self.put_tensor_from_calls = 0
@@ -205,6 +206,9 @@ class InMemoryStore:
         all_sizes: list[list[list[int]]],
     ) -> list[list[list[int]]]:
         self.get_into_ranges_calls += 1
+        self.get_into_ranges_requests.append(
+            (buffer_ptrs, all_keys, all_dst_offsets, all_src_offsets, all_sizes)
+        )
         total_keys = sum(len(keys) for keys in all_keys)
         self._enter_get(total_keys)
         try:
@@ -281,11 +285,25 @@ class FakeBufferPool:
         self.acquire_count = 0
         self.release_count = 0
         self.acquire_sizes: list[int] = []
+        self.acquire_blocks: list[object] = []
 
-    def acquire(self, size: int) -> FakeLease:
+    def acquire(self, size: int, block: object = None) -> FakeLease:
         self.acquire_count += 1
         self.acquire_sizes.append(size)
+        self.acquire_blocks.append(block)
         return FakeLease(self, size)
+
+
+class FailingRangeStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_ranges = False
+
+    def get_into_ranges(self, *args):
+        results = super().get_into_ranges(*args)
+        if self.fail_ranges:
+            results[0][-1][-1] = -1
+        return results
 
 
 class FailingBatchPutStore(InMemoryStore):
@@ -2532,6 +2550,293 @@ def test_dataproto_helper_selects_fields_and_meta() -> None:
     assert np.array_equal(
         non_tensor_only["non_tensor_batch"]["reward"], data.non_tensor_batch["reward"]
     )
+
+
+def test_dataproto_matrix_partial_read_batches_fields_stages_and_chunks() -> None:
+    pool = FakeBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
+    tokens = np.arange(6 * 8, dtype=np.int32).reshape(6, 8)
+    scores = np.arange(6 * 5, dtype=np.float32).reshape(6, 5)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"tokens": tokens}),
+        stage="rollout",
+        chunk_bytes=13,
+    )
+    ref = transfer.append_dataproto_fields(
+        ref,
+        SimpleDataProto(batch={"scores": scores}),
+        stage="scores",
+        chunk_bytes=11,
+    )
+    rows = [4, 1, 4]
+    destination = np.full((3, 4), -1, dtype=np.int32)
+    before_calls = store.get_into_ranges_calls
+    before_acquires = pool.acquire_count
+
+    result = transfer.get_dataproto(
+        ref,
+        batch_fields=["tokens", "scores"],
+        rows=rows,
+        batch_slices={
+            "scores": slice(3, 4),
+            "tokens": slice(2, 6),
+        },
+        destinations={"tokens": destination},
+    )
+
+    assert list(result["batch"]) == ["tokens", "scores"]
+    assert result["batch"]["tokens"] is destination
+    assert np.array_equal(destination, tokens[rows, 2:6])
+    assert np.array_equal(result["batch"]["scores"], scores[rows, 3:4])
+    assert result["batch"]["scores"].shape == (3, 1)
+    assert result["batch"]["scores"].flags["WRITEABLE"]
+    assert not hasattr(result["batch"]["scores"], "_mooncake_pool_owner")
+    assert store.get_into_ranges_calls == before_calls + 1
+    request = store.get_into_ranges_requests[-1]
+    assert len(request[1]) == 1
+    assert request[1][0]
+    assert pool.acquire_count == before_acquires + 1
+    assert pool.acquire_blocks[-1] is False
+
+
+def test_dataproto_matrix_row_only_uses_one_ranged_call() -> None:
+    store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    left = np.arange(30, dtype=np.int32).reshape(5, 6)
+    right = np.arange(20, dtype=np.float32).reshape(5, 4)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"left": left, "right": right}), chunk_bytes=11
+    )
+    before_calls = store.get_into_ranges_calls
+
+    result = transfer.get(ref, type="dict", rows=[4])
+
+    assert result["left"].shape == (1, 6)
+    assert np.array_equal(result["left"], left[[4]])
+    assert np.array_equal(result["right"], right[[4]])
+    assert store.get_into_ranges_calls == before_calls + 1
+
+
+def test_dataproto_matrix_range_cap_falls_back(monkeypatch) -> None:
+    store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    matrix = np.arange(48, dtype=np.int16).reshape(6, 8)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"matrix": matrix}), chunk_bytes=2
+    )
+    monkeypatch.setattr(sos, "MAX_MATRIX_RANGES", 1)
+    before_calls = store.get_into_ranges_calls
+    payload_spec = ref.stage_refs["default"].manifest["buffers"]["batch.matrix"]
+    assert (
+        transfer._transport.read_payload_ranges_batch(
+            [(payload_spec, ((0, 0, int(payload_spec["bytes"])),))], 1
+        )
+        is None
+    )
+    assert store.get_into_ranges_calls == before_calls
+
+    result = transfer.get_dataproto(
+        ref,
+        rows=[4, 0, 2],
+        batch_slices={"matrix": slice(3, 7)},
+    )
+
+    assert np.array_equal(result["batch"]["matrix"], matrix[[4, 0, 2], 3:7])
+    assert store.get_into_ranges_calls == before_calls + 1
+    assert len(store.get_into_ranges_requests[-1][1][0]) > 1
+
+    plain_store, plain_transfer = make_transfer(PlainStore())
+    plain_ref = plain_transfer.put_dataproto(SimpleDataProto(batch={"matrix": matrix}))
+    plain_result = plain_transfer.get_dataproto(
+        plain_ref, rows=[4, 0, 2], batch_slices={"matrix": slice(1, 4)}
+    )
+    assert np.array_equal(plain_result["batch"]["matrix"], matrix[[4, 0, 2], 1:4])
+    assert plain_store.get_into_ranges_calls == 0
+
+
+def test_dataproto_matrix_range_failure_does_not_modify_destination() -> None:
+    store = FailingRangeStore()
+    _store, transfer = make_transfer(store=store, buffer_pool=FakeBufferPool())
+    matrix = np.arange(36, dtype=np.int32).reshape(6, 6)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"matrix": matrix}), chunk_bytes=10
+    )
+    destination = np.full((3, 3), -1, dtype=np.int32)
+    store.fail_ranges = True
+    before_calls = store.get_into_ranges_calls
+
+    with pytest.raises(RuntimeError, match="get_into_ranges failed"):
+        transfer.get_dataproto(
+            ref,
+            batch_fields=["matrix"],
+            rows=[5, 1, 3],
+            batch_slices={"matrix": slice(2, 5)},
+            destinations={"matrix": destination},
+        )
+
+    assert np.all(destination == -1)
+    assert store.get_into_ranges_calls == before_calls + 1
+
+
+def test_dataproto_later_field_failure_does_not_commit_matrix_destination() -> None:
+    store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    matrix = np.arange(30, dtype=np.int32).reshape(5, 6)
+    reward = np.arange(5, dtype=np.float32)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(
+            batch={"matrix": matrix},
+            non_tensor_batch={"reward": reward},
+        )
+    )
+    reward_key = ref.stage_refs["default"].manifest["buffers"][
+        "non_tensor_batch.reward"
+    ]["chunks"][0]["key"]
+    del store.objects[reward_key]
+    destination = np.full((2, 3), -1, dtype=np.int32)
+
+    with pytest.raises(KeyError):
+        transfer.get_dataproto(
+            ref,
+            fields=["matrix", "reward"],
+            rows=[3, 1],
+            batch_slices={"matrix": slice(2, 5)},
+            destinations={"matrix": destination},
+        )
+
+    assert np.all(destination == -1)
+
+
+def test_dataproto_result_failure_does_not_commit_matrix_destination() -> None:
+    _store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    matrix = np.arange(30, dtype=np.int32).reshape(5, 6)
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"matrix": matrix}))
+    destination = np.full((2, 3), -1, dtype=np.int32)
+
+    with pytest.raises(TypeError, match="cannot be constructed"):
+        transfer.get_dataproto(
+            ref,
+            batch_fields=["matrix"],
+            rows=[3, 1],
+            batch_slices={"matrix": slice(2, 5)},
+            destinations={"matrix": destination},
+            data_cls=BadDataProto,
+        )
+
+    assert np.all(destination == -1)
+
+
+def test_dataproto_copied_result_keeps_matrix_destination() -> None:
+    class CopyingDataProto(SimpleDataProto):
+        @classmethod
+        def from_dict(cls, batch, non_tensor_batch=None, meta_info=None):
+            return cls(
+                batch=dict(batch),
+                non_tensor_batch=dict(non_tensor_batch or {}),
+                meta_info=dict(meta_info or {}),
+            )
+
+    _store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    matrix = np.arange(30, dtype=np.int32).reshape(5, 6)
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"matrix": matrix}))
+    destination = np.full((2, 3), -1, dtype=np.int32)
+
+    result = transfer.get_dataproto(
+        ref,
+        batch_fields=["matrix"],
+        rows=[3, 1],
+        batch_slices={"matrix": slice(2, 5)},
+        destinations={"matrix": destination},
+        data_cls=CopyingDataProto,
+    )
+
+    assert result.batch["matrix"] is destination
+    assert np.array_equal(destination, matrix[[3, 1], 2:5])
+
+
+@pytest.mark.parametrize(
+    ("rows", "columns", "shape"),
+    [([], slice(2, 5), (0, 3)), ([3, 1], slice(2, 2), (2, 0))],
+)
+def test_dataproto_empty_matrix_read_does_not_submit(rows, columns, shape) -> None:
+    pool = FakeBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
+    matrix = np.arange(24, dtype=np.float32).reshape(4, 6)
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"matrix": matrix}))
+    before_calls = store.get_into_ranges_calls
+    before_acquires = pool.acquire_count
+
+    result = transfer.get_dataproto(
+        ref,
+        batch_fields=["matrix"],
+        rows=rows,
+        batch_slices={"matrix": columns},
+    )
+
+    assert result["batch"]["matrix"].shape == shape
+    assert store.get_into_ranges_calls == before_calls
+    assert pool.acquire_count == before_acquires
+
+
+def test_dataproto_matrix_partial_read_validates_matrix_contract() -> None:
+    store, transfer = make_transfer()
+    matrix = np.arange(24, dtype=np.int32).reshape(2, 3, 4)
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"matrix": matrix}))
+    before_calls = store.get_into_ranges_calls
+
+    with pytest.raises(TypeError, match="not a dense matrix"):
+        transfer.get_dataproto(
+            ref,
+            batch_fields=["matrix"],
+            batch_slices={"matrix": slice(1, 2)},
+        )
+    matrix_2d = np.arange(12, dtype=np.int32).reshape(3, 4)
+    ref_2d = transfer.put_dataproto(
+        SimpleDataProto(batch={"matrix": matrix_2d}), stage="matrix-2d"
+    )
+    with pytest.raises(ValueError, match="column slice step"):
+        transfer.get_dataproto(
+            ref_2d,
+            batch_fields=["matrix"],
+            batch_slices={"matrix": slice(None, None, 2)},
+        )
+
+    assert store.get_into_ranges_calls == before_calls
+
+
+def test_dataproto_torch_matrix_partial_read_and_raw_destination() -> None:
+    torch = pytest.importorskip("torch")
+    if not sos._has_tensor_codec_helpers():
+        pytest.skip("built mooncake.store lacks tensor serialization helpers")
+    store, transfer = make_transfer(NoTensorFastPathStore())
+    matrix = torch.arange(30, dtype=torch.int64).reshape(5, 6)
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"matrix": matrix}))
+    transfer._transport._buffer_pool = FakeBufferPool()
+
+    result = transfer.get_dataproto(
+        ref,
+        batch_fields=["matrix"],
+        rows=[4, 1],
+        batch_slices={"matrix": slice(2, 5)},
+    )
+    expected = matrix[[4, 1], 2:5]
+    assert torch.equal(result["batch"]["matrix"], expected)
+
+    payload_spec = ref.stage_refs["default"].manifest["buffers"]["batch.matrix"]
+    payload_bytes = int(payload_spec["metadata_bytes"]) + expected.numel() * 8
+    destination = ctypes.create_string_buffer(payload_bytes)
+    raw_result = transfer.get_dataproto(
+        ref,
+        batch_fields=["matrix"],
+        rows=[4, 1],
+        batch_slices={"matrix": slice(2, 5)},
+        destinations={
+            "matrix": raw_destination(
+                ctypes.addressof(destination), payload_bytes, destination
+            )
+        },
+    )
+    decoded = sos._deserialize_tensor_payload(destination.raw)
+
+    assert raw_result["batch"]["matrix"].ptr == ctypes.addressof(destination)
+    assert torch.equal(decoded, expected)
 
 
 def test_dataproto_helper_reads_rows_with_real_store_ranges() -> None:
