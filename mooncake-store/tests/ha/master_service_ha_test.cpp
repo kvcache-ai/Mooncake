@@ -688,6 +688,15 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Exists() && accessor.Get().IsHardPinned();
     }
 
+    static std::string GroupIdForTesting(MasterService& service,
+                                         const TenantId& tenant_id,
+                                         const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() ? accessor.Get().group_id
+                                 : std::string("<absent>");
+    }
+
     static std::vector<Replica::Descriptor> ReplicaDescriptorsForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
@@ -1131,7 +1140,7 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesHardPinned) {
     EXPECT_TRUE(IsHardPinnedForTesting(service, kDefaultTenant, key));
 }
 
-TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
+TEST_F(MasterServiceHATest, RestoreSkipsBadObjectAndKeepsExistingState) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1144,30 +1153,27 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
                     .RestoreFromStandbySnapshot(
                         {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
-    const auto metric_after_restore =
-        MasterMetricManager::instance().get_allocated_mem_size();
 
+    // #3760: a bad entry is skipped rather than failing the whole restore,
+    // and the previously restored state is untouched.
     auto invalid =
         MakeStandbyObject("standby_restore_invalid", "unknown_endpoint");
     auto result = service.RestoreFromStandbySnapshot(
         {invalid}, 7, {MakeStandbyMemorySegment(endpoint)});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(result.has_value());
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_restore_existing"),
               1);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_restore_invalid"),
               0);
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
-              metric_after_restore);
     ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
                     .has_value());
 }
 
 TEST_F(MasterServiceHATest,
-       RestoreRejectsUngroupedObjectDuplicatedIntoAnotherShard) {
+       RestoreSkipsUngroupedObjectDuplicatedIntoAnotherShard) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1179,6 +1185,7 @@ TEST_F(MasterServiceHATest,
                         {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
 
+    // #3760: the duplicate is skipped and the original entry is kept.
     auto duplicate = MakeStandbyObject(key, endpoint);
     duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromObject(
         service, kDefaultTenant, key, "group-");
@@ -1187,12 +1194,13 @@ TEST_F(MasterServiceHATest,
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    EXPECT_TRUE(GroupIdForTesting(service, kDefaultTenant, key).empty());
 }
 
 TEST_F(MasterServiceHATest,
-       RestoreRejectsGroupedObjectDuplicatedIntoAnotherGroupDomain) {
+       RestoreSkipsGroupedObjectDuplicatedIntoAnotherGroupDomain) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1205,6 +1213,7 @@ TEST_F(MasterServiceHATest,
                         {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
 
+    // #3760: the duplicate is skipped and the original grouping is kept.
     auto duplicate = MakeStandbyObject(key, endpoint);
     duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromGroup(
         service, existing.metadata.group_id, "replacement-group-");
@@ -1213,11 +1222,13 @@ TEST_F(MasterServiceHATest,
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    EXPECT_EQ(GroupIdForTesting(service, kDefaultTenant, key),
+              "existing-group");
 }
 
-TEST_F(MasterServiceHATest, RestoreRejectsDescriptorSizeMismatch) {
+TEST_F(MasterServiceHATest, RestoreSkipsDescriptorSizeMismatch) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1227,14 +1238,17 @@ TEST_F(MasterServiceHATest, RestoreRejectsDescriptorSizeMismatch) {
         .get_memory_descriptor()
         .buffer_descriptor.size_ = object.metadata.size + 1;
 
+    // #3760: the mismatched entry is skipped rather than failing the restore.
     auto result = service.RestoreFromStandbySnapshot(
         {object}, 7, {MakeStandbyMemorySegment(endpoint)});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_descriptor_mismatch"),
+              0);
 }
 
-TEST_F(MasterServiceHATest, RestoreRejectsDescriptorsBeyondSegmentCapacity) {
+TEST_F(MasterServiceHATest, RestoreSkipsDescriptorsBeyondSegmentCapacity) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1248,11 +1262,17 @@ TEST_F(MasterServiceHATest, RestoreRejectsDescriptorsBeyondSegmentCapacity) {
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
 
+    // #3760: both entries overflow the segment and are skipped, one by one.
     auto result = service.RestoreFromStandbySnapshot(
         {first, second}, 7, {MakeStandbyMemorySegment(endpoint, 1024)});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_capacity_first"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_capacity_second"),
+              0);
 }
 
 TEST_F(MasterServiceHATest, RestoreRejectsDfsMode) {
@@ -1659,7 +1679,7 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
     EXPECT_NE(new_descriptor.buffer_address_, old_descriptor.buffer_address_);
 }
 
-TEST_F(MasterServiceHATest, RestoreRejectsOverlappingMemoryDescriptors) {
+TEST_F(MasterServiceHATest, RestoreKeepsLatestDescriptorOnOverlap) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1672,17 +1692,20 @@ TEST_F(MasterServiceHATest, RestoreRejectsOverlappingMemoryDescriptors) {
     conflicting.metadata.replicas.front()
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    // #3760: eviction freed and reallocated the buffer, so the standby can
+    // replay two live-looking replicas at one address. The later replay is
+    // ground truth; the earlier one is dropped.
     auto result = service.RestoreFromStandbySnapshot(
         {first, conflicting}, 7, {MakeStandbyMemorySegment(endpoint)});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(result.has_value());
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_overlap_first"),
               0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_overlap_second"),
-              0);
+              1);
 }
 
 TEST_F(MasterServiceHATest, FailedRemountKeepsReplicaInvalidAndCanBeRetried) {

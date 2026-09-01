@@ -3346,9 +3346,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
         if (!valid) {
             continue;
         }
-        const auto shard_idx = entry.metadata.group_id.empty()
-                                   ? getShardIndex(tenant_id, user_key)
-                                   : getShardIndex(entry.metadata.group_id);
+        // Routing is decoupled from groups: metadata always lands on the
+        // (tenant, key) shard, group membership is tracked in group_domain_.
+        const auto shard_idx = getShardIndex(tenant_id, user_key);
         accepted.push_back(
             {&entry, std::move(tenant_id), std::move(user_key), shard_idx});
     }
