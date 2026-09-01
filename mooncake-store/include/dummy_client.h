@@ -210,10 +210,19 @@ class DummyClient : public PyClient {
     bool is_device_buffer(void *buffer) const;
     bool is_dummy_shm_buffer(void *buffer, size_t size) const;
     std::optional<size_t> external_buffer_remaining(void *buffer) const;
+#if defined(USE_ASCEND_DIRECT)
+    std::optional<size_t> registered_ascend_buffer_remaining(
+        void *buffer) const;
+#endif
     std::optional<PreparedBuffer> prepare_buffer(void *buffer, size_t size,
                                                  bool copy_to_staging,
                                                  bool copy_back = false);
-    bool copy_from_staging(const PreparedBuffer &buffer, size_t size) const;
+    std::optional<PreparedBuffer> prepare_ranged_read_buffer(
+        void *buffer,
+        const std::vector<std::vector<size_t>> &dst_offsets,
+        const std::vector<std::vector<size_t>> &sizes);
+    bool copy_from_staging(const PreparedBuffer &buffer, size_t size,
+                           size_t offset = 0) const;
 
     struct PreparedMultiBuffers {
         std::vector<PreparedBuffer> buffers;
@@ -221,7 +230,8 @@ class DummyClient : public PyClient {
     };
     std::optional<PreparedMultiBuffers> prepare_multi_buffers(
         const std::vector<std::vector<void *>> &all_buffers,
-        const std::vector<std::vector<size_t>> &all_sizes);
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool copy_to_staging = true, bool copy_back = false);
 
     struct ExternalBufferRegistration {
         size_t size = 0;
@@ -320,6 +330,7 @@ class DummyClient : public PyClient {
 
 #if defined(USE_ASCEND_DIRECT)
     mutable std::mutex registered_device_buffers_mutex_;
+    // Tracks directly mapped Ascend device and Fabric host buffers.
     std::unordered_map<uint64_t, size_t> registered_device_buffers_;
 #endif
 

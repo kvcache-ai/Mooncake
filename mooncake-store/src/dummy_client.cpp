@@ -633,10 +633,32 @@ std::optional<size_t> DummyClient::external_buffer_remaining(
     return std::nullopt;
 }
 
+#if defined(USE_ASCEND_DIRECT)
+std::optional<size_t> DummyClient::registered_ascend_buffer_remaining(
+    void* buffer) const {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(buffer);
+    std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+    for (const auto& [base, size] : registered_device_buffers_) {
+        if (address >= base && address - base <= size) {
+            return size - (address - base);
+        }
+    }
+    return std::nullopt;
+}
+#endif
+
 std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
     void* buffer, size_t size, bool copy_to_staging, bool copy_back) {
     if (buffer == nullptr && size != 0) return std::nullopt;
-    if (size == 0) return PreparedBuffer{buffer, buffer, 0, nullptr, false};
+    if (buffer == nullptr) {
+        return PreparedBuffer{nullptr, nullptr, 0, nullptr, false};
+    }
+#if defined(USE_ASCEND_DIRECT)
+    if (auto remaining = registered_ascend_buffer_remaining(buffer)) {
+        if (size > *remaining) return std::nullopt;
+        return PreparedBuffer{buffer, buffer, size, nullptr, false};
+    }
+#endif
     if (shm_helper_ != nullptr) {
         auto shm = shm_helper_->get_shm(buffer);
         if (shm != nullptr && !is_device_buffer(buffer)) {
@@ -650,7 +672,7 @@ std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
     auto remaining = external_buffer_remaining(buffer);
     if (!remaining.has_value() || size > *remaining) return std::nullopt;
 
-    auto allocation = allocate_client_buffer(size);
+    auto allocation = allocate_client_buffer(std::max<size_t>(size, 1));
     if (!allocation) return std::nullopt;
     auto staging = std::make_unique<BufferHandle>(std::move(*allocation));
     if (copy_to_staging) {
@@ -663,24 +685,69 @@ std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
                           copy_back || !copy_to_staging};
 }
 
+std::optional<DummyClient::PreparedBuffer>
+DummyClient::prepare_ranged_read_buffer(
+    void* buffer, const std::vector<std::vector<size_t>>& dst_offsets,
+    const std::vector<std::vector<size_t>>& sizes) {
+    if (buffer == nullptr) {
+        return PreparedBuffer{nullptr, nullptr, 0, nullptr, false};
+    }
+#if defined(USE_ASCEND_DIRECT)
+    if (auto remaining = registered_ascend_buffer_remaining(buffer)) {
+        return prepare_buffer(buffer, *remaining, false, true);
+    }
+#endif
+    if (auto remaining = external_buffer_remaining(buffer)) {
+        const size_t capacity = *remaining;
+        size_t staging_size = 0;
+        const size_t row_count = std::min(dst_offsets.size(), sizes.size());
+        for (size_t i = 0; i < row_count; ++i) {
+            const size_t fragment_count =
+                std::min(dst_offsets[i].size(), sizes[i].size());
+            for (size_t j = 0; j < fragment_count; ++j) {
+                const size_t offset = dst_offsets[i][j];
+                const size_t fragment_size = sizes[i][j];
+                if (offset > capacity ||
+                    fragment_size > capacity - offset) {
+                    continue;
+                }
+                staging_size =
+                    std::max(staging_size, offset + fragment_size);
+            }
+        }
+        return prepare_buffer(buffer, staging_size, false, true);
+    }
+    if (shm_helper_ == nullptr) return std::nullopt;
+    auto shm = shm_helper_->get_shm(buffer);
+    if (shm == nullptr) return std::nullopt;
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(shm->base_addr);
+    const uintptr_t address = reinterpret_cast<uintptr_t>(buffer);
+    if (address < base || address - base > shm->size) return std::nullopt;
+    return prepare_buffer(buffer, shm->size - (address - base), false, true);
+}
+
 bool DummyClient::copy_from_staging(const PreparedBuffer& buffer,
-                                    size_t size) const {
+                                    size_t size, size_t offset) const {
     if (!buffer.copy_back || buffer.staging == nullptr || size == 0)
         return true;
-    if (size > buffer.size) return false;
+    if (offset > buffer.size || size > buffer.size - offset) return false;
     const auto& runtime =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
-    return runtime.CopyFromHost(buffer.original, buffer.staging->ptr(), size);
+    auto* destination = static_cast<uint8_t*>(buffer.original) + offset;
+    auto* source = static_cast<uint8_t*>(buffer.staging->ptr()) + offset;
+    return runtime.CopyFromHost(destination, source, size);
 }
 
 std::optional<DummyClient::PreparedMultiBuffers>
 DummyClient::prepare_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffers,
-    const std::vector<std::vector<size_t>>& all_sizes) {
+    const std::vector<std::vector<size_t>>& all_sizes, bool copy_to_staging,
+    bool copy_back) {
     if (all_buffers.size() != all_sizes.size()) return std::nullopt;
 
     PreparedMultiBuffers prepared;
-    prepared.dummy_buffers.reserve(all_buffers.size());
+    prepared.dummy_buffers = void_ptr_rows_to_u64_nested(all_buffers);
     size_t total_buffers = 0;
     for (const auto& buffers : all_buffers) total_buffers += buffers.size();
     prepared.buffers.reserve(total_buffers);
@@ -688,13 +755,12 @@ DummyClient::prepare_multi_buffers(
         if (all_buffers[i].size() != all_sizes[i].size()) {
             return std::nullopt;
         }
-        auto& dummy_row = prepared.dummy_buffers.emplace_back();
-        dummy_row.reserve(all_buffers[i].size());
         for (size_t j = 0; j < all_buffers[i].size(); ++j) {
-            auto buffer =
-                prepare_buffer(all_buffers[i][j], all_sizes[i][j], true);
+            auto buffer = prepare_buffer(all_buffers[i][j], all_sizes[i][j],
+                                         copy_to_staging, copy_back);
             if (!buffer) return std::nullopt;
-            dummy_row.push_back(reinterpret_cast<uint64_t>(buffer->dummy));
+            prepared.dummy_buffers[i][j] =
+                reinterpret_cast<uint64_t>(buffer->dummy);
             prepared.buffers.emplace_back(std::move(*buffer));
         }
     }
@@ -798,15 +864,7 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
             return register_device_buffer_for_reconnect(buffer, size);
         }
         if (globalConfig().ascend_use_fabric_mem) {
-            auto shm = std::make_shared<ShmHelper::ShmSegment>();
-            shm->base_addr = buffer;
-            shm->size = size;
-            if (register_ascend_shm(shm.get(), false) != 0) {
-                LOG(ERROR) << "Failed to register buffer, buffer=" << buffer
-                           << ", size=" << size;
-                return -1;
-            }
-            return 0;
+            return register_device_buffer_for_reconnect(buffer, size);
         }
         // non-Fabric Host: same rules as shm
     }
@@ -878,7 +936,8 @@ int DummyClient::unregister_buffer(void* buffer) {
         aclrtPtrAttributes attributes{};
         auto acl_ret = aclrtPointerGetAttributes(buffer, &attributes);
         if (acl_ret == ACL_ERROR_NONE &&
-            attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE ||
+             globalConfig().ascend_use_fabric_mem)) {
             return unregister_device_buffer_for_reconnect(buffer);
         }
     }
@@ -1212,16 +1271,51 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>>& all_sizes,
     const QueryResultCache* query_result_cache) {
+    if (buffers.size() != all_keys.size() ||
+        buffers.size() != all_dst_offsets.size() ||
+        buffers.size() != all_src_offsets.size() ||
+        buffers.size() != all_sizes.size()) {
+        return build_ranged_read_error_results(
+            buffers.size(), all_keys, all_dst_offsets,
+            ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<PreparedBuffer> prepared;
     std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
+    std::vector<size_t> dummy_buffer_sizes;
+    bool requires_staging = false;
+    prepared.reserve(buffers.size());
+    dummy_buffer_sizes.reserve(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        auto item = prepare_ranged_read_buffer(
+            buffers[i], all_dst_offsets[i], all_sizes[i]);
+        if (!item) {
+            return build_ranged_read_error_results(
+                buffers.size(), all_keys, all_dst_offsets,
+                ErrorCode::INVALID_PARAMS);
+        }
+        dummy_buffers[i] = reinterpret_cast<uint64_t>(item->dummy);
+        dummy_buffer_sizes.push_back(item->size);
+        requires_staging |= item->staging != nullptr;
+        prepared.push_back(std::move(*item));
+    }
+
     auto cached_query_results =
         build_cached_query_results_from_query_result_cache(query_result_cache);
     const auto start_time = std::chrono::steady_clock::now();
+    using RangedReadResults = std::vector<
+        std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>;
     auto internal_results =
-        invoke_rpc<&RealClient::get_into_ranges_shm_helper,
-                   std::vector<std::vector<
-                       std::vector<tl::expected<int64_t, ErrorCode>>>>>(
-            dummy_buffers, all_keys, all_dst_offsets, all_src_offsets,
-            all_sizes, cached_query_results, device_id_, client_id_);
+        requires_staging
+            ? invoke_rpc<&RealClient::get_into_ranges_staged_shm_helper,
+                         RangedReadResults>(
+                  dummy_buffers, dummy_buffer_sizes, all_keys, all_dst_offsets,
+                  all_src_offsets, all_sizes, cached_query_results, device_id_,
+                  client_id_)
+            : invoke_rpc<&RealClient::get_into_ranges_shm_helper,
+                         RangedReadResults>(
+                  dummy_buffers, all_keys, all_dst_offsets, all_src_offsets,
+                  all_sizes, cached_query_results, device_id_, client_id_);
 
     if (!internal_results) {
         LOG(ERROR) << "get_into_ranges RPC failed";
@@ -1230,6 +1324,21 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
                                                internal_results.error());
     }
     auto results = convert_ranged_read_results(internal_results.value());
+    for (size_t i = 0; i < results.size() && i < prepared.size(); ++i) {
+        for (size_t j = 0; j < results[i].size(); ++j) {
+            for (size_t k = 0; k < results[i][j].size(); ++k) {
+                auto& result = results[i][j][k];
+                if (result < 0) continue;
+                if (j >= all_dst_offsets[i].size() ||
+                    k >= all_dst_offsets[i][j].size() ||
+                    !copy_from_staging(prepared[i],
+                                       static_cast<size_t>(result),
+                                       all_dst_offsets[i][j][k])) {
+                    result = toInt(ErrorCode::INTERNAL_ERROR);
+                }
+            }
+        }
+    }
     const size_t total_bytes = sum_positive_ranges(results);
     if (total_bytes > 0) {
         ObserveTransferMetric(TransferOperationKind::kRead, "get_into_ranges",
@@ -1516,18 +1625,52 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
     bool prefer_alloc_in_same_node) {
-    std::vector<std::vector<uint64_t>> dummy_nested =
-        void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    if (keys.size() != all_buffer_ptrs.size() ||
+        keys.size() != all_sizes.size()) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+    auto prepared =
+        prepare_multi_buffers(all_buffer_ptrs, all_sizes, false, true);
+    if (!prepared) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_multi_buffers_dummy_helper,
-                         int64_t>(keys.size(), keys, dummy_nested, all_sizes,
-                                  prefer_alloc_in_same_node, device_id_,
-                                  client_id_);
+                         int64_t>(keys.size(), keys, prepared->dummy_buffers,
+                                  all_sizes, prefer_alloc_in_same_node,
+                                  device_id_, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
     for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
+    }
+
+    size_t prepared_index = 0;
+    for (size_t i = 0; i < all_sizes.size(); ++i) {
+        size_t remaining = 0;
+        const bool has_result =
+            i < internal_results.size() && internal_results[i].has_value();
+        bool copy_succeeded = false;
+        if (has_result && internal_results[i].value() >= 0 &&
+            static_cast<uint64_t>(internal_results[i].value()) <=
+                std::numeric_limits<size_t>::max()) {
+            remaining = static_cast<size_t>(internal_results[i].value());
+            copy_succeeded = true;
+        }
+        for (size_t size : all_sizes[i]) {
+            const size_t copy_size = std::min(size, remaining);
+            if (!copy_from_staging(prepared->buffers[prepared_index],
+                                   copy_size)) {
+                copy_succeeded = false;
+            }
+            remaining -= copy_size;
+            ++prepared_index;
+        }
+        if (i < results.size() && has_result &&
+            (!copy_succeeded || remaining != 0)) {
+            results[i] = toInt(ErrorCode::INTERNAL_ERROR);
+        }
     }
     const size_t total_bytes = sum_positive_results(results);
     if (total_bytes > 0) {
