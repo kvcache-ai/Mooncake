@@ -5797,6 +5797,55 @@ TEST_F(MasterServiceTest, GracefulUnmountSegment_PreventAllocation) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 }
 
+// Regression test for the LOCAL_DISK replica "update" no-op: when the same
+// owning client re-reports an already-offloaded key with a new transport
+// endpoint, the existing LOCAL_DISK replica's endpoint must be refreshed in
+// place (not written to a discarded get_descriptor() copy).
+TEST_F(MasterServiceTest, NotifyOffloadSuccessRefreshesEndpointForSameClient) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+    const std::string key = "local_disk_update_key";
+    constexpr int64_t kSize = 1024;
+
+    auto inject = [&](const std::string& endpoint) {
+        std::vector<OffloadTaskItem> tasks{
+            OffloadTaskItem{.tenant_id = std::string(TenantId::kDefaultValue),
+                            .key = key,
+                            .size = kSize}};
+        StorageObjectMetadata sm;
+        sm.bucket_id = 0;
+        sm.offset = 0;
+        sm.key_size = static_cast<int64_t>(key.size());
+        sm.data_size = kSize;
+        sm.transport_endpoint = endpoint;
+        std::vector<StorageObjectMetadata> metas{sm};
+        return service_->NotifyOffloadSuccess(client_id, tasks, metas)
+            .has_value();
+    };
+
+    // First offload registers the LOCAL_DISK replica.
+    ASSERT_TRUE(inject("endpoint_old"));
+    // Same client re-reports with a new endpoint (e.g. restart re-register)
+    // while the old record still exists -> takes the in-place update branch.
+    ASSERT_TRUE(inject("endpoint_new"));
+
+    auto resp = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(resp.has_value());
+
+    std::vector<std::string> local_disk_endpoints;
+    for (const auto& replica : resp->replicas) {
+        if (replica.is_local_disk_replica()) {
+            local_disk_endpoints.push_back(
+                replica.get_local_disk_descriptor().transport_endpoint);
+        }
+    }
+    // Still exactly one LOCAL_DISK replica, and its endpoint must be the
+    // refreshed value. Before the fix the update was a no-op and this stayed
+    // "endpoint_old".
+    ASSERT_EQ(1u, local_disk_endpoints.size());
+    EXPECT_EQ("endpoint_new", local_disk_endpoints[0]);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

@@ -503,6 +503,30 @@ class Replica {
         return std::nullopt;
     }
 
+    /**
+     * @brief Update a LOCAL_DISK replica's transport endpoint and object size
+     * in place, keeping the allocated_file_size metric in sync when the size
+     * changes. No-op for non-local_disk replicas.
+     *
+     * Used when the same owning client re-reports an offloaded object (e.g.
+     * re-registration after a restart, where the transport endpoint changes).
+     * Mutates the internal replica data directly: get_descriptor() returns a
+     * by-value copy, so writing through it does not modify the replica.
+     */
+    void update_local_disk_location(std::string transport_endpoint,
+                                    uint64_t object_size) {
+        if (auto* disk_data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            if (disk_data->object_size != object_size) {
+                MasterMetricManager::instance().dec_allocated_file_size(
+                    disk_data->object_size);
+                MasterMetricManager::instance().inc_allocated_file_size(
+                    object_size);
+            }
+            disk_data->transport_endpoint = std::move(transport_endpoint);
+            disk_data->object_size = object_size;
+        }
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);

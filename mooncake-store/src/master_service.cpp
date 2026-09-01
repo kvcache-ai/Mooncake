@@ -4834,15 +4834,10 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                        client_id;
         },
         [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
+            const auto desc =
+                replica.get_descriptor().get_local_disk_descriptor();
+            rep.update_local_disk_location(desc.transport_endpoint,
+                                           desc.object_size);
         });
     return false;
 }
@@ -7522,18 +7517,11 @@ auto MasterService::NotifyOffloadSuccess(
                                                .client_id == client_id;
                             },
                             [&replica](Replica& rep) {
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .transport_endpoint =
+                                const auto desc =
                                     replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .object_size;
+                                        .get_local_disk_descriptor();
+                                rep.update_local_disk_location(
+                                    desc.transport_endpoint, desc.object_size);
                             });
                     }
                     handled_existing_object = true;
