@@ -995,6 +995,15 @@ class MasterService {
     // Warn when tenant effective quotas collide with the pool eviction
     // watermark or dwarf steady-state charge (operator UX; #3741).
     void MaybeWarnTenantQuotaConfig(uint64_t allocatable_capacity_bytes);
+    // Bytes corresponding to eviction_high_watermark_ratio_ of capacity.
+    uint64_t GetEvictionHighWatermarkBytes(
+        uint64_t allocatable_capacity_bytes) const;
+    // Tenant-scoped eviction for PutStart/UpsertStart retries. Arms
+    // need_mem_eviction_ only when this tenant's effective quota can
+    // plausibly pin the pool at/above the watermark (so BatchEvict can help);
+    // small-quota shortfalls must not trigger global BatchEvict.
+    void HandleTenantQuotaAdmissionEviction(const TenantId& tenant_id,
+                                            uint64_t deficit_bytes);
 
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;

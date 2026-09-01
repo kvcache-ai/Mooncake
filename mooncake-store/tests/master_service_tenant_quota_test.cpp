@@ -1285,7 +1285,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 
 // #3741 case2: effective quota sits exactly on the pool watermark. Hard-pinned
 // objects prevent tenant eviction from freeing space, so Puts reject while
-// need_mem_eviction_ is armed for BatchEvict.
+// need_mem_eviction_ is armed (tenant is large enough for BatchEvict to help).
 TEST_F(MasterServiceTenantQuotaTest,
        TenantQuotaWatermarkCollisionArmsNeedMemEvictionOnReject) {
     const TenantId heavy("tenant-a");
@@ -1339,6 +1339,53 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_TRUE(GetNeedMemEvictionForTest(service));
     EXPECT_GT(MasterMetricManager::instance().get_eviction_attempts(),
               attempts_before);
+}
+
+// Small-quota shortfalls must not arm global BatchEvict: the bulk path cannot
+// free that tenant's charge when most pool memory belongs to others.
+TEST_F(MasterServiceTenantQuotaTest,
+       SmallTenantQuotaExceedDoesNotArmBulkEviction) {
+    const TenantId small("tenant-a");
+    const TenantId other("tenant-b");
+    constexpr size_t kSegmentSize = 10000;
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(
+                          WritePolicyFile({{small, 500}, {other, 9500}}))
+                      .set_eviction_high_watermark_ratio(0.90)
+                      .set_eviction_ratio(0.05)
+                      .set_default_kv_lease_ttl(60000)
+                      .build();
+    MasterService service(config);
+    UUID client_id = MountSegment(service, kSegmentSize);
+
+    const auto small_snap = Snapshot(service, small);
+    const uint64_t watermark_bytes =
+        static_cast<uint64_t>(static_cast<double>(kSegmentSize) * 0.90);
+    ASSERT_LT(small_snap.effective_quota_bytes, watermark_bytes);
+
+    auto hard_pinned = MemoryConfig();
+    hard_pinned.with_hard_pin = true;
+    constexpr uint64_t kObjectSize = 100;
+    const int fill_count =
+        static_cast<int>(small_snap.effective_quota_bytes / kObjectSize);
+    ASSERT_GT(fill_count, 0);
+    for (int i = 0; i < fill_count; ++i) {
+        const std::string key = "small-pin-" + std::to_string(i);
+        auto start =
+            service.PutStart(client_id, key, small, kObjectSize, hard_pinned);
+        ASSERT_TRUE(start.has_value()) << toString(start.error());
+        ASSERT_TRUE(service.PutEnd(client_id, key, small, ReplicaType::MEMORY)
+                        .has_value());
+    }
+
+    SetNeedMemEvictionForTest(service, false);
+    auto over = service.PutStart(client_id, "small-overflow", small,
+                                 kObjectSize, MemoryConfig());
+    ASSERT_FALSE(over.has_value());
+    EXPECT_EQ(over.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    EXPECT_FALSE(GetNeedMemEvictionForTest(service));
 }
 
 }  // namespace mooncake::test

@@ -1488,8 +1488,7 @@ void MasterService::MaybeWarnTenantQuotaConfig(
         return;
     }
     const uint64_t watermark_bytes =
-        static_cast<uint64_t>(static_cast<double>(allocatable_capacity_bytes) *
-                              eviction_high_watermark_ratio_);
+        GetEvictionHighWatermarkBytes(allocatable_capacity_bytes);
     for (const auto& snap : tenant_quota_table_.ListTenantSnapshots()) {
         if (!snap.has_explicit_policy) {
             continue;
@@ -1514,6 +1513,30 @@ void MasterService::MaybeWarnTenantQuotaConfig(
                 << "; requested weights may be oversized relative to usage.";
         }
     }
+}
+
+uint64_t MasterService::GetEvictionHighWatermarkBytes(
+    uint64_t allocatable_capacity_bytes) const {
+    return static_cast<uint64_t>(
+        static_cast<double>(allocatable_capacity_bytes) *
+        eviction_high_watermark_ratio_);
+}
+
+void MasterService::HandleTenantQuotaAdmissionEviction(
+    const TenantId& tenant_id, uint64_t deficit_bytes) {
+    // Only arm the global BatchEvict path when this tenant is large enough
+    // that its effective quota can pin used_ratio at/above the watermark.
+    // Otherwise a small over-quota tenant would keep need_mem_eviction_ armed
+    // while BatchEvict picks other tenants' objects and still cannot admit.
+    if (auto snap = GetTenantQuotaSnapshot(tenant_id)) {
+        const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
+        const uint64_t watermark_bytes =
+            GetEvictionHighWatermarkBytes(capacity);
+        if (snap->effective_quota_bytes >= watermark_bytes) {
+            need_mem_eviction_.store(true, std::memory_order_relaxed);
+        }
+    }
+    EvictTenantMemoryForQuota(tenant_id, deficit_bytes);
 }
 
 MasterService::TenantState& MasterService::GetOrCreateTenantState(
@@ -4601,10 +4624,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 object_id.tenant_id.value(), "quota_exceeded");
             return result;
         }
-        // Arm the bulk eviction thread so a tenant-quota shortfall can still
-        // engage BatchEvict when used_ratio sits exactly on the watermark.
-        need_mem_eviction_.store(true, std::memory_order_relaxed);
-        EvictTenantMemoryForQuota(object_id.tenant_id, quota_deficit_bytes);
+        // Scoped BatchEvict arming + tenant eviction (see helper).
+        HandleTenantQuotaAdmissionEviction(object_id.tenant_id,
+                                           quota_deficit_bytes);
     }
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
@@ -5486,10 +5508,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 object_id.tenant_id.value(), "quota_exceeded");
             return result;
         }
-        // Arm the bulk eviction thread so a tenant-quota shortfall can still
-        // engage BatchEvict when used_ratio sits exactly on the watermark.
-        need_mem_eviction_.store(true, std::memory_order_relaxed);
-        EvictTenantMemoryForQuota(object_id.tenant_id, quota_deficit_bytes);
+        // Scoped BatchEvict arming + tenant eviction (see helper).
+        HandleTenantQuotaAdmissionEviction(object_id.tenant_id,
+                                           quota_deficit_bytes);
     }
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
