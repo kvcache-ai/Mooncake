@@ -1,5 +1,7 @@
 //! Capability composition for a NoF backing.
 
+use mooncake_store_core::{ColdBackingRoute, Result, StoreError};
+
 use super::external_metadata::NofExternalMetadata;
 use super::object::{
     NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead, NofObjectWrite,
@@ -71,4 +73,24 @@ pub trait NofBacking: Send + Sync {
     fn device_management(&self) -> Option<&dyn NofDeviceManagement> {
         None
     }
+}
+
+pub(crate) fn validate_payload(route: &ColdBackingRoute, payload: &[u8]) -> Result<()> {
+    let actual_len = u64::try_from(payload.len())
+        .map_err(|_| StoreError::InvalidState("NoF payload length does not fit u64".to_string()))?;
+    if actual_len != route.length {
+        return Err(StoreError::InvalidState(format!(
+            "NoF payload length {actual_len} does not match route length {}",
+            route.length
+        )));
+    }
+    if route
+        .checksum
+        .is_some_and(|expected| expected != crate::client::payload_checksum(payload))
+    {
+        return Err(StoreError::InvalidState(
+            "NoF payload checksum does not match route checksum".to_string(),
+        ));
+    }
+    Ok(())
 }

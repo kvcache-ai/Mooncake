@@ -562,13 +562,21 @@ fn logical_object_nof_runtime_keeps_provider_owned_replication() {
     let first_locator = backing.object_locator.clone();
 
     let updated_payload = b"provider-owned-object-v2";
+    let error = client
+        .put("object-nof-key", updated_payload)
+        .expect_err("object NoF duplicate put must preserve StoreClient semantics");
+    assert!(matches!(error, StoreError::Conflict(_)));
+    assert_eq!(provider.objects.lock().len(), 1);
+    client
+        .remove("object-nof-key", false)
+        .expect("object NoF remove before reinsert should succeed");
     client
         .put("object-nof-key", updated_payload)
-        .expect("object NoF overwrite should succeed");
+        .expect("object NoF reinsert should succeed");
     client
         .storage_owner
         .materialize_pending_offloads_bounded(32)
-        .expect("object NoF overwrite offload should run");
+        .expect("object NoF reinsert offload should run");
     let route = wait_for_materialized_nof_backing(&client, "object-nof-key");
     let backing = route.nof_backing.as_ref().expect("NoF backing should exist");
     assert_ne!(backing.object_locator, first_locator);

@@ -14,11 +14,12 @@ use crate::client::{
 };
 
 use super::backend::NofBackend;
+use super::backing::validate_payload;
 use super::ensure_batch_len;
 use super::object::repeated_error;
 use super::physical::{
     NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalRead,
-    NofPhysicalReadRequest, NofPhysicalWrite, NofStorageHealth,
+    NofPhysicalReadRequest, NofPhysicalWrite,
 };
 
 const LOCATOR_PREFIX: &str = "nof-ll:v1:";
@@ -631,27 +632,11 @@ impl NofPhysicalAdapter {
 
 impl PersistentStorageBackend for NofPhysicalAdapter {
     fn storage_management(&self) -> PersistentStorageManagement {
-        if self.target.backing.storage_management().is_some() {
-            PersistentStorageManagement::MooncakeManaged
-        } else {
-            PersistentStorageManagement::BackendManaged
-        }
+        self.target.management_mode()
     }
 
     fn health(&self) -> Result<PersistentStorageBackendHealth> {
-        let health = if let Some(storage) = self.target.backing.storage_management() {
-            storage.storage_health()?.validate(true)?
-        } else if let Some(health) = self.target.backing.health_capability() {
-            health.health()?.validate(false)?
-        } else if let Some(devices) = self.target.backing.device_management() {
-            devices.device_health()?.validate(false)?
-        } else {
-            NofStorageHealth::default()
-        };
-        Ok(PersistentStorageBackendHealth {
-            capacity_bytes: health.capacity_bytes,
-            available_bytes: health.available_bytes,
-        })
+        self.target.health_snapshot()
     }
 
     fn put_object(
@@ -711,26 +696,6 @@ impl PersistentStorageBackend for NofPhysicalAdapter {
     }
 }
 
-fn validate_payload(route: &ColdBackingRoute, payload: &[u8]) -> Result<()> {
-    let actual_len = u64::try_from(payload.len())
-        .map_err(|_| StoreError::InvalidState("NoF payload length does not fit u64".to_string()))?;
-    if actual_len != route.length {
-        return Err(StoreError::InvalidState(format!(
-            "NoF payload length {actual_len} does not match route length {}",
-            route.length
-        )));
-    }
-    if let Some(expected) = route.checksum {
-        let actual = crate::client::payload_checksum(payload);
-        if actual != expected {
-            return Err(StoreError::InvalidState(format!(
-                "NoF payload checksum {actual} does not match route checksum {expected}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn one_batch_result<T>(operation: &str, results: Vec<Result<T>>) -> Result<T> {
     ensure_batch_len(operation, 1, results.len())?;
     results
@@ -778,7 +743,7 @@ mod tests {
     use super::*;
     use crate::{
         NofBacking, NofHealth, NofPhysicalDelete, NofPhysicalRead, NofPhysicalWrite,
-        PhysicalKeyCodec, PhysicalKeyInput,
+        NofStorageHealth, PhysicalKeyCodec, PhysicalKeyInput,
     };
     use mooncake_store_core::{ClientEpoch, ClientRuntimeId, ClientStableId};
     use std::collections::HashMap;

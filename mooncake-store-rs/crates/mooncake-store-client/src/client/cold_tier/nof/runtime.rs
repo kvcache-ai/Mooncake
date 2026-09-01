@@ -25,8 +25,8 @@ use crate::client::{
     SharedLiveClientCache,
 };
 
+use super::backing::validate_payload;
 use super::object::NofObjectState;
-use super::physical::NofStorageHealth;
 use super::physical_adapter::NofPhysicalAdapter;
 use super::NofBackend;
 
@@ -48,10 +48,6 @@ impl NofTargetConfig {
             ));
         }
         Ok(Self { target_id, backend })
-    }
-
-    pub fn target_id(&self) -> &str {
-        &self.target_id
     }
 }
 
@@ -210,37 +206,29 @@ impl NofTargetManager {
         let Some(data_plane) = self.data_plane else {
             return Ok(None);
         };
-        let mut scored = Vec::with_capacity(self.state.targets.len());
-        for (target_id, target) in &self.state.targets {
-            let health = match self.state.health_snapshot(target_id) {
-                Ok(health) => health,
-                Err(error) => {
-                    tracing::warn!(target_id, error = %error, "NoF target excluded from offload");
-                    continue;
-                }
-            };
-            let score = match (health.capacity_bytes, health.available_bytes) {
-                (Some(capacity), Some(available)) if capacity > 0 => {
-                    Some(available as f64 / capacity as f64)
-                }
-                _ => None,
-            }
-            .unwrap_or(0.0);
-            scored.push((
-                target_id.as_str(),
-                score,
-                target.accumulated_writes.load(Ordering::Relaxed),
-            ));
-        }
-        let candidates = scored
+        let candidates = self
+            .state
+            .targets
             .iter()
-            .map(
-                |(target_id, score, accumulated_writes)| ReplicaWriteCandidate {
+            .filter_map(|(target_id, target)| {
+                let health = match self.state.health_snapshot(target_id) {
+                    Ok(health) => health,
+                    Err(error) => {
+                        tracing::warn!(target_id, error = %error, "NoF target excluded from offload");
+                        return None;
+                    }
+                };
+                Some(ReplicaWriteCandidate {
                     target_id,
-                    score: *score,
-                    accumulated_writes: *accumulated_writes,
-                },
-            )
+                    score: match (health.capacity_bytes, health.available_bytes) {
+                        (Some(capacity), Some(available)) if capacity > 0 => {
+                            available as f64 / capacity as f64
+                        }
+                        _ => 0.0,
+                    },
+                    accumulated_writes: target.accumulated_writes.load(Ordering::Relaxed),
+                })
+            })
             .collect::<Vec<_>>();
         let wanted = match data_plane {
             // A logical-object provider owns placement and replication behind this one target.
@@ -253,7 +241,7 @@ impl NofTargetManager {
             return Ok(None);
         };
         for index in &selected {
-            if let Some(target) = self.state.targets.get(scored[*index].0) {
+            if let Some(target) = self.state.targets.get(candidates[*index].target_id) {
                 target.accumulated_writes.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -265,14 +253,14 @@ impl NofTargetManager {
                 .unwrap_or_else(|| route.key.0.clone()),
             route.version.0
         );
-        let primary_id = scored[primary_index].0.to_string();
+        let primary_id = candidates[primary_index].target_id.to_string();
         let primary_owner = self.state.owner_for(&primary_id).ok_or_else(|| {
             StoreError::Transport(format!("NoF target {primary_id} has no live owner"))
         })?;
         let replicas = selected[1..]
             .iter()
             .map(|index| {
-                let target_id = scored[*index].0.to_string();
+                let target_id = candidates[*index].target_id.to_string();
                 self.state
                     .owner_for(&target_id)
                     .map(|owner| NofBackingReplica {
@@ -387,19 +375,11 @@ impl NofObjectAdapter {
 
 impl PersistentStorageBackend for NofObjectAdapter {
     fn storage_management(&self) -> PersistentStorageManagement {
-        if self.target.backing.storage_management().is_some() {
-            PersistentStorageManagement::MooncakeManaged
-        } else {
-            PersistentStorageManagement::BackendManaged
-        }
+        self.target.management_mode()
     }
 
     fn health(&self) -> Result<PersistentStorageBackendHealth> {
-        let health = nof_health(&self.target)?;
-        Ok(PersistentStorageBackendHealth {
-            capacity_bytes: health.capacity_bytes,
-            available_bytes: health.available_bytes,
-        })
+        self.target.health_snapshot()
     }
 
     fn put_object(&self, backing: &ColdBackingRoute, payload: &[u8]) -> Result<ColdBackingRoute> {
@@ -415,7 +395,7 @@ impl PersistentStorageBackend for NofObjectAdapter {
         backing: &ColdBackingRoute,
         payload: &[u8],
     ) -> Result<ColdBackingRoute> {
-        validate_object_payload(backing, payload)?;
+        validate_payload(backing, payload)?;
         let route = route.ok_or_else(|| {
             StoreError::InvalidState(
                 "NoF logical-object writes require the object route identity".to_string(),
@@ -440,7 +420,7 @@ impl PersistentStorageBackend for NofObjectAdapter {
         let (namespace, key) = Self::identity(&backing.object_locator)?;
         match self.target.get_object(&namespace, &key)? {
             NofObjectState::Found(object) => {
-                validate_object_payload(backing, &object.value)?;
+                validate_payload(backing, &object.value)?;
                 if object.metadata.length != backing.length {
                     return Err(StoreError::InvalidState(
                         "NoF provider object metadata length does not match route".to_string(),
@@ -483,18 +463,6 @@ impl PersistentStorageBackend for NofObjectAdapter {
     }
 }
 
-fn nof_health(target: &NofBackend) -> Result<NofStorageHealth> {
-    if let Some(storage) = target.backing.storage_management() {
-        storage.storage_health()?.validate(true)
-    } else if let Some(health) = target.backing.health_capability() {
-        health.health()?.validate(false)
-    } else if let Some(devices) = target.backing.device_management() {
-        devices.device_health()?.validate(false)
-    } else {
-        Ok(NofStorageHealth::default())
-    }
-}
-
 fn read_locator_field(cursor: &mut &[u8]) -> Result<String> {
     if cursor.len() < 4 {
         return Err(StoreError::InvalidState(
@@ -515,25 +483,6 @@ fn read_locator_field(cursor: &mut &[u8]) -> Result<String> {
         .to_string();
     *cursor = &cursor[length..];
     Ok(value)
-}
-
-fn validate_object_payload(backing: &ColdBackingRoute, payload: &[u8]) -> Result<()> {
-    if payload.len() as u64 != backing.length {
-        return Err(StoreError::InvalidState(format!(
-            "NoF payload length {} does not match route length {}",
-            payload.len(),
-            backing.length
-        )));
-    }
-    if backing
-        .checksum
-        .is_some_and(|checksum| checksum != crate::client::payload_checksum(payload))
-    {
-        return Err(StoreError::InvalidState(
-            "NoF payload checksum does not match route checksum".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 pub(in crate::client) fn nof_as_cold(backing: &NofBackingRoute) -> ColdBackingRoute {

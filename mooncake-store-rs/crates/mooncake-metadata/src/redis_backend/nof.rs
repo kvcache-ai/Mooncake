@@ -1,9 +1,8 @@
 use std::collections::BTreeSet;
 
 use mooncake_store_core::{MetadataBackend, NofBackingRouteFilter, ObjectRoute, Result};
-use redis::Commands;
 
-use super::{bounded_set_members, json_error, metadata_error, RedisMetadataBackend};
+use super::RedisMetadataBackend;
 
 impl RedisMetadataBackend {
     pub(super) fn nof_backing_filter_index(
@@ -42,39 +41,13 @@ impl RedisMetadataBackend {
         let Some(index) = self.nof_backing_filter_index(filter) else {
             return MetadataBackend::list_object_routes_by_nof_backing(self, filter);
         };
-        let keys =
-            self.query_readonly("redis list object routes by NoF backing", |connection| {
-                bounded_set_members(connection, &index, "redis sscan NoF backing route index")
-                    .map_err(super::store_error_to_redis_error)
-            })?;
-        let entries =
-            self.query_readonly("redis load NoF backing object routes", |connection| {
-                let mut entries = Vec::with_capacity(keys.len());
-                for key in &keys {
-                    let payload: Option<String> = redis::cmd("HGET")
-                        .arg(key.as_str())
-                        .arg("payload")
-                        .query(connection)?;
-                    entries.push((key.clone(), payload));
-                }
-                Ok(entries)
-            })?;
-        let mut stale_keys = Vec::new();
-        let mut routes: Vec<ObjectRoute> = Vec::new();
-        for (key, payload) in entries {
-            if let Some(payload) = payload {
-                routes.push(serde_json::from_str(&payload).map_err(json_error)?);
-            } else {
-                stale_keys.push(key);
-            }
-        }
-        if !stale_keys.is_empty() {
-            let mut connection = self.connection("redis prune stale NoF backing route index")?;
-            connection
-                .srem::<_, _, ()>(&index, stale_keys)
-                .map_err(|error| metadata_error("redis srem NoF backing route index", error))?;
-        }
-        Ok(routes
+        Ok(self
+            .load_indexed_object_routes(
+                &index,
+                "redis sscan NoF backing route index",
+                "redis load NoF backing object routes",
+                "redis srem NoF backing route index",
+            )?
             .into_iter()
             .filter(|route| {
                 route

@@ -1,10 +1,10 @@
 use std::ffi::{c_char, c_int, c_longlong, c_void, CString};
+use std::sync::Mutex;
 
 use libc::size_t;
 use mooncake_store_core::error::QuotaKind;
 
 const DEFAULT_MAX_VALUE_SIZE: u64 = 4 * 1024 * 1024;
-const MAX_VALUE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_KEY_SIZE: usize = 256;
 const DEFAULT_MAX_BATCH_ITEMS: usize = 256;
 const KVCS_NAMESPACE_MAX_BYTES: usize = 127;
@@ -235,12 +235,47 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-struct ClientHandle(*mut KvcsClient);
+struct ClientHandle {
+    client: *mut KvcsClient,
+    destroy: unsafe extern "C" fn(*mut KvcsClient),
+}
 
 // KVCS documents one client as safe for concurrent synchronous batch operations. Mutexes below
 // protect only lazy construction and destruction.
 unsafe impl Send for ClientHandle {}
-unsafe impl Sync for ClientHandle {}
+
+impl Drop for ClientHandle {
+    fn drop(&mut self) {
+        unsafe { (self.destroy)(self.client) };
+    }
+}
+
+#[derive(Default)]
+struct ClientSlot(Mutex<Option<ClientHandle>>);
+
+impl ClientSlot {
+    fn get_or_create(
+        &self,
+        mode: &str,
+        create: impl FnOnce() -> *mut KvcsClient,
+        destroy: unsafe extern "C" fn(*mut KvcsClient),
+    ) -> Result<*mut KvcsClient> {
+        let mut slot = self.0.lock().map_err(|_| {
+            StoreError::InvalidState(format!("KVCS {mode} client lock poisoned"))
+        })?;
+        if let Some(handle) = slot.as_ref() {
+            return Ok(handle.client);
+        }
+        let client = create();
+        if client.is_null() {
+            return Err(StoreError::Transport(format!(
+                "KVCS {mode} client creation failed"
+            )));
+        }
+        slot.replace(ClientHandle { client, destroy });
+        Ok(client)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct CommonLimits {
@@ -249,63 +284,25 @@ struct CommonLimits {
     max_batch_items: usize,
 }
 
-impl CommonLimits {
-    fn from_env() -> Result<Self> {
-        let configured_value = env_u64("MOONCAKE_KVCS_MAX_VALUE_SIZE", 0)?;
-        if configured_value > MAX_VALUE_SIZE {
-            return Err(StoreError::InvalidState(format!(
-                "KVCS max value size {configured_value} exceeds SDK limit {MAX_VALUE_SIZE}"
-            )));
+impl Default for CommonLimits {
+    fn default() -> Self {
+        Self {
+            max_value_size: DEFAULT_MAX_VALUE_SIZE,
+            max_key_size: DEFAULT_MAX_KEY_SIZE,
+            max_batch_items: DEFAULT_MAX_BATCH_ITEMS,
         }
-        let configured_key = env_u32("MOONCAKE_KVCS_MAX_KEY_SIZE", 0)?;
-        let configured_batch = env_u32("MOONCAKE_KVCS_MAX_KEYS_PER_BATCH", 0)?;
-        if configured_key > c_int::MAX as u32 {
-            return Err(StoreError::InvalidState(format!(
-                "KVCS max key size {configured_key} exceeds the C ABI limit"
-            )));
-        }
-        if configured_batch > c_int::MAX as u32 {
-            return Err(StoreError::InvalidState(format!(
-                "KVCS max batch size {configured_batch} exceeds the C ABI limit"
-            )));
-        }
-        Ok(Self {
-            max_value_size: if configured_value == 0 {
-                DEFAULT_MAX_VALUE_SIZE
-            } else {
-                configured_value
-            },
-            max_key_size: if configured_key == 0 {
-                DEFAULT_MAX_KEY_SIZE
-            } else {
-                configured_key as usize
-            },
-            max_batch_items: if configured_batch == 0 {
-                DEFAULT_MAX_BATCH_ITEMS
-            } else {
-                configured_batch as usize
-            },
-        })
     }
 }
 
 fn env_u32(name: &str, default: u32) -> Result<u32> {
-    parse_env_number(name, std::env::var(name).ok(), default)
-}
-
-fn env_u64(name: &str, default: u64) -> Result<u64> {
-    parse_env_number(name, std::env::var(name).ok(), default)
-}
-
-fn parse_env_number<T>(name: &str, value: Option<String>, default: T) -> Result<T>
-where
-    T: std::str::FromStr,
-{
-    match value {
-        Some(value) => value.parse().map_err(|_| {
+    match std::env::var(name) {
+        Ok(value) => value.parse().map_err(|_| {
             StoreError::InvalidState(format!("{name} must be a non-negative integer"))
         }),
-        None => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidState(format!(
+            "{name} is not valid UTF-8"
+        ))),
     }
 }
 
@@ -375,6 +372,14 @@ fn fill_missing<T>(results: &mut [Option<Result<T>>], error: &StoreError) {
             *result = Some(Err(error.clone()));
         }
     }
+}
+
+fn fail_positional_results<T>(
+    mut results: Vec<Option<Result<T>>>,
+    error: StoreError,
+) -> Vec<Result<T>> {
+    fill_missing(&mut results, &error);
+    finish_positional_results(results)
 }
 
 fn validate_string(value: &str, limit: usize, label: &str) -> Result<CString> {

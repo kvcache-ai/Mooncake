@@ -14,7 +14,7 @@ The capabilities are independent:
 | physical KV write/read/query/delete | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | raw key/value APIs used by the shared physical adapter |
 | external logical metadata | `NofExternalMetadata` | typed NoF get/list/CAS over the existing `MetadataBackend` |
 | backing health | `NofHealth` | liveness and optional capacity without claiming storage or device ownership |
-| storage maintenance | `NofStorageManagement` | physical inventory and capacity needed by Mooncake GC/watermarks |
+| storage maintenance | `NofStorageManagement` | optional physical inventory and capacity contract for Mooncake-managed backings |
 | device lifecycle | `NofDeviceManagement` | provider-supported health and device lifecycle integration |
 
 Capability absence is authoritative. It means the provider owns the responsibility internally or
@@ -73,13 +73,16 @@ the accumulated write count to spread equal-score targets, while reads keep the 
 eligibility and capacity inputs, so sharing the strategy does not make a NoF mountpoint a local disk
 or opt it into local-disk maintenance.
 
-If `NofStorageManagement` is present, the existing Cold Tier reconciliation and watermark paths
-may use its exhaustive list and real capacity values. If it is absent, the provider owns orphan
+`NofStorageManagement` is the optional inventory/capacity boundary for a backing that delegates
+physical maintenance to Mooncake. Its storage health feeds the existing backend health and
+management classification; the provider-specific adapter must supply exhaustive inventory before
+physical reconciliation can be enabled. If the capability is absent, the provider owns orphan
 collection, watermarks and compaction. `NofDeviceManagement` is evaluated independently. KVCS
 exposes neither management trait because its public 0.4.0 client ABI does not provide those
-operations. KVCS Low-Level does expose `NofHealth`: it sends a side-effect-free existence query to
-the selected mountpoint from the background heartbeat worker, while leaving capacity unknown
-because the SDK has no capacity API.
+operations, so no KVCS path runs Mooncake physical inventory or watermark maintenance. KVCS
+Low-Level does expose `NofHealth`: it sends a side-effect-free existence query to the selected
+mountpoint from the background heartbeat worker, while leaving capacity unknown because the SDK
+has no capacity API.
 
 `StoreClientBuilder::nof_target(s)` registers the runtime backends. The binding reuses the existing
 Cold Tier state machine in this order: select target, publish `PendingWrite`, enqueue, pin/read the
@@ -364,6 +367,21 @@ changes. `MOONCAKE_KVCS_MODE` is a runtime construction parameter: `standard` ex
 logical-object traits, while `low-level` exposes only the physical-KV traits; unset defaults to
 `low-level`.
 
+The executor exposes only the connectivity and target-selection inputs required by the two public
+SDK modes:
+
+| Variable | Mode | Meaning |
+| --- | --- | --- |
+| `MOONCAKE_KVCS_EFC_SOCKET` | both | EFC Unix socket; Low-Level defaults to `/var/run/kvcs/efc-grpc.sock` |
+| `MOONCAKE_KVCS_REDIS_ENDPOINTS` | Standard | comma-separated Redis endpoints such as `tcp://host:6379` |
+| `MOONCAKE_KVCS_REDIS_PASSWORD` | Standard | optional Redis password |
+| `MOONCAKE_KVCS_MOUNTPOINT_INDEX` | Low-Level | provider mountpoint index; unset or `0` selects the default filesystem |
+
+Mooncake does not create a parallel tuning surface for SDK worker counts, ring depth, value/key
+limits, logging, metrics or performance reporting. Those `kvcs_*_config_t` fields are left at the
+public ABI's documented zero values, so the SDK owns its defaults. The adapter advertises the same
+documented 4 MiB raw value, 256-byte raw key and 256-item batch defaults to the NoF framework.
+
 The vendor's top-level `env.sh` assigns `KVCS_SDK_ROOT` as a shell variable but does not export it,
 and `mock/env.sh` configures the vendor Rust wrapper through `KVCS_DYNAMIC`. Mooncake does not read
 `KVCS_DYNAMIC`, `KVCS_NO_STDLIB_STATIC`, `PKG_CONFIG_PATH` or `LIBRARY_PATH`, so set the Mooncake
@@ -385,6 +403,17 @@ export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/mock/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_P
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --features kvcs-capi --lib \
   nof:: --offline -- --test-threads=1
+
+# The regular filter leaves live-provider smoke tests ignored. With the official mock linked,
+# run both C ABI round trips explicitly.
+MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo test -p mooncake-store-client --features kvcs-capi --lib \
+  client::cold_tier::nof::kvcs::executor::standard::tests::live_standard_round_trip_smoke \
+  --offline -- --exact --ignored --test-threads=1
+MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo test -p mooncake-store-client --features kvcs-capi --lib \
+  client::cold_tier::nof::kvcs::executor::low_level::tests::live_low_level_round_trip_smoke \
+  --offline -- --exact --ignored --test-threads=1
 ```
 
 Build and runtime library selection must agree. `KVCS_SDK_USE_MOCK=1` changes the library recorded
@@ -396,9 +425,9 @@ Public 0.4.0 requires a non-empty Low-Level EFC socket. The executor uses
 `/var/run/kvcs/efc-grpc.sock`; it never passes a null socket and relies on an SDK-version-specific
 fallback.
 
-The adapter validates KVCS's configured raw value limit and validates the key after converting the
-opaque physical key to the C ABI's hex string. The installed header currently defaults to a 256
-byte raw key limit and a 4 MiB value limit. These limits remain inside the KVCS executor.
+The adapter enforces the SDK's documented raw value limit and validates the key after converting
+the opaque physical key to the C ABI's hex string. The installed header defaults to a 256-byte raw
+key limit and a 4 MiB value limit. These limits remain inside the KVCS executor.
 
 The KVCS C ABI exposes a mountpoint index but no manager epoch or device-generation fence. This
 integration therefore does not claim physical fencing or C++ backend key/layout compatibility.
