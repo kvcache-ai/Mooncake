@@ -29,12 +29,12 @@ class MasterServiceSSDTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
-    // PushOffloadingQueue AND its ObjectIdentity parameter type are both private
-    // to MasterService; this fixture is a friend, but friendship is not inherited
-    // by the per-test subclass TEST_F generates. So both naming ObjectIdentity
-    // and calling PushOffloadingQueue must happen inside a member of this class,
-    // not in the TEST_F body. Take plain tenant/key args and build the private
-    // identity here. See issue #2997.
+    // PushOffloadingQueue AND its ObjectIdentity parameter type are both
+    // private to MasterService; this fixture is a friend, but friendship is not
+    // inherited by the per-test subclass TEST_F generates. So both naming
+    // ObjectIdentity and calling PushOffloadingQueue must happen inside a
+    // member of this class, not in the TEST_F body. Take plain tenant/key args
+    // and build the private identity here. See issue #2997.
     static tl::expected<void, ErrorCode> CallPushOffloadingQueue(
         MasterService& service, const TenantId& tenant, const std::string& key,
         Replica& replica) {
@@ -1222,8 +1222,9 @@ TEST_F(LocalDiskUnmountInterleavingTest,
 // reported as a failure rather than a silent success.
 TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     auto service = CreateSsdAwareOffloadService();
-    // ObjectIdentity is private to MasterService, so it is constructed inside the
-    // friend helper from these plain args rather than named here (see helper).
+    // ObjectIdentity is private to MasterService, so it is constructed inside
+    // the friend helper from these plain args rather than named here (see
+    // helper).
     const TenantId tenant = TenantId::Default();
     const std::string key = "noop_offload_key";
 
@@ -1231,7 +1232,8 @@ TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     // [nullopt] -> the loop enqueues nothing -> the !any_enqueued guard fires.
     Replica all_nullopt_replica(/*buffer=*/nullptr, ReplicaStatus::COMPLETE);
     ASSERT_FALSE(all_nullopt_replica.get_segment_names().empty());
-    auto r2 = CallPushOffloadingQueue(*service, tenant, key, all_nullopt_replica);
+    auto r2 =
+        CallPushOffloadingQueue(*service, tenant, key, all_nullopt_replica);
     ASSERT_FALSE(r2.has_value())
         << "all-nullopt segment names must not report a silent success "
            "(issue #2997)";
@@ -1242,7 +1244,8 @@ TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     Replica empty_names_replica(/*file_path=*/"/tmp/nonexistent_offload_src",
                                 /*object_size=*/1024, ReplicaStatus::COMPLETE);
     ASSERT_TRUE(empty_names_replica.get_segment_names().empty());
-    auto r1 = CallPushOffloadingQueue(*service, tenant, key, empty_names_replica);
+    auto r1 =
+        CallPushOffloadingQueue(*service, tenant, key, empty_names_replica);
     ASSERT_FALSE(r1.has_value())
         << "empty segment names must not report a silent success (issue #2997)";
     EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r1.error());
