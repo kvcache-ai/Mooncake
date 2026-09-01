@@ -1262,14 +1262,15 @@ TEST_F(MasterServiceHATest, RestoreSkipsDescriptorsBeyondSegmentCapacity) {
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
 
-    // #3760: both entries overflow the segment and are skipped, one by one.
+    // #3760: the first entry fills the segment exactly and survives; the
+    // second would push past capacity and is skipped on its own.
     auto result = service.RestoreFromStandbySnapshot(
         {first, second}, 7, {MakeStandbyMemorySegment(endpoint, 1024)});
 
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_capacity_first"),
-              0);
+              1);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_capacity_second"),
               0);
