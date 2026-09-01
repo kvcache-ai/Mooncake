@@ -47,6 +47,11 @@ where
     ) -> Result<CasResult> {
         if let Some(route) = next {
             route.validate_backing_kind()?;
+            if route.nof_backing.is_none() {
+                return Err(mooncake_store_core::StoreError::InvalidState(
+                    "NoF route CAS requires nof_backing metadata".to_string(),
+                ));
+            }
         }
         self.compare_and_swap_object_route(key, expected, next)
     }

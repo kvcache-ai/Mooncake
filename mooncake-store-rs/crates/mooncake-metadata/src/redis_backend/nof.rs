@@ -1,31 +1,9 @@
+use std::collections::BTreeSet;
+
 use mooncake_store_core::{MetadataBackend, NofBackingRouteFilter, ObjectRoute, Result};
 use redis::Commands;
 
 use super::{bounded_set_members, json_error, metadata_error, RedisMetadataBackend};
-
-fn route_matches_nof_backing_filter(route: &ObjectRoute, filter: &NofBackingRouteFilter) -> bool {
-    let Some(backing) = route.nof_backing.as_ref() else {
-        return false;
-    };
-    if filter
-        .target_id
-        .as_ref()
-        .is_some_and(|target_id| backing.target_id != *target_id)
-    {
-        return false;
-    }
-    if filter.state.is_some_and(|state| backing.state != state) {
-        return false;
-    }
-    if filter
-        .owner
-        .as_ref()
-        .is_some_and(|owner| backing.owner != *owner)
-    {
-        return false;
-    }
-    true
-}
 
 impl RedisMetadataBackend {
     pub(super) fn nof_backing_filter_index(
@@ -44,20 +22,17 @@ impl RedisMetadataBackend {
             .map(|owner| self.keyspace.object_nof_backing_owner_index(owner))
     }
 
-    pub(super) fn nof_backing_index_keys(&self, route: Option<&ObjectRoute>) -> [String; 3] {
-        let target_index = route
-            .and_then(|route| route.nof_backing.as_ref())
-            .map(|backing| self.keyspace.object_nof_target_index(&backing.target_id))
-            .unwrap_or_default();
-        let state_index = route
-            .and_then(|route| route.nof_backing.as_ref())
-            .map(|backing| self.keyspace.object_nof_backing_state_index(backing.state))
-            .unwrap_or_default();
-        let owner_index = route
-            .and_then(|route| route.nof_backing.as_ref())
-            .map(|backing| self.keyspace.object_nof_backing_owner_index(&backing.owner))
-            .unwrap_or_default();
-        [target_index, state_index, owner_index]
+    pub(super) fn nof_backing_index_keys(&self, route: Option<&ObjectRoute>) -> Vec<String> {
+        let Some(backing) = route.and_then(|route| route.nof_backing.as_ref()) else {
+            return Vec::new();
+        };
+        let mut indexes = BTreeSet::new();
+        indexes.insert(self.keyspace.object_nof_backing_state_index(backing.state));
+        for target in backing.all_targets() {
+            indexes.insert(self.keyspace.object_nof_target_index(target.target_id));
+            indexes.insert(self.keyspace.object_nof_backing_owner_index(target.owner));
+        }
+        indexes.into_iter().collect()
     }
 
     pub(super) fn redis_list_object_routes_by_nof_backing(
@@ -85,7 +60,7 @@ impl RedisMetadataBackend {
                 Ok(entries)
             })?;
         let mut stale_keys = Vec::new();
-        let mut routes = Vec::new();
+        let mut routes: Vec<ObjectRoute> = Vec::new();
         for (key, payload) in entries {
             if let Some(payload) = payload {
                 routes.push(serde_json::from_str(&payload).map_err(json_error)?);
@@ -101,7 +76,12 @@ impl RedisMetadataBackend {
         }
         Ok(routes
             .into_iter()
-            .filter(|route| route_matches_nof_backing_filter(route, filter))
+            .filter(|route| {
+                route
+                    .nof_backing
+                    .as_ref()
+                    .is_some_and(|backing| backing.matches_filter(filter))
+            })
             .take(filter.limit.unwrap_or(usize::MAX))
             .collect())
     }

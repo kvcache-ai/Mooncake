@@ -28,6 +28,79 @@ impl Drop for QueryResultGuard {
     }
 }
 
+fn query_shards(
+    raw: &KvcsQueryResult,
+    with_shards: bool,
+    length: u64,
+    total_shards: u32,
+    max_value_size: u64,
+) -> Result<Vec<(u32, usize)>> {
+    if !with_shards {
+        return Ok(Vec::new());
+    }
+    if total_shards == 1 {
+        if length > max_value_size {
+            return Err(StoreError::InvalidState(format!(
+                "KVCS unsharded object size {length} exceeds provider limit {max_value_size}"
+            )));
+        }
+        return Ok(vec![(
+            0,
+            usize::try_from(length).map_err(|_| {
+                StoreError::InvalidState(
+                    "KVCS object length does not fit this platform".to_string(),
+                )
+            })?,
+        )]);
+    }
+    if raw.shard_count != raw.total_shard || raw.shards.is_null() {
+        return Err(StoreError::InvalidState(
+            "KVCS complete manifest omitted shard details".to_string(),
+        ));
+    }
+    let raw_shards = unsafe { std::slice::from_raw_parts(raw.shards, raw.shard_count as usize) };
+    let mut shard_bytes = 0u64;
+    let mut shards = Vec::with_capacity(raw_shards.len());
+    for shard in raw_shards {
+        let shard_id = u32::try_from(shard.shard_id).map_err(|_| {
+            StoreError::InvalidState("KVCS query returned a negative shard ID".to_string())
+        })?;
+        let size = usize::try_from(shard.size).map_err(|_| {
+            StoreError::InvalidState("KVCS query returned an invalid shard size".to_string())
+        })?;
+        if size == 0 {
+            return Err(StoreError::InvalidState(
+                "KVCS complete query returned an empty shard".to_string(),
+            ));
+        }
+        if size as u64 > max_value_size {
+            return Err(StoreError::InvalidState(format!(
+                "KVCS shard size {size} exceeds provider limit {max_value_size}"
+            )));
+        }
+        shard_bytes = shard_bytes.checked_add(size as u64).ok_or_else(|| {
+            StoreError::InvalidState("KVCS query shard byte count overflow".to_string())
+        })?;
+        shards.push((shard_id, size));
+    }
+    if shard_bytes != length {
+        return Err(StoreError::InvalidState(
+            "KVCS query shard lengths do not match total size".to_string(),
+        ));
+    }
+    shards.sort_by_key(|(shard_id, _)| *shard_id);
+    if shards
+        .iter()
+        .enumerate()
+        .any(|(index, (shard_id, _))| *shard_id as usize != index)
+    {
+        return Err(StoreError::InvalidState(
+            "KVCS query returned non-contiguous shard IDs".to_string(),
+        ));
+    }
+    Ok(shards)
+}
+
 pub struct KvcsCapiStandardExecutor {
     config: KvcsClientConfig,
     _efc_socket: Option<CString>,
@@ -205,77 +278,13 @@ impl KvcsCapiStandardExecutor {
                 let total_shards = u32::try_from(raw.raw.total_shard).map_err(|_| {
                     StoreError::InvalidState("KVCS query shard count exceeds u32".to_string())
                 })?;
-                let mut shards = Vec::new();
-                if with_shards && total_shards > 1 {
-                    if raw.raw.shard_count != raw.raw.total_shard || raw.raw.shards.is_null() {
-                        return Err(StoreError::InvalidState(
-                            "KVCS complete manifest omitted shard details".to_string(),
-                        ));
-                    }
-                    let raw_shards = unsafe {
-                        std::slice::from_raw_parts(raw.raw.shards, raw.raw.shard_count as usize)
-                    };
-                    let mut shard_bytes = 0u64;
-                    for shard in raw_shards {
-                        let shard_id = u32::try_from(shard.shard_id).map_err(|_| {
-                            StoreError::InvalidState(
-                                "KVCS query returned a negative shard ID".to_string(),
-                            )
-                        })?;
-                        let size = usize::try_from(shard.size).map_err(|_| {
-                            StoreError::InvalidState(
-                                "KVCS query returned an invalid shard size".to_string(),
-                            )
-                        })?;
-                        if size == 0 {
-                            return Err(StoreError::InvalidState(
-                                "KVCS complete query returned an empty shard".to_string(),
-                            ));
-                        }
-                        if size as u64 > self.limits.max_value_size {
-                            return Err(StoreError::InvalidState(format!(
-                                "KVCS shard size {size} exceeds provider limit {}",
-                                self.limits.max_value_size
-                            )));
-                        }
-                        shard_bytes = shard_bytes.checked_add(size as u64).ok_or_else(|| {
-                            StoreError::InvalidState(
-                                "KVCS query shard byte count overflow".to_string(),
-                            )
-                        })?;
-                        shards.push((shard_id, size));
-                    }
-                    if shard_bytes != length {
-                        return Err(StoreError::InvalidState(
-                            "KVCS query shard lengths do not match total size".to_string(),
-                        ));
-                    }
-                    shards.sort_by_key(|(shard_id, _)| *shard_id);
-                    if shards
-                        .iter()
-                        .enumerate()
-                        .any(|(index, (shard_id, _))| *shard_id as usize != index)
-                    {
-                        return Err(StoreError::InvalidState(
-                            "KVCS query returned non-contiguous shard IDs".to_string(),
-                        ));
-                    }
-                } else {
-                    if length > self.limits.max_value_size {
-                        return Err(StoreError::InvalidState(format!(
-                            "KVCS unsharded object size {length} exceeds provider limit {}",
-                            self.limits.max_value_size
-                        )));
-                    }
-                    shards.push((
-                        0,
-                        usize::try_from(length).map_err(|_| {
-                            StoreError::InvalidState(
-                                "KVCS object length does not fit this platform".to_string(),
-                            )
-                        })?,
-                    ));
-                }
+                let shards = query_shards(
+                    &raw.raw,
+                    with_shards,
+                    length,
+                    total_shards,
+                    self.limits.max_value_size,
+                )?;
                 Ok(NofHighLevelRead::Found(RawQuery {
                     metadata: NofHighLevelObjectMetadata {
                         length,
@@ -609,6 +618,13 @@ impl NofHighLevelExecutor for KvcsCapiStandardExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_only_query_accepts_sharded_total_above_single_value_limit() {
+        let mut raw: KvcsQueryResult = unsafe { std::mem::zeroed() };
+        raw.total_shard = 2;
+        assert!(query_shards(&raw, false, 9, 2, 8).unwrap().is_empty());
+    }
 
     #[test]
     #[ignore = "requires a live KVCS EFC and Redis, or the official SDK mock"]
