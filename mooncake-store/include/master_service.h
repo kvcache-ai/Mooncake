@@ -157,6 +157,8 @@ class MasterService {
     // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
     friend class test::MasterServiceProcessingKeyDoubleEraseTest;
     friend class test::LocalDiskUnmountInterleavingTest;
+    // #2997 regression: exercises PushOffloadingQueue's no-op paths directly.
+    friend class test::MasterServiceSSDTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
