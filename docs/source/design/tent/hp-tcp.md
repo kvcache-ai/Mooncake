@@ -2,8 +2,8 @@
 
 `hp_tcp` is a standalone TENT transport for CPU DRAM transfers over
 data-center TCP. Standard `tcp` remains the RPC-based compatibility path.
-The first version intentionally excludes GPU memory, TLS, multi-endpoint
-routing, multi-NIC striping, transparent replay after an ambiguous WRITE and
+The first version intentionally excludes GPU memory, TLS, per-transfer
+striping, rail failover, transparent replay after an ambiguous WRITE and
 dynamic lane scheduling.
 
 ## Architecture
@@ -24,6 +24,20 @@ thread per historical connection.
 TENT request -> bounded admission -> owner worker -> persistent lane
              -> versioned TCP protocol -> registered remote buffer
 ```
+
+### Static multi-rail routing
+
+`rail_addresses` optionally assigns persistent lanes across an ordered set of
+local and remote TCP addresses. Each entry must be a numeric address assigned
+to the local host; when the list is non-empty it supplies the published
+endpoints instead of `advertise_address`. Lane `i` uses rail
+`i % rail_count`, binds its socket to the matching local address, and keeps the
+existing peer-and-lane worker ownership. Both peers must configure the same
+non-zero rail count; multiple local rails require a wildcard listener.
+
+Routing is deliberately static. A transfer stays on one persistent lane and
+therefore one rail: `hp_tcp` does not stripe a transfer, rebalance traffic, or
+fail over between rails.
 
 ## Protocol and memory safety
 
@@ -84,12 +98,14 @@ The transport is configured under `transports.hp_tcp`:
 | --- | --- |
 | `enable` | Enable `hp_tcp`; set `transports.tcp.enable` to `false`. The two transports cannot be enabled together because control-plane notification ownership is singular. |
 | `bind_address`, `advertise_address`, `port` | Listener and published endpoint. |
+| `rail_addresses` | Ordered local source addresses for static lane-to-rail routing. The list must be unique, no longer than `connections_per_peer`, and have the same length on both peers. Multiple rails require `bind_address` to be empty or `0.0.0.0`. |
 | `worker_count` | ASIO event-loop threads. |
 | `connections_per_peer` | Persistent lanes per peer. |
 | `max_outstanding_tasks`, `max_outstanding_bytes` | Global admission bounds. |
 | `max_transfer_bytes` | Maximum request size. I/O progress is tracked in fixed internal steps. |
 | `connect_timeout_ms`, `progress_timeout_ms` | Connection and I/O deadlines. |
 
-Tests cover wire validation, admission, buffer leases, connection reuse,
-session reaping, client/server timeout, stale-registration recovery, ambiguous
-WRITE completion and a two-process READ/WRITE smoke test.
+Tests cover wire validation, rail metadata and source binding, admission,
+buffer leases, connection reuse, session reaping, client/server timeout,
+stale-registration recovery, ambiguous WRITE completion and a two-process
+READ/WRITE smoke test.

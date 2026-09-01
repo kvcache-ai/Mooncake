@@ -48,6 +48,19 @@ TEST(HpTcpTransportConfigTest, ParsesAndValidatesLimits) {
     EXPECT_TRUE(ParseHpTcpTransportConfig(config, &parsed).IsInvalidArgument());
 }
 
+TEST(HpTcpTransportConfigTest, ParsesRailAddresses) {
+    Config config;
+    ASSERT_TRUE(
+        config
+            .load(
+                R"({"transports":{"tcp":{"enable":false},"hp_tcp":{"enable":true,"connections_per_peer":4,"rail_addresses":["10.0.0.1","10.1.0.1"]}}})")
+            .ok());
+    HpTcpTransportConfig parsed;
+    ASSERT_TRUE(ParseHpTcpTransportConfig(config, &parsed).ok());
+    ASSERT_EQ(parsed.params.rail_addresses.size(), 2U);
+    EXPECT_EQ(parsed.params.rail_addresses[1], "10.1.0.1");
+}
+
 TEST(HpTcpTransportConfigTest, AcceptsFullWidthUnsignedLimit) {
     Config config;
     ASSERT_TRUE(

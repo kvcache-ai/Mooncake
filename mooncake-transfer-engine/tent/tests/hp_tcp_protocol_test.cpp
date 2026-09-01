@@ -55,16 +55,17 @@ TEST(HighPerformanceTcpProtocolTest, RejectsMalformedWireFrames) {
 }
 
 TEST(HighPerformanceTcpProtocolTest, MetadataAttributesRoundTrip) {
-    HighPerformanceTcpEndpointAttr endpoint{"00112233445566778899aabbccddeeff",
-                                            "127.0.0.1", 1234, 4096};
+    HighPerformanceTcpEndpointAttr endpoint{
+        "00112233445566778899aabbccddeeff", {{"127.0.0.1", 1234}}, 4096};
     std::string encoded;
     ASSERT_TRUE(EncodeHighPerformanceTcpEndpointAttr(endpoint, &encoded).ok());
     HighPerformanceTcpEndpointAttr decoded_endpoint;
     ASSERT_TRUE(
         DecodeHighPerformanceTcpEndpointAttr(encoded, &decoded_endpoint).ok());
     EXPECT_EQ(decoded_endpoint.incarnation, endpoint.incarnation);
-    EXPECT_EQ(decoded_endpoint.host, endpoint.host);
-    EXPECT_EQ(decoded_endpoint.port, endpoint.port);
+    ASSERT_EQ(decoded_endpoint.endpoints.size(), 1U);
+    EXPECT_EQ(decoded_endpoint.endpoints[0].host, "127.0.0.1");
+    EXPECT_EQ(decoded_endpoint.endpoints[0].port, 1234);
 
     ASSERT_TRUE(
         EncodeHighPerformanceTcpBufferAttr({42, "global_read_write"}, &encoded)
@@ -87,6 +88,21 @@ TEST(HighPerformanceTcpProtocolTest, MetadataAttributesRoundTrip) {
     EXPECT_FALSE(
         DecodeHighPerformanceTcpEndpointAttr("not-json", &decoded_endpoint)
             .ok());
+}
+
+TEST(HighPerformanceTcpProtocolTest, MultiRailMetadataRoundTrip) {
+    HighPerformanceTcpEndpointAttr endpoint{
+        "00112233445566778899aabbccddeeff",
+        {{"127.0.0.1", 1234}, {"127.0.0.2", 1234}},
+        4096};
+    std::string encoded;
+    ASSERT_TRUE(EncodeHighPerformanceTcpEndpointAttr(endpoint, &encoded).ok());
+    HighPerformanceTcpEndpointAttr decoded;
+    ASSERT_TRUE(DecodeHighPerformanceTcpEndpointAttr(encoded, &decoded).ok());
+    ASSERT_EQ(decoded.endpoints.size(), 2U);
+    EXPECT_EQ(decoded.endpoints[0].host, "127.0.0.1");
+    EXPECT_EQ(decoded.endpoints[1].host, "127.0.0.2");
+    EXPECT_EQ(decoded.endpoints[1].port, 1234);
 }
 
 }  // namespace

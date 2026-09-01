@@ -127,6 +127,27 @@ Status HighPerformanceTcpTransport::validateParams() const {
         return Status::InvalidArgument(
             "invalid high-performance TCP limits" LOC_MARK);
     }
+    if (!params_.rail_addresses.empty()) {
+        if (params_.rail_addresses.size() > params_.connections_per_peer ||
+            (params_.rail_addresses.size() > 1 &&
+             !params_.bind_address.empty() &&
+             params_.bind_address != "0.0.0.0")) {
+            return Status::InvalidArgument(
+                "HP TCP rails require one lane per address and a wildcard "
+                "listener" LOC_MARK);
+        }
+        for (size_t i = 0; i < params_.rail_addresses.size(); ++i) {
+            if (params_.rail_addresses[i].empty() ||
+                std::find(params_.rail_addresses.begin() + i + 1,
+                          params_.rail_addresses.end(),
+                          params_.rail_addresses[i]) !=
+                    params_.rail_addresses.end()) {
+                return Status::InvalidArgument(
+                    "HP TCP rail addresses must be non-empty and "
+                    "unique" LOC_MARK);
+            }
+        }
+    }
     return Status::OK();
 }
 
@@ -246,17 +267,25 @@ Status HighPerformanceTcpTransport::install(
     }
 
     const SegmentDescRef local = metadata_->segmentManager().getLocal();
-    const std::string host = params_.advertise_address.empty()
-                                 ? HostFromRpc(local->rpc_server_addr)
-                                 : params_.advertise_address;
-    if (host.empty()) {
+    std::vector<HighPerformanceTcpEndpoint> endpoints;
+    if (!params_.rail_addresses.empty()) {
+        for (const auto& address : params_.rail_addresses) {
+            endpoints.push_back({address, bound_port});
+        }
+    } else {
+        const std::string host = params_.advertise_address.empty()
+                                     ? HostFromRpc(local->rpc_server_addr)
+                                     : params_.advertise_address;
+        if (!host.empty()) endpoints.push_back({host, bound_port});
+    }
+    if (endpoints.empty()) {
         status = Status::InvalidArgument(
             "unable to derive HP TCP advertise address" LOC_MARK);
     } else {
         const std::string incarnation = makeIncarnation();
         std::string encoded;
         status = EncodeHighPerformanceTcpEndpointAttr(
-            {incarnation, host, bound_port, params_.max_transfer_bytes},
+            {incarnation, std::move(endpoints), params_.max_transfer_bytes},
             &encoded);
         if (status.ok()) {
             status = metadata_->segmentManager().updateLocal(
@@ -512,6 +541,15 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
     }
     const uint32_t lane_id = static_cast<uint32_t>(
         request_id % static_cast<uint64_t>(params_.connections_per_peer));
+    const size_t endpoint_count =
+        params_.rail_addresses.empty() ? 1 : params_.rail_addresses.size();
+    if (endpoint_attr.endpoints.size() != endpoint_count) {
+        return Status::InvalidArgument(
+            "HP TCP local and remote rail counts differ" LOC_MARK);
+    }
+    const uint32_t endpoint_id =
+        static_cast<uint32_t>(lane_id % endpoint_count);
+    const auto& endpoint = endpoint_attr.endpoints[endpoint_id];
     const size_t owner_worker =
         workers_->affinityOwner(request.target_id, lane_id);
 
@@ -523,8 +561,11 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
     HighPerformanceTcpClient::Operation operation;
     operation.peer_id = request.target_id;
     operation.incarnation = endpoint_attr.incarnation;
-    operation.host = endpoint_attr.host;
-    operation.port = endpoint_attr.port;
+    operation.host = endpoint.host;
+    if (!params_.rail_addresses.empty()) {
+        operation.local_host = params_.rail_addresses[endpoint_id];
+    }
+    operation.port = endpoint.port;
     operation.lane_id = lane_id;
     operation.registration_id = buffer_attr.registration_id;
     operation.remote_addr = request.target_offset;

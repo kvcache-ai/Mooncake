@@ -272,6 +272,47 @@ TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
     peer.join();
 }
 
+TEST(HighPerformanceTcpSocketTest, ClientBindsConfiguredSourceAddress) {
+    asio::io_context peer_io;
+    asio::ip::tcp::acceptor acceptor(peer_io,
+                                     {asio::ip::make_address("127.0.0.1"), 0});
+    std::string peer_address;
+    std::thread peer([&] {
+        asio::ip::tcp::socket socket(peer_io);
+        acceptor.accept(socket);
+        peer_address = socket.remote_endpoint().address().to_string();
+        std::array<uint8_t, kHighPerformanceTcpRequestSize> request{};
+        asio::read(socket, asio::buffer(request));
+        const uint8_t payload = 0x5a;
+        asio::write(socket, asio::buffer(&payload, 1));
+    });
+
+    HighPerformanceTcpWorkers workers({.worker_count = 1});
+    ASSERT_TRUE(workers.start().ok());
+    HighPerformanceTcpClient client({4096, 128, 1000, 1000, 1}, &workers);
+    std::array<uint8_t, 1> local{};
+    Completion completion;
+    auto operation = Operation(local.data(), local.size(), 0x1000, 1, 4,
+                               HighPerformanceTcpOpcode::kRead, &completion,
+                               acceptor.local_endpoint().port());
+    operation.local_host = "127.0.0.2";
+    std::vector<HighPerformanceTcpWorkers::Command> commands;
+    commands.push_back({.worker_id = 0,
+                        .run =
+                            [&](size_t) mutable {
+                                client.enqueueOnOwner(0, std::move(operation));
+                            },
+                        .cancel = {}});
+    ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
+    ASSERT_TRUE(completion.wait());
+    EXPECT_EQ(completion.status, COMPLETED);
+    EXPECT_EQ(local[0], 0x5a);
+    EXPECT_TRUE(client.cancelAll().ok());
+    EXPECT_TRUE(workers.stop().ok());
+    peer.join();
+    EXPECT_EQ(peer_address, "127.0.0.2");
+}
+
 TEST(HighPerformanceTcpSocketTest,
      WriteWithoutCompletionAckMarksRemoteOutcomeUnknown) {
     asio::io_context peer_io;
