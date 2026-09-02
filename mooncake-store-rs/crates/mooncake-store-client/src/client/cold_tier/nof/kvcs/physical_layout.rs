@@ -102,30 +102,27 @@ pub(super) fn build_write_layout<'a>(
 ) -> Result<KvcsWriteLayout<'a>> {
     let value_len = u64::try_from(value.len())
         .map_err(|_| StoreError::InvalidState("KVCS value length does not fit u64".to_string()))?;
-    if value_len <= max_value_size {
-        return Ok(KvcsWriteLayout {
-            locator: KvcsLayout::Inline.encode()?,
-            records: vec![(root_key.clone(), value)],
-        });
-    }
     let plan = ValueChunkPlan::new(value_len, max_value_size)?;
-    let layout = KvcsLayout::Chunked {
-        chunk_size: max_value_size,
-        chunk_count: plan.chunk_count(),
+    let inline = plan.chunk_count() == 1;
+    let layout = if inline {
+        KvcsLayout::Inline
+    } else {
+        KvcsLayout::Chunked {
+            chunk_size: max_value_size,
+            chunk_count: plan.chunk_count(),
+        }
     };
-    let mut records = Vec::with_capacity(usize::try_from(plan.chunk_count()).map_err(|_| {
-        StoreError::InvalidState("KVCS physical chunk count does not fit usize".to_string())
-    })?);
-    for index in 0..plan.chunk_count() {
-        let range = plan.range(index)?;
-        let start = usize::try_from(range.start).map_err(|_| {
-            StoreError::InvalidState("KVCS physical chunk start does not fit usize".to_string())
-        })?;
-        let end = usize::try_from(range.end).map_err(|_| {
-            StoreError::InvalidState("KVCS physical chunk end does not fit usize".to_string())
-        })?;
-        records.push((chunk_key(root_key, index)?, &value[start..end]));
-    }
+    let records = plan
+        .slices(value)?
+        .map(|(index, value)| {
+            let key = if inline {
+                root_key.clone()
+            } else {
+                chunk_key(root_key, index)?
+            };
+            Ok((key, value))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(KvcsWriteLayout {
         locator: layout.encode()?,
         records,

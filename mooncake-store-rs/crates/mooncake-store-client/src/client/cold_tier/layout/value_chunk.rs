@@ -36,12 +36,30 @@ impl ValueChunkPlan {
         })
     }
 
-    pub(crate) fn max_chunk_len(self) -> u64 {
-        self.max_chunk_len
-    }
-
     pub(crate) fn chunk_count(self) -> u64 {
         self.chunk_count
+    }
+
+    pub(crate) fn slices<'a>(
+        self,
+        value: &'a [u8],
+    ) -> Result<impl Iterator<Item = (u64, &'a [u8])> + 'a> {
+        let value_len = u64::try_from(value.len())
+            .map_err(|_| StoreError::InvalidState("value length does not fit u64".to_string()))?;
+        if value_len != self.total_len {
+            return Err(StoreError::InvalidState(
+                "value length does not match its chunk plan".to_string(),
+            ));
+        }
+        if self.chunk_count == 0 {
+            return Err(StoreError::InvalidState(
+                "chunked value must not be empty".to_string(),
+            ));
+        }
+        let chunk_len = usize::try_from(self.max_chunk_len.min(value_len)).map_err(|_| {
+            StoreError::InvalidState("value chunk length does not fit usize".to_string())
+        })?;
+        Ok((0u64..).zip(value.chunks(chunk_len)))
     }
 
     pub(crate) fn range(self, chunk_index: u64) -> Result<Range<u64>> {
@@ -88,6 +106,7 @@ mod tests {
         let plan = ValueChunkPlan::new(0, 4).unwrap();
         assert_eq!(plan.chunk_count(), 0);
         assert!(plan.range(0).is_err());
+        assert!(plan.slices(&[]).is_err());
     }
 
     #[test]

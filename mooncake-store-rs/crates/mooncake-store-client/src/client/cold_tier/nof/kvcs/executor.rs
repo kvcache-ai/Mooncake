@@ -260,16 +260,6 @@ mod standard {
         shards: Vec<(u32, usize)>,
     }
 
-    struct QueryResultGuard {
-        raw: KvcsQueryResult,
-    }
-
-    impl Drop for QueryResultGuard {
-        fn drop(&mut self) {
-            unsafe { kvcs_query_result_free(&mut self.raw, 1) };
-        }
-    }
-
     fn query_shards(
         raw: &KvcsQueryResult,
         with_shards: bool,
@@ -368,7 +358,7 @@ mod standard {
                 renew: 0,
                 with_shards: c_int::from(with_shards),
             };
-            let mut raw: KvcsQueryResult = unsafe { std::mem::zeroed() };
+            let mut results = QueryResults::new(1);
             let count = unsafe {
                 kvcs_batch_query(
                     client,
@@ -376,7 +366,7 @@ mod standard {
                     &key_ptr,
                     1,
                     &options,
-                    &mut raw,
+                    results.as_mut_ptr(),
                     1,
                 )
             };
@@ -388,8 +378,8 @@ mod standard {
                     "KVCS Standard query returned {count} results for one request"
                 )));
             }
-            let raw = QueryResultGuard { raw };
-            let status = char_array_str(&raw.raw.status).map_err(|error| {
+            let raw = &results.as_slice()[0];
+            let status = char_array_str(&raw.status).map_err(|error| {
                 StoreError::Transport(format!(
                     "KVCS Standard query returned invalid status: {error}"
                 ))
@@ -398,10 +388,10 @@ mod standard {
                 "not_found" => Ok(NofObjectState::Missing),
                 "incomplete" => Ok(NofObjectState::Incomplete),
                 "ok" => {
-                    let length = u64::try_from(raw.raw.total_size).map_err(|_| {
+                    let length = u64::try_from(raw.total_size).map_err(|_| {
                         StoreError::InvalidState("KVCS query returned a negative size".to_string())
                     })?;
-                    if raw.raw.total_shard <= 0 {
+                    if raw.total_shard <= 0 {
                         return Err(StoreError::InvalidState(
                             "KVCS complete query returned a non-positive shard count".to_string(),
                         ));
@@ -411,16 +401,11 @@ mod standard {
                             "KVCS complete query returned an empty object".to_string(),
                         ));
                     }
-                    let total_shards = u32::try_from(raw.raw.total_shard).map_err(|_| {
+                    let total_shards = u32::try_from(raw.total_shard).map_err(|_| {
                         StoreError::InvalidState("KVCS query shard count exceeds u32".to_string())
                     })?;
-                    let shards = query_shards(
-                        &raw.raw,
-                        with_shards,
-                        length,
-                        total_shards,
-                        self.max_value_size,
-                    )?;
+                    let shards =
+                        query_shards(raw, with_shards, length, total_shards, self.max_value_size)?;
                     Ok(NofObjectState::Found(RawQuery {
                         namespace,
                         key,
@@ -474,7 +459,7 @@ mod standard {
                     ),
                 );
             }
-            let (mut results, valid) = prepare_positional(requests, |request| {
+            let (results, valid) = prepare_positional(requests, |request| {
                 let key = self.key(request.key)?;
                 if request.value.len() as u64 > self.max_value_size {
                     return Err(StoreError::InvalidState(format!(
@@ -519,12 +504,7 @@ mod standard {
                     meta_count: 0,
                 })
                 .collect::<Vec<_>>();
-            let mut native_results = (0..valid.len())
-                .map(|_| KvcsPutResult {
-                    location: [0; 256],
-                    status: 0,
-                })
-                .collect::<Vec<_>>();
+            let mut native_results = put_results(valid.len());
             let status = unsafe {
                 kvcs_batch_put(
                     client,
@@ -539,14 +519,13 @@ mod standard {
             if status < 0 {
                 return fail_positional_results(results, map_call_status(status, "Standard put"));
             }
-            for ((index, _), native) in valid.iter().zip(native_results) {
-                results[*index] = Some(if native.status == 0 {
-                    Ok(())
-                } else {
-                    Err(map_item_status(native.status, "Standard put item", true))
-                });
-            }
-            finish_positional_results(results)
+            finish_unit_statuses(
+                results,
+                &valid,
+                native_results.into_iter().map(|result| result.status),
+                "Standard put item",
+                true,
+            )
         }
     }
 
@@ -745,10 +724,7 @@ mod low_level {
     //! KVCS Low-Level SDK executor for the NoF physical KV contract.
 
     use std::collections::HashSet;
-    use std::ffi::c_int;
-    use std::ptr;
 
-    use libc::size_t;
     use mooncake_store_core::{Result, StoreError};
 
     use super::super::physical_layout::{
@@ -762,37 +738,8 @@ mod low_level {
     };
 
     impl KvcsCapiExecutor {
-        fn call_get_into(
-            &self,
-            client: *mut KvcsClient,
-            items: &[KvcsLlGetItem],
-            buffers: &mut [Vec<u8>],
-        ) -> Result<(Vec<c_int>, Vec<size_t>)> {
-            let count = checked_batch_len(items.len())?;
-            let (mut pointers, capacities, mut statuses, mut lengths) = output_buffers(buffers);
-            let options = self.low_level_options();
-            let status = unsafe {
-                kvcs_ll_batch_get_into(
-                    client,
-                    items.as_ptr(),
-                    count,
-                    pointers.as_mut_ptr(),
-                    capacities.as_ptr(),
-                    statuses.as_mut_ptr(),
-                    lengths.as_mut_ptr(),
-                    0,
-                    &options,
-                )
-            };
-            if status < 0 {
-                Err(map_call_status(status, "low-level get"))
-            } else {
-                Ok((statuses, lengths))
-            }
-        }
-
         fn put_records(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
-            let (mut results, valid) = prepare_positional(requests, |(key, value)| {
+            let (results, valid) = prepare_positional(requests, |(key, value)| {
                 Ok((encode_physical_key(key, DEFAULT_MAX_KEY_SIZE)?, *value))
             });
             if valid.is_empty() {
@@ -813,12 +760,7 @@ mod low_level {
                     seg_count: 1,
                 })
                 .collect::<Vec<_>>();
-            let mut native_results = (0..valid.len())
-                .map(|_| KvcsPutResult {
-                    location: [0; 256],
-                    status: 0,
-                })
-                .collect::<Vec<_>>();
+            let mut native_results = put_results(valid.len());
             let options = self.low_level_options();
             let status = unsafe {
                 kvcs_ll_batch_put(
@@ -834,14 +776,13 @@ mod low_level {
             if status < 0 {
                 return fail_positional_results(results, map_call_status(status, "low-level put"));
             }
-            for ((index, _), native) in valid.iter().zip(native_results) {
-                results[*index] = Some(if native.status == 0 {
-                    Ok(())
-                } else {
-                    Err(map_item_status(native.status, "low-level put item", true))
-                });
-            }
-            finish_positional_results(results)
+            finish_unit_statuses(
+                results,
+                &valid,
+                native_results.into_iter().map(|result| result.status),
+                "low-level put item",
+                true,
+            )
         }
 
         fn get_records(&self, requests: &[KvcsReadRecord]) -> Vec<Result<Option<Vec<u8>>>> {
@@ -854,8 +795,8 @@ mod low_level {
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
-            let client = match self.ensure_client() {
-                Ok(client) => client,
+            let (client, count) = match self.prepare_batch(valid.len()) {
+                Ok(prepared) => prepared,
                 Err(error) => return fail_positional_results(results, error),
             };
             let items = valid
@@ -866,52 +807,26 @@ mod low_level {
                 .iter()
                 .map(|(_, (_, hint))| vec![0; *hint])
                 .collect::<Vec<_>>();
-            let (mut statuses, mut lengths) = match self.call_get_into(client, &items, &mut buffers)
-            {
-                Ok(output) => output,
-                Err(error) => return fail_positional_results(results, error),
+            let (mut pointers, capacities, mut statuses, mut lengths) =
+                output_buffers(&mut buffers);
+            let options = self.low_level_options();
+            let status = unsafe {
+                kvcs_ll_batch_get_into(
+                    client,
+                    items.as_ptr(),
+                    count,
+                    pointers.as_mut_ptr(),
+                    capacities.as_ptr(),
+                    statuses.as_mut_ptr(),
+                    lengths.as_mut_ptr(),
+                    0,
+                    &options,
+                )
             };
-            for index in 0..valid.len() {
-                if statuses[index] == -(libc::ENOSPC as c_int)
-                    && lengths[index] > buffers[index].len()
-                {
-                    let actual_len = match u64::try_from(lengths[index]) {
-                        Ok(actual_len) if actual_len <= self.max_value_size => actual_len,
-                        Ok(actual_len) => {
-                            results[valid[index].0] = Some(Err(StoreError::InvalidState(format!(
-                                "KVCS low-level value size {actual_len} exceeds provider limit {}",
-                                self.max_value_size
-                            ))));
-                            continue;
-                        }
-                        Err(_) => {
-                            results[valid[index].0] = Some(Err(StoreError::InvalidState(
-                                "KVCS low-level value length does not fit u64".to_string(),
-                            )));
-                            continue;
-                        }
-                    };
-                    debug_assert_eq!(actual_len as usize, lengths[index]);
-                    buffers[index].resize(lengths[index], 0);
-                    match self.call_get_into(
-                        client,
-                        &items[index..=index],
-                        std::slice::from_mut(&mut buffers[index]),
-                    ) {
-                        Ok((status, length)) => {
-                            statuses[index] = status[0];
-                            lengths[index] = length[0];
-                        }
-                        Err(error) => {
-                            results[valid[index].0] = Some(Err(error));
-                        }
-                    }
-                }
+            if status < 0 {
+                return fail_positional_results(results, map_call_status(status, "low-level get"));
             }
             for (offset, ((request_index, _), status)) in valid.iter().zip(statuses).enumerate() {
-                if results[*request_index].is_some() {
-                    continue;
-                }
                 results[*request_index] = Some(if status > 0 {
                     if lengths[offset] > buffers[offset].len() {
                         Err(StoreError::Backpressure(
@@ -931,7 +846,7 @@ mod low_level {
         }
 
         fn delete_records(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<()>> {
-            let (mut results, valid) =
+            let (results, valid) =
                 prepare_positional(keys, |key| encode_physical_key(key, DEFAULT_MAX_KEY_SIZE));
             if valid.is_empty() {
                 return finish_positional_results(results);
@@ -963,14 +878,7 @@ mod low_level {
                     map_call_status(status, "low-level delete"),
                 );
             }
-            for ((request_index, _), status) in valid.iter().zip(statuses) {
-                results[*request_index] = Some(if status == 0 {
-                    Ok(())
-                } else {
-                    Err(map_item_status(status, "low-level delete item", true))
-                });
-            }
-            finish_positional_results(results)
+            finish_unit_statuses(results, &valid, statuses, "low-level delete item", true)
         }
 
         fn query_records(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
@@ -987,18 +895,7 @@ mod low_level {
                 .iter()
                 .map(|(_, key)| key.as_ptr())
                 .collect::<Vec<_>>();
-            let mut native_results = (0..valid.len())
-                .map(|_| KvcsQueryResult {
-                    key: [0; 256],
-                    status: [0; 32],
-                    total_shard: 0,
-                    total_size: 0,
-                    meta: ptr::null_mut(),
-                    meta_count: 0,
-                    shards: ptr::null_mut(),
-                    shard_count: 0,
-                })
-                .collect::<Vec<_>>();
+            let mut native_results = QueryResults::new(count);
             let options = self.low_level_options();
             let written = unsafe {
                 kvcs_ll_batch_query(
@@ -1022,11 +919,10 @@ mod low_level {
                 ));
                 fill_missing(&mut results, &error);
             } else {
-                for ((request_index, _), native) in valid.iter().zip(&native_results) {
+                for ((request_index, _), native) in valid.iter().zip(native_results.as_slice()) {
                     results[*request_index] = Some(kvcs_low_level_query_status(&native.status));
                 }
             }
-            unsafe { kvcs_query_result_free(native_results.as_mut_ptr(), count) };
             finish_positional_results(results)
         }
 
@@ -1104,36 +1000,29 @@ mod low_level {
                 }
             });
 
-            let positions = layouts
+            let records = layouts
                 .iter()
-                .enumerate()
-                .flat_map(|(layout_index, (request_index, layout))| {
+                .flat_map(|(request_index, layout)| {
                     layout
                         .records
                         .iter()
-                        .enumerate()
-                        .map(move |(record_index, _)| (layout_index, *request_index, record_index))
+                        .map(move |(key, value)| (*request_index, key.clone(), *value))
                 })
                 .collect::<Vec<_>>();
-            let records = positions
+            let writes = records
                 .iter()
-                .map(|(layout_index, _, record_index)| {
-                    let (key, value) = &layouts[*layout_index].1.records[*record_index];
-                    (key.clone(), *value)
-                })
+                .map(|(_, key, value)| (key.clone(), *value))
                 .collect::<Vec<_>>();
-            let record_results = self.put_records(&records);
-            let mut layout_ok = vec![true; requests.len()];
-            for ((_, request_index, _), status) in positions.into_iter().zip(record_results) {
+            let record_results = self.put_records(&writes);
+            for ((request_index, _, _), status) in records.into_iter().zip(record_results) {
                 if let Err(error) = status {
-                    layout_ok[request_index] = false;
                     if results[request_index].is_none() {
                         results[request_index] = Some(Err(error));
                     }
                 }
             }
             for (request_index, layout) in layouts {
-                if layout_ok[request_index] {
+                if results[request_index].is_none() {
                     results[request_index] = Some(Ok(layout.locator));
                 }
             }

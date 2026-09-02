@@ -75,7 +75,7 @@ impl NofRuntimeTarget {
         self.health.read().snapshot()
     }
 
-    fn heartbeat(&self, target_id: &str) {
+    fn heartbeat(&self, target_id: &str) -> bool {
         let result = self.backend.health();
         let mut health = self.health.write();
         let previous_failures = health.consecutive_failures;
@@ -98,6 +98,7 @@ impl NofRuntimeTarget {
             }
             _ => {}
         }
+        health.snapshot().is_ok()
     }
 }
 
@@ -213,8 +214,7 @@ impl NofOwnerState {
                     .targets
                     .get(target_id)
                     .expect("ownership only contains registered NoF targets");
-                target.heartbeat(target_id);
-                target.health_snapshot().is_err()
+                !target.heartbeat(target_id)
             })
             .collect();
         self.publish_unhealthy_targets(unhealthy);

@@ -98,11 +98,6 @@ impl NofBackend {
         value: &[u8],
     ) -> Result<NofObjectMetadata> {
         self.validate_key(key)?;
-        if value.is_empty() {
-            return Err(StoreError::InvalidState(
-                "NoF objects must not contain an empty shard".to_string(),
-            ));
-        }
         let limits = self
             .object_limits
             .ok_or_else(|| unsupported("object limits"))?;
@@ -118,16 +113,11 @@ impl NofBackend {
             StoreError::InvalidState("NoF shard count exceeds provider ABI".to_string())
         })?;
         let mut requests = Vec::with_capacity(total_shards as usize);
-        for shard_id in 0..plan.chunk_count() {
-            let range = plan.range(shard_id)?;
-            let start = usize::try_from(range.start)
-                .map_err(|_| StoreError::InvalidState("NoF shard start overflow".to_string()))?;
-            let end = usize::try_from(range.end)
-                .map_err(|_| StoreError::InvalidState("NoF shard end overflow".to_string()))?;
+        for (shard_id, value) in plan.slices(value)? {
             requests.push(NofObjectShardWrite {
                 namespace,
                 key,
-                value: &value[start..end],
+                value,
                 shard_id: u32::try_from(shard_id).map_err(|_| {
                     StoreError::InvalidState("NoF shard index exceeds provider ABI".to_string())
                 })?,
