@@ -15,8 +15,10 @@ endif()
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
-add_library(conductor_cpp_core STATIC src/common/utils.cpp
-                                      src/prefixindex/hash_strategy.cpp)
+add_library(
+  conductor_cpp_core STATIC
+  src/common/utils.cpp src/prefixindex/hash_strategy.cpp
+  src/prefixindex/prefix_indexer.cpp)
 
 # mooncake-common headers are consumed directly instead of linking
 # mooncake_common: the helpers conductor needs (ascii_string.h,
