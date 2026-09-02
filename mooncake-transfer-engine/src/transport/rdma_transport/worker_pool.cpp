@@ -128,7 +128,7 @@ static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
     RdmaContext &context, const std::string &peer_nic_path,
     const std::shared_ptr<RdmaEndPoint> &endpoint,
     std::unique_lock<std::mutex> &endpoint_lifecycle_lock,
-    const std::function<bool()> &drain_cq_while_waiting) {
+    const std::function<int()> &drain_cq_while_waiting) {
     const bool had_lifecycle_gate = endpoint_lifecycle_lock.owns_lock();
     if (had_lifecycle_gate) endpoint_lifecycle_lock.unlock();
 
@@ -139,11 +139,26 @@ static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
         auto setup_future = activeEndpointSetupExecutor().submit(endpoint);
         auto wait_period = std::chrono::milliseconds(1);
         constexpr auto kMaxWaitPeriod = std::chrono::milliseconds(25);
-        while (setup_future.wait_for(wait_period) !=
+        while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
                std::future_status::ready) {
-            if (drain_cq_while_waiting()) {
+            bool made_progress = false;
+            while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
+                   std::future_status::ready) {
+                const int drained = drain_cq_while_waiting();
+                if (drained <= 0) break;
+                made_progress = true;
+            }
+            if (setup_future.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
+                break;
+            }
+            if (made_progress) {
                 wait_period = std::chrono::milliseconds(1);
             } else {
+                if (setup_future.wait_for(wait_period) ==
+                    std::future_status::ready) {
+                    break;
+                }
                 wait_period = std::min(wait_period * 2, kMaxWaitPeriod);
             }
         }
@@ -551,9 +566,8 @@ void WorkerPool::performPostSend(int thread_id) {
             auto setup_result = setupEndpointByActiveOutsideLifecycleGate(
                 context_, entry.first, endpoint, endpoint_lifecycle_lock,
                 [this, thread_id] {
-                    if (!hasOutstandingCq(thread_id)) return false;
-                    performPollCq(thread_id, true);
-                    return true;
+                    if (!hasOutstandingCq(thread_id)) return 0;
+                    return performPollCq(thread_id, true);
                 });
             if (!setup_result.endpoint_current) {
                 LOG(WARNING)
@@ -658,9 +672,9 @@ void WorkerPool::performPostSend(int thread_id) {
     }
 }
 
-void WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
-    if (context_.cqCount() <= 0) return;
-    if (thread_id < 0 || thread_id >= worker_count_) return;
+int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
+    if (context_.cqCount() <= 0) return 0;
+    if (thread_id < 0 || thread_id >= worker_count_) return 0;
 
     const uint64_t poll_ts = getCurrentTimeInNano();
     const uint64_t previous_poll_ts =
@@ -681,13 +695,13 @@ void WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     std::vector<ibv_wc> wc_list;
     const int cq_index = cqIndexForPostingThread(thread_id);
-    if (cq_index < 0) return;
-    if (!context_.cq(cq_index)) return;
+    if (cq_index < 0) return 0;
+    if (!context_.cq(cq_index)) return 0;
     ibv_wc wc[kPollCount];
     int nr_poll = context_.poll(kPollCount, wc, cq_index);
     if (nr_poll < 0) {
         LOG(ERROR) << "Worker: Failed to poll completion queues";
-        return;
+        return nr_poll;
     }
 
     if (nr_poll > 0 && globalConfig().track_rdma_posted_slices) {
@@ -717,6 +731,7 @@ void WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
 
     if (!wc_list.empty())
         processCompletions(thread_id, wc_list, defer_local_redispatch);
+    return nr_poll;
 }
 
 void WorkerPool::processCompletions(int thread_id,

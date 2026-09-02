@@ -61,7 +61,7 @@ class WorkerPool {
 
     void performPostSend(int thread_id);
 
-    void performPollCq(int thread_id, bool defer_local_redispatch = false);
+    int performPollCq(int thread_id, bool defer_local_redispatch = false);
     void processCompletions(int thread_id, const std::vector<ibv_wc> &wc_list,
                             bool defer_local_redispatch = false);
 
