@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -167,6 +168,15 @@ class Config {
 
     // If key_path resolves to a JSON value, dump it into *out and return true.
     bool dumpSubtree(const std::string& key_path, std::string* out) const;
+
+    // Capture the complete configuration while holding a single lock. The
+    // returned object is independently owned and exposed as const so readers
+    // can share one coherent, immutable view of the configuration.
+    std::shared_ptr<const Config> freeze() const;
+
+    // Return canonical slash-delimited paths for every configured value.
+    // Arrays and empty objects are treated as values rather than traversed.
+    std::vector<std::string> paths() const;
 
    private:
     json config_data_;

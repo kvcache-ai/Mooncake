@@ -22,6 +22,30 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+void collectConfigPaths(const json& node, const std::string& prefix,
+                        std::vector<std::string>& paths) {
+    // A default-constructed Config has a null root and represents an empty
+    // configuration whose callers rely entirely on defaults.
+    if (prefix.empty() && node.is_null()) return;
+    if (!node.is_object()) {
+        paths.push_back(prefix);
+        return;
+    }
+    if (node.empty()) {
+        if (!prefix.empty()) paths.push_back(prefix);
+        return;
+    }
+
+    for (auto it = node.begin(); it != node.end(); ++it) {
+        std::string path = prefix.empty() ? it.key() : prefix + "/" + it.key();
+        collectConfigPaths(it.value(), path, paths);
+    }
+}
+
+}  // namespace
+
 Status Config::load(const std::string& content) {
     std::lock_guard<std::mutex> lock(mutex_);
     try {
@@ -77,6 +101,24 @@ bool Config::dumpSubtree(const std::string& key_path, std::string* out) const {
         return true;
     }
     return false;
+}
+
+std::shared_ptr<const Config> Config::freeze() const {
+    auto frozen = std::make_shared<Config>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    frozen->config_data_ = config_data_;
+    return frozen;
+}
+
+std::vector<std::string> Config::paths() const {
+    std::vector<std::string> paths;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        collectConfigPaths(config_data_, "", paths);
+    }
+    std::sort(paths.begin(), paths.end());
+    paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+    return paths;
 }
 
 static inline void setConfig(Config& config, const std::string& env_key,
