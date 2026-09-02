@@ -97,6 +97,7 @@ RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
       ready_wait_start_ts_(0),
       wr_depth_list_(nullptr),
       active_(true),
+      cq_(nullptr),
       cq_outstanding_(nullptr) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
@@ -118,6 +119,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     }
 
     qp_list_.resize(num_qp_list);
+    cq_ = cq;
     cq_outstanding_ = static_cast<std::atomic<int> *>(cq->cq_context);
 
     max_wr_depth_ = (int)max_wr_depth;
@@ -172,9 +174,7 @@ int RdmaEndPoint::reconstruct() {
         return ret;
     }
 
-    // Get CQ from context for reconstruction
-    ibv_cq *cq = context_.cq();
-    if (!cq) {
+    if (!cq_) {
         LOG(ERROR) << "No CQ available for endpoint reconstruction";
         return ERR_ENDPOINT;
     }
@@ -184,7 +184,7 @@ int RdmaEndPoint::reconstruct() {
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
     active_.store(true, std::memory_order_release);
 
-    return construct(cq, num_qp, max_sge_per_wr, max_wr_depth,
+    return construct(cq_, num_qp, max_sge_per_wr, max_wr_depth,
                      max_inline_bytes);
 }
 
@@ -218,7 +218,8 @@ int RdmaEndPoint::deconstructLocked() {
         if (!qp_list_[i]) continue;  // already destroyed in a previous call
         int ret = ibv_destroy_qp(qp_list_[i]);
         if (ret) {
-            LOG(ERROR) << "Failed to destroy QP[" << i << "]: " << strerror(ret);
+            LOG(ERROR) << "Failed to destroy QP[" << i
+                       << "]: " << strerror(ret);
             result = ERR_ENDPOINT;
         } else {
             qp_list_[i] = nullptr;
@@ -299,8 +300,9 @@ bool RdmaEndPoint::finishDestroy() {
         // Fall through to the unified destroy path.
     } else {
         // Gate 3: two-phase path. Wait for inflight WRs to drain via CQ
-        // polling. If ibv_modify_qp-to-ERR failed in beginDestroy, WRs may
-        // never be flushed; enforce a timeout to avoid leaking forever.
+        // polling. If they never drain, keep the retired endpoint alive in
+        // the waiting list. Leaking this object is safer than forcing QP
+        // destruction while stale slice references may still exist.
         bool has_outstanding = false;
         for (size_t i = 0; i < qp_list_.size(); ++i) {
             if (wr_depth_list_[i].load(std::memory_order_relaxed) != 0) {
@@ -313,8 +315,13 @@ bool RdmaEndPoint::finishDestroy() {
                               inactive_time_.load(std::memory_order_relaxed)) /
                              1e9;
             if (elapsed < kFinishDestroyTimeoutSec) return false;
-            LOG(WARNING) << "finishDestroy timed out after " << elapsed
-                         << "s with outstanding WRs, forcing destruction";
+            if (!finish_destroy_timeout_logged_) {
+                LOG(ERROR) << "finishDestroy timed out after " << elapsed
+                           << "s with outstanding WRs; keeping retired "
+                              "endpoint alive to avoid UAF";
+                finish_destroy_timeout_logged_ = true;
+            }
+            return false;
         }
     }
 
@@ -345,6 +352,11 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
         return;
     }
     peer_nic_path_ = peer_nic_path;
+}
+
+std::string RdmaEndPoint::peerNicPath() const {
+    RWSpinlock::ReadGuard guard(lock_);
+    return peer_nic_path_;
 }
 
 int RdmaEndPoint::setupConnectionsByActive() {
@@ -1245,8 +1257,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         LOG(ERROR) << "[Handshake] " << message
                    << ": local=" << context_.nicPath()
                    << ", peer=" << peer_nic_path_ << ", qp_index=" << qp_index
-                   << ", local_qp=" << qp->qp_num
-                   << ", peer_qp=" << peer_qp_num
+                   << ", local_qp=" << qp->qp_num << ", peer_qp=" << peer_qp_num
                    << ", local_gid=" << context_.gid()
                    << ", local_gid_index=" << local_gid_index
                    << ", peer_gid=" << gidToString(peer_gid)

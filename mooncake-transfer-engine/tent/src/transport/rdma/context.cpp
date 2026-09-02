@@ -882,6 +882,21 @@ int RdmaContext::refreshPortAttributes() {
     return 0;
 }
 
+int RdmaContext::queryPortState(ibv_port_state* state) const {
+    if (!state || !native_context_ || !params_) return -1;
+    ibv_port_attr port_attr;
+    if (verbs_.ibv_query_port_default(native_context_, params_->device.port,
+                                      &port_attr)) {
+        PLOG(WARNING) << "Failed to query state of port "
+                      << static_cast<int>(params_->device.port) << " on "
+                      << device_name_;
+        return -1;
+    }
+    // No recordPortSpeed() here on purpose -- see the header.
+    *state = port_attr.state;
+    return 0;
+}
+
 void RdmaContext::queryEffectiveSpeed() {
     if (!native_context_ || !verbs_.ibv_query_port_speed) {
         effective_speed_mbps_.store(0, std::memory_order_relaxed);

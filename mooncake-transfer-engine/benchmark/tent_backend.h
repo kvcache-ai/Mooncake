@@ -170,6 +170,9 @@ class TENTBenchRunner : public BenchRunner {
                           "target address");
     }
 
+    // Returns elapsed microseconds on success, or a negative value if the
+    // transfer failed. Never calls exit() — workers set g_tent_running so
+    // main can join threads and stop the engine first.
     double runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                              uint64_t target_addr, uint64_t block_size,
                              uint64_t batch_size, OpCode opcode,
@@ -181,6 +184,8 @@ class TENTBenchRunner : public BenchRunner {
     int freeBuffers();
 
     int runner(int thread_id);
+
+    void noteTransferFailed();
 
     size_t targetIndex(int thread_id) const;
 
