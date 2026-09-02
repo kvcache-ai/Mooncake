@@ -184,6 +184,62 @@ target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
 
+add_executable(tent_hp_tcp_transport_config_test
+               hp_tcp_transport_config_test.cpp)
+target_link_libraries(tent_hp_tcp_transport_config_test
+                      PRIVATE gtest gtest_main tent_link_group)
+target_include_directories(tent_hp_tcp_transport_config_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_transport_config_test
+         COMMAND tent_hp_tcp_transport_config_test)
+
+add_executable(tent_hp_tcp_workers_test hp_tcp_workers_test.cpp)
+target_link_libraries(tent_hp_tcp_workers_test PRIVATE gtest gtest_main
+                                                       tent_xport_hp_tcp_core)
+target_include_directories(tent_hp_tcp_workers_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_workers_test COMMAND tent_hp_tcp_workers_test)
+
+add_executable(tent_hp_tcp_protocol_test hp_tcp_protocol_test.cpp)
+target_link_libraries(tent_hp_tcp_protocol_test PRIVATE gtest gtest_main
+                                                        tent_xport_hp_tcp_core)
+target_include_directories(tent_hp_tcp_protocol_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_protocol_test COMMAND tent_hp_tcp_protocol_test)
+
+add_executable(tent_hp_tcp_buffer_registry_test hp_tcp_buffer_registry_test.cpp)
+target_link_libraries(tent_hp_tcp_buffer_registry_test
+                      PRIVATE gtest gtest_main tent_xport_hp_tcp_core)
+target_include_directories(tent_hp_tcp_buffer_registry_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_buffer_registry_test
+         COMMAND tent_hp_tcp_buffer_registry_test)
+
+add_executable(tent_hp_tcp_socket_test hp_tcp_socket_test.cpp)
+target_link_libraries(tent_hp_tcp_socket_test PRIVATE gtest gtest_main
+                                                      tent_xport_hp_tcp_core)
+target_include_directories(tent_hp_tcp_socket_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_socket_test COMMAND tent_hp_tcp_socket_test)
+
+add_executable(tent_hp_tcp_transport_test hp_tcp_transport_test.cpp)
+target_link_libraries(tent_hp_tcp_transport_test PRIVATE gtest gtest_main
+                                                         tent_link_group)
+target_include_directories(tent_hp_tcp_transport_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_transport_test COMMAND tent_hp_tcp_transport_test)
+
+add_executable(tent_hp_tcp_e2e_test hp_tcp_e2e_test.cpp)
+target_link_libraries(tent_hp_tcp_e2e_test PRIVATE gtest gtest_main
+                                                   tent_link_group)
+target_include_directories(tent_hp_tcp_e2e_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(
+  NAME tent_hp_tcp_e2e_test_concurrency_16
+  COMMAND tent_hp_tcp_e2e_test
+          --gtest_filter=HighPerformanceTcpE2eTest.WriteThenReadConcurrency16)
+set_tests_properties(tent_hp_tcp_e2e_test_concurrency_16 PROPERTIES TIMEOUT 120)
+
 add_executable(tent_tcp_datapath_roundtrip_test tcp_datapath_roundtrip_test.cpp)
 target_link_libraries(tent_tcp_datapath_roundtrip_test PRIVATE gtest gtest_main
                                                                tent_link_group)

@@ -82,6 +82,19 @@
             "retry_max_delay_ms": 2000,
             "max_concurrent_tasks": 16
         },
+        "hp_tcp": {
+            "enable": false,
+            "bind_address": "",
+            "advertise_address": "",
+            "port": 0,
+            "worker_count": 16,
+            "connections_per_peer": 4,
+            "max_outstanding_tasks": 4096,
+            "max_outstanding_bytes": 4294967296,
+            "max_transfer_bytes": 1073741824,
+            "connect_timeout_ms": 2000,
+            "progress_timeout_ms": 30000
+        },
         "gds": {
             "enable" : true
         },
@@ -98,7 +111,7 @@
             "name": "default_memory",
             "segment_type": "memory",
             "devices": ["mlx5_0", "mlx5_2"],
-            "transports": ["nvlink", "rdma", "shm"]
+            "transports": ["nvlink", "rdma", "shm", "hp_tcp"]
         },
         {
             "name": "file_storage",
