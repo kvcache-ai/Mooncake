@@ -46,7 +46,6 @@ add_store_test(centralized_client_manager_test centralized_client_manager_test.c
 add_store_test(task_manager_test task_manager_test.cpp)
 add_subdirectory(p2p)
 add_subdirectory(e2e)
-
 add_executable(high_availability_test high_availability_test.cpp)
 target_link_libraries(high_availability_test PUBLIC ${MOONCAKE_STORE_LIBS} transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
 if (STORE_USE_ETCD)
