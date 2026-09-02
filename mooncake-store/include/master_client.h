@@ -245,6 +245,13 @@ class MasterClient {
         // wire-identical to a plain send_request; non-reading server handlers
         // ignore it, so this is gray across all master RPCs.
         std::string ctx_attachment = current_request_id_attachment();
+        // Real-client-side hop-B inject trace. VLOG(2): off at -v=1 (where
+        // only the master logs), on at -v>=2 for per-hop tracing. Fires on
+        // both the real path (in-proc) and the dummy path (real-client server
+        // thread) since master_client_ is shared.
+        if (!ctx_attachment.empty()) {
+            VLOG(2) << "hop-B inject request_id=" << ctx_attachment;
+        }
         auto start_time = std::chrono::steady_clock::now();
         auto ret = co_await pool->send_request(
             [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
@@ -307,6 +314,13 @@ class MasterClient {
         // just like single-result RPCs. An empty attachment is wire-identical to
         // a plain send_request and is ignored by non-reading handlers (gray).
         std::string ctx_attachment = current_request_id_attachment();
+        // Real-client-side hop-B inject trace. VLOG(2): off at -v=1 (where
+        // only the master logs), on at -v>=2 for per-hop tracing. Fires on
+        // both the real path (in-proc) and the dummy path (real-client server
+        // thread) since master_client_ is shared.
+        if (!ctx_attachment.empty()) {
+            VLOG(2) << "hop-B inject request_id=" << ctx_attachment;
+        }
         auto start_time = std::chrono::steady_clock::now();
         return async_simple::coro::syncAwait(
             [&]() -> async_simple::coro::Lazy<

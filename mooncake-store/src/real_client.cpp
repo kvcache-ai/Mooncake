@@ -341,6 +341,10 @@ void RealClient::put_dummy_helper(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
@@ -444,6 +448,10 @@ void RealClient::put_batch_dummy_helper(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
@@ -540,6 +548,10 @@ void RealClient::put_parts_dummy_helper(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
@@ -1017,6 +1029,10 @@ void RealClient::get_buffer_info_dummy_helper(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
@@ -1150,6 +1166,10 @@ RealClient::batch_put_from_dummy_helper(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
@@ -1341,6 +1361,10 @@ RealClient::batch_get_into_dummy_helper(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
@@ -1461,6 +1485,10 @@ void RealClient::batchIsExist_internal_rpc(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
@@ -1479,6 +1507,10 @@ void RealClient::isExist_internal_rpc(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
@@ -1496,6 +1528,10 @@ void RealClient::remove_internal_rpc(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
@@ -1513,6 +1549,10 @@ void RealClient::getSize_internal_rpc(
     std::optional<CurrentCtxScope> ctx_guard;
     if (auto att = ctx.get_context_info()->get_request_attachment();
         !att.empty()) {
+        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
+        // bridge node only relays the id, so keep it off at -v=1 and surface it
+        // at -v>=2 for per-hop tracing.
+        VLOG(2) << "hop-A bridge request_id=" << att;
         RequestContext rc;
         rc.request_id = std::string(att);
         ctx_guard.emplace(std::move(rc));
