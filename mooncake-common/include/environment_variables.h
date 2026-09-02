@@ -53,6 +53,31 @@ struct LocalHotCacheEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD);
 };
 
+struct ClientMetricEnvironmentVariables {
+    // Keep these values as strings because ClientMetricConfig preserves the
+    // existing per-setting fallback and logging behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC_INTERVAL);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC_BANDWIDTH);
+};
+  
+struct DistributedStorageEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_ROOT_DIR);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_ROOT_DIR);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_FS_ADAPTER);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_FS_TYPE);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_DISTRIBUTED_HEALTH_CHECK);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_SHARD_COUNT);
+    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_DFS_SHARD_CAPACITY);
+    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_DFS_ALIGNMENT);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_DFS_SINGLE_TENANT);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_DFS_EVICTION_ENABLED);
+    MC_DEFINE_ENV_VAR(double, MOONCAKE_DFS_EVICTION_HIGH_WATERMARK);
+    MC_DEFINE_ENV_VAR(double, MOONCAKE_DFS_EVICTION_LOW_WATERMARK);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_DEFERRED_FREE_SECONDS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_EVICTION_CHECK_INTERVAL);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake
