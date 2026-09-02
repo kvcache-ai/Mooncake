@@ -44,6 +44,12 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct RegisteredPinnedMemoryEnvironmentVariables {
+    // Keep the raw string because the legacy parser rejects a leading '+',
+    // unlike the shared typed integer parser.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_PIN_MEMORY_MAX_BYTES);
+};
+
 struct LocalHotCacheEnvironmentVariables {
     // Keep these values as strings to preserve their existing per-setting
     // parsing, fallback, and logging behavior.
