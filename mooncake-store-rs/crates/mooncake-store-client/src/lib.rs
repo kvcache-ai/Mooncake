@@ -12,10 +12,11 @@ pub use client::cold_tier::nof::{
     NofBackend, NofBacking, NofDeviceManagement, NofExternalMetadata, NofHealth, NofObject,
     NofObjectDelete, NofObjectLimits, NofObjectMetadata, NofObjectQuery, NofObjectRead,
     NofObjectShardWrite, NofObjectState, NofObjectWrite, NofPhysicalDelete,
-    NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalListPage, NofPhysicalObject,
-    NofPhysicalQuery, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofStorageHealth,
-    NofStorageManagement, NofTargetConfig, OpaquePhysicalKey, PhysicalKeyCodec, PhysicalKeyInput,
-    Sha256PhysicalKeyCodec,
+    NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalListPage, NofPhysicalLocator,
+    NofPhysicalObject, NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead,
+    NofPhysicalReadRequest, NofPhysicalRecoveredRecord, NofPhysicalRecovery, NofPhysicalWrite,
+    NofPhysicalWriteRequest, NofStorageHealth, NofStorageManagement, NofTargetConfig,
+    OpaquePhysicalKey, PhysicalKeyCodec, PhysicalKeyInput, Sha256PhysicalKeyCodec,
 };
 pub use client::{
     stable_phase_spread_ms, BandwidthShaping, ColdTierKind, ColdTierOffloadMode,

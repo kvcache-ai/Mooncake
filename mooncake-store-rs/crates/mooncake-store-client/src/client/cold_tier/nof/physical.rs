@@ -4,33 +4,78 @@ use mooncake_store_core::{Result, StoreError};
 
 use crate::client::cold_tier::layout::OpaquePhysicalKey;
 
+const MAX_OPAQUE_LOCATOR_LEN: usize = 4096;
+pub(crate) const MAX_ENCODED_LOCATOR_HEX_LEN: usize = MAX_OPAQUE_LOCATOR_LEN * 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NofPhysicalLimits {
-    pub max_value_size: u64,
     pub max_batch_items: usize,
     pub max_batch_bytes: u64,
 }
 
 impl NofPhysicalLimits {
     pub(crate) fn validate(self) -> Result<Self> {
-        if self.max_value_size == 0 || self.max_batch_items == 0 || self.max_batch_bytes == 0 {
+        if self.max_batch_items == 0 || self.max_batch_bytes == 0 {
             return Err(StoreError::InvalidState(
-                "NoF physical backing must advertise non-zero value and batch limits".to_string(),
+                "NoF physical backing must advertise non-zero batch limits".to_string(),
             ));
         }
         Ok(self)
     }
 }
 
+pub struct NofPhysicalWriteRequest<'a> {
+    pub key: OpaquePhysicalKey,
+    pub value: &'a [u8],
+}
+
 #[derive(Clone, Debug)]
 pub struct NofPhysicalReadRequest {
     pub key: OpaquePhysicalKey,
+    /// Executor-owned layout descriptor persisted opaquely in the Cold Tier route.
+    pub locator: NofPhysicalLocator,
     pub expected_value_size: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct NofPhysicalDeleteRequest {
     pub key: OpaquePhysicalKey,
+    /// Executor-owned layout descriptor persisted opaquely in the Cold Tier route.
+    pub locator: NofPhysicalLocator,
+    pub expected_value_size: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct NofPhysicalLocator(Vec<u8>);
+
+impl NofPhysicalLocator {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > MAX_OPAQUE_LOCATOR_LEN {
+            return Err(StoreError::InvalidState(format!(
+                "NoF physical locator length must be in 1..={MAX_OPAQUE_LOCATOR_LEN}"
+            )));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NofPhysicalRecoveredRecord {
+    pub key: OpaquePhysicalKey,
+    pub locator: NofPhysicalLocator,
+    pub expected_value_size: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct NofPhysicalQueryRequest {
+    pub key: OpaquePhysicalKey,
+    pub locator: NofPhysicalLocator,
+    pub expected_value_size: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,29 +126,52 @@ pub trait NofHealth: Send + Sync {
     fn health(&self) -> Result<NofStorageHealth>;
 }
 
-/// Physical writes exposed by a NoF backing. Results are positional.
+/// Complete physical-object writes exposed by a NoF backing. Results are positional.
+///
+/// The executor owns the persistent layout behind each returned opaque locator: a value may be a
+/// single KV record, multiple chunks, one aligned extent, or any other executor-specific format.
 pub trait NofPhysicalWrite: Send + Sync {
-    fn put_batch(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>>;
+    fn put_batch(
+        &self,
+        requests: &[NofPhysicalWriteRequest<'_>],
+    ) -> Vec<Result<NofPhysicalLocator>>;
 
     /// Successful synchronous providers can keep this no-op durability boundary.
     fn flush(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Releases successful writes that cannot be published after a later batch failure.
+    ///
+    /// Provider-managed engines may keep this no-op and reclaim unpublished objects internally.
+    /// Allocator-backed executors should release the referenced allocation immediately.
+    fn discard_unpublished(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
+        requests.iter().map(|_| Ok(())).collect()
+    }
 }
 
-/// Physical reads exposed by a NoF backing. Results are positional.
+/// Optional route-authoritative recovery for allocator-backed executors.
+///
+/// Provider-managed engines normally omit this capability because placement and physical GC live
+/// below their API. Allocator-backed executors use their opaque locators to rebuild allocation
+/// state from the live NoF route set without introducing a second metadata journal.
+pub trait NofPhysicalRecovery: Send + Sync {
+    fn recover(&self, records: &[NofPhysicalRecoveredRecord]) -> Result<()>;
+}
+
+/// Complete physical-object reads exposed by a NoF backing. Results are positional.
 pub trait NofPhysicalRead: Send + Sync {
     fn get_batch(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>>;
 }
 
-/// Physical deletion exposed by a NoF backing. Results are positional.
+/// Complete physical-object deletion exposed by a NoF backing. Results are positional.
 pub trait NofPhysicalDelete: Send + Sync {
     fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>>;
 }
 
 /// Physical existence queries exposed by a NoF backing. Results are positional.
 pub trait NofPhysicalQuery: Send + Sync {
-    fn query_batch(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>>;
+    fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<bool>>;
 }
 
 /// Optional Mooncake-facing storage maintenance capability.

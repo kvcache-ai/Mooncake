@@ -1,8 +1,9 @@
 use crate::{
     NofBackend, NofBacking, NofHealth, NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata,
     NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
-    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalRead,
-    NofPhysicalReadRequest, NofPhysicalWrite, NofStorageHealth, NofTargetConfig, OpaquePhysicalKey,
+    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalLocator,
+    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest,
+    NofStorageHealth, NofTargetConfig,
 };
 
 struct FakePhysicalNof {
@@ -20,13 +21,16 @@ impl Default for FakePhysicalNof {
 }
 
 impl NofPhysicalWrite for FakePhysicalNof {
-    fn put_batch(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
+    fn put_batch(
+        &self,
+        requests: &[NofPhysicalWriteRequest<'_>],
+    ) -> Vec<Result<NofPhysicalLocator>> {
         let mut records = self.records.lock();
         requests
             .iter()
-            .map(|(key, value)| {
-                records.insert(key.as_bytes().to_vec(), value.to_vec());
-                Ok(())
+            .map(|request| {
+                records.insert(request.key.as_bytes().to_vec(), request.value.to_vec());
+                NofPhysicalLocator::new(b"fake-physical-layout".to_vec())
             })
             .collect()
     }
@@ -58,7 +62,6 @@ impl NofPhysicalDelete for FakePhysicalNof {
 impl NofBacking for FakePhysicalNof {
     fn physical_limits(&self) -> Option<NofPhysicalLimits> {
         Some(NofPhysicalLimits {
-            max_value_size: 64,
             max_batch_items: 32,
             max_batch_bytes: 1024,
         })
@@ -474,8 +477,10 @@ fn nof_target_owner_handoff_reclaims_routes_with_stale_owner_snapshot() {
             .cold_tier_devices
             .current_target_owner("nof-handoff-target", None)
             .ok();
-        if owner_a.is_some() && owner_a == owner_b {
-            break owner_a.expect("converged owner should exist");
+        if let (Some(owner_a), Some(owner_b)) = (&owner_a, &owner_b) {
+            if owner_a == owner_b {
+                break owner_a.clone();
+            }
         }
         assert!(
             Instant::now() < owner_deadline,

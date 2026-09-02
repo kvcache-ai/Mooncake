@@ -1875,14 +1875,14 @@ fn nof_backing_route_round_trip_preserves_distinct_targets() {
     let route = NofBackingRoute {
         owner: ClientRuntimeId::new("nof-primary", ClientEpoch(3)),
         target_id: "nof-primary-target".to_string(),
-        object_locator: "nof-ll:v1:i:01".to_string(),
+        object_locator: "nof-physical:v3:01:01".to_string(),
         length: 4096,
         checksum: Some(12345),
         state: NofBackingState::Materialized,
         replicas: vec![NofBackingReplica {
             owner: ClientRuntimeId::new("nof-replica", ClientEpoch(4)),
             target_id: "nof-replica-target".to_string(),
-            object_locator: "nof-ll:v1:i:02".to_string(),
+            object_locator: "nof-physical:v3:02:02".to_string(),
         }],
     };
 
