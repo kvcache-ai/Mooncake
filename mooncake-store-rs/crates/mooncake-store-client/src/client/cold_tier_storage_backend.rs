@@ -482,12 +482,6 @@ pub(super) struct PersistentStorageBackendHealth {
     pub(super) available_bytes: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct PersistentObjectProbe {
-    /// `None` means the backend can confirm existence but cannot query size without reading data.
-    pub(super) length: Option<u64>,
-}
-
 /// Result of a compaction pass on a cold tier backend.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackendCompactionResult {
@@ -582,17 +576,6 @@ pub(super) trait PersistentStorageBackend: Send + Sync {
         &self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
     ) -> Result<Option<Vec<u8>>>;
-
-    fn probe_object(
-        &self,
-        cold_backing: &mooncake_store_core::ColdBackingRoute,
-    ) -> Result<Option<PersistentObjectProbe>> {
-        Ok(self
-            .get_object(cold_backing)?
-            .map(|value| PersistentObjectProbe {
-                length: Some(value.len() as u64),
-            }))
-    }
 
     fn get_object_pinned(
         &self,

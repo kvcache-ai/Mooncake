@@ -2720,7 +2720,7 @@ fn resolved_object_for_route(
         route,
         replica,
         fallback_replicas,
-        transient_backing: None,
+        transient_nof_read: None,
     }
 }
 
@@ -5408,7 +5408,7 @@ fn routed_read_fails_over_within_same_request_after_primary_transport_failure() 
         route: seeded.clone(),
         replica: seeded.replicas[0].clone(),
         fallback_replicas,
-        transient_backing: None,
+        transient_nof_read: None,
     };
     let mut buffer = vec![0u8; resolved.replica.length as usize];
     let transport = reader.transport().expect("reader transport should exist");
@@ -6468,7 +6468,7 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
         route,
         replica: dead_replica,
         fallback_replicas: VecDeque::new(),
-        transient_backing: None,
+        transient_nof_read: None,
     };
     reader_a.note_remote_read_failure(
         &[&failed_read],

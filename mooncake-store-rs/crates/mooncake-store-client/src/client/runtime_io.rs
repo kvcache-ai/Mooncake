@@ -939,7 +939,7 @@ impl StoreClient {
                 route: route.clone(),
                 replica: source.clone(),
                 fallback_replicas: VecDeque::new(),
-                transient_backing: None,
+                transient_nof_read: None,
             };
             let deadline = self.request_deadline_for_transfer(source.length, 1);
             let length = source.length as usize;
@@ -1005,7 +1005,7 @@ impl StoreClient {
                 route: route.clone(),
                 replica: cold_backing_placeholder(&cold_backing),
                 fallback_replicas: VecDeque::new(),
-                transient_backing: None,
+                transient_nof_read: None,
             },
             &payload,
         )?;
@@ -2396,7 +2396,7 @@ impl StoreClient {
             route,
             replica,
             fallback_replicas,
-            transient_backing: None,
+            transient_nof_read: None,
         })
     }
 
@@ -2496,7 +2496,7 @@ impl StoreClient {
                         route,
                         replica,
                         fallback_replicas,
-                        transient_backing: None,
+                        transient_nof_read: None,
                     })
                 })();
                 match item {
@@ -5423,7 +5423,7 @@ impl StoreClient {
             if resolved.route.state == RouteState::Active
                 && cold_tier::resolved_uses_cold_backing(resolved)
             {
-                if resolved.transient_backing.is_some() {
+                if resolved.transient_nof_read.is_some() {
                     cold_tier::restore_payload_from_cold_backing(self, resolved, buffer)?;
                     return Ok(());
                 }

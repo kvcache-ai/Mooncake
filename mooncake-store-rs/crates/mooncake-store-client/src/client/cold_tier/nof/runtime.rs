@@ -19,8 +19,7 @@ use crate::client::cold_tier::replica_policy::{
     ReplicaLoadBalanceStrategy, ReplicaWriteCandidate, DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY,
 };
 use crate::client::{
-    PersistentObjectProbe, PersistentStorageBackend, PersistentStorageBackendHealth,
-    SharedLiveClientCache,
+    PersistentStorageBackend, PersistentStorageBackendHealth, SharedLiveClientCache,
 };
 
 use super::backing::validate_payload;
@@ -287,104 +286,35 @@ impl NofTargetManager {
         }))
     }
 
-    /// Find a provider object using only the logical route identity. The returned backing is a
-    /// one-request I/O descriptor and is never written to metadata.
-    pub(in crate::client) fn discover_backing(
-        &self,
-        route: &ObjectRoute,
-    ) -> Result<Option<ColdBackingRoute>> {
-        let object_locator = self.object_locator(route);
-        let mut first_error = None;
-        let mut found = Vec::new();
-        for target_id in self.target_ids() {
-            if !self.available_for_io(target_id) {
-                continue;
-            }
-            let owner = self
-                .owner_for(target_id)
-                .unwrap_or_else(|| self.state.local_runtime.clone());
-            let probe = ColdBackingRoute {
-                owner,
-                cold_tier_id: target_id.to_string(),
-                object_locator: object_locator.clone(),
-                length: 0,
-                checksum: None,
-                state: ColdBackingState::Materialized,
-                replicas: Vec::new(),
-            };
-            match self.backend_for(target_id)?.probe_object(&probe) {
-                Ok(Some(metadata)) => found.push((probe, metadata.length)),
-                Ok(None) => {}
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
+    fn transient_backing(&self, target_id: &str, object_locator: &str) -> ColdBackingRoute {
+        ColdBackingRoute {
+            owner: self.state.local_runtime.clone(),
+            cold_tier_id: target_id.to_string(),
+            object_locator: object_locator.to_string(),
+            length: 0,
+            checksum: None,
+            state: ColdBackingState::Materialized,
+            replicas: Vec::new(),
         }
-        if found.is_empty() {
-            return match first_error {
-                Some(error) => Err(error),
-                None => Ok(None),
-            };
-        }
-        let mut primary_index = 0usize;
-        let mut length = found.iter().find_map(|(_, length)| *length);
-        let mut checksum = None;
-        if length.is_none() {
-            for (index, (probe, _)) in found.iter().enumerate() {
-                match self.backend_for(&probe.cold_tier_id)?.get_object(probe) {
-                    Ok(Some(value)) => {
-                        primary_index = index;
-                        length = Some(value.len() as u64);
-                        checksum = Some(crate::client::payload_checksum(&value));
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
-        }
-        let Some(length) = length else {
-            return match first_error {
-                Some(error) => Err(error),
-                None => Ok(None),
-            };
-        };
-        let (mut primary, _) = found.swap_remove(primary_index);
-        primary.length = length;
-        primary.checksum = checksum;
-        primary.replicas = found
-            .into_iter()
-            .map(|(probe, _)| ColdBackingReplica {
-                owner: probe.owner,
-                cold_tier_id: probe.cold_tier_id,
-                object_locator: probe.object_locator,
-            })
-            .collect();
-        Ok(Some(primary))
     }
 
-    pub(in crate::client) fn contains_object(&self, route: &ObjectRoute) -> Result<bool> {
-        let object_locator = self.object_locator(route);
+    pub(in crate::client) fn read_backing(
+        &self,
+        route: &ObjectRoute,
+    ) -> Result<Option<(ColdBackingRoute, Arc<Vec<u8>>)>> {
+        let locator = self.object_locator(route);
         let mut first_error = None;
         for target_id in self.target_ids() {
             if !self.available_for_io(target_id) {
                 continue;
             }
-            let probe = ColdBackingRoute {
-                owner: self
-                    .owner_for(target_id)
-                    .unwrap_or_else(|| self.state.local_runtime.clone()),
-                cold_tier_id: target_id.to_string(),
-                object_locator: object_locator.clone(),
-                length: 0,
-                checksum: None,
-                state: ColdBackingState::Materialized,
-                replicas: Vec::new(),
-            };
-            match self.backend_for(target_id)?.probe_object(&probe) {
-                Ok(Some(_)) => return Ok(true),
+            let mut backing = self.transient_backing(target_id, &locator);
+            match self.backend_for(target_id)?.get_object(&backing) {
+                Ok(Some(payload)) => {
+                    backing.length = payload.len() as u64;
+                    backing.checksum = Some(crate::client::payload_checksum(&payload));
+                    return Ok(Some((backing, Arc::new(payload))));
+                }
                 Ok(None) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
@@ -393,8 +323,49 @@ impl NofTargetManager {
         }
         match first_error {
             Some(error) => Err(error),
-            None => Ok(false),
+            None => Ok(None),
         }
+    }
+
+    pub(in crate::client) fn discover_backing(
+        &self,
+        route: &ObjectRoute,
+    ) -> Result<Option<ColdBackingRoute>> {
+        let locator = self.object_locator(route);
+        let mut found = Vec::new();
+        let mut first_error = None;
+        for target_id in self.target_ids() {
+            if !self.available_for_io(target_id) {
+                continue;
+            }
+            let mut backing = self.transient_backing(target_id, &locator);
+            match self.backend_for(target_id)?.get_object(&backing) {
+                Ok(Some(payload)) => {
+                    backing.length = payload.len() as u64;
+                    backing.checksum = Some(crate::client::payload_checksum(&payload));
+                    found.push(backing);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let Some(mut primary) = found.pop() else {
+            return match first_error {
+                Some(error) => Err(error),
+                None => Ok(None),
+            };
+        };
+        primary.replicas = found
+            .into_iter()
+            .map(|backing| ColdBackingReplica {
+                owner: backing.owner,
+                cold_tier_id: backing.cold_tier_id,
+                object_locator: backing.object_locator,
+            })
+            .collect();
+        Ok(Some(primary))
     }
 
     pub(in crate::client) fn has_required_copies(&self, backing: &ColdBackingRoute) -> bool {
@@ -404,27 +375,6 @@ impl NofTargetManager {
             None => return false,
         };
         1 + backing.replicas.len() >= required
-    }
-
-    pub(in crate::client) fn verify_backing(
-        &self,
-        backing: &ColdBackingRoute,
-        expected_length: u64,
-        expected_checksum: u64,
-    ) -> Result<bool> {
-        if backing.length != expected_length || !self.has_required_copies(backing) {
-            return Ok(false);
-        }
-        if let Some(checksum) = backing.checksum {
-            return Ok(checksum == expected_checksum);
-        }
-        Ok(self
-            .backend_for(&backing.cold_tier_id)?
-            .get_object(backing)?
-            .is_some_and(|value| {
-                value.len() as u64 == expected_length
-                    && crate::client::payload_checksum(&value) == expected_checksum
-            }))
     }
 
     pub(in crate::client) fn put_selected(
@@ -562,26 +512,6 @@ impl PersistentStorageBackend for NofObjectAdapter {
                 }
                 Ok(Some(object.value))
             }
-            NofObjectState::Missing => Ok(None),
-            NofObjectState::Incomplete => Err(StoreError::Backpressure(
-                "NoF provider object is incomplete".to_string(),
-            )),
-        }
-    }
-
-    fn probe_object(&self, backing: &ColdBackingRoute) -> Result<Option<PersistentObjectProbe>> {
-        if self.target.backing.object_query().is_none() {
-            return Ok(self
-                .get_object(backing)?
-                .map(|value| PersistentObjectProbe {
-                    length: Some(value.len() as u64),
-                }));
-        }
-        let key = Self::provider_key(&backing.object_locator)?;
-        match self.target.query_object(&self.namespace, &key)? {
-            NofObjectState::Found(metadata) => Ok(Some(PersistentObjectProbe {
-                length: Some(metadata.length),
-            })),
             NofObjectState::Missing => Ok(None),
             NofObjectState::Incomplete => Err(StoreError::Backpressure(
                 "NoF provider object is incomplete".to_string(),

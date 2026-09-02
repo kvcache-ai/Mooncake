@@ -61,9 +61,10 @@ payload. A Standard write goes to one provider target because KVCS owns its inte
 A Low-Level write succeeds only after every target selected by `nof_replica_count` accepts the
 value. No target list is written back to metadata.
 
-When no hot or local-disk copy is available, the client derives the same key and probes its current
-NoF configuration. The resulting length, checksum, target, and owner exist only for that restore
-request. Removing an object fans out an idempotent, best-effort delete for its logical key to the
+When no hot or local-disk copy is available, the client derives the same key and reads the value
+through the provider's batch-get API. The returned payload then enters the existing Cold Tier
+restore and hot-copy promotion flow. There is no preliminary Mooncake placement or manifest
+lookup. Removing an object fans out an idempotent, best-effort delete for its logical key to the
 current target set. Mooncake does not persist a NoF delete intent or retry it after the logical
 route has been removed. If the client exits between route deletion and provider deletion, the
 provider's own GC must reclaim the orphan.
