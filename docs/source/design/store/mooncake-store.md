@@ -746,9 +746,9 @@ flags and restrictions.
 ### Descriptor-based DFS replicas
 
 ```{warning}
-**Work in progress.** Descriptor-based DFS is not production-ready and is not
-covered by the general fault-tolerance, HA continuity, durability, or
-multi-tenant guarantees described elsewhere in this design document.
+**Work in progress.** Descriptor-based DFS remains experimental and does not
+yet provide HA continuity, multi-tenant support, or data-file `fsync`
+durability.
 ```
 
 The master owns DFS placement metadata and an allocator for the shared shard
@@ -764,8 +764,24 @@ new shard files and allocator state, then atomically publishes the complete
 ready set; existing shard paths and ranges remain unchanged. Allocation tries
 the hash-selected shard first and falls back to other ready shards, so added
 capacity can relieve full shards. Startup discovers the existing contiguous
-layout to retain the expanded capacity; it does not recover allocation or key
-metadata.
+layout to retain the expanded capacity; allocator ownership is recovered as
+described below.
+
+Allocator placement is persisted per shard in an atomic checkpoint and an
+append-only WAL. An `ALLOC` record is durable before its descriptor is exposed;
+a deferred extent is not made reusable until its `RELEASE` record is durable.
+After restart, the master restores the allocator first and keeps it sealed
+while snapshot metadata is reconciled. A standalone snapshot prunes stale DFS
+replicas (and objects left without a valid replica). Allocator-only records are
+treated as uncommitted orphans and complete a fresh deferred-free interval
+before reuse. HA, OpLog recovery, and standby promotion are intentionally out
+of scope and cannot be enabled with descriptor-based DFS.
+
+Checkpoint and WAL corruption, missing sidecars, cluster-identity mismatches,
+or incompatible shard layouts fail closed. Directories created by versions
+that only contain `.data` files cannot be upgraded in place because those versions did
+not record the allocator's raw reservation boundaries; use an empty DFS root
+when enabling metadata recovery.
 
 The client owns the DFS data plane. `DistributedStorageBackend` validates the
 descriptor and delegates positional I/O to either `PosixFsAdapter` or

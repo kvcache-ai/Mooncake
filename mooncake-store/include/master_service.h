@@ -2173,6 +2173,7 @@ class MasterService {
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
+    tl::expected<void, ErrorCode> ReconcileDfsMetadataAfterSnapshot();
     void RunDfsEviction();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
