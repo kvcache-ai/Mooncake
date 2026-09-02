@@ -557,16 +557,32 @@ Status RdmaTransport::submitTransferTasks(
             rdma_batch->slice_chain.push_back(slice_lists[i].first);
             Status submit_st = workers_->submit(slice_lists[i], i);
             if (!submit_st.ok()) {
-                // The slices were allocated and attached to the task, but the
-                // initial submit was rejected (queue full). Without this check
-                // the batch would stay PENDING forever: nothing queued it and
-                // nothing marked it failed. Cancel the task so its slices are
-                // drained (CANCELED) and the batch can be retried. See #3636.
-                RdmaTask* rejected_task = slice_lists[i].first->task;
-                LOG(WARNING) << "Initial submit rejected for worker " << i
-                             << ": " << submit_st.message()
-                             << ", canceling task " << rejected_task;
-                workers_->cancel(rejected_task);
+                // The slices were allocated and attached to their tasks, but
+                // the initial submit to worker i was rejected (queue full).
+                // This is a *partial* admission: workers [0, i) already have
+                // their slice lists running, worker i's list was refused, and
+                // workers (i, num_workers) were never submitted. On top of
+                // that, the round-robin scatter above splits every request's
+                // slices across all workers, so a single worker's list — and
+                // this batch as a whole — generally spans multiple tasks.
+                //
+                // Cancelling only slice_lists[i].first->task (as an earlier
+                // revision did) would leave the already-running tasks and all
+                // never-submitted slices PENDING forever, and the upper layer
+                // (submitTransfer's fallback) could then race a second attempt
+                // on the same group. Terminalize the *whole* batch instead:
+                // cancel every task before returning failure. cancel() is
+                // idempotent (cancel_requested exchange guard) and wakes all
+                // workers, so it correctly drains a task's slices from any
+                // queue whether or not that worker was ever submitted. See
+                // #3636 and the partial-admission follow-up in #3661.
+                LOG(WARNING)
+                    << "Initial submit rejected for worker " << i << ": "
+                    << submit_st.message() << ", canceling all "
+                    << rdma_batch->task_list.size() << " task(s) in the batch";
+                for (auto* task : rdma_batch->task_list) {
+                    workers_->cancel(task);
+                }
                 return Status::TooManyRequests(
                     "Initial slice submit rejected (worker queue "
                     "full)" LOC_MARK);

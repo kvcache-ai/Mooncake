@@ -149,6 +149,71 @@ TEST(BoundedMPSCQueueTest, InitialSubmitRejectionTerminatesBatch) {
     EXPECT_EQ(inflight, 4);
 }
 
+// Regression for issue #3661 (partial-admission follow-up). The initial-submit
+// loop in RdmaTransport::submitTransferTasks() walks one slice list per worker
+// and calls Workers::submit() on each. The round-robin scatter above spreads
+// every request's slices across all workers, so a single batch generally spans
+// multiple tasks and every worker's list can carry slices from more than one.
+//
+// If worker i's queue is full mid-loop, workers [0, i) are already running and
+// workers (i, N) are never submitted. Cancelling only the one task reachable
+// from slice_lists[i].first (the earlier revision) left the already-running
+// tasks and every never-submitted slice PENDING forever, and let the upper
+// layer race a failover on the same group. The fix terminalizes the WHOLE
+// batch: cancel every task before returning failure.
+//
+// This models that loop with the SliceList stand-in and a cancel flag per task,
+// then asserts all tasks are terminalized regardless of which worker rejected.
+TEST(BoundedMPSCQueueTest, PartialAdmissionTerminalizesWholeBatch) {
+    constexpr int kNumWorkers = 4;
+    std::vector<Queue> worker_queues(kNumWorkers);
+
+    // Saturate worker 2's queue so its submit rejects, while 0/1 accept and
+    // 3 is never reached — the partial-admission shape catyans described.
+    constexpr int kRejectingWorker = 2;
+    for (int i = 0; i < 8; ++i) {
+        auto filler = entry(1);
+        ASSERT_TRUE(worker_queues[kRejectingWorker].try_push(filler));
+    }
+
+    // A batch of tasks; each task's slices are scattered across workers, so the
+    // per-worker lists below reference several tasks. Track terminalization by
+    // task, the way Workers::cancel(task) flips cancel_requested per task.
+    constexpr int kNumTasks = 5;
+    std::vector<bool> task_canceled(kNumTasks, false);
+
+    // One non-empty slice list per worker (mirrors slice_lists[i].first != null
+    // guarding the submit call). Each list "belongs" to a representative task,
+    // but the batch as a whole owns all kNumTasks tasks.
+    auto submit = [&](int worker_id, SliceList& list) -> bool {
+        return worker_queues[worker_id].try_push(list);
+    };
+
+    // The loop under test: submit each worker's list; on the first rejection,
+    // cancel EVERY task in the batch (not just the rejected worker's) and stop.
+    bool rejected = false;
+    int rejected_at = -1;
+    for (int w = 0; w < kNumWorkers; ++w) {
+        auto list = entry(2);
+        if (!submit(w, list)) {
+            rejected = true;
+            rejected_at = w;
+            for (int t = 0; t < kNumTasks; ++t) task_canceled[t] = true;
+            break;
+        }
+    }
+
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(rejected_at, kRejectingWorker);  // 0 and 1 admitted first
+
+    // The whole batch is terminalized: no task from this attempt is left
+    // un-cancelled to pend forever or to be re-run by an upper-layer failover.
+    for (int t = 0; t < kNumTasks; ++t) {
+        EXPECT_TRUE(task_canceled[t])
+            << "task " << t << " left un-terminalized after partial admission";
+    }
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
