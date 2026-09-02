@@ -306,6 +306,207 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     FAIL() << "TE metadata refresh polling did not refresh cached descriptor";
 }
 
+TEST(TransferMetadataVersionTest, SyncAcceptsNewerMetadataVersion) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kUpdatedAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+    const uint64_t base_version =
+        static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    server_desc->metadata_version = base_version;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    ASSERT_EQ(cached_desc->metadata_version, base_version);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto updated_desc = makeRdmaSegmentDesc(remote_segment_name, kUpdatedAddr);
+    updated_desc->metadata_version = base_version + 1;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(updated_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version + 1);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kUpdatedAddr);
+}
+
+TEST(TransferMetadataVersionTest, SyncRejectsOlderMetadataVersion) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kStaleAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+    const uint64_t base_version =
+        static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    server_desc->metadata_version = base_version + 1;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    ASSERT_EQ(cached_desc->metadata_version, base_version + 1);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto stale_desc = makeRdmaSegmentDesc(remote_segment_name, kStaleAddr);
+    stale_desc->metadata_version = base_version;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(stale_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version + 1);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+}
+
+TEST(TransferMetadataVersionTest, SyncRejectsConflictingSameVersionMetadata) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kConflictingAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+    const uint64_t base_version =
+        static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    server_desc->metadata_version = base_version;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    ASSERT_EQ(cached_desc->metadata_version, base_version);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto conflicting_desc =
+        makeRdmaSegmentDesc(remote_segment_name, kConflictingAddr);
+    conflicting_desc->metadata_version = base_version;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(conflicting_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+}
+
+TEST(TransferMetadataVersionTest, PublishUsesWallTimeMicroseconds) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    ASSERT_EQ(
+        metadata.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                                 makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto before_us = static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+    const auto after_us = static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    auto desc = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    EXPECT_GE(desc->metadata_version, before_us);
+    EXPECT_LE(desc->metadata_version, after_us);
+
+    const uint64_t first_version = desc->metadata_version;
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+    desc = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    EXPECT_GT(desc->metadata_version, first_version);
+}
+
+TEST(TransferMetadataVersionTest, RpcMetaPublishUsesWallTimeMicroseconds) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+
+    const auto before_us = static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+    ASSERT_EQ(
+        metadata.addRpcMetaEntry("127.0.0.1:" + std::to_string(port), rpc_desc),
+        0);
+    const auto after_us = static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    EXPECT_GE(metadata.localRpcMeta().metadata_version, before_us);
+    EXPECT_LE(metadata.localRpcMeta().metadata_version, after_us);
+    EXPECT_EQ(rpc_desc.metadata_version,
+              metadata.localRpcMeta().metadata_version);
+}
+
 TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {
     constexpr uint64_t kRemoteAddr = 0x1000;
     constexpr uint64_t kLocalOnlyAddr = 0x2000;

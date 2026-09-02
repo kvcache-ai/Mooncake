@@ -51,6 +51,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -652,6 +653,14 @@ class LocalHttpMetadataServer {
                 continue;
             }
             value["ip_or_host_name"] = new_host;
+            uint64_t metadata_version = getCurrentTimeInNano() / 1000;
+            if (value.isMember("metadata_version") &&
+                value["metadata_version"].isUInt64() &&
+                value["metadata_version"].asUInt64() >= metadata_version) {
+                metadata_version = value["metadata_version"].asUInt64() + 1;
+            }
+            value["metadata_version"] =
+                static_cast<Json::UInt64>(metadata_version);
             Json::StreamWriterBuilder writer_builder;
             writer_builder["indentation"] = "";
             encoded = Json::writeString(writer_builder, value);
