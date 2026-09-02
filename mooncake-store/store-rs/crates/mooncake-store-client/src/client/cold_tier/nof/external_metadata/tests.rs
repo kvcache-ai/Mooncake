@@ -28,7 +28,7 @@ fn nof_route() -> ObjectRoute {
         nof_backing: Some(NofBackingRoute {
             owner: owner(),
             target_id: "nof-target".to_string(),
-            object_locator: "nof-ll:v1:i:01".to_string(),
+            object_locator: "nof-physical:v3:01:01".to_string(),
             length: 1,
             checksum: None,
             state: NofBackingState::Materialized,

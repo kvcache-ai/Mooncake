@@ -111,30 +111,18 @@ impl NofRuntimeTarget {
     }
 }
 
+#[derive(Default)]
 struct NofTargetHealthState {
-    last_success: PersistentStorageBackendHealth,
+    last_success: Option<PersistentStorageBackendHealth>,
     last_error: Option<StoreError>,
     consecutive_failures: u32,
-}
-
-impl Default for NofTargetHealthState {
-    fn default() -> Self {
-        Self {
-            last_success: PersistentStorageBackendHealth {
-                capacity_bytes: None,
-                available_bytes: None,
-            },
-            last_error: None,
-            consecutive_failures: 0,
-        }
-    }
 }
 
 impl NofTargetHealthState {
     fn record(&mut self, result: Result<PersistentStorageBackendHealth>) {
         match result {
             Ok(health) => {
-                self.last_success = health;
+                self.last_success = Some(health);
                 self.last_error = None;
                 self.consecutive_failures = 0;
             }
@@ -147,12 +135,13 @@ impl NofTargetHealthState {
 
     fn snapshot(&self) -> Result<PersistentStorageBackendHealth> {
         if self.consecutive_failures < TARGET_HEARTBEAT_FAILURE_THRESHOLD {
-            return Ok(self.last_success.clone());
+            if let Some(health) = &self.last_success {
+                return Ok(health.clone());
+            }
         }
-        Err(self
-            .last_error
-            .clone()
-            .unwrap_or_else(|| StoreError::Transport("NoF target heartbeat failed".to_string())))
+        Err(self.last_error.clone().unwrap_or_else(|| {
+            StoreError::Transport("NoF target has no successful heartbeat".to_string())
+        }))
     }
 }
 
@@ -221,7 +210,7 @@ impl NofOwnerState {
         *self.remote_unhealthy_targets.write() = remote_unhealthy;
     }
 
-    fn heartbeat_owned_targets(&self) {
+    pub(super) fn heartbeat_owned_targets(&self) {
         self.refresh_ownership();
         if self.released.load(Ordering::Acquire) {
             return;
@@ -678,11 +667,11 @@ mod tests {
     }
 
     #[test]
-    fn request_health_snapshot_never_probes_backend() {
+    fn request_health_snapshot_never_probes_backend_and_starts_unknown() {
         let backend = Arc::new(CountingHealthBackend::new(false));
         let target = runtime_target(backend.clone());
         for _ in 0..100 {
-            assert!(target.health_snapshot().is_ok());
+            assert!(target.health_snapshot().is_err());
         }
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
         target.heartbeat("nof-a");
@@ -692,8 +681,10 @@ mod tests {
 
     #[test]
     fn heartbeat_fences_after_threshold_and_recovers_on_success() {
-        let backend = Arc::new(CountingHealthBackend::new(true));
+        let backend = Arc::new(CountingHealthBackend::new(false));
         let target = runtime_target(backend.clone());
+        target.heartbeat("nof-a");
+        backend.fail.store(true, Ordering::Relaxed);
         for _ in 1..TARGET_HEARTBEAT_FAILURE_THRESHOLD {
             target.heartbeat("nof-a");
             assert!(target.health_snapshot().is_ok());

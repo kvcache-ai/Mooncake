@@ -9,8 +9,8 @@ use std::sync::{atomic::Ordering, Arc};
 
 use mooncake_store_core::{
     route_logical_object_id, ClientRuntimeId, ColdBackingRoute, ColdBackingState, MetadataBackend,
-    NamespaceScope, NofBackingReplica, NofBackingRoute, NofBackingState, ObjectRoute, Result,
-    StoreError,
+    NamespaceScope, NofBackingReplica, NofBackingRoute, NofBackingRouteFilter, NofBackingState,
+    ObjectRoute, Result, StoreError,
 };
 
 use crate::client::cold_tier::layout::{
@@ -119,10 +119,20 @@ impl NofTargetManager {
             data_plane = Some(next_data_plane);
             let backend: Arc<dyn PersistentStorageBackend> = match next_data_plane {
                 NofDataPlane::Object => Arc::new(NofObjectAdapter::new(config.backend)),
-                NofDataPlane::Physical => Arc::new(NofPhysicalAdapter::new(
-                    config.target_id.clone(),
-                    config.backend,
-                )?),
+                NofDataPlane::Physical => {
+                    let adapter =
+                        NofPhysicalAdapter::new(config.target_id.clone(), config.backend)?;
+                    if adapter.requires_recovery() {
+                        let routes =
+                            metadata.list_object_routes_by_nof_backing(&NofBackingRouteFilter {
+                                target_id: Some(config.target_id.clone()),
+                                state: Some(NofBackingState::Materialized),
+                                ..NofBackingRouteFilter::default()
+                            })?;
+                        adapter.recover_routes(&routes)?;
+                    }
+                    Arc::new(adapter)
+                }
             };
             if targets
                 .insert(
@@ -144,7 +154,9 @@ impl NofTargetManager {
             target_set_fingerprint,
             targets,
         ));
-        state.refresh_ownership();
+        // Establish the first owner-scoped health snapshot before this target can be selected.
+        // Later requests only read the cached snapshot; the monitor refreshes it in the background.
+        state.heartbeat_owned_targets();
         let heartbeat = if state.targets.is_empty() {
             NofHeartbeatMonitor::disabled()
         } else {

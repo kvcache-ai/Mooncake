@@ -11,7 +11,8 @@ The capabilities are independent:
 | Capability | Trait | Purpose |
 | --- | --- | --- |
 | logical object write/read/query/delete | `NofObjectWrite`, `NofObjectRead`, `NofObjectQuery`, `NofObjectDelete` | provider object APIs with namespaces and native manifests |
-| physical KV write/read/query/delete | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | raw key/value APIs used by the shared physical adapter |
+| physical object write/read/query/delete | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | complete-object APIs whose opaque layout locator is owned by the executor |
+| route-authoritative physical recovery | `NofPhysicalRecovery` | rebuild an allocator-backed executor from live `nof_backing` locators without a second metadata journal |
 | external logical metadata | `NofExternalMetadata` | typed NoF get/list/CAS over the existing `MetadataBackend` |
 | backing health | `NofHealth` | liveness and optional capacity without claiming storage or device ownership |
 | storage maintenance | `NofStorageManagement` | optional physical inventory and capacity contract for Mooncake-managed backings |
@@ -59,11 +60,12 @@ the field.
 ## Reuse of Cold Tier
 
 The physical adapter reuses the internal `PersistentStorageBackend` I/O envelope,
-`MetadataBackend`, checksum validation, `ValueChunkPlan`, `PhysicalKeyCodec` and the existing Cold
-Tier batching entry points.
-It adds only collision-resistant physical keys, value chunk records, a small root manifest and
-calls to the backing's physical `put/get/delete/flush` traits. It does not add a scheduler,
-allocator, buffer pool, metadata service, GC loop or device manager.
+`MetadataBackend`, checksum validation, `PhysicalKeyCodec` and the existing Cold Tier batching
+entry points. It derives a collision-resistant object identity, passes the complete value to the
+selected executor and persists the returned locator opaquely. It does not define a physical record,
+chunk, extent, alignment or manifest format, and it adds no scheduler, metadata service, GC loop or
+device manager. KVCS Low-Level privately reuses `ValueChunkPlan` when its SDK value limit requires
+multiple records.
 
 Multi-replica placement and read balancing share the provider-neutral
 `ReplicaLoadBalanceStrategy`. Both `ColdBackingRoute` and `NofBackingRoute` implement the same
@@ -124,7 +126,8 @@ Target selection is capability driven:
   publication preserves the two NoF-managed labels, so no target-by-client polling or per-request
   metadata read is introduced;
 - a target remains eligible through two transient heartbeat failures and is excluded after the
-  third consecutive failure; the first successful heartbeat makes it eligible again immediately;
+  third consecutive failure; a newly configured target remains unavailable until its first
+  successful probe, and a later success makes it eligible again immediately;
   a cold restore filters unavailable targets, promotes a healthy replica and publishes the pruned
   `nof_backing` through the existing restore CAS;
 - NoF-only operation does not load `ColdTierDeviceRecord`, run local watermarks, or update local
@@ -178,13 +181,15 @@ client/
       kvcs/
         mod.rs
         executor.rs
+        physical_layout.rs
         capi.rs
         capi_tests.rs
 ```
 
 Public provider-neutral traits live directly under `nof/`. All KVCS-specific configuration, C API
 calls and tests live under `nof/kvcs/`. `executor.rs` contains one mode-selecting KVCS executor;
-`capi.rs` is the private binding for the vendor's public C ABI.
+`physical_layout.rs` owns the Low-Level SDK record/chunk layout; `capi.rs` is the private binding
+for the vendor's public C ABI.
 
 ## KVCS Low-Level capability boundary
 

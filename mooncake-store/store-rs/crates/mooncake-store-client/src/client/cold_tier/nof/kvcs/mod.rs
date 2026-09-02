@@ -7,6 +7,7 @@ use super::OpaquePhysicalKey;
 include!("capi.rs");
 
 mod executor;
+mod physical_layout;
 pub use executor::{KvcsCapiExecutor, KvcsMode};
 
 #[cfg(test)]

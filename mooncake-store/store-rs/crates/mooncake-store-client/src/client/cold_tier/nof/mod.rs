@@ -29,8 +29,10 @@ pub use object::{
 };
 pub use physical::{
     NofDeviceManagement, NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits,
-    NofPhysicalListPage, NofPhysicalObject, NofPhysicalQuery, NofPhysicalRead,
-    NofPhysicalReadRequest, NofPhysicalWrite, NofStorageHealth, NofStorageManagement,
+    NofPhysicalListPage, NofPhysicalLocator, NofPhysicalObject, NofPhysicalQuery,
+    NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalRecoveredRecord,
+    NofPhysicalRecovery, NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth,
+    NofStorageManagement,
 };
 pub use runtime::NofTargetConfig;
 pub(in crate::client) use runtime::{

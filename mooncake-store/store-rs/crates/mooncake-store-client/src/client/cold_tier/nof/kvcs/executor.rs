@@ -5,8 +5,9 @@ use super::super::object::repeated_error;
 use super::super::{
     NofBacking, NofHealth, NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata,
     NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
-    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalQuery,
-    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofStorageHealth, OpaquePhysicalKey,
+    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalLocator,
+    NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest,
+    NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth, OpaquePhysicalKey,
 };
 const KVCS_MODE_ENV: &str = "MOONCAKE_KVCS_MODE";
 
@@ -781,17 +782,22 @@ mod standard {
 mod low_level {
     //! KVCS Low-Level SDK executor for the NoF physical KV contract.
 
+    use std::collections::HashSet;
     use std::ffi::{c_int, c_void, CString};
     use std::ptr;
 
     use libc::size_t;
     use mooncake_store_core::{Result, StoreError};
 
+    use super::super::physical_layout::{
+        assemble_read, build_write_layout, object_keys, read_records, KvcsReadRecord,
+    };
     use super::super::*;
     use super::{
         NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits,
-        NofPhysicalQuery, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite,
-        NofStorageHealth, OpaquePhysicalKey,
+        NofPhysicalLocator, NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead,
+        NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth,
+        OpaquePhysicalKey,
     };
 
     pub(super) struct LowLevelExecutor {
@@ -902,7 +908,6 @@ mod low_level {
     impl LowLevelExecutor {
         pub(super) fn capabilities(&self) -> NofPhysicalLimits {
             NofPhysicalLimits {
-                max_value_size: self.limits.max_value_size,
                 max_batch_items: self.limits.max_batch_items,
                 // KVCS documents max_value_size per value and splits large batches internally.
                 max_batch_bytes: u64::MAX,
@@ -910,8 +915,8 @@ mod low_level {
         }
     }
 
-    impl NofPhysicalWrite for LowLevelExecutor {
-        fn put_batch(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
+    impl LowLevelExecutor {
+        fn put_records(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
             if requests.is_empty() {
                 return Vec::new();
             }
@@ -1005,8 +1010,8 @@ mod low_level {
         }
     }
 
-    impl NofPhysicalRead for LowLevelExecutor {
-        fn get_batch(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
+    impl LowLevelExecutor {
+        fn get_records(&self, requests: &[KvcsReadRecord]) -> Vec<Result<Option<Vec<u8>>>> {
             if requests.is_empty() {
                 return Vec::new();
             }
@@ -1121,17 +1126,17 @@ mod low_level {
         }
     }
 
-    impl NofPhysicalDelete for LowLevelExecutor {
-        fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
-            if requests.is_empty() {
+    impl LowLevelExecutor {
+        fn delete_records(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<()>> {
+            if keys.is_empty() {
                 return Vec::new();
             }
-            let mut results = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
-            let valid = requests
+            let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+            let valid = keys
                 .iter()
                 .enumerate()
-                .filter_map(|(index, request)| {
-                    let validation = encode_physical_key(&request.key, self.limits.max_key_size);
+                .filter_map(|(index, key)| {
+                    let validation = encode_physical_key(key, self.limits.max_key_size);
                     match validation {
                         Ok(key) => Some((index, key)),
                         Err(error) => {
@@ -1183,8 +1188,8 @@ mod low_level {
         }
     }
 
-    impl NofPhysicalQuery for LowLevelExecutor {
-        fn query_batch(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
+    impl LowLevelExecutor {
+        fn query_records(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
             if keys.is_empty() {
                 return Vec::new();
             }
@@ -1256,12 +1261,176 @@ mod low_level {
             unsafe { kvcs_query_result_free(native_results.as_mut_ptr(), count) };
             finish_positional_results(results)
         }
+
+        fn put_record_batches(&self, records: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
+            records
+                .chunks(self.limits.max_batch_items)
+                .flat_map(|batch| self.put_records(batch))
+                .collect()
+        }
+
+        fn get_record_batches(&self, records: &[KvcsReadRecord]) -> Vec<Result<Option<Vec<u8>>>> {
+            records
+                .chunks(self.limits.max_batch_items)
+                .flat_map(|batch| self.get_records(batch))
+                .collect()
+        }
+
+        fn delete_record_batches(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<()>> {
+            keys.chunks(self.limits.max_batch_items)
+                .flat_map(|batch| self.delete_records(batch))
+                .collect()
+        }
+
+        fn query_record_batches(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
+            keys.chunks(self.limits.max_batch_items)
+                .flat_map(|batch| self.query_records(batch))
+                .collect()
+        }
+
+        fn read_object(&self, request: &NofPhysicalReadRequest) -> Result<Option<Vec<u8>>> {
+            let records =
+                read_records(&request.key, &request.locator, request.expected_value_size)?;
+            let results = self.get_record_batches(&records);
+            assemble_read(request.expected_value_size, results)
+        }
+
+        fn delete_object(&self, request: &NofPhysicalDeleteRequest) -> Result<()> {
+            let keys = object_keys(&request.key, &request.locator, request.expected_value_size)?;
+            let mut deleted = false;
+            for result in self.delete_record_batches(&keys) {
+                match result {
+                    Ok(()) => deleted = true,
+                    Err(StoreError::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if deleted {
+                Ok(())
+            } else {
+                Err(StoreError::NotFound(
+                    "KVCS low-level physical object".to_string(),
+                ))
+            }
+        }
+
+        fn query_object(&self, request: &NofPhysicalQueryRequest) -> Result<bool> {
+            let keys = object_keys(&request.key, &request.locator, request.expected_value_size)?;
+            for result in self.query_record_batches(&keys) {
+                if !result? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    impl NofPhysicalWrite for LowLevelExecutor {
+        fn put_batch(
+            &self,
+            requests: &[NofPhysicalWriteRequest<'_>],
+        ) -> Vec<Result<NofPhysicalLocator>> {
+            let mut results = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+            let mut layouts = Vec::with_capacity(requests.len());
+            for (index, request) in requests.iter().enumerate() {
+                match build_write_layout(&request.key, request.value, self.limits.max_value_size) {
+                    Ok(layout) => layouts.push((index, layout)),
+                    Err(error) => results[index] = Some(Err(error)),
+                }
+            }
+
+            let mut seen = HashSet::new();
+            let mut duplicates = HashSet::new();
+            for (_, layout) in &layouts {
+                for (key, _) in &layout.records {
+                    if !seen.insert(key.clone()) {
+                        duplicates.insert(key.clone());
+                    }
+                }
+            }
+            layouts.retain(|(index, layout)| {
+                if layout
+                    .records
+                    .iter()
+                    .any(|(key, _)| duplicates.contains(key))
+                {
+                    results[*index] = Some(Err(StoreError::Conflict(
+                        "KVCS physical write contains duplicate record keys".to_string(),
+                    )));
+                    false
+                } else {
+                    true
+                }
+            });
+
+            let positions = layouts
+                .iter()
+                .enumerate()
+                .flat_map(|(layout_index, (request_index, layout))| {
+                    layout
+                        .records
+                        .iter()
+                        .enumerate()
+                        .map(move |(record_index, _)| (layout_index, *request_index, record_index))
+                })
+                .collect::<Vec<_>>();
+            let records = positions
+                .iter()
+                .map(|(layout_index, _, record_index)| {
+                    let (key, value) = &layouts[*layout_index].1.records[*record_index];
+                    (key.clone(), *value)
+                })
+                .collect::<Vec<_>>();
+            let record_results = self.put_record_batches(&records);
+            let mut layout_ok = vec![true; requests.len()];
+            for ((_, request_index, _), status) in positions.into_iter().zip(record_results) {
+                if let Err(error) = status {
+                    layout_ok[request_index] = false;
+                    if results[request_index].is_none() {
+                        results[request_index] = Some(Err(error));
+                    }
+                }
+            }
+            for (request_index, layout) in layouts {
+                if layout_ok[request_index] {
+                    results[request_index] = Some(Ok(layout.locator));
+                }
+            }
+            finish_positional_results(results)
+        }
+    }
+
+    impl NofPhysicalRead for LowLevelExecutor {
+        fn get_batch(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
+            requests
+                .iter()
+                .map(|request| self.read_object(request))
+                .collect()
+        }
+    }
+
+    impl NofPhysicalDelete for LowLevelExecutor {
+        fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
+            requests
+                .iter()
+                .map(|request| self.delete_object(request))
+                .collect()
+        }
+    }
+
+    impl NofPhysicalQuery for LowLevelExecutor {
+        fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<bool>> {
+            requests
+                .iter()
+                .map(|request| self.query_object(request))
+                .collect()
+        }
     }
 
     impl NofHealth for LowLevelExecutor {
         fn health(&self) -> Result<NofStorageHealth> {
             let probe = OpaquePhysicalKey::new(b"mooncake:nof:health:v1".to_vec());
-            self.query_batch(&[probe]).pop().ok_or_else(|| {
+            self.query_records(&[probe]).pop().ok_or_else(|| {
                 StoreError::Transport("KVCS health query returned no result".to_string())
             })??;
             Ok(NofStorageHealth::default())
@@ -1297,26 +1466,30 @@ mod low_level {
         use super::super::{NofBacking, NofStorageHealth};
         use super::*;
 
-        #[test]
-        #[ignore = "requires a live KVCS EFC and configured mountpoint, or the official SDK mock"]
-        fn live_low_level_round_trip_smoke() {
+        fn round_trip(value: &[u8]) {
             let executor = super::KvcsCapiExecutor::with_mode(super::KvcsMode::LowLevel).unwrap();
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let key = OpaquePhysicalKey::new(format!("mooncake-smoke-{nonce}").into_bytes());
-            let value = b"kvcs-capi-smoke";
-            executor
+            let locator = executor
                 .physical_write()
                 .unwrap()
-                .put_batch(&[(key.clone(), value)])
+                .put_batch(&[NofPhysicalWriteRequest {
+                    key: key.clone(),
+                    value,
+                }])
                 .remove(0)
                 .unwrap();
             assert!(executor
                 .physical_query()
                 .unwrap()
-                .query_batch(std::slice::from_ref(&key))
+                .query_batch(&[NofPhysicalQueryRequest {
+                    key: key.clone(),
+                    locator: locator.clone(),
+                    expected_value_size: value.len(),
+                }])
                 .remove(0)
                 .unwrap());
             assert_eq!(
@@ -1325,6 +1498,7 @@ mod low_level {
                     .unwrap()
                     .get_batch(&[NofPhysicalReadRequest {
                         key: key.clone(),
+                        locator: locator.clone(),
                         expected_value_size: value.len(),
                     }])
                     .remove(0)
@@ -1334,13 +1508,21 @@ mod low_level {
             executor
                 .physical_delete()
                 .unwrap()
-                .delete_batch(&[NofPhysicalDeleteRequest { key: key.clone() }])
+                .delete_batch(&[NofPhysicalDeleteRequest {
+                    key: key.clone(),
+                    locator: locator.clone(),
+                    expected_value_size: value.len(),
+                }])
                 .remove(0)
                 .unwrap();
             assert!(!executor
                 .physical_query()
                 .unwrap()
-                .query_batch(&[key])
+                .query_batch(&[NofPhysicalQueryRequest {
+                    key,
+                    locator,
+                    expected_value_size: value.len(),
+                }])
                 .remove(0)
                 .unwrap());
             assert!(executor.physical_read().is_some());
@@ -1355,6 +1537,19 @@ mod low_level {
             assert!(executor.metadata().is_none());
             assert!(executor.storage_management().is_none());
             assert!(executor.device_management().is_none());
+        }
+
+        #[test]
+        #[ignore = "requires a live KVCS EFC and configured mountpoint, or the official SDK mock"]
+        fn live_low_level_round_trip_smoke() {
+            round_trip(b"kvcs-capi-smoke");
+        }
+
+        #[test]
+        #[ignore = "requires a live KVCS EFC and configured mountpoint, or the official SDK mock"]
+        fn live_low_level_chunked_round_trip_smoke() {
+            let value = vec![7; usize::try_from(DEFAULT_MAX_VALUE_SIZE).unwrap() + 17];
+            round_trip(&value);
         }
     }
 }
