@@ -339,14 +339,20 @@ void RealClient::put_dummy_helper(
     // synchronous master RPC (put_internal -> client_service_->Put ->
     // master_client_.PutStart) re-attaches the same id.
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
 
@@ -446,14 +452,20 @@ void RealClient::put_batch_dummy_helper(
     // Bridge the per-request id from hop A's out-of-band attachment to hop B
     // (master RPC: BatchPutStart). See put_dummy_helper.
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
 
@@ -546,14 +558,20 @@ void RealClient::put_parts_dummy_helper(
     // Bridge the per-request id from hop A's out-of-band attachment to hop B
     // (master RPC: PutStart). See put_dummy_helper.
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
 
@@ -1027,14 +1045,20 @@ void RealClient::get_buffer_info_dummy_helper(
     // Bridge the per-request id from hop A's out-of-band attachment to hop B
     // (master RPC: GetReplicaList via Query). See put_dummy_helper.
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
 
@@ -1164,14 +1188,20 @@ RealClient::batch_put_from_dummy_helper(
     // install it in this (coro_rpc server) thread's g_current_ctx so the
     // synchronous master RPC below re-attaches the same id.
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
 
@@ -1359,14 +1389,20 @@ RealClient::batch_get_into_dummy_helper(
     // install it in this (coro_rpc server) thread's g_current_ctx so the
     // synchronous master RPC below re-attaches the same id.
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
 
@@ -1483,14 +1519,20 @@ void RealClient::batchIsExist_internal_rpc(
     // The value-returning batchIsExist_internal stays the shared body (also used
     // in-process by the real path).
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
     ctx.response_msg(batchIsExist_internal(keys));
@@ -1505,14 +1547,20 @@ void RealClient::isExist_internal_rpc(
     // B master RPC (client_service_->IsExist -> master_client_.ExistKey) on this
     // same coro_rpc server thread re-attaches the id, delegate and reply.
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
     ctx.response_msg(isExist_internal(key));
@@ -1526,14 +1574,20 @@ void RealClient::remove_internal_rpc(
     // request id to hop B (client_service_->Remove -> master_client_.Remove)
     // via CurrentCtxScope.
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
     ctx.response_msg(remove_internal(key, force));
@@ -1547,14 +1601,20 @@ void RealClient::getSize_internal_rpc(
     // request id to hop B (client_service_->Query -> master_client_.GetReplicaList)
     // via CurrentCtxScope.
     std::optional<CurrentCtxScope> ctx_guard;
-    if (auto att = ctx.get_context_info()->get_request_attachment();
-        !att.empty()) {
-        // Lower-verbosity (VLOG(2)) than the master's VLOG(1): the real-client
-        // bridge node only relays the id, so keep it off at -v=1 and surface it
-        // at -v>=2 for per-hop tracing.
-        VLOG(2) << "hop-A bridge request_id=" << att;
+    {
+        auto att = ctx.get_context_info()->get_request_attachment();
         RequestContext rc;
-        rc.request_id = std::string(att);
+        if (!att.empty()) {
+            VLOG(2) << "hop-A bridge request_id=" << att;
+            rc.request_id = std::string(att);
+        }
+        // Always install a scope (even for an empty attachment) so the hop B
+        // inject reads THIS request's id, not residue left on this io thread.
+        // The real-client serves dummy clients on a single io thread by
+        // default (FLAGS_threads=1): while a bridge's synchronous master RPC is
+        // in flight the same thread can reenter to handle the next request, so
+        // an empty-attachment request must override the thread-local with an
+        // empty context instead of inheriting a live predecessor's id.
         ctx_guard.emplace(std::move(rc));
     }
     ctx.response_msg(getSize_internal(key));
