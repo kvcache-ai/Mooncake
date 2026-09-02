@@ -31,7 +31,10 @@ impl StoreClient {
             return Ok(());
         }
         lease.expires_at_ms = min_expires_at_ms;
-        self.metadata.upsert_client_lease(&lease)
+        cold_tier::nof::upsert_client_lease_preserving_nof_labels(
+            self.metadata.as_ref(),
+            &mut lease,
+        )
     }
 
     pub fn lifecycle_state(&self) -> ClientLifecycleState {
@@ -74,7 +77,10 @@ impl StoreClient {
         }
         let mut lease = self.lease();
         lease.state = ClientLifecycleState::Active;
-        if let Err(error) = self.metadata.upsert_client_lease(&lease) {
+        if let Err(error) = cold_tier::nof::upsert_client_lease_preserving_nof_labels(
+            self.metadata.as_ref(),
+            &mut lease,
+        ) {
             self.startup_activation_pending.store(true, Ordering::SeqCst);
             return Err(error);
         }

@@ -20,8 +20,8 @@ pub struct ColdBackingRouteFilter {
 
 /// Metadata for an object on a Mooncake-managed local Cold Tier device.
 ///
-/// Remote NoF targets use `NofBackingRoute`; they must not be encoded in
-/// `cold_tier_id` or selected by local-disk GC and watermark scans.
+/// Remote NoF descriptors are request-local; they are not encoded in `cold_tier_id` or selected
+/// by local-disk GC and watermark scans.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ColdBackingRoute {
     pub owner: ClientRuntimeId,

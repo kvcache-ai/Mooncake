@@ -553,9 +553,6 @@ impl MetadataBackend for InMemoryMetadataBackend {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
-        if let Some(route) = next {
-            route.validate_backing_kind()?;
-        }
         let mut state = self.state.write();
         let storage_key = self.scoped_key(&key.0);
         let current = state.objects.get(&storage_key).cloned();
@@ -1289,6 +1286,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -1302,7 +1300,6 @@ mod tests {
                 priority: 0,
             }],
             cold_backing: None,
-            nof_backing: None,
         }
     }
 

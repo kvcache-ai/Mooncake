@@ -231,8 +231,9 @@ pub(super) async fn handle_batch_reclaim_cold_backings(
     }
     let namespace = request.namespace;
     let authority = request.authority;
+    let route_key = mooncake_store_core::ObjectKey::new(request.route_key);
     let results = run_blocking_control("batch_reclaim_cold_backings", move || {
-        cold_tier.batch_reclaim_cold_backings(&namespace, &authority, cold_backings)
+        cold_tier.batch_reclaim_cold_backings(&namespace, &authority, route_key, cold_backings)
     })
     .await?
     .into_iter()

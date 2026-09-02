@@ -104,6 +104,7 @@ pub(crate) trait ColdTierControlService: Send + Sync {
         &self,
         namespace: &str,
         authority: &str,
+        route_key: ObjectKey,
         cold_backings: Vec<mooncake_store_core::ColdBackingRoute>,
     ) -> Vec<Result<ColdReclaimResult>>;
 
@@ -162,6 +163,7 @@ impl ColdTierControlService for UnsupportedColdTierControlService {
         &self,
         _namespace: &str,
         _authority: &str,
+        _route_key: ObjectKey,
         cold_backings: Vec<mooncake_store_core::ColdBackingRoute>,
     ) -> Vec<Result<ColdReclaimResult>> {
         cold_backings
@@ -337,6 +339,7 @@ impl ControlPlaneClient {
         lease: &ClientLease,
         namespace: &str,
         authority: &str,
+        route_key: &ObjectKey,
         cold_backings: &[mooncake_store_core::ColdBackingRoute],
     ) -> Result<Vec<Result<ColdReclaimResult>>> {
         let tracker = OperationTracker::new("control_batch_reclaim_cold_backings");
@@ -345,6 +348,7 @@ impl ControlPlaneClient {
             namespace: namespace.to_string(),
             authority: authority.to_string(),
             cold_backings: cold_backings.iter().map(pb_cold_backing_route).collect(),
+            route_key: route_key.0.clone(),
         };
         let result = (|| {
             let channel = self.channel_for(lease)?;

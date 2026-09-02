@@ -44,8 +44,7 @@ use super::models::{
     DebugRouteNamespaceResponse, DebugRouteReplicaResponse, DebugRouteResponse,
     DeleteTenantPolicyResponse, GetColdTierObjectResponse, GetTenantObjectAccountingResponse,
     GetTenantPolicyResponse, GetTenantQuotaStateResponse, ListColdTierDevicesResponse,
-    ListColdTierOffloadTasksResponse, ListTenantQuotaReservationsResponse,
-    NofObjectBackingResponse, PolicyPatchInput,
+    ListColdTierOffloadTasksResponse, ListTenantQuotaReservationsResponse, PolicyPatchInput,
     RouteMigrationMode, RouteMigrationTaskListResponse, RouteMigrationTaskState,
     RouteMigrationTaskStatusResponse, RouteMigrationTaskSubmitRequest, RoutePolicyResponse,
     TenantQuotaAbortResponse, TenantQuotaReconcileAction, TenantQuotaReconcileReport,
@@ -1641,25 +1640,6 @@ impl AdminService {
                 })
                 .collect(),
             cold_backing: self.debug_route_cold_backing(self.backend.as_ref(), route),
-            nof_backing: route
-                .nof_backing
-                .as_ref()
-                .map(|backing| NofObjectBackingResponse {
-                    target_id: backing.target_id.clone(),
-                    owner: ColdTierObjectBackingOwnerResponse {
-                        stable_id: backing.owner.stable_id.to_string(),
-                        epoch: backing.owner.epoch.0,
-                    },
-                    state: match backing.state {
-                        mooncake_store_core::NofBackingState::PendingWrite => "pending_write",
-                        mooncake_store_core::NofBackingState::Materialized => "materialized",
-                        mooncake_store_core::NofBackingState::PendingDelete => "pending_delete",
-                    }
-                    .to_string(),
-                    locator: backing.object_locator.clone(),
-                    length: backing.length,
-                    checksum: backing.checksum,
-                }),
         }
     }
 
@@ -3361,11 +3341,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas,
             cold_backing: None,
-            nof_backing: None,
         }
     }
 
@@ -3534,6 +3514,7 @@ mod tests {
             sharing_scope: Some("tenant-a".to_string()),
             qos_tier: Some("default".to_string()),
             version: RouteVersion(7),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -3555,7 +3536,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         shared
             .compare_and_swap_object_route(&route.key, None, Some(&route))
@@ -3600,6 +3580,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: Some("default".to_string()),
             version: RouteVersion(7),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -3621,7 +3602,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         shared
             .compare_and_swap_object_route(&route.key, None, Some(&route))
@@ -3795,8 +3775,9 @@ mod tests {
                     canonical_key: None,
                     sharing_scope: None,
                     qos_tier: None,
-                    version: RouteVersion(1),
-                    state: RouteState::Active,
+            version: RouteVersion(1),
+            content_generation: 0,
+            state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: vec![ReplicaRoute {
                         owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
@@ -3809,7 +3790,6 @@ mod tests {
                         priority: 0,
                     }],
                     cold_backing: None,
-                    nof_backing: None,
                 }),
             )
             .expect("route cas should succeed");

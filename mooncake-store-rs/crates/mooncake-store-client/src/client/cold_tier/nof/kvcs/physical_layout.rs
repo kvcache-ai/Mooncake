@@ -1,24 +1,24 @@
 //! KVCS low-level physical layout.
 //!
-//! The shared NoF adapter passes one complete object to the executor. KVCS alone translates that
-//! object into SDK-sized records and persists the layout descriptor as an opaque locator.
+//! An object that fits the provider limit is stored directly at its root key. Only oversized
+//! objects use executor-private chunk keys and a sidecar manifest. The sidecar is written first so
+//! a retry can reconstruct the same chunk set; reads reject the object until every chunk exists.
+//! KVCS remains responsible for reclaiming unreachable provider records.
 
 use mooncake_store_core::{Result, StoreError};
 
 use crate::client::cold_tier::layout::{
-    OpaquePhysicalKey, PhysicalKeyCodec, PhysicalKeyInput, Sha256PhysicalKeyCodec, ValueChunkPlan,
+    derive_physical_key, OpaquePhysicalKey, PhysicalKeyInput, ValueChunkPlan,
 };
-use crate::client::cold_tier::nof::NofPhysicalLocator;
 
-const LOCATOR_MAGIC: &[u8; 8] = b"MCKKV001";
-const LOCATOR_LEN: usize = 25;
-const INLINE: u8 = 0;
-const CHUNKED: u8 = 1;
 const CHUNK_KEY_DOMAIN: &[u8] = b"mooncake:nof:kvcs:chunk:v1";
+const MANIFEST_KEY_DOMAIN: &[u8] = b"mooncake:nof:kvcs:manifest:v1";
+const MANIFEST_MAGIC: &[u8; 8] = b"MKVCLL01";
+pub(super) const MANIFEST_SIZE: usize = 32;
 
 pub(super) struct KvcsWriteLayout<'a> {
-    pub(super) locator: NofPhysicalLocator,
-    pub(super) records: Vec<(OpaquePhysicalKey, &'a [u8])>,
+    pub(super) data_records: Vec<(OpaquePhysicalKey, &'a [u8])>,
+    pub(super) manifest: Option<(OpaquePhysicalKey, [u8; MANIFEST_SIZE])>,
 }
 
 pub(super) struct KvcsReadRecord {
@@ -27,71 +27,43 @@ pub(super) struct KvcsReadRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum KvcsLayout {
-    Inline,
-    Chunked { chunk_size: u64, chunk_count: u64 },
+struct ChunkManifest {
+    value_size: u64,
+    chunk_size: u64,
+    chunk_count: u64,
 }
 
-impl KvcsLayout {
-    fn encode(self) -> Result<NofPhysicalLocator> {
-        let mut bytes = vec![0; LOCATOR_LEN];
-        bytes[..8].copy_from_slice(LOCATOR_MAGIC);
-        match self {
-            Self::Inline => bytes[8] = INLINE,
-            Self::Chunked {
-                chunk_size,
-                chunk_count,
-            } => {
-                bytes[8] = CHUNKED;
-                bytes[9..17].copy_from_slice(&chunk_size.to_le_bytes());
-                bytes[17..25].copy_from_slice(&chunk_count.to_le_bytes());
-            }
-        }
-        NofPhysicalLocator::new(bytes)
+impl ChunkManifest {
+    fn encode(self) -> [u8; MANIFEST_SIZE] {
+        let mut bytes = [0; MANIFEST_SIZE];
+        bytes[..8].copy_from_slice(MANIFEST_MAGIC);
+        bytes[8..16].copy_from_slice(&self.value_size.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.chunk_size.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.chunk_count.to_le_bytes());
+        bytes
     }
 
-    fn decode(locator: &NofPhysicalLocator) -> Result<Self> {
-        let bytes = locator.as_bytes();
-        if bytes.len() != LOCATOR_LEN || &bytes[..8] != LOCATOR_MAGIC {
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != MANIFEST_SIZE || &bytes[..8] != MANIFEST_MAGIC {
             return Err(StoreError::InvalidState(
-                "KVCS physical locator has invalid length or magic".to_string(),
+                "KVCS low-level chunk manifest is malformed".to_string(),
             ));
         }
-        let mut encoded_chunk_size = [0; 8];
-        encoded_chunk_size.copy_from_slice(&bytes[9..17]);
-        let chunk_size = u64::from_le_bytes(encoded_chunk_size);
-        let mut encoded_chunk_count = [0; 8];
-        encoded_chunk_count.copy_from_slice(&bytes[17..25]);
-        let chunk_count = u64::from_le_bytes(encoded_chunk_count);
-        match (bytes[8], chunk_size, chunk_count) {
-            (INLINE, 0, 0) => Ok(Self::Inline),
-            (CHUNKED, 1.., 1..) => Ok(Self::Chunked {
-                chunk_size,
-                chunk_count,
-            }),
-            _ => Err(StoreError::InvalidState(
-                "KVCS physical locator has an invalid layout".to_string(),
-            )),
-        }
-    }
-
-    fn chunk_plan(self, value_len: u64) -> Result<ValueChunkPlan> {
-        let Self::Chunked {
-            chunk_size,
-            chunk_count,
-        } = self
-        else {
-            return Err(StoreError::InvalidState(
-                "KVCS inline layout does not have a chunk plan".to_string(),
-            ));
+        let read_u64 = |range: std::ops::Range<usize>| {
+            u64::from_le_bytes(bytes[range].try_into().expect("eight-byte manifest field"))
         };
-        let plan = ValueChunkPlan::new(value_len, chunk_size)?;
-        if plan.chunk_count() != chunk_count {
+        let manifest = Self {
+            value_size: read_u64(8..16),
+            chunk_size: read_u64(16..24),
+            chunk_count: read_u64(24..32),
+        };
+        let plan = ValueChunkPlan::new(manifest.value_size, manifest.chunk_size)?;
+        if plan.chunk_count() != manifest.chunk_count || manifest.chunk_count < 2 {
             return Err(StoreError::InvalidState(
-                "KVCS physical locator chunk count does not match the object length".to_string(),
+                "KVCS low-level chunk manifest has an invalid chunk count".to_string(),
             ));
         }
-        Ok(plan)
+        Ok(manifest)
     }
 }
 
@@ -100,57 +72,55 @@ pub(super) fn build_write_layout<'a>(
     value: &'a [u8],
     max_value_size: u64,
 ) -> Result<KvcsWriteLayout<'a>> {
-    let value_len = u64::try_from(value.len())
+    let value_size = u64::try_from(value.len())
         .map_err(|_| StoreError::InvalidState("KVCS value length does not fit u64".to_string()))?;
-    let plan = ValueChunkPlan::new(value_len, max_value_size)?;
-    let inline = plan.chunk_count() == 1;
-    let layout = if inline {
-        KvcsLayout::Inline
-    } else {
-        KvcsLayout::Chunked {
-            chunk_size: max_value_size,
-            chunk_count: plan.chunk_count(),
-        }
-    };
-    let records = plan
+    if value_size == 0 {
+        return Err(StoreError::InvalidState(
+            "KVCS physical value must not be empty".to_string(),
+        ));
+    }
+    if max_value_size != 0 && value_size <= max_value_size {
+        return Ok(KvcsWriteLayout {
+            data_records: vec![(root_key.clone(), value)],
+            manifest: None,
+        });
+    }
+
+    let plan = ValueChunkPlan::new(value_size, max_value_size)?;
+    let data_records = plan
         .slices(value)?
-        .map(|(index, value)| {
-            let key = if inline {
-                root_key.clone()
-            } else {
-                chunk_key(root_key, index)?
-            };
-            Ok((key, value))
-        })
+        .map(|(index, value)| Ok((chunk_key(root_key, index)?, value)))
         .collect::<Result<Vec<_>>>()?;
+    let manifest = ChunkManifest {
+        value_size,
+        chunk_size: max_value_size,
+        chunk_count: plan.chunk_count(),
+    }
+    .encode();
     Ok(KvcsWriteLayout {
-        locator: layout.encode()?,
-        records,
+        data_records,
+        manifest: Some((manifest_key(root_key)?, manifest)),
+    })
+}
+
+pub(super) fn manifest_key(root_key: &OpaquePhysicalKey) -> Result<OpaquePhysicalKey> {
+    derive_physical_key(PhysicalKeyInput {
+        domain: MANIFEST_KEY_DOMAIN,
+        fields: &[root_key.as_bytes()],
+        chunk_index: None,
     })
 }
 
 pub(super) fn read_records(
     root_key: &OpaquePhysicalKey,
-    locator: &NofPhysicalLocator,
-    expected_value_size: usize,
-) -> Result<Vec<KvcsReadRecord>> {
-    let layout = KvcsLayout::decode(locator)?;
-    let value_len = u64::try_from(expected_value_size).map_err(|_| {
-        StoreError::InvalidState("KVCS physical read length does not fit u64".to_string())
-    })?;
-    let plan = match layout {
-        KvcsLayout::Inline => {
-            return Ok(vec![KvcsReadRecord {
-                key: root_key.clone(),
-                expected_value_size,
-            }])
-        }
-        KvcsLayout::Chunked { .. } => layout.chunk_plan(value_len)?,
-    };
-    let mut records = Vec::with_capacity(usize::try_from(plan.chunk_count()).map_err(|_| {
+    manifest_bytes: &[u8],
+) -> Result<(Vec<KvcsReadRecord>, usize)> {
+    let manifest = ChunkManifest::decode(manifest_bytes)?;
+    let plan = ValueChunkPlan::new(manifest.value_size, manifest.chunk_size)?;
+    let mut records = Vec::with_capacity(usize::try_from(manifest.chunk_count).map_err(|_| {
         StoreError::InvalidState("KVCS physical chunk count does not fit usize".to_string())
     })?);
-    for index in 0..plan.chunk_count() {
+    for index in 0..manifest.chunk_count {
         let range = plan.range(index)?;
         let expected_value_size = usize::try_from(range.end - range.start).map_err(|_| {
             StoreError::InvalidState("KVCS physical chunk length does not fit usize".to_string())
@@ -160,46 +130,14 @@ pub(super) fn read_records(
             expected_value_size,
         });
     }
-    Ok(records)
-}
-
-pub(super) fn object_keys(
-    root_key: &OpaquePhysicalKey,
-    locator: &NofPhysicalLocator,
-    expected_value_size: usize,
-) -> Result<Vec<OpaquePhysicalKey>> {
-    Ok(read_records(root_key, locator, expected_value_size)?
-        .into_iter()
-        .map(|record| record.key)
-        .collect())
-}
-
-pub(super) fn assemble_read(
-    expected_value_size: usize,
-    records: Vec<Result<Option<Vec<u8>>>>,
-) -> Result<Option<Vec<u8>>> {
-    let mut value = Vec::with_capacity(expected_value_size);
-    let mut found = 0usize;
-    for record in records {
-        if let Some(record) = record? {
-            found += 1;
-            value.extend_from_slice(&record);
-        }
-    }
-    if found == 0 {
-        return Ok(None);
-    }
-    if value.len() != expected_value_size {
-        return Err(StoreError::InvalidState(format!(
-            "KVCS physical layout reconstructed {} bytes, expected {expected_value_size}",
-            value.len()
-        )));
-    }
-    Ok(Some(value))
+    let value_size = usize::try_from(manifest.value_size).map_err(|_| {
+        StoreError::InvalidState("KVCS physical value length does not fit usize".to_string())
+    })?;
+    Ok((records, value_size))
 }
 
 fn chunk_key(root_key: &OpaquePhysicalKey, index: u64) -> Result<OpaquePhysicalKey> {
-    Sha256PhysicalKeyCodec.encode(PhysicalKeyInput {
+    derive_physical_key(PhysicalKeyInput {
         domain: CHUNK_KEY_DOMAIN,
         fields: &[root_key.as_bytes()],
         chunk_index: Some(index),
@@ -211,38 +149,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inline_layout_is_the_no_split_object_fast_path() {
+    fn inline_layout_is_a_single_direct_root_record() {
         let root = OpaquePhysicalKey::new(b"root".to_vec());
         let layout = build_write_layout(&root, b"value", 64).unwrap();
-        assert_eq!(layout.records.len(), 1);
-        assert_eq!(layout.records[0].0, root);
-        assert_eq!(layout.records[0].1, b"value");
+        assert_eq!(layout.data_records.len(), 1);
+        assert_eq!(layout.data_records[0].0, root);
+        assert_eq!(layout.data_records[0].1, b"value");
+        assert!(layout.manifest.is_none());
     }
 
     #[test]
-    fn chunk_layout_is_private_to_kvcs() {
+    fn empty_value_is_rejected_before_the_inline_path() {
+        let root = OpaquePhysicalKey::new(b"root".to_vec());
+        assert!(build_write_layout(&root, b"", 64).is_err());
+    }
+
+    #[test]
+    fn chunk_manifest_preserves_the_original_layout() {
         let root = OpaquePhysicalKey::new(b"root".to_vec());
         let value = vec![7; 150];
         let layout = build_write_layout(&root, &value, 64).unwrap();
-        assert_eq!(layout.records.len(), 3);
-        assert!(layout.records.iter().all(|(key, _)| key != &root));
-        let reads = read_records(&root, &layout.locator, value.len()).unwrap();
+        assert_eq!(layout.data_records.len(), 3);
+        assert!(layout.data_records.iter().all(|(key, _)| key != &root));
+        let (sidecar_key, manifest) = layout.manifest.unwrap();
+        assert_eq!(sidecar_key, manifest_key(&root).unwrap());
+
+        let (reads, value_size) = read_records(&root, &manifest).unwrap();
+        assert_eq!(value_size, value.len());
         assert_eq!(reads.len(), 3);
         assert_eq!(reads[2].expected_value_size, 22);
-    }
-
-    #[test]
-    fn rejects_locator_chunk_count_that_disagrees_with_route_length() {
-        let root = OpaquePhysicalKey::new(b"root".to_vec());
-        let value = vec![7; 150];
-        let layout = build_write_layout(&root, &value, 64).unwrap();
-        let mut corrupted = layout.locator.as_bytes().to_vec();
-        corrupted[17..25].copy_from_slice(&u64::MAX.to_le_bytes());
-        let corrupted = NofPhysicalLocator::new(corrupted).unwrap();
-
-        assert!(matches!(
-            read_records(&root, &corrupted, value.len()),
-            Err(StoreError::InvalidState(_))
-        ));
     }
 }

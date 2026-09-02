@@ -24,30 +24,13 @@ impl OpaquePhysicalKey {
     }
 }
 
-pub(crate) fn encode_hex(bytes: &[u8]) -> String {
+fn encode_hex(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
         use std::fmt::Write;
         let _ = write!(encoded, "{byte:02x}");
     }
     encoded
-}
-
-pub(crate) fn decode_hex(encoded: &str, description: &str) -> Result<Vec<u8>> {
-    if encoded.is_empty() || !encoded.len().is_multiple_of(2) || !encoded.is_ascii() {
-        return Err(StoreError::InvalidState(format!(
-            "{description} has invalid hex length"
-        )));
-    }
-    let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    for offset in (0..encoded.len()).step_by(2) {
-        bytes.push(
-            u8::from_str_radix(&encoded[offset..offset + 2], 16).map_err(|_| {
-                StoreError::InvalidState(format!("{description} contains non-hex bytes"))
-            })?,
-        );
-    }
-    Ok(bytes)
 }
 
 /// Borrowed, length-delimited identity fields for one physical key.
@@ -60,33 +43,25 @@ pub struct PhysicalKeyInput<'a> {
     pub chunk_index: Option<u64>,
 }
 
-pub trait PhysicalKeyCodec: Send + Sync {
-    fn encode(&self, input: PhysicalKeyInput<'_>) -> Result<OpaquePhysicalKey>;
-}
-
-/// SHA-256 codec over domain-separated, length-prefixed identity fields.
+/// Derives a SHA-256 key from domain-separated, length-prefixed identity fields.
 ///
-/// The 32-byte output is this codec's choice, not a restriction of the executor seam.
-#[derive(Default)]
-pub struct Sha256PhysicalKeyCodec;
-
-impl PhysicalKeyCodec for Sha256PhysicalKeyCodec {
-    fn encode(&self, input: PhysicalKeyInput<'_>) -> Result<OpaquePhysicalKey> {
-        let mut hasher = Sha256::new();
-        hasher.update(b"mooncake:physical-key:v1\0");
-        hash_field(&mut hasher, input.domain)?;
-        for field in input.fields {
-            hash_field(&mut hasher, field)?;
-        }
-        match input.chunk_index {
-            Some(index) => {
-                hasher.update([1]);
-                hasher.update(index.to_le_bytes());
-            }
-            None => hasher.update([0]),
-        }
-        Ok(OpaquePhysicalKey::new(hasher.finalize().to_vec()))
+/// The 32-byte output is an internal Mooncake identity; executors still receive opaque bytes and
+/// remain free to encode them for their own key API.
+pub fn derive_physical_key(input: PhysicalKeyInput<'_>) -> Result<OpaquePhysicalKey> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mooncake:physical-key:v1\0");
+    hash_field(&mut hasher, input.domain)?;
+    for field in input.fields {
+        hash_field(&mut hasher, field)?;
     }
+    match input.chunk_index {
+        Some(index) => {
+            hasher.update([1]);
+            hasher.update(index.to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    Ok(OpaquePhysicalKey::new(hasher.finalize().to_vec()))
 }
 
 fn hash_field(hasher: &mut Sha256, field: &[u8]) -> Result<()> {

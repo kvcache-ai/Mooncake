@@ -5,7 +5,6 @@ pub mod hugepage;
 pub mod identity;
 pub mod identity_codec;
 pub mod lifecycle;
-pub mod nof;
 pub mod route;
 pub mod traits;
 
@@ -14,7 +13,7 @@ pub use cold_tier::{
     ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierDeviceUpdate,
     ColdTierPutDeviceResult, ColdTierTarget, ColdTierTargetSpec, ColdTierUsageDelta,
 };
-pub use compat::{CompatibilityDescriptor, NOF_BACKING_ROUTE_CAPABILITY};
+pub use compat::CompatibilityDescriptor;
 pub use error::{Result, StoreError};
 pub use hugepage::{parse_hugepage_size, HugePageConfig};
 pub use identity::{
@@ -27,9 +26,6 @@ pub use identity_codec::{
     scoped_logical_object_id, scoped_object_key,
 };
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
-pub use nof::{
-    NofBackingReplica, NofBackingRoute, NofBackingRouteFilter, NofBackingState, NofTarget,
-};
 pub use route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest,
     RouteControlMode, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,

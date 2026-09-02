@@ -522,7 +522,7 @@ struct PendingOffloadMaterialization {
     entry: PendingOffloadEntry,
     route: ObjectRoute,
     cold_backing: mooncake_store_core::ColdBackingRoute,
-    nof_backing: bool,
+    transient_nof: bool,
     payload: PendingOffloadPayload,
     device: Option<ColdTierDeviceRecord>,
     permit: Option<ColdTierAdmissionPermit>,
@@ -530,14 +530,23 @@ struct PendingOffloadMaterialization {
 
 enum PendingBackingRoute {
     Cold(mooncake_store_core::ColdBackingRoute),
-    Nof(mooncake_store_core::NofBackingRoute),
+    Nof(mooncake_store_core::ColdBackingRoute),
 }
 
 impl PendingBackingRoute {
-    fn publish(self, route: &mut ObjectRoute) {
+    fn is_nof(&self) -> bool {
+        matches!(self, Self::Nof(_))
+    }
+
+    fn backing(&self) -> &mooncake_store_core::ColdBackingRoute {
         match self {
-            Self::Cold(backing) => route.cold_backing = Some(backing),
-            Self::Nof(backing) => route.nof_backing = Some(backing),
+            Self::Cold(backing) | Self::Nof(backing) => backing,
+        }
+    }
+
+    fn publish_local(self, route: &mut ObjectRoute) {
+        if let Self::Cold(backing) = self {
+            route.cold_backing = Some(backing);
         }
     }
 }

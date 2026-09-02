@@ -482,13 +482,10 @@ pub(super) struct PersistentStorageBackendHealth {
     pub(super) available_bytes: Option<u64>,
 }
 
-/// Selects who owns automatic physical storage maintenance for a backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PersistentStorageManagement {
-    /// Cold Tier may run physical inventory reconciliation, watermarks, and compaction.
-    MooncakeManaged,
-    /// The backend/provider owns physical inventory, pressure cleanup, and compaction.
-    BackendManaged,
+pub(super) struct PersistentObjectProbe {
+    /// `None` means the backend can confirm existence but cannot query size without reading data.
+    pub(super) length: Option<u64>,
 }
 
 /// Result of a compaction pass on a cold tier backend.
@@ -527,10 +524,6 @@ pub(crate) struct BackendMaintenanceStats {
 /// that do not need staging (extent store) can override `disable_pending_source()` to return
 /// `true`.
 pub(super) trait PersistentStorageBackend: Send + Sync {
-    fn storage_management(&self) -> PersistentStorageManagement {
-        PersistentStorageManagement::MooncakeManaged
-    }
-
     fn health(&self) -> Result<PersistentStorageBackendHealth> {
         Ok(PersistentStorageBackendHealth {
             capacity_bytes: None,
@@ -589,6 +582,17 @@ pub(super) trait PersistentStorageBackend: Send + Sync {
         &self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
     ) -> Result<Option<Vec<u8>>>;
+
+    fn probe_object(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> Result<Option<PersistentObjectProbe>> {
+        Ok(self
+            .get_object(cold_backing)?
+            .map(|value| PersistentObjectProbe {
+                length: Some(value.len() as u64),
+            }))
+    }
 
     fn get_object_pinned(
         &self,
@@ -726,15 +730,6 @@ impl ColdTierBackendResolver {
 
     pub(super) fn backend_ids(&self) -> Vec<String> {
         self.backends.keys().cloned().collect()
-    }
-
-    pub(super) fn storage_management(
-        &self,
-        cold_tier_id: &str,
-    ) -> Option<PersistentStorageManagement> {
-        self.backends
-            .get(cold_tier_id)
-            .map(|backend| backend.storage_management())
     }
 
     pub(super) fn insert_backend(

@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_int, c_longlong, c_void, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::Mutex;
 
 use libc::size_t;
@@ -9,87 +9,42 @@ const SDK_MAX_VALUE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_KEY_SIZE: usize = 256;
 const KVCS_NAMESPACE_MAX_BYTES: usize = 127;
 
-#[repr(C)]
-struct KvcsClient {
-    _private: [u8; 0],
+#[allow(dead_code, non_camel_case_types)]
+mod sdk_ffi {
+    include!(env!("KVCS_SDK_RUST_FFI"));
 }
 
-#[repr(C)]
-struct KvcsMetaEntry {
-    key: *const c_char,
-    value: *const c_char,
+use sdk_ffi::{
+    kvcs_batch_delete_items, kvcs_batch_get_into, kvcs_batch_put, kvcs_batch_query,
+    kvcs_client_create, kvcs_client_destroy, kvcs_client_t as KvcsClient, kvcs_create_namespace,
+    kvcs_create_ns_opts_t as KvcsCreateNamespaceOptions,
+    kvcs_delete_item_t as KvcsDeleteItem, kvcs_delete_result_t as KvcsDeleteResult,
+    kvcs_get_item_t as KvcsGetItem, kvcs_ll_batch_delete, kvcs_ll_batch_get,
+    kvcs_ll_batch_get_into,
+    kvcs_ll_batch_opts_t as KvcsLlBatchOptions, kvcs_ll_batch_put, kvcs_ll_batch_query,
+    kvcs_ll_config_t as KvcsLlConfig, kvcs_ll_create, kvcs_ll_get_item_t as KvcsLlGetItem,
+    kvcs_ll_put_item_t as KvcsLlPutItem, kvcs_put_item_t as KvcsPutItem,
+    kvcs_put_result_t as KvcsPutResult, kvcs_query_opts_t as KvcsQueryOptions,
+    kvcs_query_result_free, kvcs_query_result_t as KvcsQueryResult,
+};
+
+impl Default for sdk_ffi::kvcs_client_config_t {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }
 
-#[repr(C)]
-struct KvcsPutResult {
-    location: [c_char; 256],
-    status: c_int,
+impl Default for sdk_ffi::kvcs_ll_config_t {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }
 
-#[repr(C)]
-struct KvcsPutItem {
-    key: *const c_char,
-    value_segs: *const *const c_void,
-    seg_lens: *const size_t,
-    seg_count: c_int,
-    shard_id: i32,
-    total_shard: i32,
-    location: *const c_char,
-    meta: *const KvcsMetaEntry,
-    meta_count: c_int,
-}
-
-#[repr(C)]
-struct KvcsGetItem {
-    key: *const c_char,
-    shard_id: i32,
-    location: *const c_char,
-    expected_value_size: size_t,
-    meta: *const KvcsMetaEntry,
-    meta_count: c_int,
-}
-
-#[repr(C)]
-struct KvcsDeleteItem {
-    key: *const c_char,
-    shard_id: i32,
-    location: *const c_char,
-}
-
-#[repr(C)]
-struct KvcsDeleteResult {
-    location: [c_char; 256],
-    status: c_int,
-}
-
-#[repr(C)]
-struct KvcsQueryOptions {
-    renew: c_int,
-    with_shards: c_int,
-}
-
-#[repr(C)]
-struct KvcsShardResult {
-    shard_id: i32,
-    size: i64,
-    accessed_at: i64,
-}
-
-#[repr(C)]
-struct KvcsQueryResult {
-    key: [c_char; 256],
-    status: [c_char; 32],
-    total_shard: i32,
-    total_size: i64,
-    meta: *mut KvcsMetaEntry,
-    meta_count: c_int,
-    shards: *mut KvcsShardResult,
-    shard_count: c_int,
-}
+type KvcsClientConfig = sdk_ffi::kvcs_client_config_t;
 
 struct QueryResults {
     raw: Vec<KvcsQueryResult>,
-    count: c_int,
+    initialized: c_int,
 }
 
 impl QueryResults {
@@ -99,7 +54,7 @@ impl QueryResults {
             raw: (0..len)
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect(),
-            count,
+            initialized: 0,
         }
     }
 
@@ -108,166 +63,59 @@ impl QueryResults {
     }
 
     fn as_slice(&self) -> &[KvcsQueryResult] {
-        &self.raw
+        &self.raw[..self.initialized as usize]
+    }
+
+    fn complete(&mut self, returned: c_int, operation: &str) -> Result<()> {
+        if returned < 0 {
+            return Err(map_call_status(returned, operation));
+        }
+        let requested = self.raw.len();
+        let requested_c = c_int::try_from(requested)
+            .expect("query result allocation count came from a C integer");
+        self.initialized = if returned == 0 {
+            requested_c
+        } else {
+            returned.min(requested_c)
+        };
+        if returned != 0 && returned != requested_c {
+            return Err(StoreError::Transport(format!(
+                "KVCS {operation} returned {returned} results for {requested} requests"
+            )));
+        }
+        Ok(())
     }
 }
 
 impl Drop for QueryResults {
     fn drop(&mut self) {
         if !self.raw.is_empty() {
-            unsafe { kvcs_query_result_free(self.raw.as_mut_ptr(), self.count) };
+            unsafe { kvcs_query_result_free(self.raw.as_mut_ptr(), self.initialized) };
         }
     }
 }
 
-#[repr(C)]
-struct KvcsCreateNamespaceOptions {
-    space_limit: i64,
-    eviction_policy: *const c_char,
-    gc_threshold: f64,
-}
+#[cfg(test)]
+mod query_result_tests {
+    use super::*;
 
-#[derive(Default)]
-#[repr(C)]
-struct KvcsClientConfig {
-    efc_socket: *const c_char,
-    redis_endpoints: *const *const c_char,
-    redis_count: c_int,
-    redis_password: *const c_char,
-    redis_pool_size: c_int,
-    get_workers: c_int,
-    set_workers: c_int,
-    simple_workers: c_int,
-    max_keys_per_batch: c_int,
-    iov_size: i64,
-    max_value_size: i64,
-    max_key_size: c_int,
-    perf_report_interval_sec: c_int,
-    log_path: *const c_char,
-    enable_metrics: c_int,
-}
+    #[test]
+    fn query_completion_accepts_zero_as_the_full_requested_count() {
+        let mut results = QueryResults::new(2);
+        results.complete(0, "test query").unwrap();
+        assert_eq!(results.as_slice().len(), 2);
+    }
 
-#[derive(Default)]
-#[repr(C)]
-struct KvcsLlConfig {
-    efc_socket: *const c_char,
-    max_keys_per_batch: c_int,
-    iov_size: c_longlong,
-    max_value_size: c_longlong,
-    max_key_size: c_int,
-    log_path: *const c_char,
-    get_workers: c_int,
-    set_workers: c_int,
-    simple_workers: c_int,
-    perf_report_interval_sec: c_int,
-    enable_metrics: c_int,
-}
-
-#[repr(C)]
-struct KvcsLlPutItem {
-    key: *const c_char,
-    value_segs: *const *const c_void,
-    seg_lens: *const size_t,
-    seg_count: c_int,
-}
-
-#[repr(C)]
-struct KvcsLlGetItem {
-    key: *const c_char,
-}
-
-#[repr(C)]
-struct KvcsLlBatchOptions {
-    mountpoint_index: u32,
+    #[test]
+    fn query_completion_tracks_only_the_initialized_prefix() {
+        let mut results = QueryResults::new(2);
+        assert!(results.complete(1, "test query").is_err());
+        assert_eq!(results.as_slice().len(), 1);
+    }
 }
 
 unsafe extern "C" {
-    fn kvcs_client_create(config: *const KvcsClientConfig) -> *mut KvcsClient;
-    fn kvcs_client_destroy(client: *mut KvcsClient);
-    fn kvcs_create_namespace(
-        client: *mut KvcsClient,
-        namespace: *const c_char,
-        options: *const KvcsCreateNamespaceOptions,
-    ) -> c_int;
-    fn kvcs_batch_put(
-        client: *mut KvcsClient,
-        namespace: *const c_char,
-        items: *const KvcsPutItem,
-        count: c_int,
-        results: *mut KvcsPutResult,
-        capacity: c_int,
-        deadline_ns: c_longlong,
-    ) -> c_int;
-    fn kvcs_batch_get_into(
-        client: *mut KvcsClient,
-        namespace: *const c_char,
-        items: *const KvcsGetItem,
-        count: c_int,
-        buffers: *mut *mut c_void,
-        capacities: *const size_t,
-        statuses: *mut c_int,
-        lengths: *mut size_t,
-        deadline_ns: c_longlong,
-    ) -> c_int;
-    fn kvcs_batch_delete_items(
-        client: *mut KvcsClient,
-        namespace: *const c_char,
-        items: *const KvcsDeleteItem,
-        count: c_int,
-        results: *mut KvcsDeleteResult,
-        capacity: c_int,
-        deadline_ns: c_longlong,
-    ) -> c_int;
-    fn kvcs_batch_query(
-        client: *mut KvcsClient,
-        namespace: *const c_char,
-        keys: *const *const c_char,
-        count: c_int,
-        options: *const KvcsQueryOptions,
-        results: *mut KvcsQueryResult,
-        capacity: c_int,
-    ) -> c_int;
-    fn kvcs_query_result_free(results: *mut KvcsQueryResult, count: c_int);
-
-    fn kvcs_ll_create(config: *const KvcsLlConfig) -> *mut KvcsClient;
     fn kvcs_ll_client_destroy(client: *mut KvcsClient);
-    fn kvcs_ll_batch_put(
-        client: *mut KvcsClient,
-        items: *const KvcsLlPutItem,
-        count: c_int,
-        results: *mut KvcsPutResult,
-        capacity: c_int,
-        deadline_ns: c_longlong,
-        options: *const KvcsLlBatchOptions,
-    ) -> c_int;
-    fn kvcs_ll_batch_get_into(
-        client: *mut KvcsClient,
-        items: *const KvcsLlGetItem,
-        count: c_int,
-        buffers: *mut *mut c_void,
-        capacities: *const size_t,
-        statuses: *mut c_int,
-        lengths: *mut size_t,
-        deadline_ns: c_longlong,
-        options: *const KvcsLlBatchOptions,
-    ) -> c_int;
-    fn kvcs_ll_batch_delete(
-        client: *mut KvcsClient,
-        keys: *const *const c_char,
-        count: c_int,
-        statuses: *mut c_int,
-        capacity: c_int,
-        deadline_ns: c_longlong,
-        options: *const KvcsLlBatchOptions,
-    ) -> c_int;
-    fn kvcs_ll_batch_query(
-        client: *mut KvcsClient,
-        keys: *const *const c_char,
-        count: c_int,
-        results: *mut KvcsQueryResult,
-        capacity: c_int,
-        options: *const KvcsLlBatchOptions,
-    ) -> c_int;
 }
 
 struct ClientHandle {
@@ -375,26 +223,63 @@ fn put_results(len: usize) -> Vec<KvcsPutResult> {
         .collect()
 }
 
-fn output_buffers(
-    buffers: &mut [Vec<u8>],
-) -> (
-    Vec<*mut c_void>,
-    Vec<size_t>,
-    Vec<c_int>,
-    Vec<size_t>,
-) {
-    let pointers = buffers
-        .iter_mut()
-        .map(|buffer| {
-            if buffer.is_empty() {
+fn output_buffer_parts(
+    buffer: &mut [u8],
+    capacities: &[size_t],
+) -> Result<(Vec<*mut c_void>, Vec<c_int>, Vec<size_t>)> {
+    let total_capacity = capacities.iter().try_fold(0usize, |total, capacity| {
+        total.checked_add(*capacity).ok_or_else(|| {
+            StoreError::InvalidState("KVCS output buffer capacity overflow".to_string())
+        })
+    })?;
+    if total_capacity != buffer.len() {
+        return Err(StoreError::InvalidState(format!(
+            "KVCS output buffer length {} differs from requested capacity {total_capacity}",
+            buffer.len()
+        )));
+    }
+    let mut offset = 0usize;
+    let pointers = capacities
+        .iter()
+        .map(|capacity| {
+            let pointer = if *capacity == 0 {
                 std::ptr::null_mut()
             } else {
-                buffer.as_mut_ptr().cast()
-            }
+                unsafe { buffer.as_mut_ptr().add(offset).cast() }
+            };
+            offset += capacity;
+            pointer
         })
-        .collect();
-    let capacities = buffers.iter().map(Vec::len).collect();
-    (pointers, capacities, vec![0; buffers.len()], vec![0; buffers.len()])
+        .collect::<Vec<_>>();
+    let count = capacities.len();
+    Ok((pointers, vec![0; count], vec![0; count]))
+}
+
+fn validate_get_results(
+    statuses: &[c_int],
+    lengths: &[size_t],
+    expected: &[size_t],
+    operation: &str,
+) -> Result<usize> {
+    let mut found = 0;
+    for (index, ((status, length), expected)) in statuses
+        .iter()
+        .zip(lengths)
+        .zip(expected)
+        .enumerate()
+    {
+        if *status > 0 {
+            found += 1;
+            if length != expected {
+                return Err(StoreError::InvalidState(format!(
+                    "KVCS {operation} item {index} returned {length} bytes, expected {expected}"
+                )));
+            }
+        } else if *status < 0 {
+            return Err(map_item_status(*status, operation, false));
+        }
+    }
+    Ok(found)
 }
 
 fn map_call_status(status: c_int, operation: &str) -> StoreError {

@@ -538,6 +538,13 @@ impl StoreClient {
                 sharing_scope: Some(tenant.to_string()),
                 qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
                 version: next_version,
+                content_generation: if reclaim_mode == ReclaimMode::Deferred {
+                    current
+                        .as_ref()
+                        .map_or(0, |route| route.content_generation)
+                } else {
+                    0
+                },
                 state: RouteState::Active,
                 compatibility: self.lease.compatibility.clone(),
                 replicas: targets
@@ -556,7 +563,6 @@ impl StoreClient {
                     })
                     .collect(),
                 cold_backing: None,
-                nof_backing: None,
             };
             mooncake_store_core::apply_route_identity(&mut route, object_id);
             let cas_tracker = OperationTracker::new("put_stage_route_cas")
@@ -595,6 +601,7 @@ impl StoreClient {
                     .unwrap_or_else(|| next_route_version(None, &self.route_ops(), &scoped_key));
                 if retry_version > route.version {
                     route.version = retry_version;
+                    route.content_generation = retry_version.0;
                     let retry_started = Instant::now();
                     let retry_result =
                         self.route_ops()
@@ -641,6 +648,7 @@ impl StoreClient {
             }
             self.storage_owner.track_route(&route);
             if let Some(previous) = current.as_ref() {
+                self.delete_replaced_nof_content_best_effort(previous, &route);
                 if let Err(error) = self.reclaim_route(previous, reclaim_mode) {
                     warn!(
                         runtime = %self.lease.runtime,
@@ -940,6 +948,7 @@ impl StoreClient {
                 route: route.clone(),
                 replica: source.clone(),
                 fallback_replicas: VecDeque::new(),
+                transient_backing: None,
             };
             let deadline = self.request_deadline_for_transfer(source.length, 1);
             let length = source.length as usize;
@@ -1005,6 +1014,7 @@ impl StoreClient {
                 route: route.clone(),
                 replica: cold_backing_placeholder(&cold_backing),
                 fallback_replicas: VecDeque::new(),
+                transient_backing: None,
             },
             &payload,
         )?;
@@ -1151,7 +1161,6 @@ impl StoreClient {
                         next.version = current.version.next();
                         next.replicas = vec![target];
                         next.cold_backing = None;
-                        next.nof_backing = None;
                         Self::normalize_route_replica_priorities(&mut next.replicas);
                         next
                     }
@@ -1196,7 +1205,6 @@ impl StoreClient {
                 removed_source.cold_backing = current.cold_backing.clone();
             } else {
                 removed_source.cold_backing = None;
-                removed_source.nof_backing = None;
             }
             if let Err(error) = self.reclaim_route(&removed_source, ReclaimMode::Immediate) {
                 warn!(
@@ -2397,6 +2405,7 @@ impl StoreClient {
             route,
             replica,
             fallback_replicas,
+            transient_backing: None,
         })
     }
 
@@ -2496,6 +2505,7 @@ impl StoreClient {
                         route,
                         replica,
                         fallback_replicas,
+                        transient_backing: None,
                     })
                 })();
                 match item {
@@ -2895,7 +2905,7 @@ impl StoreClient {
             .enumerate()
             .filter_map(|(index, entry)| {
                 (cold_tier::resolved_uses_cold_backing(entry)
-                    && cold_tier::materialized_cold_backing(&entry.route).is_some_and(|cb| {
+                    && cold_tier::resolved_cold_backing(entry).is_some_and(|cb| {
                         self.storage_owner
                             .cold_tier_devices
                             .has_runtime_backend(&cb.cold_tier_id)
@@ -3030,7 +3040,7 @@ impl StoreClient {
             .enumerate()
             .filter_map(|(index, entry)| {
                 (cold_tier::resolved_uses_cold_backing(entry)
-                    && !cold_tier::materialized_cold_backing(&entry.route).is_some_and(|cb| {
+                    && !cold_tier::resolved_cold_backing(entry).is_some_and(|cb| {
                         self.storage_owner
                             .cold_tier_devices
                             .has_runtime_backend(&cb.cold_tier_id)
@@ -3731,7 +3741,7 @@ impl StoreClient {
         resolved: &ResolvedObject,
         reply: &crate::control_plane::pb::ReadFromColdReply,
     ) -> Result<()> {
-        let cold_backing = cold_tier::materialized_cold_backing(&resolved.route).ok_or_else(|| {
+        let cold_backing = cold_tier::resolved_cold_backing(resolved).ok_or_else(|| {
             StoreError::InvalidState(format!(
                 "tenant={} key={} remote cold read reply has no materialized cold backing source",
                 resolved.tenant, resolved.key
@@ -5422,6 +5432,10 @@ impl StoreClient {
             if resolved.route.state == RouteState::Active
                 && cold_tier::resolved_uses_cold_backing(resolved)
             {
+                if resolved.transient_backing.is_some() {
+                    cold_tier::restore_payload_from_cold_backing(self, resolved, buffer)?;
+                    return Ok(());
+                }
                 debug!(
                     runtime = %self.lease.runtime,
                     tenant = %resolved.tenant,

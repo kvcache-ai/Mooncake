@@ -1161,6 +1161,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -1174,7 +1175,6 @@ mod tests {
                 priority: 1,
             }],
             cold_backing: None,
-            nof_backing: None,
         }
     }
 
@@ -1556,6 +1556,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -1577,7 +1578,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         tenant_backend
             .compare_and_swap_object_route(&route.key, None, Some(&route))
@@ -1723,6 +1723,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
@@ -1735,7 +1736,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         tenant_backend
             .compare_and_swap_object_route(&cold_only_route.key, None, Some(&cold_only_route))
@@ -1902,6 +1902,7 @@ mod tests {
                     sharing_scope: None,
                     qos_tier: None,
                     version: RouteVersion(1),
+                    content_generation: 0,
                     state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: Vec::new(),
@@ -1914,7 +1915,6 @@ mod tests {
                         state: ColdBackingState::Materialized,
                         replicas: Vec::new(),
                     }),
-                    nof_backing: None,
                 }),
             )
             .expect("route should seed");
@@ -1991,6 +1991,7 @@ mod tests {
             sharing_scope: Some("tenant-a".to_string()),
             qos_tier: Some("default".to_string()),
             version: RouteVersion(7),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -2012,7 +2013,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         service
             .backend()
@@ -2080,6 +2080,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
@@ -2092,7 +2093,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         service
             .backend()
@@ -2107,6 +2107,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
@@ -2119,7 +2120,6 @@ mod tests {
                 state: ColdBackingState::PendingOffload,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         service
             .backend()
@@ -2134,11 +2134,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
             cold_backing: None,
-            nof_backing: None,
         };
         service
             .backend()
@@ -2240,6 +2240,7 @@ mod tests {
                     sharing_scope: None,
                     qos_tier: None,
                     version: RouteVersion(1),
+                    content_generation: 0,
                     state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: Vec::new(),
@@ -2252,7 +2253,6 @@ mod tests {
                         state: ColdBackingState::Materialized,
                         replicas: Vec::new(),
                     }),
-                    nof_backing: None,
                 }),
             )
             .expect("tenant-a route should store");
@@ -2268,6 +2268,7 @@ mod tests {
                     sharing_scope: None,
                     qos_tier: None,
                     version: RouteVersion(1),
+                    content_generation: 0,
                     state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: Vec::new(),
@@ -2280,7 +2281,6 @@ mod tests {
                         state: ColdBackingState::PendingOffload,
                         replicas: Vec::new(),
                     }),
-                    nof_backing: None,
                 }),
             )
             .expect("tenant-b route should store");
@@ -3136,6 +3136,7 @@ mod tests {
                     sharing_scope: None,
                     qos_tier: None,
                     version: RouteVersion(1),
+                    content_generation: 0,
                     state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: Vec::new(),
@@ -3148,7 +3149,6 @@ mod tests {
                         state: ColdBackingState::Materialized,
                         replicas: Vec::new(),
                     }),
-                    nof_backing: None,
                 }),
             )
             .expect("route should seed");

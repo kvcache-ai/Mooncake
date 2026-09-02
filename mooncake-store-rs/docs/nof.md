@@ -1,300 +1,192 @@
-# NoF architecture
+# NoF integration and operation
 
-NoF is one capability-based framework under the existing Cold Tier subsystem. It has no separate
-control plane and no high-level/low-level framework split. `NofBacking` is the runtime composition
-trait; a backing exposes only the capability traits that Mooncake is allowed to call.
+NoF is a remote persistence data plane attached below Cold Tier. It reuses Mooncake's existing hot
+replica lifecycle, offload queue, restore path, target ownership, heartbeat, and replica selection.
+It does not add a second metadata lifecycle.
 
-## Capability model
+The included provider is the KVCS 0.4.0 C API executor. `KvcsCapiExecutor` chooses Standard or
+Low-Level mode when it starts and exposes only the traits supported by that mode.
 
-The capabilities are independent:
+## Architecture
 
-| Capability | Trait | Purpose |
+`NofBackend` wraps an `Arc<dyn NofBacking>`. A backing composes independent, provider-neutral
+capabilities:
+
+| Capability | Trait | Responsibility |
 | --- | --- | --- |
-| logical object write/read/query/delete | `NofObjectWrite`, `NofObjectRead`, `NofObjectQuery`, `NofObjectDelete` | provider object APIs with namespaces and native manifests |
-| physical object write/read/query/delete | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | complete-object APIs whose opaque layout locator is owned by the executor |
-| route-authoritative physical recovery | `NofPhysicalRecovery` | rebuild an allocator-backed executor from live `nof_backing` locators without a second metadata journal |
-| backing health | `NofHealth` | liveness and optional capacity without claiming storage or device ownership |
-| storage maintenance | `NofStorageManagement` | optional physical inventory and capacity contract for Mooncake-managed backings |
+| logical-object I/O | `NofObjectWrite`, `NofObjectRead`, `NofObjectQuery`, `NofObjectDelete` | provider namespace, object, and manifest semantics |
+| physical-object I/O | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | complete-object I/O; the executor privately chooses its record layout |
+| health | `NofHealth` | liveness and optional capacity information |
 
-Capability absence is authoritative. It means the provider owns the responsibility internally or
-does not expose it through a supported API. Mooncake does not infer capabilities from a mode name
-and does not emulate a missing SDK function with an undocumented CLI or private service API.
+Missing capabilities remain missing. Mooncake does not recreate them with a provider CLI, a
+private service API, or a parallel disk-management implementation.
 
-`NofBackend` is the single public facade. It contains an `Arc<dyn NofBacking>`, validates advertised
-logical-object limits, holds the shared physical key codec/domain and performs provider-neutral
-shard planning. Physical request geometry and batching stay inside the selected executor. A
-backing may expose object I/O, physical I/O, health or management-only capabilities without
-creating another framework branch.
+No provider placement is stored in `ObjectRoute`. In particular, Mooncake does not persist a NoF
+target, owner, locator, manifest, shard map, object length, or checksum. The route keeps only the
+logical object identity and a stable content generation. Each request derives the provider key
+from that identity and asks the configured NoF targets directly. Target and owner information is a
+request-local I/O descriptor and is never published through route CAS or exposed by the admin API.
 
-`NofExternalMetadata` is a typed extension of Mooncake's existing `MetadataBackend`, not an
-executor capability. The Cold Tier runtime always owns route CAS and injects that shared metadata
-service directly; putting another metadata accessor on `NofBacking` would create a second,
-unused route-metadata entry point.
+Mooncake remains authoritative for logical object existence, while KVCS remains authoritative for
+provider layout and provider-internal metadata:
 
-The current KVCS mapping is:
+- Standard stores its namespace and shard manifest in KVCS/Redis. Reads query KVCS and then fetch
+  the shards reported by the provider.
+- Low-Level stores raw values in KVCS. A value that exceeds the configured record limit uses an
+  executor-private sidecar and derived record keys in the same KVCS key space.
 
-| `MOONCAKE_KVCS_MODE` | Exposed data-plane traits | External metadata | Health/management traits |
+The content generation remains unchanged while Mooncake changes replica priorities or evicts and
+restores hot copies. Removing and recreating the same logical key receives a new generation, so a
+late delete for the old object cannot address the replacement.
+
+### Standard and Low-Level
+
+| Mode | Data plane | Replication and placement | Physical maintenance |
 | --- | --- | --- | --- |
-| `standard` | object read/write/query/delete | absent; KVCS owns namespace and manifest metadata | absent; EFC owns physical maintenance and disks |
-| `low-level` (default) | physical read/write/query/delete | composed from Mooncake's existing metadata backend by the runtime binding | query-backed `NofHealth`; storage management absent because EFC owns it |
+| `standard` | KVCS logical objects and shards | KVCS owns placement, replicas, and manifest completeness; Mooncake selects one provider target | KVCS owns disks, GC, watermarks, recovery, and rebuild |
+| `low-level` | raw physical keys | Mooncake selects configured NoF targets with the shared Cold Tier replica policy; the same derived key is stored on every selected target | KVCS/EFC owns disks, capacity policy, GC, compaction, recovery, and rebuild |
 
-Both modes use one `KvcsCapiExecutor`. Mode selection initializes only the corresponding SDK
-client configuration and controls which `NofBacking` capability accessors return `Some`. Calling a
-trait from the wrong mode is rejected; it never silently crosses into the other SDK API.
+A `StoreClient` cannot mix logical-object and physical-KV NoF targets. Use separate clients when
+both data planes are required.
 
-## Object splitting and batch splitting
+## Request lifecycle
 
-These are separate layers and must not be substituted for each other:
+On offload, Mooncake derives the provider key, selects healthy targets, and writes the payload. A
+Standard write goes to one provider target because KVCS owns its internal replication. A Low-Level
+write succeeds only after every target selected by `nof_replica_count` accepts the value. No target
+list is written back to metadata.
 
-- **Object splitting** maps one logical value to one or more persistent records. Cold Tier's
-  provider-neutral `ValueChunkPlan` computes only ordered byte ranges. Standard mode uses it in
-  `NofBackend` to form native KVCS shards. KVCS Low-Level uses the same range planner inside its
-  executor-owned physical layout only above its configured value limit, then adds KVCS-only chunk
-  keys and an opaque locator. Low-Level defaults to 3 GiB; values at or below the effective limit
-  take the normal one-key, one-record inline path. An extent executor may reuse the range primitive
-  where useful, but keeps its own alignment, extent and locator rules.
-- **Batch splitting** limits how many already-planned records are submitted at once. KVCS 0.4.0
-  documents `max_keys_per_batch` as its internal ring chunk size and explicitly auto-splits larger
-  user batches in both Standard and Low-Level modes. Mooncake therefore sends one positional C API
-  batch (subject to the C `int` count bound) and does not duplicate the SDK's 256-item loop.
+When no hot or local-disk copy is available, the client derives the same key and probes its current
+NoF configuration. The resulting length, checksum, target, and owner exist only for that restore
+request. Removing an object fans out an idempotent, best-effort delete for its content generation
+to the current target set. Mooncake does not persist a NoF delete intent or retry it after the
+logical route has been removed. If the client exits between route deletion and provider deletion,
+the provider's own GC must reclaim the orphan.
 
-Each data plane performs object splitting exactly once. Removing Mooncake's redundant SDK batch
-loop does not remove object chunking or its persisted layout metadata.
+When an in-memory offload queue is rebuilt, Mooncake probes the provider for each active hot route.
+It re-enqueues only missing objects or Low-Level objects with fewer than the required target copies.
+This is route-driven recovery, not a provider key-space or disk scan.
 
-## Persisted backing metadata
+NoF targets must therefore be configured consistently on clients that share a route namespace.
+Changing a target set does not create a metadata migration. Because KVCS 0.4.0 has no listing API,
+Mooncake cannot enumerate or reclaim provider records that are unreachable from a current logical
+route and target configuration.
 
-The runtime `NofBacking` trait is deliberately separate from the persisted `NofBackingRoute`
-record. Traits cannot be a stable Redis/protobuf schema. Local disks use
-`ObjectRoute.cold_backing: ColdBackingRoute`, while NoF uses
-`ObjectRoute.nof_backing: NofBackingRoute`; a route cannot contain both. A remote NoF target is
-never encoded as a local `cold_tier_id`.
+## Object layout and batching
 
-Core types, Redis indexing, protobuf transport, admin output and `NofExternalMetadata` retain
-`nof_backing` as its own field. The metadata trait is a typed extension over the injected
-`MetadataBackend` (in-memory, Redis or etcd); it owns no connection, cache, journal or second
-keyspace implementation. NoF enumeration uses `NofBackingRouteFilter`, while local Cold Tier
-cleanup continues to use `ColdBackingRouteFilter`.
+Cold Tier's existing `ValueChunkPlan` is the only object-splitting planner:
 
-The additive route field is gated by `nof-backing-route-v1`. A writer cannot publish
-`nof_backing` unless its route compatibility descriptor advertises that capability. Operators
-must enable NoF only after every control-plane node that may decode and rewrite routes supports
-the field.
+- Standard maps the plan to KVCS `shard_id` and `total_shards`; KVCS owns the manifest.
+- Low-Level stores values at or below the configured limit directly at the root key.
+- Larger Low-Level values use derived chunk keys and an executor-private 32-byte sidecar containing
+  total length, chunk size, and chunk count.
 
-## Reuse of Cold Tier
+The Low-Level inline put/get path uses one root key. It does not encode a sidecar, generate chunk
+keys, or iterate a chunk plan. Inline delete first queries the root key and then deletes it.
+Physical layout remains an executor concern, so another executor may use aligned extents or
+another record format without changing the NoF framework.
 
-The physical backend reuses the internal `PersistentStorageBackend` I/O envelope,
-`MetadataBackend`, checksum validation, `PhysicalKeyCodec` and the existing Cold Tier batching
-entry points. It derives a collision-resistant object identity, passes the complete value to the
-selected executor and persists the returned locator opaquely. It does not define a physical record,
-chunk, extent, alignment or manifest format, and it adds no scheduler, metadata service, GC loop or
-device manager. KVCS Low-Level privately reuses `ValueChunkPlan` when its SDK value limit requires
-multiple records.
+Object splitting and SDK batch splitting are separate. Object splitting decides how many records
+represent one value. KVCS already bounds C API batches by `max_keys_per_batch`, so Mooncake passes
+positional batches without another fixed-size batch loop.
 
-Multi-replica placement and read balancing share the provider-neutral
-`ReplicaLoadBalanceStrategy`. Both `ColdBackingRoute` and `NofBackingRoute` implement the same
-`ReplicaTargetSet`: write placement keeps the existing provider-computed score ordering and uses
-the accumulated write count to spread equal-score targets, while reads keep the existing
-`(inflight_io, batch_ios, global_accum_ios)` ordering. Backings still own
-eligibility and capacity inputs, so sharing the strategy does not make a NoF mountpoint a local disk
-or opt it into local-disk maintenance.
+The configured single-value limit is also passed to the SDK client:
 
-`NofStorageManagement` is the optional inventory/capacity boundary for a backing that delegates
-physical maintenance to Mooncake. Its storage health feeds the existing backend health and
-management classification; the provider-specific backend must supply exhaustive inventory before
-physical reconciliation can be enabled. If the capability is absent, the provider owns orphan
-collection, watermarks and compaction. KVCS does not expose storage management because its public
-0.4.0 client ABI does not provide those operations, so no KVCS path runs Mooncake physical
-inventory or watermark maintenance. KVCS Low-Level does expose `NofHealth`: it sends a
-side-effect-free existence query to the selected mountpoint from the background heartbeat worker,
-while leaving capacity unknown because the SDK has no capacity API. Provider device lifecycle
-stays below the SDK until a supported lifecycle API exists; a health-only duplicate of
-`NofHealth` is not modeled as device management.
-
-`StoreClientBuilder::nof_target(s)` registers the runtime backends. The binding reuses the existing
-Cold Tier state machine in this order: select target, publish `PendingWrite`, enqueue, pin/read the
-hot payload, batch write, flush, publish the materialized route by CAS, and roll back an unpublished
-payload on conflict. The same restore singleflight, batch grouping, checksum validation, promotion
-and delayed-delete machinery handles NoF routes. Only the provider-specific I/O call changes.
-
-The old backend trait still accepts a `ColdBackingRoute`, so the runtime creates a short-lived
-in-memory envelope when invoking it. That envelope is never written to metadata. Every route CAS
-for a NoF object writes `ObjectRoute.nof_backing`, and restore/delete convert it only at the I/O
-boundary. This keeps the mature orchestration without pretending that a remote NoF target is a
-local disk.
-
-Target selection is capability driven:
-
-- Cold Tier resolves target authority in one shared `owner` module. A local-disk backing is fixed
-  to the runtime that selected the device and persists that runtime as its authoritative owner;
-  only NoF targets use distributed ownership and treat the route owner as a snapshot;
-- a logical-object target is selected once; namespace metadata, placement and replication remain
-  provider owned; Mooncake derives a versioned provider object key with the existing SHA-256 key
-  codec so delayed reclamation of an overwritten route cannot delete the replacement value;
-- physical-KV targets use `nof_replica_count` and the shared `ReplicaLoadBalanceStrategy`; each
-  successful target write contributes its real locator to `NofBackingRoute.replicas`;
-- single and batch reads use the same inflight/batch/global counters to choose among runtime-local
-  replicas;
-- NoF-enabled clients publish a `nof.target-set.v1` lease label. The value fingerprints the sorted
-  target IDs and selected data plane, so a client with a different NoF configuration is never made
-  owner of an incompatible target;
-- all clients derive the same `target_id -> ClientRuntimeId` ownership map from the existing live
-  client cache and the existing Rendezvous placement hash. The stable client ID is the hash
-  candidate: targets are statistically spread across clients, an epoch restart keeps the same
-  placement, and removing one client remaps only the targets that it owned;
-- one background owner worker runs per NoF-enabled client. Once per second it refreshes the map
-  from the local membership snapshot and probes only the targets currently owned by that client.
-  Request paths never call the SDK health operation; a local owner uses its executor-health
-  snapshot, while another client requires the elected owner's Client lease to remain live and
-  consumes its `nof.unhealthy-targets.v1` snapshot;
-- the owner updates that health label only when the unhealthy set changes. Normal Client heartbeat
-  publication preserves the two NoF-managed labels, so no target-by-client polling or per-request
-  metadata read is introduced;
-- a target remains eligible through two transient heartbeat failures and is excluded after the
-  third consecutive failure; a newly configured target remains unavailable until its first
-  successful probe, and a later success makes it eligible again immediately;
-  a cold restore filters unavailable targets, promotes a healthy replica and publishes the pruned
-  `nof_backing` through the existing restore CAS;
-- NoF-only operation does not load `ColdTierDeviceRecord`, run local watermarks, or update local
-  disk capacity accounting.
-
-The primary and every replica in `NofBackingRoute` record the owner elected for that target when
-the route is published. This field is a routing/audit snapshot, not a second lease. Current
-authority always comes from the live target-owner map, so an ownership change does not scan and
-rewrite every object route. Delete/reclaim resolves the current owner by `target_id`; pending-write
-materialization remains with the client that owns the hot source replica. The target owner is the
-maintenance and health authority; it is not assumed to hold the source payload. This separation
-lets the existing replica-owner offload queue write directly through the configured NoF backend
-without adding a remote source-transfer protocol.
-
-During graceful client shutdown, the NoF manager removes `nof.target-set.v1` from its existing
-Client lease before longer route and local-device cleanup starts. Other clients observe that
-withdrawal through the normal one-second membership refresh and immediately recompute ownership.
-For a process or machine crash, takeover follows the existing Client lease expiry and epoch fence;
-NoF does not add a parallel membership or lease service.
-
-Startup recovery requeues `PendingWrite` routes through the existing route authority's
-replica-owner listing, keyed by the hot source owner. This works for both metadata-only and the
-default EmbeddedWrh route control and avoids target-by-client scans. `NofBackingRouteFilter`
-remains the target-scoped external metadata index used by reconciliation and reclaim safety; it is
-not a second pending-work queue. A definite route CAS conflict removes every unpublished NoF
-target. An unknown CAS outcome retains the idempotent locator for retry rather than risking an
-applied route pointing at deleted data; records left by a process crash or an outcome that can
-never be confirmed remain the provider's GC responsibility.
-
-## Module layout
-
-```text
-client/
-  cold_tier/
-    layout/
-      mod.rs
-      physical_key.rs
-      value_chunk.rs
-    owner.rs
-    nof/
-      mod.rs
-      backing.rs
-      backend.rs
-      object.rs
-      physical.rs
-      physical_backend.rs
-      runtime.rs
-      external_metadata/
-        mod.rs
-        tests.rs
-      kvcs/
-        mod.rs
-        executor.rs
-        physical_layout.rs
-        capi.rs
-        capi_tests.rs
+```shell
+export MOONCAKE_KVCS_MAX_VALUE_SIZE=3221225472 # 3 GiB
 ```
 
-Public provider-neutral traits live directly under `nof/`. All KVCS-specific configuration, C API
-calls and tests live under `nof/kvcs/`. `executor.rs` contains one mode-selecting KVCS executor;
-`physical_layout.rs` owns the Low-Level SDK record/chunk layout; `capi.rs` is the private binding
-for the vendor's public C ABI. `physical_backend.rs` is the shared bridge from executor-owned
-physical objects to the existing Cold Tier backend contract; physical layout and request batching
-remain executor responsibilities.
+KVCS 0.4.0 has no runtime getter for this limit. Unset uses the documented 4 MiB SDK default; valid
+configured values are 1 byte through 4 GiB. The value must remain stable for a target because it is
+part of the Low-Level private layout.
 
-## KVCS Low-Level capability boundary
+## Ownership and health
 
-The capability boundary below was verified against the public 0.4.0 C header, exported ELF
-symbols, official Rust/Python/Go wrappers, SDK mock, EFC package configuration and the EFC tools
-shipped in the same release.
+Low-Level `nof_replica_count` is clamped to `1..=8` and defaults to 1. The shared
+`ReplicaLoadBalanceStrategy` selects write targets using provider score, accumulated writes, and
+target ID.
 
-| Capability | Low-Level SDK ABI | EFC/provider surface | Mooncake decision |
-| --- | --- | --- | --- |
-| raw put/get/get-into/delete | yes | EFC data plane | use SDK |
-| existence query | yes; `ok`, `not_found`, `unavailable` | `KVCS_OP_EXISTS` | use SDK for liveness and metadata-driven reconciliation |
-| namespace/object metadata | no; namespace is fixed to `ll` | Standard client uses Redis | keep route/version/owner/checksum/replicas in `NofBackingRoute` within shared Mooncake metadata |
-| placement or replica locations | no | Standard client only | keep low-level replica placement in NoF external metadata |
-| mountpoint selection | yes, one `mountpoint_index` per batch | EFC maps the index to a configured filesystem | use SDK; one NoF target is one configured mountpoint |
-| physical key list/scan | no | `kvcs_cli list --max N` is an EFC operations command, not SDK ABI | optional only; KVCS does not advertise it |
-| capacity/available bytes | no; SDK metrics contain operation counters only | EFC `stat` and Prometheus expose node total/used/ratio | do not fabricate SDK capacity; use configured logical scheduling capacity or a separate supported telemetry integration |
-| physical GC/watermarks | no client action | provider/EFC managed | skip Mooncake physical inventory GC and watermark cleanup for KVCS |
-| disk offline/online/recover/rebuild | no | `kvcs-disk-ops` and EFC own physical disks | do not duplicate in Mooncake |
-| flush/durability barrier | no | no public Low-Level barrier | rely only on documented synchronous operation completion; do not claim a stronger barrier |
+NoF ownership reuses client leases and Rendezvous hashing. Clients with the same target-set
+fingerprint derive the same `target_id -> owner` assignment:
 
-EFC's operations surface includes `GetStat`, `ExecuteGC`, `BatchDelete`, a local key-list command,
-Prometheus capacity gauges, and disk hot-offline/recovery tooling. Those observations establish
-that physical maintenance belongs below the SDK, but they do not make the private gRPC schema or
-CLI output a supported executor ABI. Integrating such a surface later requires a separately
-versioned provider management adapter.
+- each client probes only the targets it owns;
+- a background heartbeat runs once per second; request paths use its cached result;
+- three consecutive failures exclude a target and one success restores it;
+- owners publish unhealthy target IDs in the existing client lease;
+- graceful shutdown releases ownership immediately, while crash takeover follows lease expiry and
+  epoch fencing.
 
-Because the SDK has no physical list, KVCS supports only one-way, metadata-driven reconciliation:
-enumerate the NoF backing routes for the target, decode each stored NoF
-root locator, and call Low-Level `query`. A missing root invalidates that target reference; a
-healthy replica may be promoted before the stale reference is removed. Physical objects with no
-Mooncake route cannot be discovered through the SDK and are left to provider GC. A full
-`MooncakeManaged` executor instead supplies a stable paginated list, which enables two-way
-metadata/physical reconciliation and orphan deletion.
+KVCS Low-Level health uses the public existence query and reports no capacity because the 0.4.0 ABI
+has no capacity call. Standard exposes no KVCS health capability, so the framework treats a
+configured Standard target as available and does not probe it. Health is never checked per object
+request.
 
-The SDK exposes a filesystem/mountpoint target, not EFC's individual NVMe disk identities. A
-runtime binding may fence and retire a failed NoF target when query returns `ENODEV` or
-`unavailable`, but individual disk offline/replacement remains an EFC operation. Such a binding
-must remove target metadata only after route references have been promoted or pruned; deleting a
-target record first would create dangling routes.
+## KVCS maintenance boundary
 
-## SDK and EFC downloads
+The public KVCS 0.4.0 Low-Level API exposes put, get/get-into, delete, and existence query. It does
+not expose key listing, capacity, disk lifecycle, GC, watermarks, compaction, recovery, rebuild, or
+a separate durability barrier. KVCS/EFC owns those responsibilities. Mooncake does not scan KVCS,
+reconcile provider disks, rebuild provider metadata, or call private maintenance APIs. Queue
+recovery may query keys derived from currently active Mooncake routes; it cannot discover objects
+that have no logical route.
 
-The supported public KVCS baseline is **0.4.0**, commit
-`2089637f8d1a0144814689c8ba49d3d9034799d9`. One SDK archive contains the C ABI, production and
-mock libraries, the Rust path crate, and the Python and Go packages; there are no separate
-language downloads.
+## Source layout
 
-Authoritative entry points:
+```text
+client/cold_tier/
+  layout/
+    physical_key.rs
+    value_chunk.rs
+  owner.rs
+  replica_policy.rs
+  nof/
+    backing.rs
+    backend.rs
+    object.rs
+    physical.rs
+    physical_backend.rs
+    runtime.rs
+    kvcs/
+      capi.rs
+      executor.rs
+      physical_layout.rs
+```
+
+Provider-neutral traits and Cold Tier adapters live under `nof/`. KVCS configuration, C API calls,
+and its private Low-Level layout live under `nof/kvcs/`. `physical_backend.rs` passes complete
+objects between Cold Tier and a physical executor; it defines no chunk, extent, alignment, or
+record format.
+
+## Install KVCS SDK and EFC
+
+The supported SDK version is **0.4.0**. Official entry points:
 
 - [KVCacheStore quick start](https://www.alibabacloud.com/help/en/kvcachestore/quick-start)
-- [official installer](https://kvcachestore.oss-accelerate.aliyuncs.com/scripts/install-kvcs.sh)
+- [KVCS installation script](https://kvcachestore.oss-accelerate.aliyuncs.com/scripts/install-kvcs.sh)
 
-Versioned SDK archives:
+The complete-node installer installs EFC and the SDK under `/opt/kvcs-sdk/latest`:
 
-| Architecture | Download | SHA-256 snapshot verified 2026-09-01 |
+```shell
+curl -fL \
+  https://kvcachestore.oss-accelerate.aliyuncs.com/scripts/install-kvcs.sh \
+  -o install-kvcs.sh
+less install-kvcs.sh
+sudo bash install-kvcs.sh
+test -S /var/run/kvcs/efc-grpc.sock
+```
+
+The application and EFC must run as the same operating-system user.
+
+SDK-only archives:
+
+| Architecture | Download | SHA-256 |
 | --- | --- | --- |
 | x86_64 | [kvcs-sdk-0.4.0-x86_64.tar.gz](https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-0.4.0-x86_64.tar.gz) | `61b1cee7c0e87975d8e3d723c1e3335cabc46a6af2efeced233918f688f2b3c9` |
 | aarch64 | [kvcs-sdk-0.4.0-aarch64.tar.gz](https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-0.4.0-aarch64.tar.gz) | `22159a8fa911799857db6c8d084220efc4d6ac9adc79302a7e35371a71d1fd6c` |
 
-The hashes are locally recorded snapshots because the vendor does not currently publish signed
-sidecar checksums. Recheck them when artifacts are refreshed.
-
-Live tests require matching EFC 0.4.0. The official installer selects the package for the host;
-the direct package URLs are listed here for reproducible provisioning:
-
-| Format | x86_64 / amd64 | aarch64 / arm64 |
-| --- | --- | --- |
-| RPM | [x86_64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc-0.4.0-1.x86_64.rpm) | [aarch64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc-0.4.0-1.aarch64.rpm) |
-| DEB | [amd64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc_0.4.0_amd64.deb) | [arm64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc_0.4.0_arm64.deb) |
-
-All six versioned URLs and the installer returned HTTP 200 when verified on 2026-09-01. The
-installer's previously documented deployment tarball naming is not published for 0.4.0, so it is
-not presented as an available package.
-
-To fetch only the SDK without installing EFC:
-
-```text
+```shell
 KVCS_VERSION=0.4.0
-KVCS_ARCH="$(uname -m)"  # x86_64 or aarch64
+KVCS_ARCH="$(uname -m)" # x86_64 or aarch64
 curl -fL \
   "https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-${KVCS_VERSION}-${KVCS_ARCH}.tar.gz" \
   -o "kvcs-sdk-${KVCS_VERSION}-${KVCS_ARCH}.tar.gz"
@@ -304,226 +196,180 @@ sudo mv "kvcs-sdk-${KVCS_VERSION}" "/opt/kvcs-sdk/${KVCS_VERSION}"
 sudo ln -sfnT "/opt/kvcs-sdk/${KVCS_VERSION}" /opt/kvcs-sdk/latest
 ```
 
-For a complete node installation, download the installer first, inspect it, and then run it. The
-installer downloads the architecture-specific EFC and the same multi-language SDK archive:
+EFC packages for manual provisioning:
 
-```text
-curl -fL \
-  https://kvcachestore.oss-accelerate.aliyuncs.com/scripts/install-kvcs.sh \
-  -o install-kvcs.sh
-less install-kvcs.sh
-sudo bash install-kvcs.sh
+| Format | x86_64 / amd64 | aarch64 / arm64 |
+| --- | --- | --- |
+| RPM | [x86_64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc-0.4.0-1.x86_64.rpm) | [aarch64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc-0.4.0-1.aarch64.rpm) |
+| DEB | [amd64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc_0.4.0_amd64.deb) | [arm64](https://kvcachestore.oss-accelerate.aliyuncs.com/packages/kvcs-efc_0.4.0_arm64.deb) |
+
+The installer also supports a deploy-tarball package type, but a direct public 0.4.0 deploy-tarball
+URL is not currently published. Use the installer or the RPM/DEB links above instead of guessing a
+tarball path.
+
+## Build dependencies
+
+The default feature set has no KVCS dependency. `kvcs-capi` links the public shared C API and uses
+the installed SDK's generated `rust/src/ffi.rs`; Mooncake does not build the vendor C++ sources,
+run bindgen, or add the vendor Rust wrapper to the Cargo graph. SDK 0.4.0 omits
+`kvcs_ll_client_destroy` from that generated Rust file, so Mooncake declares that one function
+from the installed public C header until the SDK binding includes it.
+
+The `kvcs-capi` feature supports Linux GNU targets on x86_64 and aarch64 only.
+
+| Build | Linked library | Runtime directory |
+| --- | --- | --- |
+| production | `libkvcs.so.0` | `$KVCS_SDK_ROOT/lib` |
+| official mock | `libkvcsmock.so.0` | `$KVCS_SDK_ROOT/mock/lib` |
+
+`KVCS_SDK_ROOT` defaults to `/opt/kvcs-sdk/latest`. The build checks the package version and target
+architecture, requires the C header and generated Rust file, checks their expected package shape,
+and requires the selected shared library. It does not perform an independent ABI conformance
+check. No RPATH is embedded, so the loader must resolve the complete shared-library SONAME chain.
+
+Production build:
+
+```shell
+export KVCS_SDK_ROOT=/opt/kvcs-sdk/latest
+export KVCS_SDK_USE_MOCK=0
+MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo build -p mooncake-store-client --features kvcs-capi --offline
+export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
-The SDK ships an official Rust crate, but it is currently documented only as a local path
-dependency (`/opt/kvcs-sdk/latest/rust`), not as a registry coordinate. Adding that absolute path
-to this workspace would make even default Cargo metadata depend on a host installation. The
-integration therefore keeps the opt-in feature portable and links the SDK's sole supported public
-C ABI. It does not copy SDK algorithms or provider control-plane code. If a stable registry package
-becomes available, the C declarations can be replaced by that dependency without changing the NoF
-traits.
+Mock build:
 
-## KVCS executor construction
+```shell
+export KVCS_SDK_ROOT=/opt/kvcs-sdk/latest
+export KVCS_SDK_USE_MOCK=1
+MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo build -p mooncake-store-client --features kvcs-capi --offline
+export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/mock/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
 
-`KvcsCapiExecutor::new` reads `MOONCAKE_KVCS_MODE`; unset defaults to `low-level`. Tests and
-embedding code may select the same behavior explicitly with `with_mode`:
+`KVCS_SDK_USE_MOCK` is a build-time switch; changing only `LD_LIBRARY_PATH` cannot turn a
+production-linked binary into a mock build.
+
+## Runtime configuration
+
+| Variable | Mode | Meaning |
+| --- | --- | --- |
+| `MC_STORE_RS_ENABLE_COLD_TIER` | both | set to `1` to enable the shared Cold Tier lifecycle |
+| `MOONCAKE_KVCS_MODE` | both | `standard` or `low-level`; unset defaults to `low-level` |
+| `MOONCAKE_KVCS_EFC_SOCKET` | both | EFC Unix socket; Low-Level defaults to `/var/run/kvcs/efc-grpc.sock` |
+| `MOONCAKE_KVCS_REDIS_ENDPOINTS` | Standard | comma-separated Redis endpoints, for example `tcp://host:6379` |
+| `MOONCAKE_KVCS_REDIS_PASSWORD` | Standard | optional Redis password |
+| `MOONCAKE_KVCS_MOUNTPOINT_INDEX` | Low-Level | KVCS mountpoint index; defaults to 0 |
+| `MOONCAKE_KVCS_MAX_VALUE_SIZE` | both | SDK single-value limit; defaults to 4 MiB, maximum 4 GiB |
+
+```shell
+# Standard
+export MC_STORE_RS_ENABLE_COLD_TIER=1
+export MOONCAKE_KVCS_MODE=standard
+export MOONCAKE_KVCS_EFC_SOCKET=/var/run/kvcs/efc-grpc.sock
+export MOONCAKE_KVCS_REDIS_ENDPOINTS=tcp://redis.example:6379
+
+# Low-Level
+export MOONCAKE_KVCS_MODE=low-level
+export MOONCAKE_KVCS_MOUNTPOINT_INDEX=0
+export MOONCAKE_KVCS_MAX_VALUE_SIZE=3221225472
+```
+
+Register the configured KVCS target on the existing client builder:
 
 ```rust,ignore
 use std::sync::Arc;
 use mooncake_store_client::{
-    KvcsCapiExecutor, KvcsMode, NofBackend,
+    KvcsCapiExecutor, NofBackend, NofTargetConfig, StoreClientBuilder,
 };
 
-let executor = Arc::new(KvcsCapiExecutor::with_mode(KvcsMode::LowLevel)?);
-let backend = NofBackend::new(executor)?;
-let target = mooncake_store_client::NofTargetConfig::new("kvcs-mount-0", backend)?;
-
-let client = mooncake_store_client::StoreClientBuilder::new(metadata, "storage-0")
+let executor = Arc::new(KvcsCapiExecutor::new()?); // reads MOONCAKE_KVCS_MODE
+let target = NofTargetConfig::new("kvcs-mount-0", NofBackend::new(executor)?)?;
+let client = StoreClientBuilder::new(metadata, "storage-0")
     .nof_target(target)
-    // Used only by physical-KV targets; Standard/provider-object mode ignores it.
-    .nof_replica_count(2)
+    .nof_replica_count(1)
     .build(expires_at_ms)?;
 ```
 
-NoF uses the existing `MC_STORE_RS_ENABLE_COLD_TIER=1` lifecycle switch because it reuses the Cold
-Tier offload/restore workers. The runtime binding writes `nof_backing`, never the target in
-persisted `cold_backing`.
-Any configured Mooncake capacity is a logical admission/load-balancing limit, not a claim about
-EFC physical free space and not a request for Mooncake watermark GC. KVCS mountpoint selection is
-supplied to the concrete executor (`MOONCAKE_KVCS_MOUNTPOINT_INDEX`).
+The generic NoF framework accepts multiple targets, but the current KVCS executor reads its EFC
+socket and mountpoint from process-wide environment variables. Therefore one process must not
+register the same KVCS executor or mountpoint under multiple target IDs. Multi-target KVCS
+deployment requires target-specific executor construction, which is not exposed by this version.
+Every client in one ownership group must configure the same target ID and data plane. A target ID,
+its provider endpoint, mountpoint, mode, and maximum value size are immutable configuration.
+The ownership fingerprint identifies target IDs and data-plane shape; it cannot verify that two
+processes mapped a target ID to the same provider endpoint or mountpoint. Deployment configuration
+must enforce that mapping.
 
-## KVCS build and runtime dependencies
+Standard sharded writes return an SDK error when any shard fails, after which Mooncake may retry the
+object write. Mooncake does not maintain a second shard manifest or independently clean up a
+partially accepted write. Correct retry and incomplete-manifest behavior therefore depends on the
+KVCS Standard API's idempotency and manifest contract.
 
-The default feature set has no KVCS dependency. `kvcs-capi` also adds no Cargo package: the
-dependency graph and `Cargo.lock` are unchanged because Mooncake uses the SDK's public C ABI
-directly. The existing `libc` crate supplies C-compatible Rust types; the existing protobuf build
-dependencies are unrelated to KVCS.
+## Validation
 
-| Build mode | SDK files required at build time | Linked library | Runtime loader path |
-| --- | --- | --- | --- |
-| default features | none | none | none |
-| `kvcs-capi`, production | `COMMIT_ID`, `C/include/kvcs_capi.h`, `lib/libkvcs.so` and its SONAME chain | dynamic `libkvcs.so.0` | `$KVCS_SDK_ROOT/lib` |
-| `kvcs-capi`, official mock | the same metadata/header plus `mock/lib/libkvcsmock.so` and its SONAME chain | dynamic `libkvcsmock.so.0` | `$KVCS_SDK_ROOT/mock/lib` |
+Default build and tests do not require KVCS:
 
-The KVCS C API binding deliberately does not depend on the SDK's `rust/` path crate, `pkg-config`, `bindgen`,
-the KVCS C++ sources, `libkvcs.a`, or `libstdc++-static`. Those belong to the vendor Rust wrapper's
-default static-link flow, not to Mooncake's C ABI integration. EFC and Redis are runtime services,
-not compilation dependencies: Standard-mode operations require EFC plus Redis, while
-Low-Level operations require EFC and a configured mountpoint but do not use Redis.
-
-`build.rs` enforces the supported binary boundary before emitting a linker directive:
-
-- Linux GNU target only; musl, macOS and Windows are rejected;
-- Cargo target architecture must be `x86_64` or `aarch64` and must match `arch` in `COMMIT_ID`;
-- `version` in `COMMIT_ID` must be exactly `0.4.0` until another SDK ABI has been reviewed;
-- the public header and the selected unversioned `.so` linker name must both exist.
-
-The metadata check prevents accidental ABI or architecture mismatches; it is not an integrity
-check. Verify the downloaded archive against the SHA-256 snapshot above before installation.
-
-The published x86_64 production library has SONAME `libkvcs.so.0` and directly needs only the GNU
-loader plus glibc's `libc`, `libdl`, `librt`, `libpthread` and `libm`; its newest referenced glibc
-symbol is `GLIBC_2.17`. It has no dynamic `libstdc++`, gRPC, protobuf or OpenSSL dependency. The
-x86_64 mock directly needs the GNU loader, `libc` and `libm`, with `GLIBC_2.14` as its newest
-referenced symbol. These are properties of the inspected 0.4.0 SDK libraries only: the final
-Mooncake binary can require a newer glibc if it is built on a newer baseline.
-
-Mooncake emits a link search path but does not embed an RPATH. Production images must therefore
-install the complete `.so` SONAME chain in the system loader configuration or set
-`LD_LIBRARY_PATH` when starting the process. Do not copy only the unversioned linker symlink.
-
-### Build environment
-
-`KVCS_SDK_ROOT` is a Mooncake build input and defaults to `/opt/kvcs-sdk/latest`.
-`KVCS_SDK_USE_MOCK` is also a build-time switch: unset or `0` selects production, and `1` selects
-the official mock. Any other value is rejected. Cargo reruns the build script when either value
-changes. `MOONCAKE_KVCS_MODE` is a runtime construction parameter: `standard` exposes only the
-logical-object traits, while `low-level` exposes only the physical-KV traits; unset defaults to
-`low-level`.
-
-The executor exposes only the connectivity and target-selection inputs required by the two public
-SDK modes:
-
-| Variable | Mode | Meaning |
-| --- | --- | --- |
-| `MOONCAKE_KVCS_EFC_SOCKET` | both | EFC Unix socket; Low-Level defaults to `/var/run/kvcs/efc-grpc.sock` |
-| `MOONCAKE_KVCS_REDIS_ENDPOINTS` | Standard | comma-separated Redis endpoints such as `tcp://host:6379` |
-| `MOONCAKE_KVCS_REDIS_PASSWORD` | Standard | optional Redis password |
-| `MOONCAKE_KVCS_MOUNTPOINT_INDEX` | Low-Level | provider mountpoint index; unset or `0` selects the default filesystem |
-| `MOONCAKE_KVCS_MAX_VALUE_SIZE` | both | effective SDK raw-value limit in bytes; unset uses the SDK 0.4.0 default of 4 MiB; accepted range is 1 byte through the SDK maximum 4 GiB |
-
-The 0.4.0 ABI has no post-construction getter for the effective value limit: it is an input in
-`kvcs_client_config_t.max_value_size` and `kvcs_ll_config_t.max_value_size`. The executor therefore
-resolves one runtime value, validates it against the documented 4 GiB SDK maximum, passes that
-exact value into SDK client creation, and reuses the same value for object layout and validation.
-It does not keep a second Mooncake-only limit. A deployment whose Low-Level SDK clients are sized
-for 3 GiB values sets `MOONCAKE_KVCS_MAX_VALUE_SIZE=3221225472`; that value then controls both the
-real SDK client's ring sizing and Mooncake's no-object-split fast path. The deployment-specific
-3 GiB value is not compiled into Mooncake. Other worker-count, ring-depth, key-limit, logging,
-metrics and performance fields remain at the public ABI's documented zero values so the SDK owns
-their defaults.
-
-The vendor's top-level `env.sh` assigns `KVCS_SDK_ROOT` as a shell variable but does not export it,
-and `mock/env.sh` configures the vendor Rust wrapper through `KVCS_DYNAMIC`. Mooncake does not read
-`KVCS_DYNAMIC`, `KVCS_NO_STDLIB_STATIC`, `PKG_CONFIG_PATH` or `LIBRARY_PATH`, so set the Mooncake
-variables explicitly:
-
-```text
-# Production build.
-export KVCS_SDK_ROOT=/opt/kvcs-sdk/0.4.0
-export KVCS_SDK_USE_MOCK=0
+```shell
+cargo fmt --all -- --check
+MOONCAKE_SKIP_NATIVE_BUILD=1 cargo test -p mooncake-store-core --offline
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
-  cargo build -p mooncake-store-client --features kvcs-capi --offline
+  cargo test -p mooncake-store-client --lib --offline -- --test-threads=1
+```
 
-# Production runtime or live tests.
-export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+Official mock validation:
 
-# Official mock build and test process.
+```shell
+export KVCS_SDK_ROOT=/opt/kvcs-sdk/latest
 export KVCS_SDK_USE_MOCK=1
 export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/mock/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --features kvcs-capi --lib \
   nof:: --offline -- --test-threads=1
 
-# The regular filter leaves live-provider smoke tests ignored. With the official mock linked,
-# run both C ABI round trips explicitly.
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --features kvcs-capi --lib \
   client::cold_tier::nof::kvcs::executor::standard::tests::live_standard_round_trip_smoke \
   --offline -- --exact --ignored --test-threads=1
+
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --features kvcs-capi --lib \
   client::cold_tier::nof::kvcs::executor::low_level::tests::live_low_level_round_trip_smoke \
   --offline -- --exact --ignored --test-threads=1
+
+MOONCAKE_KVCS_MAX_VALUE_SIZE=8 MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo test -p mooncake-store-client --features kvcs-capi --lib \
+  client::cold_tier::nof::kvcs::executor::low_level::tests::live_low_level_round_trip_smoke \
+  --offline -- --exact --ignored --test-threads=1
+
+MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo clippy -p mooncake-store-client --all-targets --features kvcs-capi \
+  --offline -- -D warnings
 ```
 
-Build and runtime library selection must agree. `KVCS_SDK_USE_MOCK=1` changes the library recorded
-at link time; changing only `LD_LIBRARY_PATH` is not a supported way to replace a production build
-with the mock.
+Live Standard validation requires EFC plus Redis; live Low-Level validation requires EFC plus a
+configured mountpoint:
 
-Public 0.4.0 requires a non-empty Low-Level EFC socket. The executor uses
-`MOONCAKE_KVCS_EFC_SOCKET` when set and otherwise passes the documented
-`/var/run/kvcs/efc-grpc.sock`; it never passes a null socket and relies on an SDK-version-specific
-fallback.
-
-The KVCS executor enforces the SDK's documented raw value limit and validates the key after converting
-the opaque physical key to the C ABI's hex string. The installed header defaults to a 256-byte raw
-key limit and a 4 MiB value limit. These limits remain inside the KVCS executor.
-
-The KVCS C ABI exposes a mountpoint index but no manager epoch or device-generation fence. This
-integration therefore does not claim physical fencing or C++ backend key/layout compatibility.
-The official mock implements all published Low-Level functions, including existence query, but
-does not simulate real I/O, shared memory, Redis, timeouts, failover, disk failure, capacity,
-watermarks or performance. Mock tests prove ABI marshalling and executor behavior only.
-
-## Validation
-
-Offline validation:
-
-```text
-cargo fmt --all -- --check
-cargo test -p mooncake-store-core --offline
-cargo test -p mooncake-store-client --lib --offline -- --test-threads=1
-export KVCS_SDK_ROOT=/opt/kvcs-sdk/0.4.0
-export KVCS_SDK_USE_MOCK=0
-MOONCAKE_SKIP_NATIVE_BUILD=1 \
-  cargo build -p mooncake-store-client --features kvcs-capi --offline
-export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-MOONCAKE_SKIP_NATIVE_BUILD=1 \
-  cargo test -p mooncake-store-client --features kvcs-capi --lib \
-  nof:: --offline -- --test-threads=1
-
-# Exercise both Standard and Low-Level C ABI round trips without live services.
-export KVCS_SDK_USE_MOCK=1
-export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/mock/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-MOONCAKE_SKIP_NATIVE_BUILD=1 \
-  cargo test -p mooncake-store-client --features kvcs-capi --lib \
-  live_ --offline -- --ignored --test-threads=1
-```
-
-Live Standard smoke requires EFC plus Redis. Live Low-Level smoke requires EFC and a configured
-mountpoint. Use the same filters without the mock library in `LD_LIBRARY_PATH`:
-
-```text
-export KVCS_SDK_ROOT=/opt/kvcs-sdk/0.4.0
+```shell
+export KVCS_SDK_ROOT=/opt/kvcs-sdk/latest
 export KVCS_SDK_USE_MOCK=0
 export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-MOONCAKE_SKIP_NATIVE_BUILD=1 \
-cargo test -p mooncake-store-client --features kvcs-capi --lib \
-  live_ --offline -- \
-  --ignored --test-threads=1
+export MOONCAKE_KVCS_EFC_SOCKET=/var/run/kvcs/efc-grpc.sock
+export MOONCAKE_KVCS_REDIS_ENDPOINTS=tcp://127.0.0.1:6379
+
+MOONCAKE_KVCS_MODE=standard MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo test -p mooncake-store-client --features kvcs-capi --lib \
+  client::cold_tier::nof::kvcs::executor::standard::tests::live_standard_round_trip_smoke \
+  --offline -- --exact --ignored --nocapture --test-threads=1
+
+MOONCAKE_KVCS_MODE=low-level MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo test -p mooncake-store-client --features kvcs-capi --lib \
+  client::cold_tier::nof::kvcs::executor::low_level::tests::live_low_level_round_trip_smoke \
+  --offline -- --exact --ignored --nocapture --test-threads=1
 ```
 
-An SDK-linked build is not a live EFC/Redis/NVMe end-to-end result; record those outcomes
-separately.
-
-## Implementation verification checklist
-
-Use these checks when changing the NoF implementation:
-
-1. capabilities and reuse: confirm no NoF control plane, allocator, metadata backend, scheduler,
-   GC or rebuild loop was introduced, and that absent KVCS management traits are not invoked;
-2. correctness and ABI: check positional batches, partial failures, manifest visibility, checksum
-   validation, key/value limits, environment parsing, C ABI layouts and the public 0.4.0 SDK/mock;
-3. reproducibility: verify every package URL above, default and `kvcs-capi` builds, tests, clippy
-   and formatting.
+The official mock validates ABI marshalling, error handling, and executor behavior. It does not
+exercise real I/O, shared memory, Redis, timeouts, failover, disk faults, capacity, watermarks, or
+performance. It also omits the full shard details needed for a Standard sharded-object read, so
+that path requires live EFC and Redis.

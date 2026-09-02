@@ -8,9 +8,9 @@ use super::super::object::repeated_error;
 use super::super::{
     NofBacking, NofHealth, NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata,
     NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
-    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLocator, NofPhysicalQuery,
-    NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite,
-    NofPhysicalWriteRequest, NofStorageHealth, OpaquePhysicalKey,
+    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalQuery, NofPhysicalQueryRequest,
+    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest,
+    NofStorageHealth, OpaquePhysicalKey,
 };
 use super::*;
 const KVCS_MODE_ENV: &str = "MOONCAKE_KVCS_MODE";
@@ -317,9 +317,9 @@ mod standard {
             shards.push((shard_id, size));
         }
         if shard_bytes != length {
-            return Err(StoreError::InvalidState(
-                "KVCS query shard lengths do not match total size".to_string(),
-            ));
+            return Err(StoreError::InvalidState(format!(
+                "KVCS query shard byte count {shard_bytes} differs from reported total size {length}"
+            )));
         }
         shards.sort_by_key(|(shard_id, _)| *shard_id);
         if shards
@@ -370,14 +370,7 @@ mod standard {
                     1,
                 )
             };
-            if count < 0 {
-                return Err(map_call_status(count, "Standard query"));
-            }
-            if count != 1 {
-                return Err(StoreError::Transport(format!(
-                    "KVCS Standard query returned {count} results for one request"
-                )));
-            }
+            results.complete(count, "Standard query")?;
             let raw = &results.as_slice()[0];
             let status = char_array_str(&raw.status).map_err(|error| {
                 StoreError::Transport(format!(
@@ -535,9 +528,11 @@ mod standard {
             namespace: &NamespaceScope,
             key: &str,
         ) -> Result<NofObjectState<NofObjectMetadata>> {
-            Ok(self
-                .query_raw(namespace, key, false)?
-                .map(|query| query.metadata))
+            Ok(match self.query_raw(namespace, key, false)? {
+                NofObjectState::Found(query) => NofObjectState::Found(query.metadata),
+                NofObjectState::Missing => NofObjectState::Missing,
+                NofObjectState::Incomplete => NofObjectState::Incomplete,
+            })
         }
     }
 
@@ -565,13 +560,19 @@ mod standard {
                     meta_count: 0,
                 })
                 .collect::<Vec<_>>();
-            let mut buffers = query
+            let capacity = usize::try_from(query.metadata.length).map_err(|_| {
+                StoreError::InvalidState(
+                    "KVCS object length does not fit this platform".to_string(),
+                )
+            })?;
+            let mut value = vec![0; capacity];
+            let expected = query
                 .shards
                 .iter()
-                .map(|(_, size)| vec![0; *size])
+                .map(|(_, size)| *size)
                 .collect::<Vec<_>>();
-            let (mut buffer_ptrs, capacities, mut statuses, mut lengths) =
-                output_buffers(&mut buffers);
+            let (mut buffer_ptrs, mut statuses, mut lengths) =
+                output_buffer_parts(&mut value, &expected)?;
             let count = checked_batch_len(items.len())?;
             let status = unsafe {
                 kvcs_batch_get_into(
@@ -580,7 +581,7 @@ mod standard {
                     items.as_ptr(),
                     count,
                     buffer_ptrs.as_mut_ptr(),
-                    capacities.as_ptr(),
+                    expected.as_ptr(),
                     statuses.as_mut_ptr(),
                     lengths.as_mut_ptr(),
                     0,
@@ -589,32 +590,10 @@ mod standard {
             if status < 0 {
                 return Err(map_call_status(status, "Standard get"));
             }
-            let capacity = usize::try_from(query.metadata.length).map_err(|_| {
-                StoreError::InvalidState(
-                    "KVCS object length does not fit this platform".to_string(),
-                )
-            })?;
-            let mut value = Vec::with_capacity(capacity);
-            for (index, ((_, expected), status)) in query.shards.iter().zip(statuses).enumerate() {
-                if status == 0 {
-                    return Ok(NofObjectState::Incomplete);
-                }
-                if status < 0 {
-                    return Err(map_item_status(status, "Standard get item", false));
-                }
-                if lengths[index] != *expected {
-                    return Err(StoreError::InvalidState(format!(
-                        "KVCS shard {index} length {} differs from manifest length {expected}",
-                        lengths[index]
-                    )));
-                }
-                buffers[index].truncate(lengths[index]);
-                value.extend_from_slice(&buffers[index]);
-            }
-            if value.len() != capacity {
-                return Err(StoreError::InvalidState(
-                    "KVCS Standard object length differs from complete manifest".to_string(),
-                ));
+            if validate_get_results(&statuses, &lengths, &expected, "Standard get")?
+                != expected.len()
+            {
+                return Ok(NofObjectState::Incomplete);
             }
             Ok(NofObjectState::Found(NofObject {
                 metadata: query.metadata,
@@ -691,7 +670,7 @@ mod standard {
             let executor = std::sync::Arc::new(
                 super::KvcsCapiExecutor::with_mode(super::KvcsMode::Standard).unwrap(),
             );
-            let backend = crate::NofBackend::new(executor).unwrap();
+            let backend = crate::NofBackend::new(executor.clone()).unwrap();
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -703,7 +682,10 @@ mod standard {
             backend.init_namespace(&namespace).unwrap();
             let metadata = backend.put_object(&namespace, key, value).unwrap();
             assert_eq!(metadata.length, value.len() as u64);
-            assert_eq!(metadata.total_shards, 1);
+            assert_eq!(
+                metadata.total_shards as u64,
+                (value.len() as u64).div_ceil(executor.max_value_size)
+            );
             assert!(matches!(
                 backend.get_object(&namespace, key).unwrap(),
                 NofObjectState::Found(NofObject { value: got, .. }) if got == value
@@ -723,22 +705,20 @@ mod standard {
 mod low_level {
     //! KVCS Low-Level SDK executor for the NoF physical KV contract.
 
-    use std::collections::HashSet;
-
     use mooncake_store_core::{Result, StoreError};
 
     use super::super::physical_layout::{
-        assemble_read, build_write_layout, object_keys, read_records, KvcsReadRecord,
+        build_write_layout, manifest_key, read_records, KvcsReadRecord, MANIFEST_SIZE,
     };
     use super::super::*;
     use super::{
-        NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLocator,
-        NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest,
-        NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth, OpaquePhysicalKey,
+        NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalQuery,
+        NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite,
+        NofPhysicalWriteRequest, NofStorageHealth, OpaquePhysicalKey,
     };
 
     impl KvcsCapiExecutor {
-        fn put_records(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
+        fn put_records(&self, requests: &[(&OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
             let (results, valid) = prepare_positional(requests, |(key, value)| {
                 Ok((encode_physical_key(key, DEFAULT_MAX_KEY_SIZE)?, *value))
             });
@@ -785,30 +765,30 @@ mod low_level {
             )
         }
 
-        fn get_records(&self, requests: &[KvcsReadRecord]) -> Vec<Result<Option<Vec<u8>>>> {
-            let (mut results, valid) = prepare_positional(requests, |request| {
-                Ok((
-                    encode_physical_key(&request.key, DEFAULT_MAX_KEY_SIZE)?,
-                    request.expected_value_size,
-                ))
-            });
-            if valid.is_empty() {
-                return finish_positional_results(results);
-            }
-            let (client, count) = match self.prepare_batch(valid.len()) {
-                Ok(prepared) => prepared,
-                Err(error) => return fail_positional_results(results, error),
-            };
-            let items = valid
+        fn get_records(&self, records: &[KvcsReadRecord]) -> Result<Option<Vec<u8>>> {
+            let keys = records
                 .iter()
-                .map(|(_, (key, _))| KvcsLlGetItem { key: key.as_ptr() })
-                .collect::<Vec<_>>();
-            let mut buffers = valid
+                .map(|record| encode_physical_key(&record.key, DEFAULT_MAX_KEY_SIZE))
+                .collect::<Result<Vec<_>>>()?;
+            let (client, count) = self.prepare_batch(records.len())?;
+            let items = keys
                 .iter()
-                .map(|(_, (_, hint))| vec![0; *hint])
+                .map(|key| KvcsLlGetItem { key: key.as_ptr() })
                 .collect::<Vec<_>>();
-            let (mut pointers, capacities, mut statuses, mut lengths) =
-                output_buffers(&mut buffers);
+            let expected = records
+                .iter()
+                .map(|record| record.expected_value_size)
+                .collect::<Vec<_>>();
+            let capacity = expected.iter().try_fold(0usize, |total, length| {
+                total.checked_add(*length).ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "KVCS low-level read buffer length overflow".to_string(),
+                    )
+                })
+            })?;
+            let mut value = vec![0; capacity];
+            let (mut pointers, mut statuses, mut lengths) =
+                output_buffer_parts(&mut value, &expected)?;
             let options = self.low_level_options();
             let status = unsafe {
                 kvcs_ll_batch_get_into(
@@ -816,7 +796,7 @@ mod low_level {
                     items.as_ptr(),
                     count,
                     pointers.as_mut_ptr(),
-                    capacities.as_ptr(),
+                    expected.as_ptr(),
                     statuses.as_mut_ptr(),
                     lengths.as_mut_ptr(),
                     0,
@@ -824,28 +804,140 @@ mod low_level {
                 )
             };
             if status < 0 {
-                return fail_positional_results(results, map_call_status(status, "low-level get"));
+                return Err(map_call_status(status, "low-level get"));
             }
-            for (offset, ((request_index, _), status)) in valid.iter().zip(statuses).enumerate() {
-                results[*request_index] = Some(if status > 0 {
-                    if lengths[offset] > buffers[offset].len() {
-                        Err(StoreError::Backpressure(
-                            "KVCS low-level value exceeds destination buffer".to_string(),
-                        ))
-                    } else {
-                        buffers[offset].truncate(lengths[offset]);
-                        Ok(Some(std::mem::take(&mut buffers[offset])))
-                    }
-                } else if status == 0 {
-                    Ok(None)
-                } else {
-                    Err(map_item_status(status, "low-level get item", false))
-                });
+            let found = validate_get_results(&statuses, &lengths, &expected, "low-level get")?;
+            match found {
+                0 => Ok(None),
+                count if count == records.len() => Ok(Some(value)),
+                _ => Err(StoreError::InvalidState(
+                    "KVCS low-level physical object is incomplete".to_string(),
+                )),
             }
-            finish_positional_results(results)
         }
 
-        fn delete_records(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<()>> {
+        fn get_record_dynamic(&self, key: &OpaquePhysicalKey) -> Result<Option<Vec<u8>>> {
+            struct DynamicGet {
+                value: Option<Vec<u8>>,
+                status: c_int,
+            }
+
+            unsafe extern "C" fn capture(
+                count: c_int,
+                data_ptrs: *const *const std::ffi::c_void,
+                data_lens: *const libc::size_t,
+                statuses: *const c_int,
+                context: *mut std::ffi::c_void,
+            ) {
+                if count <= 0 || context.is_null() || statuses.is_null() {
+                    return;
+                }
+                let output = unsafe { &mut *(context.cast::<DynamicGet>()) };
+                let status = unsafe { *statuses };
+                if status <= 0 {
+                    if status < 0 && output.value.is_none() && output.status == 0 {
+                        output.status = status;
+                    }
+                    return;
+                }
+                if data_lens.is_null() || data_ptrs.is_null() {
+                    if output.value.is_none() {
+                        output.status = -libc::EIO;
+                    }
+                    return;
+                }
+                let length = unsafe { *data_lens };
+                let data = unsafe { *data_ptrs };
+                if data.is_null() {
+                    if output.value.is_none() {
+                        output.status = -libc::EIO;
+                    }
+                    return;
+                }
+                output.status = status;
+                output.value =
+                    Some(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length).to_vec() });
+            }
+
+            let key = encode_physical_key(key, DEFAULT_MAX_KEY_SIZE)?;
+            let (client, count) = self.prepare_batch(1)?;
+            let item = KvcsLlGetItem { key: key.as_ptr() };
+            let mut output = DynamicGet {
+                value: None,
+                status: 0,
+            };
+            let options = self.low_level_options();
+            let status = unsafe {
+                kvcs_ll_batch_get(
+                    client,
+                    &item,
+                    count,
+                    Some(capture),
+                    (&mut output as *mut DynamicGet).cast(),
+                    0,
+                    &options,
+                )
+            };
+            if status < 0 {
+                return Err(map_call_status(status, "low-level get"));
+            }
+            if output.status < 0 {
+                return Err(map_item_status(output.status, "low-level get item", false));
+            }
+            Ok(output.value)
+        }
+
+        fn put_retryable_records(
+            &self,
+            requests: &[(&OpaquePhysicalKey, &[u8])],
+        ) -> Vec<Result<()>> {
+            requests
+                .iter()
+                .zip(self.put_records(requests))
+                .map(|((key, value), result)| match result {
+                    Err(StoreError::Conflict(_)) => {
+                        let record = KvcsReadRecord {
+                            key: (*key).clone(),
+                            expected_value_size: value.len(),
+                        };
+                        match self.get_records(&[record]) {
+                            Ok(Some(existing)) if existing == *value => Ok(()),
+                            Ok(_) => Err(StoreError::Conflict(
+                                "KVCS low-level retry found a different value".to_string(),
+                            )),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    result => result,
+                })
+                .collect()
+        }
+
+        fn read_object(&self, request: &NofPhysicalReadRequest) -> Result<Option<Vec<u8>>> {
+            if let Some(value) = self.get_record_dynamic(&request.key)? {
+                return Ok(Some(value));
+            }
+
+            let manifest = KvcsReadRecord {
+                key: manifest_key(&request.key)?,
+                expected_value_size: MANIFEST_SIZE,
+            };
+            let Some(manifest) = self.get_records(&[manifest])? else {
+                return Ok(None);
+            };
+            let (chunks, value_size) = read_records(&request.key, &manifest)?;
+            match self.get_records(&chunks)? {
+                Some(value) if value.len() == value_size => Ok(Some(value)),
+                Some(_) => Err(StoreError::InvalidState(
+                    "KVCS low-level chunks do not match the manifest length".to_string(),
+                )),
+                None => Err(StoreError::InvalidState(
+                    "KVCS low-level chunk manifest references missing data".to_string(),
+                )),
+            }
+        }
+
+        fn delete_records(&self, keys: &[&OpaquePhysicalKey]) -> Vec<Result<()>> {
             let (results, valid) =
                 prepare_positional(keys, |key| encode_physical_key(key, DEFAULT_MAX_KEY_SIZE));
             if valid.is_empty() {
@@ -881,7 +973,26 @@ mod low_level {
             finish_unit_statuses(results, &valid, statuses, "low-level delete item", true)
         }
 
-        fn query_records(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
+        fn delete_existing_records(&self, keys: &[&OpaquePhysicalKey]) -> Result<bool> {
+            let mut existing = Vec::with_capacity(keys.len());
+            for (key, exists) in keys.iter().zip(self.query_records(keys)) {
+                if exists? {
+                    existing.push(*key);
+                }
+            }
+            if existing.is_empty() {
+                return Ok(false);
+            }
+            for result in self.delete_records(&existing) {
+                match result {
+                    Ok(()) | Err(StoreError::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(true)
+        }
+
+        fn query_records(&self, keys: &[&OpaquePhysicalKey]) -> Vec<Result<bool>> {
             let (mut results, valid) =
                 prepare_positional(keys, |key| encode_physical_key(key, DEFAULT_MAX_KEY_SIZE));
             if valid.is_empty() {
@@ -907,16 +1018,7 @@ mod low_level {
                     &options,
                 )
             };
-            if written < 0 {
-                return fail_positional_results(
-                    results,
-                    map_call_status(written, "low-level query"),
-                );
-            }
-            if written != count {
-                let error = StoreError::Transport(format!(
-                    "KVCS low-level query returned {written} results for {count} keys"
-                ));
+            if let Err(error) = native_results.complete(written, "low-level query") {
                 fill_missing(&mut results, &error);
             } else {
                 for ((request_index, _), native) in valid.iter().zip(native_results.as_slice()) {
@@ -926,35 +1028,46 @@ mod low_level {
             finish_positional_results(results)
         }
 
-        fn read_object(&self, request: &NofPhysicalReadRequest) -> Result<Option<Vec<u8>>> {
-            let records =
-                read_records(&request.key, &request.locator, request.expected_value_size)?;
-            assemble_read(request.expected_value_size, self.get_records(&records))
-        }
-
         fn delete_object(&self, request: &NofPhysicalDeleteRequest) -> Result<()> {
-            let keys = object_keys(&request.key, &request.locator, request.expected_value_size)?;
-            let mut deleted = false;
-            for result in self.delete_records(&keys) {
-                match result {
-                    Ok(()) => deleted = true,
-                    Err(StoreError::NotFound(_)) => {}
-                    Err(error) => return Err(error),
-                }
+            if self.delete_existing_records(&[&request.key])? {
+                return Ok(());
             }
-            if deleted {
-                Ok(())
-            } else {
-                Err(StoreError::NotFound(
+
+            let manifest_key = manifest_key(&request.key)?;
+            let manifest_record = KvcsReadRecord {
+                key: manifest_key.clone(),
+                expected_value_size: MANIFEST_SIZE,
+            };
+            let Some(manifest) = self.get_records(&[manifest_record])? else {
+                return Err(StoreError::NotFound(
                     "KVCS low-level physical object".to_string(),
-                ))
-            }
+                ));
+            };
+            let (chunks, _) = read_records(&request.key, &manifest)?;
+            self.delete_existing_records(
+                &chunks.iter().map(|chunk| &chunk.key).collect::<Vec<_>>(),
+            )?;
+            self.delete_existing_records(&[&manifest_key])?
+                .then_some(())
+                .ok_or_else(|| StoreError::NotFound("KVCS chunk manifest".to_string()))
         }
 
         fn query_object(&self, request: &NofPhysicalQueryRequest) -> Result<bool> {
-            let keys = object_keys(&request.key, &request.locator, request.expected_value_size)?;
-            for result in self.query_records(&keys) {
-                if !result? {
+            if self.query_records(&[&request.key]).remove(0)? {
+                return Ok(true);
+            }
+            let manifest = KvcsReadRecord {
+                key: manifest_key(&request.key)?,
+                expected_value_size: MANIFEST_SIZE,
+            };
+            let Some(manifest) = self.get_records(&[manifest])? else {
+                return Ok(false);
+            };
+            let (chunks, _) = read_records(&request.key, &manifest)?;
+            for exists in
+                self.query_records(&chunks.iter().map(|chunk| &chunk.key).collect::<Vec<_>>())
+            {
+                if !exists? {
                     return Ok(false);
                 }
             }
@@ -963,10 +1076,7 @@ mod low_level {
     }
 
     impl NofPhysicalWrite for KvcsCapiExecutor {
-        fn put_batch(
-            &self,
-            requests: &[NofPhysicalWriteRequest<'_>],
-        ) -> Vec<Result<NofPhysicalLocator>> {
+        fn put_batch(&self, requests: &[NofPhysicalWriteRequest<'_>]) -> Vec<Result<()>> {
             let mut results = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
             let mut layouts = Vec::with_capacity(requests.len());
             for (index, request) in requests.iter().enumerate() {
@@ -976,54 +1086,59 @@ mod low_level {
                 }
             }
 
-            let mut seen = HashSet::new();
-            let mut duplicates = HashSet::new();
-            for (_, layout) in &layouts {
-                for (key, _) in &layout.records {
-                    if !seen.insert(key.clone()) {
-                        duplicates.insert(key.clone());
-                    }
-                }
-            }
-            layouts.retain(|(index, layout)| {
-                if layout
-                    .records
-                    .iter()
-                    .any(|(key, _)| duplicates.contains(key))
-                {
-                    results[*index] = Some(Err(StoreError::Conflict(
-                        "KVCS physical write contains duplicate record keys".to_string(),
-                    )));
-                    false
-                } else {
-                    true
-                }
-            });
-
-            let records = layouts
+            let initial_records = layouts
                 .iter()
-                .flat_map(|(request_index, layout)| {
-                    layout
-                        .records
-                        .iter()
-                        .map(move |(key, value)| (*request_index, key.clone(), *value))
+                .map(|(request_index, layout)| {
+                    let (key, value) = layout
+                        .manifest
+                        .as_ref()
+                        .map(|(key, value)| (key, value.as_slice()))
+                        .unwrap_or_else(|| {
+                            let (key, value) = &layout.data_records[0];
+                            (key, *value)
+                        });
+                    (*request_index, key, value)
                 })
                 .collect::<Vec<_>>();
-            let writes = records
+            let writes = initial_records
                 .iter()
-                .map(|(_, key, value)| (key.clone(), *value))
+                .map(|(_, key, value)| (*key, *value))
                 .collect::<Vec<_>>();
-            let record_results = self.put_records(&writes);
-            for ((request_index, _, _), status) in records.into_iter().zip(record_results) {
+            for ((request_index, _, _), status) in initial_records
+                .iter()
+                .zip(self.put_retryable_records(&writes))
+            {
                 if let Err(error) = status {
-                    if results[request_index].is_none() {
-                        results[request_index] = Some(Err(error));
-                    }
+                    results[*request_index] = Some(Err(error));
                 }
             }
-            for (request_index, layout) in layouts {
-                if results[request_index].is_none() {
-                    results[request_index] = Some(Ok(layout.locator));
+
+            let chunks = layouts
+                .iter()
+                .filter(|(request_index, layout)| {
+                    results[*request_index].is_none() && layout.manifest.is_some()
+                })
+                .flat_map(|(request_index, layout)| {
+                    layout
+                        .data_records
+                        .iter()
+                        .map(move |(key, value)| (*request_index, key, *value))
+                })
+                .collect::<Vec<_>>();
+            let writes = chunks
+                .iter()
+                .map(|(_, key, value)| (*key, *value))
+                .collect::<Vec<_>>();
+            for ((request_index, _, _), status) in
+                chunks.iter().zip(self.put_retryable_records(&writes))
+            {
+                if let Err(error) = status {
+                    results[*request_index].get_or_insert(Err(error));
+                }
+            }
+            for result in &mut results {
+                if result.is_none() {
+                    *result = Some(Ok(()));
                 }
             }
             finish_positional_results(results)
@@ -1060,7 +1175,7 @@ mod low_level {
     impl NofHealth for KvcsCapiExecutor {
         fn health(&self) -> Result<NofStorageHealth> {
             let probe = OpaquePhysicalKey::new(b"mooncake:nof:health:v1".to_vec());
-            self.query_records(&[probe]).pop().ok_or_else(|| {
+            self.query_records(&[&probe]).pop().ok_or_else(|| {
                 StoreError::Transport("KVCS health query returned no result".to_string())
             })??;
             Ok(NofStorageHealth::default())
@@ -1099,7 +1214,7 @@ mod low_level {
                 .unwrap()
                 .as_nanos();
             let key = OpaquePhysicalKey::new(format!("mooncake-smoke-{nonce}").into_bytes());
-            let locator = executor
+            executor
                 .physical_write()
                 .unwrap()
                 .put_batch(&[NofPhysicalWriteRequest {
@@ -1111,22 +1226,14 @@ mod low_level {
             assert!(executor
                 .physical_query()
                 .unwrap()
-                .query_batch(&[NofPhysicalQueryRequest {
-                    key: key.clone(),
-                    locator: locator.clone(),
-                    expected_value_size: value.len(),
-                }])
+                .query_batch(&[NofPhysicalQueryRequest { key: key.clone() }])
                 .remove(0)
                 .unwrap());
             assert_eq!(
                 executor
                     .physical_read()
                     .unwrap()
-                    .get_batch(&[NofPhysicalReadRequest {
-                        key: key.clone(),
-                        locator: locator.clone(),
-                        expected_value_size: value.len(),
-                    }])
+                    .get_batch(&[NofPhysicalReadRequest { key: key.clone() }])
                     .remove(0)
                     .unwrap(),
                 Some(value.to_vec())
@@ -1134,21 +1241,13 @@ mod low_level {
             executor
                 .physical_delete()
                 .unwrap()
-                .delete_batch(&[NofPhysicalDeleteRequest {
-                    key: key.clone(),
-                    locator: locator.clone(),
-                    expected_value_size: value.len(),
-                }])
+                .delete_batch(&[NofPhysicalDeleteRequest { key: key.clone() }])
                 .remove(0)
                 .unwrap();
             assert!(!executor
                 .physical_query()
                 .unwrap()
-                .query_batch(&[NofPhysicalQueryRequest {
-                    key,
-                    locator,
-                    expected_value_size: value.len(),
-                }])
+                .query_batch(&[NofPhysicalQueryRequest { key }])
                 .remove(0)
                 .unwrap());
             assert!(executor.physical_read().is_some());
@@ -1160,7 +1259,6 @@ mod low_level {
                 NofStorageHealth::default()
             );
             assert!(executor.object_read().is_none());
-            assert!(executor.storage_management().is_none());
         }
 
         #[test]
@@ -1197,6 +1295,5 @@ mod mode_tests {
         assert!(low_level.physical_write().is_some());
         assert!(low_level.physical_query().is_some());
         assert!(low_level.health_capability().is_some());
-        assert!(low_level.storage_management().is_none());
     }
 }

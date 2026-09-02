@@ -196,6 +196,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(version),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::mooncake_v1(),
             replicas: vec![ReplicaRoute {
@@ -209,7 +210,6 @@ mod tests {
                 priority: 0,
             }],
             cold_backing: None,
-            nof_backing: None,
         }
     }
 
@@ -222,6 +222,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(version),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::mooncake_v1(),
             replicas: vec![ReplicaRoute {
@@ -235,7 +236,6 @@ mod tests {
                 priority: 1,
             }],
             cold_backing: None,
-            nof_backing: None,
         }
     }
 

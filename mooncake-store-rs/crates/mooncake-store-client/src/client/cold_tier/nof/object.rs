@@ -47,16 +47,6 @@ pub enum NofObjectState<T> {
     Incomplete,
 }
 
-impl<T> NofObjectState<T> {
-    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> NofObjectState<U> {
-        match self {
-            Self::Found(value) => NofObjectState::Found(map(value)),
-            Self::Missing => NofObjectState::Missing,
-            Self::Incomplete => NofObjectState::Incomplete,
-        }
-    }
-}
-
 /// Logical-object writes exposed by a NoF backing.
 pub trait NofObjectWrite: Send + Sync {
     fn init_namespace(&self, namespace: &NamespaceScope) -> Result<()>;

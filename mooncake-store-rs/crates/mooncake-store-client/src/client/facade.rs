@@ -275,6 +275,52 @@ impl StoreClient {
         changed_replica
     }
 
+    fn route_delete_can_follow_cold_restore(
+        previous: &ObjectRoute,
+        current: &ObjectRoute,
+    ) -> bool {
+        if previous.state != RouteState::Active
+            || current.state != RouteState::Active
+            || !previous.replicas.is_empty()
+            || current.replicas.is_empty()
+            || current.version <= previous.version
+        {
+            return false;
+        }
+
+        let mut restored = current.clone();
+        restored.version = previous.version;
+        restored.replicas.clear();
+        restored == *previous
+    }
+
+    fn delete_nof_content_best_effort(&self, route: &ObjectRoute) {
+        if let Err(error) = self
+            .storage_owner
+            .cold_tier_devices
+            .nof_targets
+            .delete_object(route)
+        {
+            warn!(
+                runtime = %self.lease.runtime,
+                key = %route.key.0,
+                content_generation = route.content_generation,
+                error = %error,
+                "request-local NoF delete failed"
+            );
+        }
+    }
+
+    fn delete_replaced_nof_content_best_effort(
+        &self,
+        previous: &ObjectRoute,
+        replacement: &ObjectRoute,
+    ) {
+        if previous.content_generation != replacement.content_generation {
+            self.delete_nof_content_best_effort(previous);
+        }
+    }
+
     pub(super) fn remove_object_route_with_retry(
         &self,
         object_id: &LogicalObjectId,
@@ -320,22 +366,7 @@ impl StoreClient {
                         "route delete reclaim scheduling failed after authoritative delete"
                     );
                 }
-                if let Some(nof_backing) = route.nof_backing.as_ref() {
-                    let mut nof_backing_route = route.clone();
-                    nof_backing_route.replicas.clear();
-                    nof_backing_route.nof_backing = None;
-                    nof_backing_route.cold_backing =
-                        Some(cold_tier::nof::nof_as_cold(nof_backing));
-                    if let Err(error) = self.schedule_route_reclaim(&nof_backing_route) {
-                        warn!(
-                            runtime = %self.lease.runtime,
-                            tenant,
-                            key,
-                            error = %error,
-                            "NoF backing reclaim scheduling failed after authoritative delete"
-                        );
-                    }
-                }
+                self.delete_nof_content_best_effort(&route);
                 return Ok(());
             }
 
@@ -346,7 +377,9 @@ impl StoreClient {
             match cas.current {
                 Some(current_route)
                     if force
-                        && self.route_delete_can_follow_rollout_handoff(&route, &current_route)
+                        && (Self::route_delete_can_follow_cold_restore(&route, &current_route)
+                            || self
+                                .route_delete_can_follow_rollout_handoff(&route, &current_route))
                         && attempt < max_attempts =>
                 {
                     debug!(
@@ -1167,9 +1200,15 @@ impl MooncakeCompatibilityFacade for StoreClient {
             if let Some(replica) = self.select_readable_replica_with_refresh(&route)? {
                 return Ok(replica.length as usize);
             }
-            Ok(cold_tier::materialized_cold_backing(&route)
-                .map(|cold_backing| cold_backing.length as usize)
-                .unwrap_or(0))
+            if let Some(cold_backing) = cold_tier::materialized_cold_backing(&route) {
+                return Ok(cold_backing.length as usize);
+            }
+            self.storage_owner
+                .cold_tier_devices
+                .nof_targets
+                .discover_backing(&route)?
+                .map(|backing| backing.length as usize)
+                .ok_or_else(|| StoreError::NotFound(format!("tenant={tenant} key={key}")))
         })();
         tracker.finish(&result, result.as_ref().copied().unwrap_or_default() as u64);
         result
@@ -1182,6 +1221,20 @@ impl MooncakeCompatibilityFacade for StoreClient {
     fn is_exist_in_tenant(&self, tenant: &str, key: &str) -> Result<bool> {
         let scope = NamespaceScope::with_defaults(Some(tenant), None, None);
         let object_key = ObjectKey::from_scope(&scope, key);
+        let Some(route) = self.route_ops().load_route(&object_key)? else {
+            return Ok(false);
+        };
+        if route.state == RouteState::Active
+            && route.replicas.is_empty()
+            && route.cold_backing.is_none()
+            && !self.storage_owner.cold_tier_devices.nof_targets.is_empty()
+        {
+            return self
+                .storage_owner
+                .cold_tier_devices
+                .nof_targets
+                .contains_object(&route);
+        }
         self.route_ops().contains_active_route(&object_key)
     }
 
@@ -1197,7 +1250,42 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 ObjectKey::from_scope(&scope, object.key)
             })
             .collect::<Vec<_>>();
-        let result = self.route_ops().contains_active_routes_bounded(&keys);
+        let result = (|| {
+            let nof_targets = &self.storage_owner.cold_tier_devices.nof_targets;
+            if nof_targets.is_empty() {
+                return self.route_ops().contains_active_routes_bounded(&keys);
+            }
+
+            let routes = self.route_ops().load_routes_bounded(&keys)?;
+            let mut exists = vec![false; keys.len()];
+            let mut ordinary_indices = Vec::new();
+            for (index, route) in routes.iter().enumerate() {
+                match route {
+                    Some(route)
+                        if route.state == RouteState::Active
+                            && route.replicas.is_empty()
+                            && route.cold_backing.is_none() =>
+                    {
+                        exists[index] = nof_targets.contains_object(route)?;
+                    }
+                    Some(_) => ordinary_indices.push(index),
+                    None => {}
+                }
+            }
+            let ordinary_keys = ordinary_indices
+                .iter()
+                .map(|&index| keys[index].clone())
+                .collect::<Vec<_>>();
+            if !ordinary_keys.is_empty() {
+                for (index, found) in ordinary_indices.into_iter().zip(
+                    self.route_ops()
+                        .contains_active_routes_bounded(&ordinary_keys)?,
+                ) {
+                    exists[index] = found;
+                }
+            }
+            Ok(exists)
+        })();
         tracker.finish(&result, result.as_ref().map(|items| items.len()).unwrap_or(0) as u64);
         result
     }

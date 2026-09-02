@@ -1,14 +1,12 @@
 //! Capability-based NoF integration within the existing Cold Tier subsystem.
 //!
 //! NoF backings are not divided into high-level and low-level framework branches. A backing
-//! advertises only the logical-object, physical-KV, query, health and storage-maintenance traits
-//! that Mooncake may call. External metadata is a typed view of the existing MetadataBackend.
+//! advertises only the logical-object, physical-KV, query and health traits that Mooncake may call.
 
 use mooncake_store_core::{Result, StoreError};
 
 mod backend;
 mod backing;
-pub(in crate::client) mod external_metadata;
 mod object;
 mod physical;
 pub(in crate::client) mod physical_backend;
@@ -22,24 +20,20 @@ pub(in crate::client) use super::owner::{
 };
 pub use backend::NofBackend;
 pub use backing::NofBacking;
-pub use external_metadata::NofExternalMetadata;
 pub use object::{
     NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata, NofObjectQuery, NofObjectRead,
     NofObjectShardWrite, NofObjectState, NofObjectWrite,
 };
 pub use physical::{
-    NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalListPage,
-    NofPhysicalLocator, NofPhysicalObject, NofPhysicalQuery, NofPhysicalQueryRequest,
-    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalRecoveredRecord, NofPhysicalRecovery,
-    NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth, NofStorageManagement,
+    NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalQuery,
+    NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite,
+    NofPhysicalWriteRequest, NofStorageHealth,
 };
 pub use runtime::NofTargetConfig;
-pub(in crate::client) use runtime::{
-    cold_as_nof, nof_as_cold, route_backing_as_cold, target_set_fingerprint, NofTargetManager,
-};
+pub(in crate::client) use runtime::{target_set_fingerprint, NofTargetManager};
 
 pub use crate::client::cold_tier::layout::{
-    OpaquePhysicalKey, PhysicalKeyCodec, PhysicalKeyInput, Sha256PhysicalKeyCodec,
+    derive_physical_key, OpaquePhysicalKey, PhysicalKeyInput,
 };
 
 #[cfg(feature = "kvcs-capi")]

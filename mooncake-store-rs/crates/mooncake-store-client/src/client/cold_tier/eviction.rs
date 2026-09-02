@@ -3,6 +3,7 @@ use super::super::{
     DebugEvictAllResult, ObjectRoute, OperationTracker, PendingOffloadPrepareOutcome,
     RestorePromotionQueue, Result, RouteState, SegmentName, StorageOwnerState,
 };
+use super::{local_hot_replica_checksum, read_local_hot_replica_payload};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
@@ -512,7 +513,10 @@ impl StorageOwnerState {
         &self,
         route: &ObjectRoute,
     ) -> Result<Option<ObjectRoute>> {
-        let cold_state = super::nof::route_backing_as_cold(route).map(|backing| backing.state);
+        if route.cold_backing.is_none() && !self.cold_tier_devices.nof_targets.is_empty() {
+            return self.ensure_request_local_nof_copy(route);
+        }
+        let cold_state = route.cold_backing.as_ref().map(|backing| backing.state);
         match cold_state {
             Some(mooncake_store_core::ColdBackingState::Materialized) => Ok(Some(route.clone())),
             Some(mooncake_store_core::ColdBackingState::PendingOffload) => {
@@ -550,6 +554,56 @@ impl StorageOwnerState {
                 self.current_materialized_route(&route.key)
             }
         }
+    }
+
+    fn ensure_request_local_nof_copy(&self, route: &ObjectRoute) -> Result<Option<ObjectRoute>> {
+        let Some(replica) = route
+            .replicas
+            .iter()
+            .filter(|replica| replica.owner == self.runtime)
+            .min_by_key(|replica| replica.priority)
+        else {
+            return Ok(None);
+        };
+        let checksum = match replica.checksum {
+            Some(checksum) => checksum,
+            None => local_hot_replica_checksum(&self.allocator, &self.state, route, replica)?,
+        };
+        if let Some(backing) = self.cold_tier_devices.nof_targets.discover_backing(route)? {
+            if self.cold_tier_devices.nof_targets.verify_backing(
+                &backing,
+                replica.length,
+                checksum,
+            )? {
+                return Ok(Some(route.clone()));
+            }
+        }
+        let Some(target) =
+            self.cold_tier_devices
+                .nof_targets
+                .pending_backing(route, replica.length, checksum)?
+        else {
+            return Ok(None);
+        };
+        let backend = self.cold_tier_devices.backend_for(&target)?;
+        let payload = read_local_hot_replica_payload(
+            &self.allocator,
+            &self.state,
+            backend.as_ref(),
+            route,
+            replica,
+        )?;
+        self.cold_tier_devices
+            .nof_targets
+            .put_selected(&target, payload.as_slice())?;
+        let Some(backing) = self.cold_tier_devices.nof_targets.discover_backing(route)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .cold_tier_devices
+            .nof_targets
+            .verify_backing(&backing, replica.length, checksum)?
+            .then_some(route.clone()))
     }
 
     fn publish_pending_cold_backing_for_eviction(

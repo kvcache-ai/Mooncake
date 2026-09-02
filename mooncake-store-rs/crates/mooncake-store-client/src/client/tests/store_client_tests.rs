@@ -245,11 +245,11 @@ impl RecordingRouteDirectory {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
             cold_backing: None,
-            nof_backing: None,
         })
     }
 }

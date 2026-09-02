@@ -12,22 +12,6 @@ fn namespace_fields_do_not_collide() {
     );
 }
 
-#[test]
-fn object_state_map_preserves_provider_state() {
-    assert_eq!(
-        NofObjectState::Found(2).map(|value| value * 3),
-        NofObjectState::Found(6)
-    );
-    assert_eq!(
-        NofObjectState::<u8>::Missing.map(u16::from),
-        NofObjectState::Missing
-    );
-    assert_eq!(
-        NofObjectState::<u8>::Incomplete.map(u16::from),
-        NofObjectState::Incomplete
-    );
-}
-
 struct RecordingObjectBacking {
     shards: Mutex<Vec<(u32, u32, usize)>>,
     batches: Mutex<Vec<usize>>,

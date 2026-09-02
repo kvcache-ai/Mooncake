@@ -1088,11 +1088,11 @@ impl StoreClient {
                             sharing_scope: None,
                             qos_tier: None,
                             version: next_version,
+                            content_generation: 0,
                             state: RouteState::Active,
                             compatibility: self.lease.compatibility.clone(),
                             replicas,
                             cold_backing: None,
-                            nof_backing: None,
                         };
                         mooncake_store_core::apply_route_identity(&mut route, &entry.object_id);
                         route.qos_tier = Some(
@@ -1407,6 +1407,7 @@ impl StoreClient {
                         });
                     if retry_version > routes[index].route.version {
                         routes[index].route.version = retry_version;
+                        routes[index].route.content_generation = retry_version.0;
                         floor_retry_indices.push(index);
                         floor_retry_requests.push(RouteCasRequest {
                             key: routes[index].key.clone(),
@@ -1576,6 +1577,7 @@ impl StoreClient {
                     };
                     self.storage_owner.track_route(&route);
                     if let Some(previous) = pending.previous.as_ref() {
+                        self.delete_replaced_nof_content_best_effort(previous, &route);
                         if let Err(error) = self.schedule_route_reclaim(previous) {
                             warn!(
                                 runtime = %self.lease.runtime,

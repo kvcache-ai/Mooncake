@@ -10,8 +10,8 @@ use super::super::{
     DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
 };
 use super::{
-    backend_load_cold_payload_batch_into, cold_restore_flight_key, materialized_cold_backing,
-    payload_checksum, record_cold_tier_ssd_read, select_cold_backing_target,
+    backend_load_cold_payload_batch_into, cold_restore_flight_key, payload_checksum,
+    record_cold_tier_ssd_read, resolved_cold_backing, select_cold_backing_target,
     validate_cold_restore_payload, with_disjoint_restore_caller_buffers,
 };
 use std::{
@@ -40,7 +40,7 @@ pub(in super::super) fn enqueue_restore_promotion(
 ) {
     let payload = payload.into_arc();
     let payload_bytes = payload.len();
-    let Some(cold_backing) = materialized_cold_backing(&resolved.route) else {
+    let Some(cold_backing) = resolved_cold_backing(resolved) else {
         debug!(
             runtime = %client.lease.runtime,
             tenant = %resolved.tenant,
@@ -790,7 +790,7 @@ fn restore_payload_from_cold_backing_singleflight_into(
     buffer: &mut [u8],
 ) -> Result<Option<Arc<Vec<u8>>>> {
     let route_tracker = OperationTracker::new("cold_restore_route_check");
-    let cold_backing = materialized_cold_backing(&resolved.route).ok_or_else(|| {
+    let cold_backing = resolved_cold_backing(resolved).ok_or_else(|| {
         StoreError::NotFound(format!(
             "tenant={} key={} has no materialized cold backing",
             resolved.tenant, resolved.key
@@ -998,7 +998,7 @@ fn restore_batch_payloads_from_cold_backing_grouped(
     let mut leaders = Vec::new();
     let mut promotion_payloads = Vec::new();
     for index in indices {
-        let Some(cold_backing) = materialized_cold_backing(&resolved[*index].route) else {
+        let Some(cold_backing) = resolved_cold_backing(&resolved[*index]) else {
             restore_payload_from_cold_backing(client, &resolved[*index], buffers[*index])?;
             continue;
         };
@@ -1551,7 +1551,7 @@ fn promote_materialized_cold_backing(
             return Ok(true);
         };
         if route_restore_race_resolved(storage_owner, &current)
-            || super::nof::route_backing_as_cold(&current).as_ref() != Some(&cold_backing)
+            || current.cold_backing.as_ref() != Some(&cold_backing)
         {
             return Ok(false);
         }
@@ -2364,7 +2364,7 @@ pub(in super::super) fn execute_owner_cold_restore_cas_phase(
             return Ok(true);
         };
         if route_restore_race_resolved(storage_owner, &current)
-            || super::nof::route_backing_as_cold(&current).as_ref() != Some(&ctx.cold_backing)
+            || current.cold_backing.as_ref() != Some(&ctx.cold_backing)
         {
             return Ok(false);
         }

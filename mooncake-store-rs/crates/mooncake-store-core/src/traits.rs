@@ -7,7 +7,6 @@ use crate::identity::{
     ClientRuntimeId, ClientStableId, LogicalObjectId, NamespaceScope, ReuseIdentity,
 };
 use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
-use crate::nof::NofBackingRouteFilter;
 use crate::route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
@@ -182,35 +181,6 @@ pub trait MetadataBackend: Send + Sync {
                 .as_ref()
                 .is_some_and(|owner| backing.owner != *owner)
             {
-                continue;
-            }
-            routes.push(route);
-            if filter.limit.is_some_and(|limit| routes.len() >= limit) {
-                break;
-            }
-        }
-        Ok(routes)
-    }
-
-    /// Lists object routes with NoF external backing metadata.
-    ///
-    /// NoF routes are deliberately separate from local Cold Tier routes. The
-    /// default implementation shares the metadata backend and CAS record, while
-    /// production backends may add a NoF-specific index without creating a
-    /// second metadata service.
-    fn list_object_routes_by_nof_backing(
-        &self,
-        filter: &NofBackingRouteFilter,
-    ) -> Result<Vec<ObjectRoute>> {
-        if filter.limit == Some(0) {
-            return Ok(Vec::new());
-        }
-        let mut routes = Vec::new();
-        for route in self.list_object_routes()? {
-            let Some(backing) = route.nof_backing.as_ref() else {
-                continue;
-            };
-            if !backing.matches_filter(filter) {
                 continue;
             }
             routes.push(route);
@@ -529,14 +499,6 @@ pub trait RouteDirectory: Send + Sync {
         self.metadata().list_object_routes_by_cold_backing(filter)
     }
 
-    fn list_routes_by_nof_backing(
-        &self,
-        _observer: &ClientLease,
-        filter: &NofBackingRouteFilter,
-    ) -> Result<Vec<ObjectRoute>> {
-        self.metadata().list_object_routes_by_nof_backing(filter)
-    }
-
     fn list_routes_in_scope(
         &self,
         _observer: &ClientLease,
@@ -850,6 +812,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(7),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -863,7 +826,6 @@ mod tests {
                 priority: 1,
             }],
             cold_backing: None,
-            nof_backing: None,
         }
     }
 
