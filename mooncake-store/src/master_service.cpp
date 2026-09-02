@@ -3243,19 +3243,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
         }
 
         restored_memory_segments.push_back(seg);
-        // Reuse the live standby allocator for this endpoint when one
-        // exists. Restored buffers hold their allocator by weak_ptr, so a
+        // Reuse the live standby allocator only on an exact endpoint
+        // match. Restored buffers hold their allocator by weak_ptr, so a
         // later snapshot that swaps the keepalive must not expire the
-        // buffers an earlier snapshot restored onto the same endpoint.
+        // buffers an earlier snapshot restored onto the same endpoint. A
+        // name match with a changed endpoint is a different physical
+        // segment: reusing its allocator would make the replica report
+        // the stale endpoint and look readable before the new endpoint
+        // remounts.
         std::shared_ptr<BufferAllocatorBase> allocator;
         if (auto keepalive =
                 standby_allocator_keepalive_.find(seg.transport_endpoint);
             keepalive != standby_allocator_keepalive_.end()) {
             allocator = keepalive->second;
-        } else if (auto by_name =
-                       standby_allocator_keepalive_.find(seg.segment_name);
-                   by_name != standby_allocator_keepalive_.end()) {
-            allocator = by_name->second;
         } else {
             allocator = std::make_shared<DummyBufferAllocator>(
                 seg.segment_name, seg.transport_endpoint);

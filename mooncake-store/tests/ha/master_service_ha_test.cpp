@@ -1306,6 +1306,58 @@ TEST_F(MasterServiceHATest, RestoreSkipsDescriptorsBeyondSegmentCapacity) {
               0);
 }
 
+TEST_F(MasterServiceHATest, RestoreWithChangedEndpointGetsFreshAllocator) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    // The same segment name returns under a new endpoint in the next
+    // snapshot. Reusing the first endpoint's allocator through the name
+    // alias would make the new replica report the stale endpoint and look
+    // readable before the new endpoint remounts.
+    const std::string name = "standby_rebind_segment";
+    const std::string endpoint_v1 = "standby_rebind_endpoint_v1";
+    const std::string endpoint_v2 = "standby_rebind_endpoint_v2";
+
+    auto segment_v1 = MakeStandbyMemorySegment(endpoint_v1);
+    segment_v1.segment_name = name;
+    auto first = MakeStandbyObject("standby_rebind_first", endpoint_v1);
+    first.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({first}, 7, {segment_v1})
+                    .has_value());
+
+    auto segment_v2 = MakeStandbyMemorySegment(endpoint_v2);
+    segment_v2.segment_name = name;
+    auto second = MakeStandbyObject("standby_rebind_second", endpoint_v2);
+    second.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({second}, 7, {segment_v2})
+                    .has_value());
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_rebind_second");
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint_v2);
+    EXPECT_FALSE(HasReadableReplicaForTesting(service, kDefaultTenant,
+                                              "standby_rebind_second"));
+
+    Segment segment_v2_live;
+    segment_v2_live.id = generate_uuid();
+    segment_v2_live.name = name;
+    segment_v2_live.te_endpoint = endpoint_v2;
+    segment_v2_live.base = kDefaultSegmentBase;
+    segment_v2_live.size = kDefaultSegmentSize;
+    ASSERT_TRUE(
+        service.ReMountSegment({segment_v2_live}, generate_uuid()).has_value());
+    EXPECT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant,
+                                             "standby_rebind_second"));
+}
+
 TEST_F(MasterServiceHATest, RestoreRejectsDfsMode) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
