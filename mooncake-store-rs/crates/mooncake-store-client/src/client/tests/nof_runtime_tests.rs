@@ -253,7 +253,7 @@ fn physical_nof_client(
 }
 
 #[test]
-fn physical_nof_runtime_reuses_offload_restore_replica_and_delete_flow() {
+fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let (client, primary, replica) = physical_nof_client("nof-physical-runtime");
 

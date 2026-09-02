@@ -1,4 +1,9 @@
-//! Provider-neutral physical-KV capabilities for NoF backings.
+//! Provider-addressed physical-KV capabilities for NoF backings.
+//!
+//! These operations address complete objects by a deterministic key and return no allocation
+//! locator. They fit providers such as KVCS that own their lookup metadata. An executor that
+//! allocates extents and returns an opaque location requires Mooncake-managed route metadata and
+//! must not be adapted through these traits.
 
 use mooncake_store_core::{Result, StoreError};
 
@@ -49,7 +54,7 @@ pub trait NofHealth: Send + Sync {
     fn health(&self) -> Result<NofStorageHealth>;
 }
 
-/// Complete physical-object writes exposed by a NoF backing. Results are positional.
+/// Key-addressed complete-object writes exposed by a NoF backing. Results are positional.
 ///
 /// The executor derives its persistent layout from the opaque object key. A value may be one
 /// record or multiple executor-private records.
@@ -57,17 +62,17 @@ pub trait NofPhysicalWrite: Send + Sync {
     fn put_batch(&self, requests: &[NofPhysicalWriteRequest<'_>]) -> Vec<Result<()>>;
 }
 
-/// Complete physical-object reads exposed by a NoF backing. Results are positional.
+/// Key-addressed complete-object reads exposed by a NoF backing. Results are positional.
 pub trait NofPhysicalRead: Send + Sync {
     fn get_batch(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>>;
 }
 
-/// Complete physical-object deletion exposed by a NoF backing. Results are positional.
+/// Key-addressed complete-object deletion exposed by a NoF backing. Results are positional.
 pub trait NofPhysicalDelete: Send + Sync {
     fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>>;
 }
 
-/// Physical existence queries exposed by a NoF backing. Results are positional.
+/// Key-addressed existence queries exposed by a NoF backing. Results are positional.
 pub trait NofPhysicalQuery: Send + Sync {
     fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<bool>>;
 }

@@ -13,8 +13,8 @@ use super::object::{
 
 /// Unified NoF facade and capability container.
 ///
-/// A backing may expose logical-object I/O, physical-KV I/O and health independently. The facade
-/// never infers one capability from another.
+/// A backing may expose logical-object I/O, provider-addressed physical-KV I/O and health
+/// independently. The facade never infers one capability from another.
 #[derive(Clone)]
 pub struct NofBackend {
     pub(crate) backing: Arc<dyn NofBacking>,

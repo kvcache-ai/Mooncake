@@ -1,4 +1,4 @@
-//! Cold Tier backend for executor-owned NoF physical objects.
+//! Cold Tier adapter for provider-addressed NoF physical objects.
 
 use mooncake_store_core::{ColdBackingRoute, ColdBackingState, Result, StoreError};
 
