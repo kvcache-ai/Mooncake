@@ -51,6 +51,8 @@ constexpr ConfigFieldSpec kConfigFields[] = {
      ConfigFieldMatch::kSubtree},
     {"transports/tcp", ConfigLifecycle::kBootstrapOnly,
      ConfigFieldMatch::kSubtree},
+    {"transports/hp_tcp", ConfigLifecycle::kBootstrapOnly,
+     ConfigFieldMatch::kSubtree},
     {"transports/shm", ConfigLifecycle::kBootstrapOnly,
      ConfigFieldMatch::kSubtree},
     {"transports/nvlink", ConfigLifecycle::kBootstrapOnly,

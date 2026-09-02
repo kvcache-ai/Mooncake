@@ -64,6 +64,8 @@ TEST(ConfigLifecycleTest, ClassifiesRepresentativeFields) {
               ConfigLifecycle::kBootstrapOnly);
     EXPECT_EQ(classifyConfigPath("transports/tcp/max_retry_count"),
               ConfigLifecycle::kBootstrapOnly);
+    EXPECT_EQ(classifyConfigPath("transports/hp_tcp/worker_count"),
+              ConfigLifecycle::kBootstrapOnly);
     EXPECT_EQ(classifyConfigPath("staging/shutdown_drain_timeout_ms"),
               ConfigLifecycle::kBootstrapOnly);
 
