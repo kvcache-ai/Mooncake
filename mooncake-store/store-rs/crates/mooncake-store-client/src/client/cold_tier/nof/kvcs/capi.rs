@@ -87,6 +87,39 @@ struct KvcsQueryResult {
     shard_count: c_int,
 }
 
+struct QueryResults {
+    raw: Vec<KvcsQueryResult>,
+    count: c_int,
+}
+
+impl QueryResults {
+    fn new(count: c_int) -> Self {
+        let len = usize::try_from(count).expect("KVCS query result count is non-negative");
+        Self {
+            raw: (0..len)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect(),
+            count,
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut KvcsQueryResult {
+        self.raw.as_mut_ptr()
+    }
+
+    fn as_slice(&self) -> &[KvcsQueryResult] {
+        &self.raw
+    }
+}
+
+impl Drop for QueryResults {
+    fn drop(&mut self) {
+        if !self.raw.is_empty() {
+            unsafe { kvcs_query_result_free(self.raw.as_mut_ptr(), self.count) };
+        }
+    }
+}
+
 #[repr(C)]
 struct KvcsCreateNamespaceOptions {
     space_limit: i64,
@@ -333,6 +366,15 @@ fn input_segments<'a>(
         .unzip()
 }
 
+fn put_results(len: usize) -> Vec<KvcsPutResult> {
+    (0..len)
+        .map(|_| KvcsPutResult {
+            location: [0; 256],
+            status: 0,
+        })
+        .collect()
+}
+
 fn output_buffers(
     buffers: &mut [Vec<u8>],
 ) -> (
@@ -432,6 +474,23 @@ fn fail_positional_results<T>(
     error: StoreError,
 ) -> Vec<Result<T>> {
     fill_missing(&mut results, &error);
+    finish_positional_results(results)
+}
+
+fn finish_unit_statuses<U>(
+    mut results: Vec<Option<Result<()>>>,
+    valid: &[(usize, U)],
+    statuses: impl IntoIterator<Item = c_int>,
+    operation: &str,
+    write: bool,
+) -> Vec<Result<()>> {
+    for ((index, _), status) in valid.iter().zip(statuses) {
+        results[*index] = Some(if status == 0 {
+            Ok(())
+        } else {
+            Err(map_item_status(status, operation, write))
+        });
+    }
     finish_positional_results(results)
 }
 

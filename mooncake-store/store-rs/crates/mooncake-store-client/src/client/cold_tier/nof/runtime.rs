@@ -253,7 +253,7 @@ impl NofTargetManager {
             NofDataPlane::Physical => self.replica_count,
         };
         let selected =
-            DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, wanted.max(1));
+            DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, wanted);
         let Some(primary_index) = selected.first().copied() else {
             return Ok(None);
         };
@@ -395,8 +395,7 @@ impl PersistentStorageBackend for NofObjectAdapter {
         self.target.health_snapshot()
     }
 
-    fn put_object(&self, backing: &ColdBackingRoute, payload: &[u8]) -> Result<ColdBackingRoute> {
-        let _ = (backing, payload);
+    fn put_object(&self, _backing: &ColdBackingRoute, _payload: &[u8]) -> Result<ColdBackingRoute> {
         Err(StoreError::InvalidState(
             "NoF logical-object writes require the object route identity".to_string(),
         ))
