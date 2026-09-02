@@ -24,10 +24,10 @@ private service API, or a parallel disk-management implementation.
 
 For KVCS, no provider placement is stored in `ObjectRoute`. Mooncake does not persist a KVCS
 target, owner, locator, manifest, shard map, object length, or checksum. The route keeps only the
-logical object identity and a stable content generation. Each request derives the provider key
-from that identity and asks the configured KVCS targets directly. Target and owner information is
-a request-local I/O descriptor and is never published through route CAS or exposed by the admin
-API.
+logical object identity. Each request derives the provider key from the stable scoped logical key
+and asks the configured KVCS targets directly. `ObjectRoute.version` is control-plane state and is
+not part of that key. Target and owner information is a request-local I/O descriptor and is never
+published through route CAS or exposed by the admin API.
 
 This route-free rule follows metadata authority, not the Standard/Low-Level or logical/physical
 API shape. An allocator-backed executor that cannot locate an object from its key must return an
@@ -43,10 +43,6 @@ provider layout and provider-internal metadata:
   the shards reported by the provider.
 - Low-Level stores raw values in KVCS. A value that exceeds the configured record limit uses an
   executor-private sidecar and derived record keys in the same KVCS key space.
-
-The content generation remains unchanged while Mooncake changes replica priorities or evicts and
-restores hot copies. Removing and recreating the same logical key receives a new generation, so a
-late delete for the old object cannot address the replacement.
 
 ### Standard and Low-Level
 
@@ -67,10 +63,10 @@ value. No target list is written back to metadata.
 
 When no hot or local-disk copy is available, the client derives the same key and probes its current
 NoF configuration. The resulting length, checksum, target, and owner exist only for that restore
-request. Removing an object fans out an idempotent, best-effort delete for its content generation
-to the current target set. Mooncake does not persist a NoF delete intent or retry it after the
-logical route has been removed. If the client exits between route deletion and provider deletion,
-the provider's own GC must reclaim the orphan.
+request. Removing an object fans out an idempotent, best-effort delete for its logical key to the
+current target set. Mooncake does not persist a NoF delete intent or retry it after the logical
+route has been removed. If the client exits between route deletion and provider deletion, the
+provider's own GC must reclaim the orphan.
 
 When an in-memory offload queue is rebuilt, Mooncake probes the provider for each active hot route.
 It re-enqueues only missing objects or Low-Level objects with fewer than the required target copies.

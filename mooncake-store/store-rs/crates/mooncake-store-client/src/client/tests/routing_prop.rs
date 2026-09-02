@@ -39,7 +39,6 @@ fn make_route(key: &ObjectKey, segment: &str) -> ObjectRoute {
         sharing_scope: None,
         qos_tier: None,
         version: RouteVersion(1),
-        content_generation: 0,
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::mooncake_v1(),
         replicas: vec![ReplicaRoute {

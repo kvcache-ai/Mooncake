@@ -256,7 +256,7 @@ impl NofTargetManager {
                 .accumulated_writes
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let object_locator = self.object_locator(route)?;
+        let object_locator = self.object_locator(route);
         let primary_owner = self.state.owner_for(&primary_id).ok_or_else(|| {
             StoreError::Transport(format!("NoF target {primary_id} has no live owner"))
         })?;
@@ -293,7 +293,7 @@ impl NofTargetManager {
         &self,
         route: &ObjectRoute,
     ) -> Result<Option<ColdBackingRoute>> {
-        let object_locator = self.object_locator(route)?;
+        let object_locator = self.object_locator(route);
         let mut first_error = None;
         let mut found = Vec::new();
         for target_id in self.target_ids() {
@@ -366,7 +366,7 @@ impl NofTargetManager {
     }
 
     pub(in crate::client) fn contains_object(&self, route: &ObjectRoute) -> Result<bool> {
-        let object_locator = self.object_locator(route)?;
+        let object_locator = self.object_locator(route);
         let mut first_error = None;
         for target_id in self.target_ids() {
             if !self.available_for_io(target_id) {
@@ -439,9 +439,9 @@ impl NofTargetManager {
         Ok(())
     }
 
-    /// Delete one content generation from all configured targets. No reclaim route is persisted.
+    /// Delete the logical object from all configured targets. No reclaim route is persisted.
     pub(in crate::client) fn delete_object(&self, route: &ObjectRoute) -> Result<bool> {
-        let object_locator = self.object_locator(route)?;
+        let object_locator = self.object_locator(route);
         let mut deleted = false;
         let mut first_error = None;
         for target_id in self.target_ids() {
@@ -470,14 +470,8 @@ impl NofTargetManager {
         }
     }
 
-    fn object_locator(&self, route: &ObjectRoute) -> Result<String> {
-        let generation = route.content_generation.to_le_bytes();
-        Ok(derive_physical_key(PhysicalKeyInput {
-            domain: b"nof-object",
-            fields: &[route.key.0.as_bytes(), &generation],
-            chunk_index: None,
-        })?
-        .to_hex())
+    fn object_locator(&self, route: &ObjectRoute) -> String {
+        route.key.0.clone()
     }
 
     pub(in crate::client) fn release_ownership_on_shutdown(&self) {
@@ -703,7 +697,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(7),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
