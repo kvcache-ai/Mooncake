@@ -67,8 +67,7 @@ TEST(ConfigLifecycleTest, ClassifiesRepresentativeFields) {
     EXPECT_EQ(classifyConfigPath("staging/shutdown_drain_timeout_ms"),
               ConfigLifecycle::kBootstrapOnly);
 
-    EXPECT_EQ(classifyConfigPath("policy"),
-              ConfigLifecycle::kRuntimeCandidate);
+    EXPECT_EQ(classifyConfigPath("policy"), ConfigLifecycle::kRuntimeCandidate);
     EXPECT_EQ(classifyConfigPath("qos/tenants"),
               ConfigLifecycle::kRuntimeCandidate);
     EXPECT_EQ(classifyConfigPath("runtime_queue/max_dispatch_bytes"),
@@ -83,9 +82,8 @@ TEST(ConfigLifecycleTest, ClassifiesRepresentativeFields) {
 TEST(ConfigLifecycleTest, MostSpecificFieldOverridesBootstrapSubtree) {
     EXPECT_EQ(classifyConfigPath("transports/rdma/device/max_cqe"),
               ConfigLifecycle::kBootstrapOnly);
-    EXPECT_EQ(
-        classifyConfigPath("transports/rdma/enable_smart_scheduling"),
-        ConfigLifecycle::kRuntimeCandidate);
+    EXPECT_EQ(classifyConfigPath("transports/rdma/enable_smart_scheduling"),
+              ConfigLifecycle::kRuntimeCandidate);
 }
 
 TEST(ConfigLifecycleTest, BundleViewsEnforceLifecycleBoundaries) {
@@ -119,13 +117,11 @@ TEST(ConfigLifecycleTest, SnapshotDoesNotChangeWithLegacyConfig) {
     auto generation_two = buildTentConfigBundle(config, 2);
 
     EXPECT_EQ(generation_one.bootstrap->get("rpc_server_port", 0), 18080);
-    EXPECT_TRUE(
-        generation_one.runtime->config->get("merge_requests", false));
+    EXPECT_TRUE(generation_one.runtime->config->get("merge_requests", false));
     EXPECT_EQ(generation_one.runtime->generation, 1);
 
     EXPECT_EQ(generation_two.bootstrap->get("rpc_server_port", 0), 28080);
-    EXPECT_FALSE(
-        generation_two.runtime->config->get("merge_requests", true));
+    EXPECT_FALSE(generation_two.runtime->config->get("merge_requests", true));
     EXPECT_EQ(generation_two.runtime->generation, 2);
 }
 

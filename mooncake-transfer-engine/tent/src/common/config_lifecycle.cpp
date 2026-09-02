@@ -42,14 +42,11 @@ constexpr ConfigFieldSpec kConfigFields[] = {
      ConfigFieldMatch::kExact},
     {"enable_runtime_queue", ConfigLifecycle::kBootstrapOnly,
      ConfigFieldMatch::kExact},
-    {"staging", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
+    {"staging", ConfigLifecycle::kBootstrapOnly, ConfigFieldMatch::kSubtree},
 
     // Discovery and resource construction.
-    {"topology", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
+    {"topology", ConfigLifecycle::kBootstrapOnly, ConfigFieldMatch::kSubtree},
+    {"transports", ConfigLifecycle::kBootstrapOnly, ConfigFieldMatch::kExact},
     {"transports/rdma", ConfigLifecycle::kBootstrapOnly,
      ConfigFieldMatch::kSubtree},
     {"transports/tcp", ConfigLifecycle::kBootstrapOnly,
@@ -88,8 +85,7 @@ constexpr ConfigFieldSpec kConfigFields[] = {
      ConfigFieldMatch::kExact},
 
     // Fields that can be represented by an immutable runtime generation.
-    {"log_level", ConfigLifecycle::kRuntimeCandidate,
-     ConfigFieldMatch::kExact},
+    {"log_level", ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
     {"merge_requests", ConfigLifecycle::kRuntimeCandidate,
      ConfigFieldMatch::kExact},
     {"max_failover_attempts", ConfigLifecycle::kRuntimeCandidate,
@@ -98,31 +94,29 @@ constexpr ConfigFieldSpec kConfigFields[] = {
      ConfigFieldMatch::kExact},
     {"runtime_queue", ConfigLifecycle::kRuntimeCandidate,
      ConfigFieldMatch::kSubtree},
-    {"policy", ConfigLifecycle::kRuntimeCandidate,
-     ConfigFieldMatch::kSubtree},
-    {"qos", ConfigLifecycle::kRuntimeCandidate,
-     ConfigFieldMatch::kSubtree},
-    {"metrics/report_interval_seconds",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
+    {"policy", ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kSubtree},
+    {"qos", ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kSubtree},
+    {"metrics/report_interval_seconds", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
 
     // RDMA policy and health knobs do not allocate devices, CQs, or QPs and
     // are candidates for a later staged apply handler.
     {"transports/rdma/enable_smart_scheduling",
      ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/numa_penalties",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/strict_local_numa",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
+    {"transports/rdma/numa_penalties", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
+    {"transports/rdma/strict_local_numa", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
     {"transports/rdma/bandwidth_learning_rate",
      ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
     {"transports/rdma/ewma_min_bandwidth_multiplier",
      ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
     {"transports/rdma/ewma_max_bandwidth_multiplier",
      ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/score_jitter_range",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/score_epsilon",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
+    {"transports/rdma/score_jitter_range", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
+    {"transports/rdma/score_epsilon", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
     {"transports/rdma/enable_priority_filtering",
      ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
     {"transports/rdma/local_rotation_interval_us",
@@ -137,22 +131,22 @@ constexpr ConfigFieldSpec kConfigFields[] = {
      ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
     {"transports/rdma/default_bandwidth_gbps",
      ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/min_bandwidth_gbps",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/max_bandwidth_gbps",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/rail_error_threshold",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
+    {"transports/rdma/min_bandwidth_gbps", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
+    {"transports/rdma/max_bandwidth_gbps", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
+    {"transports/rdma/rail_error_threshold", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
     {"transports/rdma/rail_error_window_secs",
      ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/rail_cooldown_secs",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/gdr_error_threshold",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
+    {"transports/rdma/rail_cooldown_secs", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
+    {"transports/rdma/gdr_error_threshold", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
     {"transports/rdma/gdr_error_window_secs",
      ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
-    {"transports/rdma/gdr_cooldown_secs",
-     ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
+    {"transports/rdma/gdr_cooldown_secs", ConfigLifecycle::kRuntimeCandidate,
+     ConfigFieldMatch::kExact},
 };
 
 bool matches(const ConfigFieldSpec& spec, std::string_view path) {
@@ -177,8 +171,7 @@ ConfigLifecycle classifyConfigPath(std::string_view path) {
             best_match = &field;
         }
     }
-    return best_match ? best_match->lifecycle
-                      : ConfigLifecycle::kUnsupported;
+    return best_match ? best_match->lifecycle : ConfigLifecycle::kUnsupported;
 }
 
 const char* configLifecycleName(ConfigLifecycle lifecycle) {
@@ -205,8 +198,7 @@ bool LifecycleConfigView::contains(const std::string& key_path) const {
 
 bool LifecycleConfigView::dumpSubtree(const std::string& key_path,
                                       std::string* out) const {
-    return allows(key_path) && values_ &&
-           values_->dumpSubtree(key_path, out);
+    return allows(key_path) && values_ && values_->dumpSubtree(key_path, out);
 }
 
 TentConfigBundle buildTentConfigBundle(const Config& effective_config,
