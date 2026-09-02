@@ -1,12 +1,14 @@
 # NoF integration and operation
 
 NoF is a remote persistence data plane attached below Cold Tier. It reuses Mooncake's existing hot
-replica lifecycle, offload queue, restore path, target ownership, heartbeat, and replica selection.
+replica lifecycle, offload path, restore admission and batching, heartbeat ownership, cached health
+state, and replica selection.
 
-The included provider is the KVCS 0.4.0 C API executor. `KvcsCapiExecutor` chooses Standard or
-Low-Level mode when it starts and exposes only the traits supported by that mode. Both KVCS modes
-are provider-owned: KVCS can find an object from its derived key, so Mooncake does not persist a
-NoF placement route for KVCS.
+The included provider is the KVCS 0.4.0 C API executor. `KvcsCapiExecutor::new()` reads process
+environment for a single target; `with_standard_config` and `with_low_level_config` create
+independent per-target clients. The selected mode exposes only the traits supported by that mode.
+Both KVCS modes are provider-owned: KVCS can find an object from its derived key, so Mooncake does
+not persist KVCS placement metadata.
 
 ## Architecture
 
@@ -23,18 +25,10 @@ Missing capabilities remain missing. Mooncake does not recreate them with a prov
 private service API, or a parallel disk-management implementation.
 
 For KVCS, no provider placement is stored in `ObjectRoute`. Mooncake does not persist a KVCS
-target, owner, locator, manifest, shard map, object length, or checksum. The route keeps only the
-logical object identity. Each request derives the provider key from the stable scoped logical key
-and asks the configured KVCS targets directly. `ObjectRoute.version` is control-plane state and is
-not part of that key. Target and owner information is a request-local I/O descriptor and is never
-published through route CAS or exposed by the admin API.
-
-This route-free rule follows metadata authority, not the Standard/Low-Level or logical/physical
-API shape. An allocator-backed executor that cannot locate an object from its key must return an
-opaque location and use a Mooncake-managed NoF route. That route is authoritative for target and
-replica placement, while record, extent, chunk, and alignment details remain private to the
-executor. Such a managed-route executor must not reuse KVCS request-local discovery as its source
-of truth.
+target, owner, locator, manifest, shard map, object length, or checksum. Each request derives the
+provider key from the stable scoped logical key and asks the configured KVCS targets directly.
+`ObjectRoute.version` is control-plane state and is not part of that key. Target selection is a
+request-local I/O descriptor and is never published through route CAS or exposed by the admin API.
 
 Mooncake remains authoritative for logical object existence, while KVCS remains authoritative for
 provider layout and provider-internal metadata:
@@ -61,17 +55,21 @@ payload. A Standard write goes to one provider target because KVCS owns its inte
 A Low-Level write succeeds only after every target selected by `nof_replica_count` accepts the
 value. No target list is written back to metadata.
 
-When no hot or local-disk copy is available, the client derives the same key and reads the value
-through the provider's batch-get API. The returned payload then enters the existing Cold Tier
-restore and hot-copy promotion flow. There is no preliminary Mooncake placement or manifest
-lookup. Removing an object fans out an idempotent, best-effort delete for its logical key to the
-current target set. Mooncake does not persist a NoF delete intent or retry it after the logical
-route has been removed. If the client exits between route deletion and provider deletion, the
-provider's own GC must reclaim the orphan.
+When no hot or local-disk copy is available, the client derives the same key and queries provider
+metadata for existence and length. The existing Cold Tier target selector, singleflight,
+admission control, and batch restore path then call the provider batch-get API and promote the
+payload to a hot copy. Provider payload I/O does not run during route resolution.
 
-When an in-memory offload queue is rebuilt, Mooncake probes the provider for each active hot route.
-It re-enqueues only missing objects or Low-Level objects with fewer than the required target copies.
-This is route-driven recovery, not a provider key-space or disk scan.
+Removal first changes the logical route from `Active` to `Deleting`. It then fans out the stable
+provider key to the current target set. A provider error is returned to the caller and the
+`Deleting` route remains as the retry identity; put and upsert cannot replace it. After provider
+deletion succeeds, Mooncake removes the logical route and reclaims its hot or local-disk copies.
+Retry is caller-driven through another remove call; there is no NoF delete worker or provider scan.
+This state records logical deletion progress, not KVCS target placement or provider metadata.
+
+Startup rebuilds persisted local Cold Tier work only. KVCS objects are discovered lazily by
+request-time metadata query; Mooncake neither downloads provider values nor scans active routes to
+reconstruct a NoF queue.
 
 KVCS targets must therefore be configured consistently on clients that share a route namespace.
 Changing a target set does not create a metadata migration. Because KVCS 0.4.0 has no listing API,
@@ -87,14 +85,16 @@ Cold Tier's existing `ValueChunkPlan` is the only object-splitting planner:
 - Larger Low-Level values use derived chunk keys and an executor-private 32-byte sidecar containing
   total length, chunk size, and chunk count.
 
-The Low-Level inline put/get path uses one root key. It does not encode a sidecar, generate chunk
-keys, or iterate a chunk plan. Inline delete first queries the root key and then deletes it.
-Physical layout remains an executor concern, so another executor may use aligned extents or
-another record format without changing the NoF framework.
+Low-Level writes send data records first and publish the sidecar last. The inline path remains one
+direct root-record write and does not execute sidecar or chunk logic.
 
-Object splitting and SDK batch splitting are separate. Object splitting decides how many records
-represent one value. KVCS already bounds C API batches by `max_keys_per_batch`, so Mooncake passes
-positional batches without another fixed-size batch loop.
+The Low-Level inline put/get path uses one root key. It does not encode a sidecar, generate chunk
+keys, or iterate a chunk plan. Inline delete calls the SDK delete API directly. Physical layout
+remains an executor concern and is not defined by the NoF framework.
+
+Object splitting and request batching are separate. Object splitting decides how many records
+represent one value. Cold Tier groups objects by target, and the executor maps those positional
+objects or records directly to the corresponding KVCS batch API.
 
 The configured single-value limit is also passed to the SDK client:
 
@@ -112,8 +112,8 @@ Low-Level `nof_replica_count` is clamped to `1..=8` and defaults to 1. The share
 `ReplicaLoadBalanceStrategy` selects write targets using provider score, accumulated writes, and
 target ID.
 
-NoF ownership reuses client leases and Rendezvous hashing. Clients with the same target-set
-fingerprint derive the same `target_id -> owner` assignment:
+NoF heartbeat ownership reuses client leases and Rendezvous hashing. Clients with the same
+target-set fingerprint derive the same `target_id -> heartbeat owner` assignment:
 
 - each client probes only the targets it owns;
 - a background heartbeat runs once per second; request paths use its cached result;
@@ -121,6 +121,10 @@ fingerprint derive the same `target_id -> owner` assignment:
 - owners publish unhealthy target IDs in the existing client lease;
 - graceful shutdown releases ownership immediately, while crash takeover follows lease expiry and
   epoch fencing.
+
+Ownership applies only to heartbeat work. Every client keeps its own SDK client for each configured
+remote target and may read, write, or delete that target directly; the heartbeat owner never
+proxies, authorizes, or gates data I/O.
 
 KVCS Low-Level health uses the public existence query and reports no capacity because the 0.4.0 ABI
 has no capacity call. Standard exposes no KVCS health capability, so the framework treats a
@@ -132,9 +136,7 @@ request.
 The public KVCS 0.4.0 Low-Level API exposes put, get/get-into, delete, and existence query. It does
 not expose key listing, capacity, disk lifecycle, GC, watermarks, compaction, recovery, rebuild, or
 a separate durability barrier. KVCS/EFC owns those responsibilities. Mooncake does not scan KVCS,
-reconcile provider disks, rebuild provider metadata, or call private maintenance APIs. Queue
-recovery may query keys derived from currently active Mooncake routes; it cannot discover objects
-that have no logical route.
+reconcile provider disks, rebuild provider metadata, or call private maintenance APIs.
 
 ## Source layout
 
@@ -161,8 +163,7 @@ client/cold_tier/
 The traits and Cold Tier adapters in this source tree implement provider-owned access. KVCS
 configuration, C API calls, and its private Low-Level layout live under `nof/kvcs/`.
 `physical_backend.rs` passes complete objects to a key-addressed provider; it defines no chunk,
-extent, alignment, record format, or persisted placement route. A locator-returning,
-Mooncake-managed executor uses a separate adapter and route lifecycle.
+extent, alignment, record format, or persisted placement route.
 
 ## Install KVCS SDK and EFC
 
@@ -290,7 +291,11 @@ use mooncake_store_client::{
     KvcsCapiExecutor, NofBackend, NofTargetConfig, StoreClientBuilder,
 };
 
-let executor = Arc::new(KvcsCapiExecutor::new()?); // reads MOONCAKE_KVCS_MODE
+let executor = Arc::new(KvcsCapiExecutor::with_low_level_config(
+    "/var/run/kvcs/efc-grpc.sock".to_string(),
+    0,
+    3 * 1024 * 1024 * 1024,
+)?);
 let target = NofTargetConfig::new("kvcs-mount-0", NofBackend::new(executor)?)?;
 let client = StoreClientBuilder::new(metadata, "storage-0")
     .nof_target(target)
@@ -298,12 +303,11 @@ let client = StoreClientBuilder::new(metadata, "storage-0")
     .build(expires_at_ms)?;
 ```
 
-The generic NoF framework accepts multiple targets, but the current KVCS executor reads its EFC
-socket and mountpoint from process-wide environment variables. Therefore one process must not
-register the same KVCS executor or mountpoint under multiple target IDs. Multi-target KVCS
-deployment requires target-specific executor construction, which is not exposed by this version.
-Every client in one ownership group must configure the same target ID and data plane. A target ID,
-its provider endpoint, mountpoint, mode, and maximum value size are immutable configuration.
+`KvcsCapiExecutor::new()` is the environment-variable convenience constructor for a single target.
+For multiple remote nodes or disks in one process, construct one executor per target with
+`with_low_level_config` or `with_standard_config`, then register each executor under its own target
+ID. Every client in one ownership group must configure the same target IDs and data plane. A target
+ID, its provider endpoint, mountpoint, mode, and maximum value size are immutable configuration.
 The ownership fingerprint identifies target IDs and data-plane shape; it cannot verify that two
 processes mapped a target ID to the same provider endpoint or mountpoint. Deployment configuration
 must enforce that mapping.

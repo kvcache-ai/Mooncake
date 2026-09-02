@@ -7,9 +7,7 @@ use crate::client::PersistentStorageBackendHealth;
 
 use super::backing::NofBacking;
 use super::ensure_batch_len;
-use super::object::{
-    NofObject, NofObjectLimits, NofObjectMetadata, NofObjectShardWrite, NofObjectState,
-};
+use super::object::{NofObjectLimits, NofObjectShardWrite, NofObjectState};
 
 /// Unified NoF facade and capability container.
 ///
@@ -61,12 +59,7 @@ impl NofBackend {
             .init_namespace(namespace)
     }
 
-    pub fn put_object(
-        &self,
-        namespace: &NamespaceScope,
-        key: &str,
-        value: &[u8],
-    ) -> Result<NofObjectMetadata> {
+    pub fn put_object(&self, namespace: &NamespaceScope, key: &str, value: &[u8]) -> Result<()> {
         self.validate_key(key)?;
         let limits = self
             .object_limits
@@ -100,32 +93,14 @@ impl NofBackend {
         for result in results {
             result?;
         }
-        let expected = NofObjectMetadata {
-            length: value_len,
-            total_shards,
-        };
-        let Some(query) = self.backing.object_query() else {
-            return Ok(expected);
-        };
-        match query.query_object(namespace, key)? {
-            NofObjectState::Found(metadata) if metadata == expected => Ok(metadata),
-            NofObjectState::Found(actual) => Err(StoreError::InvalidState(format!(
-                "NoF provider published object metadata {actual:?}, expected {expected:?}"
-            ))),
-            NofObjectState::Missing => Err(StoreError::NotFound(
-                "NoF object missing after successful put".to_string(),
-            )),
-            NofObjectState::Incomplete => Err(StoreError::Backpressure(
-                "NoF object manifest is incomplete after shard put".to_string(),
-            )),
-        }
+        Ok(())
     }
 
     pub fn query_object(
         &self,
         namespace: &NamespaceScope,
         key: &str,
-    ) -> Result<NofObjectState<NofObjectMetadata>> {
+    ) -> Result<NofObjectState<u64>> {
         self.validate_key(key)?;
         self.backing
             .object_query()
@@ -137,7 +112,7 @@ impl NofBackend {
         &self,
         namespace: &NamespaceScope,
         key: &str,
-    ) -> Result<NofObjectState<NofObject>> {
+    ) -> Result<NofObjectState<Vec<u8>>> {
         self.validate_key(key)?;
         self.backing
             .object_read()

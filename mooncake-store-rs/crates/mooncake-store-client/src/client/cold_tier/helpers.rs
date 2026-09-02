@@ -143,15 +143,8 @@ pub(in super::super) fn resolved_cold_backing(
     resolved
         .transient_nof_read
         .as_ref()
-        .map(|(backing, _)| backing.clone())
+        .cloned()
         .or_else(|| materialized_cold_backing(&resolved.route))
-}
-
-pub(in super::super) fn prefetched_nof_payload(resolved: &ResolvedObject) -> Option<Arc<Vec<u8>>> {
-    resolved
-        .transient_nof_read
-        .as_ref()
-        .map(|(_, payload)| payload.clone())
 }
 
 pub(in super::super) fn pending_persistent_backing(

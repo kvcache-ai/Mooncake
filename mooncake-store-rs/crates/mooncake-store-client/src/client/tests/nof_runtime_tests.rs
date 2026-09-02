@@ -1,13 +1,15 @@
 use crate::{
-    NofBackend, NofBacking, NofHealth, NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata,
+    NofBackend, NofBacking, NofHealth, NofObjectDelete, NofObjectLimits,
     NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
-    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalRead, NofPhysicalReadRequest,
-    NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth, NofTargetConfig,
+    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalQuery, NofPhysicalQueryRequest,
+    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest,
+    NofStorageHealth, NofTargetConfig,
 };
 
 struct FakePhysicalNof {
     records: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
     available: AtomicBool,
+    fail_next_read: AtomicBool,
     fail_next_write: AtomicBool,
 }
 
@@ -16,6 +18,7 @@ impl Default for FakePhysicalNof {
         Self {
             records: Mutex::new(BTreeMap::new()),
             available: AtomicBool::new(true),
+            fail_next_read: AtomicBool::new(false),
             fail_next_write: AtomicBool::new(false),
         }
     }
@@ -47,7 +50,24 @@ impl NofPhysicalRead for FakePhysicalNof {
         let records = self.records.lock();
         requests
             .iter()
-            .map(|request| Ok(records.get(request.key.as_bytes()).cloned()))
+            .map(|request| {
+                if self.fail_next_read.swap(false, Ordering::Relaxed) {
+                    return Err(StoreError::Transport(
+                        "injected NoF read failure".to_string(),
+                    ));
+                }
+                Ok(records.get(request.key.as_bytes()).cloned())
+            })
+            .collect()
+    }
+}
+
+impl NofPhysicalQuery for FakePhysicalNof {
+    fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<Option<u64>>> {
+        let records = self.records.lock();
+        requests
+            .iter()
+            .map(|request| Ok(records.get(request.key.as_bytes()).map(|value| value.len() as u64)))
             .collect()
     }
 }
@@ -71,6 +91,10 @@ impl NofBacking for FakePhysicalNof {
     }
 
     fn physical_read(&self) -> Option<&dyn NofPhysicalRead> {
+        Some(self)
+    }
+
+    fn physical_query(&self) -> Option<&dyn NofPhysicalQuery> {
         Some(self)
     }
 
@@ -98,6 +122,7 @@ impl NofHealth for FakePhysicalNof {
 #[derive(Default)]
 struct FakeObjectNof {
     objects: Mutex<BTreeMap<(NamespaceScope, String), Vec<u8>>>,
+    fail_next_delete: AtomicBool,
 }
 
 impl NofObjectWrite for FakeObjectNof {
@@ -129,15 +154,9 @@ impl NofObjectRead for FakeObjectNof {
         &self,
         namespace: &NamespaceScope,
         key: &str,
-    ) -> Result<NofObjectState<NofObject>> {
+    ) -> Result<NofObjectState<Vec<u8>>> {
         Ok(match self.objects.lock().get(&(namespace.clone(), key.to_string())) {
-            Some(value) => NofObjectState::Found(NofObject {
-                metadata: NofObjectMetadata {
-                    length: value.len() as u64,
-                    total_shards: 1,
-                },
-                value: value.clone(),
-            }),
+            Some(value) => NofObjectState::Found(value.clone()),
             None => NofObjectState::Missing,
         })
     }
@@ -148,12 +167,9 @@ impl NofObjectQuery for FakeObjectNof {
         &self,
         namespace: &NamespaceScope,
         key: &str,
-    ) -> Result<NofObjectState<NofObjectMetadata>> {
+    ) -> Result<NofObjectState<u64>> {
         Ok(match self.objects.lock().get(&(namespace.clone(), key.to_string())) {
-            Some(value) => NofObjectState::Found(NofObjectMetadata {
-                length: value.len() as u64,
-                total_shards: 1,
-            }),
+            Some(value) => NofObjectState::Found(value.len() as u64),
             None => NofObjectState::Missing,
         })
     }
@@ -165,6 +181,11 @@ impl NofObjectDelete for FakeObjectNof {
         namespace: &NamespaceScope,
         key: &str,
     ) -> Result<NofObjectState<()>> {
+        if self.fail_next_delete.swap(false, Ordering::Relaxed) {
+            return Err(StoreError::Transport(
+                "injected NoF delete failure".to_string(),
+            ));
+        }
         Ok(if self
             .objects
             .lock()
@@ -313,8 +334,11 @@ fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
             .expect("NoF batch existence probe should succeed"),
         vec![true]
     );
+    primary.fail_next_read.store(true, Ordering::Relaxed);
     assert_eq!(
-        client.get("physical-nof-key").expect("physical NoF restore should succeed"),
+        client
+            .get("physical-nof-key")
+            .expect("physical NoF restore should fail over to the queried replica"),
         payload
     );
     client
@@ -403,32 +427,6 @@ fn physical_nof_retries_a_partial_replica_write() {
 }
 
 #[test]
-fn embedded_route_directory_rebuilds_pending_physical_nof_offload() {
-    let _cold_tier_env = enable_cold_tier_for_test();
-    let (client, primary, replica) = physical_nof_client("nof-physical-recovery");
-    client
-        .put("physical-nof-recovery-key", &[9u8; 150])
-        .expect("physical NoF put should succeed");
-
-    assert_eq!(
-        crate::client::cold_tier::rebuild_pending_offload_queue(
-            client.storage_owner.as_ref(),
-        )
-        .expect("NoF pending queue should rebuild from the route directory"),
-        1
-    );
-    assert_eq!(
-        client
-            .storage_owner
-            .materialize_pending_offloads_bounded(32)
-            .expect("recovered physical NoF offload should run"),
-        1
-    );
-    assert!(!primary.records.lock().is_empty());
-    assert!(!replica.records.lock().is_empty());
-}
-
-#[test]
 fn unavailable_physical_nof_target_is_pruned_after_replica_restore() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let (client, primary, _replica) = physical_nof_client("nof-physical-health");
@@ -465,7 +463,7 @@ fn unavailable_physical_nof_target_is_pruned_after_replica_restore() {
 }
 
 #[test]
-fn nof_target_owner_handoff_reclaims_routes_with_stale_owner_snapshot() {
+fn nof_target_heartbeat_owner_handoff_does_not_gate_data_io() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let backend = Arc::new(FakePhysicalNof::default());
@@ -497,13 +495,13 @@ fn nof_target_owner_handoff_reclaims_routes_with_stale_owner_snapshot() {
         let owner_a = client_a
             .storage_owner
             .cold_tier_devices
-            .current_target_owner("nof-handoff-target", None)
-            .ok();
+            .nof_targets
+            .heartbeat_owner_for("nof-handoff-target");
         let owner_b = client_b
             .storage_owner
             .cold_tier_devices
-            .current_target_owner("nof-handoff-target", None)
-            .ok();
+            .nof_targets
+            .heartbeat_owner_for("nof-handoff-target");
         if let (Some(owner_a), Some(owner_b)) = (&owner_a, &owner_b) {
             if owner_a == owner_b {
                 break owner_a.clone();
@@ -542,8 +540,8 @@ fn nof_target_owner_handoff_reclaims_routes_with_stale_owner_snapshot() {
         let current = survivor
             .storage_owner
             .cold_tier_devices
-            .current_target_owner("nof-handoff-target", None)
-            .ok();
+            .nof_targets
+            .heartbeat_owner_for("nof-handoff-target");
         if current.as_ref() == Some(survivor.runtime_id()) {
             break;
         }
@@ -556,13 +554,13 @@ fn nof_target_owner_handoff_reclaims_routes_with_stale_owner_snapshot() {
     assert_eq!(
         survivor
             .get("nof-handoff-key")
-            .expect("new NoF owner should restore the object"),
+            .expect("any client should restore the object after heartbeat handoff"),
         [13u8; 150]
     );
 
     survivor
         .remove("nof-handoff-key", true)
-        .expect("current target owner should reclaim a stale-owner route");
+        .expect("any client should delete provider data after heartbeat handoff");
     assert!(
         wait_for_nof_reclaims(&survivor, || backend.records.lock().is_empty()),
         "NoF target data remained after owner handoff reclaim"
@@ -637,9 +635,27 @@ fn logical_object_nof_runtime_keeps_provider_owned_replication() {
         client.get("object-nof-key").expect("object NoF restore should succeed"),
         updated_payload
     );
+    provider.fail_next_delete.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        client.remove("object-nof-key", false),
+        Err(StoreError::Transport(_))
+    ));
+    assert_eq!(
+        client
+            .route_ops()
+            .load_route(&client.scoped_key(client.default_tenant(), "object-nof-key"))
+            .expect("deleting NoF route lookup should succeed")
+            .expect("failed provider delete must retain the logical route")
+            .state,
+        mooncake_store_core::RouteState::Deleting
+    );
+    assert!(matches!(
+        client.put("object-nof-key", b"must-not-replace-deleting-object"),
+        Err(StoreError::Conflict(_))
+    ));
     client
         .remove("object-nof-key", true)
-        .expect("object NoF delete should succeed");
+        .expect("object NoF delete retry should succeed");
     assert!(wait_for_nof_reclaims(&client, || provider.objects.lock().is_empty()));
     assert!(provider.objects.lock().is_empty());
 }

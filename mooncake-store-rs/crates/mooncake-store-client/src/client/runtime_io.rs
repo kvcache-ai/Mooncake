@@ -428,6 +428,11 @@ impl StoreClient {
             current,
             reclaim_mode,
         } = options;
+        if current.is_some_and(|route| route.state == RouteState::Deleting) {
+            return Err(StoreError::Conflict(format!(
+                "object deletion is still in progress for key {key}"
+            )));
+        }
         let mut object_ref = ObjectRef::new(key).tenant(tenant);
         if object_id.scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
             object_ref = object_ref.domain(object_id.scope.domain.as_str());
@@ -706,6 +711,15 @@ impl StoreClient {
             .load_route(&mooncake_store_core::ObjectKey::from_logical_id(&object_id));
         load_tracker.finish(&current_result, 0);
         let current = current_result?;
+        if current.as_ref().is_some_and(|route| {
+            matches!(route.state, RouteState::Active | RouteState::Deleting)
+        })
+        {
+            return Err(StoreError::Conflict(format!(
+                "object already exists for key {}",
+                object.key
+            )));
+        }
         let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
         self.put_object_with_policy_current(
             &object_id,

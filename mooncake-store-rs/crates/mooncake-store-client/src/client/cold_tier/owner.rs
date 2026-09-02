@@ -20,26 +20,19 @@ use crate::placement::stable_rendezvous_score;
 
 const TARGET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const TARGET_HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
-pub(in crate::client) const NOF_TARGET_SET_LABEL: &str = "nof.target-set.v1";
-pub(in crate::client) const NOF_UNHEALTHY_TARGETS_LABEL: &str = "nof.unhealthy-targets.v1";
+pub(in crate::client) const NOF_TARGET_SET_LABEL: &str = "nof.target-set";
+pub(in crate::client) const NOF_UNHEALTHY_TARGETS_LABEL: &str = "nof.unhealthy-targets";
 const NOF_MANAGED_LABELS: [&str; 2] = [NOF_TARGET_SET_LABEL, NOF_UNHEALTHY_TARGETS_LABEL];
 
 impl ColdTierDeviceManager {
-    /// Resolve the authority for a persistent target without making callers
-    /// depend on the backing type.
+    /// Resolve the authority for a local persistent target.
     ///
-    /// Local targets are fixed to the creating runtime and retain the owner persisted in their
-    /// route. NoF targets use their current distributed owner in request-local I/O descriptors.
+    /// NoF ownership only distributes heartbeat work and never gates data I/O.
     pub(in crate::client) fn current_target_owner(
         &self,
         target_id: &str,
         recorded_owner: Option<&ClientRuntimeId>,
     ) -> Result<ClientRuntimeId> {
-        if self.nof_targets.contains(target_id) {
-            return self.nof_targets.owner_for(target_id).ok_or_else(|| {
-                StoreError::Transport(format!("NoF target {target_id} has no live owner"))
-            });
-        }
         if let Some(owner) = recorded_owner {
             return Ok(owner.clone());
         }
@@ -455,7 +448,7 @@ fn assign_target_owners<'a>(
                 .map(|owner| {
                     (
                         stable_rendezvous_score(
-                            &["nof-target-owner-v1", target_set_fingerprint, target_id],
+                            &["nof-target-owner", target_set_fingerprint, target_id],
                             &owner.runtime.stable_id,
                         ),
                         owner,

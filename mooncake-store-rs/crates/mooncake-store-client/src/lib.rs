@@ -7,12 +7,11 @@ mod route_directory;
 mod transport;
 
 pub use client::cold_tier::nof::{
-    derive_physical_key, NofBackend, NofBacking, NofHealth, NofObject, NofObjectDelete,
-    NofObjectLimits, NofObjectMetadata, NofObjectQuery, NofObjectRead, NofObjectShardWrite,
-    NofObjectState, NofObjectWrite, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalQuery,
-    NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite,
-    NofPhysicalWriteRequest, NofStorageHealth, NofTargetConfig, OpaquePhysicalKey,
-    PhysicalKeyInput,
+    derive_physical_key, NofBackend, NofBacking, NofHealth, NofObjectDelete, NofObjectLimits,
+    NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
+    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalQuery, NofPhysicalQueryRequest,
+    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest,
+    NofStorageHealth, NofTargetConfig, OpaquePhysicalKey, PhysicalKeyInput,
 };
 #[cfg(feature = "kvcs-capi")]
 pub use client::cold_tier::nof::{KvcsCapiExecutor, KvcsMode};

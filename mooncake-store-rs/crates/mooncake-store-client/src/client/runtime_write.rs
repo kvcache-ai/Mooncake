@@ -648,6 +648,14 @@ impl StoreClient {
                 .zip(current_routes)
             {
                 let tenant = request.tenant.unwrap_or(self.default_tenant());
+                if current.as_ref().is_some_and(|route| {
+                    matches!(route.state, RouteState::Active | RouteState::Deleting)
+                })
+                {
+                    return Err(BatchPutReserveStageError::terminal(StoreError::Conflict(
+                        format!("object already exists for key {}", request.key),
+                    )));
+                }
                 let mut candidates = shared_candidates.clone();
                 let mut seen = shared_seen.clone();
                 for owner in &plan.owners {

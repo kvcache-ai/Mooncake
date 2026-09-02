@@ -1,8 +1,8 @@
 //! KVCS low-level physical layout.
 //!
 //! An object that fits the provider limit is stored directly at its root key. Only oversized
-//! objects use executor-private chunk keys and a sidecar manifest. The sidecar is written first so
-//! a retry can reconstruct the same chunk set; reads reject the object until every chunk exists.
+//! objects use executor-private chunk keys and a sidecar manifest. Chunks are written first and
+//! the sidecar is published last; reads reject a newly created object until every chunk exists.
 //! KVCS remains responsible for reclaiming unreachable provider records.
 
 use mooncake_store_core::{Result, StoreError};

@@ -5,8 +5,8 @@ struct ResolvedObject {
     route: ObjectRoute,
     replica: ReplicaRoute,
     fallback_replicas: VecDeque<ReplicaRoute>,
-    /// Request-local NoF read. It must never be published through RouteOperations.
-    transient_nof_read: Option<(mooncake_store_core::ColdBackingRoute, Arc<Vec<u8>>)>,
+    /// Request-local NoF read descriptor. It must never be published through RouteOperations.
+    transient_nof_read: Option<mooncake_store_core::ColdBackingRoute>,
 }
 
 fn copy_into_region(allocation: RegionAllocation, value: &[u8]) {
