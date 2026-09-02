@@ -22,10 +22,11 @@ Capability absence is authoritative. It means the provider owns the responsibili
 does not expose it through a supported API. Mooncake does not infer capabilities from a mode name
 and does not emulate a missing SDK function with an undocumented CLI or private service API.
 
-`NofBackend` is the single public facade. It contains an `Arc<dyn NofBacking>`, validates the
-limits advertised for the selected data plane, performs the existing provider-neutral shard/key
-planning, and optionally composes `NofExternalMetadata`. A backing may expose object I/O, physical
-I/O, health, or management-only capabilities without creating another framework branch.
+`NofBackend` is the single public facade. It contains an `Arc<dyn NofBacking>`, validates advertised
+logical-object limits, holds the shared physical key codec/domain, performs provider-neutral shard
+planning and optionally composes `NofExternalMetadata`. Physical request geometry and batching stay
+inside the selected executor. A backing may expose object I/O, physical I/O, health or
+management-only capabilities without creating another framework branch.
 
 The current KVCS mapping is:
 
@@ -59,7 +60,7 @@ the field.
 
 ## Reuse of Cold Tier
 
-The physical adapter reuses the internal `PersistentStorageBackend` I/O envelope,
+The physical backend reuses the internal `PersistentStorageBackend` I/O envelope,
 `MetadataBackend`, checksum validation, `PhysicalKeyCodec` and the existing Cold Tier batching
 entry points. It derives a collision-resistant object identity, passes the complete value to the
 selected executor and persists the returned locator opaquely. It does not define a physical record,
@@ -77,7 +78,7 @@ or opt it into local-disk maintenance.
 
 `NofStorageManagement` is the optional inventory/capacity boundary for a backing that delegates
 physical maintenance to Mooncake. Its storage health feeds the existing backend health and
-management classification; the provider-specific adapter must supply exhaustive inventory before
+management classification; the provider-specific backend must supply exhaustive inventory before
 physical reconciliation can be enabled. If the capability is absent, the provider owns orphan
 collection, watermarks and compaction. `NofDeviceManagement` is evaluated independently. KVCS
 exposes neither management trait because its public 0.4.0 client ABI does not provide those
@@ -173,7 +174,7 @@ client/
       backend.rs
       object.rs
       physical.rs
-      physical_adapter.rs
+      physical_backend.rs
       runtime.rs
       external_metadata/
         mod.rs
@@ -189,7 +190,9 @@ client/
 Public provider-neutral traits live directly under `nof/`. All KVCS-specific configuration, C API
 calls and tests live under `nof/kvcs/`. `executor.rs` contains one mode-selecting KVCS executor;
 `physical_layout.rs` owns the Low-Level SDK record/chunk layout; `capi.rs` is the private binding
-for the vendor's public C ABI.
+for the vendor's public C ABI. `physical_backend.rs` is the shared bridge from executor-owned
+physical objects to the existing Cold Tier backend contract; physical layout and request batching
+remain executor responsibilities.
 
 ## KVCS Low-Level capability boundary
 
@@ -339,7 +342,7 @@ dependencies are unrelated to KVCS.
 | `kvcs-capi`, production | `COMMIT_ID`, `C/include/kvcs_capi.h`, `lib/libkvcs.so` and its SONAME chain | dynamic `libkvcs.so.0` | `$KVCS_SDK_ROOT/lib` |
 | `kvcs-capi`, official mock | the same metadata/header plus `mock/lib/libkvcsmock.so` and its SONAME chain | dynamic `libkvcsmock.so.0` | `$KVCS_SDK_ROOT/mock/lib` |
 
-The adapter deliberately does not depend on the SDK's `rust/` path crate, `pkg-config`, `bindgen`,
+The KVCS C API binding deliberately does not depend on the SDK's `rust/` path crate, `pkg-config`, `bindgen`,
 the KVCS C++ sources, `libkvcs.a`, or `libstdc++-static`. Those belong to the vendor Rust wrapper's
 default static-link flow, not to Mooncake's C ABI integration. EFC and Redis are runtime services,
 not compilation dependencies: Standard-mode operations require EFC plus Redis, while
@@ -387,8 +390,9 @@ SDK modes:
 
 Mooncake does not create a parallel tuning surface for SDK worker counts, ring depth, value/key
 limits, logging, metrics or performance reporting. Those `kvcs_*_config_t` fields are left at the
-public ABI's documented zero values, so the SDK owns its defaults. The adapter advertises the same
-documented 4 MiB raw value, 256-byte raw key and 256-item batch defaults to the NoF framework.
+public ABI's documented zero values, so the SDK owns its defaults. The KVCS executor applies the
+documented 4 MiB raw value, 256-byte raw key and 256-item batch defaults internally; the shared NoF
+backend does not reinterpret executor geometry or split its batches.
 
 The vendor's top-level `env.sh` assigns `KVCS_SDK_ROOT` as a shell variable but does not export it,
 and `mock/env.sh` configures the vendor Rust wrapper through `KVCS_DYNAMIC`. Mooncake does not read
@@ -433,7 +437,7 @@ Public 0.4.0 requires a non-empty Low-Level EFC socket. The executor uses
 `/var/run/kvcs/efc-grpc.sock`; it never passes a null socket and relies on an SDK-version-specific
 fallback.
 
-The adapter enforces the SDK's documented raw value limit and validates the key after converting
+The KVCS executor enforces the SDK's documented raw value limit and validates the key after converting
 the opaque physical key to the C ABI's hex string. The installed header defaults to a 256-byte raw
 key limit and a 4 MiB value limit. These limits remain inside the KVCS executor.
 
@@ -441,7 +445,7 @@ The KVCS C ABI exposes a mountpoint index but no manager epoch or device-generat
 integration therefore does not claim physical fencing or C++ backend key/layout compatibility.
 The official mock implements all published Low-Level functions, including existence query, but
 does not simulate real I/O, shared memory, Redis, timeouts, failover, disk failure, capacity,
-watermarks or performance. Mock tests prove ABI marshalling and adapter behavior only.
+watermarks or performance. Mock tests prove ABI marshalling and executor behavior only.
 
 ## Validation
 

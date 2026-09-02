@@ -7,8 +7,8 @@ use super::object::{
     NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead, NofObjectWrite,
 };
 use super::physical::{
-    NofDeviceManagement, NofHealth, NofPhysicalDelete, NofPhysicalLimits, NofPhysicalQuery,
-    NofPhysicalRead, NofPhysicalRecovery, NofPhysicalWrite, NofStorageManagement,
+    NofDeviceManagement, NofHealth, NofPhysicalDelete, NofPhysicalQuery, NofPhysicalRead,
+    NofPhysicalRecovery, NofPhysicalWrite, NofStorageManagement,
 };
 
 /// Runtime NoF backing assembled from optional, provider-neutral capabilities.
@@ -35,10 +35,6 @@ pub trait NofBacking: Send + Sync {
     }
 
     fn object_delete(&self) -> Option<&dyn NofObjectDelete> {
-        None
-    }
-
-    fn physical_limits(&self) -> Option<NofPhysicalLimits> {
         None
     }
 

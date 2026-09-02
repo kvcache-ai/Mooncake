@@ -11,7 +11,7 @@ mod backing;
 pub(in crate::client) mod external_metadata;
 mod object;
 mod physical;
-pub(in crate::client) mod physical_adapter;
+pub(in crate::client) mod physical_backend;
 mod runtime;
 
 #[cfg(feature = "kvcs-capi")]
@@ -28,7 +28,7 @@ pub use object::{
     NofObjectShardWrite, NofObjectState, NofObjectWrite,
 };
 pub use physical::{
-    NofDeviceManagement, NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits,
+    NofDeviceManagement, NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest,
     NofPhysicalListPage, NofPhysicalLocator, NofPhysicalObject, NofPhysicalQuery,
     NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalRecoveredRecord,
     NofPhysicalRecovery, NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth,

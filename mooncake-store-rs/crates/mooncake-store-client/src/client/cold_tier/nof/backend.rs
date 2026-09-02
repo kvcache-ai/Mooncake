@@ -11,7 +11,6 @@ use super::external_metadata::NofExternalMetadata;
 use super::object::{
     NofObject, NofObjectLimits, NofObjectMetadata, NofObjectShardWrite, NofObjectState,
 };
-use super::physical::NofPhysicalLimits;
 
 /// Unified NoF facade and capability container.
 ///
@@ -22,7 +21,6 @@ use super::physical::NofPhysicalLimits;
 pub struct NofBackend {
     pub(crate) backing: Arc<dyn NofBacking>,
     pub(crate) object_limits: Option<NofObjectLimits>,
-    pub(crate) physical_limits: Option<NofPhysicalLimits>,
     pub(crate) key_codec: Arc<dyn PhysicalKeyCodec>,
     pub(crate) key_domain: Vec<u8>,
     external_metadata: Option<Arc<dyn NofExternalMetadata>>,
@@ -34,10 +32,6 @@ impl NofBackend {
             .object_limits()
             .map(NofObjectLimits::validate)
             .transpose()?;
-        let physical_limits = backing
-            .physical_limits()
-            .map(NofPhysicalLimits::validate)
-            .transpose()?;
         let has_object_io = backing.object_write().is_some()
             || backing.object_read().is_some()
             || backing.object_query().is_some()
@@ -47,19 +41,9 @@ impl NofBackend {
                 "NoF logical-object capabilities require object limits".to_string(),
             ));
         }
-        let has_physical_io = backing.physical_write().is_some()
-            || backing.physical_read().is_some()
-            || backing.physical_query().is_some()
-            || backing.physical_delete().is_some();
-        if has_physical_io && physical_limits.is_none() {
-            return Err(StoreError::InvalidState(
-                "NoF physical-KV capabilities require physical limits".to_string(),
-            ));
-        }
         Ok(Self {
             backing,
             object_limits,
-            physical_limits,
             key_codec: Arc::new(Sha256PhysicalKeyCodec),
             key_domain: b"mooncake:nof:physical:v1".to_vec(),
             external_metadata: None,
