@@ -84,6 +84,9 @@ class Workers {
 
     // dev_id is the NicID (context_set_ index), which is also the
     // DeviceSelector id, so port events can flip that device's availability.
+    // Drains the whole async event queue: the async fd is edge-triggered and
+    // ibv_get_async_event() dequeues one record per call, so an event left
+    // behind waits for an unrelated later event to release it.
     int handleContextEvents(int dev_id, std::shared_ptr<RdmaContext>& context);
 
     // The decision half of handleContextEvents, kept apart from
@@ -94,10 +97,23 @@ class Workers {
     void applyContextEvent(int dev_id, RdmaContext& context,
                            const ibv_async_event& event);
 
+    // Everything a recovered port needs: resume the context, re-seed its
+    // bandwidth and make it selectable again. Shared by the
+    // IBV_EVENT_PORT_ACTIVE path and by resumePausedContexts().
+    void activateContext(int dev_id, RdmaContext& context);
+
     // Re-read the link speed after a port event and re-seed the selector if
     // it changed; a link that returns at the same speed keeps what it
     // learned.
     void refreshLinkSpeed(int dev_id, RdmaContext& context);
+
+    // 1 Hz heartbeat from monitorThread(): safety net for a lost
+    // IBV_EVENT_PORT_ACTIVE. Nothing else ever leaves DEVICE_PAUSED, so a
+    // context whose recovery event was dropped (edge-triggered fd, event
+    // queue overflow, ...) would fail every transfer on that NIC forever.
+    // Polls the port state of paused contexts and activates the ones the
+    // hardware reports as up.
+    void resumePausedContexts();
 
     Status generatePostPath(RdmaSlice* slice);
 
@@ -123,6 +139,8 @@ class Workers {
                                 RdmaSlice* slice);
 
     int getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx);
+
+    bool strictLocalNuma() const;
 
     // True if the (sdev -> tdev) NIC pair is known-unable to GPUDirect-DMA to
     // the source/target GPU (learned from prior completion errors). Used to

@@ -129,6 +129,7 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
             for (int dev_id : entry->device_list[rank]) {
                 if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
+                if (!isNumaEligible(entry, dev_id)) continue;
                 tl_eligible.push_back(dev_id);
             }
             if (tl_eligible.empty()) continue;
@@ -147,7 +148,7 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
             }
             return Status::OK();
         }
-        return Status::DeviceNotFound("no eligible devices");
+        return Status::DeviceNotFound(noEligibleDeviceReason());
     }
 
     std::vector<DeviceSelector::Candidate> tl_candidates;
@@ -166,6 +167,39 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                         probe_mode);
     }
     return Status::OK();
+}
+
+void DeviceSelector::auditStrictLocalNuma() const {
+    if (!sched_params_.strict_local_numa || !local_topology_) return;
+
+    size_t excludable = 0;
+    for (const auto& mem : local_topology_->mem_list_) {
+        bool has_nic = false, has_local_nic = false;
+        for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+            for (int dev_id : mem.device_list[rank]) {
+                if (devices_.find(dev_id) == devices_.end()) continue;
+                has_nic = true;
+                if (local_topology_->isCrossNuma(mem, dev_id))
+                    excludable++;
+                else
+                    has_local_nic = true;
+            }
+        }
+        if (has_nic && !has_local_nic) {
+            LOG(WARNING) << "strict_local_numa: location " << mem.name
+                         << " (NUMA " << mem.numa_node
+                         << ") has no same-NUMA RDMA NIC; transfers from it "
+                            "will fail with DeviceNotFound";
+        }
+    }
+
+    if (excludable == 0) {
+        LOG(WARNING) << "strict_local_numa is enabled but no NIC can be "
+                        "classified as cross-NUMA on this host (custom "
+                        "priority matrix, VM, or sysfs without NUMA info), so "
+                        "the flag has no effect and cross-NUMA NICs keep the "
+                        "numa_penalties soft penalty";
+    }
 }
 
 int DeviceSelector::getDeviceRank(const std::string& location,
@@ -211,6 +245,7 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         for (int dev_id : entry->device_list[rank]) {
             if (!usable(dev_id)) continue;
             if ((device_mask & (1ULL << dev_id)) == 0) continue;
+            if (!isNumaEligible(entry, dev_id)) continue;
             // QoS: Get device's current priority slot (local, per-process)
             // Device accepts request if dev_priority >= request_priority
             int dev_priority = PRIO_LOW;  // Default: accept all
@@ -222,20 +257,20 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         }
     }
 
-    // If no devices after priority filtering, fall back to every usable
-    // device. Availability is not a QoS filter and is never relaxed here.
+    // Retry without QoS filtering; availability and NUMA exclusion stay.
     if (candidates.empty()) {
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             for (int dev_id : entry->device_list[rank]) {
                 if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
+                if (!isNumaEligible(entry, dev_id)) continue;
                 add_candidate(dev_id, rank);
             }
         }
     }
 
     if (candidates.empty()) {
-        return Status::DeviceNotFound("no eligible devices");
+        return Status::DeviceNotFound(noEligibleDeviceReason());
     }
 
     std::sort(
