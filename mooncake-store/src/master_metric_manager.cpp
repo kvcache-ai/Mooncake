@@ -7,7 +7,9 @@
 #include <vector>   // Required by histogram serialization
 #include <cmath>
 
+#include "segment.h"
 #include "utils.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -482,9 +484,17 @@ MasterMetricManager::MasterMetricManager()
           "Total number of MarkTaskToComplete requests received"),
       mark_task_to_complete_failures_(
           "master_update_task_failures_total",
-          "Total number of failed MarkTaskToComplete requests") {
+          "Total number of failed MarkTaskToComplete requests"),
+      build_info_("mooncake_build_info",
+                  "Build version of the running master; the value is always 1 "
+                  "and the version strings are carried by the labels",
+                  {{"version", GetMooncakeStoreVersion()},
+                   {"display_version", MOONCAKE_DISPLAY_VERSION}}) {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
+    // Info-style metric: emit a single series for the build this binary was
+    // compiled from. Set once here because the value never changes at runtime.
+    build_info_.update(1);
 }
 
 // --- Metric Interface Methods ---
@@ -682,15 +692,6 @@ int64_t MasterMetricManager::get_total_mem_capacity() {
     return mem_total_capacity_.value();
 }
 
-double MasterMetricManager::get_global_mem_used_ratio(void) {
-    double allocated = mem_allocated_size_.value();
-    double capacity = mem_total_capacity_.value();
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
-}
-
 int64_t MasterMetricManager::get_segment_allocated_mem_size(
     const std::string& segment) {
     return mem_allocated_size_per_segment_.value({segment});
@@ -714,16 +715,6 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
-}
-
-double MasterMetricManager::get_segment_mem_used_ratio(
-    const std::string& segment) {
-    double allocated = get_segment_allocated_mem_size(segment);
-    double capacity = get_segment_total_mem_capacity(segment);
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
 }
 
 // NoF segment Metrics
@@ -767,13 +758,44 @@ int64_t MasterMetricManager::get_total_nof_capacity() {
     return nof_total_capacity_.value();
 }
 
-double MasterMetricManager::get_global_nof_used_ratio(void) {
-    double allocated = nof_allocated_size_.value();
-    double capacity = nof_total_capacity_.value();
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
+void MasterMetricManager::project_storage_usage(
+    const TieredStorageUsageSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(storage_projection_mutex_);
+
+    auto project_tier = [](const StorageUsageSnapshot& tier,
+                           ylt::metric::gauge_t& allocated,
+                           ylt::metric::gauge_t& capacity,
+                           ylt::metric::dynamic_gauge_1t& allocated_by_segment,
+                           ylt::metric::dynamic_gauge_1t& capacity_by_segment,
+                           std::set<std::string>& projected_segments) {
+        allocated.update(static_cast<int64_t>(tier.used_bytes));
+        capacity.update(static_cast<int64_t>(tier.capacity_bytes));
+
+        std::set<std::string> current_segments;
+        for (const auto& [segment_name, usage] : tier.segments) {
+            current_segments.insert(segment_name);
+            allocated_by_segment.update({segment_name},
+                                        static_cast<int64_t>(usage.used_bytes));
+            capacity_by_segment.update(
+                {segment_name}, static_cast<int64_t>(usage.capacity_bytes));
+        }
+        for (const auto& segment_name : projected_segments) {
+            if (!current_segments.contains(segment_name)) {
+                allocated_by_segment.remove_label_value(
+                    {{"segment", segment_name}});
+                capacity_by_segment.remove_label_value(
+                    {{"segment", segment_name}});
+            }
+        }
+        projected_segments = std::move(current_segments);
+    };
+
+    project_tier(snapshot.memory, mem_allocated_size_, mem_total_capacity_,
+                 mem_allocated_size_per_segment_,
+                 mem_total_capacity_per_segment_, projected_mem_segments_);
+    project_tier(snapshot.nof, nof_allocated_size_, nof_total_capacity_,
+                 nof_allocated_size_per_segment_,
+                 nof_total_capacity_per_segment_, projected_nof_segments_);
 }
 
 int64_t MasterMetricManager::get_segment_allocated_nof_size(
@@ -790,16 +812,6 @@ void MasterMetricManager::remove_nof_segment_metrics(
     const std::string& segment) {
     nof_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     nof_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
-}
-
-double MasterMetricManager::get_segment_nof_used_ratio(
-    const std::string& segment) {
-    double allocated = get_segment_allocated_nof_size(segment);
-    double capacity = get_segment_total_nof_capacity(segment);
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
 }
 
 // File Storage Metrics
@@ -1984,6 +1996,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
+    serialize_metric(build_info_);
 
     // Serialize Snapshot Metrics
     serialize_metric(snapshot_duration_ms_);

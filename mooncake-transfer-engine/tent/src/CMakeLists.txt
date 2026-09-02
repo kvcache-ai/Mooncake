@@ -61,6 +61,31 @@ if(IBVERBS_LIB AND IBVERBS_INCLUDE)
   target_compile_definitions(tent_interface INTERFACE USE_RDMA)
   target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
   target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
+  # ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
+  # newer rdma-core adds active_speed_ex to carry it.
+  include(CheckStructHasMember)
+  set(CMAKE_REQUIRED_INCLUDES ${IBVERBS_INCLUDE})
+  check_struct_has_member(
+    "struct ibv_port_attr" active_speed_ex infiniband/verbs.h
+    HAVE_IBV_ACTIVE_SPEED_EX LANGUAGE CXX)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(HAVE_IBV_ACTIVE_SPEED_EX)
+    target_compile_definitions(tent_interface
+                               INTERFACE HAVE_IBV_ACTIVE_SPEED_EX)
+  endif()
+  # IBV_EVENT_DEVICE_SPEED_CHANGE (rdma-core >= 62) reports a port speed change
+  # without a link flap. It is an enumerator, so probe by compiling.
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${IBVERBS_INCLUDE})
+  check_cxx_source_compiles(
+    "#include <infiniband/verbs.h>
+     int main() { return IBV_EVENT_DEVICE_SPEED_CHANGE == IBV_EVENT_PORT_ACTIVE; }"
+    HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE)
+    target_compile_definitions(tent_interface
+                               INTERFACE HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE)
+  endif()
 else()
   message(STATUS "RDMA: Disabled")
 endif()
@@ -128,6 +153,8 @@ foreach(
   tent_xport_rdma
   tent_xport_shm
   tent_xport_tcp
+  tent_xport_hp_tcp
+  tent_xport_hp_tcp_core
   tent_xport_ub
   tent_xport_ascend_direct
   tent_xport_sunrise_link

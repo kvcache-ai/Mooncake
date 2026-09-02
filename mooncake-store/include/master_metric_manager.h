@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -11,6 +12,8 @@
 #include "ylt/metric/histogram.hpp"
 
 namespace mooncake {
+
+struct TieredStorageUsageSnapshot;
 
 class MasterMetricManager {
    public:
@@ -29,7 +32,6 @@ class MasterMetricManager {
     void inc_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_mem_capacity();
-    double get_global_mem_used_ratio(void);
 
     void inc_mem_cache_hit_nums(int64_t val = 1);
     void inc_file_cache_hit_nums(int64_t val = 1);
@@ -55,7 +57,14 @@ class MasterMetricManager {
     void inc_total_nof_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_nof_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_nof_capacity();
-    double get_global_nof_used_ratio(void);
+
+    /**
+     * @brief Refresh storage gauges from authoritative allocator snapshots.
+     *
+     * This is an observability projection. Business code must use the domain
+     * snapshots directly and must not read the resulting gauges.
+     */
+    void project_storage_usage(const TieredStorageUsageSnapshot& snapshot);
 
     enum class CacheHitStat {
         MEMORY_HITS,
@@ -83,7 +92,6 @@ class MasterMetricManager {
     // Memory Storage Metrics
     int64_t get_allocated_mem_size();
     int64_t get_total_mem_capacity();
-    double get_segment_mem_used_ratio(const std::string& segment);
     void reset_segment_allocated_mem_size(const std::string& segment);
     void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);
@@ -97,7 +105,6 @@ class MasterMetricManager {
     // NoF segment Metrics
     int64_t get_allocated_nof_size();
     int64_t get_total_nof_capacity();
-    double get_segment_nof_used_ratio(const std::string& segment);
     int64_t get_segment_allocated_nof_size(const std::string& segment);
     int64_t get_segment_total_nof_capacity(const std::string& segment);
     // Remove all per-segment NoF metric labels for the given segment.
@@ -531,6 +538,10 @@ class MasterMetricManager {
     std::mutex summary_snapshot_mutex_;
     SummarySnapshot summary_snapshot_;
 
+    std::mutex storage_projection_mutex_;
+    std::set<std::string> projected_mem_segments_;
+    std::set<std::string> projected_nof_segments_;
+
     // Memory Storage Metrics
     ylt::metric::gauge_t
         mem_allocated_size_;  // Overall memory usage update for gauge
@@ -744,6 +755,16 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    // Build Info Metric
+    // Prometheus "info" pattern: the value carries no meaning and is always 1,
+    // the version strings are exposed as labels so dashboards and alerts can
+    // group or filter by the running build. The label values are compile-time
+    // constants, so this is a single-series gauge with static labels rather
+    // than a dynamic-label metric.
+    // Shares the `mooncake_build_info` name with the client-side metric; the
+    // two are told apart by the scrape target's job/instance labels.
+    ylt::metric::gauge_t build_info_;
 };
 
 }  // namespace mooncake

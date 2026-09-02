@@ -24,8 +24,8 @@
   [![PyPI Non-CUDA](https://img.shields.io/static/v1?label=pypi&message=non-CUDA&color=00BFFF)](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
   [![PyPI NPU](https://img.shields.io/static/v1?label=pypi&message=NPU&color=F87171)](https://pypi.org/project/mooncake-transfer-engine-npu/)
   [![PyPI MUSA](https://img.shields.io/static/v1?label=pypi&message=MUSA&color=F97316)](https://pypi.org/project/mooncake-transfer-engine-musa/)
-  [![PyPI EFA CUDA 12](https://img.shields.io/static/v1?label=pypi&message=EFA%20%2B%20CUDA%2012&color=F59E0B)](https://pypi.org/project/mooncake-transfer-engine-efa/)
-  [![PyPI EFA Non-CUDA](https://img.shields.io/static/v1?label=pypi&message=EFA%20non-CUDA&color=F59E0B)](https://pypi.org/project/mooncake-transfer-engine-efa-non-cuda/)
+  [![PyPI EFA](https://img.shields.io/static/v1?label=pypi&message=EFA&color=F59E0B)](https://pypi.org/project/mooncake-transfer-engine-efa/)
+  [![PyPI ROCm](https://img.shields.io/static/v1?label=pypi&message=ROCm&color=black)](https://pypi.org/project/mooncake-transfer-engine-rocm/)
 </div>
 <br/>
 

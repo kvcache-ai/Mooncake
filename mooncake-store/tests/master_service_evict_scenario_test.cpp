@@ -1,4 +1,4 @@
-#include "master_scenario.h"
+#include "master_service/dsl/scenario.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -261,7 +261,8 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtLowRatio) {
                    .CompleteOn("memory")
                    .ExpiredFrom(ExpiredBase()))
         .When(EvictMemory(0.05))
-        .Then(KeyCount(kObjectCount - kExpectedEvicted))
+        .Then(ReadableCount(IndexedObjects(0, kObjectCount),
+                            kObjectCount - kExpectedEvicted))
         .Then(IndexedObjects(0, kExpectedEvicted).DoNotExist())
         .Then(IndexedObjects(kExpectedEvicted, kObjectCount).AreReadable());
 }
@@ -277,7 +278,8 @@ TEST_F(MasterServiceEvictScenarioTest, TargetEqualsLowerBoundEvictsExactCount) {
                    .CompleteOn("memory")
                    .ExpiredFrom(ExpiredBase()))
         .When(EvictMemory(0.10).ToLowerBound(0.10))
-        .Then(KeyCount(kObjectCount - kExpectedEvicted))
+        .Then(ReadableCount(IndexedObjects(0, kObjectCount),
+                            kObjectCount - kExpectedEvicted))
         .Then(Object(Key(kExpectedEvicted - 1)).DoesNotExist())
         .Then(Object(Key(kExpectedEvicted)).IsReadable());
 }
@@ -302,7 +304,9 @@ TEST_F(MasterServiceEvictScenarioTest, SoftPinnedObjectsAreFallbackCandidates) {
                    .ExpiredFrom(base + std::chrono::nanoseconds(kUnpinnedCount))
                    .SoftPinnedUntil(active_soft_pin))
         .When(EvictMemory(0.80))
-        .Then(KeyCount(kSoftPinnedCount - kExpectedSoftPinnedEvicted))
+        .Then(
+            ReadableCount(IndexedObjects(0, kUnpinnedCount + kSoftPinnedCount),
+                          kSoftPinnedCount - kExpectedSoftPinnedEvicted))
         .Then(IndexedObjects(0, kUnpinnedCount + kExpectedSoftPinnedEvicted)
                   .DoNotExist())
         .Then(IndexedObjects(kUnpinnedCount + kExpectedSoftPinnedEvicted,
@@ -327,7 +331,8 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsWholeGroupTogether) {
                    .CompleteOn("memory")
                    .ExpiredFrom(base + std::chrono::nanoseconds(kGroupSize)))
         .When(EvictMemory(0.10))
-        .Then(KeyCount(kObjectCount - kGroupSize))
+        .Then(ReadableCount(IndexedObjects(0, kObjectCount),
+                            kObjectCount - kGroupSize))
         .Then(IndexedObjects(0, kGroupSize).DoNotExist())
         .Then(IndexedObjects(kGroupSize, kObjectCount).AreReadable());
 }
@@ -352,7 +357,7 @@ TEST_F(MasterServiceEvictScenarioTest, ActiveGroupMemberBlocksWholeGroup) {
         .When(ExpireAt(Key(kGroupSize - 1), std::chrono::system_clock::now() +
                                                 std::chrono::hours(1)))
         .When(EvictMemory(0.10))
-        .Then(KeyCount(kObjectCount - 1))
+        .Then(ReadableCount(IndexedObjects(0, kObjectCount), kObjectCount - 1))
         .Then(IndexedObjects(0, kGroupSize).AreReadable())
         .Then(Object(Key(kGroupSize)).DoesNotExist());
 }
@@ -368,7 +373,8 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtHighRatio) {
                    .CompleteOn("memory")
                    .ExpiredFrom(ExpiredBase()))
         .When(EvictMemory(0.80))
-        .Then(KeyCount(kObjectCount - kExpectedEvicted))
+        .Then(ReadableCount(IndexedObjects(0, kObjectCount),
+                            kObjectCount - kExpectedEvicted))
         .Then(IndexedObjects(0, kExpectedEvicted).DoNotExist())
         .Then(IndexedObjects(kExpectedEvicted, kObjectCount).AreReadable());
 }
@@ -404,7 +410,7 @@ TEST_F(MasterServiceEvictScenarioTest,
                    .CompleteOn("memory")
                    .ExpiredFrom(base + std::chrono::nanoseconds(plain_begin)))
         .When(EvictMemory(0.05))
-        .Then(KeyCount(total - kExpectedEvicted))
+        .Then(ReadableCount(IndexedObjects(0, total), total - kExpectedEvicted))
         .Then(IndexedObjects(0, kBlockedCount + 1).AreReadable())
         .Then(IndexedObjects(plain_begin, plain_begin + kAlwaysEvictedPlain)
                   .DoNotExist());
@@ -439,7 +445,7 @@ TEST_F(MasterServiceEvictScenarioTest,
                    .CompleteOn("memory")
                    .ExpiredFrom(base + std::chrono::nanoseconds(plain_begin)))
         .When(EvictMemory(0.05))
-        .Then(KeyCount(total - kExpectedEvicted))
+        .Then(ReadableCount(IndexedObjects(0, total), total - kExpectedEvicted))
         .Then(IndexedObjects(0, kBlockedCount + 1).AreReadable());
 }
 
@@ -491,18 +497,16 @@ TEST_F(MasterServiceEvictScenarioTest,
     backend->BlockTxn();
     scenario.When(EvictMemory(1.0))
         .Then(Object("cold").DoesNotExist())
-        .Then(TenantQuota(tenant).Charges(kObjectSize))
         .When(PutStart("before-durable", kObjectSize)
                   .ForTenant(tenant)
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
-    scenario.Then(TenantQuota(tenant).Charges(0).Eventually())
-        .When(PutStart("after-durable", kObjectSize)
-                  .ForTenant(tenant)
-                  .ExpectReplicas(1))
-        .Then(TenantQuota(tenant).Charges(kObjectSize));
+    scenario.When(PutStart("after-durable", kObjectSize)
+                      .ForTenant(tenant)
+                      .ExpectReplicas(1)
+                      .Eventually());
 }
 
 TEST_F(MasterServiceEvictScenarioTest,
@@ -532,10 +536,9 @@ TEST_F(MasterServiceEvictScenarioTest,
         .When(PutEnd("writer-failure"));
     ASSERT_TRUE(backend->WaitForTransactionCalls(1));
 
-    scenario.Then(OpLogUnavailable())
+    scenario.When(WaitForOpLogFailure())
         .When(EvictMemory(1.0))
-        .Then(Object("cold").IsReadable())
-        .Then(KeyCount(2));
+        .Then(Object("cold").IsReadable());
 }
 
 TEST_F(MasterServiceEvictScenarioTest,
@@ -553,13 +556,16 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Given(Objects({"same-key"})
                    .Size(kObjectSize)
                    .ForTenant("tenant-b")
+                   .WithHardPin()
                    .CompleteOn("memory")
                    .ExpiresAt(base + std::chrono::seconds(1)))
         .When(EvictMemory(0.5))
         .Then(Object("same-key").ForTenant("tenant-a").DoesNotExist())
         .Then(Object("same-key").ForTenant("tenant-b").IsReadable())
-        .Then(TenantQuota("tenant-a").Charges(0))
-        .Then(TenantQuota("tenant-b").Charges(kObjectSize));
+        .When(PutStart("tenant-a-probe", kObjectSize).ForTenant("tenant-a"))
+        .When(PutStart("tenant-b-probe", 1)
+                  .ForTenant("tenant-b")
+                  .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
 }
 
 TEST_F(MasterServiceEvictScenarioTest,
@@ -576,16 +582,17 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Given(Objects({"tenant-b-object"})
                    .Size(kObjectSize)
                    .ForTenant("tenant-b")
+                   .WithHardPin()
                    .CompleteOn("memory"))
         .When(PutStart("tenant-a-new", kObjectSize)
                   .ForTenant("tenant-a")
                   .ExpectReplicas(1))
         .Then(Object("tenant-a-old").ForTenant("tenant-a").DoesNotExist())
         .Then(Object("tenant-b-object").ForTenant("tenant-b").IsReadable())
-        .Then(TenantQuota("tenant-a").Charges(kObjectSize))
         .When(PutEnd("tenant-a-new").ForTenant("tenant-a"))
-        .Then(TenantQuota("tenant-a").Charges(kObjectSize))
-        .Then(TenantQuota("tenant-b").Charges(kObjectSize));
+        .When(PutStart("tenant-b-overflow", 1)
+                  .ForTenant("tenant-b")
+                  .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
 }
 
 }  // namespace

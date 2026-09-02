@@ -15,6 +15,8 @@
 #include "tent_backend.h"
 #include "utils.h"
 #include "char_util.h"
+
+#include <atomic>
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -31,18 +33,18 @@
 namespace mooncake {
 namespace tent {
 
-volatile bool g_tent_running = true;
-volatile bool g_tent_triggered_sig = false;
+std::atomic<bool> g_tent_running{true};
+std::atomic<bool> g_tent_triggered_sig{false};
 
 void signalHandlerV1(int signum) {
-    if (g_tent_triggered_sig) {
+    if (g_tent_triggered_sig.load()) {
         LOG(ERROR) << "Received signal " << signum
                    << " again, forcefully terminating...";
         std::exit(EXIT_FAILURE);
     }
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    g_tent_running = false;
-    g_tent_triggered_sig = true;
+    g_tent_running.store(false);
+    g_tent_triggered_sig.store(true);
 }
 
 std::shared_ptr<Config> loadConfig() {
@@ -58,14 +60,11 @@ std::shared_ptr<Config> loadConfig() {
     if (!XferBenchConfig::xport_type.empty()) {
         // Map of transport names to their config keys (handle name mismatches)
         std::unordered_map<std::string, std::string> transport_map = {
-            {"rdma", "rdma"},
-            {"tcp", "tcp"},
-            {"shm", "shm"},
+            {"rdma", "rdma"},        {"tcp", "tcp"},
+            {"hp_tcp", "hp_tcp"},    {"shm", "shm"},
             {"iouring", "io_uring"},  // Note: iouring -> io_uring
-            {"gds", "gds"},
-            {"mnnvl", "mnnvl"},
-            {"nvlink", "nvlink"},
-            {"sunrise_link", "sunrise_link"},
+            {"gds", "gds"},          {"mnnvl", "mnnvl"},
+            {"nvlink", "nvlink"},    {"sunrise_link", "sunrise_link"},
             {"mpcomm", "mpcomm"}};
 
         // Disable all transports by default
@@ -93,6 +92,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "iouring") return IOURING;
     if (xport_type == "sunrise_link") return SUNRISE_LINK;
     if (xport_type == "mpcomm") return MPCOMM;
+    if (xport_type == "hp_tcp") return HP_TCP;
     return UNSPEC;
 }
 
@@ -142,7 +142,7 @@ static int resolveSegTypeParams(const std::string& seg_type,
         }
 #elif defined(USE_HIP)
     } else if (seg_type == "VRAM" || seg_type == "vram") {
-        device_prefix = "rocm";
+        device_prefix = "hip";
         int gpu_count = 0;
         hipGetDeviceCount(&gpu_count);
         start_idx = 0;
@@ -302,7 +302,7 @@ TENTBenchRunner::TENTBenchRunner() {
 TENTBenchRunner::~TENTBenchRunner() { freeBuffers(); }
 
 int TENTBenchRunner::runTarget() {
-    while (g_tent_running) sleep(1);
+    while (g_tent_running.load()) sleep(1);
     return 0;
 }
 
@@ -350,7 +350,7 @@ int TENTBenchRunner::startInitiator(int num_threads) {
     LOG(INFO) << "Opened " << target_handles_.size() << " target segments";
     threads_.resize(num_threads);
     current_task_.resize(threads_.size());
-    g_tent_running = true;
+    g_tent_running.store(true);
     for (size_t i = 0; i < threads_.size(); ++i)
         threads_[i] = std::thread(&TENTBenchRunner::runner, this, i);
     return 0;
@@ -359,7 +359,7 @@ int TENTBenchRunner::startInitiator(int num_threads) {
 int TENTBenchRunner::stopInitiator() {
     {
         std::unique_lock<std::mutex> lk(mtx_);
-        g_tent_running = false;
+        g_tent_running.store(false);
         cv_task_.notify_all();
         cv_done_.notify_all();
     }
@@ -425,7 +425,8 @@ void TENTBenchRunner::pinThread(int thread_id) {
     if (location.type() == "cpu") {
         auto socket_id = location.index();
         bindToSocket(socket_id);
-    } else if (location.type() == "cuda" || location.type() == "rocm") {
+    } else if (location.type() == "cuda" ||
+               isAmdGpuLocationType(location.type())) {
         auto device_id = location.index();
         auto socket_id = getGpuDeviceNumaID(device_id);
         bindToSocket(socket_id);
@@ -433,14 +434,14 @@ void TENTBenchRunner::pinThread(int thread_id) {
 }
 
 int TENTBenchRunner::runner(int thread_id) {
-    while (g_tent_running) {
+    while (g_tent_running.load()) {
         std::function<int(int)> task;
         {
             std::unique_lock<std::mutex> lk(mtx_);
             cv_task_.wait(lk, [&] {
-                return !g_tent_running || current_task_[thread_id];
+                return !g_tent_running.load() || current_task_[thread_id];
             });
-            if (!g_tent_running) break;
+            if (!g_tent_running.load()) break;
             std::swap(task, current_task_[thread_id]);
         }
         if (task) task(thread_id);
@@ -459,15 +460,37 @@ int TENTBenchRunner::runInitiatorTasks(
         current_task_[id] = func;
     pending_ = (int)threads_.size();
     cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return !g_tent_running || pending_ == 0; });
-    return g_tent_running ? 0 : -1;
+    cv_done_.wait(lk, [&] { return !g_tent_running.load() || pending_ == 0; });
+    return g_tent_running.load() ? 0 : -1;
+}
+
+void TENTBenchRunner::noteTransferFailed() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    g_tent_running.store(false);
+    cv_task_.notify_all();
+    cv_done_.notify_all();
 }
 
 double TENTBenchRunner::runSingleTransfer(
     uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
     uint64_t block_size, uint64_t batch_size, OpCode opcode,
     uint64_t deadline_ns, IntentType intent_type) {
+    if (!g_tent_running.load()) return -1.0;
+
+    auto abortTransfer = [&](const char* why) {
+        LOG(ERROR) << why;
+        noteTransferFailed();
+        return -1.0;
+    };
+
     auto batch_id = engine_->allocateBatch(batch_size);
+    if (!batch_id) return abortTransfer("Failed to allocate transfer batch");
+
+    auto finish = [&](double duration) {
+        (void)engine_->freeBatch(batch_id);
+        return duration;
+    };
+
     std::vector<Request> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
         Request entry;
@@ -484,26 +507,39 @@ double TENTBenchRunner::runSingleTransfer(
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;
+    Status submitted;
     if (XferBenchConfig::notifi) {
-        // Use target_addr as msg for verification by peer
         Notification notifi{"benchmark", std::to_string(target_addr)};
-        CHECK_FAIL(engine_->submitTransfer(batch_id, requests, notifi));
+        submitted = engine_->submitTransfer(batch_id, requests, notifi);
     } else {
-        CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+        submitted = engine_->submitTransfer(batch_id, requests);
     }
-    while (true) {
+    if (!submitted.ok()) {
+        LOG(ERROR) << "Failed to submit transfer: " << submitted.ToString();
+        noteTransferFailed();
+        return finish(-1.0);
+    }
+    while (g_tent_running.load()) {
         TransferStatus overall_status;
-        CHECK_FAIL(engine_->getTransferStatus(batch_id, overall_status));
+        auto polled = engine_->getTransferStatus(batch_id, overall_status);
+        if (!polled.ok()) {
+            LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
+            noteTransferFailed();
+            return finish(-1.0);
+        }
         if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            break;
-        } else if (overall_status.s == TransferStatusEnum::FAILED) {
+            return finish(timer.lap_us());
+        }
+        if (overall_status.s == TransferStatusEnum::FAILED ||
+            overall_status.s == TransferStatusEnum::TIMEOUT ||
+            overall_status.s == TransferStatusEnum::CANCELED ||
+            overall_status.s == TransferStatusEnum::INVALID) {
             LOG(ERROR) << "Failed transfer detected";
-            exit(EXIT_FAILURE);
+            noteTransferFailed();
+            return finish(-1.0);
         }
     }
-    auto duration = timer.lap_us();
-    CHECK_FAIL(engine_->freeBatch(batch_id));
-    return duration;
+    return finish(-1.0);
 }
 
 }  // namespace tent

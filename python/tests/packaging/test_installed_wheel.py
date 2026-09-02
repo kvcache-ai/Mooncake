@@ -61,6 +61,12 @@ assert mooncake.engine.TransferEngine is not None
 assert mooncake.shared_segment.SharedSegment is not None
 assert isinstance(mooncake.shared_segment.shared_segment_supported(), bool)
 assert Path(mooncake.shared_segment.__file__).resolve().parent == package_path.parent
+for ep_module in (
+    "ep.py",
+    "mooncake_ep_buffer.py",
+    "mooncake_elastic_buffer.py",
+):
+    assert (package_path.parent / ep_module).is_file(), ep_module
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],

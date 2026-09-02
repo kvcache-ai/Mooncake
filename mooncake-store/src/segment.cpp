@@ -5,6 +5,7 @@
 #include "utils/zstd_util.h"
 
 #include <functional>
+#include <unordered_set>
 
 namespace mooncake {
 namespace {
@@ -95,6 +96,27 @@ std::vector<std::string> BuildHostOrderedSegments(
     return ordered_segments;
 }
 
+void AddAllocatorUsage(
+    StorageUsageSnapshot& snapshot,
+    const std::shared_ptr<BufferAllocatorBase>& allocator,
+    std::unordered_set<const BufferAllocatorBase*>& counted_allocators) {
+    if (!allocator || !counted_allocators.insert(allocator.get()).second) {
+        return;
+    }
+
+    const size_t used_bytes = allocator->size();
+    const size_t capacity_bytes = allocator->capacity();
+    snapshot.used_bytes += used_bytes;
+    snapshot.capacity_bytes += capacity_bytes;
+
+    const std::string segment_name = allocator->getSegmentName();
+    if (!segment_name.empty()) {
+        auto& segment = snapshot.segments[segment_name];
+        segment.used_bytes += used_bytes;
+        segment.capacity_bytes += capacity_bytes;
+    }
+}
+
 }  // namespace
 
 std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
@@ -103,6 +125,38 @@ std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
         return {};
     }
     return BuildHostOrderedSegments(*segments_by_host_, writer_host_id, key);
+}
+
+StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    StorageUsageSnapshot snapshot;
+    std::unordered_set<const BufferAllocatorBase*> counted_allocators;
+
+    // The CXL allocator is owned by SegmentManager independently of client
+    // mounts and may be shared by multiple mounted segment records.
+    AddAllocatorUsage(snapshot, cxl_global_allocator_, counted_allocators);
+
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        AddAllocatorUsage(snapshot, mounted_segment.buf_allocator,
+                          counted_allocators);
+    }
+    return snapshot;
+}
+
+void SegmentManager::AttachMountedUsageTrackers() {
+    std::unordered_set<const BufferAllocatorBase*> attached_allocators;
+    if (cxl_global_allocator_) {
+        cxl_global_allocator_->AttachUsageTracker(usage_tracker_);
+        attached_allocators.insert(cxl_global_allocator_.get());
+    }
+    for (auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        auto& allocator = mounted_segment.buf_allocator;
+        if (allocator && attached_allocators.insert(allocator.get()).second) {
+            allocator->AttachUsageTracker(usage_tracker_);
+        }
+    }
 }
 
 std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
@@ -182,39 +236,15 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         }
     }
 
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    // CachelibBufferAllocator may throw an exception if the size or base is
-    // invalid for the slab allocator.
-    try {
-        // Create allocator based on the configured type
-        switch (segment_manager_->memory_allocator_) {
-            case BufferAllocatorType::CACHELIB:
-                allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
-                break;
-            case BufferAllocatorType::OFFSET:
-                allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
-                break;
-            default:
-                LOG(ERROR) << "segment_name=" << segment.name
-                           << ", error=unknown_memory_allocator="
-                           << static_cast<int>(
-                                  segment_manager_->memory_allocator_);
-                return ErrorCode::INVALID_PARAMS;
-        }
-
-        if (!allocator) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=failed_to_create_allocator";
-            return ErrorCode::INVALID_PARAMS;
-        }
-    } catch (...) {
-        LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=exception_during_allocator_creation";
-        return ErrorCode::INVALID_PARAMS;
+    auto created =
+        CreateBufferAllocator(segment_manager_->memory_allocator_, segment.name,
+                              buffer, size, segment.te_endpoint);
+    if (!created) {
+        return created.error();
     }
+    auto allocator = std::move(*created);
 
+    allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
@@ -314,6 +344,10 @@ bool ScopedSegmentAccess::ReplaceAllocators(
         return false;
     }
     for (const auto& replacement : replacements) {
+        if (replacement.expected != replacement.replacement) {
+            replacement.replacement->AttachUsageTracker(
+                segment_manager_->usage_tracker_);
+        }
         segment_manager_->mounted_segments_.at(replacement.segment_id)
             .buf_allocator = replacement.replacement;
     }
@@ -358,7 +392,9 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     }
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
 
-    // 2. Remove from mounted_segment
+    // 2. Remove from mounted_segment. Do not detach usage here: in-flight
+    // deallocate calls hold a local shared_ptr and must finish first. The
+    // allocator destructor RAII-detaches when the last shared_ptr is dropped.
     mounted_segment.buf_allocator.reset();
 
     // Set the segment status to UNMOUNTING
@@ -997,6 +1033,7 @@ SegmentSerializer::Deserialize(const std::vector<uint8_t>& data) {
         }
     }
 
+    segment_manager_->AttachMountedUsageTrackers();
     return std::move(*local_ssd_state);
 }
 
@@ -1160,38 +1197,15 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         }
     }
 
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    try {
-        switch (nof_segment_manager_->memory_allocator_) {
-            case BufferAllocatorType::CACHELIB:
-                allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint,
-                    ReplicaType::NOF_SSD);
-                break;
-            case BufferAllocatorType::OFFSET:
-                allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint,
-                    ReplicaType::NOF_SSD);
-                break;
-            default:
-                LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
-                           << ", error=unknown_memory_allocator="
-                           << static_cast<int>(
-                                  nof_segment_manager_->memory_allocator_);
-                return ErrorCode::INVALID_PARAMS;
-        }
-
-        if (!allocator) {
-            LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
-                       << ", error=failed_to_create_allocator";
-            return ErrorCode::INVALID_PARAMS;
-        }
-    } catch (...) {
-        LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
-                   << ", error=exception_during_allocator_creation";
-        return ErrorCode::INVALID_PARAMS;
+    auto created = CreateBufferAllocator(
+        nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
+        segment.te_endpoint, ReplicaType::NOF_SSD);
+    if (!created) {
+        return created.error();
     }
+    auto allocator = std::move(*created);
 
+    allocator->AttachUsageTracker(nof_segment_manager_->usage_tracker_);
     nof_segment_manager_->allocator_manager_.addAllocator(segment.name,
                                                           allocator);
     nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
@@ -1375,6 +1389,18 @@ void NoFSegmentManager::GetMountedSegmentsSnapshot(
     }
 }
 
+StorageUsageSnapshot NoFSegmentManager::GetUsageSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    StorageUsageSnapshot snapshot;
+    std::unordered_set<const BufferAllocatorBase*> counted_allocators;
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        AddAllocatorUsage(snapshot, mounted_segment.buf_allocator,
+                          counted_allocators);
+    }
+    return snapshot;
+}
+
 void SegmentManager::releaseCapacityMetrics() {
     // Segments that are still mounted here never went through
     // CommitUnmountSegment, so their contribution to the capacity metrics
@@ -1394,8 +1420,8 @@ void SegmentManager::releaseCapacityMetrics() {
     }
 }
 
-void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
-                                            const size_t cxl_size) {
+ErrorCode SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
+                                                 size_t cxl_size) {
     LOG(INFO) << "Init CXL global allocator.";
     LOG(INFO) << "[CXL] create allocator with "
               << "path=" << cxl_path << " base=0x" << std::hex
@@ -1403,9 +1429,20 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
               << std::fixed << std::setprecision(2)
               << cxl_size / (1024.0 * 1024 * 1024) << " GB)";
 
-    cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
-        cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    auto created =
+        CreateBufferAllocator(BufferAllocatorType::CACHELIB, cxl_path,
+                              DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    if (!created) {
+        return created.error();
+    }
+    auto allocator = std::move(*created);
+    allocator->AttachUsageTracker(usage_tracker_);
+    {
+        std::unique_lock<std::shared_mutex> lock(segment_mutex_);
+        cxl_global_allocator_ = std::move(allocator);
+    }
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
+    return ErrorCode::OK;
 }
 
 bool SegmentManager::HasSegmentByEndpoint(const std::string& endpoint) const {

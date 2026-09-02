@@ -516,7 +516,7 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
                FLAGS_protocol == "musa" || FLAGS_protocol == "hip" ||
                FLAGS_protocol == "nvlink_intra" ||
                FLAGS_protocol == "ubshmem" ||
-               FLAGS_protocol == "sunrise_link") {
+               FLAGS_protocol == "sunrise_link" || FLAGS_protocol == "flagcx") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;

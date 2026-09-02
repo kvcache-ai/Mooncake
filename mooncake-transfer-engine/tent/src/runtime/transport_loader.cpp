@@ -15,6 +15,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/shm/shm_transport.h"
 #include "tent/transport/tcp/tcp_transport.h"
+#include "tent/transport/hp_tcp/hp_tcp_transport.h"
 
 #ifdef USE_RDMA
 #include "tent/transport/rdma/rdma_transport.h"
@@ -55,6 +56,10 @@ namespace tent {
 Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
+
+    if (hp_tcp_transport_config_.enabled)
+        transport_list_[HP_TCP] = std::make_shared<HighPerformanceTcpTransport>(
+            hp_tcp_transport_config_.params);
 
     // SHM is opt-in: default false because the current path is not NUMA-aware
     // (see tent/config/transfer-engine.json for an example that enables it).

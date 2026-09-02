@@ -25,6 +25,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
@@ -54,6 +55,7 @@ constexpr uint8_t kRedisDefaultDbIndex = 0;
 // pass or two and a healthy-but-inflight batch reports PENDING (which resets
 // the counter), so only a permanently failing poll or queue retire gets here.
 constexpr size_t kMaxReclaimAttempts = 4096;
+constexpr int kMaxHpTcpMetadataRefreshRetries = 1;
 }  // namespace
 
 struct Batch {
@@ -335,6 +337,7 @@ Status TransferEngineImpl::setupLocalSegment() {
 }
 
 Status TransferEngineImpl::construct() {
+    CHECK_STATUS(ParseHpTcpTransportConfig(*conf_, &hp_tcp_transport_config_));
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
 
@@ -342,8 +345,18 @@ Status TransferEngineImpl::construct() {
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
+    // TCP SendData/RecvData copies are offloaded, but the RPC io_context still
+    // reads the full attachment. One thread serializes concurrent bulk TCP.
+    // Leave RDMA-only at 1; when TCP is on and the user did not set
+    // rpc_server_threads, use several so attachments can be read in parallel.
     size_t rpc_server_threads = 1;
-    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, 1, rpc_server_threads));
+    const size_t rpc_threads_default =
+        conf_->get("transports/tcp/enable", false)
+            ? std::min<size_t>(
+                  8, std::max<size_t>(4, std::thread::hardware_concurrency()))
+            : 1;
+    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, rpc_threads_default,
+                                               rpc_server_threads));
     merge_requests_ = conf_->get("merge_requests", true);
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     enable_auto_failover_on_poll_ =
@@ -415,11 +428,30 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(loadTransports());
 
     std::string transport_string;
-    for (auto& transport : transport_list_) {
+    for (size_t transport_index = 0; transport_index < transport_list_.size();
+         ++transport_index) {
+        auto& transport = transport_list_[transport_index];
         if (transport) {
             auto status = transport->install(local_segment_name_, metadata_,
                                              topology_, conf_);
             if (!status.ok()) {
+                if (hp_tcp_transport_config_.enabled &&
+                    transport_index ==
+                        static_cast<size_t>(TransportType::HP_TCP)) {
+                    // HP TCP is explicitly required, so a failed install is a
+                    // construction failure rather than an optional-transport
+                    // skip. Unwind the already-started control service and
+                    // any preceding transports immediately; the destructor's
+                    // later deconstruct() call is intentionally idempotent.
+                    const Status cleanup = deconstruct();
+                    if (!cleanup.ok()) {
+                        LOG(ERROR)
+                            << "Failed to unwind TENT after required HP TCP "
+                               "install failure: "
+                            << cleanup.ToString();
+                    }
+                    return status;
+                }
                 LOG(WARNING) << "Transport " << transport->getName()
                              << " skipped: " << status.ToString();
                 transport = nullptr;
@@ -514,6 +546,16 @@ Status TransferEngineImpl::deconstruct() {
         progress_worker_->stop();
     }
 
+    for (auto& transport : transport_list_) {
+        if (!transport) continue;
+        const Status status = transport->quiesce();
+        if (!status.ok()) {
+            LOG(ERROR) << "Transport " << transport->getName()
+                       << " quiesce failed during teardown: "
+                       << status.ToString();
+        }
+    }
+
     // Destroy staging_proxy_ first: its destructor calls back into
     // unregisterLocalMemory/freeLocalMemory, which require
     // local_segment_tracker_ and metadata_ to be alive.
@@ -553,15 +595,55 @@ Status TransferEngineImpl::deconstruct() {
             }
             Slab<Batch>::Get().deallocate(batch);
         };
-        for (auto& batch : batch_set_.active) release_batch(batch);
-        for (auto& batch : batch_set_.freelist) release_batch(batch);
-        batch_set_.active.clear();
-        batch_set_.freelist.clear();
-        alive_batches_.clear();
+        // Registry state is sharded; collect members under each shard.
+        // Shutdown is quiesced (progress_mutex_ held, no pollers expected),
+        // so a brief per-shard lock per batch is sufficient.
+        for (auto& shard : batch_shards_) {
+            std::lock_guard<std::recursive_mutex> shard_lk(shard.mtx);
+            for (auto* batch : shard.active_batches) release_batch(batch);
+            shard.active_batches.clear();
+            shard.alive_batches.clear();
+        }
+        for (auto* batch : batch_freelist_) release_batch(batch);
+        batch_freelist_.clear();
     }
 
     // Now safe to destroy transports (workers join here)
     for (auto& transport : transport_list_) transport.reset();
+
+    // Staging resources adopted from a timed-out ProxyManager drain may only
+    // be touched now that the workers above have joined and their completion
+    // queues are drained. Reclaiming them cleanly is not possible here:
+    // freeSubBatch() is a virtual on the transports just destroyed, and
+    // freeLocalMemory()/unregisterLocalMemory() route through raw Transport
+    // pointers captured in allocated_memory_. Following the
+    // resource_abandoned_ precedent in mooncake-pg, leak them on purpose
+    // until process exit instead of risking a use-after-free. The abandoned
+    // holder is kept reachable from a static registry (and the Batch shells
+    // stay inside the Slab arenas) so LeakSanitizer stays quiet.
+    {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        if (!deferred_stage_teardown_.empty()) {
+            LOG(WARNING) << "Abandoning "
+                         << deferred_stage_teardown_.batches.size()
+                         << " undrained staging batches and "
+                         << deferred_stage_teardown_.stage_buffers.size()
+                         << " local stage buffer arenas until process exit";
+            for (auto& entry : deferred_stage_teardown_.stage_buffers) {
+                // The bitmap is plain host memory only the (already joined)
+                // staging workers touched; the chunks are what the transport
+                // slices pointed at, so only they must be kept.
+                delete[] entry.bitmap;
+                entry.bitmap = nullptr;
+            }
+            static std::mutex abandoned_mu;
+            static auto* abandoned = new std::vector<DeferredStageTeardown>();
+            std::lock_guard<std::mutex> alk(abandoned_mu);
+            abandoned->push_back(std::move(deferred_stage_teardown_));
+            deferred_stage_teardown_ = DeferredStageTeardown();
+        }
+    }
+
     progress_worker_.reset();
     local_segment_tracker_.reset();
     if (metadata_) {
@@ -659,15 +741,19 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = SHM;
         else if (transport_list_[RDMA])
             options.type = RDMA;
-        else
+        else if (transport_list_[TCP])
             options.type = TCP;
+        else
+            options.type = HP_TCP;
     } else {
         if (transport_list_[MNNVL])
             options.type = MNNVL;
         else if (transport_list_[RDMA])
             options.type = RDMA;
-        else
+        else if (transport_list_[TCP])
             options.type = TCP;
+        else
+            options.type = HP_TCP;
     }
     return allocateLocalMemory(addr, size, options);
 }
@@ -679,6 +765,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = RDMA;
         else if (transport_list_[TCP])
             options.type = TCP;
+        else if (transport_list_[HP_TCP])
+            options.type = HP_TCP;
         else
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
@@ -703,12 +791,22 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
          ++it) {
         if (it->addr == addr) {
             auto status = it->transport->freeLocalMemory(addr, it->size);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Failed to free local memory, addr=" << addr
+                    << ", size=" << it->size << ": " << status.ToString();
+                return status;
+            }
             allocated_memory_.erase(it);
-            return status;
+            return Status::OK();
         }
     }
     return Status::InvalidArgument("Address region not registered" LOC_MARK);
 }
+
+// Forward declaration: getTypeEnum() is defined below but is needed by the
+// registerLocalMemory location-override validation.
+static MemoryType getTypeEnum(const std::string& type);
 
 Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
                                                Permission permission) {
@@ -742,6 +840,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
+    if (transport_list_[HP_TCP]) result.push_back(HP_TCP);
     if (transport_list_[GDS]) result.push_back(GDS);
     if (transport_list_[MPCOMM]) result.push_back(MPCOMM);
     if (transport_list_[TPU]) result.push_back(TPU);
@@ -790,17 +889,61 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             desc.regions = coalesceRegions(entries);
         }
         desc.ref_count = 1;
-        if (options.location != kWildcardLocation)
-            desc.location = options.location;
+        // The probe is the source of truth for transport selection: it
+        // classifies the memory (cpu/cuda/...). A caller-supplied location
+        // may refine the probe within the SAME memory type (e.g. probe
+        // "cpu:0" -> caller "cpu:1"), but must not replace it with an
+        // incompatible or unknown type. Classic TE encodes NUMA-segmented
+        // host DRAM as "segments:4096:0,1"; that is a TE dialect TENT's
+        // type system does not understand, and blindly adopting it would
+        // make getTypeEnum() return MTYPE_UNKNOWN and break transport
+        // selection. Validate before overriding: keep the probe when the
+        // caller is a wildcard, unknown, or a different type.
+        if (options.location != kWildcardLocation &&
+            !options.location.empty()) {
+            auto probed_type =
+                getTypeEnum(LocationParser(desc.location).type());
+            auto caller_type =
+                getTypeEnum(LocationParser(options.location).type());
+            if (caller_type == MTYPE_UNKNOWN) {
+                LOG(WARNING)
+                    << "Ignoring unknown caller location '" << options.location
+                    << "' for registered memory at " << addr_list[i]
+                    << " (probed '" << desc.location
+                    << "'); keeping probed location";
+            } else if (caller_type != probed_type) {
+                LOG(WARNING) << "Ignoring caller location '" << options.location
+                             << "' (type mismatch with probed '"
+                             << desc.location << "') for registered memory at "
+                             << addr_list[i] << "; keeping probed location";
+            } else {
+                desc.location = options.location;
+            }
+        }
         if (options.internal) desc.internal = options.internal;
         desc_list.push_back(std::move(desc));
     }
 
     auto status = local_segment_tracker_->addInBatch(
         desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
+            const bool hp_tcp_required =
+                options.type == HP_TCP ||
+                (options.type == UNSPEC && transports.size() == 1 &&
+                 transports.front() == HP_TCP);
             for (auto type : transports) {
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
-                if (!s.ok()) LOG(WARNING) << s.ToString();
+                if (!s.ok()) {
+                    if (type == HP_TCP && hp_tcp_required) return s;
+                    LOG(WARNING) << s.ToString();
+                }
+            }
+            // desc.transports lists the transports that actually registered
+            // the buffer (each transport appends itself on success).
+            for (auto& desc : descs) {
+                for (auto type : desc.transports) {
+                    TentMetrics::instance().recordRegisteredBufferBytes(
+                        type, static_cast<int64_t>(desc.length));
+                }
             }
             return Status::OK();
         });
@@ -817,9 +960,23 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
     auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             removed = true;
-            for (auto type : desc.transports) {
-                auto status = transport_list_[type]->removeMemoryBuffer(desc);
+            const auto registered_transports = desc.transports;
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                auto& transport = transport_list_[type];
+                if (!transport) continue;
+                const auto transport_type = static_cast<TransportType>(type);
+                const bool advertised =
+                    std::find(registered_transports.begin(),
+                              registered_transports.end(),
+                              transport_type) != registered_transports.end();
+                if (!advertised && !transport->tracksLocalBuffer(desc))
+                    continue;
+                auto status = transport->removeMemoryBuffer(desc);
                 if (!status.ok()) LOG(WARNING) << status.ToString();
+            }
+            for (auto type : registered_transports) {
+                TentMetrics::instance().recordRegisteredBufferBytes(
+                    type, -static_cast<int64_t>(desc.length));
             }
             return Status::OK();
         });
@@ -841,9 +998,25 @@ Status TransferEngineImpl::unregisterLocalMemory(
             (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
             [&](BufferDesc& desc) -> Status {
                 removed = true;
-                for (auto type : desc.transports) {
-                    auto s = transport_list_[type]->removeMemoryBuffer(desc);
+                const auto registered_transports = desc.transports;
+                for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                    auto& transport = transport_list_[type];
+                    if (!transport) continue;
+                    const auto transport_type =
+                        static_cast<TransportType>(type);
+                    const bool advertised =
+                        std::find(registered_transports.begin(),
+                                  registered_transports.end(),
+                                  transport_type) !=
+                        registered_transports.end();
+                    if (!advertised && !transport->tracksLocalBuffer(desc))
+                        continue;
+                    auto s = transport->removeMemoryBuffer(desc);
                     if (!s.ok()) LOG(WARNING) << s.ToString();
+                }
+                for (auto type : registered_transports) {
+                    TentMetrics::instance().recordRegisteredBufferBytes(
+                        type, -static_cast<int64_t>(desc.length));
                 }
                 return Status::OK();
             });
@@ -860,31 +1033,99 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     batch->max_size = batch_size;
     batch->task_list.reserve(batch_size);
     BatchID batch_id = (BatchID)batch;
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    batch_set_.active.insert(batch);
-    alive_batches_.insert(batch_id);
+    // Registry insert under the batch's own shard; no global lock.
+    {
+        BatchShard& shard = batchShard(batch_id);
+        std::lock_guard<std::recursive_mutex> lk(shard.mtx);
+        shard.active_batches.insert(batch);
+        shard.alive_batches.insert(batch_id);
+    }
     return batch_id;
 }
 
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
-        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
-    if (runtime_queue_config_.enabled && batch->queue_token != 0) {
-        auto retire_status = retireQueueForBatch(batch);
-        if (!retire_status.ok() && !retire_status.IsInvalidEntry()) {
-            return retire_status;
+    // Fast path (queue off, no refs, tasks terminal): free under the batch
+    // shard only. tebench / sglang take this path. Shard is released before
+    // the deferred path takes progress_mutex_ (lock-order safety).
+    bool already_requested = false;
+    bool deferred = false;
+    {
+        std::lock_guard<std::recursive_mutex> shard_lk(
+            progressLockFor(batch_id));
+        if (!isBatchAlive(batch_id))
+            return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+        if (!runtime_queue_config_.enabled && batch->runtime_refs == 0 &&
+            !batch->free_requested) {
+            // Only free inline when the final poll succeeds and reports a
+            // terminal state. A poll error defers the batch instead of
+            // failing freeBatch(): the lazy sweep retries, rate-limits and
+            // eventually quarantines a permanently stuck batch.
+            TransferStatus overall_status;
+            auto status = getTransferStatus(batch_id, overall_status);
+            if (status.ok() && overall_status.s != PENDING) {
+                for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                    auto& transport = transport_list_[type];
+                    auto& sub_batch = batch->sub_batch[type];
+                    if (transport && sub_batch)
+                        transport->freeSubBatch(sub_batch);
+                }
+                {
+                    BatchShard& shard = batchShard(batch_id);
+                    std::lock_guard<std::recursive_mutex> shard_reg_lk(
+                        shard.mtx);
+                    shard.active_batches.erase(batch);
+                    shard.alive_batches.erase(batch_id);
+                }
+                Slab<Batch>::Get().deallocate(batch);
+                return Status::OK();
+            }
         }
+        already_requested = batch->free_requested;
+        batch->free_requested = true;
+        deferred = true;
     }
-    if (batch->free_requested) {
+
+    if (deferred) {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        // The shard lock was released before taking progress_mutex_ to keep
+        // the lock order one-way. In the default queue-off mode,
+        // progress_mutex_ does not protect the per-shard registry, so
+        // reacquire that shard before reading alive_batches_. Queue mode
+        // already makes progress_mutex_ the caller's lock and isBatchAlive()
+        // takes the shard for this check.
+        bool batch_alive = false;
+        if (runtime_queue_config_.enabled) {
+            batch_alive = isBatchAlive(batch_id);
+        } else {
+            std::lock_guard<std::recursive_mutex> shard_lk(
+                batchShardMutex(batch_id));
+            batch_alive = isBatchAlive(batch_id);
+        }
+        if (!batch_alive) {
+            // We marked free_requested; another thread already reaped it.
+            return Status::OK();
+        }
+        if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+            auto retire_status = retireQueueForBatch(batch);
+            if (!retire_status.ok() && !retire_status.IsInvalidEntry()) {
+                return retire_status;
+            }
+        }
+        if (!already_requested) {
+            // First free request: accepted unconditionally; the lazy sweep
+            // result is dropped (retry/quarantine happens in background).
+            batch_freelist_.push_back(batch);
+            lazyFreeBatch();
+            return Status::OK();
+        }
+        // Re-free of an already-requested batch: surface the sweep status —
+        // callers polling a stuck batch observe the reclaim error until the
+        // batch is quarantined or reclaimed.
         CHECK_STATUS(lazyFreeBatch());
         return Status::OK();
     }
-    batch->free_requested = true;
-    batch_set_.freelist.push_back(batch);
-    lazyFreeBatch();
     return Status::OK();
 }
 
@@ -899,61 +1140,81 @@ Status TransferEngineImpl::lazyFreeBatch() {
     // also logged here, rate-limited, or a permanently stuck batch would be
     // re-polled forever without a trace.
     Status first_error = Status::OK();
-    for (auto it = batch_set_.freelist.begin();
-         it != batch_set_.freelist.end();) {
+    for (auto it = batch_freelist_.begin(); it != batch_freelist_.end();) {
         auto& batch = *it;
-        if (batch->runtime_refs > 0 || batch->reclaim_abandoned) {
+        if (batch->reclaim_abandoned) {
             it++;
             continue;
         }
-        TransferStatus overall_status;
-        auto status = getTransferStatus((BatchID)batch, overall_status);
-        if (status.ok() && overall_status.s == PENDING) {
-            batch->reclaim_failures = 0;
-            it++;
-            continue;
-        }
-        if (status.ok() && runtime_queue_config_.enabled &&
-            batch->queue_token != 0) {
-            status = retireQueueForBatch(batch);
-        }
-        if (!status.ok()) {
-            if (++batch->reclaim_failures >= kMaxReclaimAttempts) {
-                batch->reclaim_abandoned = true;
-                TENT_RECORD_BATCH_QUARANTINED();
-                LOG(ERROR) << "lazyFreeBatch: batch " << batch << " failed "
-                           << batch->reclaim_failures
-                           << " consecutive reclaim attempts; giving up until "
-                              "engine teardown reclaims it unconditionally. "
-                              "Last error: "
-                           << status.ToString();
-            } else {
-                LOG_EVERY_N(WARNING, 100)
-                    << "lazyFreeBatch: batch " << batch
-                    << " cannot be reclaimed yet, left in freelist: "
-                    << status.ToString();
+        BatchID batch_id = (BatchID)batch;
+        // Hold the shard through deallocate so a poller waiting on the
+        // same shard cannot observe a dangling Batch*. runtime_refs is
+        // read under the shard because retain/release mutate it there.
+        {
+            std::lock_guard<std::recursive_mutex> shard_lk(
+                progressLockFor(batch_id));
+            if (!isBatchAlive(batch_id)) {
+                // Another thread already reaped this batch.
+                it = batch_freelist_.erase(it);
+                continue;
             }
-            if (first_error.ok()) first_error = status;
-            it++;
-            continue;
+            if (batch->runtime_refs > 0) {
+                it++;
+                continue;
+            }
+            TransferStatus overall_status;
+            auto status = getTransferStatus(batch_id, overall_status);
+            if (status.ok() && overall_status.s == PENDING) {
+                batch->reclaim_failures = 0;
+                it++;
+                continue;
+            }
+            if (status.ok() && runtime_queue_config_.enabled &&
+                batch->queue_token != 0) {
+                status = retireQueueForBatch(batch);
+            }
+            if (!status.ok()) {
+                if (++batch->reclaim_failures >= kMaxReclaimAttempts) {
+                    batch->reclaim_abandoned = true;
+                    TENT_RECORD_BATCH_QUARANTINED();
+                    LOG(ERROR) << "lazyFreeBatch: batch " << batch << " failed "
+                               << batch->reclaim_failures
+                               << " consecutive reclaim attempts; giving up "
+                                  "until engine teardown reclaims it "
+                                  "unconditionally. Last error: "
+                               << status.ToString();
+                } else {
+                    LOG_EVERY_N(WARNING, 100)
+                        << "lazyFreeBatch: batch " << batch
+                        << " cannot be reclaimed yet, left in freelist: "
+                        << status.ToString();
+                }
+                if (first_error.ok()) first_error = status;
+                it++;
+                continue;
+            }
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                auto& transport = transport_list_[type];
+                auto& sub_batch = batch->sub_batch[type];
+                if (transport && sub_batch) transport->freeSubBatch(sub_batch);
+            }
+            {
+                BatchShard& shard = batchShard(batch_id);
+                std::lock_guard<std::recursive_mutex> shard_reg_lk(shard.mtx);
+                shard.active_batches.erase(batch);
+                shard.alive_batches.erase(batch_id);
+            }
+            Slab<Batch>::Get().deallocate(batch);
         }
-        for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-            auto& transport = transport_list_[type];
-            auto& sub_batch = batch->sub_batch[type];
-            if (transport && sub_batch) transport->freeSubBatch(sub_batch);
-        }
-        batch_set_.active.erase(batch);
-        alive_batches_.erase((BatchID)batch);
-        Slab<Batch>::Get().deallocate(batch);
-        it = batch_set_.freelist.erase(it);
+        it = batch_freelist_.erase(it);
     }
     return first_error;
 }
 
 Status TransferEngineImpl::retainBatch(BatchID batch_id, Batch*& batch) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id)) {
+    std::lock_guard<std::recursive_mutex> shard_lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id)) {
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     }
     batch = (Batch*)batch_id;
@@ -966,15 +1227,49 @@ Status TransferEngineImpl::retainBatch(BatchID batch_id, Batch*& batch) {
 
 Status TransferEngineImpl::releaseBatch(Batch* batch) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (batch->runtime_refs == 0) {
-        return Status::InternalError("Batch runtime ref underflow" LOC_MARK);
+    // Refcount under the batch lock; deferred free runs on the global path
+    // after that lock is released (lock-order safety).
+    bool deferred_free = false;
+    {
+        std::lock_guard<std::recursive_mutex> shard_lk(
+            progressLockFor((BatchID)batch));
+        if (batch->runtime_refs == 0) {
+            return Status::InternalError(
+                "Batch runtime ref underflow" LOC_MARK);
+        }
+        --batch->runtime_refs;
+        deferred_free = (batch->runtime_refs == 0 && batch->free_requested);
     }
-    --batch->runtime_refs;
-    if (batch->runtime_refs == 0 && batch->free_requested) {
+    if (deferred_free) {
         CHECK_STATUS(lazyFreeBatch());
     }
     return Status::OK();
+}
+
+void TransferEngineImpl::adoptDeferredStageTeardown(
+    DeferredStageTeardown&& deferred) {
+    if (deferred.empty()) return;
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    for (auto batch_id : deferred.batches) {
+        Batch* batch = (Batch*)batch_id;
+        // Detach from the normal lifecycle: an undrained batch sits in its
+        // shard's active_batches / alive_batches and possibly
+        // batch_freelist_ (free_requested, still referenced), so the sweep
+        // in deconstruct() would hand its SubBatch/Slice objects back to
+        // the Slab while a transport worker can still write their status.
+        BatchShard& shard = batchShard(batch_id);
+        std::lock_guard<std::recursive_mutex> shard_lk(shard.mtx);
+        shard.active_batches.erase(batch);
+        shard.alive_batches.erase(batch_id);
+        auto it =
+            std::find(batch_freelist_.begin(), batch_freelist_.end(), batch);
+        if (it != batch_freelist_.end()) batch_freelist_.erase(it);
+        deferred_stage_teardown_.batches.push_back(batch_id);
+    }
+    deferred_stage_teardown_.stage_buffers.insert(
+        deferred_stage_teardown_.stage_buffers.end(),
+        std::make_move_iterator(deferred.stage_buffers.begin()),
+        std::make_move_iterator(deferred.stage_buffers.end()));
 }
 
 class TransferEngineImpl::BatchRef {
@@ -1041,7 +1336,7 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (type == "cpu" || type == "*") return MTYPE_CPU;
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
-    if (type == "rocm") return MTYPE_ROCM;
+    if (isAmdGpuLocationType(type)) return MTYPE_ROCM;
     if (type == "tpu") return MTYPE_TPU;
     return MTYPE_UNKNOWN;
 }
@@ -1275,6 +1570,14 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         if (last.req.transport_hint != curr.req.transport_hint) {
             return false;
         }
+        // These fields affect transport selection. Merging
+        // requests with different values would silently apply the first
+        // request's policy to the whole combined transfer.
+        if (last.req.priority != curr.req.priority ||
+            last.req.policy_name != curr.req.policy_name ||
+            last.req.intent_type != curr.req.intent_type) {
+            return false;
+        }
         if (!last.boundary.source_key || !curr.boundary.source_key ||
             !last.boundary.target_key || !curr.boundary.target_key) {
             return false;
@@ -1459,7 +1762,8 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
     // An empty stage location means "no staging needed on that side".
     if (transport_list_[TPU] &&
-        (transport_list_[RDMA] || transport_list_[TCP])) {
+        (transport_list_[RDMA] || transport_list_[TCP] ||
+         transport_list_[HP_TCP])) {
         if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
             policy.clear();
             policy.push_back(server_addr);
@@ -1514,7 +1818,7 @@ Status TransferEngineImpl::prepareSubmit(
         PreparedSubmit::Owner owner;
         owner.request = request;
         owner.route = resolveTransport(owner.request, 0);
-        if (owner.route.transport == TCP) {
+        if (owner.route.transport == TCP || owner.route.transport == HP_TCP) {
             findStagingPolicy(owner.request, owner.staging_params);
             owner.staging = !owner.staging_params.empty() && staging_proxy_;
         }
@@ -1558,14 +1862,15 @@ Status TransferEngineImpl::commitPreparedSubmit(
             "batch public task capacity exceeded" LOC_MARK);
     }
 
-    std::vector<Request> classified_request_list[kSupportedTransportTypes];
-    std::vector<size_t> task_id_list[kSupportedTransportTypes];
+    std::vector<size_t> physical_task_id_list[kSupportedTransportTypes];
     std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
     batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
                             TaskInfo{});
 
-    std::unordered_map<TransportType, size_t> next_sub_task_id;
+    std::unordered_map<size_t, size_t> owner_task_id_by_merged_task;
+    std::unordered_map<size_t, std::vector<size_t>>
+        public_tasks_by_physical_owner;
     for (const auto& task_plan : prepared.tasks) {
         size_t task_id = task_plan.task_id;
         size_t merged_task_id = task_plan.merged_task_index;
@@ -1575,7 +1880,14 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
-            if (task.type != UNSPEC) task_id_list[task.type].push_back(task_id);
+            if (task.type != UNSPEC) {
+                auto owner_it =
+                    owner_task_id_by_merged_task.find(merged_task_id);
+                if (owner_it != owner_task_id_by_merged_task.end()) {
+                    public_tasks_by_physical_owner[owner_it->second].push_back(
+                        task_id);
+                }
+            }
             continue;
         }
 
@@ -1628,47 +1940,114 @@ Status TransferEngineImpl::commitPreparedSubmit(
             attachProgressNotifier(batch, batch->sub_batch[task.type]);
         }
 
-        if (!next_sub_task_id.count(task.type))
-            next_sub_task_id[task.type] = batch->sub_batch[task.type]->size();
-        size_t sub_task_id = next_sub_task_id[task.type];
-        next_sub_task_id[task.type]++;
-
-        classified_request_list[task.type].push_back(merged_request);
-        task.sub_task_id = sub_task_id;
+        task.sub_task_id = -1;
         task.derived = false;
-        task_id_list[task.type].push_back(task_id);
+        physical_task_id_list[task.type].push_back(task_id);
+        owner_task_id_by_merged_task[merged_task_id] = task_id;
+        public_tasks_by_physical_owner[task_id].push_back(task_id);
         merged_task_id_map[merged_task_id] = task;
     }
 
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-        if (classified_request_list[type].empty()) continue;
+        if (physical_task_id_list[type].empty()) continue;
         auto& transport = transport_list_[type];
         auto& sub_batch = batch->sub_batch[type];
 
-        // Set device_mask on SubBatch for RDMA transport
-        if (type == RDMA && !task_id_list[type].empty()) {
-            // Use the device_mask from the first task (we assume all tasks in
-            // this batch should have the same policy)
-            sub_batch->device_mask =
-                batch->task_list[task_id_list[type][0]].device_mask;
-            sub_batch->qp_pool =
-                batch->task_list[task_id_list[type][0]].qp_pool;
+        // SubBatch carries one policy per submit call. Requests using the
+        // same transport may still resolve to different device masks or QP
+        // pools, so RDMA owners must be submitted in homogeneous groups.
+        // RdmaTransport copies these scalar fields into each RdmaTask before
+        // returning, so groups can safely share one SubBatch.
+        std::vector<std::vector<size_t>> submit_groups;
+        if (type == RDMA) {
+            std::map<std::pair<uint64_t, std::string>, size_t> group_by_policy;
+            for (const auto task_id : physical_task_id_list[type]) {
+                const auto& task = batch->task_list[task_id];
+                auto key = std::make_pair(task.device_mask, task.qp_pool);
+                auto [it, inserted] = group_by_policy.emplace(
+                    std::move(key), submit_groups.size());
+                if (inserted) submit_groups.emplace_back();
+                submit_groups[it->second].push_back(task_id);
+            }
+        } else {
+            submit_groups.push_back(physical_task_id_list[type]);
         }
 
-        auto attempt_start = std::chrono::steady_clock::now();
-        for (auto& task_id : task_id_list[type]) {
-            startTransportAttempt(batch->task_list[task_id],
-                                  static_cast<TransportType>(type),
-                                  attempt_start);
-        }
-        auto status = transport->submitTransferTasks(
-            sub_batch, classified_request_list[type]);
-        if (!status.ok()) {
-            auto attempt_end = std::chrono::steady_clock::now();
-            for (auto& task_id : task_id_list[type]) {
-                finishTransportAttempt(batch->task_list[task_id], FAILED,
-                                       attempt_end);
-                batch->task_list[task_id].type = UNSPEC;
+        for (const auto& group : submit_groups) {
+            if (group.empty()) continue;
+
+            // A synchronous failure is allowed to return without appending
+            // anything to the SubBatch. Resolve IDs from the actual current
+            // size for each group so a failed earlier group cannot leave a gap
+            // in the IDs assigned to a later successful group. Propagate the
+            // physical ID to every merged public alias before submission so
+            // synchronous failure handling still sees a consistent mapping.
+            int next_sub_task_id = static_cast<int>(sub_batch->size());
+            for (const auto physical_task_id : group) {
+                for (const auto public_task_id :
+                     public_tasks_by_physical_owner.at(physical_task_id)) {
+                    batch->task_list[public_task_id].sub_task_id =
+                        next_sub_task_id;
+                }
+                ++next_sub_task_id;
+            }
+
+            if (type == RDMA) {
+                const auto& first_task = batch->task_list[group.front()];
+                sub_batch->device_mask = first_task.device_mask;
+                sub_batch->qp_pool = first_task.qp_pool;
+            }
+
+            std::vector<Request> requests;
+            requests.reserve(group.size());
+            for (const auto task_id : group)
+                requests.push_back(batch->task_list[task_id].request);
+
+            auto attempt_start = std::chrono::steady_clock::now();
+            for (const auto task_id : group) {
+                startTransportAttempt(batch->task_list[task_id],
+                                      static_cast<TransportType>(type),
+                                      attempt_start);
+            }
+            auto status = transport->submitTransferTasks(sub_batch, requests);
+            if (!status.ok()) {
+                auto attempt_end = std::chrono::steady_clock::now();
+                // failure_stage must be marked in this first segment, before
+                // any recovery/failover attempt on the failure: a task that
+                // recovers and later fails at poll must still attribute its
+                // root cause to submit.
+                for (const auto physical_task_id : group) {
+                    for (const auto public_task_id :
+                         public_tasks_by_physical_owner.at(physical_task_id)) {
+                        auto& task = batch->task_list[public_task_id];
+                        if (task.failure_stage < 0) task.failure_stage = 0;
+                        finishTransportAttempt(task, FAILED, attempt_end);
+                    }
+                }
+                // Recover by failing over to the remaining candidate
+                // transports instead of terminal-failing the tasks. Only
+                // physical (owner) tasks carry a submission: resubmitting a
+                // public alias would re-post the merged transfer (see
+                // docs/source/design/tent/failover.md, hazard 1).
+                for (const auto physical_task_id : group) {
+                    attemptSubmitStageFailover(batch, physical_task_id);
+                }
+                // Public aliases mirror their owner's recovered (or
+                // terminally failed) route so per-task status queries observe
+                // the same transport and sub-batch slot as the owner.
+                for (const auto physical_task_id : group) {
+                    const auto& owner_task = batch->task_list[physical_task_id];
+                    for (const auto public_task_id :
+                         public_tasks_by_physical_owner.at(physical_task_id)) {
+                        if (public_task_id == physical_task_id) continue;
+                        auto& task = batch->task_list[public_task_id];
+                        task.type = owner_task.type;
+                        task.sub_task_id = owner_task.sub_task_id;
+                        task.status = owner_task.status;
+                        task.failover_count = owner_task.failover_count;
+                        task.xport_priority = owner_task.xport_priority;
+                    }
+                }
             }
         }
     }
@@ -1824,12 +2203,12 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto route = resolveTransport(task.request, 0);
     task.type = route.transport;
     task.device_mask = route.device_mask;
-    if (route.qp_pool) task.qp_pool = *route.qp_pool;
+    task.qp_pool = route.qp_pool.value_or("");
     if (task.type == UNSPEC) {
         return finishQueuedOwner(owner_id, FAILED);
     }
 
-    if (task.type == TCP) {
+    if (task.type == TCP || task.type == HP_TCP) {
         std::vector<std::string> staging_params;
         findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {
@@ -1865,16 +2244,23 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        if (task.failure_stage < 0) task.failure_stage = 0;
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
-        task.type = UNSPEC;
+        // Submit-stage failover: walk the remaining candidate transports
+        // before giving up (the queued path dispatches one owner task at a
+        // time, so there are no derived aliases to mirror here).
+        if (attemptSubmitStageFailover(batch, queued.owner_task_id)) {
+            return markQueuedOwnerSubmitted(owner_id);
+        }
         return finishQueuedOwner(owner_id, FAILED);
     }
     return markQueuedOwnerSubmitted(owner_id);
 }
 
 Status TransferEngineImpl::refillDispatchWindow() {
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    // Queue is off by default; skip the global lock on the poll hot path.
     if (!runtime_queue_config_.enabled) return Status::OK();
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     if (dispatch_inflight_owners_ >=
             runtime_queue_config_.max_dispatch_owners ||
         dispatch_inflight_bytes_ >= runtime_queue_config_.max_dispatch_bytes) {
@@ -1912,7 +2298,7 @@ Status TransferEngineImpl::progressRuntimeQueue() {
         auto& queued = queued_it->second;
         if (!queued.in_dispatch_window) continue;
         auto* batch = queued.batch;
-        if (!batch || !alive_batches_.count((BatchID)batch)) continue;
+        if (!batch || !isBatchAlive((BatchID)batch)) continue;
         if (queued.owner_task_id >= batch->task_list.size()) {
             return Status::InternalError(
                 "queued owner task id out of range" LOC_MARK);
@@ -2048,8 +2434,8 @@ Status TransferEngineImpl::submitTransfer(
 
 Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id)) {
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id)) {
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     }
     auto* batch = reinterpret_cast<Batch*>(batch_id);
@@ -2152,14 +2538,51 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         attachProgressNotifier(batch, batch->sub_batch[type]);
     }
     auto& sub_batch = batch->sub_batch[type];
+    task.device_mask = result.device_mask;
+    task.qp_pool = result.qp_pool.value_or("");
+    if (type == RDMA) {
+        sub_batch->device_mask = task.device_mask;
+        sub_batch->qp_pool = task.qp_pool;
+    }
     task.sub_task_id = sub_batch->size();
     task.type = type;
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        if (task.failure_stage < 0) task.failure_stage = 0;
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
     }
     return status;
+}
+
+bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
+                                                    size_t task_id) {
+    auto& task = batch->task_list[task_id];
+    // Mark terminal first so a concurrent poll cannot observe a task that is
+    // half-migrated to its fallback transport (mirrors the poll-time
+    // failover in updateTaskStatusAfterPoll, which sets task.status = FAILED
+    // before calling resubmitTransferTask).
+    task.status = FAILED;
+    for (int attempt = 0; attempt < max_failover_attempts_; ++attempt) {
+        if (resubmitTransferTask(batch, task_id).ok()) {
+            task.status = PENDING;
+            return true;
+        }
+        // resubmitTransferTask() already finished the failed attempt, logged
+        // the reason and advanced the candidate cursor; the next iteration
+        // tries the following transport until the candidates or the failover
+        // budget are exhausted.
+    }
+    // Terminally failed: record the logical outcome here. The poll paths only
+    // record tasks transitioning out of PENDING, so they would never observe
+    // this task's PENDING -> FAILED transition. Record BEFORE resetting
+    // task.type so the failure is attributed to the last attempted transport.
+    recordTaskCompletionMetrics(task, PENDING, FAILED);
+    // Reset to UNSPEC so pollTaskStatus()'s UNSPEC short-circuit applies: the
+    // last failed submit never created a sub-batch entry for this task, so
+    // there is nothing to poll on the transport.
+    task.type = UNSPEC;
+    return false;
 }
 
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
@@ -2180,8 +2603,59 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     if (!transport || !sub_batch) {
         return Status::InvalidArgument("Transport not available" LOC_MARK);
     }
-    return transport->getTransferStatus(sub_batch, task.sub_task_id,
-                                        task_status);
+    // HP TCP classifies transport errors using the terminal output. Other
+    // transports retain their existing error-output contract.
+    if (task.type == HP_TCP) task_status = {PENDING, 0};
+    Status result =
+        transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
+    if (result.ok() || task.type != HP_TCP || task_status.s != FAILED) {
+        return result;
+    }
+
+    if (result.IsNeedsRefreshCache()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+        if (task.metadata_refresh_retry_count >=
+            kMaxHpTcpMetadataRefreshRetries) {
+            task.suppress_failover = true;
+            return Status::OK();
+        }
+        ++task.metadata_refresh_retry_count;
+        Status invalidated = metadata_->segmentManager().invalidateRemote(
+            task.request.target_id);
+        if (!invalidated.ok()) {
+            task.suppress_failover = true;
+            LOG(WARNING) << "HP TCP metadata cache invalidation failed: "
+                         << invalidated.ToString();
+            return Status::OK();
+        }
+
+        const auto retry_start = std::chrono::steady_clock::now();
+        startTransportAttempt(task, HP_TCP, retry_start);
+        Status retried = transport->retryTransferTask(
+            sub_batch, task.sub_task_id, task.request);
+        if (!retried.ok()) {
+            finishTransportAttempt(task, FAILED,
+                                   std::chrono::steady_clock::now());
+            task.suppress_failover = true;
+            LOG(WARNING) << "HP TCP metadata refresh retry failed: "
+                         << retried.ToString();
+            return Status::OK();
+        }
+        task.status = PENDING;
+        task_status.s = PENDING;
+        task_status.transferred_bytes = 0;
+        return Status::OK();
+    }
+
+    // A valid remote permission/range/protocol rejection, or a WRITE whose
+    // remote outcome is unknown because its ACK was lost, is permanent for
+    // this logical request. ShuttingDown maps to TooManyRequests and remains
+    // transient, so the existing failover policy may act on it.
+    if (!result.IsTooManyRequests()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+        task.suppress_failover = true;
+    }
+    return Status::OK();
 }
 
 void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
@@ -2189,8 +2663,16 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
     task.status = task_status.s;
-    if (!allow_failover || task.cancel_requested || task_status.s != FAILED ||
-        task.type == UNSPEC)
+    // First-failure attribution: a terminal failure observed by polling marks
+    // the poll stage. Submit-stage failures were already marked at their
+    // origin and are not overwritten (a poll failure followed by a rejected
+    // failover resubmit still counts as poll).
+    if (task_status.s == FAILED || task_status.s == TIMEOUT ||
+        task_status.s == CANCELED) {
+        if (task.failure_stage < 0) task.failure_stage = 1;
+    }
+    if (!allow_failover || task.cancel_requested || task.suppress_failover ||
+        task_status.s != FAILED || task.type == UNSPEC)
         return;
 
     // The current physical transport attempt has failed even if the logical
@@ -2245,8 +2727,8 @@ Status TransferEngineImpl::receiveNotification(
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                                              TransferStatus& task_status) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     if (task_id >= batch->task_list.size())
@@ -2306,8 +2788,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
 Status TransferEngineImpl::getTransferStatus(
     BatchID batch_id, std::vector<TransferStatus>& status_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     status_list.clear();
@@ -2323,8 +2805,8 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                                           TransferStatus& overall_status,
                                           bool allow_failover) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    if (!alive_batches_.count(batch_id))
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id))
         return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     CHECK_STATUS(refillDispatchWindow());
     Batch* batch = (Batch*)(batch_id);
@@ -2335,11 +2817,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
     size_t total_tasks = 0;
     TransferStatusEnum worst_failure = PENDING;
     auto isWorse = [](TransferStatusEnum cur, TransferStatusEnum best) {
-        static const std::unordered_map<TransferStatusEnum, int> severity = {
-            {INITIAL, 0},  {PENDING, 0}, {COMPLETED, 0}, {INVALID, 1},
-            {CANCELED, 2}, {TIMEOUT, 3}, {FAILED, 4},
-        };
-        return severity.at(cur) > severity.at(best);
+        return transferStatusSeverity(cur) > transferStatusSeverity(best);
     };
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         auto& task = batch->task_list[task_id];
@@ -2567,6 +3045,35 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
 #if TENT_METRICS_ENABLED
     if (prev_status == PENDING && new_status != PENDING && !task.derived) {
         auto end_time = std::chrono::steady_clock::now();
+        // Failure reason: task.failure_stage marks where the first failure
+        // originated (0 = submit, 1 = poll), set at the failure site — a
+        // poll-observed failure stays "poll" even when the failover resubmit
+        // is synchronously rejected. TIMEOUT/CANCELED come from the status
+        // itself and were previously not recorded anywhere.
+        if (new_status == FAILED || new_status == TIMEOUT ||
+            new_status == CANCELED) {
+            TentMetrics::TaskFailureReason reason;
+            if (new_status == TIMEOUT) {
+                reason = TentMetrics::TaskFailureReason::Timeout;
+            } else if (new_status == CANCELED) {
+                reason = TentMetrics::TaskFailureReason::Canceled;
+            } else if (task.failure_stage == 0) {
+                reason = TentMetrics::TaskFailureReason::Submit;
+            } else if (task.failure_stage == 1) {
+                reason = TentMetrics::TaskFailureReason::Poll;
+            } else {
+                // Unmarked path: an attempt still in flight means the
+                // failure was observed by polling.
+                reason = task.attempt_active
+                             ? TentMetrics::TaskFailureReason::Poll
+                             : TentMetrics::TaskFailureReason::Submit;
+            }
+            // Prefer the attempt transport: task.type may already be UNSPEC
+            // after a submit-stage failure.
+            TransportType failure_tp =
+                task.attempt_type != UNSPEC ? task.attempt_type : task.type;
+            TentMetrics::instance().recordTaskFailure(failure_tp, reason);
+        }
         finishTransportAttempt(task, new_status, end_time);
         auto start_time = task.start_time;
         if (start_time.time_since_epoch().count() > 0) {
@@ -2608,10 +3115,17 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                     }
                 }
             } else if (new_status == FAILED) {
+                // A task whose type is UNSPEC (no candidate ever resolved,
+                // or a legacy submit-stage failure clobbered it) has lost its
+                // transport attribution; fall back to the last physical
+                // attempt's transport so terminal failures are not
+                // mislabeled "unspec".
+                const auto attributed_type =
+                    task.type != UNSPEC ? task.type : task.attempt_type;
                 if (task.request.opcode == Request::READ) {
-                    TentMetrics::instance().recordReadFailed(task.type);
+                    TentMetrics::instance().recordReadFailed(attributed_type);
                 } else {
-                    TentMetrics::instance().recordWriteFailed(task.type);
+                    TentMetrics::instance().recordWriteFailed(attributed_type);
                 }
             }
             // Observability only (RFC #2519): deadline feasibility. The
@@ -2661,6 +3175,7 @@ void TransferEngineImpl::startTransportAttempt(
 #if TENT_METRICS_ENABLED
     TentMetrics::instance().recordTransportAttemptStarted(type,
                                                           task.request.opcode);
+    TentMetrics::instance().recordInflightAttemptStarted(type);
 #else
     (void)type;
 #endif
@@ -2672,6 +3187,10 @@ void TransferEngineImpl::finishTransportAttempt(
     if (!task.attempt_active) return;
     task.attempt_active = false;
 #if TENT_METRICS_ENABLED
+    // Decrement before the early return below so the in-flight gauge stays
+    // symmetric with recordInflightAttemptStarted() for every attempt that
+    // actually started.
+    TentMetrics::instance().recordInflightAttemptFinished(task.attempt_type);
     auto post_time = task.attempt_post_time;
     if (post_time.time_since_epoch().count() == 0) return;
     double latency_us =

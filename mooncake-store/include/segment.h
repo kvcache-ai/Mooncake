@@ -16,6 +16,7 @@
 #include "allocator.h"
 #include "local_ssd/persisted_state.h"
 #include "rpc_types.h"
+#include "storage_usage.h"
 #include "types.h"
 
 namespace mooncake {
@@ -378,6 +379,15 @@ class SegmentSerializer {
     SegmentManager* segment_manager_;
 };
 
+struct StorageUsageSnapshot : StorageUsage {
+    std::map<std::string, StorageUsage> segments;
+};
+
+struct TieredStorageUsageSnapshot {
+    StorageUsageSnapshot memory;
+    StorageUsageSnapshot nof;
+};
+
 class SegmentManager {
    public:
     /**
@@ -420,8 +430,28 @@ class SegmentManager {
 
     SegmentView getView() const { return SegmentView(this); }
 
-    void initializeCxlAllocator(const std::string& cxl_path,
-                                const size_t cxl_size);
+    /**
+     * @brief Return current DRAM usage derived from mounted allocators.
+     *
+     * Shared allocators (for example the global CXL allocator) are counted
+     * once even when they are referenced by multiple mounted segments.
+     */
+    [[nodiscard]] StorageUsageSnapshot GetMemoryUsageSnapshot() const;
+
+    /**
+     * @brief Return aggregate DRAM usage in O(1) without segment_mutex_.
+     *
+     * Best-effort: used/capacity may tear briefly across mount/unmount,
+     * matching the previous metric-gauge watermark reads. An unmounted
+     * allocator may remain in the aggregate until in-flight allocate or
+     * deallocate calls drain and the last shared_ptr is dropped.
+     */
+    [[nodiscard]] StorageUsage GetMemoryUsage() const noexcept {
+        return usage_tracker_->GetUsage();
+    }
+
+    ErrorCode initializeCxlAllocator(const std::string& cxl_path,
+                                     size_t cxl_size);
 
     // Endpoint-based segment queries (for standby restore)
     bool HasSegmentByEndpoint(const std::string& endpoint) const;
@@ -429,6 +459,10 @@ class SegmentManager {
                              std::string& te_endpoint) const;
 
    private:
+    void AttachMountedUsageTrackers();
+
+    std::shared_ptr<StorageUsageTracker> usage_tracker_ =
+        std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType
@@ -493,6 +527,23 @@ class NoFSegmentManager {
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
 
+    /**
+     * @brief Return current NoF usage derived from mounted allocators.
+     */
+    [[nodiscard]] StorageUsageSnapshot GetUsageSnapshot() const;
+
+    /**
+     * @brief Return aggregate NoF usage in O(1) without segment_mutex_.
+     *
+     * Best-effort: used/capacity may tear briefly across mount/unmount,
+     * matching the previous metric-gauge watermark reads. An unmounted
+     * allocator may remain in the aggregate until in-flight allocate or
+     * deallocate calls drain and the last shared_ptr is dropped.
+     */
+    [[nodiscard]] StorageUsage GetUsage() const noexcept {
+        return usage_tracker_->GetUsage();
+    }
+
     tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> GetSegmentsByName(
         const std::string& segment_name) const {
         std::shared_lock<std::shared_mutex> lock(segment_mutex_);
@@ -509,6 +560,8 @@ class NoFSegmentManager {
     }
 
    private:
+    std::shared_ptr<StorageUsageTracker> usage_tracker_ =
+        std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType

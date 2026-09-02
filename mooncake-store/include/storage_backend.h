@@ -1174,7 +1174,15 @@ class BucketStorageBackend : public StorageBackendInterface {
         return lru_index_.size();
     }
 
+    // Test-only: inject datasync failure in WriteBucket to verify orphan
+    // cleanup. SetDatasyncFailureForTest(true) makes WriteBucket fail its
+    // datasync call and immediately call CleanupOrphanedBucket.
+    void SetDatasyncFailureForTest(bool enabled) {
+        test_datasync_failure_.store(enabled, std::memory_order_relaxed);
+    }
+
    private:
+    std::atomic<bool> test_datasync_failure_{false};
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 

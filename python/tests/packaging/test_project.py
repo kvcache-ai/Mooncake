@@ -80,6 +80,38 @@ def test_shared_segment_has_one_authoritative_source() -> None:
     assert "mooncake-integration/shared_segment.py" not in legacy_build_script
 
 
+def test_ep_modules_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+
+    for module in (
+        "ep.py",
+        "mooncake_ep_buffer.py",
+        "mooncake_elastic_buffer.py",
+    ):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    test_root = REPOSITORY_ROOT / "python" / "tests" / "ep"
+    for test_file in (
+        "ep_test_utils.py",
+        "test_elastic_buffer.py",
+        "test_ep_grid.py",
+        "test_mooncake_ep.py",
+        "test_regmr_overhead.py",
+    ):
+        assert (test_root / test_file).is_file()
+
+    for legacy_test in (
+        REPOSITORY_ROOT / "mooncake-ep" / "tests" / "test_elastic_buffer.py",
+        REPOSITORY_ROOT / "mooncake-ep" / "tests" / "test_ep_grid.py",
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "ep_test_utils.py",
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_mooncake_ep.py",
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_regmr_overhead.py",
+    ):
+        assert not legacy_test.exists()
+
+
 def test_pg_extension_build_stages_outside_the_source_tree(
     tmp_path: Path,
 ) -> None:

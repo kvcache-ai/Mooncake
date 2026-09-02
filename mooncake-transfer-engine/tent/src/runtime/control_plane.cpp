@@ -16,6 +16,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 
 #include <cassert>
+#include <exception>
 #include <set>
 #include <utility>
 
@@ -57,6 +58,24 @@ Status ControlClient::getSegmentDesc(const std::string& server_addr,
     return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
 }
 
+Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
+                                              BootstrapDesc& response) {
+    try {
+        response = json::parse(response_raw).get<BootstrapDesc>();
+    } catch (const std::exception& e) {
+        return Status::MalformedJson(
+            std::string("Invalid bootstrap response: ") + e.what() + LOC_MARK);
+    }
+    if (!response.reply_msg.empty()) {
+        return Status::RpcServiceError(response.reply_msg);
+    }
+    if (response.local_gid.empty()) {
+        return Status::InvalidArgument(
+            "Missing peer GID in bootstrap" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 Status ControlClient::bootstrap(const std::string& server_addr,
                                 const BootstrapDesc& request,
                                 BootstrapDesc& response) {
@@ -65,8 +84,7 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     request_raw = j.dump();
     CHECK_STATUS(tl_rpc_agent.call(server_addr, BootstrapRdma, request_raw,
                                    response_raw));
-    response = json::parse(response_raw).get<BootstrapDesc>();
-    return Status::OK();
+    return decodeBootstrapResponse(response_raw, response);
 }
 
 Status ControlClient::sendData(const std::string& server_addr,
@@ -84,8 +102,11 @@ Status ControlClient::sendData(const std::string& server_addr,
         // and the extra copy in call().
         request.append(reinterpret_cast<const char*>(local_mem_addr), length);
     } else {
+        // resize() zero-fills the payload, so an unchecked copy failure would
+        // ship zeros that the peer stores successfully and reports COMPLETED.
         request.resize(sizeof(XferDataDesc) + length);
-        loader.copy(request.data() + sizeof(desc), local_mem_addr, length);
+        CHECK_STATUS(
+            loader.copy(request.data() + sizeof(desc), local_mem_addr, length));
     }
     auto status = tl_rpc_agent.callOwned(server_addr, SendData,
                                          std::move(request), response);
@@ -105,9 +126,8 @@ Status ControlClient::recvData(const std::string& server_addr,
     if (!status.ok()) return status;
     if (response.size() != length)
         return Status::RpcServiceError(
-            "RecvData failed: target address not in registered buffer");
-    Platform::getLoader().copy(local_mem_addr, response.data(), length);
-    return Status::OK();
+            response.empty() ? "RecvData failed: empty response" : response);
+    return Platform::getLoader().copy(local_mem_addr, response.data(), length);
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {
@@ -249,16 +269,22 @@ ControlService::ControlService(const std::string& type,
         [this](const std::string_view& request, std::string& response) {
             onBootstrapRdma(request, response);
         });
+    // SendData/RecvData copy the full TCP payload. Running them inline on the
+    // io_context serializes every bulk transfer and stalls Probe/Bootstrap
+    // on the same thread. Offload matches Delegate: the connection coroutine
+    // suspends, copies run on the blocking executor, and other RPCs proceed.
     rpc_server_->registerFunction(
         SendData,
         [this](const std::string_view& request, std::string& response) {
             onSendData(request, response);
-        });
+        },
+        /*offload=*/true);
     rpc_server_->registerFunction(
         RecvData,
         [this](const std::string_view& request, std::string& response) {
             onRecvData(request, response);
-        });
+        },
+        /*offload=*/true);
     rpc_server_->registerFunction(
         Notify, [this](const std::string_view& request, std::string& response) {
             onNotify(request, response);
@@ -428,7 +454,15 @@ void ControlService::onSendData(const std::string_view& request,
     }
 
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
+        auto status =
+            Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
+        if (!status.ok()) {
+            // A non-empty response is interpreted as an RPC error by the
+            // client (see ControlClient::sendData). Without this the sender's
+            // transfer would be reported COMPLETED even though the destination
+            // buffer was never written.
+            response = "SendData failed: copy: " + status.ToString();
+        }
     } else {
         response = "SendData failed: target address not in registered buffer";
     }
@@ -445,10 +479,18 @@ void ControlService::onRecvData(const std::string_view& request,
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
 
+    // The client accepts any response of exactly `length` bytes as payload (see
+    // ControlClient::recvData), so an error of that size must be padded or it
+    // would be copied into the caller's buffer and reported as success.
+    auto fail = [&response, length](std::string message) {
+        response = std::move(message);
+        if (response.size() == length) response.push_back(' ');
+    };
+
     // Validate length to prevent DoS via excessive memory allocation
     constexpr size_t kMaxTransferSize = 1ULL << 30;  // 1GB max per RPC
     if (length > kMaxTransferSize) {
-        response = "RecvData failed: length exceeds maximum allowed";
+        fail("RecvData failed: length exceeds maximum allowed");
         return;
     }
 
@@ -460,10 +502,14 @@ void ControlService::onRecvData(const std::string_view& request,
                             length);
         } else {
             response.resize(length);
-            loader.copy(response.data(), (void*)peer_mem_addr, length);
+            auto status =
+                loader.copy(response.data(), (void*)peer_mem_addr, length);
+            if (!status.ok()) {
+                fail("RecvData failed: copy: " + status.ToString());
+            }
         }
     } else {
-        response = "RecvData failed: target address not in registered buffer";
+        fail("RecvData failed: target address not in registered buffer");
     }
 }
 
