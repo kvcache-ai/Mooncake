@@ -5,9 +5,9 @@ use super::super::object::repeated_error;
 use super::super::{
     NofBacking, NofHealth, NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata,
     NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
-    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalLocator,
-    NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest,
-    NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth, OpaquePhysicalKey,
+    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLocator, NofPhysicalQuery,
+    NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite,
+    NofPhysicalWriteRequest, NofStorageHealth, OpaquePhysicalKey,
 };
 const KVCS_MODE_ENV: &str = "MOONCAKE_KVCS_MODE";
 
@@ -108,12 +108,6 @@ impl NofBacking for KvcsCapiExecutor {
         self.executor
             .standard()
             .map(|executor| executor as &dyn NofObjectDelete)
-    }
-
-    fn physical_limits(&self) -> Option<NofPhysicalLimits> {
-        self.executor
-            .low_level()
-            .map(low_level::LowLevelExecutor::capabilities)
     }
 
     fn physical_write(&self) -> Option<&dyn NofPhysicalWrite> {
@@ -794,10 +788,9 @@ mod low_level {
     };
     use super::super::*;
     use super::{
-        NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits,
-        NofPhysicalLocator, NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead,
-        NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth,
-        OpaquePhysicalKey,
+        NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLocator,
+        NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest,
+        NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth, OpaquePhysicalKey,
     };
 
     pub(super) struct LowLevelExecutor {
@@ -901,16 +894,6 @@ mod low_level {
                 Err(map_call_status(status, "low-level get"))
             } else {
                 Ok((statuses, lengths))
-            }
-        }
-    }
-
-    impl LowLevelExecutor {
-        pub(super) fn capabilities(&self) -> NofPhysicalLimits {
-            NofPhysicalLimits {
-                max_batch_items: self.limits.max_batch_items,
-                // KVCS documents max_value_size per value and splits large batches internally.
-                max_batch_bytes: u64::MAX,
             }
         }
     }

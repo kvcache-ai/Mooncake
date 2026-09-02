@@ -1,4 +1,4 @@
-//! Adapts executor-owned NoF physical objects to the existing Cold Tier backend contract.
+//! Cold Tier backend for executor-owned NoF physical objects.
 
 use std::collections::HashSet;
 
@@ -19,9 +19,9 @@ use super::backing::validate_payload;
 use super::ensure_batch_len;
 use super::object::repeated_error;
 use super::physical::{
-    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalLocator,
-    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalRecoveredRecord, NofPhysicalWrite,
-    NofPhysicalWriteRequest, MAX_ENCODED_LOCATOR_HEX_LEN,
+    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLocator, NofPhysicalRead,
+    NofPhysicalReadRequest, NofPhysicalRecoveredRecord, NofPhysicalWrite, NofPhysicalWriteRequest,
+    MAX_ENCODED_LOCATOR_HEX_LEN,
 };
 
 const LOCATOR_PREFIX: &str = "nof-physical:v3:";
@@ -34,13 +34,12 @@ struct PreparedWrite<'a> {
     payload: &'a [u8],
 }
 
-pub(in crate::client) struct NofPhysicalAdapter {
+pub(in crate::client) struct NofPhysicalStorageBackend {
     target_id: String,
     target: NofBackend,
-    limits: NofPhysicalLimits,
 }
 
-impl NofPhysicalAdapter {
+impl NofPhysicalStorageBackend {
     pub(in crate::client) fn new(target_id: impl Into<String>, target: NofBackend) -> Result<Self> {
         let target_id = target_id.into();
         if target_id.is_empty() {
@@ -53,19 +52,10 @@ impl NofPhysicalAdapter {
             || target.backing.physical_delete().is_none()
         {
             return Err(StoreError::InvalidState(
-                "NoF physical adapter requires read, write and delete capabilities".to_string(),
+                "NoF physical backend requires read, write and delete capabilities".to_string(),
             ));
         }
-        let limits = target.physical_limits.ok_or_else(|| {
-            StoreError::InvalidState(
-                "NoF physical adapter requires advertised physical limits".to_string(),
-            )
-        })?;
-        Ok(Self {
-            target_id,
-            target,
-            limits,
-        })
+        Ok(Self { target_id, target })
     }
 
     fn writer(&self) -> &dyn NofPhysicalWrite {
@@ -211,31 +201,6 @@ impl NofPhysicalAdapter {
         }
     }
 
-    fn run_batches<T, U>(
-        &self,
-        operation: &str,
-        requests: &[T],
-        size_of: impl Fn(&T) -> u64,
-        mut run: impl FnMut(&[T]) -> Vec<Result<U>>,
-    ) -> Vec<Result<U>> {
-        let sizes = requests.iter().map(size_of).collect::<Vec<_>>();
-        let ranges = match bounded_ranges(&sizes, self.limits) {
-            Ok(ranges) => ranges,
-            Err(error) => return repeated_error(requests.len(), error),
-        };
-        let mut results = Vec::with_capacity(requests.len());
-        for range in ranges {
-            let expected = range.len();
-            let batch = run(&requests[range]);
-            if let Err(error) = ensure_batch_len(operation, expected, batch.len()) {
-                results.extend(repeated_error(expected, error));
-            } else {
-                results.extend(batch);
-            }
-        }
-        results
-    }
-
     fn put_objects(&self, writes: &[ColdObjectWrite<'_>]) -> Vec<Result<ColdBackingRoute>> {
         let mut results = (0..writes.len()).map(|_| None).collect::<Vec<_>>();
         let mut prepared = Vec::with_capacity(writes.len());
@@ -271,21 +236,17 @@ impl NofPhysicalAdapter {
             }
         });
 
-        let put_results = self.run_batches(
-            "physical put",
-            &prepared,
-            |write| write.payload.len() as u64,
-            |writes| {
-                let requests = writes
-                    .iter()
-                    .map(|write| NofPhysicalWriteRequest {
-                        key: write.key.clone(),
-                        value: write.payload,
-                    })
-                    .collect::<Vec<_>>();
-                self.writer().put_batch(&requests)
-            },
-        );
+        let requests = prepared
+            .iter()
+            .map(|write| NofPhysicalWriteRequest {
+                key: write.key.clone(),
+                value: write.payload,
+            })
+            .collect::<Vec<_>>();
+        let put_results = self.writer().put_batch(&requests);
+        let put_results = ensure_batch_len("physical put", prepared.len(), put_results.len())
+            .map(|_| put_results)
+            .unwrap_or_else(|error| repeated_error(prepared.len(), error));
         let mut successful = Vec::new();
         for (write, status) in prepared.iter().zip(put_results) {
             match status {
@@ -396,7 +357,7 @@ impl NofPhysicalAdapter {
     }
 }
 
-impl PersistentStorageBackend for NofPhysicalAdapter {
+impl PersistentStorageBackend for NofPhysicalStorageBackend {
     fn storage_management(&self) -> PersistentStorageManagement {
         self.target.management_mode()
     }
@@ -470,40 +431,6 @@ fn one_batch_result<T>(operation: &str, results: Vec<Result<T>>) -> Result<T> {
         .ok_or_else(|| StoreError::Transport(format!("NoF {operation} returned no result")))?
 }
 
-fn bounded_ranges(
-    item_sizes: &[u64],
-    limits: NofPhysicalLimits,
-) -> Result<Vec<std::ops::Range<usize>>> {
-    if item_sizes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    let mut bytes = 0u64;
-    for (index, size) in item_sizes.iter().copied().enumerate() {
-        if size > limits.max_batch_bytes {
-            return Err(StoreError::InvalidState(format!(
-                "NoF request size {size} exceeds executor batch byte limit {}",
-                limits.max_batch_bytes
-            )));
-        }
-        let exceeds_items = index - start >= limits.max_batch_items;
-        let exceeds_bytes = bytes
-            .checked_add(size)
-            .is_none_or(|total| total > limits.max_batch_bytes);
-        if index > start && (exceeds_items || exceeds_bytes) {
-            ranges.push(start..index);
-            start = index;
-            bytes = 0;
-        }
-        bytes = bytes
-            .checked_add(size)
-            .ok_or_else(|| StoreError::InvalidState("NoF batch byte count overflow".to_string()))?;
-    }
-    ranges.push(start..item_sizes.len());
-    Ok(ranges)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,13 +450,6 @@ mod tests {
     }
 
     impl NofBacking for MemoryExecutor {
-        fn physical_limits(&self) -> Option<NofPhysicalLimits> {
-            Some(NofPhysicalLimits {
-                max_batch_items: 64,
-                max_batch_bytes: u64::MAX,
-            })
-        }
-
         fn physical_write(&self) -> Option<&dyn NofPhysicalWrite> {
             Some(self)
         }
@@ -625,7 +545,7 @@ mod tests {
     fn executor_receives_the_complete_value_and_owns_its_layout() {
         let executor = Arc::new(MemoryExecutor::default());
         let backend =
-            NofPhysicalAdapter::new("nof-test", NofBackend::new(executor.clone()).unwrap())
+            NofPhysicalStorageBackend::new("nof-test", NofBackend::new(executor.clone()).unwrap())
                 .unwrap();
         let payload = vec![7; 150];
         let materialized = backend
@@ -643,7 +563,7 @@ mod tests {
     fn backing_health_does_not_claim_mooncake_storage_management() {
         let executor = Arc::new(MemoryExecutor::default());
         let backend =
-            NofPhysicalAdapter::new("nof-test", NofBackend::new(executor).unwrap()).unwrap();
+            NofPhysicalStorageBackend::new("nof-test", NofBackend::new(executor).unwrap()).unwrap();
 
         assert_eq!(
             backend.storage_management(),
@@ -658,7 +578,7 @@ mod tests {
     fn malformed_locator_fails_closed() {
         let executor = Arc::new(MemoryExecutor::default());
         let backend =
-            NofPhysicalAdapter::new("nof-test", NofBackend::new(executor).unwrap()).unwrap();
+            NofPhysicalStorageBackend::new("nof-test", NofBackend::new(executor).unwrap()).unwrap();
         let mut backing = route("logical@v1", b"value");
         backing.object_locator = "file:v1:abcd".to_string();
         assert!(matches!(
@@ -681,7 +601,7 @@ mod tests {
         let target = NofBackend::new(executor.clone())
             .unwrap()
             .key_codec(Arc::new(CollidingCodec));
-        let backend = NofPhysicalAdapter::new("nof-test", target).unwrap();
+        let backend = NofPhysicalStorageBackend::new("nof-test", target).unwrap();
         let payload = vec![9; 150];
         let first = route("first", &payload);
         let second = route("second", &payload);

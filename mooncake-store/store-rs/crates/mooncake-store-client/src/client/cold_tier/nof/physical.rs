@@ -7,23 +7,6 @@ use crate::client::cold_tier::layout::OpaquePhysicalKey;
 const MAX_OPAQUE_LOCATOR_LEN: usize = 4096;
 pub(crate) const MAX_ENCODED_LOCATOR_HEX_LEN: usize = MAX_OPAQUE_LOCATOR_LEN * 2;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NofPhysicalLimits {
-    pub max_batch_items: usize,
-    pub max_batch_bytes: u64,
-}
-
-impl NofPhysicalLimits {
-    pub(crate) fn validate(self) -> Result<Self> {
-        if self.max_batch_items == 0 || self.max_batch_bytes == 0 {
-            return Err(StoreError::InvalidState(
-                "NoF physical backing must advertise non-zero batch limits".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-}
-
 pub struct NofPhysicalWriteRequest<'a> {
     pub key: OpaquePhysicalKey,
     pub value: &'a [u8],

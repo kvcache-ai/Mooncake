@@ -1,9 +1,9 @@
 use crate::{
     NofBackend, NofBacking, NofHealth, NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata,
     NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
-    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLimits, NofPhysicalLocator,
-    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest,
-    NofStorageHealth, NofTargetConfig,
+    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalLocator, NofPhysicalRead,
+    NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth,
+    NofTargetConfig,
 };
 
 struct FakePhysicalNof {
@@ -60,13 +60,6 @@ impl NofPhysicalDelete for FakePhysicalNof {
 }
 
 impl NofBacking for FakePhysicalNof {
-    fn physical_limits(&self) -> Option<NofPhysicalLimits> {
-        Some(NofPhysicalLimits {
-            max_batch_items: 32,
-            max_batch_bytes: 1024,
-        })
-    }
-
     fn physical_write(&self) -> Option<&dyn NofPhysicalWrite> {
         Some(self)
     }

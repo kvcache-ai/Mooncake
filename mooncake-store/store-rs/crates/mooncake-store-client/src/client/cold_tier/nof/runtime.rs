@@ -27,7 +27,7 @@ use crate::client::{
 
 use super::backing::validate_payload;
 use super::object::NofObjectState;
-use super::physical_adapter::NofPhysicalAdapter;
+use super::physical_backend::NofPhysicalStorageBackend;
 use super::NofBackend;
 
 const OBJECT_LOCATOR_PREFIX: &str = "nof-object:v1:";
@@ -120,18 +120,18 @@ impl NofTargetManager {
             let backend: Arc<dyn PersistentStorageBackend> = match next_data_plane {
                 NofDataPlane::Object => Arc::new(NofObjectAdapter::new(config.backend)),
                 NofDataPlane::Physical => {
-                    let adapter =
-                        NofPhysicalAdapter::new(config.target_id.clone(), config.backend)?;
-                    if adapter.requires_recovery() {
+                    let backend =
+                        NofPhysicalStorageBackend::new(config.target_id.clone(), config.backend)?;
+                    if backend.requires_recovery() {
                         let routes =
                             metadata.list_object_routes_by_nof_backing(&NofBackingRouteFilter {
                                 target_id: Some(config.target_id.clone()),
                                 state: Some(NofBackingState::Materialized),
                                 ..NofBackingRouteFilter::default()
                             })?;
-                        adapter.recover_routes(&routes)?;
+                        backend.recover_routes(&routes)?;
                     }
-                    Arc::new(adapter)
+                    Arc::new(backend)
                 }
             };
             if targets
