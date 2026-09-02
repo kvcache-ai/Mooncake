@@ -188,6 +188,14 @@ class MasterServiceTest : public ::testing::Test {
         return MasterService::KvMediaForRemoval(accessor.Get());
     }
 
+    // Lets a test line up a key with a shard the RemoveAll scan has already
+    // passed, which is the only way to reproduce the commit/clear ordering race
+    // deterministically.
+    size_t ShardIndexForKey(MasterService& service, const std::string& key,
+                            const TenantId& tenant_id = TenantId::Default()) {
+        return service.getShardIndex(tenant_id, key);
+    }
+
     void UpsertSoftPinDeadlineIndexForTest(
         MasterService& service, const std::string& key, size_t shard_idx,
         const std::chrono::system_clock::time_point& deadline,

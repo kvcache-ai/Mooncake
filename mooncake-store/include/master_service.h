@@ -211,6 +211,26 @@ class MasterService {
     void RunDfsEvictionForTesting();
 
     /**
+     * @brief Enables the tenant-epoch bookkeeping that decides whether
+     *        RemoveAll may publish `cleared`. Production turns this on from the
+     *        publisher config; tests need it without a live ZMQ socket.
+     */
+    void SetKvTenantEpochTrackingForTesting(bool enabled);
+    /**
+     * @brief Installs a callback invoked after each shard's lock is released
+     *        during a RemoveAll scan, receiving the shard index just finished.
+     *        Lets a test commit into an already-scanned shard
+     *        deterministically.
+     */
+    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
+    /**
+     * @brief Counts of `cleared` publications and of clears withheld because a
+     *        concurrent commit advanced the tenant epoch mid-scan.
+     */
+    uint64_t GetKvClearedPublishedForTesting() const;
+    uint64_t GetKvClearedSuppressedForTesting() const;
+
+    /**
      * @brief Mount a memory segment for buffer allocation. This function is
      * idempotent.
      * @return ErrorCode::OK on success,
@@ -2901,9 +2921,71 @@ class MasterService {
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 
-    // Gated snapshots for the call sites that capture a pre-mutation medium set.
-    // They run on hot metadata paths, so skip the VisitReplicas walk entirely
-    // when no publisher is listening.
+    // RemoveAll releases each shard lock before moving to the next one, so a
+    // concurrent commit can land in an already-scanned shard. Publishing
+    // `cleared` from the scan's own bookkeeping would then order it after that
+    // commit's `stored` and tell subscribers to drop a live object. Every
+    // announcement of a newly available object bumps its tenant's epoch, and a
+    // clear is published only if the epoch still matches the value read before
+    // the scan began. A racing commit therefore suppresses the
+    // clear instead of superseding it; subscribers fall back to the per-object
+    // `removed` stream, which is what they saw before `cleared` existed.
+    //
+    // Slots are a fixed hashed array rather than a per-tenant map so the
+    // structure cannot grow with tenant churn. A hash collision makes two
+    // tenants share an epoch, which can only suppress a clear that was safe to
+    // send — never publish one that was not.
+    static constexpr size_t kKvTenantEpochSlots = 1024;
+    mutable std::mutex kv_tenant_epoch_mutex_;
+    std::array<uint64_t, kKvTenantEpochSlots> kv_tenant_epochs_
+        GUARDED_BY(kv_tenant_epoch_mutex_) = {};
+    // Set from KvEventsEnabled() at construction. Kept separate so tests can
+    // exercise the ordering rule without a live ZMQ publisher.
+    bool kv_track_tenant_epochs_{false};
+    std::atomic<uint64_t> kv_cleared_published_{0};
+    std::atomic<uint64_t> kv_cleared_suppressed_by_epoch_{0};
+    // Fires after each shard's lock is released during a RemoveAll scan, which
+    // is the only point where a test can commit into an already-scanned shard.
+    std::function<void(size_t)> kv_remove_all_shard_hook_;
+
+    static size_t KvTenantEpochSlot(const std::string& tenant) {
+        return std::hash<std::string>{}(tenant) % kKvTenantEpochSlots;
+    }
+    // Called while the object's shard lock is held, before the `stored` is
+    // enqueued, so any clear that observes the old epoch has not yet published.
+    void BumpKvTenantEpoch(const std::string& tenant) {
+        if (!kv_track_tenant_epochs_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
+        ++kv_tenant_epochs_[KvTenantEpochSlot(tenant)];
+    }
+    uint64_t ReadKvTenantEpoch(const std::string& tenant) {
+        if (!kv_track_tenant_epochs_) {
+            return 0;
+        }
+        std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
+        return kv_tenant_epochs_[KvTenantEpochSlot(tenant)];
+    }
+    // A whole-array copy taken before a scan begins. The global RemoveAll does
+    // not know which tenants it will meet, and reading a tenant's epoch only
+    // once the scan reaches it is too late — see the call site.
+    std::array<uint64_t, kKvTenantEpochSlots> SnapshotKvTenantEpochs(
+        bool needed) {
+        if (!needed || !kv_track_tenant_epochs_) {
+            return {};
+        }
+        std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
+        return kv_tenant_epochs_;
+    }
+    // Re-reads the epoch and publishes under the same lock that guards the
+    // bump, so a commit cannot slip between the check and the enqueue.
+    void PublishKvClearedIfEpochUnchanged(const TenantId& tenant_id,
+                                          uint64_t expected_epoch);
+
+    // Gated snapshots for the call sites that capture a pre-mutation medium
+    // set. They run on hot metadata paths, so skip the VisitReplicas walk
+    // entirely when no publisher is listening.
     std::vector<std::string> KvMediaSnapshot(const ObjectMetadata& metadata) {
         return KvEventsEnabled() ? KvMediaForMetadata(metadata)
                                  : std::vector<std::string>{};
@@ -2923,8 +3005,7 @@ class MasterService {
         const ObjectMetadata& metadata);
     // The medium is derived from the object's full replica set, not from the
     // replica type that triggered the commit, so no replica type is taken.
-    void PublishKvStored(const std::string& key,
-                         const ObjectMetadata& metadata,
+    void PublishKvStored(const std::string& key, const ObjectMetadata& metadata,
                          const TenantId& tenant_id);
     void SyncKvObjectState(
         const std::string& key, const ObjectMetadata& metadata,

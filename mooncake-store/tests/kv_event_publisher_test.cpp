@@ -415,8 +415,8 @@ TEST(KvEventPublisherTest, DropsOldestWhenQueueFull) {
     FAIL() << "expected dropped_events after queue overflow";
 }
 
-// Removal is driven entirely by the caller's previous-media set, in sorted order
-// so a multi-medium object produces a deterministic event sequence.
+// Removal is driven entirely by the caller's previous-media set, in sorted
+// order so a multi-medium object produces a deterministic event sequence.
 TEST(KvEventPublisherTest, RemovalEmitsEveryMediumFromCaller) {
     const std::string endpoint = MakeIpcEndpoint();
     KvEventPublisher publisher(MakeEnabledConfig(endpoint));
@@ -493,8 +493,8 @@ TEST(KvEventPublisherTest, SyncWithUnchangedMediaEmitsNothing) {
     ScopedSubscriber subscriber;
     ASSERT_TRUE(subscriber.Connect(endpoint));
 
-    publisher.SyncObjectState("object-a", {"cpu", "disk"}, "tenant-a", "group-a",
-                              {"disk", "cpu"});
+    publisher.SyncObjectState("object-a", {"cpu", "disk"}, "tenant-a",
+                              "group-a", {"disk", "cpu"});
     EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
 }
 
@@ -587,9 +587,9 @@ TEST(KvEventPublisherTest, ClearedEventIsEnvelopeOnlyWithNilMedium) {
     EXPECT_EQ(FindMapValue(cleared, "dp_rank")->as<uint32_t>(), 3u);
 }
 
-// medium is the availability field, so an empty one would describe a replica the
-// subscriber cannot place on any tier. Every entry point has to drop it rather
-// than publish a nil medium.
+// medium is the availability field, so an empty one would describe a replica
+// the subscriber cannot place on any tier. Every entry point has to drop it
+// rather than publish a nil medium.
 TEST(KvEventPublisherTest, EmptyMediumProducesNoEvent) {
     const std::string endpoint = MakeIpcEndpoint();
     KvEventPublisher publisher(MakeEnabledConfig(endpoint));

@@ -440,6 +440,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     InitDfsAllocatorFromEnvironment(config);
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
+    kv_track_tenant_epochs_ = KvEventsEnabled();
 
     if (enable_oplog_ && !cluster_id_.empty()) {
 #ifdef STORE_USE_ETCD
@@ -729,6 +730,23 @@ void MasterService::RunNoFBatchEvictForTesting(double evict_ratio_target,
 }
 
 void MasterService::RunDfsEvictionForTesting() { RunDfsEviction(); }
+
+void MasterService::SetKvTenantEpochTrackingForTesting(bool enabled) {
+    kv_track_tenant_epochs_ = enabled;
+}
+
+void MasterService::SetRemoveAllShardHookForTesting(
+    std::function<void(size_t)> hook) {
+    kv_remove_all_shard_hook_ = std::move(hook);
+}
+
+uint64_t MasterService::GetKvClearedPublishedForTesting() const {
+    return kv_cleared_published_.load(std::memory_order_relaxed);
+}
+
+uint64_t MasterService::GetKvClearedSuppressedForTesting() const {
+    return kv_cleared_suppressed_by_epoch_.load(std::memory_order_relaxed);
+}
 
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
 #ifdef USE_NOF
@@ -6709,7 +6727,13 @@ long MasterService::RemoveAll(bool force) {
     auto now = std::chrono::system_clock::now();
     // Tracking which tenants ended up empty costs a hash insert per visited
     // object, so it is skipped entirely when nobody is listening for `cleared`.
-    const bool track_cleared_tenants = KvEventsEnabled();
+    const bool track_cleared_tenants =
+        KvEventsEnabled() || kv_track_tenant_epochs_;
+    // Baselines must be read before the scan starts, not at first sight of each
+    // tenant: a commit can land in a shard the scan already passed while the
+    // tenant is still unseen, and a per-tenant read would then fold that commit
+    // into its own baseline and wrongly conclude nothing raced.
+    const auto epoch_baseline = SnapshotKvTenantEpochs(track_cleared_tenants);
     std::unordered_set<std::string> tenants_seen;
     std::unordered_set<std::string> tenants_with_remaining_objects;
 
@@ -6720,102 +6744,114 @@ long MasterService::RemoveAll(bool force) {
 
     // Delete metadata — runs concurrently with client SSD cleanup.
     for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRW shard(this, i);
-        for (auto tenant_it = shard->tenants.begin();
-             tenant_it != shard->tenants.end();) {
-            auto& tenant_state = tenant_it->second;
-            auto it = tenant_state.metadata.begin();
-            while (it != tenant_state.metadata.end()) {
-                // Record the tenant only once the loop actually reaches an
-                // object. A tenant row can outlive its objects, and recording it
-                // unconditionally made every empty-but-present tenant look like
-                // a fresh wipe and emit a spurious `cleared`.
-                if (track_cleared_tenants) {
-                    tenants_seen.insert(tenant_it->first.value());
-                }
-                if ((force || it->second.IsLeaseExpired(now)) &&
-                    it->second.AllReplicas(&Replica::fn_is_completed) &&
-                    !tenant_state.replication_tasks.contains(it->first)) {
-                    auto mem_rep_count = it->second.CountReplicas(
-                        &Replica::fn_is_memory_replica);
-
-                    if (enable_ha_) {
-                        if (enable_oplog_) {
-                            auto reservation = ReserveBatchOpLogSlot();
-                            if (!reservation) {
-                                // Skipped, so the tenant is not empty.
-                                if (track_cleared_tenants) {
-                                    tenants_with_remaining_objects.insert(
-                                        tenant_it->first.value());
-                                }
-                                ++it;
-                                continue;
-                            }
-                            std::vector<ReplicaID> removed_ids;
-                            it->second.VisitReplicas(
-                                &Replica::fn_is_completed,
-                                [&removed_ids](Replica& replica) {
-                                    removed_ids.push_back(replica.id());
-                                    replica.mark_removed();
-                                });
-                            auto persist_result =
-                                AppendReservedOpLogWithDurableFinalize(
-                                    std::move(reservation.value()),
-                                    OpType::REMOVE, tenant_it->first.value(),
-                                    it->first, {},
-                                    [this,
-                                     removed_ids = std::move(removed_ids)](
-                                        const OpLogEntry& durable_entry) {
-                                        FinalizeRemovedReplicasAfterDurable(
-                                            durable_entry, removed_ids,
-                                            QuotaEraseMode::kFull);
-                                    });
-                            if (!persist_result) {
-                                if (track_cleared_tenants) {
-                                    tenants_with_remaining_objects.insert(
-                                        tenant_it->first.value());
-                                }
-                                ++it;
-                                continue;
-                            }
-                            total_freed_size += it->second.size * mem_rep_count;
-                            ++it;
-                            removed_count++;
-                            continue;
-                        }
-                    }
-
-                    total_freed_size += it->second.size * mem_rep_count;
-                    ErasePromotionTaskIfPresent(tenant_state, it->first);
-                    it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
-                    removed_count++;
-                } else {
-                    // Only a skipped object means the tenant is not empty.
-                    // Under HA+oplog the erase is deferred to the durable
-                    // callback, so a non-empty metadata map does not.
+        // Scoped in a lambda so the shard lock is released before the hook
+        // runs; a hook that commits into shard i would otherwise deadlock.
+        auto scan_shard = [&] {
+            MetadataShardAccessorRW shard(this, i);
+            for (auto tenant_it = shard->tenants.begin();
+                 tenant_it != shard->tenants.end();) {
+                auto& tenant_state = tenant_it->second;
+                auto it = tenant_state.metadata.begin();
+                while (it != tenant_state.metadata.end()) {
+                    // Record the tenant only once the loop actually reaches an
+                    // object. A tenant row can outlive its objects, and
+                    // recording it unconditionally made every empty-but-present
+                    // tenant look like a fresh wipe and emit a spurious
+                    // `cleared`.
                     if (track_cleared_tenants) {
-                        tenants_with_remaining_objects.insert(
-                            tenant_it->first.value());
+                        tenants_seen.insert(tenant_it->first.value());
                     }
-                    ++it;
+                    if ((force || it->second.IsLeaseExpired(now)) &&
+                        it->second.AllReplicas(&Replica::fn_is_completed) &&
+                        !tenant_state.replication_tasks.contains(it->first)) {
+                        auto mem_rep_count = it->second.CountReplicas(
+                            &Replica::fn_is_memory_replica);
+
+                        if (enable_ha_) {
+                            if (enable_oplog_) {
+                                auto reservation = ReserveBatchOpLogSlot();
+                                if (!reservation) {
+                                    // Skipped, so the tenant is not empty.
+                                    if (track_cleared_tenants) {
+                                        tenants_with_remaining_objects.insert(
+                                            tenant_it->first.value());
+                                    }
+                                    ++it;
+                                    continue;
+                                }
+                                std::vector<ReplicaID> removed_ids;
+                                it->second.VisitReplicas(
+                                    &Replica::fn_is_completed,
+                                    [&removed_ids](Replica& replica) {
+                                        removed_ids.push_back(replica.id());
+                                        replica.mark_removed();
+                                    });
+                                auto persist_result =
+                                    AppendReservedOpLogWithDurableFinalize(
+                                        std::move(reservation.value()),
+                                        OpType::REMOVE,
+                                        tenant_it->first.value(), it->first, {},
+                                        [this,
+                                         removed_ids = std::move(removed_ids)](
+                                            const OpLogEntry& durable_entry) {
+                                            FinalizeRemovedReplicasAfterDurable(
+                                                durable_entry, removed_ids,
+                                                QuotaEraseMode::kFull);
+                                        });
+                                if (!persist_result) {
+                                    if (track_cleared_tenants) {
+                                        tenants_with_remaining_objects.insert(
+                                            tenant_it->first.value());
+                                    }
+                                    ++it;
+                                    continue;
+                                }
+                                total_freed_size +=
+                                    it->second.size * mem_rep_count;
+                                ++it;
+                                removed_count++;
+                                continue;
+                            }
+                        }
+
+                        total_freed_size += it->second.size * mem_rep_count;
+                        ErasePromotionTaskIfPresent(tenant_state, it->first);
+                        it = EraseMetadata(tenant_state, it, tenant_it->first,
+                                           QuotaEraseMode::kFull, &shard);
+                        removed_count++;
+                    } else {
+                        // Only a skipped object means the tenant is not empty.
+                        // Under HA+oplog the erase is deferred to the durable
+                        // callback, so a non-empty metadata map does not.
+                        if (track_cleared_tenants) {
+                            tenants_with_remaining_objects.insert(
+                                tenant_it->first.value());
+                        }
+                        ++it;
+                    }
+                }
+                if (tenant_state.Empty()) {
+                    tenant_it = shard->tenants.erase(tenant_it);
+                } else {
+                    ++tenant_it;
                 }
             }
-            if (tenant_state.Empty()) {
-                tenant_it = shard->tenants.erase(tenant_it);
-            } else {
-                ++tenant_it;
-            }
+        };
+        scan_shard();
+        if (kv_remove_all_shard_hook_) {
+            kv_remove_all_shard_hook_(i);
         }
     }
 
     // tenants_seen holds only tenants that actually held an object, so this
-    // difference is "held objects and lost all of them" — a real wipe. Both sets
-    // stay empty unless track_cleared_tenants was set.
+    // difference is "held objects and lost all of them" — a real wipe. Both
+    // sets stay empty unless track_cleared_tenants was set.
     if (track_cleared_tenants) {
         for (const auto& tenant : tenants_seen) {
             if (!tenants_with_remaining_objects.contains(tenant)) {
-                PublishKvCleared(TenantId(tenant));
+                PublishKvClearedIfEpochUnchanged(
+                    TenantId(tenant),
+                    epoch_baseline[KvTenantEpochSlot(tenant)]);
             }
         }
     }
@@ -6839,6 +6875,9 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     // the loop actually did instead.
     bool saw_any_object = false;
     bool skipped_any_object = false;
+    // This overload knows its tenant up front, so the epoch can be read before
+    // the scan starts rather than at first sight of an object.
+    const uint64_t entry_epoch = ReadKvTenantEpoch(normalized_tenant.value());
 
     // For the tenant-scoped overload, only signal clients that own LOCAL_DISK
     // replicas of THIS tenant — clearing all clients would cross-delete other
@@ -6846,77 +6885,87 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
 
     for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRW shard(this, i);
-        auto tenant_it = shard->tenants.find(normalized_tenant);
-        if (tenant_it == shard->tenants.end()) {
-            continue;
-        }
-        auto& tenant_state = tenant_it->second;
-        auto it = tenant_state.metadata.begin();
-        while (it != tenant_state.metadata.end()) {
-            saw_any_object = true;
-            if ((force || it->second.IsLeaseExpired(now)) &&
-                it->second.AllReplicas(&Replica::fn_is_completed) &&
-                !tenant_state.replication_tasks.contains(it->first)) {
-                it->second.VisitReplicas(
-                    &Replica::fn_is_local_disk_replica,
-                    [&clients_with_disk_replicas](const Replica& replica) {
-                        auto cid = replica.get_local_disk_client_id();
-                        if (cid) {
-                            clients_with_disk_replicas.insert(*cid);
-                        }
-                    });
-                auto mem_rep_count =
-                    it->second.CountReplicas(&Replica::fn_is_memory_replica);
-                if (enable_ha_) {
-                    if (enable_oplog_) {
-                        auto reservation = ReserveBatchOpLogSlot();
-                        if (!reservation) {
-                            // Skipped, so this is not a wipe.
-                            skipped_any_object = true;
-                            ++it;
-                            continue;
-                        }
-                        std::vector<ReplicaID> removed_ids;
-                        it->second.VisitReplicas(
-                            &Replica::fn_is_completed,
-                            [&removed_ids](Replica& replica) {
-                                removed_ids.push_back(replica.id());
-                                replica.mark_removed();
-                            });
-                        auto persist_result =
-                            AppendReservedOpLogWithDurableFinalize(
-                                std::move(reservation.value()), OpType::REMOVE,
-                                normalized_tenant.value(), it->first, {},
-                                [this, removed_ids = std::move(removed_ids)](
-                                    const OpLogEntry& durable_entry) {
-                                    FinalizeRemovedReplicasAfterDurable(
-                                        durable_entry, removed_ids,
-                                        QuotaEraseMode::kFull);
-                                });
-                        if (!persist_result) {
-                            skipped_any_object = true;
-                            ++it;
-                            continue;
-                        }
-                        total_freed_size += it->second.size * mem_rep_count;
-                        ++it;
-                        removed_count++;
-                        continue;
-                    }
-                }
-                total_freed_size += it->second.size * mem_rep_count;
-                ErasePromotionTaskIfPresent(tenant_state, it->first);
-                it = EraseMetadata(tenant_state, it, normalized_tenant,
-                                   QuotaEraseMode::kFull, &shard);
-                removed_count++;
-            } else {
-                skipped_any_object = true;
-                ++it;
+        // Scoped in a lambda so the shard lock is released before the hook
+        // runs; a hook that commits into shard i would otherwise deadlock.
+        auto scan_shard = [&] {
+            MetadataShardAccessorRW shard(this, i);
+            auto tenant_it = shard->tenants.find(normalized_tenant);
+            if (tenant_it == shard->tenants.end()) {
+                return;
             }
-        }
-        if (tenant_state.Empty()) {
-            shard->tenants.erase(tenant_it);
+            auto& tenant_state = tenant_it->second;
+            auto it = tenant_state.metadata.begin();
+            while (it != tenant_state.metadata.end()) {
+                saw_any_object = true;
+                if ((force || it->second.IsLeaseExpired(now)) &&
+                    it->second.AllReplicas(&Replica::fn_is_completed) &&
+                    !tenant_state.replication_tasks.contains(it->first)) {
+                    it->second.VisitReplicas(
+                        &Replica::fn_is_local_disk_replica,
+                        [&clients_with_disk_replicas](const Replica& replica) {
+                            auto cid = replica.get_local_disk_client_id();
+                            if (cid) {
+                                clients_with_disk_replicas.insert(*cid);
+                            }
+                        });
+                    auto mem_rep_count = it->second.CountReplicas(
+                        &Replica::fn_is_memory_replica);
+                    if (enable_ha_) {
+                        if (enable_oplog_) {
+                            auto reservation = ReserveBatchOpLogSlot();
+                            if (!reservation) {
+                                // Skipped, so this is not a wipe.
+                                skipped_any_object = true;
+                                ++it;
+                                continue;
+                            }
+                            std::vector<ReplicaID> removed_ids;
+                            it->second.VisitReplicas(
+                                &Replica::fn_is_completed,
+                                [&removed_ids](Replica& replica) {
+                                    removed_ids.push_back(replica.id());
+                                    replica.mark_removed();
+                                });
+                            auto persist_result =
+                                AppendReservedOpLogWithDurableFinalize(
+                                    std::move(reservation.value()),
+                                    OpType::REMOVE, normalized_tenant.value(),
+                                    it->first, {},
+                                    [this,
+                                     removed_ids = std::move(removed_ids)](
+                                        const OpLogEntry& durable_entry) {
+                                        FinalizeRemovedReplicasAfterDurable(
+                                            durable_entry, removed_ids,
+                                            QuotaEraseMode::kFull);
+                                    });
+                            if (!persist_result) {
+                                skipped_any_object = true;
+                                ++it;
+                                continue;
+                            }
+                            total_freed_size += it->second.size * mem_rep_count;
+                            ++it;
+                            removed_count++;
+                            continue;
+                        }
+                    }
+                    total_freed_size += it->second.size * mem_rep_count;
+                    ErasePromotionTaskIfPresent(tenant_state, it->first);
+                    it = EraseMetadata(tenant_state, it, normalized_tenant,
+                                       QuotaEraseMode::kFull, &shard);
+                    removed_count++;
+                } else {
+                    skipped_any_object = true;
+                    ++it;
+                }
+            }
+            if (tenant_state.Empty()) {
+                shard->tenants.erase(tenant_it);
+            }
+        };
+        scan_shard();
+        if (kv_remove_all_shard_hook_) {
+            kv_remove_all_shard_hook_(i);
         }
     }
 
@@ -6924,7 +6973,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
         clients_with_disk_replicas.begin(), clients_with_disk_replicas.end()));
 
     if (saw_any_object && !skipped_any_object) {
-        PublishKvCleared(normalized_tenant);
+        PublishKvClearedIfEpochUnchanged(normalized_tenant, entry_epoch);
     }
 
     VLOG(1) << "action=remove_all_objects"
@@ -13148,6 +13197,11 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
 void MasterService::PublishKvStored(const std::string& key,
                                     const ObjectMetadata& metadata,
                                     const TenantId& tenant_id) {
+    // The epoch is bumped even when no publisher is listening so that the
+    // ordering rule is testable, and always before the enqueue below: a
+    // concurrent RemoveAll must either see the new epoch and withhold its
+    // `cleared`, or have already published it ahead of this `stored`.
+    BumpKvTenantEpoch(tenant_id.value());
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
@@ -13159,11 +13213,23 @@ void MasterService::SyncKvObjectState(
     const std::string& key, const ObjectMetadata& metadata,
     const TenantId& tenant_id,
     const std::vector<std::string>& previous_media_hint) {
-    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+    const bool publishing =
+        kv_event_publisher_ && kv_event_publisher_->enabled();
+    if (!publishing && !kv_track_tenant_epochs_) {
         return;
     }
-    kv_event_publisher_->SyncObjectState(key, KvMediaForMetadata(metadata),
-                                         tenant_id.value(), metadata.group_id,
+    auto current_media = KvMediaForMetadata(metadata);
+    // Only an object that still has a medium can contradict a `cleared`. Sync
+    // calls that end with no medium left are retractions, which a clear may
+    // safely follow.
+    if (!current_media.empty()) {
+        BumpKvTenantEpoch(tenant_id.value());
+    }
+    if (!publishing) {
+        return;
+    }
+    kv_event_publisher_->SyncObjectState(key, current_media, tenant_id.value(),
+                                         metadata.group_id,
                                          previous_media_hint);
 }
 
@@ -13199,8 +13265,9 @@ void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
     if (!metadata.IsValid()) {
         return;
     }
-    // The object survives. Feeding the evicted medium in as part of the previous
-    // set lets the delta drop it, unless another replica still lives on it.
+    // The object survives. Feeding the evicted medium in as part of the
+    // previous set lets the delta drop it, unless another replica still lives
+    // on it.
     auto previous_media = KvMediaForMetadata(metadata);
     if (std::find(previous_media.begin(), previous_media.end(), medium) ==
         previous_media.end()) {
@@ -13214,6 +13281,27 @@ void MasterService::PublishKvCleared(const TenantId& tenant_id) {
         return;
     }
     kv_event_publisher_->PublishCleared(tenant_id.value());
+}
+
+void MasterService::PublishKvClearedIfEpochUnchanged(const TenantId& tenant_id,
+                                                     uint64_t expected_epoch) {
+    if (!kv_track_tenant_epochs_) {
+        PublishKvCleared(tenant_id);
+        return;
+    }
+    // Holding the epoch lock across the publish is what makes this a barrier
+    // rather than a racy re-check: a commit that wants to announce this tenant
+    // has to wait for the lock, and will then find the clear already enqueued.
+    std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
+    if (kv_tenant_epochs_[KvTenantEpochSlot(tenant_id.value())] !=
+        expected_epoch) {
+        // A commit landed in an already-scanned shard. Its `stored` is on the
+        // wire, so a clear here would retract a live object.
+        kv_cleared_suppressed_by_epoch_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    kv_cleared_published_.fetch_add(1, std::memory_order_relaxed);
+    PublishKvCleared(tenant_id);
 }
 
 bool MasterService::KvEventsEnabled() const {

@@ -110,9 +110,10 @@ KvEventPublisher::KvEventPublisher(KvEventConfig config)
         // it a stored/removed event carries nothing a subscriber can act on and
         // is dropped. Say so at startup: the flag name reads like a formatting
         // switch, but it silences the whole per-object stream.
-        LOG(WARNING) << "kv_events: emit_object_key=false suppresses all stored "
-                        "and removed events; only cleared will be published. "
-                        "Suppressed events are counted as skipped_keyless_events";
+        LOG(WARNING)
+            << "kv_events: emit_object_key=false suppresses all stored "
+               "and removed events; only cleared will be published. "
+               "Suppressed events are counted as skipped_keyless_events";
     }
 
     zmq_context_ = zmq_ctx_new();
@@ -273,8 +274,8 @@ void KvEventPublisher::SyncObjectState(
     }
     for (const auto& medium : SortedMedia(new_set)) {
         if (!previous_set.contains(medium)) {
-            events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                          normalized_tenant, group_id});
+            events.push_back(PendingEvent{EventKind::kStored, object_key,
+                                          medium, normalized_tenant, group_id});
         }
     }
     EnqueueBatch(std::move(events));
