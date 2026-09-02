@@ -128,13 +128,18 @@ Status HighPerformanceTcpTransport::validateParams() const {
             "invalid high-performance TCP limits" LOC_MARK);
     }
     if (!params_.rail_addresses.empty()) {
-        if (params_.rail_addresses.size() > params_.connections_per_peer ||
-            (params_.rail_addresses.size() > 1 &&
-             !params_.bind_address.empty() &&
-             params_.bind_address != "0.0.0.0")) {
+        if (params_.rail_addresses.size() > params_.connections_per_peer) {
             return Status::InvalidArgument(
-                "HP TCP rails require one lane per address and a wildcard "
-                "listener" LOC_MARK);
+                "HP TCP rails require at least one lane per address" LOC_MARK);
+        }
+        const bool wildcard_listener =
+            params_.bind_address.empty() || params_.bind_address == "0.0.0.0";
+        if (!wildcard_listener &&
+            (params_.rail_addresses.size() != 1 ||
+             params_.bind_address != params_.rail_addresses.front())) {
+            return Status::InvalidArgument(
+                "HP TCP listener must be wildcard or match the sole rail "
+                "address" LOC_MARK);
         }
         for (size_t i = 0; i < params_.rail_addresses.size(); ++i) {
             std::error_code error;

@@ -202,6 +202,16 @@ TEST(HighPerformanceTcpTransportTest,
     ASSERT_TRUE(transport.uninstall().ok());
 }
 
+TEST(HighPerformanceTcpTransportTest, RejectsMismatchedSingleRailListener) {
+    auto params = MakeParams();
+    params.rail_addresses = {"127.0.0.2"};
+    HighPerformanceTcpTransport transport(std::move(params));
+    std::string segment_name = "hp_transport_test";
+    EXPECT_TRUE(
+        transport.install(segment_name, MakeLocalMetadata(), nullptr, nullptr)
+            .IsInvalidArgument());
+}
+
 Status PublishBuffers(const std::shared_ptr<ControlService>& metadata,
                       const std::vector<BufferDesc>& buffers) {
     return metadata->segmentManager().updateLocal(
