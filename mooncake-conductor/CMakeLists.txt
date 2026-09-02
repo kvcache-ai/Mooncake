@@ -16,8 +16,15 @@ find_package(Threads REQUIRED)
 
 add_library(conductor_cpp_core STATIC src/common/utils.cpp)
 
-target_include_directories(conductor_cpp_core
-                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# mooncake-common headers are consumed directly instead of linking
+# mooncake_common: the helpers conductor needs (ascii_string.h,
+# integer_parser.h) are header-only, so this reuses them without taking on that
+# target's asio/yaml-cpp/yalantinglibs dependencies. Keeps the standalone build
+# resolvable against glog/JsonCpp/Threads alone.
+target_include_directories(
+  conductor_cpp_core
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+         ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-common/include)
 
 target_link_libraries(conductor_cpp_core PUBLIC glog::glog JsonCpp::JsonCpp
                                                 Threads::Threads)

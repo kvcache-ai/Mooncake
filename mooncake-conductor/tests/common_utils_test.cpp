@@ -1,5 +1,6 @@
 // Tests for common utility helpers: LoadEnv/LoadIntEnv/ParseLogLevel.
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -10,8 +11,13 @@ namespace {
 
 using mooncake::conductor::common::LoadEnv;
 using mooncake::conductor::common::LoadIntEnv;
-using mooncake::conductor::common::LogLevel;
+using mooncake::conductor::common::LogLevelConfig;
 using mooncake::conductor::common::ParseLogLevel;
+
+constexpr LogLevelConfig kDebug{google::GLOG_INFO, 1};
+constexpr LogLevelConfig kInfo{google::GLOG_INFO, 0};
+constexpr LogLevelConfig kWarn{google::GLOG_WARNING, 0};
+constexpr LogLevelConfig kError{google::GLOG_ERROR, 0};
 
 class EnvGuard {
    public:
@@ -25,27 +31,39 @@ class EnvGuard {
 
 TEST(ParseLogLevel, DefaultsToInfoWhenUnset) {
     EnvGuard guard("CONDUCTOR_LOG_LEVEL");
-    EXPECT_EQ(ParseLogLevel(), LogLevel::kInfo);
+    EXPECT_EQ(ParseLogLevel(), kInfo);
 }
 
 TEST(ParseLogLevel, ParsesAllLevelsCaseInsensitively) {
     EnvGuard guard("CONDUCTOR_LOG_LEVEL");
     guard.Set("DEBUG");
-    EXPECT_EQ(ParseLogLevel(), LogLevel::kDebug);
+    EXPECT_EQ(ParseLogLevel(), kDebug);
     guard.Set("debug");
-    EXPECT_EQ(ParseLogLevel(), LogLevel::kDebug);
+    EXPECT_EQ(ParseLogLevel(), kDebug);
     guard.Set("Info");
-    EXPECT_EQ(ParseLogLevel(), LogLevel::kInfo);
+    EXPECT_EQ(ParseLogLevel(), kInfo);
     guard.Set("WARN");
-    EXPECT_EQ(ParseLogLevel(), LogLevel::kWarn);
+    EXPECT_EQ(ParseLogLevel(), kWarn);
     guard.Set("error");
-    EXPECT_EQ(ParseLogLevel(), LogLevel::kError);
+    EXPECT_EQ(ParseLogLevel(), kError);
 }
 
 TEST(ParseLogLevel, InvalidValueFallsBackToInfo) {
     EnvGuard guard("CONDUCTOR_LOG_LEVEL");
     guard.Set("verbose");
-    EXPECT_EQ(ParseLogLevel(), LogLevel::kInfo);
+    EXPECT_EQ(ParseLogLevel(), kInfo);
+}
+
+// DEBUG is the one level glog has no direct severity for: it shares INFO and
+// is distinguished by FLAGS_v, so pin that mapping explicitly.
+TEST(ParseLogLevel, DebugSharesInfoSeverityAndRaisesVerbosity) {
+    EnvGuard guard("CONDUCTOR_LOG_LEVEL");
+    guard.Set("DEBUG");
+    const auto debug = ParseLogLevel();
+    guard.Set("INFO");
+    const auto info = ParseLogLevel();
+    EXPECT_EQ(debug.min_severity, info.min_severity);
+    EXPECT_GT(debug.verbosity, info.verbosity);
 }
 
 TEST(LoadEnv, ReturnsValueWhenSet) {
