@@ -1,7 +1,9 @@
 //! StoreClient runtime binding for configured NoF targets.
 //!
-//! NoF placement is request-local. Targets are selected for a write and discovered again through
-//! the provider for reads and deletes; provider placement is never published as route metadata.
+//! This runtime is for provider-addressed NoF backings such as KVCS. Targets are selected for a
+//! write and discovered again through the provider for reads and deletes; placement is therefore
+//! request-local and is never published as route metadata. Locator-addressed executors whose
+//! allocation state is owned by Mooncake use a separate, persisted-route integration.
 
 use std::collections::BTreeMap;
 use std::sync::{atomic::Ordering, Arc};
@@ -31,7 +33,7 @@ use super::NofBackend;
 pub struct NofTargetConfig {
     target_id: String,
     backend: NofBackend,
-    data_plane: NofDataPlane,
+    data_plane: ProviderDataPlane,
 }
 
 impl NofTargetConfig {
@@ -42,7 +44,7 @@ impl NofTargetConfig {
                 "NoF target ID must not be empty".to_string(),
             ));
         }
-        let data_plane = runtime_data_plane(&backend)?;
+        let data_plane = provider_data_plane(&backend)?;
         Ok(Self {
             target_id,
             backend,
@@ -65,8 +67,8 @@ pub(in crate::client) fn target_set_fingerprint(
     let mut encoded_fields = Vec::<Vec<u8>>::with_capacity(targets.len() * 2);
     for (target_id, data_plane) in targets {
         encoded_fields.push(match data_plane {
-            NofDataPlane::Object => b"object".to_vec(),
-            NofDataPlane::Physical => b"physical".to_vec(),
+            ProviderDataPlane::Object => b"object".to_vec(),
+            ProviderDataPlane::Physical => b"physical".to_vec(),
         });
         encoded_fields.push(target_id.as_bytes().to_vec());
     }
@@ -80,13 +82,13 @@ pub(in crate::client) fn target_set_fingerprint(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NofDataPlane {
+enum ProviderDataPlane {
     Object,
     Physical,
 }
 
 pub(in crate::client) struct NofTargetManager {
-    data_plane: Option<NofDataPlane>,
+    data_plane: Option<ProviderDataPlane>,
     replica_count: usize,
     state: Arc<NofOwnerState>,
     _heartbeat: NofHeartbeatMonitor,
@@ -113,8 +115,10 @@ impl NofTargetManager {
             }
             data_plane = Some(next_data_plane);
             let backend: Arc<dyn PersistentStorageBackend> = match next_data_plane {
-                NofDataPlane::Object => Arc::new(NofObjectAdapter::new(config.backend)),
-                NofDataPlane::Physical => Arc::new(NofPhysicalStorageBackend::new(config.backend)),
+                ProviderDataPlane::Object => Arc::new(NofObjectAdapter::new(config.backend)),
+                ProviderDataPlane::Physical => {
+                    Arc::new(NofPhysicalStorageBackend::new(config.backend))
+                }
             };
             if targets
                 .insert(
@@ -222,12 +226,12 @@ impl NofTargetManager {
             .collect::<Vec<_>>();
         let wanted = match data_plane {
             // A logical-object provider owns placement and replication behind this one target.
-            NofDataPlane::Object => 1,
-            NofDataPlane::Physical => self.replica_count,
+            ProviderDataPlane::Object => 1,
+            ProviderDataPlane::Physical => self.replica_count,
         };
         let selected =
             DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, wanted);
-        if data_plane == NofDataPlane::Physical && selected.len() < wanted {
+        if data_plane == ProviderDataPlane::Physical && selected.len() < wanted {
             tracing::warn!(
                 available_targets = selected.len(),
                 required_targets = wanted,
@@ -395,8 +399,8 @@ impl NofTargetManager {
 
     pub(in crate::client) fn has_required_copies(&self, backing: &ColdBackingRoute) -> bool {
         let required = match self.data_plane {
-            Some(NofDataPlane::Object) => 1,
-            Some(NofDataPlane::Physical) => self.replica_count,
+            Some(ProviderDataPlane::Object) => 1,
+            Some(ProviderDataPlane::Physical) => self.replica_count,
             None => return false,
         };
         1 + backing.replicas.len() >= required
@@ -483,7 +487,7 @@ impl NofTargetManager {
     }
 }
 
-fn runtime_data_plane(backend: &NofBackend) -> Result<NofDataPlane> {
+fn provider_data_plane(backend: &NofBackend) -> Result<ProviderDataPlane> {
     let object = backend.backing.object_write().is_some()
         && backend.backing.object_read().is_some()
         && backend.backing.object_delete().is_some();
@@ -491,8 +495,8 @@ fn runtime_data_plane(backend: &NofBackend) -> Result<NofDataPlane> {
         && backend.backing.physical_read().is_some()
         && backend.backing.physical_delete().is_some();
     match (object, physical) {
-        (true, false) => Ok(NofDataPlane::Object),
-        (false, true) => Ok(NofDataPlane::Physical),
+        (true, false) => Ok(ProviderDataPlane::Object),
+        (false, true) => Ok(ProviderDataPlane::Physical),
         (true, true) => Err(StoreError::InvalidState(
             "NoF runtime target must select one data plane through its advertised capabilities"
                 .to_string(),
@@ -731,7 +735,7 @@ mod tests {
         ));
         state.heartbeat_owned_targets();
         let manager = NofTargetManager {
-            data_plane: Some(NofDataPlane::Physical),
+            data_plane: Some(ProviderDataPlane::Physical),
             replica_count: 8,
             state: state.clone(),
             _heartbeat: NofHeartbeatMonitor::disabled(),

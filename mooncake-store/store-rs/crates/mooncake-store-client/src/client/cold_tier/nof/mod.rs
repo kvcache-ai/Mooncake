@@ -1,7 +1,8 @@
 //! Capability-based NoF integration within the existing Cold Tier subsystem.
 //!
 //! NoF backings are not divided into high-level and low-level framework branches. A backing
-//! advertises only the logical-object, physical-KV, query and health traits that Mooncake may call.
+//! advertises only the logical-object, provider-addressed physical-KV, query and health traits
+//! that Mooncake may call.
 
 use mooncake_store_core::{Result, StoreError};
 

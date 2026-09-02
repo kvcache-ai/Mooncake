@@ -2,10 +2,11 @@
 
 NoF is a remote persistence data plane attached below Cold Tier. It reuses Mooncake's existing hot
 replica lifecycle, offload queue, restore path, target ownership, heartbeat, and replica selection.
-It does not add a second metadata lifecycle.
 
 The included provider is the KVCS 0.4.0 C API executor. `KvcsCapiExecutor` chooses Standard or
-Low-Level mode when it starts and exposes only the traits supported by that mode.
+Low-Level mode when it starts and exposes only the traits supported by that mode. Both KVCS modes
+are provider-owned: KVCS can find an object from its derived key, so Mooncake does not persist a
+NoF placement route for KVCS.
 
 ## Architecture
 
@@ -15,17 +16,25 @@ capabilities:
 | Capability | Trait | Responsibility |
 | --- | --- | --- |
 | logical-object I/O | `NofObjectWrite`, `NofObjectRead`, `NofObjectQuery`, `NofObjectDelete` | provider namespace, object, and manifest semantics |
-| physical-object I/O | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | complete-object I/O; the executor privately chooses its record layout |
+| provider-addressed physical I/O | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | complete-object I/O by deterministic key; the provider owns lookup metadata and privately chooses its record layout |
 | health | `NofHealth` | liveness and optional capacity information |
 
 Missing capabilities remain missing. Mooncake does not recreate them with a provider CLI, a
 private service API, or a parallel disk-management implementation.
 
-No provider placement is stored in `ObjectRoute`. In particular, Mooncake does not persist a NoF
+For KVCS, no provider placement is stored in `ObjectRoute`. Mooncake does not persist a KVCS
 target, owner, locator, manifest, shard map, object length, or checksum. The route keeps only the
 logical object identity and a stable content generation. Each request derives the provider key
-from that identity and asks the configured NoF targets directly. Target and owner information is a
-request-local I/O descriptor and is never published through route CAS or exposed by the admin API.
+from that identity and asks the configured KVCS targets directly. Target and owner information is
+a request-local I/O descriptor and is never published through route CAS or exposed by the admin
+API.
+
+This route-free rule follows metadata authority, not the Standard/Low-Level or logical/physical
+API shape. An allocator-backed executor that cannot locate an object from its key must return an
+opaque location and use a Mooncake-managed NoF route. That route is authoritative for target and
+replica placement, while record, extent, chunk, and alignment details remain private to the
+executor. Such a managed-route executor must not reuse KVCS request-local discovery as its source
+of truth.
 
 Mooncake remains authoritative for logical object existence, while KVCS remains authoritative for
 provider layout and provider-internal metadata:
@@ -51,10 +60,10 @@ both data planes are required.
 
 ## Request lifecycle
 
-On offload, Mooncake derives the provider key, selects healthy targets, and writes the payload. A
-Standard write goes to one provider target because KVCS owns its internal replication. A Low-Level
-write succeeds only after every target selected by `nof_replica_count` accepts the value. No target
-list is written back to metadata.
+On KVCS offload, Mooncake derives the provider key, selects healthy targets, and writes the
+payload. A Standard write goes to one provider target because KVCS owns its internal replication.
+A Low-Level write succeeds only after every target selected by `nof_replica_count` accepts the
+value. No target list is written back to metadata.
 
 When no hot or local-disk copy is available, the client derives the same key and probes its current
 NoF configuration. The resulting length, checksum, target, and owner exist only for that restore
@@ -67,7 +76,7 @@ When an in-memory offload queue is rebuilt, Mooncake probes the provider for eac
 It re-enqueues only missing objects or Low-Level objects with fewer than the required target copies.
 This is route-driven recovery, not a provider key-space or disk scan.
 
-NoF targets must therefore be configured consistently on clients that share a route namespace.
+KVCS targets must therefore be configured consistently on clients that share a route namespace.
 Changing a target set does not create a metadata migration. Because KVCS 0.4.0 has no listing API,
 Mooncake cannot enumerate or reclaim provider records that are unreachable from a current logical
 route and target configuration.
@@ -152,10 +161,11 @@ client/cold_tier/
       physical_layout.rs
 ```
 
-Provider-neutral traits and Cold Tier adapters live under `nof/`. KVCS configuration, C API calls,
-and its private Low-Level layout live under `nof/kvcs/`. `physical_backend.rs` passes complete
-objects between Cold Tier and a physical executor; it defines no chunk, extent, alignment, or
-record format.
+The traits and Cold Tier adapters in this source tree implement provider-owned access. KVCS
+configuration, C API calls, and its private Low-Level layout live under `nof/kvcs/`.
+`physical_backend.rs` passes complete objects to a key-addressed provider; it defines no chunk,
+extent, alignment, record format, or persisted placement route. A locator-returning,
+Mooncake-managed executor uses a separate adapter and route lifecycle.
 
 ## Install KVCS SDK and EFC
 
