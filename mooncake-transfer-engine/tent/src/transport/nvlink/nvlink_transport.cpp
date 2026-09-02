@@ -475,10 +475,18 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
 
         {
             std::lock_guard<std::mutex> lock(register_mutex_);
-            if (registered_base_addrs_.count((uint64_t)base_ptr)) {
-                // Already registered this cudaMalloc block, just tag transport
+            auto iter = registered_base_addrs_.find((uint64_t)base_ptr);
+            if (iter != registered_base_addrs_.end()) {
+                // Already registered this cudaMalloc block: expand to the
+                // segment granularity and REUSE its IPC handle. The handle
+                // must be stamped on this desc too -- torch's caching
+                // allocator sub-allocates many logical buffers (KV pool, aux
+                // pool, mamba state pool, ...) inside one cudaMalloc segment,
+                // and every desc covering the segment needs the handle or
+                // cross-process NVLink submission for that buffer fails.
                 desc.addr = (uint64_t)base_ptr;
                 desc.length = alloc_size;
+                desc.shm_path = iter->second;
                 desc.transports.push_back(TransportType::NVLINK);
                 CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
                 return Status::OK();
@@ -505,7 +513,7 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
 
         {
             std::lock_guard<std::mutex> lock(register_mutex_);
-            registered_base_addrs_.insert((uint64_t)base_ptr);
+            registered_base_addrs_.emplace((uint64_t)base_ptr, desc.shm_path);
         }
     } else if (location.type() == "cpu" ||
                location.type() == kWildcardLocation) {
@@ -584,9 +592,26 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
     CHECK_STATUS(segment_manager.withCachedSegment(
         target_id, pin, [&](SegmentDesc* segment) {
             buffer = segment->findBuffer(dest_addr, length);
-            if (!buffer || buffer->shm_path.empty())
+            if (!buffer) {
+                LOG_EVERY_N(WARNING, 1000)
+                    << "NVLink relocation: no buffer covers target_addr=0x"
+                    << std::hex << dest_addr << std::dec << " length=" << length
+                    << " in segment " << target_id;
                 return Status::NeedsRefreshCache(
                     "Requested address is not in registered buffer" LOC_MARK);
+            }
+            if (buffer->shm_path.empty()) {
+                // cudaMalloc-segment dedup used to drop the IPC handle for
+                // every desc after the first one in the same segment; this
+                // log is the fingerprint of that (fixed) bug.
+                LOG_EVERY_N(WARNING, 1000)
+                    << "NVLink relocation: target buffer at 0x" << std::hex
+                    << buffer->addr << std::dec
+                    << " (location=" << buffer->location
+                    << ") has no CUDA IPC handle; NVLink unavailable for it";
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            }
             return Status::OK();
         }));
 
@@ -594,6 +619,9 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         void* shm_addr = nullptr;
         LocationParser location(buffer->location);
         if (location.type() != "cuda") {
+            LOG_EVERY_N(WARNING, 1000)
+                << "NVLink relocation: target buffer location "
+                << buffer->location << " is not cuda; NVLink unavailable";
             return Status::InvalidArgument(
                 "Requested address is not in registered CUDA buffer" LOC_MARK);
         }

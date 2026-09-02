@@ -116,6 +116,10 @@ class Topology {
 
     const MemEntry* getMemEntry(const std::string& name) const;
 
+    // True only when both NUMA ids are known and differ. Unknown (-1) is not
+    // treated as remote; rank is ignored because probes disagree on placement.
+    bool isCrossNuma(const MemEntry& mem, NicID nic_id) const;
+
     NicID getNicId(const std::string& name) const;
 
     MemID getMemId(const std::string& name) const;

@@ -329,10 +329,10 @@ TcpTransport::TcpTransport()
     }
 
     constexpr size_t kDefaultLanesPerPeer = 4;
-    constexpr size_t kDefaultQueuedTransfersPerPeer = 1024;
-    constexpr size_t kMaxQueuedTransfersPerPeer = 65535;
-    constexpr size_t kDefaultPendingAdmissionsPerPeer = 1024;
-    constexpr size_t kMaxPendingAdmissionsPerPeer = 65535;
+    constexpr size_t kDefaultQueuedTransfersPerPeer = 65535;
+    constexpr size_t kMaxQueuedTransfersPerPeer = 1048576;
+    constexpr size_t kDefaultPendingAdmissionsPerPeer = 65535;
+    constexpr size_t kMaxPendingAdmissionsPerPeer = 1048576;
     constexpr size_t kDefaultAdmissionTimeoutMs = 1000;
     constexpr size_t kMaxAdmissionTimeoutMs = 600000;
 
@@ -365,6 +365,12 @@ TcpTransport::TcpTransport()
             "MC_TCP_ADMISSION_TIMEOUT_MS",
             getenv("MC_TCP_ADMISSION_TIMEOUT_MS"), kDefaultAdmissionTimeoutMs,
             1, kMaxAdmissionTimeoutMs));
+
+    constexpr size_t kDefaultNumIoThreads = 1;
+    constexpr size_t kMaxNumIoThreads = 32;
+    num_io_threads_ = parseBoundedTcpSetting(
+        "MC_NUM_TCP_IO_THREADS", getenv("MC_NUM_TCP_IO_THREADS"),
+        kDefaultNumIoThreads, 1, kMaxNumIoThreads);
 }
 
 TcpTransport::~TcpTransport() {
@@ -419,15 +425,22 @@ int TcpTransport::install(std::string& local_server_name,
     close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
     auto metadata = metadata_;
-    context_ = new TcpContext(tcp_port, [metadata = std::move(metadata)](
-                                            uint64_t addr, uint64_t size) {
-        return validateTcpAddress(metadata, addr, size);
-    });
-    lane_runtime_ =
-        std::make_shared<ConnectionLaneRuntime>(context_->io_context);
+    io_pool_ = std::make_unique<TcpIoPool>(num_io_threads_);
+    context_ = new TcpContext(
+        *io_pool_, tcp_port,
+        [metadata = std::move(metadata)](uint64_t addr, uint64_t size) {
+            return validateTcpAddress(metadata, addr, size);
+        });
+    lane_runtime_ = std::make_shared<ConnectionLaneRuntime>(*io_pool_);
     lane_state_->runtime = lane_runtime_;
     running_ = true;
-    thread_ = std::thread(&TcpTransport::worker, this);
+    // Shard 0 owns the acceptor; arm (and re-arm after a restart) doAccept on
+    // its own thread. Other shards just drain their io_context.
+    io_pool_->start([this](size_t shard) {
+        if (shard == 0) context_->doAccept();
+    });
+    LOG(INFO) << "TcpTransport: I/O pool started with " << num_io_threads_
+              << " thread(s)";
     return 0;
 }
 
@@ -502,9 +515,16 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    // These counters are updated with __atomic_fetch_add from the I/O
+    // thread(s) in Slice::markSuccess/markFailed; read them atomically here to
+    // match MultiTransport::getTransferStatus and avoid a data race with the
+    // completion path (the read runs on the polling submission thread).
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_ACQUIRE);
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
@@ -663,20 +683,6 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
     };
 
     (*advance)();
-}
-
-void TcpTransport::worker() {
-    while (running_) {
-        try {
-            context_->doAccept();
-            context_->io_context.run();
-        } catch (std::exception& e) {
-            LOG(ERROR) << "TcpTransport::worker encountered an exception "
-                          "during doAccept/run: "
-                       << e.what();
-            context_->io_context.restart();
-        }
-    }
 }
 
 std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(

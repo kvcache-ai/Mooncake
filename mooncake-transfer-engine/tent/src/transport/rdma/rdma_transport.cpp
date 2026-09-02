@@ -675,27 +675,46 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
         local_desc.reply_msg = ss.str();
         return -1;
     }
-    auto endpoint =
-        context->endpointStore()->getOrInsert(peer_desc.local_nic_path);
-    if (!endpoint) {
-        std::stringstream ss;
-        ss << "Cannot allocate endpoint: " << peer_desc.local_nic_path;
-        LOG(ERROR) << ss.str();
-        local_desc.reply_msg = ss.str();
-        return -1;
-    }
-    auto status = endpoint->accept(peer_desc, local_desc);
-    if (!status.ok()) {
-        if (endpoint->status() == RdmaEndPoint::EP_DESTROYING ||
-            endpoint->status() == RdmaEndPoint::EP_DESTROYED) {
-            context->endpointStore()->remove(endpoint.get());
+    // Endpoints are never reset. A peer process that reused the same nic path
+    // (same IP:port after a restart) hits an EP_READY endpoint whose QPs no
+    // longer exist. accept() retires it and the next getOrInsert() creates a
+    // fresh one. Do that retry inside this RPC so the initiator receives a
+    // valid GID instead of an empty bootstrap reply.
+    auto store = context->endpointStore();
+    constexpr int kMaxAcceptAttempts = 2;
+    for (int attempt = 0; attempt < kMaxAcceptAttempts; ++attempt) {
+        auto endpoint = store->getOrInsert(peer_desc.local_nic_path);
+        if (!endpoint) {
+            std::stringstream ss;
+            ss << "Cannot allocate endpoint: " << peer_desc.local_nic_path;
+            LOG(ERROR) << ss.str();
+            local_desc.reply_msg = ss.str();
+            return -1;
+        }
+        local_desc = BootstrapDesc();
+        auto status = endpoint->accept(peer_desc, local_desc);
+        if (status.ok()) {
+            local_desc.reply_msg.clear();
+            return 0;
+        }
+        const auto ep_status = endpoint->status();
+        const bool retired = ep_status == RdmaEndPoint::EP_DESTROYING ||
+                             ep_status == RdmaEndPoint::EP_DESTROYED;
+        if (retired) {
+            store->remove(endpoint.get());
+            if (attempt + 1 < kMaxAcceptAttempts) {
+                LOG(INFO) << "Retrying RDMA bootstrap after retiring stale "
+                             "endpoint for "
+                          << peer_desc.local_nic_path;
+                continue;
+            }
         }
         LOG(ERROR) << status.ToString();
         local_desc.reply_msg = status.ToString();
         return -1;
     }
 
-    return 0;
+    return -1;
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
@@ -796,6 +815,38 @@ void RdmaTransport::addNotificationToQueue(const std::string& name,
     notify_list_.emplace_back(name, msg);
 }
 
+namespace {
+// The notify QP carries its own host-memory send/recv buffers, so a local
+// length/protection/WQE fault is confined to notification state. The data QPs
+// of the same endpoint use separate WRs and MRs.
+bool isNotifyLocalFault(ibv_wc_status status) {
+    switch (status) {
+        case IBV_WC_LOC_LEN_ERR:
+        case IBV_WC_LOC_QP_OP_ERR:
+        case IBV_WC_LOC_PROT_ERR:
+        case IBV_WC_LOC_ACCESS_ERR:
+        case IBV_WC_MW_BIND_ERR:
+            return true;
+        default:
+            return false;
+    }
+}
+}  // namespace
+
+RdmaTransport::NotifyCompletionAction RdmaTransport::classifyNotifyCompletion(
+    ibv_wc_status status, bool endpoint_alive, bool endpoint_ready) {
+    // Every WR still posted on a retiring endpoint's notify QP flushes, which
+    // is expected and must stay quiet.
+    if (status == IBV_WC_WR_FLUSH_ERR && !endpoint_ready) {
+        return NotifyCompletionAction::SkipSilently;
+    }
+    if (!endpoint_alive) return NotifyCompletionAction::ReportOnly;
+    if (isNotifyLocalFault(status)) {
+        return NotifyCompletionAction::DisableNotification;
+    }
+    return NotifyCompletionAction::RetireEndpoint;
+}
+
 int RdmaTransport::processNotifyCompletions() {
     int total_completions = 0;
 
@@ -829,13 +880,29 @@ int RdmaTransport::processNotifyCompletions() {
             }
 
             if (wc[i].status != IBV_WC_SUCCESS) {
-                if (wc[i].status == IBV_WC_WR_FLUSH_ERR &&
-                    (!endpoint ||
-                     endpoint->status() != RdmaEndPoint::EP_READY)) {
-                    continue;
-                }
+                // A failed completion leaves this notify QP unusable for good
+                // and only the endpoint lifecycle builds a new one, so left
+                // alone the endpoint stays EP_READY and every later
+                // sendNotification() silently flushes. Retiring it also moves
+                // the data QPs to ERR, so that is reserved for faults which may
+                // mean the peer restarted or the path died. Both acting
+                // branches re-take the notify_endpoint_map_lock_ ReadGuard
+                // released above via unregisterNotifyQp(); the locally held
+                // shared_ptr keeps the endpoint alive across the call.
+                const bool endpoint_ready =
+                    endpoint && endpoint->status() == RdmaEndPoint::EP_READY;
+                auto action = classifyNotifyCompletion(
+                    wc[i].status, endpoint != nullptr, endpoint_ready);
+                if (action == NotifyCompletionAction::SkipSilently) continue;
+
                 LOG(ERROR) << "Notification completion failed: " << wc[i].status
                            << ", qp_num=" << wc[i].qp_num;
+                if (action == NotifyCompletionAction::DisableNotification) {
+                    endpoint->disableNotification(
+                        "notify QP local completion error");
+                } else if (action == NotifyCompletionAction::RetireEndpoint) {
+                    endpoint->resetConnection("notify QP completion error");
+                }
                 continue;
             }
 

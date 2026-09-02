@@ -36,6 +36,7 @@ function(add_ha_test name)
 endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
+add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
@@ -58,6 +59,7 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_group_test master_service_group_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
 target_link_libraries(master_service_evict_scenario_test
@@ -142,6 +144,8 @@ add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
+add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
+add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
@@ -152,9 +156,12 @@ endif()
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
+add_store_test(client_metric_config_test client_metric_config_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
 add_store_test(dfs_posix_test dfs_posix_test.cpp)
+add_store_test(distributed_storage_config_test
+               distributed_storage_config_test.cpp)
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
 add_test(NAME dfs_batch_read_checksum_test
          COMMAND dfs_sync_client_test
@@ -183,6 +190,12 @@ add_ha_test(batch_oplog_snapshot_codec_test
             ha/snapshot/batch_oplog/codec_test.cpp)
 add_ha_test(batch_oplog_snapshot_writer_test
             ha/snapshot/batch_oplog/writer_test.cpp)
+add_ha_test(batch_oplog_snapshot_provider_test
+            ha/snapshot/batch_oplog/provider_test.cpp)
+add_ha_test(batch_oplog_snapshot_publisher_test
+            ha/snapshot/batch_oplog/publisher_test.cpp)
+add_ha_test(batch_oplog_snapshot_coordinator_test
+            ha/snapshot/batch_oplog/coordinator_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)

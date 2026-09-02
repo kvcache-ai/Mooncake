@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <fstream>
 #include <sstream>
 
@@ -111,6 +112,9 @@ Workers::Workers(RdmaTransport* transport)
         }
     }
 
+    params.strict_local_numa =
+        conf->get("transports/rdma/strict_local_numa", false);
+
     // ============================================================
     // Bandwidth Estimation (EWMA)
     // ============================================================
@@ -179,13 +183,45 @@ Workers::Workers(RdmaTransport* transport)
     // ============================================================
 
     params.default_bandwidth_gbps =
-        conf->get("transports/rdma/default_bandwidth_gbps", 400.0);
-    params.min_bandwidth_gbps =
-        conf->get("transports/rdma/min_bandwidth_gbps", 10.0);
-    params.max_bandwidth_gbps =
-        conf->get("transports/rdma/max_bandwidth_gbps", 800.0);
+        conf->get("transports/rdma/default_bandwidth_gbps",
+                  params.default_bandwidth_gbps);
+    params.min_bandwidth_gbps = conf->get("transports/rdma/min_bandwidth_gbps",
+                                          params.min_bandwidth_gbps);
+    params.max_bandwidth_gbps = conf->get("transports/rdma/max_bandwidth_gbps",
+                                          params.max_bandwidth_gbps);
 
     device_selector_->setSchedulingParams(params);
+    device_selector_->auditStrictLocalNuma();
+
+    // Seed each device from its context. context_set_ is indexed by NicID,
+    // the same id the selector uses. Three cases:
+    //   - no usable context (DEVICE_UNINIT: initializeContexts() replaced a
+    //     failed construct() with an inert slot; DEVICE_DISABLED handled the
+    //     same way defensively): the NIC cannot carry traffic, so it gets no
+    //     bandwidth at all -- not the default -- and leaves candidate
+    //     selection and the aggregate.
+    //   - port down at open (DEVICE_PAUSED): seeded from whatever the port
+    //     reports (possibly 0, i.e. the default), but unavailable until
+    //     IBV_EVENT_PORT_ACTIVE.
+    //   - DEVICE_ENABLED: seeded from the negotiated speed, or the configured
+    //     default (with a warning) when the speed could not be read.
+    for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
+         ++dev_id) {
+        const auto* nic = transport_->local_topology_->getNicEntry(dev_id);
+        // Only NIC_RDMA entries have a selector slot (see loadTopology()).
+        if (!nic || nic->type != Topology::NIC_RDMA) continue;
+        const auto& context = transport_->context_set_[dev_id];
+        const auto status =
+            context ? context->status() : RdmaContext::DEVICE_UNINIT;
+        if (status == RdmaContext::DEVICE_UNINIT ||
+            status == RdmaContext::DEVICE_DISABLED) {
+            device_selector_->setDeviceAvailable(dev_id, false);
+            continue;
+        }
+        device_selector_->setDeviceBandwidth(dev_id, context->linkSpeedGbps());
+        device_selector_->setDeviceAvailable(
+            dev_id, status == RdmaContext::DEVICE_ENABLED);
+    }
 
     // ============================================================
     // Shared Memory Configuration
@@ -271,6 +307,24 @@ Status Workers::submit(RdmaSlice* slice) {
     slice_list.first = slice;
     slice_list.num_slices = 1;
     return submit(slice_list);
+}
+
+void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {
+    RdmaSliceList slice_list;
+    slice_list.first = slice;
+    slice_list.num_slices = 1;
+    int priority = PRIO_HIGH;
+    if (slice && slice->task) {
+        priority = slice->priority;
+    }
+    // The worker must never block on its own queue (issue #3637): a full
+    // queue parks the slice in requeue_overflow and the next tick retries.
+    // Either way it stays counted as inflight, which keeps the worker from
+    // suspending while a parked flush is pending.
+    if (!worker.queues[priority].try_push(slice_list)) {
+        worker.requeue_overflow.emplace_back(priority, slice_list);
+    }
+    worker.inflight_slices.fetch_add(1);
 }
 
 Status Workers::cancel(RdmaTask* task) {
@@ -395,9 +449,21 @@ void Workers::asyncPostSend() {
     // Promote timed-out low priority requests
     promoteTimedOutRequests(worker);
 
-    // Priority selection: HIGH -> MEDIUM -> LOW
+    // Priority selection: HIGH -> MEDIUM -> LOW. The worker-local overflow is
+    // drained before the shared queues, so a parked retry can never starve
+    // behind producers that keep refilling freed slots (issue #3637).
+    auto& overflow = worker.requeue_overflow;
     for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
         if (shared_quota && !shared_quota->canSend(prio)) continue;
+        for (auto it = overflow.begin(); it != overflow.end();) {
+            if (it->first == prio) {
+                result.push_back(it->second);
+                it = overflow.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (!result.empty()) break;
         worker.queues[prio].pop(result);
         if (!result.empty()) break;
     }
@@ -461,7 +527,7 @@ void Workers::asyncPostSend() {
                     updateSliceStatus(slice, FAILED);
                 } else {
                     releaseSliceQuota(slice);
-                    submit(slice);
+                    submitFromTick(worker, slice);
                 }
                 worker.inflight_slices.fetch_sub(1);
             }
@@ -529,7 +595,7 @@ void Workers::asyncPostSend() {
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
                 } else {
-                    submit(slice);
+                    submitFromTick(worker, slice);
                 }
                 worker.inflight_slices.fetch_sub(1);
             } else {
@@ -559,17 +625,14 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
         worker.queues[from].pop(drained);
         if (drained.empty()) return false;
 
-        if (!priority_promotion_per_entry_) {
-            auto* slice = drained.front().first;
-            const bool head_timed_out = slice && slice->enqueue_ts > 0 &&
-                                        current_ts >= slice->enqueue_ts &&
-                                        (current_ts - slice->enqueue_ts) >=
-                                            priority_promotion_timeout_ns_;
-            for (auto& slice_list : drained) {
-                worker.queues[head_timed_out ? to : from].push(slice_list);
+        // The worker must never block on its own queue: a full target parks
+        // the entry in requeue_overflow and the next tick retries (issue
+        // #3637). Parked entries stay counted as inflight throughout.
+        auto requeue = [&](int target, RdmaSliceList& slice_list) {
+            if (!worker.queues[target].try_push(slice_list)) {
+                worker.requeue_overflow.emplace_back(target, slice_list);
             }
-            return head_timed_out;
-        }
+        };
 
         std::vector<uint64_t> enqueue_ts;
         enqueue_ts.reserve(drained.size());
@@ -578,12 +641,15 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
             enqueue_ts.push_back(slice ? slice->enqueue_ts : 0);
         }
 
-        PromotionDecision decision = DecidePromotionPerEntry(
-            enqueue_ts, current_ts, priority_promotion_timeout_ns_);
+        PromotionDecision decision =
+            priority_promotion_per_entry_
+                ? DecidePromotionPerEntry(enqueue_ts, current_ts,
+                                          priority_promotion_timeout_ns_)
+                : DecidePromotionHeadOnly(enqueue_ts, current_ts,
+                                          priority_promotion_timeout_ns_);
 
         if (!decision.promoted_any()) {
-            for (auto& slice_list : drained)
-                worker.queues[from].push(slice_list);
+            for (auto& slice_list : drained) requeue(from, slice_list);
             return false;
         }
 
@@ -592,7 +658,7 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
             if (idx < drained.size()) promote[idx] = true;
         }
         for (size_t i = 0; i < drained.size(); ++i) {
-            worker.queues[promote[i] ? to : from].push(drained[i]);
+            requeue(promote[i] ? to : from, drained[i]);
         }
         return true;
     };
@@ -706,7 +772,7 @@ void Workers::asyncPollCq() {
                             std::memory_order_acquire)) {
                         updateSliceStatus(slice, CANCELED);
                     } else {
-                        submit(slice);
+                        submitFromTick(worker, slice);
                     }
                 }
             } else {
@@ -798,30 +864,120 @@ void Workers::workerThread(int thread_id) {
     }
 }
 
-int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
-    ibv_async_event event;
-    if (ibv_get_async_event(context->nativeContext(), &event) < 0) return -1;
-    LOG(WARNING) << "Received context async event "
-                 << ibv_event_type_str(event.event_type) << " for context "
-                 << context->name();
-    if (event.event_type == IBV_EVENT_QP_FATAL ||
-        event.event_type == IBV_EVENT_WQ_FATAL) {
-        auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
-        context->endpointStore()->remove(endpoint);
-    } else if (event.event_type == IBV_EVENT_CQ_ERR) {
-        context->pause();
-        context->resume();
-        LOG(WARNING) << "Action: " << context->name() << " restarted";
-    } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
-               event.event_type == IBV_EVENT_PORT_ERR) {
-        context->pause();
-        LOG(WARNING) << "Action: " << context->name() << " down";
-    } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
-        context->resume();
-        LOG(WARNING) << "Action: " << context->name() << " up";
+int Workers::handleContextEvents(int dev_id,
+                                 std::shared_ptr<RdmaContext>& context) {
+    // The async fd is non-blocking and edge-triggered
+    // (joinNonblockingPollList), and ibv_get_async_event() dequeues one record
+    // per call, so every queued event has to be consumed here: epoll only
+    // reports readiness again once a *new* event arrives. Bursts are routine
+    // (IBV_EVENT_COMM_EST fires once per connection), and a PORT_ACTIVE
+    // stranded behind one keeps the context paused until some unrelated event
+    // happens to release it -- which may be never.
+    while (true) {
+        ibv_async_event event;
+        errno = 0;
+        if (ibv_get_async_event(context->nativeContext(), &event) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;  // drained
+            if (errno == EINTR) continue;
+            PLOG(ERROR) << "ibv_get_async_event for context "
+                        << context->name();
+            return -1;
+        }
+        if (event.event_type == IBV_EVENT_COMM_EST) {
+            VLOG(1) << "Received context async event "
+                    << ibv_event_type_str(event.event_type) << " for context "
+                    << context->name();
+        } else {
+            LOG(WARNING) << "Received context async event "
+                         << ibv_event_type_str(event.event_type)
+                         << " for context " << context->name();
+        }
+        applyContextEvent(dev_id, *context, event);
+        ibv_ack_async_event(&event);
     }
-    ibv_ack_async_event(&event);
-    return 0;
+}
+
+void Workers::applyContextEvent(int dev_id, RdmaContext& context,
+                                const ibv_async_event& event) {
+    switch (event.event_type) {
+        case IBV_EVENT_QP_FATAL:
+        case IBV_EVENT_WQ_FATAL: {
+            auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
+            context.endpointStore()->remove(endpoint);
+            break;
+        }
+        case IBV_EVENT_CQ_ERR:
+            context.pause();
+            context.resume();
+            LOG(WARNING) << "Action: " << context.name() << " restarted";
+            break;
+        case IBV_EVENT_DEVICE_FATAL:
+            // Device-scoped: every port is gone.
+            context.pause();
+            device_selector_->setDeviceAvailable(dev_id, false);
+            LOG(WARNING) << "Action: " << context.name() << " down";
+            break;
+        case IBV_EVENT_PORT_ERR:
+        case IBV_EVENT_PORT_ACTIVE: {
+            if (event.element.port_num != context.portNum()) {
+                LOG(INFO) << context.name() << ": ignoring "
+                          << ibv_event_type_str(event.event_type)
+                          << " for port " << event.element.port_num
+                          << " (this context uses port "
+                          << static_cast<int>(context.portNum()) << ")";
+                break;
+            }
+            if (event.event_type == IBV_EVENT_PORT_ERR) {
+                context.pause();
+                // Out of selection and out of the aggregate until the port
+                // returns; its EWMA cannot learn anything while no traffic
+                // flows.
+                device_selector_->setDeviceAvailable(dev_id, false);
+                LOG(WARNING) << "Action: " << context.name() << " down";
+            } else {
+                activateContext(dev_id, context);
+                LOG(WARNING) << "Action: " << context.name() << " up";
+            }
+            break;
+        }
+#ifdef HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE
+        case IBV_EVENT_DEVICE_SPEED_CHANGE:
+            // rdma-core >= 62: a port speed changed without a link flap
+            // (e.g. a VF over LAG losing a PF). Device-level, so the event
+            // names no port; each context opens exactly one, so re-query
+            // that one.
+            refreshLinkSpeed(dev_id, context);
+            break;
+#endif
+        default:
+            break;
+    }
+}
+
+void Workers::activateContext(int dev_id, RdmaContext& context) {
+    context.resume();
+    // The link may have renegotiated while down: re-seed before the device
+    // becomes selectable so no worker scores it on the old rate.
+    refreshLinkSpeed(dev_id, context);
+    if (device_selector_) device_selector_->setDeviceAvailable(dev_id, true);
+}
+
+void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {
+    if (!device_selector_) return;
+    const double before = context.linkSpeedGbps();
+    if (context.refreshPortAttributes() != 0) return;  // already logged
+    const double after = context.linkSpeedGbps();
+    // Both values decode from the same integer encodings, so exact
+    // comparison is meaningful. A speed that can no longer be read (0)
+    // counts as a change: setDeviceBandwidth() then falls back to the
+    // configured default and warns, the same as at startup.
+    if (after == before) return;
+    LOG(WARNING) << context.name() << " link speed " << before << " -> "
+                 << after << " Gbps ("
+                 << (context.effectiveSpeedKnown() ? "effective speed"
+                                                   : "encoded rate")
+                 << "), re-seeding its bandwidth estimate";
+    device_selector_->setDeviceBandwidth(dev_id, after);
 }
 
 void Workers::reclaimEndpoints() {
@@ -829,6 +985,27 @@ void Workers::reclaimEndpoints() {
         // Inert contexts never built an endpoint store.
         auto store = context->endpointStore();
         if (store) store->reclaim();
+    }
+}
+
+void Workers::resumePausedContexts() {
+    for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
+         ++dev_id) {
+        auto& context = transport_->context_set_[dev_id];
+        // Only a paused context is waiting for a recovery event; this also
+        // filters out inert slots, which never leave DEVICE_UNINIT.
+        if (!context || context->status() != RdmaContext::DEVICE_PAUSED)
+            continue;
+        ibv_port_state state;
+        if (context->queryPortState(&state) != 0) continue;  // already logged
+        // Only a fully active port carries traffic. Intermediate states
+        // (INIT/ARMED/ACTIVE_DEFER) mean the link is still settling, so leave
+        // the context paused and re-check on the next tick.
+        if (state != IBV_PORT_ACTIVE) continue;
+        LOG(WARNING) << "Action: " << context->name()
+                     << " up (port reports ACTIVE without an "
+                        "IBV_EVENT_PORT_ACTIVE event)";
+        activateContext(static_cast<int>(dev_id), *context);
     }
 }
 
@@ -847,10 +1024,14 @@ void Workers::monitorThread() {
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
             reclaimEndpoints();
+            // Safety net for a recovery event that never reached us.
+            resumePausedContexts();
             last_reclaim_time = current_time;
         }
 
-        for (auto& context : transport_->context_set_) {
+        for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
+             ++dev_id) {
+            auto& context = transport_->context_set_[dev_id];
             struct epoll_event event;
             if (context->eventFd() < 0) continue;
             int num_events = epoll_wait(context->eventFd(), &event, 1, 100);
@@ -861,7 +1042,7 @@ void Workers::monitorThread() {
             if (num_events == 0) continue;
             if (!(event.events & EPOLLIN)) continue;
             if (event.data.fd == context->nativeContext()->async_fd)
-                handleContextEvents(context);
+                handleContextEvents(static_cast<int>(dev_id), context);
         }
     }
 }
@@ -960,7 +1141,18 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             const auto& list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
-            slice->target_dev_id = list[SimpleRandom::Get().next(list.size())];
+            size_t start = SimpleRandom::Get().next(list.size());
+            slice->target_dev_id = list[start];
+            // Prefer a same-NUMA peer NIC; do not fail if none exist.
+            if (strictLocalNuma()) {
+                for (size_t i = 0; i < list.size(); ++i) {
+                    int tdev = list[(start + i) % list.size()];
+                    if (!target.topo->isCrossNuma(*target.topo_entry, tdev)) {
+                        slice->target_dev_id = tdev;
+                        break;
+                    }
+                }
+            }
             break;
         }
     }
@@ -1009,6 +1201,11 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     }
 
     return Status::OK();
+}
+
+bool Workers::strictLocalNuma() const {
+    return device_selector_ &&
+           device_selector_->getSchedulingParams().strict_local_numa;
 }
 
 int Workers::getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx) {
@@ -1092,6 +1289,9 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         int sdev = getDeviceByFlatIndex(source, src_idx);
         int tdev = getDeviceByFlatIndex(target, dst_idx);
         if (sdev < 0 || sdev >= 64 || (device_mask & (1ULL << sdev)) == 0)
+            continue;
+        if (strictLocalNuma() &&
+            source.topo->isCrossNuma(*source.topo_entry, sdev))
             continue;
         bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
                                       : rail_mon->available(sdev, tdev);

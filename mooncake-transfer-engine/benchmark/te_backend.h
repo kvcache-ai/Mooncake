@@ -63,6 +63,10 @@ class TEBenchRunner : public BenchRunner {
 
     size_t getTargetCount() const;
 
+    size_t getTargetIndex(int thread_id) const {
+        return targetIndex(thread_id);
+    }
+
     uint64_t getTargetSegmentId(int thread_id) const;
 
     uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,

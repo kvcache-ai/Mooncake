@@ -16,6 +16,7 @@
 
 #include "bench_runner.h"
 #include "qos_metrics_adapter.h"
+#include "target_metrics.h"
 #include "te_backend.h"
 #include "workload_config.h"
 #ifdef USE_TENT
@@ -73,6 +74,12 @@ int processBatchSizes(
 
     XferBenchStats stats;
     std::vector<XferBenchStats> qos_stats(qos_classes.size());
+    std::vector<TargetBenchStats> target_stats(runner.getTargetCount());
+    const auto target_names =
+        splitCommaSeparated(XferBenchConfig::target_seg_name);
+    LOG_ASSERT(target_names.size() == target_stats.size());
+    for (size_t i = 0; i < target_stats.size(); ++i)
+        target_stats[i].segment_name = target_names[i];
     XferBenchStats tight_stats;
     XferBenchStats loose_stats;
     std::mutex mutex;
@@ -110,6 +117,7 @@ int processBatchSizes(
         uint64_t target_addr = runner.getTargetBufferBase(
             target_thread_id, address_stride_bytes, 1);
         uint64_t target_id = runner.getTargetSegmentId(target_thread_id);
+        const size_t target_index = runner.getTargetIndex(target_thread_id);
         const bool qos_enabled = !qos_classes.empty();
         const size_t qos_class =
             qos_enabled ? qosClassForThread(qos_classes, thread_id) : 0;
@@ -208,10 +216,23 @@ int processBatchSizes(
             }
         }
         auto total_duration = timer.lap_us();
+        const uint64_t bytes_per_operation = checkedMul(
+            thread_block_size, thread_batch_size, "operation payload size");
+        const uint64_t transferred_bytes =
+            checkedMul(bytes_per_operation, transfer_duration.size(),
+                       "thread transferred bytes");
         std::lock_guard<std::mutex> lock(mutex);
         stats.total_duration.add(total_duration);
         stats.transfer_duration.add(transfer_duration);
         stats.instant_bandwidth.add(thread_instant_bandwidth);
+        auto& target = target_stats[target_index];
+        ++target.threads;
+        target.transferred_bytes =
+            checkedAdd(target.transferred_bytes, transferred_bytes,
+                       "target transferred bytes");
+        target.stats.total_duration.add(total_duration);
+        target.stats.transfer_duration.add(transfer_duration);
+        target.stats.instant_bandwidth.add(thread_instant_bandwidth);
         if (qos_enabled) {
             qos_stats[qos_class].total_duration.add(total_duration);
             qos_stats[qos_class].transfer_duration.add(transfer_duration);
@@ -227,6 +248,18 @@ int processBatchSizes(
     if (rc != 0) return -1;
     if (workload_classes.empty())
         printStats(block_size, batch_size, stats, num_threads);
+    auto target_report = calculateTargetMetrics(
+        block_size, batch_size, num_threads, XferBenchConfig::backend,
+        XferBenchConfig::op_type, &target_stats);
+    if (runner.getTargetCount() > 1) printTargetMetrics(target_report);
+    if (!XferBenchConfig::result_output_jsonl.empty()) {
+        std::string error;
+        if (!appendTargetMetricsJsonl(XferBenchConfig::result_output_jsonl,
+                                      target_report, &error)) {
+            LOG(ERROR) << error;
+            return -1;
+        }
+    }
     if (!qos_classes.empty()) {
         std::vector<uint64_t> bytes_per_operation;
         for (const auto& config : workload_classes) {

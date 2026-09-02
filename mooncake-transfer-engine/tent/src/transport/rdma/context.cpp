@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "ib_link_speed.h"
 #include "tent/common/status.h"
 #include "tent/transport/rdma/endpoint_store.h"
 
@@ -849,7 +850,92 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
 
     native_context_ = context.release();
     lid_ = port_attr.lid;
+    recordPortSpeed(port_attr);
+    queryEffectiveSpeed();
     return 0;
+}
+
+void RdmaContext::recordPortSpeed(const ibv_port_attr& port_attr) {
+    int speed = port_attr.active_speed;
+#ifdef HAVE_IBV_ACTIVE_SPEED_EX
+    // XDR (encoding 256) overflows the uint8_t field above, which then
+    // reads 0; the extended field carries it on rdma-core builds that have
+    // one.
+    if (port_attr.active_speed_ex) speed = port_attr.active_speed_ex;
+#endif
+    active_speed_.store(speed, std::memory_order_relaxed);
+    active_width_.store(port_attr.active_width, std::memory_order_relaxed);
+}
+
+int RdmaContext::refreshPortAttributes() {
+    if (!native_context_) return -1;
+    ibv_port_attr port_attr;
+    if (verbs_.ibv_query_port_default(native_context_, params_->device.port,
+                                      &port_attr)) {
+        PLOG(WARNING) << "Failed to re-query port "
+                      << static_cast<int>(params_->device.port) << " on "
+                      << device_name_;
+        return -1;
+    }
+    recordPortSpeed(port_attr);
+    queryEffectiveSpeed();
+    return 0;
+}
+
+int RdmaContext::queryPortState(ibv_port_state* state) const {
+    if (!state || !native_context_ || !params_) return -1;
+    ibv_port_attr port_attr;
+    if (verbs_.ibv_query_port_default(native_context_, params_->device.port,
+                                      &port_attr)) {
+        PLOG(WARNING) << "Failed to query state of port "
+                      << static_cast<int>(params_->device.port) << " on "
+                      << device_name_;
+        return -1;
+    }
+    // No recordPortSpeed() here on purpose -- see the header.
+    *state = port_attr.state;
+    return 0;
+}
+
+void RdmaContext::queryEffectiveSpeed() {
+    if (!native_context_ || !verbs_.ibv_query_port_speed) {
+        effective_speed_mbps_.store(0, std::memory_order_relaxed);
+        return;
+    }
+    uint64_t speed = 0;
+    int rc = verbs_.ibv_query_port_speed(native_context_, params_->device.port,
+                                         &speed);
+    if (rc != 0) {
+        // Keep the last known value: on a degraded LAG, dropping to the
+        // encoded rate would overstate the port until the next successful
+        // query. Log once per failure episode, not per query.
+        effective_speed_query_failures_.fetch_add(1, std::memory_order_relaxed);
+        if (!effective_speed_query_failing_.exchange(
+                true, std::memory_order_relaxed)) {
+            LOG(WARNING) << "ibv_query_port_speed failed on " << device_name_
+                         << " (rc " << rc << "), keeping "
+                         << effective_speed_mbps_.load(
+                                std::memory_order_relaxed)
+                         << " Mb/s ("
+                         << effective_speed_query_failures_.load(
+                                std::memory_order_relaxed)
+                         << " failures so far)";
+        }
+        return;
+    }
+    if (effective_speed_query_failing_.exchange(false,
+                                                std::memory_order_relaxed)) {
+        LOG(INFO) << "ibv_query_port_speed recovered on " << device_name_;
+    }
+    // The verb reports 100 Mb/s units; store plain Mb/s.
+    effective_speed_mbps_.store(speed * 100, std::memory_order_relaxed);
+}
+
+double RdmaContext::linkSpeedGbps() const {
+    return ibPortSpeedGbps(
+        effective_speed_mbps_.load(std::memory_order_relaxed),
+        active_speed_.load(std::memory_order_relaxed),
+        active_width_.load(std::memory_order_relaxed));
 }
 }  // namespace tent
 }  // namespace mooncake

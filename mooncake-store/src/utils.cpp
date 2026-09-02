@@ -598,22 +598,30 @@ int64_t time_gen() {
         .count();
 }
 
-std::string ResolveMooncakeHostId(const std::string &local_hostname) {
-    const std::string hostname(TrimAsciiWhitespace(local_hostname));
+static bool IsUsableMooncakeHostId(std::string_view host_id) {
+    return !host_id.empty() &&
+           !AsciiCaseInsensitiveEquals(host_id, "localhost") &&
+           host_id != "127.0.0.1" && host_id != "0.0.0.0" && host_id != "::1" &&
+           host_id != "[::1]" && host_id != "::" && host_id != "[::]";
+}
+
+static std::string NormalizeMooncakeHostId(std::string_view value) {
+    const std::string hostname(TrimAsciiWhitespace(value));
     const std::string host_id = (hostname == "::1" || hostname == "::")
                                     ? hostname
                                     : std::string(TrimAsciiWhitespace(
                                           getHostNameWithoutPort(hostname)));
-    if (host_id.empty()) {
-        return "";
+    return IsUsableMooncakeHostId(host_id) ? host_id : "";
+}
+
+std::string ResolveMooncakeHostId(const std::string &local_hostname) {
+    const std::string configured_host_id(
+        TrimAsciiWhitespace(Environ::GetString("MOONCAKE_HOST_ID", "")));
+    if (!configured_host_id.empty()) {
+        return NormalizeMooncakeHostId(configured_host_id);
     }
 
-    if (AsciiCaseInsensitiveEquals(host_id, "localhost") ||
-        host_id == "127.0.0.1" || host_id == "0.0.0.0" || host_id == "::1" ||
-        host_id == "[::1]" || host_id == "::" || host_id == "[::]") {
-        return "";
-    }
-    return host_id;
+    return NormalizeMooncakeHostId(local_hostname);
 }
 
 static std::string SanitizeKey(const std::string &key) {

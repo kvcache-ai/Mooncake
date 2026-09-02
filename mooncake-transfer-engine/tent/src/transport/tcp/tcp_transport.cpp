@@ -242,7 +242,7 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(
                     std::min(static_cast<uint64_t>(100), delay_ms - i)));
             }
-            delay_ms = std::min(delay_ms * 2, params_.retry_max_delay_ms);
+            delay_ms = nextTcpRetryDelay(delay_ms, params_.retry_max_delay_ms);
         }
 
         if (task->request.opcode == Request::WRITE) {
