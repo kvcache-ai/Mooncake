@@ -536,7 +536,7 @@ int DummyClient::put_parts(const std::string& key,
 
 int DummyClient::remove(const std::string& key, bool force) {
     return to_py_ret(
-        invoke_rpc<&RealClient::remove_internal, void>(key, force));
+        invoke_rpc<&RealClient::remove_internal_rpc, void>(key, force));
 }
 
 long DummyClient::removeByRegex(const std::string& str, bool force) {
@@ -559,7 +559,7 @@ int DummyClient::removeLocal(const std::string& key) {
 }
 
 int DummyClient::isExist(const std::string& key) {
-    auto result = invoke_rpc<&RealClient::isExist_internal, bool>(key);
+    auto result = invoke_rpc<&RealClient::isExist_internal_rpc, bool>(key);
 
     if (result.has_value()) {
         return *result ? 1 : 0;  // 1 if exists, 0 if not
@@ -589,7 +589,7 @@ std::vector<int> DummyClient::batchIsExist(
 }
 
 int64_t DummyClient::getSize(const std::string& key) {
-    return to_py_ret(invoke_rpc<&RealClient::getSize_internal, int64_t>(key));
+    return to_py_ret(invoke_rpc<&RealClient::getSize_internal_rpc, int64_t>(key));
 }
 
 std::shared_ptr<BufferHandle> DummyClient::get_buffer(

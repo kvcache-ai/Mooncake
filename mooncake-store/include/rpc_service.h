@@ -29,7 +29,14 @@ class WrappedMasterService {
 
     uint16_t GetHttpPort() const { return http_server_.port(); }
 
-    tl::expected<bool, ErrorCode> ExistKey(std::string_view key);
+    tl::expected<bool, ErrorCode> ExistKeyInternal(std::string_view key);
+
+    // Bypass (out-of-band attachment) RPC handler for single-key exist. Log the
+    // per-request request_id read from the coro_rpc attachment (set client-side
+    // via invoke_rpc), delegate to the value-returning ExistKeyInternal (shared
+    // with in-process tests), and reply via ctx.response_msg.
+    void ExistKey(coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+                 std::string_view key);
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
@@ -86,8 +93,16 @@ class WrappedMasterService {
         const GetReplicaListRequestConfig& config =
             GetReplicaListRequestConfig());
 
-    tl::expected<void, ErrorCode> Remove(std::string_view key,
+    tl::expected<void, ErrorCode> RemoveInternal(std::string_view key,
                                          bool force = false);
+
+    // Bypass (out-of-band attachment) RPC handler for single-key remove. Log
+    // the per-request request_id read from the coro_rpc attachment, delegate to
+    // the value-returning RemoveInternal (shared with in-process tests), and
+    // reply via ctx.response_msg.
+    void Remove(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+                std::string_view key, bool force = false);
+
 
     tl::expected<long, ErrorCode> RemoveByRegex(std::string_view str,
                                                 bool force = false);

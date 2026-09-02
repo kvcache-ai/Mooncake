@@ -201,13 +201,31 @@ WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
 }
 
-tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
+tl::expected<bool, ErrorCode> WrappedMasterService::ExistKeyInternal(
     std::string_view key) {
     return execute_rpc(
         "ExistKey", [&] { return GetMasterService().ExistKey(key); },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_exist_key_requests(); },
         [] { MasterMetricManager::instance().inc_exist_key_failures(); });
+}
+
+void
+WrappedMasterService::ExistKey(coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+                               std::string_view key) {
+    // Bypass: the per-request request_id rides the out-of-band request
+    // attachment (set client-side from g_current_ctx via
+    // send_request_with_attachment). Log it here, then delegate to the
+    // value-returning ExistKeyInternal (also used in-process by tests) and
+    // reply via ctx.response_msg.
+    if (auto att = ctx.get_context_info()->get_request_attachment();
+        !att.empty()) {
+        VLOG(1) << "ExistKey request_id=" << att;
+        RecordObservedRequestId(att);
+    }
+
+    auto result = ExistKeyInternal(key);
+    ctx.response_msg(std::move(result));
 }
 
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKeyInternal(
@@ -360,13 +378,29 @@ WrappedMasterService::BatchGetReplicaListInternal(
     return results;
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::Remove(std::string_view key,
+tl::expected<void, ErrorCode> WrappedMasterService::RemoveInternal(std::string_view key,
                                                            bool force) {
     return execute_rpc(
         "Remove", [&] { return GetMasterService().Remove(key, force); },
         [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
         [] { MasterMetricManager::instance().inc_remove_requests(); },
         [] { MasterMetricManager::instance().inc_remove_failures(); });
+}
+
+void
+WrappedMasterService::Remove(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+                             std::string_view key, bool force) {
+    // Bypass: see ExistKey. Log the per-request request_id from the attachment,
+    // delegate to RemoveInternal (shared with in-process tests), reply via
+    // ctx.response_msg.
+    if (auto att = ctx.get_context_info()->get_request_attachment();
+        !att.empty()) {
+        VLOG(1) << "Remove request_id=" << att;
+        RecordObservedRequestId(att);
+    }
+
+    auto result = RemoveInternal(key, force);
+    ctx.response_msg(std::move(result));
 }
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(

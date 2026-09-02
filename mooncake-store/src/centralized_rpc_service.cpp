@@ -94,7 +94,7 @@ void WrappedCentralizedMasterService::init_centralized_http_server() {
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-WrappedCentralizedMasterService::PutStart(const UUID& client_id,
+WrappedCentralizedMasterService::PutStartInternal(const UUID& client_id,
                                           const std::string& key,
                                           const uint64_t slice_length,
                                           const ReplicateConfig& config) {
@@ -114,6 +114,28 @@ WrappedCentralizedMasterService::PutStart(const UUID& client_id,
         [] {
             CentralizedMasterMetricManager::instance().inc_put_start_failures();
         });
+}
+
+void
+WrappedCentralizedMasterService::PutStart(
+    coro_rpc::context<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        ctx,
+    const UUID& client_id, const std::string& key,
+    const uint64_t slice_length, const ReplicateConfig& config) {
+    // Bypass: log the per-request request_id carried in the out-of-band
+    // attachment (set client-side by invoke_rpc via
+    // send_request_with_attachment), delegate to the value-returning
+    // PutStartInternal (shared with in-process tests), and reply via
+    // ctx.response_msg.
+    if (auto att = ctx.get_context_info()->get_request_attachment();
+        !att.empty()) {
+        VLOG(1) << "PutStart request_id=" << att;
+        RecordObservedRequestId(att);
+    }
+
+    auto result = PutStartInternal(client_id, key, slice_length, config);
+    ctx.response_msg(std::move(result));
 }
 
 tl::expected<void, ErrorCode> WrappedCentralizedMasterService::PutEnd(

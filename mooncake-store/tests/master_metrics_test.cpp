@@ -202,7 +202,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     // Test PutStart and PutRevoke request
     auto put_start_result1 =
-        service_.PutStart(client_id, key, value_length, config);
+        service_.PutStartInternal(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result1.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
@@ -221,7 +221,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     // Test PutStart and PutEnd request
     auto put_start_result2 =
-        service_.PutStart(client_id, key, value_length, config);
+        service_.PutStartInternal(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
@@ -239,7 +239,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
 
     // Test ExistKey request
-    auto exist_result = service_.ExistKey(key);
+    auto exist_result = service_.ExistKeyInternal(key);
     ASSERT_TRUE(exist_result.has_value() && exist_result.value());
     ASSERT_EQ(metrics.get_exist_key_requests(), 1);
     ASSERT_EQ(metrics.get_exist_key_failures(), 0);
@@ -253,7 +253,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // Test Remove request
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl));
-    auto remove_result = service_.Remove(key);
+    auto remove_result = service_.RemoveInternal(key);
     ASSERT_TRUE(remove_result.has_value());
     ASSERT_EQ(metrics.get_remove_requests(), 1);
     ASSERT_EQ(metrics.get_remove_failures(), 0);
@@ -263,7 +263,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     // Test RemoveAll request
     auto put_start_result3 =
-        service_.PutStart(client_id, key, value_length, config);
+        service_.PutStartInternal(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result3.has_value());
     auto put_end_result2 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
@@ -277,7 +277,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     // Test UnmountSegment request
     auto put_start_result4 =
-        service_.PutStart(client_id, key, value_length, config);
+        service_.PutStartInternal(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result4.has_value());
     auto put_end_result3 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result3.has_value());
@@ -345,7 +345,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     auto put_start_result1 =
-        service_.PutStart(client_id, key, value_length, config);
+        service_.PutStartInternal(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result1.has_value());
     auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result1.has_value());
@@ -368,7 +368,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl));
-    auto remove_result = service_.Remove(key);
+    auto remove_result = service_.RemoveInternal(key);
     ASSERT_TRUE(remove_result.has_value());
 }
 

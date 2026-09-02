@@ -12,9 +12,22 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
     // Initialize centralized-specific HTTP handlers
     void init_centralized_http_server();
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStartInternal(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config);
+
+    // Bypass (out-of-band attachment) RPC handler for single-key put-start.
+    // Mirrors BatchPutStart: log the per-request request_id from the coro_rpc
+    // attachment (set client-side by invoke_rpc), delegate to the value-returning
+    // PutStartInternal (shared with in-process tests), and reply via
+    // ctx.response_msg.
+    void PutStart(
+        coro_rpc::context<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+            ctx,
+        const UUID& client_id, const std::string& key,
+        const uint64_t slice_length, const ReplicateConfig& config);
+
 
     tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
                                          const std::string& key,
