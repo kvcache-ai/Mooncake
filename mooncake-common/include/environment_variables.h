@@ -44,6 +44,15 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct LocalHotCacheEnvironmentVariables {
+    // Keep these values as strings to preserve their existing per-setting
+    // parsing, fallback, and logging behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_LOCAL_HOT_CACHE_SIZE);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_LOCAL_HOT_BLOCK_SIZE);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_LOCAL_HOT_CACHE_USE_SHM);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD);
+};
+
 struct ClientMetricEnvironmentVariables {
     // Keep these values as strings because ClientMetricConfig preserves the
     // existing per-setting fallback and logging behavior.
