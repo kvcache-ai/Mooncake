@@ -13,31 +13,53 @@ The capabilities are independent:
 | logical object write/read/query/delete | `NofObjectWrite`, `NofObjectRead`, `NofObjectQuery`, `NofObjectDelete` | provider object APIs with namespaces and native manifests |
 | physical object write/read/query/delete | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | complete-object APIs whose opaque layout locator is owned by the executor |
 | route-authoritative physical recovery | `NofPhysicalRecovery` | rebuild an allocator-backed executor from live `nof_backing` locators without a second metadata journal |
-| external logical metadata | `NofExternalMetadata` | typed NoF get/list/CAS over the existing `MetadataBackend` |
 | backing health | `NofHealth` | liveness and optional capacity without claiming storage or device ownership |
 | storage maintenance | `NofStorageManagement` | optional physical inventory and capacity contract for Mooncake-managed backings |
-| device lifecycle | `NofDeviceManagement` | provider-supported health and device lifecycle integration |
 
 Capability absence is authoritative. It means the provider owns the responsibility internally or
 does not expose it through a supported API. Mooncake does not infer capabilities from a mode name
 and does not emulate a missing SDK function with an undocumented CLI or private service API.
 
 `NofBackend` is the single public facade. It contains an `Arc<dyn NofBacking>`, validates advertised
-logical-object limits, holds the shared physical key codec/domain, performs provider-neutral shard
-planning and optionally composes `NofExternalMetadata`. Physical request geometry and batching stay
-inside the selected executor. A backing may expose object I/O, physical I/O, health or
-management-only capabilities without creating another framework branch.
+logical-object limits, holds the shared physical key codec/domain and performs provider-neutral
+shard planning. Physical request geometry and batching stay inside the selected executor. A
+backing may expose object I/O, physical I/O, health or management-only capabilities without
+creating another framework branch.
+
+`NofExternalMetadata` is a typed extension of Mooncake's existing `MetadataBackend`, not an
+executor capability. The Cold Tier runtime always owns route CAS and injects that shared metadata
+service directly; putting another metadata accessor on `NofBacking` would create a second,
+unused route-metadata entry point.
 
 The current KVCS mapping is:
 
 | `MOONCAKE_KVCS_MODE` | Exposed data-plane traits | External metadata | Health/management traits |
 | --- | --- | --- | --- |
 | `standard` | object read/write/query/delete | absent; KVCS owns namespace and manifest metadata | absent; EFC owns physical maintenance and disks |
-| `low-level` (default) | physical read/write/query/delete | composed from Mooncake's existing metadata backend by the runtime binding | query-backed `NofHealth`; storage/device management absent because EFC owns them |
+| `low-level` (default) | physical read/write/query/delete | composed from Mooncake's existing metadata backend by the runtime binding | query-backed `NofHealth`; storage management absent because EFC owns it |
 
 Both modes use one `KvcsCapiExecutor`. Mode selection initializes only the corresponding SDK
 client configuration and controls which `NofBacking` capability accessors return `Some`. Calling a
 trait from the wrong mode is rejected; it never silently crosses into the other SDK API.
+
+## Object splitting and batch splitting
+
+These are separate layers and must not be substituted for each other:
+
+- **Object splitting** maps one logical value to one or more persistent records. Cold Tier's
+  provider-neutral `ValueChunkPlan` computes only ordered byte ranges. Standard mode uses it in
+  `NofBackend` to form native KVCS shards. KVCS Low-Level uses the same range planner inside its
+  executor-owned physical layout only above its configured value limit, then adds KVCS-only chunk
+  keys and an opaque locator. Low-Level defaults to 3 GiB; values at or below the effective limit
+  take the normal one-key, one-record inline path. An extent executor may reuse the range primitive
+  where useful, but keeps its own alignment, extent and locator rules.
+- **Batch splitting** limits how many already-planned records are submitted at once. KVCS 0.4.0
+  documents `max_keys_per_batch` as its internal ring chunk size and explicitly auto-splits larger
+  user batches in both Standard and Low-Level modes. Mooncake therefore sends one positional C API
+  batch (subject to the C `int` count bound) and does not duplicate the SDK's 256-item loop.
+
+Each data plane performs object splitting exactly once. Removing Mooncake's redundant SDK batch
+loop does not remove object chunking or its persisted layout metadata.
 
 ## Persisted backing metadata
 
@@ -80,12 +102,13 @@ or opt it into local-disk maintenance.
 physical maintenance to Mooncake. Its storage health feeds the existing backend health and
 management classification; the provider-specific backend must supply exhaustive inventory before
 physical reconciliation can be enabled. If the capability is absent, the provider owns orphan
-collection, watermarks and compaction. `NofDeviceManagement` is evaluated independently. KVCS
-exposes neither management trait because its public 0.4.0 client ABI does not provide those
-operations, so no KVCS path runs Mooncake physical inventory or watermark maintenance. KVCS
-Low-Level does expose `NofHealth`: it sends a side-effect-free existence query to the selected
-mountpoint from the background heartbeat worker, while leaving capacity unknown because the SDK
-has no capacity API.
+collection, watermarks and compaction. KVCS does not expose storage management because its public
+0.4.0 client ABI does not provide those operations, so no KVCS path runs Mooncake physical
+inventory or watermark maintenance. KVCS Low-Level does expose `NofHealth`: it sends a
+side-effect-free existence query to the selected mountpoint from the background heartbeat worker,
+while leaving capacity unknown because the SDK has no capacity API. Provider device lifecycle
+stays below the SDK until a supported lifecycle API exists; a health-only duplicate of
+`NofHealth` is not modeled as device management.
 
 `StoreClientBuilder::nof_target(s)` registers the runtime backends. The binding reuses the existing
 Cold Tier state machine in this order: select target, publish `PendingWrite`, enqueue, pin/read the
@@ -387,12 +410,18 @@ SDK modes:
 | `MOONCAKE_KVCS_REDIS_ENDPOINTS` | Standard | comma-separated Redis endpoints such as `tcp://host:6379` |
 | `MOONCAKE_KVCS_REDIS_PASSWORD` | Standard | optional Redis password |
 | `MOONCAKE_KVCS_MOUNTPOINT_INDEX` | Low-Level | provider mountpoint index; unset or `0` selects the default filesystem |
+| `MOONCAKE_KVCS_MAX_VALUE_SIZE` | both | effective SDK raw-value limit in bytes; unset uses the SDK 0.4.0 default of 4 MiB; accepted range is 1 byte through the SDK maximum 4 GiB |
 
-Mooncake does not create a parallel tuning surface for SDK worker counts, ring depth, value/key
-limits, logging, metrics or performance reporting. Those `kvcs_*_config_t` fields are left at the
-public ABI's documented zero values, so the SDK owns its defaults. The KVCS executor applies the
-documented 4 MiB raw value, 256-byte raw key and 256-item batch defaults internally; the shared NoF
-backend does not reinterpret executor geometry or split its batches.
+The 0.4.0 ABI has no post-construction getter for the effective value limit: it is an input in
+`kvcs_client_config_t.max_value_size` and `kvcs_ll_config_t.max_value_size`. The executor therefore
+resolves one runtime value, validates it against the documented 4 GiB SDK maximum, passes that
+exact value into SDK client creation, and reuses the same value for object layout and validation.
+It does not keep a second Mooncake-only limit. A deployment whose Low-Level SDK clients are sized
+for 3 GiB values sets `MOONCAKE_KVCS_MAX_VALUE_SIZE=3221225472`; that value then controls both the
+real SDK client's ring sizing and Mooncake's no-object-split fast path. The deployment-specific
+3 GiB value is not compiled into Mooncake. Other worker-count, ring-depth, key-limit, logging,
+metrics and performance fields remain at the public ABI's documented zero values so the SDK owns
+their defaults.
 
 The vendor's top-level `env.sh` assigns `KVCS_SDK_ROOT` as a shell variable but does not export it,
 and `mock/env.sh` configures the vendor Rust wrapper through `KVCS_DYNAMIC`. Mooncake does not read

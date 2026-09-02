@@ -735,6 +735,9 @@ impl ColdTierDeviceManager {
     /// Unknown/dynamic backends retain the historical Mooncake-managed behavior. Registered
     /// provider-managed backends explicitly opt out of automatic physical maintenance.
     pub(in super::super) fn mooncake_manages_storage(&self, cold_tier_id: &str) -> bool {
+        if let Some(managed) = self.nof_targets.mooncake_manages_storage(cold_tier_id) {
+            return managed;
+        }
         !matches!(
             self.resolver.lock().storage_management(cold_tier_id),
             Some(super::super::PersistentStorageManagement::BackendManaged)

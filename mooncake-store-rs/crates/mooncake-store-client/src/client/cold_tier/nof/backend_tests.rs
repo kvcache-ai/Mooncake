@@ -30,6 +30,7 @@ fn object_state_map_preserves_provider_state() {
 
 struct RecordingObjectBacking {
     shards: Mutex<Vec<(u32, u32, usize)>>,
+    batches: Mutex<Vec<usize>>,
     expose_query: bool,
 }
 
@@ -82,6 +83,7 @@ impl NofObjectWrite for RecordingObjectBacking {
     }
 
     fn put_shards(&self, requests: &[NofObjectShardWrite<'_>]) -> Vec<Result<()>> {
+        self.batches.lock().unwrap().push(requests.len());
         self.shards.lock().unwrap().extend(
             requests
                 .iter()
@@ -123,6 +125,7 @@ impl NofObjectDelete for RecordingObjectBacking {
 fn recording_backend(expose_query: bool) -> (Arc<RecordingObjectBacking>, NofBackend) {
     let backing = Arc::new(RecordingObjectBacking {
         shards: Mutex::new(Vec::new()),
+        batches: Mutex::new(Vec::new()),
         expose_query,
     });
     let backend = NofBackend::new(backing.clone()).unwrap();
@@ -149,6 +152,15 @@ fn object_backing_uses_native_zero_based_shards() {
 }
 
 #[test]
+fn object_chunking_does_not_duplicate_provider_batch_splitting() {
+    let (backing, backend) = recording_backend(false);
+    let scope = NamespaceScope::new("tenant", "domain", "set");
+    backend.put_object(&scope, "key", &[0; 1028]).unwrap();
+    assert_eq!(*backing.batches.lock().unwrap(), vec![257]);
+    assert_eq!(backing.shards.lock().unwrap().len(), 257);
+}
+
+#[test]
 fn object_query_is_an_optional_post_write_capability() {
     let (_, backend) = recording_backend(false);
     let scope = NamespaceScope::new("tenant", "domain", "set");
@@ -163,16 +175,6 @@ fn object_query_is_an_optional_post_write_capability() {
         backend.query_object(&scope, "key"),
         Err(StoreError::Unsupported(message)) if message.contains("query")
     ));
-}
-
-#[test]
-fn external_metadata_is_composed_explicitly() {
-    let (_, backend) = recording_backend(false);
-    assert!(backend.metadata().is_none());
-
-    let metadata = Arc::new(mooncake_metadata::InMemoryMetadataBackend::new());
-    let backend = backend.external_metadata(metadata);
-    assert!(backend.metadata().is_some());
 }
 
 #[test]

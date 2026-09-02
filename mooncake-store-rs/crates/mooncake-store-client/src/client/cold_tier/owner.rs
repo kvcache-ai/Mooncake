@@ -96,16 +96,6 @@ impl NofRuntimeTarget {
                     "NoF target excluded after consecutive heartbeat failures"
                 );
             }
-            (_, failures)
-                if failures > TARGET_HEARTBEAT_FAILURE_THRESHOLD && failures % 10 == 0 =>
-            {
-                tracing::warn!(
-                    target_id,
-                    failures,
-                    error = ?health.last_error,
-                    "NoF target heartbeat is still failing"
-                );
-            }
             _ => {}
         }
     }
@@ -215,12 +205,19 @@ impl NofOwnerState {
         if self.released.load(Ordering::Acquire) {
             return;
         }
-        for target_id in self.locally_owned_target_ids() {
-            if let Some(target) = self.targets.get(&target_id) {
-                target.heartbeat(&target_id);
-            }
-        }
-        self.publish_unhealthy_targets();
+        let unhealthy = self
+            .locally_owned_target_ids()
+            .into_iter()
+            .filter(|target_id| {
+                let target = self
+                    .targets
+                    .get(target_id)
+                    .expect("ownership only contains registered NoF targets");
+                target.heartbeat(target_id);
+                target.health_snapshot().is_err()
+            })
+            .collect();
+        self.publish_unhealthy_targets(unhealthy);
     }
 
     pub(super) fn owner_for(&self, target_id: &str) -> Option<ClientRuntimeId> {
@@ -264,16 +261,7 @@ impl NofOwnerState {
             .health_snapshot()
     }
 
-    fn publish_unhealthy_targets(&self) {
-        let unhealthy = self
-            .locally_owned_target_ids()
-            .into_iter()
-            .filter(|target_id| {
-                self.targets
-                    .get(target_id)
-                    .is_some_and(|target| target.health_snapshot().is_err())
-            })
-            .collect::<BTreeSet<_>>();
+    fn publish_unhealthy_targets(&self, unhealthy: BTreeSet<String>) {
         if self.published_unhealthy_targets.lock().as_ref() == Some(&unhealthy) {
             return;
         }
@@ -384,10 +372,6 @@ pub(in crate::client) fn upsert_client_lease_preserving_nof_labels(
 }
 
 fn set_unhealthy_target_label(lease: &mut ClientLease, unhealthy: &BTreeSet<String>) {
-    if unhealthy.is_empty() {
-        lease.endpoints.labels.remove(NOF_UNHEALTHY_TARGETS_LABEL);
-        return;
-    }
     let encoded =
         serde_json::to_string(unhealthy).expect("serializing a set of NoF target IDs cannot fail");
     lease
@@ -419,11 +403,8 @@ fn remote_unhealthy_targets(
                 return None;
             }
             match unhealthy_by_owner.get(owner) {
-                Some(Some(Ok(unhealthy))) if unhealthy.contains(target_id) => {
-                    Some(target_id.clone())
-                }
-                Some(Some(Err(_))) => Some(target_id.clone()),
-                _ => None,
+                Some(Some(Ok(unhealthy))) if !unhealthy.contains(target_id) => None,
+                _ => Some(target_id.clone()),
             }
         })
         .collect()
@@ -465,24 +446,18 @@ fn assign_target_owners<'a>(
     leases: &[ClientLease],
     target_set_fingerprint: &str,
 ) -> BTreeMap<String, ClientRuntimeId> {
-    let mut newest_by_stable = BTreeMap::<String, &ClientLease>::new();
-    for lease in leases.iter().filter(|lease| {
-        lease.state == ClientLifecycleState::Active
-            && lease
-                .endpoints
-                .labels
-                .get(NOF_TARGET_SET_LABEL)
-                .is_some_and(|value| value == target_set_fingerprint)
-    }) {
-        let stable_id = lease.runtime.stable_id.0.clone();
-        if newest_by_stable
-            .get(&stable_id)
-            .is_none_or(|current| lease.runtime.epoch > current.runtime.epoch)
-        {
-            newest_by_stable.insert(stable_id, lease);
-        }
-    }
-    let candidates = newest_by_stable.into_values().collect::<Vec<_>>();
+    // LiveClientCache already removes expired leases and older active epochs.
+    let candidates = leases
+        .iter()
+        .filter(|lease| {
+            lease.state == ClientLifecycleState::Active
+                && lease
+                    .endpoints
+                    .labels
+                    .get(NOF_TARGET_SET_LABEL)
+                    .is_some_and(|value| value == target_set_fingerprint)
+        })
+        .collect::<Vec<_>>();
     target_ids
         .filter_map(|target_id| {
             candidates
@@ -507,6 +482,7 @@ fn assign_target_owners<'a>(
         .collect()
 }
 
+#[derive(Default)]
 pub(super) struct NofHeartbeatMonitor {
     shutdown: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
@@ -514,10 +490,7 @@ pub(super) struct NofHeartbeatMonitor {
 
 impl NofHeartbeatMonitor {
     pub(super) fn disabled() -> Self {
-        Self {
-            shutdown: None,
-            thread: None,
-        }
+        Self::default()
     }
 
     pub(super) fn start(state: Arc<NofOwnerState>) -> Result<Self> {
@@ -812,7 +785,7 @@ mod tests {
         }
         state.release();
         *state.published_unhealthy_targets.lock() = None;
-        state.publish_unhealthy_targets();
+        state.publish_unhealthy_targets(BTreeSet::new());
         let released = metadata
             .get_client_lease(&runtime)
             .expect("released lease lookup should succeed")
@@ -830,17 +803,12 @@ mod tests {
             .endpoints
             .labels
             .contains_key(NOF_TARGET_SET_LABEL));
-        assert!(!metadata
-            .get_client_lease(&runtime)
-            .unwrap()
-            .unwrap()
+        let persisted = metadata.get_client_lease(&runtime).unwrap().unwrap();
+        assert!(!persisted
             .endpoints
             .labels
             .contains_key(NOF_UNHEALTHY_TARGETS_LABEL));
-        assert!(!metadata
-            .get_client_lease(&runtime)
-            .unwrap()
-            .unwrap()
+        assert!(!persisted
             .endpoints
             .labels
             .contains_key(NOF_TARGET_SET_LABEL));
@@ -888,8 +856,25 @@ mod tests {
 
         let owners = BTreeMap::from([(target_id.clone(), runtime)]);
         let remote_runtime = owner_lease("client-b", 1, "same-target-set").runtime;
+        assert!(remote_unhealthy_targets(
+            &owners,
+            std::slice::from_ref(&published),
+            &remote_runtime
+        )
+        .contains(&target_id));
+
+        let mut unknown = published.clone();
+        unknown.endpoints.labels.remove(NOF_UNHEALTHY_TARGETS_LABEL);
         assert!(
-            remote_unhealthy_targets(&owners, &[published], &remote_runtime).contains(&target_id)
+            remote_unhealthy_targets(&owners, &[unknown.clone()], &remote_runtime)
+                .contains(&target_id)
+        );
+        unknown.endpoints.labels.insert(
+            NOF_UNHEALTHY_TARGETS_LABEL.to_string(),
+            "not-json".to_string(),
+        );
+        assert!(
+            remote_unhealthy_targets(&owners, &[unknown], &remote_runtime).contains(&target_id)
         );
     }
 }

@@ -2,13 +2,12 @@
 
 use mooncake_store_core::{ColdBackingRoute, Result, StoreError};
 
-use super::external_metadata::NofExternalMetadata;
 use super::object::{
     NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead, NofObjectWrite,
 };
 use super::physical::{
-    NofDeviceManagement, NofHealth, NofPhysicalDelete, NofPhysicalQuery, NofPhysicalRead,
-    NofPhysicalRecovery, NofPhysicalWrite, NofStorageManagement,
+    NofHealth, NofPhysicalDelete, NofPhysicalQuery, NofPhysicalRead, NofPhysicalRecovery,
+    NofPhysicalWrite, NofStorageManagement,
 };
 
 /// Runtime NoF backing assembled from optional, provider-neutral capabilities.
@@ -58,19 +57,11 @@ pub trait NofBacking: Send + Sync {
         None
     }
 
-    fn metadata(&self) -> Option<&dyn NofExternalMetadata> {
-        None
-    }
-
     fn health_capability(&self) -> Option<&dyn NofHealth> {
         None
     }
 
     fn storage_management(&self) -> Option<&dyn NofStorageManagement> {
-        None
-    }
-
-    fn device_management(&self) -> Option<&dyn NofDeviceManagement> {
         None
     }
 }

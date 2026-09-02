@@ -7,23 +7,20 @@ use crate::client::{PersistentStorageBackendHealth, PersistentStorageManagement}
 
 use super::backing::NofBacking;
 use super::ensure_batch_len;
-use super::external_metadata::NofExternalMetadata;
 use super::object::{
     NofObject, NofObjectLimits, NofObjectMetadata, NofObjectShardWrite, NofObjectState,
 };
 
 /// Unified NoF facade and capability container.
 ///
-/// A backing may expose logical-object I/O, physical-KV I/O, external metadata, storage
-/// health, maintenance and device management independently. The facade never infers one
-/// capability from another.
+/// A backing may expose logical-object I/O, physical-KV I/O, health and storage maintenance
+/// independently. The facade never infers one capability from another.
 #[derive(Clone)]
 pub struct NofBackend {
     pub(crate) backing: Arc<dyn NofBacking>,
     pub(crate) object_limits: Option<NofObjectLimits>,
     pub(crate) key_codec: Arc<dyn PhysicalKeyCodec>,
     pub(crate) key_domain: Vec<u8>,
-    external_metadata: Option<Arc<dyn NofExternalMetadata>>,
 }
 
 impl NofBackend {
@@ -46,19 +43,7 @@ impl NofBackend {
             object_limits,
             key_codec: Arc::new(Sha256PhysicalKeyCodec),
             key_domain: b"mooncake:nof:physical:v1".to_vec(),
-            external_metadata: None,
         })
-    }
-
-    pub fn external_metadata(mut self, metadata: Arc<dyn NofExternalMetadata>) -> Self {
-        self.external_metadata = Some(metadata);
-        self
-    }
-
-    pub fn metadata(&self) -> Option<&dyn NofExternalMetadata> {
-        self.external_metadata
-            .as_deref()
-            .or_else(|| self.backing.metadata())
     }
 
     pub fn key_codec(mut self, codec: Arc<dyn PhysicalKeyCodec>) -> Self {
@@ -90,8 +75,6 @@ impl NofBackend {
             storage.storage_health()?.validate(true)?
         } else if let Some(health) = self.backing.health_capability() {
             health.health()?.validate(false)?
-        } else if let Some(devices) = self.backing.device_management() {
-            devices.device_health()?.validate(false)?
         } else {
             Default::default()
         };
