@@ -570,11 +570,13 @@ impl StorageOwnerState {
             None => local_hot_replica_checksum(&self.allocator, &self.state, route, replica)?,
         };
         if let Some(backing) = self.cold_tier_devices.nof_targets.discover_backing(route)? {
-            if self.cold_tier_devices.nof_targets.verify_backing(
-                &backing,
-                replica.length,
-                checksum,
-            )? {
+            if backing.length == replica.length
+                && backing.checksum == Some(checksum)
+                && self
+                    .cold_tier_devices
+                    .nof_targets
+                    .has_required_copies(&backing)
+            {
                 return Ok(Some(route.clone()));
             }
         }
@@ -596,14 +598,7 @@ impl StorageOwnerState {
         self.cold_tier_devices
             .nof_targets
             .put_selected(&target, payload.as_slice())?;
-        let Some(backing) = self.cold_tier_devices.nof_targets.discover_backing(route)? else {
-            return Ok(None);
-        };
-        Ok(self
-            .cold_tier_devices
-            .nof_targets
-            .verify_backing(&backing, replica.length, checksum)?
-            .then_some(route.clone()))
+        Ok(Some(route.clone()))
     }
 
     fn publish_pending_cold_backing_for_eviction(

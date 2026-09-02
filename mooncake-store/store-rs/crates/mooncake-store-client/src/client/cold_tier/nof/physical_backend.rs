@@ -3,10 +3,7 @@
 use mooncake_store_core::{ColdBackingRoute, ColdBackingState, Result, StoreError};
 
 use crate::client::cold_tier::layout::{derive_physical_key, OpaquePhysicalKey, PhysicalKeyInput};
-use crate::client::{
-    ColdObjectWrite, PersistentObjectProbe, PersistentStorageBackend,
-    PersistentStorageBackendHealth,
-};
+use crate::client::{ColdObjectWrite, PersistentStorageBackend, PersistentStorageBackendHealth};
 
 use super::backend::NofBackend;
 use super::backing::validate_payload;
@@ -151,24 +148,6 @@ impl PersistentStorageBackend for NofPhysicalStorageBackend {
             }
         }
         Ok(value)
-    }
-
-    fn probe_object(
-        &self,
-        cold_backing: &ColdBackingRoute,
-    ) -> Result<Option<PersistentObjectProbe>> {
-        let Some(query) = self.target.backing.physical_query() else {
-            return Ok(self
-                .get_object(cold_backing)?
-                .map(|value| PersistentObjectProbe {
-                    length: Some(value.len() as u64),
-                }));
-        };
-        let found = one_batch_result(
-            "physical query",
-            query.query_batch(&[self.request(cold_backing)?]),
-        )?;
-        Ok(found.then_some(PersistentObjectProbe { length: None }))
     }
 
     fn delete_object(&self, cold_backing: &ColdBackingRoute) -> Result<bool> {

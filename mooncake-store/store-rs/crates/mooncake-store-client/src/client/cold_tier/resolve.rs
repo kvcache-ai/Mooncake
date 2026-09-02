@@ -7,7 +7,7 @@ use mooncake_store_core::ColdTierDeviceState;
 use std::collections::{BTreeSet, VecDeque};
 
 pub(in super::super) fn resolved_uses_cold_backing(entry: &ResolvedObject) -> bool {
-    (entry.transient_backing.is_some() || materialized_cold_backing(&entry.route).is_some())
+    (entry.transient_nof_read.is_some() || materialized_cold_backing(&entry.route).is_some())
         && (entry.route.replicas.is_empty() || entry.replica.segment_name.0 == "__cold_backing__")
 }
 
@@ -81,18 +81,24 @@ impl StoreClient {
                 "tenant={tenant} key={logical_key} has no readable replica owner"
             )));
         }
-        let transient_backing = if materialized_cold_backing(&route).is_none() {
-            self.storage_owner
+        if materialized_cold_backing(&route).is_none() {
+            if let Some((backing, payload)) = self
+                .storage_owner
                 .cold_tier_devices
                 .nof_targets
-                .discover_backing(&route)?
-        } else {
-            None
-        };
-        let Some(mut cold_backing) = transient_backing
-            .clone()
-            .or_else(|| materialized_cold_backing(&route))
-        else {
+                .read_backing(&route)?
+            {
+                return Ok(ResolvedObject {
+                    tenant: tenant.to_string(),
+                    key: logical_key.to_string(),
+                    route,
+                    replica: cold_backing_placeholder(&backing),
+                    fallback_replicas: VecDeque::new(),
+                    transient_nof_read: Some((backing, payload)),
+                });
+            }
+        }
+        let Some(mut cold_backing) = materialized_cold_backing(&route) else {
             return Err(StoreError::NotFound(format!(
                 "tenant={tenant} key={logical_key} has no readable replica owner"
             )));
@@ -168,7 +174,7 @@ impl StoreClient {
             route,
             replica: cold_backing_placeholder(&cold_backing),
             fallback_replicas: VecDeque::<ReplicaRoute>::new(),
-            transient_backing,
+            transient_nof_read: None,
         })
     }
 }

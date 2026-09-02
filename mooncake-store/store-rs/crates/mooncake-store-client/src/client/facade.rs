@@ -1206,8 +1206,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             self.storage_owner
                 .cold_tier_devices
                 .nof_targets
-                .discover_backing(&route)?
-                .map(|backing| backing.length as usize)
+                .read_backing(&route)?
+                .map(|(_, payload)| payload.len())
                 .ok_or_else(|| StoreError::NotFound(format!("tenant={tenant} key={key}")))
         })();
         tracker.finish(&result, result.as_ref().copied().unwrap_or_default() as u64);
@@ -1221,20 +1221,6 @@ impl MooncakeCompatibilityFacade for StoreClient {
     fn is_exist_in_tenant(&self, tenant: &str, key: &str) -> Result<bool> {
         let scope = NamespaceScope::with_defaults(Some(tenant), None, None);
         let object_key = ObjectKey::from_scope(&scope, key);
-        let Some(route) = self.route_ops().load_route(&object_key)? else {
-            return Ok(false);
-        };
-        if route.state == RouteState::Active
-            && route.replicas.is_empty()
-            && route.cold_backing.is_none()
-            && !self.storage_owner.cold_tier_devices.nof_targets.is_empty()
-        {
-            return self
-                .storage_owner
-                .cold_tier_devices
-                .nof_targets
-                .contains_object(&route);
-        }
         self.route_ops().contains_active_route(&object_key)
     }
 
@@ -1250,42 +1236,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 ObjectKey::from_scope(&scope, object.key)
             })
             .collect::<Vec<_>>();
-        let result = (|| {
-            let nof_targets = &self.storage_owner.cold_tier_devices.nof_targets;
-            if nof_targets.is_empty() {
-                return self.route_ops().contains_active_routes_bounded(&keys);
-            }
-
-            let routes = self.route_ops().load_routes_bounded(&keys)?;
-            let mut exists = vec![false; keys.len()];
-            let mut ordinary_indices = Vec::new();
-            for (index, route) in routes.iter().enumerate() {
-                match route {
-                    Some(route)
-                        if route.state == RouteState::Active
-                            && route.replicas.is_empty()
-                            && route.cold_backing.is_none() =>
-                    {
-                        exists[index] = nof_targets.contains_object(route)?;
-                    }
-                    Some(_) => ordinary_indices.push(index),
-                    None => {}
-                }
-            }
-            let ordinary_keys = ordinary_indices
-                .iter()
-                .map(|&index| keys[index].clone())
-                .collect::<Vec<_>>();
-            if !ordinary_keys.is_empty() {
-                for (index, found) in ordinary_indices.into_iter().zip(
-                    self.route_ops()
-                        .contains_active_routes_bounded(&ordinary_keys)?,
-                ) {
-                    exists[index] = found;
-                }
-            }
-            Ok(exists)
-        })();
+        let result = self.route_ops().contains_active_routes_bounded(&keys);
         tracker.finish(&result, result.as_ref().map(|items| items.len()).unwrap_or(0) as u64);
         result
     }

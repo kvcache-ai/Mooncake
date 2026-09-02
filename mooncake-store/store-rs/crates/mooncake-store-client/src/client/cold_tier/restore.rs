@@ -11,8 +11,9 @@ use super::super::{
 };
 use super::{
     backend_load_cold_payload_batch_into, cold_restore_flight_key, payload_checksum,
-    record_cold_tier_ssd_read, resolved_cold_backing, select_cold_backing_target,
-    validate_cold_restore_payload, with_disjoint_restore_caller_buffers,
+    prefetched_nof_payload, record_cold_tier_ssd_read, resolved_cold_backing,
+    select_cold_backing_target, validate_cold_restore_payload,
+    with_disjoint_restore_caller_buffers,
 };
 use std::{
     sync::{
@@ -472,6 +473,26 @@ pub(in super::super) fn restore_payload_from_cold_backing(
     result
 }
 
+fn copy_prefetched_nof_payload(
+    resolved: &ResolvedObject,
+    buffer: &mut [u8],
+) -> Result<Option<Arc<Vec<u8>>>> {
+    let Some(payload) = prefetched_nof_payload(resolved) else {
+        return Ok(None);
+    };
+    if payload.len() > buffer.len() {
+        return Err(StoreError::Allocator(format!(
+            "buffer too small for tenant={} key={}: need {}, have {}",
+            resolved.tenant,
+            resolved.key,
+            payload.len(),
+            buffer.len()
+        )));
+    }
+    buffer[..payload.len()].copy_from_slice(&payload);
+    Ok(Some(payload))
+}
+
 pub(in super::super) fn restore_batch_payloads_from_cold_backing(
     client: &StoreClient,
     resolved: &[ResolvedObject],
@@ -855,20 +876,25 @@ fn restore_payload_from_cold_backing_singleflight_into(
                         )));
                     }
                 };
-                let backend_resolve_tracker = OperationTracker::new("cold_restore_backend_resolve");
-                let backend_result = client
-                    .storage_owner
-                    .cold_tier_devices
-                    .backend_for_with_refresh(
-                        client.metadata.as_ref(),
-                        &cold_backing,
-                        "cold_restore_backend_resolve_refresh",
-                    );
-                backend_resolve_tracker.finish(&backend_result, 0);
-                let backend = backend_result?;
                 let backend_read_tracker =
                     OperationTracker::new("cold_restore_backend_read_into_caller");
-                let read_result = backend.get_object_into(&cold_backing, buffer);
+                let read_result =
+                    if let Some(payload) = copy_prefetched_nof_payload(resolved, buffer)? {
+                        Ok(Some(payload.len()))
+                    } else {
+                        let backend_resolve_tracker =
+                            OperationTracker::new("cold_restore_backend_resolve");
+                        let backend_result = client
+                            .storage_owner
+                            .cold_tier_devices
+                            .backend_for_with_refresh(
+                                client.metadata.as_ref(),
+                                &cold_backing,
+                                "cold_restore_backend_resolve_refresh",
+                            );
+                        backend_resolve_tracker.finish(&backend_result, 0);
+                        backend_result?.get_object_into(&cold_backing, buffer)
+                    };
                 backend_read_tracker.finish(
                     &read_result,
                     read_result
@@ -1015,7 +1041,14 @@ fn restore_batch_payloads_from_cold_backing_grouped(
         );
         match registration {
             ColdRestoreFlightRegistration::Leader(leader) => {
-                leaders.push((*index, cold_backing, leader));
+                if let Some(payload) =
+                    copy_prefetched_nof_payload(&resolved[*index], buffers[*index])?
+                {
+                    validate_cold_restore_payload(&resolved[*index], &payload)?;
+                    promotion_payloads.push((*index, leader.finish(Ok(payload))?));
+                } else {
+                    leaders.push((*index, cold_backing, leader));
+                }
             }
             ColdRestoreFlightRegistration::Waiter(flight) => {
                 debug!(
