@@ -16,10 +16,15 @@
 
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <functional>
 #include <future>
+#include <queue>
+#include <thread>
 
 #include "config.h"
 #include "memory_location.h"
@@ -54,24 +59,101 @@ struct ActiveEndpointSetupResult {
     bool endpoint_current = false;
 };
 
+class ActiveEndpointSetupExecutor {
+   public:
+    explicit ActiveEndpointSetupExecutor(size_t thread_count) : running_(true) {
+        workers_.reserve(thread_count);
+        for (size_t i = 0; i < thread_count; ++i) {
+            workers_.emplace_back([this] { run(); });
+        }
+    }
+
+    ~ActiveEndpointSetupExecutor() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = false;
+        }
+        cv_.notify_all();
+        for (auto &worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    std::future<int> submit(const std::shared_ptr<RdmaEndPoint> &endpoint) {
+        std::packaged_task<int()> task(
+            [endpoint] { return endpoint->setupConnectionsByActive(); });
+        auto future = task.get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!running_) {
+                task();
+                return future;
+            }
+            tasks_.emplace(std::move(task));
+        }
+        cv_.notify_one();
+        return future;
+    }
+
+   private:
+    void run() {
+        while (true) {
+            std::packaged_task<int()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return !running_ || !tasks_.empty(); });
+                if (!running_ && tasks_.empty()) return;
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+            task();
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::packaged_task<int()>> tasks_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool running_;
+};
+
+static ActiveEndpointSetupExecutor &activeEndpointSetupExecutor() {
+    constexpr size_t kActiveEndpointSetupThreadCount = 8;
+    static ActiveEndpointSetupExecutor executor(
+        kActiveEndpointSetupThreadCount);
+    return executor;
+}
+
 static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
     RdmaContext &context, const std::string &peer_nic_path,
     const std::shared_ptr<RdmaEndPoint> &endpoint,
     std::unique_lock<std::mutex> &endpoint_lifecycle_lock,
-    const std::function<void()> &drain_cq_while_waiting) {
+    const std::function<bool()> &drain_cq_while_waiting) {
     const bool had_lifecycle_gate = endpoint_lifecycle_lock.owns_lock();
     if (had_lifecycle_gate) endpoint_lifecycle_lock.unlock();
 
     // The owner worker also polls this peer's CQ. Keep it draining while the
     // active handshake can block on TCP connect/read timeouts.
-    auto setup_future = std::async(std::launch::async, [endpoint] {
-        return endpoint->setupConnectionsByActive();
-    });
-    while (setup_future.wait_for(std::chrono::milliseconds(1)) !=
-           std::future_status::ready) {
-        drain_cq_while_waiting();
+    int ret = ERR_ENDPOINT;
+    try {
+        auto setup_future = activeEndpointSetupExecutor().submit(endpoint);
+        auto wait_period = std::chrono::milliseconds(1);
+        constexpr auto kMaxWaitPeriod = std::chrono::milliseconds(25);
+        while (setup_future.wait_for(wait_period) !=
+               std::future_status::ready) {
+            if (drain_cq_while_waiting()) {
+                wait_period = std::chrono::milliseconds(1);
+            } else {
+                wait_period = std::min(wait_period * 2, kMaxWaitPeriod);
+            }
+        }
+        ret = setup_future.get();
+    } catch (const std::exception &ex) {
+        LOG(ERROR) << "Worker: Active endpoint setup threw: " << ex.what();
+    } catch (...) {
+        LOG(ERROR)
+            << "Worker: Active endpoint setup threw an unknown exception";
     }
-    int ret = setup_future.get();
 
     if (had_lifecycle_gate) endpoint_lifecycle_lock.lock();
     auto current_endpoint = context.findEndpoint(peer_nic_path);
@@ -469,8 +551,9 @@ void WorkerPool::performPostSend(int thread_id) {
             auto setup_result = setupEndpointByActiveOutsideLifecycleGate(
                 context_, entry.first, endpoint, endpoint_lifecycle_lock,
                 [this, thread_id] {
-                    if (hasOutstandingCq(thread_id))
-                        performPollCq(thread_id, true);
+                    if (!hasOutstandingCq(thread_id)) return false;
+                    performPollCq(thread_id, true);
+                    return true;
                 });
             if (!setup_result.endpoint_current) {
                 LOG(WARNING)
@@ -581,7 +664,8 @@ void WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
 
     const uint64_t poll_ts = getCurrentTimeInNano();
     const uint64_t previous_poll_ts =
-        last_poll_ts_ns_.exchange(poll_ts, std::memory_order_relaxed);
+        last_poll_ts_ns_.exchange(poll_ts, std::memory_order_release);
+    last_poll_ts_ns_.notify_all();
     if (previous_poll_ts > 0 && poll_ts > previous_poll_ts) {
         const uint64_t interval = poll_ts - previous_poll_ts;
         last_poll_interval_ns_.store(interval, std::memory_order_relaxed);
@@ -779,8 +863,7 @@ void WorkerPool::processCompletions(int thread_id,
                    defer_local_redispatch);
     }
     if (!failed_slice_list.empty()) {
-        redispatch(failed_slice_list, thread_id, false,
-                   defer_local_redispatch);
+        redispatch(failed_slice_list, thread_id, false, defer_local_redispatch);
     }
 }
 

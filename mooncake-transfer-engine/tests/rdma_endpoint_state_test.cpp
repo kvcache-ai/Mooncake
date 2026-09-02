@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -120,8 +121,7 @@ class RdmaContextTestPeer {
         context.cq_list_.clear();
     }
 
-    static void clearNativeCompletionQueue(RdmaContext &context,
-                                           int cq_index) {
+    static void clearNativeCompletionQueue(RdmaContext &context, int cq_index) {
         ASSERT_GE(cq_index, 0);
         ASSERT_LT(static_cast<size_t>(cq_index), context.cq_list_.size());
         context.cq_list_[cq_index].native = nullptr;
@@ -155,7 +155,40 @@ class WorkerPoolTestPeer {
     }
 
     static uint64_t lastPollTs(const WorkerPool &pool) {
-        return pool.last_poll_ts_ns_.load(std::memory_order_relaxed);
+        return pool.last_poll_ts_ns_.load(std::memory_order_acquire);
+    }
+
+    static bool waitForPollTs(WorkerPool &pool,
+                              std::chrono::milliseconds timeout) {
+        if (lastPollTs(pool) != 0) return true;
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool observed = false;
+        std::thread waiter([&] {
+            uint64_t poll_ts =
+                pool.last_poll_ts_ns_.load(std::memory_order_acquire);
+            while (poll_ts == 0) {
+                pool.last_poll_ts_ns_.wait(poll_ts, std::memory_order_acquire);
+                poll_ts = pool.last_poll_ts_ns_.load(std::memory_order_acquire);
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                observed = true;
+            }
+            cv.notify_one();
+        });
+
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool ok = cv.wait_for(lock, timeout, [&] { return observed; });
+        if (!ok) {
+            pool.last_poll_ts_ns_.store(std::numeric_limits<uint64_t>::max(),
+                                        std::memory_order_release);
+            pool.last_poll_ts_ns_.notify_all();
+        }
+        lock.unlock();
+        waiter.join();
+        return ok;
     }
 };
 
@@ -537,8 +570,8 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
         initFakePeer(peer, "rdma-drain-a:10000", "mlx5_drain_a", barrier));
     peer.transport->fail_after_barrier_ = true;
 
-    const std::string peer_nic_path = MakeNicPath("rdma-drain-b:10000",
-                                                  "mlx5_drain_b");
+    const std::string peer_nic_path =
+        MakeNicPath("rdma-drain-b:10000", "mlx5_drain_b");
     ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(peer, peer_nic_path));
 
     // The fake CQ is not a real verbs object. Clearing the native pointer keeps
@@ -563,13 +596,8 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
         }));
     }
 
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(5);
-    while (WorkerPoolTestPeer::lastPollTs(*peer.worker_pool) == 0 &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    EXPECT_GT(WorkerPoolTestPeer::lastPollTs(*peer.worker_pool), 0u);
+    EXPECT_TRUE(WorkerPoolTestPeer::waitForPollTs(*peer.worker_pool,
+                                                  std::chrono::seconds(5)));
 
     {
         std::lock_guard<std::mutex> lock(barrier->mutex);
