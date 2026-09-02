@@ -131,7 +131,6 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
         sharing_scope: Some("tenant-a".to_string()),
         qos_tier: Some("default".to_string()),
         version: RouteVersion(7),
-        content_generation: 0,
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![
@@ -220,7 +219,6 @@ fn explicit_move_route_delta_replaces_source_replica_with_target() {
         sharing_scope: Some("tenant-a".to_string()),
         qos_tier: Some("default".to_string()),
         version: RouteVersion(3),
-        content_generation: 0,
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![
@@ -294,7 +292,6 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         sharing_scope: Some("tenant-a".to_string()),
         qos_tier: Some("default".to_string()),
         version: RouteVersion(1),
-        content_generation: 0,
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
@@ -2348,7 +2345,6 @@ fn explicit_source_selector_resolves_route_replica_by_segment_and_owner() {
         sharing_scope: Some("tenant-a".to_string()),
         qos_tier: Some("default".to_string()),
         version: RouteVersion(2),
-        content_generation: 0,
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![
@@ -2409,7 +2405,6 @@ fn explicit_source_selector_rejects_missing_or_owner_mismatched_replicas() {
         sharing_scope: Some("tenant-a".to_string()),
         qos_tier: Some("default".to_string()),
         version: RouteVersion(5),
-        content_generation: 0,
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {

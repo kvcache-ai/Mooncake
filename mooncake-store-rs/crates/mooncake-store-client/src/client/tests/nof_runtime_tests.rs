@@ -273,7 +273,6 @@ fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
         .expect("physical NoF route query should succeed")
         .expect("physical NoF route should exist");
     assert!(route.cold_backing.is_none());
-    assert_ne!(route.content_generation, 0);
     assert!(!primary.records.lock().is_empty());
     assert!(!replica.records.lock().is_empty());
 
@@ -607,8 +606,6 @@ fn logical_object_nof_runtime_keeps_provider_owned_replication() {
         .expect("object NoF route query should succeed")
         .expect("object NoF route should exist");
     assert!(route.cold_backing.is_none());
-    let first_generation = route.content_generation;
-    assert_ne!(first_generation, 0);
 
     let updated_payload = b"provider-owned-object-v2";
     let error = client
@@ -630,7 +627,6 @@ fn logical_object_nof_runtime_keeps_provider_owned_replication() {
         .query_route("object-nof-key")
         .expect("updated object NoF route query should succeed")
         .expect("updated object NoF route should exist");
-    assert_ne!(route.content_generation, first_generation);
     assert!(route.cold_backing.is_none());
     assert!(wait_for_nof_reclaims(&client, || provider.objects.lock().len() == 1));
 

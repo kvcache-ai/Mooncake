@@ -130,10 +130,6 @@ pub struct ObjectRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qos_tier: Option<String>,
     pub version: RouteVersion,
-    /// Stable identity of the logical value represented by this route. It remains unchanged by
-    /// replica, ownership and eviction updates.
-    #[serde(default)]
-    pub content_generation: u64,
     pub state: RouteState,
     pub compatibility: CompatibilityDescriptor,
     pub replicas: Vec<ReplicaRoute>,
@@ -1210,7 +1206,6 @@ mod tests {
             sharing_scope: Some("shared".to_string()),
             qos_tier: Some("premium".to_string()),
             version: RouteVersion(42),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -1269,7 +1264,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),

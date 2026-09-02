@@ -36,9 +36,6 @@ pub fn route_logical_object_id(route: &ObjectRoute) -> Result<LogicalObjectId> {
 }
 
 pub fn apply_route_identity(route: &mut ObjectRoute, id: &LogicalObjectId) {
-    if route.content_generation == 0 {
-        route.content_generation = route.version.0;
-    }
     route.key = ObjectKey::from_logical_id(id);
     route.namespace = Some(id.scope.clone());
     route.logical_key = Some(id.logical_key.clone());
@@ -93,7 +90,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
@@ -126,7 +122,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -162,7 +157,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
@@ -210,7 +204,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
@@ -266,7 +259,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
@@ -287,7 +279,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
@@ -307,7 +298,6 @@ mod tests {
             sharing_scope: Some("old".to_string()),
             qos_tier: Some("old".to_string()),
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),

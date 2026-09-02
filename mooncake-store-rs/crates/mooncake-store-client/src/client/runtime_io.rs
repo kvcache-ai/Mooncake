@@ -538,13 +538,6 @@ impl StoreClient {
                 sharing_scope: Some(tenant.to_string()),
                 qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
                 version: next_version,
-                content_generation: if reclaim_mode == ReclaimMode::Deferred {
-                    current
-                        .as_ref()
-                        .map_or(0, |route| route.content_generation)
-                } else {
-                    0
-                },
                 state: RouteState::Active,
                 compatibility: self.lease.compatibility.clone(),
                 replicas: targets
@@ -601,7 +594,6 @@ impl StoreClient {
                     .unwrap_or_else(|| next_route_version(None, &self.route_ops(), &scoped_key));
                 if retry_version > route.version {
                     route.version = retry_version;
-                    route.content_generation = retry_version.0;
                     let retry_started = Instant::now();
                     let retry_result =
                         self.route_ops()
@@ -648,7 +640,6 @@ impl StoreClient {
             }
             self.storage_owner.track_route(&route);
             if let Some(previous) = current.as_ref() {
-                self.delete_replaced_nof_content_best_effort(previous, &route);
                 if let Err(error) = self.reclaim_route(previous, reclaim_mode) {
                     warn!(
                         runtime = %self.lease.runtime,

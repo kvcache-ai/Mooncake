@@ -2643,7 +2643,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(version),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {

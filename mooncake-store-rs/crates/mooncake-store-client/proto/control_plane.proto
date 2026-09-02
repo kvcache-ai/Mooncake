@@ -149,7 +149,6 @@ message ObjectRoute {
   string qos_tier = 12;
   ColdBackingRoute cold_backing = 13;
   reserved 14;
-  uint64 content_generation = 15;
 }
 
 message CasResult {
