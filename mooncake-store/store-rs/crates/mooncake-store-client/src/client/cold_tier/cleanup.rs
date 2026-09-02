@@ -241,10 +241,6 @@ impl StorageOwnerState {
             ..ColdTierCompactionResult::default()
         };
         for (device_id, stats) in maintenance.devices {
-            if !self.cold_tier_devices.mooncake_manages_storage(&device_id) {
-                result.skipped_devices = result.skipped_devices.saturating_add(1);
-                continue;
-            }
             if stats.extent_dead_bytes == 0 {
                 continue;
             }
@@ -305,10 +301,6 @@ impl StorageOwnerState {
         let mut devices = devices
             .into_iter()
             .filter(|device| device.stable_id == self.runtime.stable_id.0)
-            .filter(|device| {
-                self.cold_tier_devices
-                    .mooncake_manages_storage(&device.device_id)
-            })
             .filter(|device| device.used_bytes.saturating_add(device.reserved_bytes) >= high_bytes)
             .collect::<Vec<_>>();
         devices.sort_by_key(|device| {
@@ -434,12 +426,6 @@ impl StorageOwnerState {
             {
                 continue;
             }
-            if !self
-                .cold_tier_devices
-                .mooncake_manages_storage(&device.device_id)
-            {
-                continue;
-            }
             // GC both Healthy (capacity tight) and Full (need to reclaim) devices.
             if !matches!(
                 device.state,
@@ -497,11 +483,9 @@ impl StorageOwnerState {
 
     pub(in super::super) fn reclaim_cold_backing_for_route_delete(
         &self,
+        route_key: &mooncake_store_core::ObjectKey,
         cold_backing: &mooncake_store_core::ColdBackingRoute,
     ) -> Result<crate::control_plane::ColdReclaimResult> {
-        let nof_backing = self
-            .cold_tier_devices
-            .has_nof_backend(cold_tier_device_id(cold_backing));
         let expected_owner = self
             .cold_tier_devices
             .current_target_owner(cold_tier_device_id(cold_backing), Some(&cold_backing.owner))?;
@@ -513,17 +497,16 @@ impl StorageOwnerState {
                 self.runtime
             )));
         }
-        if !nof_backing
-            && self
-                .ensure_cold_tier_device_loaded(cold_tier_device_id(cold_backing))?
-                .is_none()
+        if self
+            .ensure_cold_tier_device_loaded(cold_tier_device_id(cold_backing))?
+            .is_none()
         {
             return Err(StoreError::NotFound(format!(
                 "cold tier device {} not found",
                 cold_tier_device_id(cold_backing)
             )));
         }
-        if self.persistent_backing_still_referenced_by_active_route(cold_backing, nof_backing)? {
+        if self.persistent_backing_still_referenced_by_active_route(route_key, cold_backing)? {
             return Ok(crate::control_plane::ColdReclaimResult {
                 skipped_still_referenced: true,
                 ..crate::control_plane::ColdReclaimResult::default()
@@ -546,7 +529,6 @@ impl StorageOwnerState {
                 }
             };
         if removed_cold_payload
-            && !nof_backing
             && cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
         {
             self.apply_cold_tier_usage_delta(
@@ -573,30 +555,17 @@ impl StorageOwnerState {
 
     fn persistent_backing_still_referenced_by_active_route(
         &self,
+        route_key: &mooncake_store_core::ObjectKey,
         backing: &mooncake_store_core::ColdBackingRoute,
-        nof_backing: bool,
     ) -> Result<bool> {
-        let routes = if nof_backing {
-            self.metadata.as_ref().list_object_routes_by_nof_backing(
-                &mooncake_store_core::NofBackingRouteFilter {
-                    target_id: Some(cold_tier_device_id(backing).to_string()),
-                    ..mooncake_store_core::NofBackingRouteFilter::default()
-                },
-            )?
-        } else {
-            self.metadata.as_ref().list_object_routes_by_cold_backing(
-                &mooncake_store_core::ColdBackingRouteFilter {
-                    device_id: Some(cold_tier_device_id(backing).to_string()),
-                    owner: Some(backing.owner.clone()),
-                    ..mooncake_store_core::ColdBackingRouteFilter::default()
-                },
-            )?
+        let Some(route) = self.metadata.get_object_route(route_key)? else {
+            return Ok(false);
         };
-        Ok(routes.iter().any(|route| {
-            route.state == RouteState::Active
-                && super::nof::route_backing_as_cold(route)
-                    .is_some_and(|current| persistent_backing_contains_target(&current, backing))
-        }))
+        Ok(route.state == RouteState::Active
+            && route
+                .cold_backing
+                .as_ref()
+                .is_some_and(|current| persistent_backing_contains_target(current, backing)))
     }
 
     pub(crate) fn probe_cold_tier_device(&self, device_id: &str) -> Result<ColdTierDeviceRecord> {
@@ -693,10 +662,6 @@ impl StorageOwnerState {
         for device in devices
             .into_iter()
             .filter(|device| device.stable_id == self.runtime.stable_id.0)
-            .filter(|device| {
-                self.cold_tier_devices
-                    .mooncake_manages_storage(&device.device_id)
-            })
             .filter(|device| device.state == mooncake_store_core::ColdTierDeviceState::Full)
             .filter(|device| device.used_bytes.saturating_add(device.reserved_bytes) <= low_bytes)
         {

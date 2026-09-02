@@ -6,11 +6,10 @@ use std::{
     },
 };
 
-use mooncake_store_core::ClientRuntimeId;
+use mooncake_store_core::{ClientRuntimeId, ColdBackingRoute};
 
 use super::replica_policy::{
-    ReplicaLoadBalanceStrategy, ReplicaReadCandidate, ReplicaTargetSet,
-    DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY,
+    ReplicaLoadBalanceStrategy, ReplicaReadCandidate, DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY,
 };
 
 /// Resolve-stage target selection for cold-backed objects with multiple replicas.
@@ -176,13 +175,6 @@ impl ReplicaTargetSelector {
             Some(map) => map.into_iter().collect(),
             None => Vec::new(),
         };
-        Self::from_inflight_snapshot(inflight_snapshot)
-    }
-
-    /// Construct a selector from a provider-neutral target load snapshot.
-    ///
-    /// NoF uses this entry point because its targets are not local Cold Tier devices.
-    pub fn from_inflight_snapshot(inflight_snapshot: Vec<(String, u64)>) -> Self {
         Self {
             batch_ios: Vec::new(),
             inflight_snapshot,
@@ -235,18 +227,15 @@ impl ReplicaTargetSelector {
     /// fairness.
     ///
     /// Hot path: zero exclusive locks; only lookup keys and the final result are cloned.
-    pub fn select_target<T: ReplicaTargetSet + ?Sized>(
-        &mut self,
-        backing: &T,
-    ) -> ReplicaTargetResult {
-        let targets = backing.replica_targets();
+    pub fn select_target(&mut self, backing: &ColdBackingRoute) -> ReplicaTargetResult {
+        let targets = backing.all_targets();
         if targets.len() <= 1 {
             let target = targets
                 .first()
                 .expect("a persistent backing has at least one target");
             return ReplicaTargetResult {
                 owner: target.owner.clone(),
-                target_id: target.target_id.to_string(),
+                target_id: target.cold_tier_id.to_string(),
                 object_locator: target.object_locator.to_string(),
             };
         }
@@ -256,9 +245,9 @@ impl ReplicaTargetSelector {
         let candidates = targets
             .iter()
             .map(|target| ReplicaReadCandidate {
-                inflight_io: self.inflight_count(target.target_id),
-                batch_ios: self.batch_count(target.owner, target.target_id),
-                global_accum_ios: global_accum_count(&global, target.owner, target.target_id),
+                inflight_io: self.inflight_count(target.cold_tier_id),
+                batch_ios: self.batch_count(target.owner, target.cold_tier_id),
+                global_accum_ios: global_accum_count(&global, target.owner, target.cold_tier_id),
             })
             .collect::<Vec<_>>();
         let selected_idx = DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY
@@ -268,20 +257,20 @@ impl ReplicaTargetSelector {
         let selected = &targets[selected_idx];
 
         // Update batch-local counter (Vec scan, clone only on first occurrence).
-        self.batch_increment(selected.owner, selected.target_id);
+        self.batch_increment(selected.owner, selected.cold_tier_id);
 
         // Update global accum (atomic under shared read lock — common path).
-        let global_key = (selected.owner.clone(), selected.target_id.to_string());
+        let global_key = (selected.owner.clone(), selected.cold_tier_id.to_string());
         if let Some(count) = global.get(&global_key) {
             count.fetch_add(1, Ordering::Relaxed);
         } else {
             drop(global);
-            increment_global_accum(selected.owner, selected.target_id);
+            increment_global_accum(selected.owner, selected.cold_tier_id);
         }
 
         ReplicaTargetResult {
             owner: selected.owner.clone(),
-            target_id: selected.target_id.to_string(),
+            target_id: selected.cold_tier_id.to_string(),
             object_locator: selected.object_locator.to_string(),
         }
     }
@@ -292,7 +281,6 @@ mod tests {
     use super::*;
     use mooncake_store_core::{
         ClientEpoch, ClientStableId, ColdBackingReplica, ColdBackingRoute, ColdBackingState,
-        NofBackingReplica, NofBackingRoute, NofBackingState,
     };
 
     fn owner(name: &str) -> ClientRuntimeId {
@@ -303,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn selector_balances_local_and_nof_routes_with_the_same_policy() {
+    fn selector_prefers_the_less_loaded_replica() {
         let owner = owner("shared-replica-selector");
         let cold = ColdBackingRoute {
             owner: owner.clone(),
@@ -318,27 +306,14 @@ mod tests {
                 object_locator: "cold-b".to_string(),
             }],
         };
-        let nof = NofBackingRoute {
-            owner: owner.clone(),
-            target_id: "shared-nof-busy".to_string(),
-            object_locator: "nof-a".to_string(),
-            length: 1,
-            checksum: None,
-            state: NofBackingState::Materialized,
-            replicas: vec![NofBackingReplica {
-                owner,
-                target_id: "shared-nof-idle".to_string(),
-                object_locator: "nof-b".to_string(),
-            }],
+        let mut selector = ReplicaTargetSelector {
+            batch_ios: Vec::new(),
+            inflight_snapshot: vec![
+                ("shared-cold-busy".to_string(), 2),
+                ("shared-cold-idle".to_string(), 0),
+            ],
         };
-        let mut selector = ReplicaTargetSelector::from_inflight_snapshot(vec![
-            ("shared-cold-busy".to_string(), 2),
-            ("shared-cold-idle".to_string(), 0),
-            ("shared-nof-busy".to_string(), 2),
-            ("shared-nof-idle".to_string(), 0),
-        ]);
 
         assert_eq!(selector.select_target(&cold).target_id, "shared-cold-idle");
-        assert_eq!(selector.select_target(&nof).target_id, "shared-nof-idle");
     }
 }

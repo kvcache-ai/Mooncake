@@ -7,7 +7,7 @@ use mooncake_store_core::ColdTierDeviceState;
 use std::collections::{BTreeSet, VecDeque};
 
 pub(in super::super) fn resolved_uses_cold_backing(entry: &ResolvedObject) -> bool {
-    materialized_cold_backing(&entry.route).is_some()
+    (entry.transient_backing.is_some() || materialized_cold_backing(&entry.route).is_some())
         && (entry.route.replicas.is_empty() || entry.replica.segment_name.0 == "__cold_backing__")
 }
 
@@ -71,7 +71,7 @@ impl StoreClient {
 
     pub(in super::super) fn resolve_cold_backing_read(
         &self,
-        mut route: ObjectRoute,
+        route: ObjectRoute,
         tenant: &str,
         logical_key: &str,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
@@ -81,7 +81,18 @@ impl StoreClient {
                 "tenant={tenant} key={logical_key} has no readable replica owner"
             )));
         }
-        let Some(mut cold_backing) = materialized_cold_backing(&route) else {
+        let transient_backing = if materialized_cold_backing(&route).is_none() {
+            self.storage_owner
+                .cold_tier_devices
+                .nof_targets
+                .discover_backing(&route)?
+        } else {
+            None
+        };
+        let Some(mut cold_backing) = transient_backing
+            .clone()
+            .or_else(|| materialized_cold_backing(&route))
+        else {
             return Err(StoreError::NotFound(format!(
                 "tenant={tenant} key={logical_key} has no readable replica owner"
             )));
@@ -116,11 +127,6 @@ impl StoreClient {
             );
             let selected = selector.select_target(&cold_backing);
             super::target_selection::promote_cold_backing_target(&mut cold_backing, &selected);
-            if route.nof_backing.is_some() {
-                route.nof_backing = Some(super::nof::cold_as_nof(&cold_backing));
-            } else {
-                route.cold_backing = Some(cold_backing.clone());
-            }
         }
         if !self
             .storage_owner
@@ -162,6 +168,7 @@ impl StoreClient {
             route,
             replica: cold_backing_placeholder(&cold_backing),
             fallback_replicas: VecDeque::<ReplicaRoute>::new(),
+            transient_backing,
         })
     }
 }

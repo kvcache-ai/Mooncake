@@ -10,7 +10,6 @@ use crate::identity::{
     DEFAULT_OBJECT_SET,
 };
 use crate::lifecycle::ClientLifecycleState;
-use crate::nof::NofBackingRoute;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ObjectKey(pub String);
@@ -131,39 +130,15 @@ pub struct ObjectRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qos_tier: Option<String>,
     pub version: RouteVersion,
+    /// Stable identity of the logical value represented by this route. It remains unchanged by
+    /// replica, ownership and eviction updates.
+    #[serde(default)]
+    pub content_generation: u64,
     pub state: RouteState,
     pub compatibility: CompatibilityDescriptor,
     pub replicas: Vec<ReplicaRoute>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_backing: Option<ColdBackingRoute>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nof_backing: Option<NofBackingRoute>,
-}
-
-impl ObjectRoute {
-    pub fn has_persistent_backing(&self) -> bool {
-        self.cold_backing.is_some() || self.nof_backing.is_some()
-    }
-
-    pub fn validate_backing_kind(&self) -> crate::Result<()> {
-        if self.cold_backing.is_some() && self.nof_backing.is_some() {
-            return Err(crate::StoreError::InvalidState(
-                "an object route cannot contain both local Cold Tier and NoF backing metadata"
-                    .to_string(),
-            ));
-        }
-        if self.nof_backing.is_some()
-            && !self
-                .compatibility
-                .supports(crate::NOF_BACKING_ROUTE_CAPABILITY)
-        {
-            return Err(crate::StoreError::InvalidState(format!(
-                "NoF backing publication requires capability {}",
-                crate::NOF_BACKING_ROUTE_CAPABILITY
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1235,6 +1210,7 @@ mod tests {
             sharing_scope: Some("shared".to_string()),
             qos_tier: Some("premium".to_string()),
             version: RouteVersion(42),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -1248,7 +1224,6 @@ mod tests {
                 priority: 0,
             }],
             cold_backing: None,
-            nof_backing: None,
         };
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
@@ -1294,11 +1269,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
-            nof_backing: None,
         };
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();

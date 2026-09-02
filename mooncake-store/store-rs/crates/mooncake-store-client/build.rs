@@ -91,6 +91,7 @@ fn configure_kvcs_capi() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(format!("cannot read KVCS_SDK_USE_MOCK: {error}").into()),
     };
     let header = root.join("C/include/kvcs_capi.h");
+    let rust_ffi = root.join("rust/src/ffi.rs");
     let lib_dir = if use_mock {
         root.join("mock/lib")
     } else {
@@ -100,6 +101,13 @@ fn configure_kvcs_capi() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!(
             "KVCS SDK C ABI header does not exist: {}; set KVCS_SDK_ROOT to an extracted SDK root",
             header.display()
+        )
+        .into());
+    }
+    if !rust_ffi.is_file() {
+        return Err(format!(
+            "KVCS SDK Rust ABI definitions do not exist: {}; set KVCS_SDK_ROOT to the complete extracted SDK root",
+            rust_ffi.display()
         )
         .into());
     }
@@ -114,7 +122,19 @@ fn configure_kvcs_capi() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("cargo:rerun-if-changed={}", package_metadata.display());
     println!("cargo:rerun-if-changed={}", header.display());
+    println!("cargo:rerun-if-changed={}", rust_ffi.display());
     println!("cargo:rerun-if-changed={}", shared_library.display());
+    let ffi_source = std::fs::read_to_string(&rust_ffi)?;
+    let ffi_source = ffi_source
+        .strip_prefix("#![allow(non_camel_case_types)]\n")
+        .ok_or("KVCS SDK Rust ABI definitions have an unexpected preamble")?;
+    let generated_ffi =
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("kvcs_sdk_ffi.rs");
+    std::fs::write(&generated_ffi, ffi_source)?;
+    println!(
+        "cargo:rustc-env=KVCS_SDK_RUST_FFI={}",
+        generated_ffi.display()
+    );
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib={link_name}");
     Ok(())

@@ -36,6 +36,9 @@ pub fn route_logical_object_id(route: &ObjectRoute) -> Result<LogicalObjectId> {
 }
 
 pub fn apply_route_identity(route: &mut ObjectRoute, id: &LogicalObjectId) {
+    if route.content_generation == 0 {
+        route.content_generation = route.version.0;
+    }
     route.key = ObjectKey::from_logical_id(id);
     route.namespace = Some(id.scope.clone());
     route.logical_key = Some(id.logical_key.clone());
@@ -90,11 +93,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
-            nof_backing: None,
         };
         assert_eq!(
             route_logical_object_id(&route).expect("route should parse"),
@@ -123,6 +126,7 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -136,7 +140,6 @@ mod tests {
                 priority: 0,
             }],
             cold_backing: None,
-            nof_backing: None,
         };
         apply_route_identity(&mut route, &scoped_logical_object_id("tenant-b", "key-b"));
         assert_eq!(route.key.0, "tenant-b::key-b");
@@ -159,11 +162,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
-            nof_backing: None,
         };
         let id = LogicalObjectId::new(
             NamespaceScope::new("tenant-a", "domain-a", "set-a"),
@@ -207,11 +210,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
-            nof_backing: None,
         };
         apply_route_identity(&mut route, &scoped_logical_object_id("tenant-b", "key-b"));
         route.sharing_scope = Some("domain-a".to_string());
@@ -263,11 +266,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
-            nof_backing: None,
         };
         let id = route_logical_object_id(&route).expect("namespace path must win");
         assert_eq!(id.scope.tenant, "explicit-tenant");
@@ -284,11 +287,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
-            nof_backing: None,
         };
         let reuse = route_reuse_identity(&route).expect("fallback build");
         assert_eq!(reuse.sharing_scope, "default");
@@ -304,11 +307,11 @@ mod tests {
             sharing_scope: Some("old".to_string()),
             qos_tier: Some("old".to_string()),
             version: RouteVersion(1),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
-            nof_backing: None,
         };
         apply_route_identity(&mut route, &scoped_logical_object_id("new-t", "new-k"));
         assert_eq!(route.key.0, "new-t::new-k");

@@ -55,8 +55,9 @@ pub(super) use helpers::{
     cold_restore_flight_key, has_materialized_cold_backing, is_cold_backing_placeholder,
     local_hot_replica_checksum, materialized_cold_backing, payload_checksum,
     pending_persistent_backing, persistent_backing_contains_target, persistent_backing_targets,
-    read_local_hot_replica_payload, same_cold_payload, validate_cold_restore_payload,
-    validate_resolved_payload_checksum, with_disjoint_restore_caller_buffers,
+    read_local_hot_replica_payload, resolved_cold_backing, same_cold_payload,
+    validate_cold_restore_payload, validate_resolved_payload_checksum,
+    with_disjoint_restore_caller_buffers,
 };
 #[allow(unused_imports)]
 pub(super) use metrics::{
@@ -69,6 +70,7 @@ pub(super) use metrics::{
 pub(super) use offload::{
     checked_add_cold_tier_bytes, is_stale_pending_cold_backing_error,
     rebuild_pending_offload_queue, remove_unpublished_persistent_backing,
+    repair_initial_write_cold_backings,
 };
 #[allow(unused_imports)] // publish_pending_cold_backing_for_eviction used by PR6
 pub(super) use offload::{
@@ -78,16 +80,13 @@ pub(super) use offload::{
     publish_pending_cold_backing_for_eviction,
 };
 pub(super) use resolve::resolved_uses_cold_backing;
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(super) use restore::restore_payload_from_cold_backing;
 #[allow(unused_imports)]
 pub(super) use restore::{
     batch_read_from_cold_staged, enqueue_restore_promotion, execute_local_restore_batch_reads,
     execute_owner_cold_restore_promote_phase, execute_owner_cold_restore_ssd_phase_staging,
     promote_owned_materialized_route_by_key, read_from_cold_one_shot,
-    trigger_remote_owner_cold_restore, try_init_staging_pool, wait_for_restore_promotions,
-    PromoteTimingBreakdown,
+    restore_payload_from_cold_backing, trigger_remote_owner_cold_restore, try_init_staging_pool,
+    wait_for_restore_promotions, PromoteTimingBreakdown,
 };
 pub(super) use scheduler::ColdTierHandle;
 pub(super) use staging_pool::{ColdRestoreStagingPool, StagingSlot};

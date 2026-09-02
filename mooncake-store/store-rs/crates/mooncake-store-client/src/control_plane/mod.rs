@@ -260,7 +260,6 @@ mod codec;
 mod cold_tier;
 mod cold_tier_codec;
 mod cold_tier_server;
-mod nof_codec;
 mod server;
 
 pub(crate) use cold_tier::{
@@ -281,8 +280,6 @@ use self::codec::{
 };
 #[cfg(test)]
 use self::cold_tier_codec::{pb_cold_backing_route, try_cold_backing_route};
-#[cfg(test)]
-use self::nof_codec::{pb_nof_backing_route, try_nof_backing_route};
 #[cfg(test)]
 use self::server::{
     control_plane_server_threads_from_env, handle_control_stream_request, GrpcControlPlaneService,

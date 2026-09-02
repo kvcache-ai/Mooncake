@@ -2,8 +2,6 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-pub const NOF_BACKING_ROUTE_CAPABILITY: &str = "nof-backing-route-v1";
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompatibilityDescriptor {
     pub store_api_version: u32,
@@ -22,7 +20,6 @@ impl CompatibilityDescriptor {
             "hot-standby".to_string(),
             "hot-upgrade".to_string(),
             "masterless-routing".to_string(),
-            NOF_BACKING_ROUTE_CAPABILITY.to_string(),
         ]);
         Self {
             store_api_version: 1,
@@ -65,7 +62,7 @@ impl Default for CompatibilityDescriptor {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{CompatibilityDescriptor, NOF_BACKING_ROUTE_CAPABILITY};
+    use super::CompatibilityDescriptor;
 
     #[test]
     fn default_descriptor_matches_mooncake_v1_contract() {
@@ -76,7 +73,6 @@ mod tests {
         assert_eq!(descriptor.metadata_schema_version, 1);
         assert_eq!(descriptor.transport_api_version, 1);
         assert!(descriptor.supports("masterless-routing"));
-        assert!(descriptor.supports(NOF_BACKING_ROUTE_CAPABILITY));
         assert!(!descriptor.supports("imaginary-capability"));
     }
 

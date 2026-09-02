@@ -22,14 +22,14 @@ const TARGET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const TARGET_HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
 pub(in crate::client) const NOF_TARGET_SET_LABEL: &str = "nof.target-set.v1";
 pub(in crate::client) const NOF_UNHEALTHY_TARGETS_LABEL: &str = "nof.unhealthy-targets.v1";
+const NOF_MANAGED_LABELS: [&str; 2] = [NOF_TARGET_SET_LABEL, NOF_UNHEALTHY_TARGETS_LABEL];
 
 impl ColdTierDeviceManager {
     /// Resolve the authority for a persistent target without making callers
     /// depend on the backing type.
     ///
-    /// Local targets are fixed to the creating runtime and retain the owner
-    /// persisted in their route. NoF targets use their current distributed
-    /// owner; the persisted value is only a routing snapshot.
+    /// Local targets are fixed to the creating runtime and retain the owner persisted in their
+    /// route. NoF targets use their current distributed owner in request-local I/O descriptors.
     pub(in crate::client) fn current_target_owner(
         &self,
         target_id: &str,
@@ -303,10 +303,9 @@ impl NofOwnerState {
 
         // Withdraw only the NoF-manager capability. The Client remains live
         // long enough to finish the rest of its normal shutdown cleanup.
-        let release_error = {
+        let released_lease = {
             let _guard = nof_managed_label_lock().lock();
-            let mut lease = self
-                .metadata
+            self.metadata
                 .get_client_lease(&self.local_runtime)
                 .ok()
                 .flatten()
@@ -317,32 +316,24 @@ impl NofOwnerState {
                         .unwrap_or_default()
                         .into_iter()
                         .find(|lease| lease.runtime == self.local_runtime)
-                });
-            if let Some(ref mut lease) = lease {
-                lease.endpoints.labels.remove(NOF_TARGET_SET_LABEL);
-                lease.endpoints.labels.remove(NOF_UNHEALTHY_TARGETS_LABEL);
-                self.metadata.upsert_client_lease(lease).err()
-            } else {
-                None
-            }
+                })
+                .map(|mut lease| {
+                    for label in NOF_MANAGED_LABELS {
+                        lease.endpoints.labels.remove(label);
+                    }
+                    let error = self.metadata.upsert_client_lease(&lease).err();
+                    (lease, error)
+                })
         };
-        if let Some(error) = release_error {
-            tracing::warn!(
-                runtime = %self.local_runtime,
-                error = %error,
-                "failed to withdraw NoF target ownership during shutdown"
-            );
-        }
-
-        let mut cache = self.live_clients.lock();
-        if let Some(mut leases) = cache.snapshot() {
-            for lease in &mut leases {
-                if lease.runtime == self.local_runtime {
-                    lease.endpoints.labels.remove(NOF_TARGET_SET_LABEL);
-                    lease.endpoints.labels.remove(NOF_UNHEALTHY_TARGETS_LABEL);
-                }
+        if let Some((lease, error)) = released_lease {
+            replace_cached_lease(&self.live_clients, &lease);
+            if let Some(error) = error {
+                tracing::warn!(
+                    runtime = %self.local_runtime,
+                    error = %error,
+                    "failed to withdraw NoF target ownership during shutdown"
+                );
             }
-            cache.store(leases);
         }
         self.owners.write().clear();
         self.remote_unhealthy_targets.write().clear();
@@ -358,11 +349,9 @@ pub(in crate::client) fn upsert_client_lease_preserving_nof_labels(
     metadata: &dyn MetadataBackend,
     lease: &mut ClientLease,
 ) -> Result<()> {
-    if !lease.endpoints.labels.contains_key(NOF_TARGET_SET_LABEL)
-        && !lease
-            .endpoints
-            .labels
-            .contains_key(NOF_UNHEALTHY_TARGETS_LABEL)
+    if NOF_MANAGED_LABELS
+        .iter()
+        .all(|label| !lease.endpoints.labels.contains_key(*label))
     {
         return metadata.upsert_client_lease(lease);
     }
@@ -392,7 +381,7 @@ fn remote_unhealthy_targets(
                 .endpoints
                 .labels
                 .get(NOF_UNHEALTHY_TARGETS_LABEL)
-                .map(|encoded| serde_json::from_str::<BTreeSet<String>>(encoded));
+                .and_then(|encoded| serde_json::from_str::<BTreeSet<String>>(encoded).ok());
             (&lease.runtime, unhealthy)
         })
         .collect::<BTreeMap<_, _>>();
@@ -403,7 +392,7 @@ fn remote_unhealthy_targets(
                 return None;
             }
             match unhealthy_by_owner.get(owner) {
-                Some(Some(Ok(unhealthy))) if !unhealthy.contains(target_id) => None,
+                Some(Some(unhealthy)) if !unhealthy.contains(target_id) => None,
                 _ => Some(target_id.clone()),
             }
         })
@@ -413,10 +402,11 @@ fn remote_unhealthy_targets(
 fn replace_cached_lease(live_clients: &SharedLiveClientCache, updated: &ClientLease) {
     let mut cache = live_clients.lock();
     if let Some(mut leases) = cache.snapshot() {
-        for lease in &mut leases {
-            if lease.runtime == updated.runtime {
-                *lease = updated.clone();
-            }
+        if let Some(lease) = leases
+            .iter_mut()
+            .find(|lease| lease.runtime == updated.runtime)
+        {
+            *lease = updated.clone();
         }
         cache.store(leases);
     }
@@ -426,7 +416,7 @@ fn preserve_nof_managed_labels(metadata: &dyn MetadataBackend, lease: &mut Clien
     let Ok(Some(current)) = metadata.get_client_lease(&lease.runtime) else {
         return;
     };
-    for key in [NOF_TARGET_SET_LABEL, NOF_UNHEALTHY_TARGETS_LABEL] {
+    for key in NOF_MANAGED_LABELS {
         match current.endpoints.labels.get(key) {
             Some(value) => {
                 lease

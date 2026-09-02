@@ -1,27 +1,23 @@
 //! StoreClient runtime binding for configured NoF targets.
 //!
-//! The existing Cold Tier state machine still owns queueing, batching, route CAS and rollback.
-//! These types only select a NoF target and adapt its advertised data-plane capabilities to the
-//! internal I/O envelope. Persisted metadata remains `NofBackingRoute` throughout.
+//! NoF placement is request-local. Targets are selected for a write and discovered again through
+//! the provider for reads and deletes; provider placement is never published as route metadata.
 
 use std::collections::BTreeMap;
 use std::sync::{atomic::Ordering, Arc};
 
 use mooncake_store_core::{
-    route_logical_object_id, ClientRuntimeId, ColdBackingRoute, ColdBackingState, MetadataBackend,
-    NamespaceScope, NofBackingReplica, NofBackingRoute, NofBackingRouteFilter, NofBackingState,
-    ObjectRoute, Result, StoreError,
+    ClientRuntimeId, ColdBackingReplica, ColdBackingRoute, ColdBackingState, MetadataBackend,
+    NamespaceScope, ObjectRoute, Result, StoreError,
 };
 
-use crate::client::cold_tier::layout::{
-    decode_hex, encode_hex, PhysicalKeyCodec, PhysicalKeyInput, Sha256PhysicalKeyCodec,
-};
+use crate::client::cold_tier::layout::{derive_physical_key, PhysicalKeyInput};
 use crate::client::cold_tier::owner::{NofHeartbeatMonitor, NofOwnerState, NofRuntimeTarget};
 use crate::client::cold_tier::replica_policy::{
     ReplicaLoadBalanceStrategy, ReplicaWriteCandidate, DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY,
 };
 use crate::client::{
-    PersistentStorageBackend, PersistentStorageBackendHealth, PersistentStorageManagement,
+    PersistentObjectProbe, PersistentStorageBackend, PersistentStorageBackendHealth,
     SharedLiveClientCache,
 };
 
@@ -29,8 +25,6 @@ use super::backing::validate_payload;
 use super::object::NofObjectState;
 use super::physical_backend::NofPhysicalStorageBackend;
 use super::NofBackend;
-
-const OBJECT_LOCATOR_PREFIX: &str = "nof-object:v1:";
 
 /// One NoF target registered on `StoreClientBuilder`.
 #[derive(Clone)]
@@ -77,8 +71,8 @@ pub(in crate::client) fn target_set_fingerprint(
         encoded_fields.push(target_id.as_bytes().to_vec());
     }
     let fields = encoded_fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let fingerprint = Sha256PhysicalKeyCodec.encode(PhysicalKeyInput {
-        domain: b"nof-target-set-v1",
+    let fingerprint = derive_physical_key(PhysicalKeyInput {
+        domain: b"nof-target-set",
         fields: &fields,
         chunk_index: None,
     })?;
@@ -119,23 +113,8 @@ impl NofTargetManager {
             }
             data_plane = Some(next_data_plane);
             let backend: Arc<dyn PersistentStorageBackend> = match next_data_plane {
-                NofDataPlane::Object => Arc::new(NofObjectAdapter {
-                    target: config.backend,
-                }),
-                NofDataPlane::Physical => {
-                    let backend =
-                        NofPhysicalStorageBackend::new(config.target_id.clone(), config.backend);
-                    if backend.requires_recovery() {
-                        let routes =
-                            metadata.list_object_routes_by_nof_backing(&NofBackingRouteFilter {
-                                target_id: Some(config.target_id.clone()),
-                                state: Some(NofBackingState::Materialized),
-                                ..NofBackingRouteFilter::default()
-                            })?;
-                        backend.recover_routes(&routes)?;
-                    }
-                    Arc::new(backend)
-                }
+                NofDataPlane::Object => Arc::new(NofObjectAdapter::new(config.backend)),
+                NofDataPlane::Physical => Arc::new(NofPhysicalStorageBackend::new(config.backend)),
             };
             if targets
                 .insert(
@@ -167,7 +146,7 @@ impl NofTargetManager {
         };
         Ok(Self {
             data_plane,
-            replica_count: replica_count.clamp(1, 8),
+            replica_count,
             state,
             _heartbeat: heartbeat,
         })
@@ -183,12 +162,6 @@ impl NofTargetManager {
 
     pub(in crate::client) fn available_for_io(&self, target_id: &str) -> bool {
         self.state.health_snapshot(target_id).is_ok()
-    }
-
-    pub(in crate::client) fn mooncake_manages_storage(&self, target_id: &str) -> Option<bool> {
-        self.state.targets.get(target_id).map(|target| {
-            target.backend.storage_management() == PersistentStorageManagement::MooncakeManaged
-        })
     }
 
     pub(in crate::client) fn target_ids(&self) -> impl Iterator<Item = &str> {
@@ -219,7 +192,7 @@ impl NofTargetManager {
         route: &ObjectRoute,
         length: u64,
         checksum: u64,
-    ) -> Result<Option<NofBackingRoute>> {
+    ) -> Result<Option<ColdBackingRoute>> {
         let Some(data_plane) = self.data_plane else {
             return Ok(None);
         };
@@ -254,23 +227,32 @@ impl NofTargetManager {
         };
         let selected =
             DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, wanted);
+        if data_plane == NofDataPlane::Physical && selected.len() < wanted {
+            tracing::warn!(
+                available_targets = selected.len(),
+                required_targets = wanted,
+                "NoF physical offload retained its hot copy because redundancy is unavailable"
+            );
+            return Ok(None);
+        }
         let Some(primary_index) = selected.first().copied() else {
             return Ok(None);
         };
-        for index in &selected {
-            if let Some(target) = self.state.targets.get(candidates[*index].target_id) {
-                target.accumulated_writes.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        let locator = format!(
-            "{}@v{}",
-            route
-                .canonical_key
-                .clone()
-                .unwrap_or_else(|| route.key.0.clone()),
-            route.version.0
-        );
         let primary_id = candidates[primary_index].target_id.to_string();
+        let primary_target = self
+            .state
+            .targets
+            .get(&primary_id)
+            .expect("selected NoF target must remain registered");
+        primary_target
+            .accumulated_writes
+            .fetch_add(1, Ordering::Relaxed);
+        for index in selected.iter().skip(1) {
+            self.state.targets[candidates[*index].target_id]
+                .accumulated_writes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let object_locator = self.object_locator(route)?;
         let primary_owner = self.state.owner_for(&primary_id).ok_or_else(|| {
             StoreError::Transport(format!("NoF target {primary_id} has no live owner"))
         })?;
@@ -280,25 +262,218 @@ impl NofTargetManager {
                 let target_id = candidates[*index].target_id.to_string();
                 self.state
                     .owner_for(&target_id)
-                    .map(|owner| NofBackingReplica {
+                    .map(|owner| ColdBackingReplica {
                         owner,
-                        target_id,
-                        object_locator: locator.clone(),
+                        cold_tier_id: target_id,
+                        object_locator: object_locator.clone(),
                     })
                     .ok_or_else(|| {
                         StoreError::Transport("NoF replica target has no live owner".to_string())
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Some(NofBackingRoute {
+        Ok(Some(ColdBackingRoute {
             owner: primary_owner,
-            target_id: primary_id,
-            object_locator: locator,
+            cold_tier_id: primary_id,
+            object_locator,
             length,
             checksum: Some(checksum),
-            state: NofBackingState::PendingWrite,
+            state: ColdBackingState::PendingOffload,
             replicas,
         }))
+    }
+
+    /// Find a provider object using only the logical route identity. The returned backing is a
+    /// one-request I/O descriptor and is never written to metadata.
+    pub(in crate::client) fn discover_backing(
+        &self,
+        route: &ObjectRoute,
+    ) -> Result<Option<ColdBackingRoute>> {
+        let object_locator = self.object_locator(route)?;
+        let mut first_error = None;
+        let mut found = Vec::new();
+        for target_id in self.target_ids() {
+            if !self.available_for_io(target_id) {
+                continue;
+            }
+            let owner = self
+                .owner_for(target_id)
+                .unwrap_or_else(|| self.state.local_runtime.clone());
+            let probe = ColdBackingRoute {
+                owner,
+                cold_tier_id: target_id.to_string(),
+                object_locator: object_locator.clone(),
+                length: 0,
+                checksum: None,
+                state: ColdBackingState::Materialized,
+                replicas: Vec::new(),
+            };
+            match self.backend_for(target_id)?.probe_object(&probe) {
+                Ok(Some(metadata)) => found.push((probe, metadata.length)),
+                Ok(None) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if found.is_empty() {
+            return match first_error {
+                Some(error) => Err(error),
+                None => Ok(None),
+            };
+        }
+        let mut primary_index = 0usize;
+        let mut length = found.iter().find_map(|(_, length)| *length);
+        let mut checksum = None;
+        if length.is_none() {
+            for (index, (probe, _)) in found.iter().enumerate() {
+                match self.backend_for(&probe.cold_tier_id)?.get_object(probe) {
+                    Ok(Some(value)) => {
+                        primary_index = index;
+                        length = Some(value.len() as u64);
+                        checksum = Some(crate::client::payload_checksum(&value));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        let Some(length) = length else {
+            return match first_error {
+                Some(error) => Err(error),
+                None => Ok(None),
+            };
+        };
+        let (mut primary, _) = found.swap_remove(primary_index);
+        primary.length = length;
+        primary.checksum = checksum;
+        primary.replicas = found
+            .into_iter()
+            .map(|(probe, _)| ColdBackingReplica {
+                owner: probe.owner,
+                cold_tier_id: probe.cold_tier_id,
+                object_locator: probe.object_locator,
+            })
+            .collect();
+        Ok(Some(primary))
+    }
+
+    pub(in crate::client) fn contains_object(&self, route: &ObjectRoute) -> Result<bool> {
+        let object_locator = self.object_locator(route)?;
+        let mut first_error = None;
+        for target_id in self.target_ids() {
+            if !self.available_for_io(target_id) {
+                continue;
+            }
+            let probe = ColdBackingRoute {
+                owner: self
+                    .owner_for(target_id)
+                    .unwrap_or_else(|| self.state.local_runtime.clone()),
+                cold_tier_id: target_id.to_string(),
+                object_locator: object_locator.clone(),
+                length: 0,
+                checksum: None,
+                state: ColdBackingState::Materialized,
+                replicas: Vec::new(),
+            };
+            match self.backend_for(target_id)?.probe_object(&probe) {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(false),
+        }
+    }
+
+    pub(in crate::client) fn has_required_copies(&self, backing: &ColdBackingRoute) -> bool {
+        let required = match self.data_plane {
+            Some(NofDataPlane::Object) => 1,
+            Some(NofDataPlane::Physical) => self.replica_count,
+            None => return false,
+        };
+        1 + backing.replicas.len() >= required
+    }
+
+    pub(in crate::client) fn verify_backing(
+        &self,
+        backing: &ColdBackingRoute,
+        expected_length: u64,
+        expected_checksum: u64,
+    ) -> Result<bool> {
+        if backing.length != expected_length || !self.has_required_copies(backing) {
+            return Ok(false);
+        }
+        if let Some(checksum) = backing.checksum {
+            return Ok(checksum == expected_checksum);
+        }
+        Ok(self
+            .backend_for(&backing.cold_tier_id)?
+            .get_object(backing)?
+            .is_some_and(|value| {
+                value.len() as u64 == expected_length
+                    && crate::client::payload_checksum(&value) == expected_checksum
+            }))
+    }
+
+    pub(in crate::client) fn put_selected(
+        &self,
+        backing: &ColdBackingRoute,
+        payload: &[u8],
+    ) -> Result<()> {
+        for target in crate::client::cold_tier::persistent_backing_targets(backing) {
+            self.backend_for(&target.cold_tier_id)?
+                .put_object(&target, payload)?;
+        }
+        Ok(())
+    }
+
+    /// Delete one content generation from all configured targets. No reclaim route is persisted.
+    pub(in crate::client) fn delete_object(&self, route: &ObjectRoute) -> Result<bool> {
+        let object_locator = self.object_locator(route)?;
+        let mut deleted = false;
+        let mut first_error = None;
+        for target_id in self.target_ids() {
+            let owner = self
+                .owner_for(target_id)
+                .unwrap_or_else(|| self.state.local_runtime.clone());
+            let request = ColdBackingRoute {
+                owner,
+                cold_tier_id: target_id.to_string(),
+                object_locator: object_locator.clone(),
+                length: 0,
+                checksum: None,
+                state: ColdBackingState::PendingDelete,
+                replicas: Vec::new(),
+            };
+            match self.backend_for(target_id)?.delete_object(&request) {
+                Ok(found) => deleted |= found,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(deleted),
+        }
+    }
+
+    fn object_locator(&self, route: &ObjectRoute) -> Result<String> {
+        let generation = route.content_generation.to_le_bytes();
+        Ok(derive_physical_key(PhysicalKeyInput {
+            domain: b"nof-object",
+            fields: &[route.key.0.as_bytes(), &generation],
+            chunk_index: None,
+        })?
+        .to_hex())
     }
 
     pub(in crate::client) fn release_ownership_on_shutdown(&self) {
@@ -330,110 +505,59 @@ fn runtime_data_plane(backend: &NofBackend) -> Result<NofDataPlane> {
 
 struct NofObjectAdapter {
     target: NofBackend,
+    namespace: NamespaceScope,
 }
 
 impl NofObjectAdapter {
-    fn identity(locator: &str) -> Result<(NamespaceScope, String)> {
-        let encoded = locator.strip_prefix(OBJECT_LOCATOR_PREFIX).ok_or_else(|| {
-            StoreError::InvalidState(format!("unknown NoF object locator: {locator}"))
-        })?;
-        let bytes = decode_hex(encoded, "NoF object locator")?;
-        let mut cursor = bytes.as_slice();
-        let tenant = read_locator_field(&mut cursor)?;
-        let domain = read_locator_field(&mut cursor)?;
-        let object_set = read_locator_field(&mut cursor)?;
-        let key = read_locator_field(&mut cursor)?;
-        if !cursor.is_empty() {
-            return Err(StoreError::InvalidState(
-                "NoF object locator has trailing bytes".to_string(),
-            ));
+    fn new(target: NofBackend) -> Self {
+        Self {
+            target,
+            namespace: NamespaceScope::new("mooncake", "nof", "objects"),
         }
-        Ok((NamespaceScope::new(tenant, domain, object_set), key))
     }
 
-    fn provider_identity(route: &ObjectRoute) -> Result<(NamespaceScope, String)> {
-        let object_id = route_logical_object_id(route)?;
-        let route_version = route.version.0.to_le_bytes();
-        let key = Sha256PhysicalKeyCodec.encode(PhysicalKeyInput {
-            domain: b"nof-object",
-            fields: &[
-                object_id.scope.tenant.as_bytes(),
-                object_id.scope.domain.as_bytes(),
-                object_id.scope.object_set.as_bytes(),
-                object_id.logical_key.as_bytes(),
-                &route_version,
-            ],
-            chunk_index: None,
-        })?;
-        Ok((object_id.scope, format!("mooncake-{}", key.to_hex())))
-    }
-
-    fn locator(namespace: &NamespaceScope, key: &str) -> Result<String> {
-        let mut bytes = Vec::new();
-        for field in [
-            namespace.tenant.as_str(),
-            namespace.domain.as_str(),
-            namespace.object_set.as_str(),
-            key,
-        ] {
-            let length = u32::try_from(field.len()).map_err(|_| {
-                StoreError::InvalidState("NoF object identity field is too long".to_string())
-            })?;
-            bytes.extend_from_slice(&length.to_le_bytes());
-            bytes.extend_from_slice(field.as_bytes());
-        }
-        Ok(format!("{OBJECT_LOCATOR_PREFIX}{}", encode_hex(&bytes)))
+    fn provider_key(object_id: &str) -> Result<String> {
+        Ok(format!(
+            "mooncake-{}",
+            derive_physical_key(PhysicalKeyInput {
+                domain: b"nof-provider-object",
+                fields: &[object_id.as_bytes()],
+                chunk_index: None,
+            })?
+            .to_hex()
+        ))
     }
 }
 
 impl PersistentStorageBackend for NofObjectAdapter {
-    fn storage_management(&self) -> PersistentStorageManagement {
-        self.target.management_mode()
-    }
-
     fn health(&self) -> Result<PersistentStorageBackendHealth> {
         self.target.health_snapshot()
     }
 
-    fn put_object(&self, _backing: &ColdBackingRoute, _payload: &[u8]) -> Result<ColdBackingRoute> {
-        Err(StoreError::InvalidState(
-            "NoF logical-object writes require the object route identity".to_string(),
-        ))
-    }
-
-    fn put_object_with_route(
-        &self,
-        route: Option<&ObjectRoute>,
-        backing: &ColdBackingRoute,
-        payload: &[u8],
-    ) -> Result<ColdBackingRoute> {
+    fn put_object(&self, backing: &ColdBackingRoute, payload: &[u8]) -> Result<ColdBackingRoute> {
         validate_payload(backing, payload)?;
-        let route = route.ok_or_else(|| {
-            StoreError::InvalidState(
-                "NoF logical-object writes require the object route identity".to_string(),
-            )
-        })?;
-        let (namespace, key) = Self::provider_identity(route)?;
-        self.target.init_namespace(&namespace)?;
-        let metadata = self.target.put_object(&namespace, &key, payload)?;
+        let key = Self::provider_key(&backing.object_locator)?;
+        self.target.init_namespace(&self.namespace)?;
+        let metadata = self.target.put_object(&self.namespace, &key, payload)?;
         if metadata.length != backing.length {
             return Err(StoreError::InvalidState(
                 "NoF provider returned an unexpected logical-object length".to_string(),
             ));
         }
         Ok(ColdBackingRoute {
-            object_locator: Self::locator(&namespace, &key)?,
             state: ColdBackingState::Materialized,
             ..backing.clone()
         })
     }
 
     fn get_object(&self, backing: &ColdBackingRoute) -> Result<Option<Vec<u8>>> {
-        let (namespace, key) = Self::identity(&backing.object_locator)?;
-        match self.target.get_object(&namespace, &key)? {
+        let key = Self::provider_key(&backing.object_locator)?;
+        match self.target.get_object(&self.namespace, &key)? {
             NofObjectState::Found(object) => {
-                validate_payload(backing, &object.value)?;
-                if object.metadata.length != backing.length {
+                if backing.length != 0 {
+                    validate_payload(backing, &object.value)?;
+                }
+                if backing.length != 0 && object.metadata.length != backing.length {
                     return Err(StoreError::InvalidState(
                         "NoF provider object metadata length does not match route".to_string(),
                     ));
@@ -447,9 +571,29 @@ impl PersistentStorageBackend for NofObjectAdapter {
         }
     }
 
+    fn probe_object(&self, backing: &ColdBackingRoute) -> Result<Option<PersistentObjectProbe>> {
+        if self.target.backing.object_query().is_none() {
+            return Ok(self
+                .get_object(backing)?
+                .map(|value| PersistentObjectProbe {
+                    length: Some(value.len() as u64),
+                }));
+        }
+        let key = Self::provider_key(&backing.object_locator)?;
+        match self.target.query_object(&self.namespace, &key)? {
+            NofObjectState::Found(metadata) => Ok(Some(PersistentObjectProbe {
+                length: Some(metadata.length),
+            })),
+            NofObjectState::Missing => Ok(None),
+            NofObjectState::Incomplete => Err(StoreError::Backpressure(
+                "NoF provider object is incomplete".to_string(),
+            )),
+        }
+    }
+
     fn delete_object(&self, backing: &ColdBackingRoute) -> Result<bool> {
-        let (namespace, key) = Self::identity(&backing.object_locator)?;
-        match self.target.delete_object(&namespace, &key)? {
+        let key = Self::provider_key(&backing.object_locator)?;
+        match self.target.delete_object(&self.namespace, &key)? {
             NofObjectState::Found(()) => Ok(true),
             NofObjectState::Missing => Ok(false),
             NofObjectState::Incomplete => Err(StoreError::Backpressure(
@@ -473,83 +617,6 @@ impl PersistentStorageBackend for NofObjectAdapter {
     fn disable_pending_source(&self) -> bool {
         true
     }
-}
-
-fn read_locator_field(cursor: &mut &[u8]) -> Result<String> {
-    if cursor.len() < 4 {
-        return Err(StoreError::InvalidState(
-            "NoF object locator is truncated".to_string(),
-        ));
-    }
-    let mut encoded_length = [0; 4];
-    encoded_length.copy_from_slice(&cursor[..4]);
-    *cursor = &cursor[4..];
-    let length = u32::from_le_bytes(encoded_length) as usize;
-    if cursor.len() < length {
-        return Err(StoreError::InvalidState(
-            "NoF object locator field is truncated".to_string(),
-        ));
-    }
-    let value = std::str::from_utf8(&cursor[..length])
-        .map_err(|_| StoreError::InvalidState("NoF object locator is not UTF-8".to_string()))?
-        .to_string();
-    *cursor = &cursor[length..];
-    Ok(value)
-}
-
-pub(in crate::client) fn nof_as_cold(backing: &NofBackingRoute) -> ColdBackingRoute {
-    ColdBackingRoute {
-        owner: backing.owner.clone(),
-        cold_tier_id: backing.target_id.clone(),
-        object_locator: backing.object_locator.clone(),
-        length: backing.length,
-        checksum: backing.checksum,
-        state: match backing.state {
-            NofBackingState::PendingWrite => ColdBackingState::PendingOffload,
-            NofBackingState::Materialized => ColdBackingState::Materialized,
-            NofBackingState::PendingDelete => ColdBackingState::PendingDelete,
-        },
-        replicas: backing
-            .replicas
-            .iter()
-            .map(|replica| mooncake_store_core::ColdBackingReplica {
-                owner: replica.owner.clone(),
-                cold_tier_id: replica.target_id.clone(),
-                object_locator: replica.object_locator.clone(),
-            })
-            .collect(),
-    }
-}
-
-pub(in crate::client) fn cold_as_nof(backing: &ColdBackingRoute) -> NofBackingRoute {
-    NofBackingRoute {
-        owner: backing.owner.clone(),
-        target_id: backing.cold_tier_id.clone(),
-        object_locator: backing.object_locator.clone(),
-        length: backing.length,
-        checksum: backing.checksum,
-        state: match backing.state {
-            ColdBackingState::PendingOffload => NofBackingState::PendingWrite,
-            ColdBackingState::Materialized => NofBackingState::Materialized,
-            ColdBackingState::PendingDelete => NofBackingState::PendingDelete,
-        },
-        replicas: backing
-            .replicas
-            .iter()
-            .map(|replica| NofBackingReplica {
-                owner: replica.owner.clone(),
-                target_id: replica.cold_tier_id.clone(),
-                object_locator: replica.object_locator.clone(),
-            })
-            .collect(),
-    }
-}
-
-pub(in crate::client) fn route_backing_as_cold(route: &ObjectRoute) -> Option<ColdBackingRoute> {
-    route
-        .cold_backing
-        .clone()
-        .or_else(|| route.nof_backing.as_ref().map(nof_as_cold))
 }
 
 #[cfg(test)]
@@ -632,11 +699,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(7),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
             cold_backing: None,
-            nof_backing: None,
         }
     }
 
@@ -677,7 +744,7 @@ mod tests {
         let mut saw_remote_owner = false;
         for target in backing.all_targets() {
             let expected = manager
-                .owner_for(target.target_id)
+                .owner_for(target.cold_tier_id)
                 .expect("selected target should have an owner");
             assert_eq!(*target.owner, expected);
             saw_remote_owner |= target.owner == &remote.runtime;

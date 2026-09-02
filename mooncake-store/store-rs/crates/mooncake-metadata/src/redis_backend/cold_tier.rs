@@ -180,9 +180,6 @@ impl RedisMetadataBackend {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
-        if let Some(route) = next {
-            route.validate_backing_kind()?;
-        }
         let mut connection = self.connection("redis cas object route")?;
         let payload = next
             .map(|route| serde_json::to_string(route).map_err(json_error))
@@ -194,11 +191,7 @@ impl RedisMetadataBackend {
             self.cold_backing_index_keys(current.as_ref());
         let [new_device_index, new_state_index, new_owner_index] =
             self.cold_backing_index_keys(next);
-        let old_nof_indexes = self.nof_backing_index_keys(current.as_ref());
-        let new_nof_indexes = self.nof_backing_index_keys(next);
-        let script = Script::new(CAS_OBJECT_ROUTE_SCRIPT);
-        let mut invocation = script.prepare_invoke();
-        invocation
+        let current_payload = Script::new(CAS_OBJECT_ROUTE_SCRIPT)
             .key(&object_key)
             .key(self.keyspace.object_index())
             .key(old_device_index.as_str())
@@ -206,14 +199,7 @@ impl RedisMetadataBackend {
             .key(old_owner_index.as_str())
             .key(new_device_index.as_str())
             .key(new_state_index.as_str())
-            .key(new_owner_index.as_str());
-        for index in &old_nof_indexes {
-            invocation.key(index);
-        }
-        for index in &new_nof_indexes {
-            invocation.key(index);
-        }
-        invocation
+            .key(new_owner_index.as_str())
             .arg(
                 expected
                     .map(|version| version.0.to_string())
@@ -235,9 +221,6 @@ impl RedisMetadataBackend {
             })
             .arg(if new_state_index.is_empty() { "0" } else { "1" })
             .arg(if new_owner_index.is_empty() { "0" } else { "1" })
-            .arg(old_nof_indexes.len())
-            .arg(new_nof_indexes.len());
-        let current_payload = invocation
             .invoke::<(i32, String)>(&mut connection)
             .map_err(|error| metadata_error("redis cas object route", error))?;
 

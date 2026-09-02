@@ -29,42 +29,51 @@ pub(in super::super) fn enqueue_pending_offload(
     if super::cold_tier_disabled() {
         return;
     }
-    let Some((cold_backing, nof_backing)) = pending_persistent_backing(route) else {
+    let Some(cold_backing) = pending_persistent_backing(route) else {
         return;
     };
-    if !can_materialize_pending_backing(storage_owner, route, &cold_backing, nof_backing) {
+    if cold_backing.owner != storage_owner.runtime {
         return;
     }
-    let _accepted = storage_owner.pending_offloads.push(
-        route.key.clone(),
-        route.version,
-        Some(cold_backing.length),
-    );
+    enqueue_pending_offload_with_length(storage_owner, route, cold_backing.length);
 }
 
-fn can_materialize_pending_backing(
+fn enqueue_pending_offload_with_length(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
-    backing: &mooncake_store_core::ColdBackingRoute,
-    nof_backing: bool,
-) -> bool {
-    if !nof_backing {
-        return backing.owner == storage_owner.runtime;
+    length: u64,
+) {
+    if storage_owner
+        .pending_offloads
+        .push(route.key.clone(), route.version, Some(length))
+    {
+        storage_owner.cold_tier_devices.pressure_increment_pending();
     }
-    route
-        .replicas
-        .iter()
-        .any(|replica| replica.owner == storage_owner.runtime)
 }
 
 pub(in super::super) fn publish_initial_write_cold_backing(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
 ) -> Result<Option<ObjectRoute>> {
+    publish_initial_write_backing(storage_owner, route, true)
+}
+
+fn repair_initial_write_local_backing(
+    storage_owner: &StorageOwnerState,
+    route: &ObjectRoute,
+) -> Result<Option<ObjectRoute>> {
+    publish_initial_write_backing(storage_owner, route, false)
+}
+
+fn publish_initial_write_backing(
+    storage_owner: &StorageOwnerState,
+    route: &ObjectRoute,
+    allow_nof: bool,
+) -> Result<Option<ObjectRoute>> {
     if super::cold_tier_disabled() {
         return Ok(None);
     }
-    if route.state != RouteState::Active || route.has_persistent_backing() {
+    if route.state != RouteState::Active || route.cold_backing.is_some() {
         storage_owner.sync_route(route);
         return Ok(None);
     }
@@ -81,13 +90,20 @@ pub(in super::super) fn publish_initial_write_cold_backing(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(backing) = storage_owner.backing_for_route(route, replica.length, checksum)? else {
+    let Some(backing) =
+        storage_owner.backing_for_route(route, replica.length, checksum, allow_nof)?
+    else {
         storage_owner.sync_route(route);
         return Ok(None);
     };
+    if backing.is_nof() {
+        enqueue_pending_offload_with_length(storage_owner, route, backing.backing().length);
+        storage_owner.sync_route(route);
+        return Ok(None);
+    }
     let mut next = route.clone();
     next.version = next.version.next();
-    backing.publish(&mut next);
+    backing.publish_local(&mut next);
     let cas = storage_owner.route_ops.compare_and_swap_route(
         &route.key,
         Some(route.version),
@@ -126,7 +142,7 @@ pub(in super::super) fn repair_initial_write_cold_backings(
     let result = storage_owner.route_ops.visit_routes_by_replica_owner(
         &storage_owner.runtime,
         &mut |route| {
-            if route.state != RouteState::Active || route.has_persistent_backing() {
+            if route.state != RouteState::Active || route.cold_backing.is_some() {
                 storage_owner.sync_route(&route);
                 return Ok(());
             }
@@ -134,7 +150,7 @@ pub(in super::super) fn repair_initial_write_cold_backings(
                 return Ok(());
             }
             attempted = attempted.saturating_add(1);
-            match publish_initial_write_cold_backing(storage_owner, &route) {
+            match repair_initial_write_local_backing(storage_owner, &route) {
                 Ok(Some(_)) => published = published.saturating_add(1),
                 Ok(None) => {}
                 Err(error) => {
@@ -163,7 +179,7 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
     if super::cold_tier_disabled() {
         return Ok(None);
     }
-    if route.state != RouteState::Active || route.has_persistent_backing() {
+    if route.state != RouteState::Active || route.cold_backing.is_some() {
         storage_owner.sync_route(route);
         return Ok(None);
     }
@@ -180,14 +196,20 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(backing) = storage_owner.pending_backing_for_route(route, replica.length, checksum)?
+    let Some(backing) =
+        storage_owner.pending_backing_for_route(route, replica.length, checksum, true)?
     else {
         storage_owner.sync_route(route);
         return Ok(None);
     };
+    if backing.is_nof() {
+        enqueue_pending_offload_with_length(storage_owner, route, backing.backing().length);
+        storage_owner.sync_route(route);
+        return Ok(Some(route.clone()));
+    }
     let mut next = route.clone();
     next.version = next.version.next();
-    backing.publish(&mut next);
+    backing.publish_local(&mut next);
     let cas = storage_owner.route_ops.compare_and_swap_route(
         &route.key,
         Some(route.version),
@@ -474,18 +496,18 @@ pub(in super::super) fn prepare_pending_offload_entry(
         storage_owner.hot_replicas.remove_key(&entry.key.route_key);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     };
-    let refreshed_pending_entry =
-        pending_persistent_backing(&route).and_then(|(backing, nof_backing)| {
-            can_materialize_pending_backing(storage_owner, &route, &backing, nof_backing).then(
-                || PendingOffloadEntry {
-                    key: entry.key.clone(),
-                    route_version: route.version,
-                    attempts: entry.attempts,
-                    not_before: Instant::now(),
-                    enqueued_at: entry.enqueued_at,
-                    length_bytes: Some(backing.length),
-                },
-            )
+    let refreshed_pending_entry = route
+        .replicas
+        .iter()
+        .filter(|replica| replica.owner == storage_owner.runtime)
+        .min_by_key(|replica| replica.priority)
+        .map(|replica| PendingOffloadEntry {
+            key: entry.key.clone(),
+            route_version: route.version,
+            attempts: entry.attempts,
+            not_before: Instant::now(),
+            enqueued_at: entry.enqueued_at,
+            length_bytes: Some(replica.length),
         });
     if route.state != RouteState::Active {
         if let Some(refreshed_entry) = refreshed_pending_entry.clone() {
@@ -503,14 +525,6 @@ pub(in super::super) fn prepare_pending_offload_entry(
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     }
-    let Some((cold_backing, nof_backing)) = pending_persistent_backing(&route) else {
-        storage_owner.sync_route(&route);
-        return Ok(PendingOffloadPrepareOutcome::Skipped);
-    };
-    if !can_materialize_pending_backing(storage_owner, &route, &cold_backing, nof_backing) {
-        storage_owner.sync_route(&route);
-        return Ok(PendingOffloadPrepareOutcome::Skipped);
-    }
     let Some(replica) = route
         .replicas
         .iter()
@@ -520,8 +534,30 @@ pub(in super::super) fn prepare_pending_offload_entry(
     else {
         return Ok(PendingOffloadPrepareOutcome::Retry(entry));
     };
+    let (cold_backing, transient_nof) = match pending_persistent_backing(&route) {
+        Some(backing) => (backing, false),
+        None => {
+            let Some(checksum) = checksum_for_cold_backing(storage_owner, &route, &replica)? else {
+                storage_owner.sync_route(&route);
+                return Ok(PendingOffloadPrepareOutcome::Skipped);
+            };
+            let Some(backing) = storage_owner
+                .cold_tier_devices
+                .nof_targets
+                .pending_backing(&route, replica.length, checksum)?
+            else {
+                storage_owner.sync_route(&route);
+                return Ok(PendingOffloadPrepareOutcome::Skipped);
+            };
+            (backing, true)
+        }
+    };
+    if !transient_nof && cold_backing.owner != storage_owner.runtime {
+        storage_owner.sync_route(&route);
+        return Ok(PendingOffloadPrepareOutcome::Skipped);
+    }
     let device_id = cold_tier_device_id(&cold_backing);
-    let device = if nof_backing {
+    let device = if transient_nof {
         None
     } else {
         let Some(device) = devices.get(device_id).cloned() else {
@@ -529,7 +565,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
                 storage_owner,
                 &route,
                 &cold_backing,
-                nof_backing,
+                transient_nof,
                 "missing_device",
                 None,
             )?;
@@ -578,7 +614,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
                 storage_owner,
                 &route,
                 &cold_backing,
-                nof_backing,
+                transient_nof,
                 "missing_backend",
                 Some(&error),
             )?;
@@ -597,7 +633,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
             entry,
             route,
             cold_backing,
-            nof_backing,
+            transient_nof,
             payload,
             device,
             permit,
@@ -609,17 +645,26 @@ pub(in super::super) fn clear_unavailable_pending_cold_backing(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
     cold_backing: &mooncake_store_core::ColdBackingRoute,
-    nof_backing: bool,
+    transient_nof: bool,
     reason: &'static str,
     error: Option<&StoreError>,
 ) -> Result<()> {
+    if transient_nof {
+        tracing::warn!(
+            runtime = %storage_owner.runtime,
+            key = %route.key.0,
+            route_version = route.version.0,
+            target_id = %cold_backing.cold_tier_id,
+            reason,
+            error = %error.map(|e| e.to_string()).unwrap_or_default(),
+            "request-local NoF offload target is unavailable"
+        );
+        storage_owner.sync_route(route);
+        return Ok(());
+    }
     let mut next = route.clone();
     next.version = next.version.next();
-    if nof_backing {
-        next.nof_backing = None;
-    } else {
-        next.cold_backing = None;
-    }
+    next.cold_backing = None;
     let cas = storage_owner.route_ops.compare_and_swap_route(
         &route.key,
         Some(route.version),
@@ -656,6 +701,9 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
     }
     if pending.is_empty() {
         return Ok(0);
+    }
+    if pending[0].transient_nof {
+        return materialize_transient_nof_batch(storage_owner, pending, first_error);
     }
     let backend = match storage_owner
         .cold_tier_devices
@@ -756,6 +804,49 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
     Ok(outcome.materialized)
 }
 
+fn materialize_transient_nof_batch(
+    storage_owner: &StorageOwnerState,
+    pending: &[PendingOffloadMaterialization],
+    first_error: &mut Option<StoreError>,
+) -> Result<usize> {
+    if !pending.iter().all(|entry| entry.transient_nof) {
+        retry_pending_offload_batch(storage_owner, pending);
+        return Err(StoreError::InvalidState(
+            "NoF and local Cold Tier writes cannot share one backend batch".to_string(),
+        ));
+    }
+    let mut completed = 0usize;
+    for prepared in pending {
+        let write_result = storage_owner
+            .cold_tier_devices
+            .nof_targets
+            .put_selected(&prepared.cold_backing, prepared.payload.as_slice());
+        match write_result {
+            Ok(()) => {
+                if let Some(permit) = prepared.permit.as_ref() {
+                    permit.complete_ok();
+                }
+                storage_owner.pending_offloads.complete(&prepared.entry.key);
+                storage_owner.cold_tier_devices.pressure_decrement_pending();
+                completed = completed.saturating_add(1);
+            }
+            Err(error) => {
+                if let Some(permit) = prepared.permit.as_ref() {
+                    permit.complete_error();
+                }
+                if first_error.is_none() {
+                    *first_error = Some(error);
+                }
+                storage_owner.pending_offloads.retry(prepared.entry.clone());
+            }
+        }
+    }
+    if completed > 0 {
+        storage_owner.eviction_ready_signal.signal();
+    }
+    Ok(completed)
+}
+
 fn retry_pending_offload_batch(
     storage_owner: &StorageOwnerState,
     pending: &[PendingOffloadMaterialization],
@@ -839,7 +930,7 @@ fn write_pending_offload_payloads(
                 publish_materialized_backing(
                     &mut next_route,
                     &materialized_cold_backing,
-                    prepared.nof_backing,
+                    prepared.transient_nof,
                 );
                 ready.push(PendingOffloadReadyRoute {
                     index,
@@ -932,7 +1023,7 @@ fn write_pending_offload_replicas(
         publish_materialized_backing(
             &mut ready_route.next_route,
             &ready_route.materialized_cold_backing,
-            prepared.nof_backing,
+            prepared.transient_nof,
         );
     }
 }
@@ -940,15 +1031,10 @@ fn write_pending_offload_replicas(
 fn publish_materialized_backing(
     route: &mut ObjectRoute,
     backing: &mooncake_store_core::ColdBackingRoute,
-    nof_backing: bool,
+    transient_nof: bool,
 ) {
-    if nof_backing {
-        route.cold_backing = None;
-        route.nof_backing = Some(super::nof::cold_as_nof(backing));
-    } else {
-        route.nof_backing = None;
-        route.cold_backing = Some(backing.clone());
-    }
+    debug_assert!(!transient_nof);
+    route.cold_backing = Some(backing.clone());
 }
 
 fn cas_pending_offload_routes(
@@ -979,7 +1065,7 @@ fn rollback_ready_pending_offloads(
         // locators are idempotent and have no Mooncake capacity reservation, so retain them
         // for route confirmation/retry rather than risking an applied route pointing at data
         // we just deleted. Local Cold Tier keeps its established reservation rollback path.
-        if !pending[ready.index].nof_backing {
+        if !pending[ready.index].transient_nof {
             remove_unpublished_persistent_backing(storage_owner, &ready.materialized_cold_backing);
         }
         reserved_release_bytes = checked_add_cold_tier_bytes(
@@ -1092,7 +1178,7 @@ fn apply_pending_offload_cas_result(
             // Per-item errors can also represent a lost CAS reply. See the batch-error path
             // above for why provider-managed NoF payloads are retained until retry confirms the
             // route; definite conflicts are handled by the preceding branch and cleaned up.
-            if !pending.nof_backing {
+            if !pending.transient_nof {
                 context
                     .outcome
                     .cleanup
@@ -1136,7 +1222,7 @@ fn reserve_pending_offload_batch(
     storage_owner: &StorageOwnerState,
     pending: &[PendingOffloadMaterialization],
 ) -> Result<()> {
-    if pending[0].nof_backing {
+    if pending[0].transient_nof {
         return Ok(());
     }
     let reserved_bytes = sum_pending_offload_payload_bytes(pending)?;
@@ -1170,7 +1256,7 @@ fn record_failed_pending_offload_write(
             storage_owner,
             &prepared.route,
             &prepared.cold_backing,
-            prepared.nof_backing,
+            prepared.transient_nof,
             "checksum_mismatch",
             Some(&error),
         )?;
@@ -1205,7 +1291,7 @@ fn settle_pending_offload_batch(
     used_add_bytes: i64,
     reserved_release_bytes: i64,
 ) -> Result<()> {
-    if pending[0].nof_backing {
+    if pending[0].transient_nof {
         return Ok(());
     }
     storage_owner.apply_cold_tier_usage_delta(
@@ -1270,29 +1356,36 @@ fn rebuild_pending_offload_queue_with(
             }
         }
     }
-    // Pending writes are materialized by the runtime that still owns the hot source. The
-    // target owner is a maintenance/health authority and may not have the source payload.
-    // Reuse the existing replica-owner recovery listing instead of scanning NoF targets.
-    for route in storage_owner
-        .route_ops
-        .list_routes_by_replica_owner(&storage_owner.runtime)?
-    {
-        let Some(backing) = route.nof_backing.as_ref() else {
-            continue;
-        };
-        let owns_hot_source = route
-            .replicas
-            .iter()
-            .any(|replica| replica.owner == storage_owner.runtime);
-        if route.state == RouteState::Active
-            && owns_hot_source
-            && backing.state == mooncake_store_core::NofBackingState::PendingWrite
-            && storage_owner
+    if !storage_owner.cold_tier_devices.nof_targets.is_empty() {
+        for route in storage_owner
+            .route_ops
+            .list_routes_by_replica_owner(&storage_owner.runtime)?
+        {
+            if route.state != RouteState::Active || route.cold_backing.is_some() {
+                continue;
+            }
+            if storage_owner
                 .cold_tier_devices
                 .nof_targets
-                .contains(&backing.target_id)
-        {
-            queue.push(route.key.clone(), route.version, Some(backing.length));
+                .discover_backing(&route)?
+                .as_ref()
+                .is_some_and(|backing| {
+                    storage_owner
+                        .cold_tier_devices
+                        .nof_targets
+                        .has_required_copies(backing)
+                })
+            {
+                continue;
+            }
+            if let Some(replica) = route
+                .replicas
+                .iter()
+                .filter(|replica| replica.owner == storage_owner.runtime)
+                .min_by_key(|replica| replica.priority)
+            {
+                queue.push(route.key.clone(), route.version, Some(replica.length));
+            }
         }
     }
     let len = queue.len();

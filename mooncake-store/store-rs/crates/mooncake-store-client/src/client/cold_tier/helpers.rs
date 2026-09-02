@@ -128,7 +128,6 @@ pub(in super::super) fn persistent_backing_contains_target(
         .any(|candidate| same_cold_payload(candidate, target) && candidate.length == target.length)
 }
 
-#[allow(dead_code)]
 pub(in super::super) fn materialized_cold_backing(
     route: &ObjectRoute,
 ) -> Option<mooncake_store_core::ColdBackingRoute> {
@@ -136,30 +135,24 @@ pub(in super::super) fn materialized_cold_backing(
         .cold_backing
         .clone()
         .filter(|cold| cold.state == mooncake_store_core::ColdBackingState::Materialized)
-        .or_else(|| {
-            route
-                .nof_backing
-                .as_ref()
-                .filter(|nof| nof.state == mooncake_store_core::NofBackingState::Materialized)
-                .map(super::nof::nof_as_cold)
-        })
+}
+
+pub(in super::super) fn resolved_cold_backing(
+    resolved: &ResolvedObject,
+) -> Option<mooncake_store_core::ColdBackingRoute> {
+    resolved
+        .transient_backing
+        .clone()
+        .or_else(|| materialized_cold_backing(&resolved.route))
 }
 
 pub(in super::super) fn pending_persistent_backing(
     route: &ObjectRoute,
-) -> Option<(mooncake_store_core::ColdBackingRoute, bool)> {
+) -> Option<mooncake_store_core::ColdBackingRoute> {
     route
         .cold_backing
         .clone()
         .filter(|cold| cold.state == mooncake_store_core::ColdBackingState::PendingOffload)
-        .map(|backing| (backing, false))
-        .or_else(|| {
-            route
-                .nof_backing
-                .as_ref()
-                .filter(|nof| nof.state == mooncake_store_core::NofBackingState::PendingWrite)
-                .map(|nof| (super::nof::nof_as_cold(nof), true))
-        })
 }
 
 /// Like [`materialized_cold_backing`] but without cloning the backing record —
@@ -169,9 +162,6 @@ pub(in super::super) fn has_materialized_cold_backing(route: &ObjectRoute) -> bo
         .cold_backing
         .as_ref()
         .is_some_and(|backing| backing.state == mooncake_store_core::ColdBackingState::Materialized)
-        || route.nof_backing.as_ref().is_some_and(|backing| {
-            backing.state == mooncake_store_core::NofBackingState::Materialized
-        })
 }
 
 pub(in super::super) fn validate_cold_restore_payload(
@@ -210,7 +200,7 @@ pub(in super::super) fn validate_resolved_payload_checksum(
     resolved: &ResolvedObject,
     payload: &[u8],
 ) -> Result<()> {
-    if let Some(cold_backing) = materialized_cold_backing(&resolved.route) {
+    if let Some(cold_backing) = resolved_cold_backing(resolved) {
         if payload.len() != cold_backing.length as usize {
             warn!(
                 tenant = %resolved.tenant,

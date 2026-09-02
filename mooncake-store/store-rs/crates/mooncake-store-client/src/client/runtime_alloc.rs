@@ -855,7 +855,10 @@ impl StoreClient {
             let results = if owner == self.lease.runtime {
                 targets
                     .iter()
-                    .map(|target| self.storage_owner.reclaim_cold_backing_for_route_delete(target))
+                    .map(|target| {
+                        self.storage_owner
+                            .reclaim_cold_backing_for_route_delete(route_key, target)
+                    })
                     .collect::<Vec<_>>()
             } else {
                 let lease = self.lookup_runtime_lease(&owner)?;
@@ -863,6 +866,7 @@ impl StoreClient {
                     &lease,
                     &namespace,
                     &owner.stable_id.0,
+                    route_key,
                     &targets,
                 )?
             };
@@ -922,7 +926,7 @@ impl StoreClient {
             return Ok(true);
         };
         Ok(current.state != RouteState::Active
-            || cold_tier::nof::route_backing_as_cold(&current).as_ref() != Some(cold_backing))
+            || current.cold_backing.as_ref() != Some(cold_backing))
     }
 
     fn reclaim_policy_rank(qos_tier: &str) -> u8 {
@@ -1187,7 +1191,10 @@ impl StoreClient {
                 self.lease_ttl_ms
                     .max(DEFAULT_SEGMENT_PUBLISH_LEASE_TTL_MS),
             ));
-        self.metadata.upsert_client_lease(&lease)
+        cold_tier::nof::upsert_client_lease_preserving_nof_labels(
+            self.metadata.as_ref(),
+            &mut lease,
+        )
     }
 
     fn publish_local_segments(&self, segments: &[StorageExtentInfo], used_bytes: u64) -> Result<()> {

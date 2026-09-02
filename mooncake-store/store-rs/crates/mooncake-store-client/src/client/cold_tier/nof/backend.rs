@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use mooncake_store_core::{NamespaceScope, Result, StoreError};
 
-use crate::client::cold_tier::layout::{PhysicalKeyCodec, Sha256PhysicalKeyCodec, ValueChunkPlan};
-use crate::client::{PersistentStorageBackendHealth, PersistentStorageManagement};
+use crate::client::cold_tier::layout::ValueChunkPlan;
+use crate::client::PersistentStorageBackendHealth;
 
 use super::backing::NofBacking;
 use super::ensure_batch_len;
@@ -13,14 +13,12 @@ use super::object::{
 
 /// Unified NoF facade and capability container.
 ///
-/// A backing may expose logical-object I/O, physical-KV I/O, health and storage maintenance
-/// independently. The facade never infers one capability from another.
+/// A backing may expose logical-object I/O, physical-KV I/O and health independently. The facade
+/// never infers one capability from another.
 #[derive(Clone)]
 pub struct NofBackend {
     pub(crate) backing: Arc<dyn NofBacking>,
     pub(crate) object_limits: Option<NofObjectLimits>,
-    pub(crate) key_codec: Arc<dyn PhysicalKeyCodec>,
-    pub(crate) key_domain: Vec<u8>,
 }
 
 impl NofBackend {
@@ -41,40 +39,12 @@ impl NofBackend {
         Ok(Self {
             backing,
             object_limits,
-            key_codec: Arc::new(Sha256PhysicalKeyCodec),
-            key_domain: b"mooncake:nof:physical:v1".to_vec(),
         })
     }
 
-    pub fn key_codec(mut self, codec: Arc<dyn PhysicalKeyCodec>) -> Self {
-        self.key_codec = codec;
-        self
-    }
-
-    pub fn key_domain(mut self, domain: impl Into<Vec<u8>>) -> Result<Self> {
-        let domain = domain.into();
-        if domain.is_empty() {
-            return Err(StoreError::InvalidState(
-                "NoF physical key domain must not be empty".to_string(),
-            ));
-        }
-        self.key_domain = domain;
-        Ok(self)
-    }
-
-    pub(in crate::client) fn management_mode(&self) -> PersistentStorageManagement {
-        if self.backing.storage_management().is_some() {
-            PersistentStorageManagement::MooncakeManaged
-        } else {
-            PersistentStorageManagement::BackendManaged
-        }
-    }
-
     pub(in crate::client) fn health_snapshot(&self) -> Result<PersistentStorageBackendHealth> {
-        let health = if let Some(storage) = self.backing.storage_management() {
-            storage.storage_health()?.validate(true)?
-        } else if let Some(health) = self.backing.health_capability() {
-            health.health()?.validate(false)?
+        let health = if let Some(health) = self.backing.health_capability() {
+            health.health()?.validate()?
         } else {
             Default::default()
         };
@@ -139,9 +109,9 @@ impl NofBackend {
         };
         match query.query_object(namespace, key)? {
             NofObjectState::Found(metadata) if metadata == expected => Ok(metadata),
-            NofObjectState::Found(_) => Err(StoreError::InvalidState(
-                "NoF provider published inconsistent object metadata".to_string(),
-            )),
+            NofObjectState::Found(actual) => Err(StoreError::InvalidState(format!(
+                "NoF provider published object metadata {actual:?}, expected {expected:?}"
+            ))),
             NofObjectState::Missing => Err(StoreError::NotFound(
                 "NoF object missing after successful put".to_string(),
             )),

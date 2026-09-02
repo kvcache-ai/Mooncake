@@ -448,6 +448,7 @@ fn route_from_recovered_cold_object(
         sharing_scope: recovered.manifest.sharing_scope.clone(),
         qos_tier: recovered.manifest.qos_tier.clone(),
         version: recovered.manifest.route_version,
+        content_generation: 0,
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
@@ -460,7 +461,6 @@ fn route_from_recovered_cold_object(
             state: mooncake_store_core::ColdBackingState::Materialized,
             replicas: Vec::new(),
         }),
-        nof_backing: None,
     }
 }
 
@@ -1438,11 +1438,11 @@ mod tests {
             sharing_scope: Some("sharing-scope".to_string()),
             qos_tier: Some("qos-tier".to_string()),
             version: RouteVersion(3),
+            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
             cold_backing: Some(cold_backing.clone()),
-            nof_backing: None,
         };
         backend
             .put_object_with_route(Some(&route), &cold_backing, payload)

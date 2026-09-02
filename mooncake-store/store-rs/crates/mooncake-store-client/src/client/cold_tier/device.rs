@@ -126,10 +126,11 @@ impl StorageOwnerState {
         route: &ObjectRoute,
         length: u64,
         checksum: u64,
+        allow_nof: bool,
     ) -> Result<Option<super::super::PendingBackingRoute>> {
         match self.offload_mode {
             super::super::ColdTierOffloadMode::Passthrough => {
-                self.pending_backing_for_route(route, length, checksum)
+                self.pending_backing_for_route(route, length, checksum, allow_nof)
             }
             super::super::ColdTierOffloadMode::EvictTriggered => Ok(None),
         }
@@ -140,16 +141,17 @@ impl StorageOwnerState {
         route: &ObjectRoute,
         length: u64,
         checksum: u64,
+        allow_nof: bool,
     ) -> Result<Option<super::super::PendingBackingRoute>> {
         let replica_count = cold_tier_replica_count();
         if !self.cold_tier_devices.has_any_local_backend() {
+            if !allow_nof {
+                return Ok(None);
+            }
             let backing = self
                 .cold_tier_devices
                 .nof_targets
                 .pending_backing(route, length, checksum)?;
-            if backing.is_some() {
-                self.cold_tier_devices.pressure_increment_pending();
-            }
             return Ok(backing.map(super::super::PendingBackingRoute::Nof));
         }
         let select_devices = |s: &Self| -> Result<Vec<ColdTierDeviceRecord>> {
@@ -168,13 +170,14 @@ impl StorageOwnerState {
             }
         }
         let Some(primary) = devices.first() else {
-            if let Some(backing) = self
-                .cold_tier_devices
-                .nof_targets
-                .pending_backing(route, length, checksum)?
-            {
-                self.cold_tier_devices.pressure_increment_pending();
-                return Ok(Some(super::super::PendingBackingRoute::Nof(backing)));
+            if allow_nof {
+                if let Some(backing) = self
+                    .cold_tier_devices
+                    .nof_targets
+                    .pending_backing(route, length, checksum)?
+                {
+                    return Ok(Some(super::super::PendingBackingRoute::Nof(backing)));
+                }
             }
             tracing::debug!(
                 runtime = %self.runtime,
@@ -218,7 +221,6 @@ impl StorageOwnerState {
         }
         // Signal that a new entry needs offload — pressure tracker uses this
         // to throttle restore concurrency when the backlog grows.
-        self.cold_tier_devices.pressure_increment_pending();
         Ok(Some(super::super::PendingBackingRoute::Cold(
             mooncake_store_core::ColdBackingRoute {
                 cold_tier_id: primary.device_id.clone(),
@@ -730,18 +732,6 @@ impl ColdTierDeviceManager {
 
     pub(in super::super) fn runtime_backend_available(&self, target_id: &str) -> bool {
         self.has_local_backend(target_id) || self.nof_targets.available_for_io(target_id)
-    }
-
-    /// Unknown/dynamic backends retain the historical Mooncake-managed behavior. Registered
-    /// provider-managed backends explicitly opt out of automatic physical maintenance.
-    pub(in super::super) fn mooncake_manages_storage(&self, cold_tier_id: &str) -> bool {
-        if let Some(managed) = self.nof_targets.mooncake_manages_storage(cold_tier_id) {
-            return managed;
-        }
-        !matches!(
-            self.resolver.lock().storage_management(cold_tier_id),
-            Some(super::super::PersistentStorageManagement::BackendManaged)
-        )
     }
 
     /// Returns the set of cold_tier_ids that have local backends registered.

@@ -6,7 +6,7 @@ use crate::control_plane::{
     ColdReadResponse, ColdReadTarget, ColdReclaimResult, ColdTierControlService,
     ColdTierFreeResult, ColdTierProbeResult,
 };
-use mooncake_store_core::{SegmentName, StoreError};
+use mooncake_store_core::{ObjectKey, SegmentName, StoreError};
 use std::sync::Arc;
 
 impl ColdTierControlService for LocalAllocatorAdapter {
@@ -167,6 +167,7 @@ impl ColdTierControlService for LocalAllocatorAdapter {
         &self,
         namespace: &str,
         authority: &str,
+        route_key: ObjectKey,
         cold_backings: Vec<mooncake_store_core::ColdBackingRoute>,
     ) -> Vec<mooncake_store_core::Result<ColdReclaimResult>> {
         if authority != self.runtime.stable_id.0 {
@@ -195,7 +196,7 @@ impl ColdTierControlService for LocalAllocatorAdapter {
             .into_iter()
             .map(|cold_backing| {
                 self.storage_owner
-                    .reclaim_cold_backing_for_route_delete(&cold_backing)
+                    .reclaim_cold_backing_for_route_delete(&route_key, &cold_backing)
             })
             .collect()
     }
