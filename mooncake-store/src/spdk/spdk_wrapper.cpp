@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <glog/logging.h>
 
 #include <atomic>
@@ -5,6 +7,8 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <pthread.h>
+#include <sched.h>
 #include <thread>
 #include "spdk/spdk_wrapper.h"
 
@@ -118,11 +122,36 @@ bool SpdkWrapper::InitializeEnv() {
         return true;
     }
 
+    // rte_eal_init registers the calling thread as DPDK's main lcore and may
+    // restrict its CPU affinity to the configured EAL cores (default
+    // core_mask "0x1"). Linux threads inherit the creator's affinity mask, so
+    // without restoring it, every thread sglang spawns after Mooncake's setup
+    // would be pinned to a single core and KV read/write throughput would drop
+    // sharply. Save the original affinity and restore it around spdk_env_init
+    // to stop that propagation. DPDK's main-lcore identity is a thread-local
+    // registration, not the kernel affinity, so later SPDK calls are
+    // unaffected by the restore.
+    cpu_set_t orig_cpuset;
+    CPU_ZERO(&orig_cpuset);
+    bool affinity_saved =
+        pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t),
+                               &orig_cpuset) == 0;
+
     struct spdk_env_opts opts;
     spdk_env_opts_init(&opts);
     opts.name = "mooncake";
 
     int rc = spdk_env_init(&opts);
+
+    // Best-effort restore of the caller's original affinity.
+    if (affinity_saved) {
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t),
+                                   &orig_cpuset) != 0) {
+            LOG(WARNING) << "Failed to restore calling thread CPU affinity "
+                            "after SPDK env init";
+        }
+    }
+
     if (rc != 0) {
         fprintf(stderr, "SPDK init failed: %d\n", rc);
         return false;
