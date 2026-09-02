@@ -814,8 +814,8 @@ class Client {
                         const DiskDescriptor& disk_descriptor);
     /**
      * @brief Initialize local hot cache
-     * @return ErrorCode::OK if use local hot cache,
-     * ErrorCode::INVALID_PARAMS if invalid MC_STORE_LOCAL_HOT_CACHE_SIZE config
+     * @return ErrorCode::OK if disabled or initialized successfully;
+     * ErrorCode::INVALID_PARAMS if cache allocation or registration fails
      */
     ErrorCode InitLocalHotCache();
 
@@ -823,21 +823,6 @@ class Client {
      * @brief Unregister local hot cache backing memory from TransferEngine.
      */
     void UnregisterLocalHotCacheMemory();
-
-    /**
-     * @brief Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment variable
-     * @return Cache size in bytes, or 0 if not set or invalid
-     */
-    size_t GetLocalHotCacheSizeFromEnv();
-
-    /**
-     * @brief Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment variable
-     * @param default_value Default block size to use if env var is not set or
-     * invalid
-     * @return Parsed block size from environment, or default_value if not
-     * set/invalid
-     */
-    size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
 
     /**
      * @brief Redirect replica descriptor to local hot cache if cache hit

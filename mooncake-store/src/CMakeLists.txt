@@ -8,6 +8,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
+    config/distributed_storage_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     utils/file_util.cpp)
@@ -91,8 +92,10 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    config/client_metric_config.cpp
     config/file_storage_config.cpp
     config/client_auto_port_config.cpp
+    config/local_hot_cache_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp

@@ -126,6 +126,15 @@ class RdmaContext {
     // open or the query fails.
     int refreshPortAttributes();
 
+    // Read the port's current state from the hardware. The monitor thread
+    // polls this for paused contexts so a link that came back without a
+    // usable IBV_EVENT_PORT_ACTIVE is still noticed. Deliberately leaves the
+    // cached speed/width alone: refreshLinkSpeed() diffs against them, so
+    // refreshing here would hide a renegotiated rate from the selector.
+    // Returns -1 and leaves *state untouched if no device is open or the
+    // query fails.
+    int queryPortState(ibv_port_state *state) const;
+
     int eventFd() const { return event_fd_; }
 
     RdmaCQ *cq(int index);
