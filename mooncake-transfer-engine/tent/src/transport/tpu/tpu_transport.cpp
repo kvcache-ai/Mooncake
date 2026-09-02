@@ -44,6 +44,7 @@ Status TpuTransport::install(std::string &local_segment_name,
     // TPU HBM is not NIC-addressable: only the device<->host staging hop is
     // supported here. gpu_to_gpu stays false so the engine always stages
     // cross-node traffic through host DRAM.
+    caps.local_stage_executor = true;
     caps.gpu_to_dram = true;
     caps.dram_to_gpu = true;
     return Status::OK();

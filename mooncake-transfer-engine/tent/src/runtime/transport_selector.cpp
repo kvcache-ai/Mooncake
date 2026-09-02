@@ -453,22 +453,26 @@ bool TransportSelector::matchesPolicy(const SelectionPolicy& policy,
     return true;
 }
 
-bool TransportSelector::isTransportAvailable(
+const SelectionPolicy* TransportSelector::findMatchingPolicy(
+    const SelectionContext& context) const {
+    for (const auto& policy : policies_) {
+        if (matchesPolicy(policy, context)) return &policy;
+    }
+    return nullptr;
+}
+
+bool TransportSelector::isTransportInstalled(
     TransportType type, const SelectionContext& context,
     const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
         available_transports) const {
-    // Check if transport type is valid
     if (type < 0 || type >= kSupportedTransportTypes) {
         return false;
     }
 
-    // Check if transport exists
-    const auto& transport = available_transports[type];
-    if (!transport) {
+    if (!available_transports[type]) {
         return false;
     }
 
-    // Special constraints
     if ((type == NVLINK || type == SHM || type == TPU) &&
         !context.same_machine) {
         // NVLINK/SHM only work on same machine; TPU is a local-stage-only
@@ -476,6 +480,17 @@ bool TransportSelector::isTransportAvailable(
         return false;
     }
 
+    return true;
+}
+
+bool TransportSelector::isTransportAvailable(
+    TransportType type, const SelectionContext& context,
+    const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
+        available_transports) const {
+    if (!isTransportInstalled(type, context, available_transports))
+        return false;
+
+    const auto& transport = available_transports[type];
     const auto& caps = transport->capabilities();
 
     // Helper to check if memory type is a device (GPU/NPU/TPU). TPU is included
@@ -515,21 +530,10 @@ bool TransportSelector::isTransportAvailable(
     return false;
 }
 
-SelectionResult TransportSelector::select(
-    const SelectionContext& context,
-    const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
-        available_transports,
-    int transport_index, TransportType hint) {
+SelectionResult TransportSelector::policyResult(
+    const SelectionContext& context) const {
     SelectionResult result;
-
-    // Find the first matching policy (JSON order wins)
-    const SelectionPolicy* matching_policy = nullptr;
-    for (const auto& policy : policies_) {
-        if (matchesPolicy(policy, context)) {
-            matching_policy = &policy;
-            break;  // First match wins
-        }
-    }
+    const auto* matching_policy = findMatchingPolicy(context);
 
     if (!matching_policy) {
         LOG(WARNING) << "No matching transport policy for segment_type="
@@ -551,44 +555,83 @@ SelectionResult TransportSelector::select(
     // topology are both fixed by then, and repeating the lookup here also
     // repeated its diagnostics on every single select().
     result.device_mask = matching_policy->resolved_device_mask;
+    return result;
+}
+
+std::vector<SelectionResult> TransportSelector::listCandidates(
+    const SelectionContext& context,
+    const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
+        available_transports,
+    TransportType hint, TransportReachabilityMode reachability) const {
+    std::vector<SelectionResult> result;
+    const auto* matching_policy = findMatchingPolicy(context);
+    if (!matching_policy) {
+        LOG(WARNING) << "No matching transport policy for segment_type="
+                     << (context.segment_type == SegmentType::File ? "file"
+                                                                   : "memory")
+                     << ", size=" << context.transfer_size
+                     << ", priority_level=" << context.priority_level;
+        return result;
+    }
 
     // The "raw" candidate set is whatever the matching policy authorizes:
     // the policy's explicit transports list, or the buffer's registered
     // transports as a fallback.
     static const std::vector<TransportType> kEmpty;
-    const auto& raw = !matching_policy->transports.empty()
-                          ? matching_policy->transports
-                      : context.buffer_transports ? *context.buffer_transports
-                                                  : kEmpty;
+    const std::vector<TransportType>* raw = &kEmpty;
+    if (!matching_policy->transports.empty()) {
+        raw = &matching_policy->transports;
+    } else if (context.buffer_transports) {
+        raw = context.buffer_transports;
+    }
 
-    if (transport_index < 0) return result;
-    const int original_index = transport_index;
-
-    auto candidates = reorderWithHint(raw, hint);
-    if (!candidates) return result;  // UNSPEC -> task FAILED downstream
+    auto candidates = reorderWithHint(*raw, hint);
+    if (!candidates) return result;
 
     const bool has_hint = (hint != UNSPEC);
     for (size_t i = 0; i < candidates->size(); ++i) {
         TransportType type = (*candidates)[i];
-        if (!isTransportAvailable(type, context, available_transports)) {
+        const bool available =
+            reachability == TransportReachabilityMode::DirectEndpoint
+                ? isTransportAvailable(type, context, available_transports)
+                : isTransportInstalled(type, context, available_transports);
+        if (!available) {
             // The pinned hint at slot 0 must be available; if it isn't,
             // reject the request rather than falling through to another
             // transport the caller did not ask for.
-            if (has_hint && i == 0) return result;
+            if (has_hint && i == 0) return {};
             continue;
         }
-        if (transport_index == 0) {
-            result.transport = type;
-            break;
-        }
-        --transport_index;
+        SelectionResult candidate;
+        candidate.transport = type;
+        candidate.device_mask = matching_policy->resolved_device_mask;
+        candidate.service_level = matching_policy->service_level;
+        candidate.traffic_class = matching_policy->traffic_class;
+        candidate.qp_pool = matching_policy->qp_pool;
+        result.push_back(std::move(candidate));
+    }
+    return result;
+}
+
+SelectionResult TransportSelector::select(
+    const SelectionContext& context,
+    const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
+        available_transports,
+    int transport_index, TransportType hint) {
+    auto result = policyResult(context);
+    if (transport_index < 0) return result;
+    const int original_index = transport_index;
+
+    auto candidates = listCandidates(context, available_transports, hint);
+    if (transport_index >= 0 &&
+        static_cast<size_t>(transport_index) < candidates.size()) {
+        result = candidates[transport_index];
     }
     if (result.transport == UNSPEC) return result;
     VLOG(1) << "Selected transport " << transportTypeName(result.transport)
-            << " for policy " << matching_policy->name << " at index "
-            << original_index << " (hint=" << transportTypeName(hint)
-            << "), device_mask=0x" << std::hex << result.device_mask
-            << std::dec;
+            << " at index " << original_index
+            << " (hint=" << transportTypeName(hint) << "), device_mask=0x"
+            << std::hex << result.device_mask << std::dec;
     return result;
 }
 

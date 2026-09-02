@@ -128,6 +128,7 @@ Status AscendDirectTransport::install(std::string &local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     installed_ = true;
+    caps.cross_node_transfer = true;
     caps.dram_to_dram = true;
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;

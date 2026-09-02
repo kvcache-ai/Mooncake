@@ -133,8 +133,19 @@ class FakeTransport : public Transport {
     }
     bool warmupMemory(void*, size_t) override { return false; }
     const char* getName() const override {
-        return self_type_ == RDMA ? "<fake-rdma>" : "<fake-tcp>";
+        if (self_type_ == RDMA) return "<fake-rdma>";
+        if (self_type_ == TCP) return "<fake-tcp>";
+        if (self_type_ == MNNVL) return "<fake-mnnvl>";
+        if (self_type_ == NVLINK) return "<fake-nvlink>";
+        return "<fake>";
     }
+
+    void setDramToDram(bool val) { caps.dram_to_dram = val; }
+    void setDramToGpu(bool val) { caps.dram_to_gpu = val; }
+    void setGpuToDram(bool val) { caps.gpu_to_dram = val; }
+    void setGpuToGpu(bool val) { caps.gpu_to_gpu = val; }
+    void setCrossNodeTransfer(bool val) { caps.cross_node_transfer = val; }
+    void setLocalStageExecutor(bool val) { caps.local_stage_executor = val; }
 
    private:
     TransportType self_type_;
@@ -175,6 +186,57 @@ void installFakeRdmaAndTcp(TransferEngineImpl& engine,
     engine.swapTransportForTest(TCP, tcp);
 }
 
+void installFakeMnnvlTcpAndNvlink(TransferEngineImpl& engine,
+                                  std::shared_ptr<FakeTransport>& mnnvl,
+                                  std::shared_ptr<FakeTransport>& tcp,
+                                  std::shared_ptr<FakeTransport>& nvlink) {
+    mnnvl = std::make_shared<FakeTransport>(MNNVL);
+    tcp = std::make_shared<FakeTransport>(TCP);
+    nvlink = std::make_shared<FakeTransport>(NVLINK);
+
+    mnnvl->setDramToDram(false);
+    mnnvl->setCrossNodeTransfer(true);
+    mnnvl->setGpuToGpu(true);
+
+    tcp->setCrossNodeTransfer(true);
+
+    nvlink->setDramToDram(false);
+    nvlink->setDramToGpu(true);
+    nvlink->setGpuToDram(true);
+    nvlink->setGpuToGpu(true);
+    nvlink->setLocalStageExecutor(true);
+
+    engine.swapTransportForTest(MNNVL, mnnvl);
+    engine.swapTransportForTest(TCP, tcp);
+    engine.swapTransportForTest(NVLINK, nvlink);
+}
+
+void installFakeRdmaTcpAndNvlink(TransferEngineImpl& engine,
+                                 std::shared_ptr<FakeTransport>& rdma,
+                                 std::shared_ptr<FakeTransport>& tcp,
+                                 std::shared_ptr<FakeTransport>& nvlink) {
+    rdma = std::make_shared<FakeTransport>(RDMA);
+    tcp = std::make_shared<FakeTransport>(TCP);
+    nvlink = std::make_shared<FakeTransport>(NVLINK);
+
+    rdma->setCrossNodeTransfer(true);
+
+    tcp->setCrossNodeTransfer(true);
+    tcp->setDramToGpu(true);
+    tcp->setGpuToDram(true);
+    tcp->setGpuToGpu(true);
+
+    nvlink->setDramToDram(false);
+    nvlink->setDramToGpu(true);
+    nvlink->setGpuToDram(true);
+    nvlink->setGpuToGpu(true);
+    nvlink->setLocalStageExecutor(true);
+
+    engine.swapTransportForTest(RDMA, rdma);
+    engine.swapTransportForTest(TCP, tcp);
+    engine.swapTransportForTest(NVLINK, nvlink);
+}
+
 Request makeLocalWriteRequest(uint8_t* buf, size_t len) {
     Request r;
     r.opcode = Request::WRITE;
@@ -183,6 +245,312 @@ Request makeLocalWriteRequest(uint8_t* buf, size_t len) {
     r.target_offset = reinterpret_cast<uint64_t>(buf);
     r.length = len;
     return r;
+}
+
+Request makeRemoteWriteRequest(uint8_t* source, uint8_t* target, size_t len,
+                               SegmentID target_id) {
+    Request r;
+    r.opcode = Request::WRITE;
+    r.source = source;
+    r.target_id = target_id;
+    r.target_offset = reinterpret_cast<uint64_t>(target);
+    r.length = len;
+    return r;
+}
+
+Status registerLocalMemoryAt(TransferEngineImpl& engine, uint8_t* buf,
+                             size_t len, const std::string& location) {
+    MemoryOptions options;
+    options.location = location;
+    return engine.registerLocalMemory({buf}, {len}, options);
+}
+
+std::shared_ptr<Config> makeStagingP2PConfig() {
+    auto cfg = makeMinimalP2PConfig();
+    json topology;
+    for (int i = 0; i < 16; ++i) {
+        topology["cpu:" + std::to_string(i)] = {json::array(), json::array()};
+    }
+    topology["cuda:0"] = {json::array(), json::array()};
+    cfg->set("topology/priority_matrix", topology);
+    return cfg;
+}
+
+void setTcpOnlyPolicy(std::shared_ptr<Config> cfg) {
+    json policy;
+    policy["name"] = "tcp-only";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"tcp"};
+    cfg->set("policy", json::array({policy}));
+}
+
+// ---------------------------------------------------------------------------
+// resolveExecutionRoute() staging integration
+// ---------------------------------------------------------------------------
+
+TEST(TransportHint, ResolveExecutionRouteSeesMnnvlStagingCandidate) {
+    auto server_cfg = makeStagingP2PConfig();
+    auto client_cfg = makeStagingP2PConfig();
+    TransferEngineImpl server(server_cfg);
+    TransferEngineImpl client(client_cfg);
+    ASSERT_TRUE(server.available());
+    ASSERT_TRUE(client.available());
+
+    std::shared_ptr<FakeTransport> server_mnnvl, server_tcp, server_nvlink;
+    std::shared_ptr<FakeTransport> client_mnnvl, client_tcp, client_nvlink;
+    installFakeMnnvlTcpAndNvlink(server, server_mnnvl, server_tcp,
+                                 server_nvlink);
+    installFakeMnnvlTcpAndNvlink(client, client_mnnvl, client_tcp,
+                                 client_nvlink);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> source(kBufLen, 0x11);
+    std::vector<uint8_t> target(kBufLen, 0x22);
+    ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
+    ASSERT_TRUE(server.registerLocalMemory(target.data(), kBufLen).ok());
+
+    SegmentID target_id = 0;
+    ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = source.data();
+    req.target_id = target_id;
+    req.target_offset = reinterpret_cast<uint64_t>(target.data());
+    req.length = kBufLen;
+
+    auto resolved = client.resolveExecutionRouteForTest(req);
+    EXPECT_TRUE(resolved.staging);
+    EXPECT_EQ(resolved.route.transport, MNNVL);
+    ASSERT_EQ(resolved.staging_params.size(), 3u);
+    EXPECT_FALSE(resolved.staging_params[1].empty());
+    EXPECT_FALSE(resolved.staging_params[2].empty());
+
+    EXPECT_TRUE(client.closeSegment(target_id).ok());
+    EXPECT_TRUE(client.unregisterLocalMemory(source.data(), kBufLen).ok());
+    EXPECT_TRUE(server.unregisterLocalMemory(target.data(), kBufLen).ok());
+}
+
+TEST(TransportHint, ResolveExecutionRouteUsesLocalOnlyMnnvlStage) {
+    auto server_cfg = makeStagingP2PConfig();
+    auto client_cfg = makeStagingP2PConfig();
+    TransferEngineImpl server(server_cfg);
+    TransferEngineImpl client(client_cfg);
+    ASSERT_TRUE(server.available());
+    ASSERT_TRUE(client.available());
+
+    std::shared_ptr<FakeTransport> server_mnnvl, server_tcp, server_nvlink;
+    std::shared_ptr<FakeTransport> client_mnnvl, client_tcp, client_nvlink;
+    installFakeMnnvlTcpAndNvlink(server, server_mnnvl, server_tcp,
+                                 server_nvlink);
+    installFakeMnnvlTcpAndNvlink(client, client_mnnvl, client_tcp,
+                                 client_nvlink);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> source(kBufLen, 0x33);
+    std::vector<uint8_t> target(kBufLen, 0x44);
+    ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
+    ASSERT_TRUE(
+        registerLocalMemoryAt(server, target.data(), kBufLen, "cuda:0").ok());
+
+    SegmentID target_id = 0;
+    ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
+
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
+    EXPECT_TRUE(resolved.staging);
+    EXPECT_EQ(resolved.route.transport, MNNVL);
+    ASSERT_EQ(resolved.staging_params.size(), 3u);
+    EXPECT_FALSE(resolved.staging_params[1].empty());
+    EXPECT_TRUE(resolved.staging_params[2].empty());
+
+    EXPECT_TRUE(client.closeSegment(target_id).ok());
+    EXPECT_TRUE(client.unregisterLocalMemory(source.data(), kBufLen).ok());
+    EXPECT_TRUE(server.unregisterLocalMemory(target.data(), kBufLen).ok());
+}
+
+TEST(TransportHint, ResolveExecutionRouteUsesRemoteOnlyMnnvlStage) {
+    auto server_cfg = makeStagingP2PConfig();
+    auto client_cfg = makeStagingP2PConfig();
+    TransferEngineImpl server(server_cfg);
+    TransferEngineImpl client(client_cfg);
+    ASSERT_TRUE(server.available());
+    ASSERT_TRUE(client.available());
+
+    std::shared_ptr<FakeTransport> server_mnnvl, server_tcp, server_nvlink;
+    std::shared_ptr<FakeTransport> client_mnnvl, client_tcp, client_nvlink;
+    installFakeMnnvlTcpAndNvlink(server, server_mnnvl, server_tcp,
+                                 server_nvlink);
+    installFakeMnnvlTcpAndNvlink(client, client_mnnvl, client_tcp,
+                                 client_nvlink);
+    server_mnnvl->setGpuToGpu(false);
+    client_mnnvl->setGpuToGpu(false);
+    server_mnnvl->setDramToGpu(true);
+    client_mnnvl->setDramToGpu(true);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> source(kBufLen, 0x55);
+    std::vector<uint8_t> target(kBufLen, 0x66);
+    ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
+    ASSERT_TRUE(server.registerLocalMemory(target.data(), kBufLen).ok());
+
+    SegmentID target_id = 0;
+    ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
+
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
+    EXPECT_TRUE(resolved.staging);
+    EXPECT_EQ(resolved.route.transport, MNNVL);
+    ASSERT_EQ(resolved.staging_params.size(), 3u);
+    EXPECT_TRUE(resolved.staging_params[1].empty());
+    EXPECT_FALSE(resolved.staging_params[2].empty());
+
+    EXPECT_TRUE(client.closeSegment(target_id).ok());
+    EXPECT_TRUE(client.unregisterLocalMemory(source.data(), kBufLen).ok());
+    EXPECT_TRUE(server.unregisterLocalMemory(target.data(), kBufLen).ok());
+}
+
+TEST(TransportHint, ResolveExecutionRouteFallsBackToDirectTcpWithoutStage) {
+    auto server_cfg = makeMinimalP2PConfig();
+    auto client_cfg = makeMinimalP2PConfig();
+    TransferEngineImpl server(server_cfg);
+    TransferEngineImpl client(client_cfg);
+    ASSERT_TRUE(server.available());
+    ASSERT_TRUE(client.available());
+
+    std::shared_ptr<FakeTransport> server_mnnvl, server_tcp, server_nvlink;
+    std::shared_ptr<FakeTransport> client_mnnvl, client_tcp, client_nvlink;
+    installFakeMnnvlTcpAndNvlink(server, server_mnnvl, server_tcp,
+                                 server_nvlink);
+    installFakeMnnvlTcpAndNvlink(client, client_mnnvl, client_tcp,
+                                 client_nvlink);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> source(kBufLen, 0x77);
+    std::vector<uint8_t> target(kBufLen, 0x88);
+    ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
+    ASSERT_TRUE(server.registerLocalMemory(target.data(), kBufLen).ok());
+
+    SegmentID target_id = 0;
+    ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
+
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
+    EXPECT_FALSE(resolved.staging);
+    EXPECT_EQ(resolved.route.transport, TCP);
+    EXPECT_TRUE(resolved.staging_params.empty());
+
+    EXPECT_TRUE(client.closeSegment(target_id).ok());
+    EXPECT_TRUE(client.unregisterLocalMemory(source.data(), kBufLen).ok());
+    EXPECT_TRUE(server.unregisterLocalMemory(target.data(), kBufLen).ok());
+}
+
+TEST(TransportHint, ResolveExecutionRouteReturnsUnspecWithoutFeasiblePath) {
+    auto server_cfg = makeMinimalP2PConfig();
+    auto client_cfg = makeMinimalP2PConfig();
+    TransferEngineImpl server(server_cfg);
+    TransferEngineImpl client(client_cfg);
+    ASSERT_TRUE(server.available());
+    ASSERT_TRUE(client.available());
+
+    std::shared_ptr<FakeTransport> server_mnnvl, server_tcp, server_nvlink;
+    std::shared_ptr<FakeTransport> client_mnnvl, client_tcp, client_nvlink;
+    installFakeMnnvlTcpAndNvlink(server, server_mnnvl, server_tcp,
+                                 server_nvlink);
+    installFakeMnnvlTcpAndNvlink(client, client_mnnvl, client_tcp,
+                                 client_nvlink);
+    server.swapTransportForTest(TCP, nullptr);
+    client.swapTransportForTest(TCP, nullptr);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> source(kBufLen, 0x99);
+    std::vector<uint8_t> target(kBufLen, 0xAA);
+    ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
+    ASSERT_TRUE(server.registerLocalMemory(target.data(), kBufLen).ok());
+
+    SegmentID target_id = 0;
+    ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
+
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
+    EXPECT_FALSE(resolved.staging);
+    EXPECT_EQ(resolved.route.transport, UNSPEC);
+    EXPECT_TRUE(resolved.staging_params.empty());
+
+    EXPECT_TRUE(client.closeSegment(target_id).ok());
+    EXPECT_TRUE(client.unregisterLocalMemory(source.data(), kBufLen).ok());
+    EXPECT_TRUE(server.unregisterLocalMemory(target.data(), kBufLen).ok());
+}
+
+TEST(TransportHint, ResolveExecutionRoutePrefersStagedRdmaOverDirectTcp) {
+    auto server_cfg = makeStagingP2PConfig();
+    auto client_cfg = makeStagingP2PConfig();
+    TransferEngineImpl server(server_cfg);
+    TransferEngineImpl client(client_cfg);
+    ASSERT_TRUE(server.available());
+    ASSERT_TRUE(client.available());
+
+    std::shared_ptr<FakeTransport> server_rdma, server_tcp, server_nvlink;
+    std::shared_ptr<FakeTransport> client_rdma, client_tcp, client_nvlink;
+    installFakeRdmaTcpAndNvlink(server, server_rdma, server_tcp, server_nvlink);
+    installFakeRdmaTcpAndNvlink(client, client_rdma, client_tcp, client_nvlink);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> source(kBufLen, 0xBB);
+    std::vector<uint8_t> target(kBufLen, 0xCC);
+    ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
+    ASSERT_TRUE(
+        registerLocalMemoryAt(server, target.data(), kBufLen, "cuda:0").ok());
+
+    SegmentID target_id = 0;
+    ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
+
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
+    EXPECT_TRUE(resolved.staging);
+    EXPECT_EQ(resolved.route.transport, RDMA);
+    ASSERT_EQ(resolved.staging_params.size(), 3u);
+    EXPECT_TRUE(resolved.staging_params[1].empty());
+    EXPECT_FALSE(resolved.staging_params[2].empty());
+
+    EXPECT_TRUE(client.closeSegment(target_id).ok());
+    EXPECT_TRUE(client.unregisterLocalMemory(source.data(), kBufLen).ok());
+    EXPECT_TRUE(server.unregisterLocalMemory(target.data(), kBufLen).ok());
+}
+
+TEST(TransportHint, ResolveExecutionRouteRespectsPolicyWhitelistForStaging) {
+    auto server_cfg = makeStagingP2PConfig();
+    auto client_cfg = makeStagingP2PConfig();
+    setTcpOnlyPolicy(client_cfg);
+    TransferEngineImpl server(server_cfg);
+    TransferEngineImpl client(client_cfg);
+    ASSERT_TRUE(server.available());
+    ASSERT_TRUE(client.available());
+
+    std::shared_ptr<FakeTransport> server_rdma, server_tcp, server_nvlink;
+    std::shared_ptr<FakeTransport> client_rdma, client_tcp, client_nvlink;
+    installFakeRdmaTcpAndNvlink(server, server_rdma, server_tcp, server_nvlink);
+    installFakeRdmaTcpAndNvlink(client, client_rdma, client_tcp, client_nvlink);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> source(kBufLen, 0xDD);
+    std::vector<uint8_t> target(kBufLen, 0xEE);
+    ASSERT_TRUE(client.registerLocalMemory(source.data(), kBufLen).ok());
+    ASSERT_TRUE(
+        registerLocalMemoryAt(server, target.data(), kBufLen, "cuda:0").ok());
+
+    SegmentID target_id = 0;
+    ASSERT_TRUE(client.openSegment(target_id, server.getSegmentName()).ok());
+
+    auto resolved = client.resolveExecutionRouteForTest(makeRemoteWriteRequest(
+        source.data(), target.data(), kBufLen, target_id));
+    EXPECT_FALSE(resolved.staging);
+    EXPECT_EQ(resolved.route.transport, TCP);
+    EXPECT_TRUE(resolved.staging_params.empty());
+
+    EXPECT_TRUE(client.closeSegment(target_id).ok());
+    EXPECT_TRUE(client.unregisterLocalMemory(source.data(), kBufLen).ok());
+    EXPECT_TRUE(server.unregisterLocalMemory(target.data(), kBufLen).ok());
 }
 
 // ---------------------------------------------------------------------------

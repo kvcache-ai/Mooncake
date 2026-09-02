@@ -69,6 +69,7 @@ class FakeTransport : public Transport {
     void setGpuToGpu(bool val) { caps.gpu_to_gpu = val; }
     void setDramToGpu(bool val) { caps.dram_to_gpu = val; }
     void setGpuToDram(bool val) { caps.gpu_to_dram = val; }
+    void setCrossNodeTransfer(bool val) { caps.cross_node_transfer = val; }
 
    private:
     TransportType type_;
@@ -745,6 +746,100 @@ TEST(TransportSelectorTest, HintNotInMatchingPolicyReturnsUnspec) {
 
     auto r = selector.select(ctx, transports, /*index=*/0, /*hint=*/RDMA);
     EXPECT_EQ(r.transport, UNSPEC);
+}
+
+TEST(TransportSelectorTest, InstalledOnlyCandidatesKeepStagedCrossTransports) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
+    auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
+    rdma->setCrossNodeTransfer(true);
+    rdma->setDramToDram(true);
+    tcp->setCrossNodeTransfer(true);
+    tcp->setDramToDram(true);
+    tcp->setGpuToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CUDA;
+    ctx.remote_memory_type = MTYPE_CUDA;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_HIGH;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+
+    auto direct = selector.listCandidates(
+        ctx, transports, UNSPEC, TransportReachabilityMode::DirectEndpoint);
+    ASSERT_EQ(direct.size(), 1u);
+    EXPECT_EQ(direct[0].transport, TCP);
+
+    auto staged = selector.listCandidates(
+        ctx, transports, UNSPEC, TransportReachabilityMode::InstalledOnly);
+    ASSERT_EQ(staged.size(), 2u);
+    EXPECT_EQ(staged[0].transport, RDMA);
+    EXPECT_EQ(staged[1].transport, TCP);
+}
+
+TEST(TransportSelectorTest, InstalledOnlyCandidatesDoNotBypassHint) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[TCP].get())->setGpuToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CUDA;
+    ctx.remote_memory_type = MTYPE_CUDA;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_HIGH;
+    ctx.buffer_transports = &buffer_transports;
+
+    auto staged = selector.listCandidates(
+        ctx, transports, RDMA, TransportReachabilityMode::InstalledOnly);
+    EXPECT_TRUE(staged.empty());
+}
+
+TEST(TransportSelectorTest, InstalledOnlyCandidatesRespectPolicyWhitelist) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "tcp-only";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"tcp"};
+    conf->set("policy", json::array({policy}));
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CUDA;
+    ctx.remote_memory_type = MTYPE_CUDA;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_HIGH;
+    ctx.buffer_transports = &buffer_transports;
+
+    auto staged = selector.listCandidates(
+        ctx, transports, UNSPEC, TransportReachabilityMode::InstalledOnly);
+    ASSERT_EQ(staged.size(), 1u);
+    EXPECT_EQ(staged[0].transport, TCP);
 }
 
 // RFC #2519 / #2568 step 1: a policy's link-layer QoS (service_level /

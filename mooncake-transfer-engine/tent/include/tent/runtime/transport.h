@@ -42,6 +42,14 @@ struct Capabilities {
     bool gpu_to_gpu = false;
     bool dram_to_file = false;
     bool gpu_to_file = false;
+
+    // Hop roles used by capability-graph path synthesis. Reachability
+    // booleans above answer which memory pairs a transport can move between;
+    // these role traits answer where that movement is valid in a synthesized
+    // path.
+    bool cross_node_transfer = false;
+    bool local_stage_executor = false;
+    bool file_transfer = false;
 };
 
 class Transport {

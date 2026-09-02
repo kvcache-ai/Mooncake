@@ -368,6 +368,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
     notify_worker_ = std::thread(&RdmaTransport::notifyWorkerThread, this);
 
     installed_ = true;
+    caps.cross_node_transfer = true;
     caps.dram_to_dram = true;
     if (isGpuDirectRdmaSupported(conf_)) {
         caps.dram_to_gpu = true;

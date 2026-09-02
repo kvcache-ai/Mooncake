@@ -94,6 +94,7 @@ Status TcpTransport::install(std::string &local_segment_name,
         notify_list_.push_back(message);
         return 0;
     });
+    caps.cross_node_transfer = true;
     caps.dram_to_dram = true;
     if (Platform::getLoader().type() != "cpu") {
         caps.dram_to_gpu = true;
