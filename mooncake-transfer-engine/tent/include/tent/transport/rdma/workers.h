@@ -39,6 +39,10 @@ class DeviceSelector;
 
 class Workers {
     friend class RdmaTransportTestPeer;
+    // Grants the quota-accounting unit test access to the private static
+    // charge/release reconcile helpers (they only need a DeviceSelector, so the
+    // test can exercise them without constructing a Workers / RdmaTransport).
+    friend class WorkersQuotaTestAccessor;
 
    public:
     static constexpr size_t kCapacity = 1024 * 8;
@@ -73,7 +77,16 @@ class Workers {
 
     bool cancelUnpostedSlice(WorkerContext& worker, RdmaSlice* slice);
 
-    void releaseSliceQuota(RdmaSlice* slice, double latency = 0.0);
+    // Release a slice's inflight charge against the device it was charged on,
+    // unwinding exactly charged_bytes. static so the accounting can be unit
+    // tested with just a DeviceSelector (no Workers/RdmaTransport instance).
+    static void releaseSliceQuota(DeviceSelector* selector, RdmaSlice* slice,
+                                  double latency = 0.0);
+
+    // Reconcile a slice's inflight charge onto its current routing NIC
+    // (source_dev_id), migrating a stale charge or re-charging after a retry.
+    // static for the same testability reason as releaseSliceQuota.
+    static void chargeSliceQuota(DeviceSelector* selector, RdmaSlice* slice);
 
     void monitorThread();
 
