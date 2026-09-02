@@ -50,7 +50,7 @@ std::shared_ptr<UbEndpoint> EndpointStore::get(const UbEndpointKey& key) {
     }
     if (retired) {
         auto status = retired->retire();
-        if (!status.ok()) {
+        if (!status.ok() || retired->state() != UbEndpoint::State::kDestroyed) {
             std::lock_guard<std::mutex> lock(mutex_);
             quarantined_.push_back(std::move(retired));
         }
@@ -69,60 +69,73 @@ Status EndpointStore::getOrCreate(const UbEndpointKey& key,
             "Invalid UB endpoint store request" LOC_MARK);
     }
 
-    std::shared_ptr<UbEndpoint> evicted;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto existing = endpoints_.find(key);
-        if (existing != endpoints_.end()) {
-            if (existing->second.endpoint &&
-                existing->second.endpoint->reusable()) {
-                endpoint = existing->second.endpoint;
-            } else {
-                evicted = std::move(existing->second.endpoint);
-                endpoints_.erase(existing);
-            }
-        }
-
-        if (!endpoint && endpoints_.size() + quarantined_.size() >= max_size_) {
-            auto victim = endpoints_.end();
-            uint64_t oldest = std::numeric_limits<uint64_t>::max();
-            for (auto it = endpoints_.begin(); it != endpoints_.end(); ++it) {
-                if (it->second.endpoint &&
-                    it->second.endpoint->outstandingWrs() == 0 &&
-                    it->second.insertion_order < oldest) {
-                    victim = it;
-                    oldest = it->second.insertion_order;
+    for (;;) {
+        std::shared_ptr<UbEndpoint> evicted;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto existing = endpoints_.find(key);
+            if (existing != endpoints_.end()) {
+                if (existing->second.endpoint &&
+                    existing->second.endpoint->reusable()) {
+                    endpoint = existing->second.endpoint;
+                } else {
+                    evicted = std::move(existing->second.endpoint);
+                    endpoints_.erase(existing);
                 }
             }
-            if (victim == endpoints_.end()) {
-                return Status::TooManyRequests(
-                    "All UB endpoint cache entries are in flight" LOC_MARK);
+
+            if (!endpoint && !evicted &&
+                endpoints_.size() + quarantined_.size() >= max_size_) {
+                auto victim = endpoints_.end();
+                uint64_t oldest = std::numeric_limits<uint64_t>::max();
+                for (auto it = endpoints_.begin(); it != endpoints_.end();
+                     ++it) {
+                    if (it->second.endpoint &&
+                        it->second.endpoint->outstandingWrs() == 0 &&
+                        it->second.insertion_order < oldest) {
+                        victim = it;
+                        oldest = it->second.insertion_order;
+                    }
+                }
+                if (victim == endpoints_.end()) {
+                    return Status::TooManyRequests(
+                        "All UB endpoint cache entries are in flight" LOC_MARK);
+                }
+                evicted = std::move(victim->second.endpoint);
+                endpoints_.erase(victim);
             }
-            if (!evicted) evicted = std::move(victim->second.endpoint);
-            endpoints_.erase(victim);
+
+            if (!endpoint && !evicted) {
+                endpoint = std::make_shared<UbEndpoint>(
+                    key, context, adapter_, jetty_count_, jetty_options_);
+                endpoints_.emplace(key,
+                                   Entry{endpoint, next_insertion_order_++});
+            }
         }
 
-        if (!endpoint) {
-            endpoint = std::make_shared<UbEndpoint>(
-                key, context, adapter_, jetty_count_, jetty_options_);
-            endpoints_.emplace(key, Entry{endpoint, next_insertion_order_++});
+        if (evicted) {
+            auto status = evicted->retire();
+            if (!status.ok() ||
+                evicted->state() != UbEndpoint::State::kDestroyed) {
+                if (status.ok()) {
+                    status = Status::TooManyRequests(
+                        "UB endpoint cleanup is still in progress" LOC_MARK);
+                }
+                std::lock_guard<std::mutex> lock(mutex_);
+                quarantined_.push_back(std::move(evicted));
+                return status;
+            }
+            continue;
         }
-    }
-    if (evicted) {
-        auto evict_status = evicted->retire();
-        if (!evict_status.ok()) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            quarantined_.push_back(std::move(evicted));
-        }
-    }
 
-    auto status = endpoint->prepare();
-    if (!status.ok()) {
-        (void)retire(key, endpoint->generation());
-        endpoint.reset();
-        return status;
+        auto status = endpoint->prepare();
+        if (!status.ok()) {
+            (void)retire(key, endpoint->generation());
+            endpoint.reset();
+            return status;
+        }
+        return Status::OK();
     }
-    return Status::OK();
 }
 
 bool EndpointStore::retire(const UbEndpointKey& key, uint64_t generation) {
@@ -138,7 +151,7 @@ bool EndpointStore::retire(const UbEndpointKey& key, uint64_t generation) {
         endpoints_.erase(it);
     }
     auto status = endpoint->retire();
-    if (!status.ok()) {
+    if (!status.ok() || endpoint->state() != UbEndpoint::State::kDestroyed) {
         std::lock_guard<std::mutex> lock(mutex_);
         quarantined_.push_back(std::move(endpoint));
     }
@@ -167,7 +180,12 @@ Status EndpointStore::clear() {
     std::vector<std::shared_ptr<UbEndpoint>> failed;
     for (auto& endpoint : endpoints) {
         auto status = endpoint->retire();
-        if (!status.ok()) {
+        if (!status.ok() ||
+            endpoint->state() != UbEndpoint::State::kDestroyed) {
+            if (status.ok()) {
+                status = Status::TooManyRequests(
+                    "UB endpoint cleanup is still in progress" LOC_MARK);
+            }
             if (first_error.ok()) first_error = status;
             failed.push_back(std::move(endpoint));
         }

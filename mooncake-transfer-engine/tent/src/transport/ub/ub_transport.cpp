@@ -651,6 +651,14 @@ Status UbTransport::submitTransferTasks(
     std::vector<ub::UbTask::Ptr> new_tasks;
     new_tasks.reserve(request_list.size());
     for (const auto& request : request_list) {
+        const size_t slice_count =
+            request.length / impl_->params.slice_size +
+            (request.length % impl_->params.slice_size != 0 ? 1 : 0);
+        if (slice_count > impl_->params.max_slices_per_task) {
+            return Status::InvalidArgument(
+                "UB request exceeds "
+                "transports/ub/max_slices_per_task" LOC_MARK);
+        }
         auto task = ub::UbTask::create(
             request,
             [notify_progress, progress_batch_id](const TransferStatus&) {
