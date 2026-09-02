@@ -22,8 +22,8 @@ pub(in crate::client) use super::owner::{
 pub use backend::NofBackend;
 pub use backing::NofBacking;
 pub use object::{
-    NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata, NofObjectQuery, NofObjectRead,
-    NofObjectShardWrite, NofObjectState, NofObjectWrite,
+    NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead, NofObjectShardWrite,
+    NofObjectState, NofObjectWrite,
 };
 pub use physical::{
     NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalQuery,

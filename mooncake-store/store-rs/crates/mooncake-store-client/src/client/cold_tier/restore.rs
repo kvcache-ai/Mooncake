@@ -9,9 +9,10 @@ use super::super::{
     RestorePromotionTask, Result, RouteState, StorageOwnerState, StoreClient, StoreError,
     DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
 };
+use super::target_selection::promote_cold_backing_target;
 use super::{
     backend_load_cold_payload_batch_into, cold_restore_flight_key, payload_checksum,
-    prefetched_nof_payload, record_cold_tier_ssd_read, resolved_cold_backing,
+    persistent_backing_targets, record_cold_tier_ssd_read, resolved_cold_backing,
     select_cold_backing_target, validate_cold_restore_payload,
     with_disjoint_restore_caller_buffers,
 };
@@ -473,26 +474,6 @@ pub(in super::super) fn restore_payload_from_cold_backing(
     result
 }
 
-fn copy_prefetched_nof_payload(
-    resolved: &ResolvedObject,
-    buffer: &mut [u8],
-) -> Result<Option<Arc<Vec<u8>>>> {
-    let Some(payload) = prefetched_nof_payload(resolved) else {
-        return Ok(None);
-    };
-    if payload.len() > buffer.len() {
-        return Err(StoreError::Allocator(format!(
-            "buffer too small for tenant={} key={}: need {}, have {}",
-            resolved.tenant,
-            resolved.key,
-            payload.len(),
-            buffer.len()
-        )));
-    }
-    buffer[..payload.len()].copy_from_slice(&payload);
-    Ok(Some(payload))
-}
-
 pub(in super::super) fn restore_batch_payloads_from_cold_backing(
     client: &StoreClient,
     resolved: &[ResolvedObject],
@@ -841,132 +822,9 @@ fn restore_payload_from_cold_backing_singleflight_into(
                 singleflight_role = "leader",
                 "mooncake store cold restore singleflight entered"
             );
-            let result = (|| {
-                let admission_tracker = OperationTracker::new("cold_restore_admission");
-                let permit_result = client
-                    .storage_owner
-                    .cold_tier_devices
-                    .try_acquire_restore(cold_tier_device_id(&cold_backing));
-                admission_tracker.finish_with_result(
-                    if permit_result.is_ok() {
-                        "ok"
-                    } else {
-                        "reject"
-                    },
-                    0,
-                );
-                let permit = match permit_result {
-                    Ok(permit) => permit,
-                    Err(reason) => {
-                        debug!(
-                            runtime = %client.lease.runtime,
-                            tenant = %resolved.tenant,
-                            key = %resolved.key,
-                            reason = reason.metric_label(),
-                            "singleflight leader admission rejected"
-                        );
-                        registry::record_cold_tier_operation(
-                            "restore",
-                            "admission_reject",
-                            reason.metric_label(),
-                        );
-                        return Err(StoreError::Transport(format!(
-                            "cold tier restore backpressure: {}",
-                            reason.metric_label()
-                        )));
-                    }
-                };
-                let backend_read_tracker =
-                    OperationTracker::new("cold_restore_backend_read_into_caller");
-                let read_result =
-                    if let Some(payload) = copy_prefetched_nof_payload(resolved, buffer)? {
-                        Ok(Some(payload.len()))
-                    } else {
-                        let backend_resolve_tracker =
-                            OperationTracker::new("cold_restore_backend_resolve");
-                        let backend_result = client
-                            .storage_owner
-                            .cold_tier_devices
-                            .backend_for_with_refresh(
-                                client.metadata.as_ref(),
-                                &cold_backing,
-                                "cold_restore_backend_resolve_refresh",
-                            );
-                        backend_resolve_tracker.finish(&backend_result, 0);
-                        backend_result?.get_object_into(&cold_backing, buffer)
-                    };
-                backend_read_tracker.finish(
-                    &read_result,
-                    read_result
-                        .as_ref()
-                        .ok()
-                        .and_then(|length| *length)
-                        .unwrap_or_default() as u64,
-                );
-                let length = match read_result {
-                    Ok(Some(length)) => {
-                        if length > buffer.len() {
-                            warn!(
-                                runtime = %client.lease.runtime,
-                                tenant = %resolved.tenant,
-                                key = %resolved.key,
-                                bytes = length,
-                                buffer_len = buffer.len(),
-                                "cold restore backend read exceeded caller buffer"
-                            );
-                            permit.complete_error();
-                            return Err(StoreError::Allocator(format!(
-                                "buffer too small for tenant={} key={}: need {}, have {}",
-                                resolved.tenant,
-                                resolved.key,
-                                length,
-                                buffer.len()
-                            )));
-                        }
-                        debug!(
-                            runtime = %client.lease.runtime,
-                            tenant = %resolved.tenant,
-                            key = %resolved.key,
-                            bytes = length,
-                            backend_read = "some",
-                            "mooncake store cold restore backend read returned payload"
-                        );
-                        permit.complete_ok();
-                        length
-                    }
-                    Ok(None) => {
-                        warn!(
-                            runtime = %client.lease.runtime,
-                            tenant = %resolved.tenant,
-                            key = %resolved.key,
-                            backend_read = "none",
-                            "cold restore backend read returned no payload"
-                        );
-                        permit.complete_error();
-                        return Err(StoreError::NotFound(format!(
-                            "tenant={} key={} cold backing payload is unavailable",
-                            resolved.tenant, resolved.key
-                        )));
-                    }
-                    Err(error) => {
-                        warn!(
-                            runtime = %client.lease.runtime,
-                            tenant = %resolved.tenant,
-                            key = %resolved.key,
-                            backend_read = "error",
-                            error = %error,
-                            "cold restore backend read error"
-                        );
-                        permit.complete_error();
-                        return Err(error);
-                    }
-                };
-                let validation_tracker = OperationTracker::new("cold_restore_validate");
-                let validation_result = validate_cold_restore_payload(resolved, &buffer[..length]);
-                validation_tracker.finish(&validation_result, length as u64);
-                validation_result?;
-                Ok(Arc::new(buffer[..length].to_vec()))
-            })();
+            let result =
+                read_cold_backing_with_nof_failover(client, resolved, &cold_backing, buffer)
+                    .map(|length| Arc::new(buffer[..length].to_vec()));
             leader.finish(result).map(Some)
         }
         ColdRestoreFlightRegistration::Waiter(flight) => {
@@ -1015,6 +873,106 @@ fn restore_payload_from_cold_backing_singleflight_into(
     }
 }
 
+fn read_cold_backing_once(
+    client: &StoreClient,
+    resolved: &ResolvedObject,
+    cold_backing: &mooncake_store_core::ColdBackingRoute,
+    buffer: &mut [u8],
+) -> Result<usize> {
+    let admission_tracker = OperationTracker::new("cold_restore_admission");
+    let permit_result = client
+        .storage_owner
+        .cold_tier_devices
+        .try_acquire_restore(cold_tier_device_id(cold_backing));
+    admission_tracker.finish_with_result(
+        if permit_result.is_ok() {
+            "ok"
+        } else {
+            "reject"
+        },
+        0,
+    );
+    let permit = permit_result.map_err(|reason| {
+        registry::record_cold_tier_operation("restore", "admission_reject", reason.metric_label());
+        StoreError::Transport(format!(
+            "cold tier restore backpressure: {}",
+            reason.metric_label()
+        ))
+    })?;
+    let backend_tracker = OperationTracker::new("cold_restore_backend_resolve");
+    let backend_result = client
+        .storage_owner
+        .cold_tier_devices
+        .backend_for_with_refresh(
+            client.metadata.as_ref(),
+            cold_backing,
+            "cold_restore_backend_resolve_refresh",
+        );
+    backend_tracker.finish(&backend_result, 0);
+    let result = backend_result.and_then(|backend| {
+        let read_tracker = OperationTracker::new("cold_restore_backend_read_into_caller");
+        let result = backend
+            .get_object_into(cold_backing, buffer)?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "tenant={} key={} cold backing payload is unavailable",
+                    resolved.tenant, resolved.key
+                ))
+            })
+            .and_then(|length| {
+                (length <= buffer.len()).then_some(length).ok_or_else(|| {
+                    StoreError::Allocator(format!(
+                        "buffer too small for tenant={} key={}: need {}, have {}",
+                        resolved.tenant,
+                        resolved.key,
+                        length,
+                        buffer.len()
+                    ))
+                })
+            });
+        read_tracker.finish(&result, result.as_ref().copied().unwrap_or_default() as u64);
+        result
+    });
+    match &result {
+        Ok(_) => permit.complete_ok(),
+        Err(_) => permit.complete_error(),
+    }
+    let length = result?;
+    let validation_tracker = OperationTracker::new("cold_restore_validate");
+    let validation = validate_cold_restore_payload(resolved, &buffer[..length]);
+    validation_tracker.finish(&validation, length as u64);
+    validation.map(|_| length)
+}
+
+fn retry_transient_nof_read(
+    client: &StoreClient,
+    resolved: &ResolvedObject,
+    cold_backing: &mooncake_store_core::ColdBackingRoute,
+    buffer: &mut [u8],
+    mut last_error: StoreError,
+) -> Result<usize> {
+    if resolved.transient_nof_read.is_none() {
+        return Err(last_error);
+    }
+    for fallback in persistent_backing_targets(cold_backing).into_iter().skip(1) {
+        match read_cold_backing_once(client, resolved, &fallback, buffer) {
+            Ok(length) => return Ok(length),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+fn read_cold_backing_with_nof_failover(
+    client: &StoreClient,
+    resolved: &ResolvedObject,
+    cold_backing: &mooncake_store_core::ColdBackingRoute,
+    buffer: &mut [u8],
+) -> Result<usize> {
+    read_cold_backing_once(client, resolved, cold_backing, buffer)
+        .or_else(|error| retry_transient_nof_read(client, resolved, cold_backing, buffer, error))
+}
+
 fn restore_batch_payloads_from_cold_backing_grouped(
     client: &StoreClient,
     resolved: &[ResolvedObject],
@@ -1041,14 +999,7 @@ fn restore_batch_payloads_from_cold_backing_grouped(
         );
         match registration {
             ColdRestoreFlightRegistration::Leader(leader) => {
-                if let Some(payload) =
-                    copy_prefetched_nof_payload(&resolved[*index], buffers[*index])?
-                {
-                    validate_cold_restore_payload(&resolved[*index], &payload)?;
-                    promotion_payloads.push((*index, leader.finish(Ok(payload))?));
-                } else {
-                    leaders.push((*index, cold_backing, leader));
-                }
+                leaders.push((*index, cold_backing, leader));
             }
             ColdRestoreFlightRegistration::Waiter(flight) => {
                 debug!(
@@ -1122,13 +1073,7 @@ fn restore_batch_payloads_from_cold_backing_grouped(
                 select_cold_backing_target(cold_backing, |id| is_local(id));
                 cold_backing.replicas.retain(|r| is_local(&r.cold_tier_id));
                 let result = selector.select_target(cold_backing);
-                if result.target_id != cold_backing.cold_tier_id
-                    || result.owner != cold_backing.owner
-                {
-                    cold_backing.owner = result.owner;
-                    cold_backing.cold_tier_id = result.target_id;
-                    cold_backing.object_locator = result.object_locator;
-                }
+                promote_cold_backing_target(cold_backing, &result);
             }
         }
     }
@@ -1226,77 +1171,46 @@ fn restore_batch_leaders_from_same_cold_tier(
     let mut promotion_payloads = Vec::new();
     let mut first_error = None;
     for ((index, cold_backing, leader), permit_result) in leaders.into_iter().zip(permit_results) {
-        let result = match permit_result {
+        let initial_result = match permit_result {
             Ok(permit) => {
-                let read_result = read_results
+                let result = read_results
                     .next()
-                    .ok_or_else(|| {
-                        warn!(
-                            runtime = %client.lease.runtime,
-                            tenant = %resolved[index].tenant,
-                            key = %resolved[index].key,
-                            "cold restore batch result missing"
-                        );
-                        StoreError::InvalidState("cold restore batch result missing".to_string())
-                    })
+                    .ok_or_else(|| StoreError::InvalidState(
+                        "cold restore batch result missing".to_string(),
+                    ))
                     .and_then(|(read_index, result)| {
-                        if read_index == index {
-                            result
-                        } else {
-                            warn!(
-                                runtime = %client.lease.runtime,
-                                tenant = %resolved[index].tenant,
-                                key = %resolved[index].key,
-                                expected_index = index,
-                                actual_index = read_index,
-                                "cold restore batch result index mismatch"
-                            );
-                            Err(StoreError::InvalidState(format!(
+                        (read_index == index).then_some(result).ok_or_else(|| {
+                            StoreError::InvalidState(format!(
                                 "cold restore batch result index mismatch: expected {index} actual {read_index}"
-                            )))
-                        }
-                    });
-                match read_result {
-                    Ok(Some(length)) => {
-                        debug!(
-                            runtime = %client.lease.runtime,
-                            tenant = %resolved[index].tenant,
-                            key = %resolved[index].key,
-                            bytes = length,
-                            backend_read = "some",
-                            "mooncake store cold restore batch backend read returned payload"
-                        );
-                        permit.complete_ok();
-                        validate_cold_restore_payload(&resolved[index], &buffers[index][..length])?;
-                        Ok(Arc::new(buffers[index][..length].to_vec()))
-                    }
-                    Ok(None) => {
-                        warn!(
-                            runtime = %client.lease.runtime,
-                            tenant = %resolved[index].tenant,
-                            key = %resolved[index].key,
-                            backend_read = "none",
-                            "cold restore batch backend read returned no payload"
-                        );
-                        permit.complete_error();
-                        Err(StoreError::NotFound(format!(
+                            ))
+                        })?
+                    })
+                    .and_then(|result| {
+                        result.ok_or_else(|| StoreError::NotFound(format!(
                             "tenant={} key={} cold backing payload is unavailable",
                             resolved[index].tenant, resolved[index].key
                         )))
-                    }
-                    Err(error) => {
-                        warn!(
-                            runtime = %client.lease.runtime,
-                            tenant = %resolved[index].tenant,
-                            key = %resolved[index].key,
-                            backend_read = "error",
-                            error = %error,
-                            "cold restore batch backend read error"
-                        );
-                        permit.complete_error();
-                        Err(error)
-                    }
+                    })
+                    .and_then(|length| {
+                        (length <= buffers[index].len()).then_some(length).ok_or_else(|| {
+                            StoreError::Allocator(format!(
+                                "buffer too small for tenant={} key={}: need {}, have {}",
+                                resolved[index].tenant,
+                                resolved[index].key,
+                                length,
+                                buffers[index].len()
+                            ))
+                        })
+                    })
+                    .and_then(|length| {
+                        validate_cold_restore_payload(&resolved[index], &buffers[index][..length])?;
+                        Ok(length)
+                    });
+                match &result {
+                    Ok(_) => permit.complete_ok(),
+                    Err(_) => permit.complete_error(),
                 }
+                result
             }
             Err(reason) => {
                 registry::record_cold_tier_operation(
@@ -1310,6 +1224,17 @@ fn restore_batch_leaders_from_same_cold_tier(
                 )))
             }
         };
+        let result = initial_result
+            .or_else(|error| {
+                retry_transient_nof_read(
+                    client,
+                    &resolved[index],
+                    &cold_backing,
+                    buffers[index],
+                    error,
+                )
+            })
+            .map(|length| Arc::new(buffers[index][..length].to_vec()));
         let payload_result = leader.finish(result);
         match payload_result {
             Ok(payload) => {

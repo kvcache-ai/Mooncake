@@ -55,8 +55,8 @@ pub(super) use helpers::{
     cold_restore_flight_key, has_materialized_cold_backing, is_cold_backing_placeholder,
     local_hot_replica_checksum, materialized_cold_backing, payload_checksum,
     pending_persistent_backing, persistent_backing_contains_target, persistent_backing_targets,
-    prefetched_nof_payload, read_local_hot_replica_payload, resolved_cold_backing,
-    same_cold_payload, validate_cold_restore_payload, validate_resolved_payload_checksum,
+    read_local_hot_replica_payload, resolved_cold_backing, same_cold_payload,
+    validate_cold_restore_payload, validate_resolved_payload_checksum,
     with_disjoint_restore_caller_buffers,
 };
 #[allow(unused_imports)]

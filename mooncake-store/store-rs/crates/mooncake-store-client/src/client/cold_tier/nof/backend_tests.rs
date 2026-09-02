@@ -31,7 +31,7 @@ impl NofObjectRead for ObjectReadWithoutLimits {
         &self,
         _namespace: &NamespaceScope,
         _key: &str,
-    ) -> Result<NofObjectState<NofObject>> {
+    ) -> Result<NofObjectState<Vec<u8>>> {
         Ok(NofObjectState::Missing)
     }
 }
@@ -78,15 +78,8 @@ impl NofObjectWrite for RecordingObjectBacking {
 }
 
 impl NofObjectQuery for RecordingObjectBacking {
-    fn query_object(
-        &self,
-        _namespace: &NamespaceScope,
-        _key: &str,
-    ) -> Result<NofObjectState<NofObjectMetadata>> {
-        Ok(NofObjectState::Found(NofObjectMetadata {
-            length: 10,
-            total_shards: 3,
-        }))
+    fn query_object(&self, _namespace: &NamespaceScope, _key: &str) -> Result<NofObjectState<u64>> {
+        Ok(NofObjectState::Found(10))
     }
 }
 
@@ -95,7 +88,7 @@ impl NofObjectRead for RecordingObjectBacking {
         &self,
         _namespace: &NamespaceScope,
         _key: &str,
-    ) -> Result<NofObjectState<NofObject>> {
+    ) -> Result<NofObjectState<Vec<u8>>> {
         Ok(NofObjectState::Missing)
     }
 }
@@ -145,16 +138,10 @@ fn object_chunking_does_not_duplicate_provider_batch_splitting() {
 }
 
 #[test]
-fn object_query_is_an_optional_post_write_capability() {
+fn object_put_does_not_require_a_post_write_query() {
     let (_, backend) = recording_backend(false);
     let scope = NamespaceScope::new("tenant", "domain", "set");
-    assert_eq!(
-        backend.put_object(&scope, "key", &[0; 10]).unwrap(),
-        NofObjectMetadata {
-            length: 10,
-            total_shards: 3,
-        }
-    );
+    backend.put_object(&scope, "key", &[0; 10]).unwrap();
     assert!(matches!(
         backend.query_object(&scope, "key"),
         Err(StoreError::Unsupported(message)) if message.contains("query")

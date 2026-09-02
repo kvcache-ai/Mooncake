@@ -182,16 +182,6 @@ fn optional_env(name: &str) -> Result<Option<String>> {
     }
 }
 
-fn optional_cstring(name: &str) -> Result<Option<CString>> {
-    optional_env(name)?
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            CString::new(value)
-                .map_err(|_| StoreError::InvalidState(format!("{name} contains NUL")))
-        })
-        .transpose()
-}
-
 fn checked_batch_len(len: usize) -> Result<c_int> {
     c_int::try_from(len).map_err(|_| {
         StoreError::InvalidState(format!("KVCS batch size {len} exceeds the C ABI limit"))

@@ -81,24 +81,18 @@ impl StoreClient {
                 "tenant={tenant} key={logical_key} has no readable replica owner"
             )));
         }
-        if materialized_cold_backing(&route).is_none() {
-            if let Some((backing, payload)) = self
-                .storage_owner
+        let transient_nof_read = if materialized_cold_backing(&route).is_none() {
+            self.storage_owner
                 .cold_tier_devices
                 .nof_targets
                 .read_backing(&route)?
-            {
-                return Ok(ResolvedObject {
-                    tenant: tenant.to_string(),
-                    key: logical_key.to_string(),
-                    route,
-                    replica: cold_backing_placeholder(&backing),
-                    fallback_replicas: VecDeque::new(),
-                    transient_nof_read: Some((backing, payload)),
-                });
-            }
-        }
-        let Some(mut cold_backing) = materialized_cold_backing(&route) else {
+        } else {
+            None
+        };
+        let Some(mut cold_backing) = transient_nof_read
+            .clone()
+            .or_else(|| materialized_cold_backing(&route))
+        else {
             return Err(StoreError::NotFound(format!(
                 "tenant={tenant} key={logical_key} has no readable replica owner"
             )));
@@ -174,7 +168,7 @@ impl StoreClient {
             route,
             replica: cold_backing_placeholder(&cold_backing),
             fallback_replicas: VecDeque::<ReplicaRoute>::new(),
-            transient_nof_read: None,
+            transient_nof_read: transient_nof_read.map(|_| cold_backing),
         })
     }
 }

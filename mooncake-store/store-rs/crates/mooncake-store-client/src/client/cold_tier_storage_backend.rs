@@ -577,6 +577,15 @@ pub(super) trait PersistentStorageBackend: Send + Sync {
         cold_backing: &mooncake_store_core::ColdBackingRoute,
     ) -> Result<Option<Vec<u8>>>;
 
+    fn query_object_length(
+        &self,
+        _cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> Result<Option<u64>> {
+        Err(StoreError::Unsupported(
+            "persistent backend does not expose object metadata queries".to_string(),
+        ))
+    }
+
     fn get_object_pinned(
         &self,
         cold_backing: &mooncake_store_core::ColdBackingRoute,

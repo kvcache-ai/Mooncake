@@ -1,9 +1,7 @@
 //! Provider-addressed physical-KV capabilities for NoF backings.
 //!
-//! These operations address complete objects by a deterministic key and return no allocation
-//! locator. They fit providers such as KVCS that own their lookup metadata. An executor that
-//! allocates extents and returns an opaque location requires Mooncake-managed route metadata and
-//! must not be adapted through these traits.
+//! These operations address complete objects by a deterministic key and fit providers such as
+//! KVCS that own their lookup metadata.
 
 use mooncake_store_core::{Result, StoreError};
 
@@ -72,9 +70,10 @@ pub trait NofPhysicalDelete: Send + Sync {
     fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>>;
 }
 
-/// Key-addressed existence queries exposed by a NoF backing. Results are positional.
+/// Key-addressed metadata queries exposed by a NoF backing. Results are positional; `None`
+/// means missing and `Some(length)` describes the complete logical value.
 pub trait NofPhysicalQuery: Send + Sync {
-    fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<bool>>;
+    fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<Option<u64>>>;
 }
 
 #[cfg(test)]

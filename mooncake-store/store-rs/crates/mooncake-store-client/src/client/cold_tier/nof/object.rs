@@ -27,18 +27,6 @@ pub struct NofObjectShardWrite<'a> {
     pub total_shards: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NofObjectMetadata {
-    pub length: u64,
-    pub total_shards: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NofObject {
-    pub metadata: NofObjectMetadata,
-    pub value: Vec<u8>,
-}
-
 /// `Incomplete` is never equivalent to `Missing`; callers should retry it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NofObjectState<T> {
@@ -55,20 +43,12 @@ pub trait NofObjectWrite: Send + Sync {
 
 /// Logical-object reads exposed by a NoF backing.
 pub trait NofObjectRead: Send + Sync {
-    fn get_object(
-        &self,
-        namespace: &NamespaceScope,
-        key: &str,
-    ) -> Result<NofObjectState<NofObject>>;
+    fn get_object(&self, namespace: &NamespaceScope, key: &str) -> Result<NofObjectState<Vec<u8>>>;
 }
 
 /// Logical-object metadata queries exposed by a NoF backing.
 pub trait NofObjectQuery: Send + Sync {
-    fn query_object(
-        &self,
-        namespace: &NamespaceScope,
-        key: &str,
-    ) -> Result<NofObjectState<NofObjectMetadata>>;
+    fn query_object(&self, namespace: &NamespaceScope, key: &str) -> Result<NofObjectState<u64>>;
 }
 
 /// Logical-object deletion exposed by a NoF backing.

@@ -815,14 +815,56 @@ fn materialize_transient_nof_batch(
             "NoF and local Cold Tier writes cannot share one backend batch".to_string(),
         ));
     }
+    let mut target_writes =
+        BTreeMap::<String, Vec<(usize, mooncake_store_core::ColdBackingRoute)>>::new();
+    for (index, prepared) in pending.iter().enumerate() {
+        for target in persistent_backing_targets(&prepared.cold_backing) {
+            target_writes
+                .entry(target.cold_tier_id.clone())
+                .or_default()
+                .push((index, target));
+        }
+    }
+    let mut errors = (0..pending.len()).map(|_| None).collect::<Vec<_>>();
+    for writes in target_writes.into_values() {
+        let backend = storage_owner.cold_tier_devices.backend_for(&writes[0].1);
+        let results = match backend {
+            Ok(backend) => {
+                let requests = writes
+                    .iter()
+                    .map(|(index, backing)| ColdObjectWrite {
+                        route: Some(&pending[*index].route),
+                        cold_backing: backing,
+                        payload: pending[*index].payload.as_slice(),
+                    })
+                    .collect::<Vec<_>>();
+                backend_store_cold_payload_batch(backend.as_ref(), &requests)
+            }
+            Err(error) => std::iter::repeat_with(|| Err(error.clone()))
+                .take(writes.len())
+                .collect(),
+        };
+        if results.len() != writes.len() {
+            let error = StoreError::InvalidState(format!(
+                "NoF backend returned {} results for {} writes",
+                results.len(),
+                writes.len()
+            ));
+            for (index, _) in writes {
+                errors[index].get_or_insert_with(|| error.clone());
+            }
+            continue;
+        }
+        for ((index, _), result) in writes.into_iter().zip(results) {
+            if let Err(error) = result {
+                errors[index].get_or_insert(error);
+            }
+        }
+    }
     let mut completed = 0usize;
-    for prepared in pending {
-        let write_result = storage_owner
-            .cold_tier_devices
-            .nof_targets
-            .put_selected(&prepared.cold_backing, prepared.payload.as_slice());
-        match write_result {
-            Ok(()) => {
+    for (prepared, error) in pending.iter().zip(errors) {
+        match error {
+            None => {
                 if let Some(permit) = prepared.permit.as_ref() {
                     permit.complete_ok();
                 }
@@ -830,7 +872,7 @@ fn materialize_transient_nof_batch(
                 storage_owner.cold_tier_devices.pressure_decrement_pending();
                 completed = completed.saturating_add(1);
             }
-            Err(error) => {
+            Some(error) => {
                 if let Some(permit) = prepared.permit.as_ref() {
                     permit.complete_error();
                 }
@@ -1353,38 +1395,6 @@ fn rebuild_pending_offload_queue_with(
                 && cold_backing.state == mooncake_store_core::ColdBackingState::PendingOffload
             {
                 queue.push(route.key.clone(), route.version, Some(cold_backing.length));
-            }
-        }
-    }
-    if !storage_owner.cold_tier_devices.nof_targets.is_empty() {
-        for route in storage_owner
-            .route_ops
-            .list_routes_by_replica_owner(&storage_owner.runtime)?
-        {
-            if route.state != RouteState::Active || route.cold_backing.is_some() {
-                continue;
-            }
-            if storage_owner
-                .cold_tier_devices
-                .nof_targets
-                .discover_backing(&route)?
-                .as_ref()
-                .is_some_and(|backing| {
-                    storage_owner
-                        .cold_tier_devices
-                        .nof_targets
-                        .has_required_copies(backing)
-                })
-            {
-                continue;
-            }
-            if let Some(replica) = route
-                .replicas
-                .iter()
-                .filter(|replica| replica.owner == storage_owner.runtime)
-                .min_by_key(|replica| replica.priority)
-            {
-                queue.push(route.key.clone(), route.version, Some(replica.length));
             }
         }
     }

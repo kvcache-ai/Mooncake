@@ -6,11 +6,11 @@ use mooncake_store_core::{Result, StoreError};
 use super::super::backend::encode_namespace;
 use super::super::object::repeated_error;
 use super::super::{
-    NofBacking, NofHealth, NofObject, NofObjectDelete, NofObjectLimits, NofObjectMetadata,
-    NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
-    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalQuery, NofPhysicalQueryRequest,
-    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest,
-    NofStorageHealth, OpaquePhysicalKey,
+    NofBacking, NofHealth, NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead,
+    NofObjectShardWrite, NofObjectState, NofObjectWrite, NofPhysicalDelete,
+    NofPhysicalDeleteRequest, NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead,
+    NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth,
+    OpaquePhysicalKey,
 };
 use super::*;
 const KVCS_MODE_ENV: &str = "MOONCAKE_KVCS_MODE";
@@ -75,16 +75,12 @@ impl KvcsCapiExecutor {
             })
             .transpose()?
             .unwrap_or(SDK_DEFAULT_MAX_VALUE_SIZE);
-        if !(1..=SDK_MAX_VALUE_SIZE).contains(&max_value_size) {
-            return Err(StoreError::InvalidState(format!(
-                "{KVCS_MAX_VALUE_SIZE_ENV} must be in 1..={SDK_MAX_VALUE_SIZE}, got {max_value_size}"
-            )));
-        }
-        let config = match mode {
-            KvcsMode::Standard => {
-                let efc_socket = optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")?;
-                let redis_password = optional_cstring("MOONCAKE_KVCS_REDIS_PASSWORD")?;
-                let redis_endpoints = optional_env("MOONCAKE_KVCS_REDIS_ENDPOINTS")?
+        let efc_socket =
+            optional_env("MOONCAKE_KVCS_EFC_SOCKET")?.filter(|value| !value.is_empty());
+        match mode {
+            KvcsMode::Standard => Self::with_standard_config(
+                efc_socket,
+                optional_env("MOONCAKE_KVCS_REDIS_ENDPOINTS")?
                     .into_iter()
                     .flat_map(|value| {
                         value
@@ -94,28 +90,68 @@ impl KvcsCapiExecutor {
                             .map(str::to_string)
                             .collect::<Vec<_>>()
                     })
-                    .map(|endpoint| {
-                        CString::new(endpoint).map_err(|_| {
-                            StoreError::InvalidState("KVCS Redis endpoint contains NUL".to_string())
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                checked_batch_len(redis_endpoints.len())?;
-                KvcsConfig::Standard {
-                    efc_socket,
-                    redis_endpoints,
-                    redis_password,
-                }
-            }
-            KvcsMode::LowLevel => {
-                let efc_socket = optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")?
-                    .unwrap_or(CString::new("/var/run/kvcs/efc-grpc.sock").expect("static path"));
-                KvcsConfig::LowLevel {
-                    efc_socket,
-                    mountpoint_index: env_u32("MOONCAKE_KVCS_MOUNTPOINT_INDEX", 0)?,
-                }
-            }
+                    .collect(),
+                optional_env("MOONCAKE_KVCS_REDIS_PASSWORD")?.filter(|value| !value.is_empty()),
+                max_value_size,
+            ),
+            KvcsMode::LowLevel => Self::with_low_level_config(
+                efc_socket.unwrap_or_else(|| "/var/run/kvcs/efc-grpc.sock".to_string()),
+                env_u32("MOONCAKE_KVCS_MOUNTPOINT_INDEX", 0)?,
+                max_value_size,
+            ),
+        }
+    }
+
+    pub fn with_standard_config(
+        efc_socket: Option<String>,
+        redis_endpoints: Vec<String>,
+        redis_password: Option<String>,
+        max_value_size: u64,
+    ) -> Result<Self> {
+        checked_batch_len(redis_endpoints.len())?;
+        let to_cstring = |value: String, name: &str| {
+            CString::new(value)
+                .map_err(|_| StoreError::InvalidState(format!("KVCS {name} contains NUL")))
         };
+        Self::from_config(
+            KvcsConfig::Standard {
+                efc_socket: efc_socket
+                    .map(|value| to_cstring(value, "EFC socket"))
+                    .transpose()?,
+                redis_endpoints: redis_endpoints
+                    .into_iter()
+                    .map(|value| to_cstring(value, "Redis endpoint"))
+                    .collect::<Result<Vec<_>>>()?,
+                redis_password: redis_password
+                    .map(|value| to_cstring(value, "Redis password"))
+                    .transpose()?,
+            },
+            max_value_size,
+        )
+    }
+
+    pub fn with_low_level_config(
+        efc_socket: String,
+        mountpoint_index: u32,
+        max_value_size: u64,
+    ) -> Result<Self> {
+        let efc_socket = CString::new(efc_socket)
+            .map_err(|_| StoreError::InvalidState("KVCS EFC socket contains NUL".to_string()))?;
+        Self::from_config(
+            KvcsConfig::LowLevel {
+                efc_socket,
+                mountpoint_index,
+            },
+            max_value_size,
+        )
+    }
+
+    fn from_config(config: KvcsConfig, max_value_size: u64) -> Result<Self> {
+        if !(1..=SDK_MAX_VALUE_SIZE).contains(&max_value_size) {
+            return Err(StoreError::InvalidState(format!(
+                "KVCS max value size must be in 1..={SDK_MAX_VALUE_SIZE}, got {max_value_size}"
+            )));
+        }
         Ok(Self {
             config,
             client: ClientSlot::default(),
@@ -249,14 +285,14 @@ mod standard {
 
     use super::super::*;
     use super::{
-        encode_namespace, repeated_error, NofObject, NofObjectDelete, NofObjectMetadata,
-        NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
+        encode_namespace, repeated_error, NofObjectDelete, NofObjectQuery, NofObjectRead,
+        NofObjectShardWrite, NofObjectState, NofObjectWrite,
     };
 
     struct RawQuery {
         namespace: CString,
         key: CString,
-        metadata: NofObjectMetadata,
+        length: u64,
         shards: Vec<(u32, usize)>,
     }
 
@@ -402,10 +438,7 @@ mod standard {
                     Ok(NofObjectState::Found(RawQuery {
                         namespace,
                         key,
-                        metadata: NofObjectMetadata {
-                            length,
-                            total_shards,
-                        },
+                        length,
                         shards,
                     }))
                 }
@@ -527,9 +560,9 @@ mod standard {
             &self,
             namespace: &NamespaceScope,
             key: &str,
-        ) -> Result<NofObjectState<NofObjectMetadata>> {
+        ) -> Result<NofObjectState<u64>> {
             Ok(match self.query_raw(namespace, key, false)? {
-                NofObjectState::Found(query) => NofObjectState::Found(query.metadata),
+                NofObjectState::Found(query) => NofObjectState::Found(query.length),
                 NofObjectState::Missing => NofObjectState::Missing,
                 NofObjectState::Incomplete => NofObjectState::Incomplete,
             })
@@ -541,7 +574,7 @@ mod standard {
             &self,
             namespace: &NamespaceScope,
             key: &str,
-        ) -> Result<NofObjectState<NofObject>> {
+        ) -> Result<NofObjectState<Vec<u8>>> {
             let query = match self.query_raw(namespace, key, true)? {
                 NofObjectState::Found(query) => query,
                 NofObjectState::Missing => return Ok(NofObjectState::Missing),
@@ -560,7 +593,7 @@ mod standard {
                     meta_count: 0,
                 })
                 .collect::<Vec<_>>();
-            let capacity = usize::try_from(query.metadata.length).map_err(|_| {
+            let capacity = usize::try_from(query.length).map_err(|_| {
                 StoreError::InvalidState(
                     "KVCS object length does not fit this platform".to_string(),
                 )
@@ -595,10 +628,7 @@ mod standard {
             {
                 return Ok(NofObjectState::Incomplete);
             }
-            Ok(NofObjectState::Found(NofObject {
-                metadata: query.metadata,
-                value,
-            }))
+            Ok(NofObjectState::Found(value))
         }
     }
 
@@ -680,15 +710,15 @@ mod standard {
             let value = b"kvcs-capi-standard-smoke";
 
             backend.init_namespace(&namespace).unwrap();
-            let metadata = backend.put_object(&namespace, key, value).unwrap();
-            assert_eq!(metadata.length, value.len() as u64);
-            assert_eq!(
-                metadata.total_shards as u64,
-                (value.len() as u64).div_ceil(executor.max_value_size)
-            );
+            backend.put_object(&namespace, key, value).unwrap();
+            let NofObjectState::Found(length) = backend.query_object(&namespace, key).unwrap()
+            else {
+                panic!("KVCS Standard put did not publish its manifest")
+            };
+            assert_eq!(length, value.len() as u64);
             assert!(matches!(
                 backend.get_object(&namespace, key).unwrap(),
-                NofObjectState::Found(NofObject { value: got, .. }) if got == value
+                NofObjectState::Found(got) if got == value
             ));
             assert!(matches!(
                 backend.delete_object(&namespace, key).unwrap(),
@@ -816,10 +846,11 @@ mod low_level {
             }
         }
 
-        fn get_record_dynamic(&self, key: &OpaquePhysicalKey) -> Result<Option<Vec<u8>>> {
-            struct DynamicGet {
-                value: Option<Vec<u8>>,
-                status: c_int,
+        fn get_records_dynamic(&self, keys: &[&OpaquePhysicalKey]) -> Vec<Result<Option<Vec<u8>>>> {
+            struct DynamicGets {
+                values: Vec<Option<Vec<u8>>>,
+                statuses: Vec<c_int>,
+                malformed: bool,
             }
 
             unsafe extern "C" fn capture(
@@ -829,62 +860,94 @@ mod low_level {
                 statuses: *const c_int,
                 context: *mut std::ffi::c_void,
             ) {
-                if count <= 0 || context.is_null() || statuses.is_null() {
+                if count < 0 || context.is_null() || statuses.is_null() {
                     return;
                 }
-                let output = unsafe { &mut *(context.cast::<DynamicGet>()) };
-                let status = unsafe { *statuses };
-                if status <= 0 {
-                    if status < 0 && output.value.is_none() && output.status == 0 {
-                        output.status = status;
+                let output = unsafe { &mut *(context.cast::<DynamicGets>()) };
+                let count = count as usize;
+                if count != output.values.len() {
+                    output.malformed = true;
+                }
+                for index in 0..count.min(output.values.len()) {
+                    let status = unsafe { *statuses.add(index) };
+                    output.statuses[index] = status;
+                    if status <= 0 {
+                        continue;
                     }
-                    return;
-                }
-                if data_lens.is_null() || data_ptrs.is_null() {
-                    if output.value.is_none() {
-                        output.status = -libc::EIO;
+                    if data_lens.is_null() || data_ptrs.is_null() {
+                        output.statuses[index] = -libc::EIO;
+                        continue;
                     }
-                    return;
-                }
-                let length = unsafe { *data_lens };
-                let data = unsafe { *data_ptrs };
-                if data.is_null() {
-                    if output.value.is_none() {
-                        output.status = -libc::EIO;
+                    let length = unsafe { *data_lens.add(index) };
+                    let data = unsafe { *data_ptrs.add(index) };
+                    if data.is_null() {
+                        output.statuses[index] = -libc::EIO;
+                        continue;
                     }
-                    return;
+                    output.values[index] = Some(
+                        unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) }.to_vec(),
+                    );
                 }
-                output.status = status;
-                output.value =
-                    Some(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length).to_vec() });
             }
 
-            let key = encode_physical_key(key, DEFAULT_MAX_KEY_SIZE)?;
-            let (client, count) = self.prepare_batch(1)?;
-            let item = KvcsLlGetItem { key: key.as_ptr() };
-            let mut output = DynamicGet {
-                value: None,
-                status: 0,
+            let (mut results, valid) =
+                prepare_positional(keys, |key| encode_physical_key(key, DEFAULT_MAX_KEY_SIZE));
+            if valid.is_empty() {
+                return finish_positional_results(results);
+            }
+            let (client, count) = match self.prepare_batch(valid.len()) {
+                Ok(prepared) => prepared,
+                Err(error) => return fail_positional_results(results, error),
+            };
+            let items = valid
+                .iter()
+                .map(|(_, key)| KvcsLlGetItem { key: key.as_ptr() })
+                .collect::<Vec<_>>();
+            let mut output = DynamicGets {
+                values: vec![None; valid.len()],
+                statuses: vec![0; valid.len()],
+                malformed: false,
             };
             let options = self.low_level_options();
             let status = unsafe {
                 kvcs_ll_batch_get(
                     client,
-                    &item,
+                    items.as_ptr(),
                     count,
                     Some(capture),
-                    (&mut output as *mut DynamicGet).cast(),
+                    (&mut output as *mut DynamicGets).cast(),
                     0,
                     &options,
                 )
             };
             if status < 0 {
-                return Err(map_call_status(status, "low-level get"));
+                return fail_positional_results(results, map_call_status(status, "low-level get"));
             }
-            if output.status < 0 {
-                return Err(map_item_status(output.status, "low-level get item", false));
+            if output.malformed {
+                return fail_positional_results(
+                    results,
+                    StoreError::InvalidState(
+                        "KVCS low-level get callback returned the wrong item count".to_string(),
+                    ),
+                );
             }
-            Ok(output.value)
+            for ((request_index, _), (status, value)) in valid
+                .iter()
+                .zip(output.statuses.into_iter().zip(output.values))
+            {
+                results[*request_index] = Some(if status < 0 {
+                    Err(map_item_status(status, "low-level get item", false))
+                } else if status == 0 {
+                    Ok(None)
+                } else {
+                    value.map(Some).ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "KVCS low-level get callback omitted a value".to_string(),
+                        )
+                    })
+                });
+            }
+            finish_positional_results(results)
         }
 
         fn put_retryable_records(
@@ -913,19 +976,10 @@ mod low_level {
                 .collect()
         }
 
-        fn read_object(&self, request: &NofPhysicalReadRequest) -> Result<Option<Vec<u8>>> {
-            if let Some(value) = self.get_record_dynamic(&request.key)? {
-                return Ok(Some(value));
-            }
-
-            let manifest = KvcsReadRecord {
-                key: manifest_key(&request.key)?,
-                expected_value_size: MANIFEST_SIZE,
-            };
-            let Some(manifest) = self.get_records(&[manifest])? else {
+        fn read_chunked_object(&self, request: &NofPhysicalReadRequest) -> Result<Option<Vec<u8>>> {
+            let Some((_, chunks, value_size)) = self.read_chunk_manifest(&request.key)? else {
                 return Ok(None);
             };
-            let (chunks, value_size) = read_records(&request.key, &manifest)?;
             match self.get_records(&chunks)? {
                 Some(value) if value.len() == value_size => Ok(Some(value)),
                 Some(_) => Err(StoreError::InvalidState(
@@ -974,25 +1028,34 @@ mod low_level {
         }
 
         fn delete_existing_records(&self, keys: &[&OpaquePhysicalKey]) -> Result<bool> {
-            let mut existing = Vec::with_capacity(keys.len());
-            for (key, exists) in keys.iter().zip(self.query_records(keys)) {
-                if exists? {
-                    existing.push(*key);
-                }
-            }
-            if existing.is_empty() {
-                return Ok(false);
-            }
-            for result in self.delete_records(&existing) {
+            let mut deleted = false;
+            for result in self.delete_records(keys) {
                 match result {
-                    Ok(()) | Err(StoreError::NotFound(_)) => {}
+                    Ok(()) => deleted = true,
+                    Err(StoreError::NotFound(_)) => {}
                     Err(error) => return Err(error),
                 }
             }
-            Ok(true)
+            Ok(deleted)
         }
 
-        fn query_records(&self, keys: &[&OpaquePhysicalKey]) -> Vec<Result<bool>> {
+        fn read_chunk_manifest(
+            &self,
+            root: &OpaquePhysicalKey,
+        ) -> Result<Option<(OpaquePhysicalKey, Vec<KvcsReadRecord>, usize)>> {
+            let key = manifest_key(root)?;
+            let record = KvcsReadRecord {
+                key: key.clone(),
+                expected_value_size: MANIFEST_SIZE,
+            };
+            let Some(manifest) = self.get_records(&[record])? else {
+                return Ok(None);
+            };
+            let (chunks, value_size) = read_records(root, &manifest)?;
+            Ok(Some((key, chunks, value_size)))
+        }
+
+        fn query_records(&self, keys: &[&OpaquePhysicalKey]) -> Vec<Result<Option<u64>>> {
             let (mut results, valid) =
                 prepare_positional(keys, |key| encode_physical_key(key, DEFAULT_MAX_KEY_SIZE));
             if valid.is_empty() {
@@ -1022,7 +1085,7 @@ mod low_level {
                 fill_missing(&mut results, &error);
             } else {
                 for ((request_index, _), native) in valid.iter().zip(native_results.as_slice()) {
-                    results[*request_index] = Some(kvcs_low_level_query_status(&native.status));
+                    results[*request_index] = Some(kvcs_low_level_query_status(native));
                 }
             }
             finish_positional_results(results)
@@ -1033,17 +1096,11 @@ mod low_level {
                 return Ok(());
             }
 
-            let manifest_key = manifest_key(&request.key)?;
-            let manifest_record = KvcsReadRecord {
-                key: manifest_key.clone(),
-                expected_value_size: MANIFEST_SIZE,
-            };
-            let Some(manifest) = self.get_records(&[manifest_record])? else {
+            let Some((manifest_key, chunks, _)) = self.read_chunk_manifest(&request.key)? else {
                 return Err(StoreError::NotFound(
                     "KVCS low-level physical object".to_string(),
                 ));
             };
-            let (chunks, _) = read_records(&request.key, &manifest)?;
             self.delete_existing_records(
                 &chunks.iter().map(|chunk| &chunk.key).collect::<Vec<_>>(),
             )?;
@@ -1052,26 +1109,14 @@ mod low_level {
                 .ok_or_else(|| StoreError::NotFound("KVCS chunk manifest".to_string()))
         }
 
-        fn query_object(&self, request: &NofPhysicalQueryRequest) -> Result<bool> {
-            if self.query_records(&[&request.key]).remove(0)? {
-                return Ok(true);
+        fn query_object(&self, request: &NofPhysicalQueryRequest) -> Result<Option<u64>> {
+            if let Some(length) = self.query_records(&[&request.key]).remove(0)? {
+                return Ok(Some(length));
             }
-            let manifest = KvcsReadRecord {
-                key: manifest_key(&request.key)?,
-                expected_value_size: MANIFEST_SIZE,
+            let Some((_, _, value_size)) = self.read_chunk_manifest(&request.key)? else {
+                return Ok(None);
             };
-            let Some(manifest) = self.get_records(&[manifest])? else {
-                return Ok(false);
-            };
-            let (chunks, _) = read_records(&request.key, &manifest)?;
-            for exists in
-                self.query_records(&chunks.iter().map(|chunk| &chunk.key).collect::<Vec<_>>())
-            {
-                if !exists? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
+            Ok(Some(value_size as u64))
         }
     }
 
@@ -1086,38 +1131,8 @@ mod low_level {
                 }
             }
 
-            let initial_records = layouts
+            let data_records = layouts
                 .iter()
-                .map(|(request_index, layout)| {
-                    let (key, value) = layout
-                        .manifest
-                        .as_ref()
-                        .map(|(key, value)| (key, value.as_slice()))
-                        .unwrap_or_else(|| {
-                            let (key, value) = &layout.data_records[0];
-                            (key, *value)
-                        });
-                    (*request_index, key, value)
-                })
-                .collect::<Vec<_>>();
-            let writes = initial_records
-                .iter()
-                .map(|(_, key, value)| (*key, *value))
-                .collect::<Vec<_>>();
-            for ((request_index, _, _), status) in initial_records
-                .iter()
-                .zip(self.put_retryable_records(&writes))
-            {
-                if let Err(error) = status {
-                    results[*request_index] = Some(Err(error));
-                }
-            }
-
-            let chunks = layouts
-                .iter()
-                .filter(|(request_index, layout)| {
-                    results[*request_index].is_none() && layout.manifest.is_some()
-                })
                 .flat_map(|(request_index, layout)| {
                     layout
                         .data_records
@@ -1125,12 +1140,37 @@ mod low_level {
                         .map(move |(key, value)| (*request_index, key, *value))
                 })
                 .collect::<Vec<_>>();
-            let writes = chunks
+            let writes = data_records
                 .iter()
                 .map(|(_, key, value)| (*key, *value))
                 .collect::<Vec<_>>();
             for ((request_index, _, _), status) in
-                chunks.iter().zip(self.put_retryable_records(&writes))
+                data_records.iter().zip(self.put_retryable_records(&writes))
+            {
+                if let Err(error) = status {
+                    results[*request_index] = Some(Err(error));
+                }
+            }
+
+            let manifests = layouts
+                .iter()
+                .filter(|(request_index, layout)| {
+                    results[*request_index].is_none() && layout.manifest.is_some()
+                })
+                .map(|(request_index, layout)| {
+                    let (key, value) = layout
+                        .manifest
+                        .as_ref()
+                        .expect("manifest presence was filtered above");
+                    (*request_index, key, value.as_slice())
+                })
+                .collect::<Vec<_>>();
+            let writes = manifests
+                .iter()
+                .map(|(_, key, value)| (*key, *value))
+                .collect::<Vec<_>>();
+            for ((request_index, _, _), status) in
+                manifests.iter().zip(self.put_retryable_records(&writes))
             {
                 if let Err(error) = status {
                     results[*request_index].get_or_insert(Err(error));
@@ -1147,9 +1187,17 @@ mod low_level {
 
     impl NofPhysicalRead for KvcsCapiExecutor {
         fn get_batch(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
+            let keys = requests
+                .iter()
+                .map(|request| &request.key)
+                .collect::<Vec<_>>();
             requests
                 .iter()
-                .map(|request| self.read_object(request))
+                .zip(self.get_records_dynamic(&keys))
+                .map(|(request, root)| match root? {
+                    Some(value) => Ok(Some(value)),
+                    None => self.read_chunked_object(request),
+                })
                 .collect()
         }
     }
@@ -1164,7 +1212,7 @@ mod low_level {
     }
 
     impl NofPhysicalQuery for KvcsCapiExecutor {
-        fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<bool>> {
+        fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<Option<u64>>> {
             requests
                 .iter()
                 .map(|request| self.query_object(request))
@@ -1174,7 +1222,7 @@ mod low_level {
 
     impl NofHealth for KvcsCapiExecutor {
         fn health(&self) -> Result<NofStorageHealth> {
-            let probe = OpaquePhysicalKey::new(b"mooncake:nof:health:v1".to_vec());
+            let probe = OpaquePhysicalKey::new(b"mooncake:nof:health".to_vec());
             self.query_records(&[&probe]).pop().ok_or_else(|| {
                 StoreError::Transport("KVCS health query returned no result".to_string())
             })??;
@@ -1182,14 +1230,16 @@ mod low_level {
         }
     }
 
-    fn kvcs_low_level_query_status(status: &[std::ffi::c_char; 32]) -> Result<bool> {
-        match char_array_str(status).map_err(|error| {
+    fn kvcs_low_level_query_status(raw: &KvcsQueryResult) -> Result<Option<u64>> {
+        match char_array_str(&raw.status).map_err(|error| {
             StoreError::Transport(format!(
                 "KVCS low-level query returned invalid status: {error}"
             ))
         })? {
-            "ok" => Ok(true),
-            "not_found" => Ok(false),
+            "ok" => u64::try_from(raw.total_size).map(Some).map_err(|_| {
+                StoreError::InvalidState("KVCS query returned a negative size".to_string())
+            }),
+            "not_found" => Ok(None),
             "incomplete" => Err(StoreError::Backpressure(
                 "KVCS low-level query returned incomplete".to_string(),
             )),
@@ -1223,12 +1273,15 @@ mod low_level {
                 }])
                 .remove(0)
                 .unwrap();
-            assert!(executor
-                .physical_query()
-                .unwrap()
-                .query_batch(&[NofPhysicalQueryRequest { key: key.clone() }])
-                .remove(0)
-                .unwrap());
+            assert_eq!(
+                executor
+                    .physical_query()
+                    .unwrap()
+                    .query_batch(&[NofPhysicalQueryRequest { key: key.clone() }])
+                    .remove(0)
+                    .unwrap(),
+                Some(value.len() as u64)
+            );
             assert_eq!(
                 executor
                     .physical_read()
@@ -1244,12 +1297,15 @@ mod low_level {
                 .delete_batch(&[NofPhysicalDeleteRequest { key: key.clone() }])
                 .remove(0)
                 .unwrap();
-            assert!(!executor
-                .physical_query()
-                .unwrap()
-                .query_batch(&[NofPhysicalQueryRequest { key }])
-                .remove(0)
-                .unwrap());
+            assert_eq!(
+                executor
+                    .physical_query()
+                    .unwrap()
+                    .query_batch(&[NofPhysicalQueryRequest { key }])
+                    .remove(0)
+                    .unwrap(),
+                None
+            );
             assert!(executor.physical_read().is_some());
             assert!(executor.physical_write().is_some());
             assert!(executor.physical_query().is_some());
@@ -1295,5 +1351,21 @@ mod mode_tests {
         assert!(low_level.physical_write().is_some());
         assert!(low_level.physical_query().is_some());
         assert!(low_level.health_capability().is_some());
+    }
+
+    #[test]
+    fn explicit_config_keeps_per_target_connection_state() {
+        for (socket, expected) in [("/run/kvcs-a.sock", 3), ("/run/kvcs-b.sock", 7)] {
+            let executor = KvcsCapiExecutor::with_low_level_config(
+                socket.to_string(),
+                expected,
+                SDK_DEFAULT_MAX_VALUE_SIZE,
+            )
+            .unwrap();
+            assert!(matches!(
+                executor.config,
+                KvcsConfig::LowLevel { mountpoint_index, .. } if mountpoint_index == expected
+            ));
+        }
     }
 }

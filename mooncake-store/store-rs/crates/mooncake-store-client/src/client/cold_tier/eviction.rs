@@ -571,17 +571,6 @@ impl StorageOwnerState {
             Some(checksum) => checksum,
             None => local_hot_replica_checksum(&self.allocator, &self.state, route, replica)?,
         };
-        if let Some(backing) = self.cold_tier_devices.nof_targets.discover_backing(route)? {
-            if backing.length == replica.length
-                && backing.checksum == Some(checksum)
-                && self
-                    .cold_tier_devices
-                    .nof_targets
-                    .has_required_copies(&backing)
-            {
-                return Ok(Some(route.clone()));
-            }
-        }
         let Some(target) =
             self.cold_tier_devices
                 .nof_targets

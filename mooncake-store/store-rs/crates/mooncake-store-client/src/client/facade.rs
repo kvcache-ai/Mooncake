@@ -294,13 +294,17 @@ impl StoreClient {
         restored == *previous
     }
 
-    fn delete_nof_content_best_effort(&self, route: &ObjectRoute) {
-        if let Err(error) = self
+    fn delete_nof_content(&self, route: &ObjectRoute) -> Result<()> {
+        self
             .storage_owner
             .cold_tier_devices
             .nof_targets
             .delete_object(route)
-        {
+            .map(|_| ())
+    }
+
+    fn delete_nof_content_best_effort(&self, route: &ObjectRoute) {
+        if let Err(error) = self.delete_nof_content(route) {
             warn!(
                 runtime = %self.lease.runtime,
                 key = %route.key.0,
@@ -308,6 +312,32 @@ impl StoreClient {
                 error = %error,
                 "request-local NoF delete failed"
             );
+        }
+    }
+
+    fn retry_route_delete_conflict(
+        &self,
+        previous: &ObjectRoute,
+        current: Option<ObjectRoute>,
+        force: bool,
+        attempt: usize,
+        tenant: &str,
+        key: &str,
+    ) -> Result<Option<ObjectRoute>> {
+        match current {
+            Some(current)
+                if force
+                    && attempt < DEFAULT_PUT_WRITE_RETRY_LIMIT
+                    && (Self::route_delete_can_follow_cold_restore(previous, &current)
+                        || self.route_delete_can_follow_rollout_handoff(previous, &current)) =>
+            {
+                Ok(Some(current))
+            }
+            Some(current) if current.state == RouteState::Active => Err(StoreError::Conflict(
+                format!("route delete lost race for tenant={tenant} key={key}"),
+            )),
+            _ if force => Ok(None),
+            _ => Err(StoreError::NotFound(format!("tenant={tenant} key={key}"))),
         }
     }
 
@@ -330,18 +360,20 @@ impl StoreClient {
         let tenant = object_id.scope.tenant.as_str();
         let key = object_id.logical_key.as_str();
         let mut current = self.route_ops().load_route(object_key)?;
-        let max_attempts = DEFAULT_PUT_WRITE_RETRY_LIMIT;
         let mut attempt = 0usize;
 
         loop {
-            let Some(route) = current.take() else {
+            let Some(mut route) = current.take() else {
                 return if force {
                     Ok(())
                 } else {
                     Err(StoreError::NotFound(format!("tenant={tenant} key={key}")))
                 };
             };
-            if route.state != RouteState::Active {
+            let has_nof = !self.storage_owner.cold_tier_devices.nof_targets.is_empty();
+            if route.state != RouteState::Active
+                && !(has_nof && route.state == RouteState::Deleting)
+            {
                 return if force {
                     Ok(())
                 } else {
@@ -350,11 +382,42 @@ impl StoreClient {
             }
 
             attempt = attempt.saturating_add(1);
+            if has_nof && route.state == RouteState::Active {
+                let mut deleting = route.clone();
+                deleting.version = route.version.next();
+                deleting.state = RouteState::Deleting;
+                let cas = self.route_ops().compare_and_swap_route(
+                    object_key,
+                    Some(route.version),
+                    Some(&deleting),
+                )?;
+                if cas.applied {
+                    route = deleting;
+                } else {
+                    current = self.retry_route_delete_conflict(
+                        &route,
+                        cas.current,
+                        force,
+                        attempt,
+                        tenant,
+                        key,
+                    )?;
+                    continue;
+                }
+            }
+            if has_nof {
+                // Keep a deleting route while the provider delete is in progress so a failed
+                // provider operation remains retryable without persisted provider placement.
+                self.delete_nof_content(&route)?;
+            }
             let quota_reservation =
                 self.reserve_tenant_quota_for_delete(object_id, object_key, &route)?;
-            let cas = self
-                .route_ops()
-                .delete_route_with_version_fence(&route)?;
+            let cas = if has_nof {
+                self.route_ops()
+                    .delete_route(object_key, Some(route.version))?
+            } else {
+                self.route_ops().delete_route_with_version_fence(&route)?
+            };
             if cas.applied {
                 self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
                 if let Err(error) = self.schedule_route_reclaim(&route) {
@@ -366,7 +429,6 @@ impl StoreClient {
                         "route delete reclaim scheduling failed after authoritative delete"
                     );
                 }
-                self.delete_nof_content_best_effort(&route);
                 return Ok(());
             }
 
@@ -374,39 +436,14 @@ impl StoreClient {
                 quota_reservation.as_ref(),
                 "route_delete_compare_and_swap_conflict",
             );
-            match cas.current {
-                Some(current_route)
-                    if force
-                        && (Self::route_delete_can_follow_cold_restore(&route, &current_route)
-                            || self
-                                .route_delete_can_follow_rollout_handoff(&route, &current_route))
-                        && attempt < max_attempts =>
-                {
-                    debug!(
-                        runtime = %self.lease.runtime,
-                        tenant,
-                        key,
-                        attempt,
-                        max_attempts,
-                        route_version = current_route.version.0,
-                        "retrying remove after route compare-and-swap conflict with rollout successor route"
-                    );
-                    current = Some(current_route);
-                    continue;
-                }
-                Some(current_route) if current_route.state == RouteState::Active => {
-                    return Err(StoreError::Conflict(format!(
-                        "route delete lost race for tenant={tenant} key={key}"
-                    )));
-                }
-                _ => {
-                    return if force {
-                        Ok(())
-                    } else {
-                        Err(StoreError::NotFound(format!("tenant={tenant} key={key}")))
-                    };
-                }
-            }
+            current = self.retry_route_delete_conflict(
+                &route,
+                cas.current,
+                force,
+                attempt,
+                tenant,
+                key,
+            )?;
         }
     }
 
@@ -1207,7 +1244,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 .cold_tier_devices
                 .nof_targets
                 .read_backing(&route)?
-                .map(|(_, payload)| payload.len())
+                .map(|backing| backing.length as usize)
                 .ok_or_else(|| StoreError::NotFound(format!("tenant={tenant} key={key}")))
         })();
         tracker.finish(&result, result.as_ref().copied().unwrap_or_default() as u64);
