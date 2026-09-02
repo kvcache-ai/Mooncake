@@ -15,8 +15,13 @@
 #ifndef WORKER_H
 #define WORKER_H
 
-#include <queue>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "config.h"
 #include "rdma_context.h"
@@ -41,7 +46,6 @@ class WorkerPool {
 
    private:
     using SliceList = std::vector<Transport::Slice *>;
-    const static int kShardCount = 8;
 
     // Enqueue slices that were prepared by another WorkerPool. Used for
     // local-NIC failure handoff: the original worker keeps the remote path
@@ -49,12 +53,16 @@ class WorkerPool {
     // worker queue.
     int submitPreparedPostSend(
         const std::vector<Transport::Slice *> &slice_list);
-    void enqueuePreparedSlices(SliceList (&slice_list_map)[kShardCount],
+    void enqueuePreparedSlices(const SliceList &slice_list,
                                uint64_t submitted_slice_count);
+    void enqueueSliceToOwner(Transport::Slice *slice);
+    int postingThreadForPeer(const std::string &peer_nic_path) const;
+    int cqIndexForPostingThread(int thread_id) const;
 
     void performPostSend(int thread_id);
 
     void performPollCq(int thread_id);
+    void processCompletions(int thread_id, const std::vector<ibv_wc> &wc_list);
 
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
                     bool handoff_to_local_worker = false);
@@ -130,6 +138,7 @@ class WorkerPool {
    private:
     RdmaContext &context_;
     const int numa_socket_id_;
+    const int worker_count_;
 
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
@@ -151,12 +160,10 @@ class WorkerPool {
     std::mutex cond_mutex_;
     std::condition_variable cond_var_;
 
-    std::unordered_map<std::string, SliceList> slice_queue_[kShardCount];
-    std::atomic<uint64_t> slice_queue_count_[kShardCount];
-    TicketLock slice_queue_lock_[kShardCount];
-
     std::vector<std::unordered_map<std::string, SliceList>>
         collective_slice_queue_;
+    std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
+    std::vector<std::mutex> worker_slice_queue_lock_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
     std::atomic<uint64_t> recovery_activate_after_ns_{0};

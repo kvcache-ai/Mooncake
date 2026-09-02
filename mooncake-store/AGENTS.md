@@ -11,3 +11,12 @@
 - Do not migrate `src/cachelib_memory_allocator/` unless explicitly requested.
 - The shared engine is not cryptographically secure; do not use it for secrets
   or authentication tokens.
+
+## Local-first Host Identity
+
+- Keep the placement host ID separate from the routable transfer endpoint.
+- `MOONCAKE_HOST_ID` takes priority after ASCII whitespace trimming. Unset,
+  empty, or whitespace-only values fall back to the existing `local_hostname`
+  behavior.
+- Normalize endpoint-shaped host IDs before rejecting loopback or wildcard
+  identities.

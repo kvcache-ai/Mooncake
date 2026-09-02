@@ -196,6 +196,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     void postNotifyRecv(size_t idx);
     void repostAllNotifyRecvs();
 
+    static char* notifySlotPtr(char* base, size_t idx);
+    static bool encodeNotifyPayload(char* slot, const std::string& name,
+                                    const std::string& msg, uint32_t* out_len);
+    static bool decodeNotifyPayload(const char* data, size_t byte_len,
+                                    std::string* name, std::string* msg);
+
    private:
     friend class EndpointTestAccess;
 
@@ -226,13 +232,14 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Notification QP (one per endpoint for control plane operations)
     ibv_qp* notify_qp_ = nullptr;
 
-    // Notification buffers
+    // Notification buffers. Send and recv each use one contiguous host buffer
+    // split into kNotifyMaxPendingSends slots, registered with a single MR.
     static constexpr size_t kNotifyBufferSize = 65536;  // 64 KB
     static constexpr size_t kNotifyMaxPendingSends = 256;
-    std::vector<std::vector<char>> notify_recv_buffers_;
-    std::vector<ibv_mr*> notify_recv_mrs_;  // Memory regions for recv buffers
-    std::vector<char> notify_send_buffer_;  // Single contiguous send buffer
-    ibv_mr* notify_send_mr_ = nullptr;      // Single MR for all send slots
+    std::vector<char> notify_recv_buffer_;
+    ibv_mr* notify_recv_mr_ = nullptr;
+    std::vector<char> notify_send_buffer_;
+    ibv_mr* notify_send_mr_ = nullptr;
     // Serializes notification buffer/QP access against deconstruction.
     std::mutex notify_resource_mutex_;
     std::mutex notify_send_mutex_;

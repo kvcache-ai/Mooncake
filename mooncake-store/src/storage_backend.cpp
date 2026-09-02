@@ -684,14 +684,9 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
 
 void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
-    // TODO: attention: this function is not thread-safe, need to add lock if
-    // used in multi-thread environment Check if the file exists before
-    // attempting to remove it
-    // TODO: add a sleep to ensure the write thread has time to create the
-    // corresponding file it will be fixed in the next version
-    std::this_thread::sleep_for(
-        std::chrono::microseconds(50));  // sleep for 50 us
-
+    // StoreObject holds the same striped path lock across file creation, write,
+    // and queue insertion. Acquiring it here serializes deletion with those
+    // operations without relying on a timing delay.
     MutexLocker path_locker(&GetFilePathMutex(path));
 
     // Eviction disabled, use simple delete (no queue tracking)

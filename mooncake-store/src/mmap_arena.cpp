@@ -76,9 +76,13 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment,
 
     const size_t actual_alignment = std::max(alignment, kMinAlignment);
 
-    // Align pool size to 2MB for huge pages with overflow protection
+    // Align pool size to the configured huge page size (2MB when hugepages
+    // are not explicitly requested) with overflow protection
+    unsigned int hugepage_flags = 0;
+    const size_t hugepage_size = get_hugepage_size_from_env(&hugepage_flags);
+    const size_t page_align = hugepage_size > 0 ? hugepage_size : SZ_2MB;
     size_t aligned_pool_size;
-    if (!safe_align_up(pool_size, SZ_2MB, &aligned_pool_size)) {
+    if (!safe_align_up(pool_size, page_align, &aligned_pool_size)) {
         LOG(ERROR) << "Arena pool size overflow: requested=" << pool_size;
         return false;
     }
@@ -91,7 +95,12 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment,
 
 // Try huge pages for better TLB performance
 #ifdef MAP_HUGETLB
-    flags |= MAP_HUGETLB;
+    if (hugepage_size > 0) {
+        // MC_STORE_USE_HUGEPAGE set: honor the configured page size.
+        flags |= static_cast<int>(hugepage_flags);
+    } else {
+        flags |= MAP_HUGETLB;
+    }
 #endif
 
     void* pool_base =
@@ -111,7 +120,7 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment,
         }
 
         // Retry without huge pages
-        flags &= ~MAP_HUGETLB;
+        flags &= ~(MAP_HUGETLB | (0x3f << 26));  // strip MAP_HUGE_* size bits
         LOG(WARNING) << "Arena hugepage mmap failed for pool_size="
                      << aligned_pool_size << " bytes"
                      << ", errno=" << mmap_errno << " (" << strerror(mmap_errno)

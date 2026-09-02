@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <fstream>
 #include <sstream>
 
@@ -111,6 +112,9 @@ Workers::Workers(RdmaTransport* transport)
         }
     }
 
+    params.strict_local_numa =
+        conf->get("transports/rdma/strict_local_numa", false);
+
     // ============================================================
     // Bandwidth Estimation (EWMA)
     // ============================================================
@@ -187,6 +191,7 @@ Workers::Workers(RdmaTransport* transport)
                                           params.max_bandwidth_gbps);
 
     device_selector_->setSchedulingParams(params);
+    device_selector_->auditStrictLocalNuma();
 
     // Seed each device from its context. context_set_ is indexed by NicID,
     // the same id the selector uses. Three cases:
@@ -861,14 +866,35 @@ void Workers::workerThread(int thread_id) {
 
 int Workers::handleContextEvents(int dev_id,
                                  std::shared_ptr<RdmaContext>& context) {
-    ibv_async_event event;
-    if (ibv_get_async_event(context->nativeContext(), &event) < 0) return -1;
-    LOG(WARNING) << "Received context async event "
-                 << ibv_event_type_str(event.event_type) << " for context "
-                 << context->name();
-    applyContextEvent(dev_id, *context, event);
-    ibv_ack_async_event(&event);
-    return 0;
+    // The async fd is non-blocking and edge-triggered
+    // (joinNonblockingPollList), and ibv_get_async_event() dequeues one record
+    // per call, so every queued event has to be consumed here: epoll only
+    // reports readiness again once a *new* event arrives. Bursts are routine
+    // (IBV_EVENT_COMM_EST fires once per connection), and a PORT_ACTIVE
+    // stranded behind one keeps the context paused until some unrelated event
+    // happens to release it -- which may be never.
+    while (true) {
+        ibv_async_event event;
+        errno = 0;
+        if (ibv_get_async_event(context->nativeContext(), &event) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;  // drained
+            if (errno == EINTR) continue;
+            PLOG(ERROR) << "ibv_get_async_event for context "
+                        << context->name();
+            return -1;
+        }
+        if (event.event_type == IBV_EVENT_COMM_EST) {
+            VLOG(1) << "Received context async event "
+                    << ibv_event_type_str(event.event_type) << " for context "
+                    << context->name();
+        } else {
+            LOG(WARNING) << "Received context async event "
+                         << ibv_event_type_str(event.event_type)
+                         << " for context " << context->name();
+        }
+        applyContextEvent(dev_id, *context, event);
+        ibv_ack_async_event(&event);
+    }
 }
 
 void Workers::applyContextEvent(int dev_id, RdmaContext& context,
@@ -909,12 +935,7 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
                 device_selector_->setDeviceAvailable(dev_id, false);
                 LOG(WARNING) << "Action: " << context.name() << " down";
             } else {
-                context.resume();
-                // The link may have renegotiated while down: re-seed before
-                // the device becomes selectable so no worker scores it on
-                // the old rate.
-                refreshLinkSpeed(dev_id, context);
-                device_selector_->setDeviceAvailable(dev_id, true);
+                activateContext(dev_id, context);
                 LOG(WARNING) << "Action: " << context.name() << " up";
             }
             break;
@@ -933,6 +954,14 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
     }
 }
 
+void Workers::activateContext(int dev_id, RdmaContext& context) {
+    context.resume();
+    // The link may have renegotiated while down: re-seed before the device
+    // becomes selectable so no worker scores it on the old rate.
+    refreshLinkSpeed(dev_id, context);
+    if (device_selector_) device_selector_->setDeviceAvailable(dev_id, true);
+}
+
 void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {
     if (!device_selector_) return;
     const double before = context.linkSpeedGbps();
@@ -944,7 +973,10 @@ void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {
     // configured default and warns, the same as at startup.
     if (after == before) return;
     LOG(WARNING) << context.name() << " link speed " << before << " -> "
-                 << after << " Gbps, re-seeding its bandwidth estimate";
+                 << after << " Gbps ("
+                 << (context.effectiveSpeedKnown() ? "effective speed"
+                                                   : "encoded rate")
+                 << "), re-seeding its bandwidth estimate";
     device_selector_->setDeviceBandwidth(dev_id, after);
 }
 
@@ -953,6 +985,27 @@ void Workers::reclaimEndpoints() {
         // Inert contexts never built an endpoint store.
         auto store = context->endpointStore();
         if (store) store->reclaim();
+    }
+}
+
+void Workers::resumePausedContexts() {
+    for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
+         ++dev_id) {
+        auto& context = transport_->context_set_[dev_id];
+        // Only a paused context is waiting for a recovery event; this also
+        // filters out inert slots, which never leave DEVICE_UNINIT.
+        if (!context || context->status() != RdmaContext::DEVICE_PAUSED)
+            continue;
+        ibv_port_state state;
+        if (context->queryPortState(&state) != 0) continue;  // already logged
+        // Only a fully active port carries traffic. Intermediate states
+        // (INIT/ARMED/ACTIVE_DEFER) mean the link is still settling, so leave
+        // the context paused and re-check on the next tick.
+        if (state != IBV_PORT_ACTIVE) continue;
+        LOG(WARNING) << "Action: " << context->name()
+                     << " up (port reports ACTIVE without an "
+                        "IBV_EVENT_PORT_ACTIVE event)";
+        activateContext(static_cast<int>(dev_id), *context);
     }
 }
 
@@ -971,6 +1024,8 @@ void Workers::monitorThread() {
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
             reclaimEndpoints();
+            // Safety net for a recovery event that never reached us.
+            resumePausedContexts();
             last_reclaim_time = current_time;
         }
 
@@ -1086,7 +1141,18 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             const auto& list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
-            slice->target_dev_id = list[SimpleRandom::Get().next(list.size())];
+            size_t start = SimpleRandom::Get().next(list.size());
+            slice->target_dev_id = list[start];
+            // Prefer a same-NUMA peer NIC; do not fail if none exist.
+            if (strictLocalNuma()) {
+                for (size_t i = 0; i < list.size(); ++i) {
+                    int tdev = list[(start + i) % list.size()];
+                    if (!target.topo->isCrossNuma(*target.topo_entry, tdev)) {
+                        slice->target_dev_id = tdev;
+                        break;
+                    }
+                }
+            }
             break;
         }
     }
@@ -1135,6 +1201,11 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     }
 
     return Status::OK();
+}
+
+bool Workers::strictLocalNuma() const {
+    return device_selector_ &&
+           device_selector_->getSchedulingParams().strict_local_numa;
 }
 
 int Workers::getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx) {
@@ -1218,6 +1289,9 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         int sdev = getDeviceByFlatIndex(source, src_idx);
         int tdev = getDeviceByFlatIndex(target, dst_idx);
         if (sdev < 0 || sdev >= 64 || (device_mask & (1ULL << sdev)) == 0)
+            continue;
+        if (strictLocalNuma() &&
+            source.topo->isCrossNuma(*source.topo_entry, sdev))
             continue;
         bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
                                       : rail_mon->available(sdev, tdev);

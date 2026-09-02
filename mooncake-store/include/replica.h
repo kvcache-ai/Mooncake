@@ -454,7 +454,14 @@ class Replica {
         if (!buffer || !is_memory_replica()) {
             return false;
         }
-        std::get<MemoryReplicaData>(data_).buffer = std::move(buffer);
+        auto& memory = std::get<MemoryReplicaData>(data_);
+        if (!memory.buffer ||
+            !buffer->copyTransferProtocolFrom(*memory.buffer)) {
+            return false;
+        }
+        // Allocator import rebuilds address ownership; the replica keeps the
+        // transfer protocol advertised before remount.
+        memory.buffer = std::move(buffer);
         return true;
     }
 
