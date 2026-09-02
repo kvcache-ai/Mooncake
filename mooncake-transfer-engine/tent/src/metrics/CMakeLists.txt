@@ -13,9 +13,15 @@ file(GLOB TENT_METRICS_SOURCES "*.cpp")
 # tree (tent/CMakeLists.txt sets CMAKE_POSITION_INDEPENDENT_CODE ON), so the
 # tent_common OBJECT dependency links cleanly into the shared object.
 add_library(tent_metrics SHARED ${TENT_METRICS_SOURCES})
-set_target_properties(
-  tent_metrics
-  PROPERTIES INSTALL_RPATH "$ORIGIN" BUILD_WITH_INSTALL_RPATH TRUE)
+# Installed libtent_metrics.so sits next to libasio.so / libtent_common.so in
+# lib/, so $ORIGIN resolves its sibling dependencies at runtime regardless of
+# install prefix. Do NOT set BUILD_WITH_INSTALL_RPATH here: that would replace
+# CMake's build-tree RPATH (which records full paths to the build-tree siblings
+# like libasio.so) with $ORIGIN alone, and ctest would fail to load
+# libtent_metrics.so before `cmake --install` (libasio.so lives in a different
+# build subdir). CMake falls back to INSTALL_RPATH automatically at install
+# time, mirroring asio_shared in mooncake-common/src/CMakeLists.txt.
+set_target_properties(tent_metrics PROPERTIES INSTALL_RPATH "$ORIGIN")
 # Link yalantinglibs::yalantinglibs for metrics and HTTP server (ylt headers +
 # transitive deps). ODR safety: yalantinglibs bundles ASIO headers but does NOT
 # compile ASIO inline because ASIO_SEPARATE_COMPILATION is set globally. All
@@ -42,6 +48,4 @@ endif()
 # mooncake-integration/CMakeLists.txt.
 install(
   TARGETS tent_metrics
-  LIBRARY DESTINATION lib
-  ARCHIVE DESTINATION lib
-  RUNTIME DESTINATION bin)
+  LIBRARY DESTINATION lib)
