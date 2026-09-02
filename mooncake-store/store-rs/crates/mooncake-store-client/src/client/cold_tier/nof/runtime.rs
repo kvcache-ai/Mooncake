@@ -37,6 +37,7 @@ const OBJECT_LOCATOR_PREFIX: &str = "nof-object:v1:";
 pub struct NofTargetConfig {
     target_id: String,
     backend: NofBackend,
+    data_plane: NofDataPlane,
 }
 
 impl NofTargetConfig {
@@ -47,7 +48,12 @@ impl NofTargetConfig {
                 "NoF target ID must not be empty".to_string(),
             ));
         }
-        Ok(Self { target_id, backend })
+        let data_plane = runtime_data_plane(&backend)?;
+        Ok(Self {
+            target_id,
+            backend,
+            data_plane,
+        })
     }
 }
 
@@ -59,13 +65,8 @@ pub(in crate::client) fn target_set_fingerprint(
     }
     let mut targets = configs
         .iter()
-        .map(|config| {
-            Ok((
-                config.target_id.as_str(),
-                runtime_data_plane(&config.backend)?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|config| (config.target_id.as_str(), config.data_plane))
+        .collect::<Vec<_>>();
     targets.sort_unstable_by(|left, right| left.0.cmp(right.0));
     let mut encoded_fields = Vec::<Vec<u8>>::with_capacity(targets.len() * 2);
     for (target_id, data_plane) in targets {
@@ -109,7 +110,7 @@ impl NofTargetManager {
         let mut data_plane = None;
         let mut targets = BTreeMap::new();
         for config in configs {
-            let next_data_plane = runtime_data_plane(&config.backend)?;
+            let next_data_plane = config.data_plane;
             if data_plane.is_some_and(|current| current != next_data_plane) {
                 return Err(StoreError::InvalidState(
                     "one StoreClient cannot mix NoF logical-object and physical-KV targets"
@@ -118,10 +119,12 @@ impl NofTargetManager {
             }
             data_plane = Some(next_data_plane);
             let backend: Arc<dyn PersistentStorageBackend> = match next_data_plane {
-                NofDataPlane::Object => Arc::new(NofObjectAdapter::new(config.backend)),
+                NofDataPlane::Object => Arc::new(NofObjectAdapter {
+                    target: config.backend,
+                }),
                 NofDataPlane::Physical => {
                     let backend =
-                        NofPhysicalStorageBackend::new(config.target_id.clone(), config.backend)?;
+                        NofPhysicalStorageBackend::new(config.target_id.clone(), config.backend);
                     if backend.requires_recovery() {
                         let routes =
                             metadata.list_object_routes_by_nof_backing(&NofBackingRouteFilter {
@@ -182,8 +185,14 @@ impl NofTargetManager {
         self.state.health_snapshot(target_id).is_ok()
     }
 
-    pub(in crate::client) fn target_ids(&self) -> Vec<String> {
-        self.state.targets.keys().cloned().collect()
+    pub(in crate::client) fn mooncake_manages_storage(&self, target_id: &str) -> Option<bool> {
+        self.state.targets.get(target_id).map(|target| {
+            target.backend.storage_management() == PersistentStorageManagement::MooncakeManaged
+        })
+    }
+
+    pub(in crate::client) fn target_ids(&self) -> impl Iterator<Item = &str> {
+        self.state.targets.keys().map(String::as_str)
     }
 
     pub(in crate::client) fn owner_for(&self, target_id: &str) -> Option<ClientRuntimeId> {
@@ -324,10 +333,6 @@ struct NofObjectAdapter {
 }
 
 impl NofObjectAdapter {
-    fn new(target: NofBackend) -> Self {
-        Self { target }
-    }
-
     fn identity(locator: &str) -> Result<(NamespaceScope, String)> {
         let encoded = locator.strip_prefix(OBJECT_LOCATOR_PREFIX).ok_or_else(|| {
             StoreError::InvalidState(format!("unknown NoF object locator: {locator}"))
@@ -557,14 +562,17 @@ mod tests {
     };
 
     use super::*;
-    use crate::client::cold_tier::owner::NOF_TARGET_SET_LABEL;
+    use crate::client::cold_tier::owner::{NOF_TARGET_SET_LABEL, NOF_UNHEALTHY_TARGETS_LABEL};
     use crate::client::LiveClientCache;
 
     struct FakeBackend;
 
     impl PersistentStorageBackend for FakeBackend {
         fn health(&self) -> Result<PersistentStorageBackendHealth> {
-            unreachable!("disabled owner worker does not probe the test backend")
+            Ok(PersistentStorageBackendHealth {
+                capacity_bytes: None,
+                available_bytes: None,
+            })
         }
 
         fn put_object(
@@ -601,6 +609,9 @@ mod tests {
         endpoints
             .labels
             .insert(NOF_TARGET_SET_LABEL.to_string(), fingerprint.to_string());
+        endpoints
+            .labels
+            .insert(NOF_UNHEALTHY_TARGETS_LABEL.to_string(), "[]".to_string());
         ClientLease {
             runtime: ClientRuntimeId {
                 stable_id: ClientStableId::new(stable_id),
@@ -652,7 +663,7 @@ mod tests {
             "same-target-set".to_string(),
             targets,
         ));
-        state.refresh_ownership();
+        state.heartbeat_owned_targets();
         let manager = NofTargetManager {
             data_plane: Some(NofDataPlane::Physical),
             replica_count: 8,

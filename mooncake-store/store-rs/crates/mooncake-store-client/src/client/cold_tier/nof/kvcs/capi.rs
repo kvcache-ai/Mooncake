@@ -4,9 +4,9 @@ use std::sync::Mutex;
 use libc::size_t;
 use mooncake_store_core::error::QuotaKind;
 
-const DEFAULT_MAX_VALUE_SIZE: u64 = 4 * 1024 * 1024;
+const SDK_DEFAULT_MAX_VALUE_SIZE: u64 = 4 * 1024 * 1024;
+const SDK_MAX_VALUE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_KEY_SIZE: usize = 256;
-const DEFAULT_MAX_BATCH_ITEMS: usize = 256;
 const KVCS_NAMESPACE_MAX_BYTES: usize = 127;
 
 #[repr(C)]
@@ -94,6 +94,7 @@ struct KvcsCreateNamespaceOptions {
     gc_threshold: f64,
 }
 
+#[derive(Default)]
 #[repr(C)]
 struct KvcsClientConfig {
     efc_socket: *const c_char,
@@ -113,6 +114,7 @@ struct KvcsClientConfig {
     enable_metrics: c_int,
 }
 
+#[derive(Default)]
 #[repr(C)]
 struct KvcsLlConfig {
     efc_socket: *const c_char,
@@ -277,23 +279,6 @@ impl ClientSlot {
     }
 }
 
-#[derive(Clone, Copy)]
-struct CommonLimits {
-    max_value_size: u64,
-    max_key_size: usize,
-    max_batch_items: usize,
-}
-
-impl Default for CommonLimits {
-    fn default() -> Self {
-        Self {
-            max_value_size: DEFAULT_MAX_VALUE_SIZE,
-            max_key_size: DEFAULT_MAX_KEY_SIZE,
-            max_batch_items: DEFAULT_MAX_BATCH_ITEMS,
-        }
-    }
-}
-
 fn env_u32(name: &str, default: u32) -> Result<u32> {
     match std::env::var(name) {
         Ok(value) => value.parse().map_err(|_| {
@@ -330,6 +315,44 @@ fn checked_batch_len(len: usize) -> Result<c_int> {
     c_int::try_from(len).map_err(|_| {
         StoreError::InvalidState(format!("KVCS batch size {len} exceeds the C ABI limit"))
     })
+}
+
+fn input_segments<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> (Vec<*const c_void>, Vec<size_t>) {
+    values
+        .into_iter()
+        .map(|value| {
+            let pointer = if value.is_empty() {
+                std::ptr::null()
+            } else {
+                value.as_ptr().cast()
+            };
+            (pointer, value.len())
+        })
+        .unzip()
+}
+
+fn output_buffers(
+    buffers: &mut [Vec<u8>],
+) -> (
+    Vec<*mut c_void>,
+    Vec<size_t>,
+    Vec<c_int>,
+    Vec<size_t>,
+) {
+    let pointers = buffers
+        .iter_mut()
+        .map(|buffer| {
+            if buffer.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                buffer.as_mut_ptr().cast()
+            }
+        })
+        .collect();
+    let capacities = buffers.iter().map(Vec::len).collect();
+    (pointers, capacities, vec![0; buffers.len()], vec![0; buffers.len()])
 }
 
 fn map_call_status(status: c_int, operation: &str) -> StoreError {
@@ -375,6 +398,27 @@ fn map_item_status(status: c_int, operation: &str, write: bool) -> StoreError {
     }
 }
 
+type PreparedBatch<U, V> = (Vec<Option<Result<V>>>, Vec<(usize, U)>);
+
+fn prepare_positional<'a, T, U, V>(
+    requests: &'a [T],
+    validate: impl Fn(&'a T) -> Result<U>,
+) -> PreparedBatch<U, V> {
+    let mut results = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+    let valid = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| match validate(request) {
+            Ok(value) => Some((index, value)),
+            Err(error) => {
+                results[index] = Some(Err(error));
+                None
+            }
+        })
+        .collect();
+    (results, valid)
+}
+
 fn fill_missing<T>(results: &mut [Option<Result<T>>], error: &StoreError) {
     for result in results {
         if result.is_none() {
@@ -406,13 +450,13 @@ fn encode_physical_key(key: &OpaquePhysicalKey, key_limit: usize) -> Result<CStr
     validate_string(&encoded, key_limit, "encoded low-level key")
 }
 
-fn char_array_string(value: &[c_char]) -> String {
-    let bytes = value
+fn char_array_str(value: &[c_char]) -> std::result::Result<&str, std::str::Utf8Error> {
+    let len = value
         .iter()
-        .take_while(|byte| **byte != 0)
-        .map(|byte| *byte as u8)
-        .collect::<Vec<_>>();
-    String::from_utf8_lossy(&bytes).into_owned()
+        .position(|byte| *byte == 0)
+        .unwrap_or(value.len());
+    let bytes = unsafe { std::slice::from_raw_parts(value.as_ptr().cast::<u8>(), len) };
+    std::str::from_utf8(bytes)
 }
 
 fn finish_positional_results<T>(results: Vec<Option<Result<T>>>) -> Vec<Result<T>> {

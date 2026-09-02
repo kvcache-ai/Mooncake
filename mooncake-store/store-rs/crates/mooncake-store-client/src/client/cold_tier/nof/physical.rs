@@ -166,14 +166,6 @@ pub trait NofStorageManagement: Send + Sync {
     fn storage_health(&self) -> Result<NofStorageHealth>;
 }
 
-/// Optional Mooncake-facing device lifecycle capability.
-///
-/// Provider-managed discovery, offline/recovery and rebuild are represented by the absence of this
-/// capability; Mooncake must not emulate them through an undocumented side channel.
-pub trait NofDeviceManagement: Send + Sync {
-    fn device_health(&self) -> Result<NofStorageHealth>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

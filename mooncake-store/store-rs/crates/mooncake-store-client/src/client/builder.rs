@@ -611,7 +611,7 @@ impl StoreClientBuilder {
             nof_target_set_fingerprint.unwrap_or_default(),
         )?;
         for target_id in nof_targets.target_ids() {
-            if cold_tier_resolver.has_backend(&target_id) {
+            if cold_tier_resolver.has_backend(target_id) {
                 return Err(StoreError::InvalidState(format!(
                     "persistent target ID {target_id} is configured as both local Cold Tier and NoF"
                 )));
@@ -683,14 +683,17 @@ impl StoreClientBuilder {
             .labels
             .entry(control_address_label().to_string())
             .or_insert_with(|| control_plane.address().to_string());
-        let lease = ClientLease {
+        let mut lease = ClientLease {
             runtime: runtime.clone(),
             state: published_initial_state,
             compatibility: provisional_lease.compatibility.clone(),
             endpoints,
             expires_at_ms,
         };
-        runtime_metadata.upsert_client_lease(&lease)?;
+        cold_tier::nof::upsert_client_lease_preserving_nof_labels(
+            runtime_metadata.as_ref(),
+            &mut lease,
+        )?;
         prewarm_live_client_cache(runtime_metadata.as_ref(), &live_client_cache, &lease)?;
         if !startup_activation_pending {
             run_deferred_cold_tier_reconciles(

@@ -214,7 +214,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inline_layout_keeps_one_complete_record() {
+    fn inline_layout_is_the_no_split_object_fast_path() {
         let root = OpaquePhysicalKey::new(b"root".to_vec());
         let layout = build_write_layout(&root, b"value", 64).unwrap();
         assert_eq!(layout.records.len(), 1);

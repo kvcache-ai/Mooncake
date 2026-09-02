@@ -1,8 +1,8 @@
 //! Capability-based NoF integration within the existing Cold Tier subsystem.
 //!
 //! NoF backings are not divided into high-level and low-level framework branches. A backing
-//! advertises only the logical-object, physical-KV, query, metadata, health, storage-maintenance
-//! and device-management traits that Mooncake may call.
+//! advertises only the logical-object, physical-KV, query, health and storage-maintenance traits
+//! that Mooncake may call. External metadata is a typed view of the existing MetadataBackend.
 
 use mooncake_store_core::{Result, StoreError};
 
@@ -28,11 +28,10 @@ pub use object::{
     NofObjectShardWrite, NofObjectState, NofObjectWrite,
 };
 pub use physical::{
-    NofDeviceManagement, NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest,
-    NofPhysicalListPage, NofPhysicalLocator, NofPhysicalObject, NofPhysicalQuery,
-    NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalRecoveredRecord,
-    NofPhysicalRecovery, NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth,
-    NofStorageManagement,
+    NofHealth, NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalListPage,
+    NofPhysicalLocator, NofPhysicalObject, NofPhysicalQuery, NofPhysicalQueryRequest,
+    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalRecoveredRecord, NofPhysicalRecovery,
+    NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth, NofStorageManagement,
 };
 pub use runtime::NofTargetConfig;
 pub(in crate::client) use runtime::{

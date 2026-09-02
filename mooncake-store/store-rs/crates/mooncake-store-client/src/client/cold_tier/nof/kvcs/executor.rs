@@ -1,3 +1,6 @@
+use std::ffi::{c_int, CString};
+use std::ptr;
+
 use mooncake_store_core::{Result, StoreError};
 
 use super::super::backend::encode_namespace;
@@ -9,7 +12,9 @@ use super::super::{
     NofPhysicalQueryRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite,
     NofPhysicalWriteRequest, NofStorageHealth, OpaquePhysicalKey,
 };
+use super::*;
 const KVCS_MODE_ENV: &str = "MOONCAKE_KVCS_MODE";
+const KVCS_MAX_VALUE_SIZE_ENV: &str = "MOONCAKE_KVCS_MAX_VALUE_SIZE";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KvcsMode {
@@ -29,40 +34,29 @@ impl KvcsMode {
     }
 
     fn from_env() -> Result<Self> {
-        match std::env::var(KVCS_MODE_ENV) {
-            Ok(value) => Self::parse(value.trim()),
-            Err(std::env::VarError::NotPresent) => Ok(Self::LowLevel),
-            Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidState(format!(
-                "{KVCS_MODE_ENV} is not valid UTF-8"
-            ))),
-        }
+        optional_env(KVCS_MODE_ENV)?
+            .map(|value| Self::parse(value.trim()))
+            .unwrap_or(Ok(Self::LowLevel))
     }
 }
 
-enum KvcsExecutor {
-    Standard(standard::StandardExecutor),
-    LowLevel(low_level::LowLevelExecutor),
-}
-
-impl KvcsExecutor {
-    fn standard(&self) -> Option<&standard::StandardExecutor> {
-        let Self::Standard(executor) = self else {
-            return None;
-        };
-        Some(executor)
-    }
-
-    fn low_level(&self) -> Option<&low_level::LowLevelExecutor> {
-        let Self::LowLevel(executor) = self else {
-            return None;
-        };
-        Some(executor)
-    }
+enum KvcsConfig {
+    Standard {
+        efc_socket: Option<CString>,
+        redis_endpoints: Vec<CString>,
+        redis_password: Option<CString>,
+    },
+    LowLevel {
+        efc_socket: CString,
+        mountpoint_index: u32,
+    },
 }
 
 /// KVCS C API executor whose exposed NoF traits are selected by `MOONCAKE_KVCS_MODE`.
 pub struct KvcsCapiExecutor {
-    executor: KvcsExecutor,
+    config: KvcsConfig,
+    client: ClientSlot,
+    max_value_size: u64,
 }
 
 impl KvcsCapiExecutor {
@@ -71,93 +65,197 @@ impl KvcsCapiExecutor {
     }
 
     pub fn with_mode(mode: KvcsMode) -> Result<Self> {
-        let executor = match mode {
-            KvcsMode::Standard => KvcsExecutor::Standard(standard::StandardExecutor::new()?),
-            KvcsMode::LowLevel => KvcsExecutor::LowLevel(low_level::LowLevelExecutor::new()?),
+        let max_value_size = optional_env(KVCS_MAX_VALUE_SIZE_ENV)?
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    StoreError::InvalidState(format!(
+                        "{KVCS_MAX_VALUE_SIZE_ENV} must be an integer byte count"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(SDK_DEFAULT_MAX_VALUE_SIZE);
+        if !(1..=SDK_MAX_VALUE_SIZE).contains(&max_value_size) {
+            return Err(StoreError::InvalidState(format!(
+                "{KVCS_MAX_VALUE_SIZE_ENV} must be in 1..={SDK_MAX_VALUE_SIZE}, got {max_value_size}"
+            )));
+        }
+        let config = match mode {
+            KvcsMode::Standard => {
+                let efc_socket = optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")?;
+                let redis_password = optional_cstring("MOONCAKE_KVCS_REDIS_PASSWORD")?;
+                let redis_endpoints = optional_env("MOONCAKE_KVCS_REDIS_ENDPOINTS")?
+                    .into_iter()
+                    .flat_map(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|endpoint| !endpoint.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .map(|endpoint| {
+                        CString::new(endpoint).map_err(|_| {
+                            StoreError::InvalidState("KVCS Redis endpoint contains NUL".to_string())
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                checked_batch_len(redis_endpoints.len())?;
+                KvcsConfig::Standard {
+                    efc_socket,
+                    redis_endpoints,
+                    redis_password,
+                }
+            }
+            KvcsMode::LowLevel => {
+                let efc_socket = optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")?
+                    .unwrap_or(CString::new("/var/run/kvcs/efc-grpc.sock").expect("static path"));
+                KvcsConfig::LowLevel {
+                    efc_socket,
+                    mountpoint_index: env_u32("MOONCAKE_KVCS_MOUNTPOINT_INDEX", 0)?,
+                }
+            }
         };
-        Ok(Self { executor })
+        Ok(Self {
+            config,
+            client: ClientSlot::default(),
+            max_value_size,
+        })
+    }
+
+    fn mode(&self) -> KvcsMode {
+        match &self.config {
+            KvcsConfig::Standard { .. } => KvcsMode::Standard,
+            KvcsConfig::LowLevel { .. } => KvcsMode::LowLevel,
+        }
+    }
+
+    fn ensure_client(&self) -> Result<*mut KvcsClient> {
+        match &self.config {
+            KvcsConfig::Standard {
+                efc_socket,
+                redis_endpoints,
+                redis_password,
+            } => self.client.get_or_create(
+                "Standard",
+                || {
+                    let endpoint_ptrs = redis_endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.as_ptr())
+                        .collect::<Vec<_>>();
+                    let raw = KvcsClientConfig {
+                        efc_socket: efc_socket
+                            .as_ref()
+                            .map_or(ptr::null(), |value| value.as_ptr()),
+                        redis_endpoints: endpoint_ptrs
+                            .first()
+                            .map_or(ptr::null(), |_| endpoint_ptrs.as_ptr()),
+                        redis_count: endpoint_ptrs.len() as c_int,
+                        redis_password: redis_password
+                            .as_ref()
+                            .map_or(ptr::null(), |value| value.as_ptr()),
+                        max_value_size: self.max_value_size as i64,
+                        ..KvcsClientConfig::default()
+                    };
+                    unsafe { kvcs_client_create(&raw) }
+                },
+                kvcs_client_destroy,
+            ),
+            KvcsConfig::LowLevel { efc_socket, .. } => self.client.get_or_create(
+                "low-level",
+                || {
+                    let raw = KvcsLlConfig {
+                        // Public SDK 0.4.0 rejects NULL/empty for the low-level client.
+                        efc_socket: efc_socket.as_ptr(),
+                        max_value_size: self.max_value_size as i64,
+                        ..KvcsLlConfig::default()
+                    };
+                    unsafe { kvcs_ll_create(&raw) }
+                },
+                kvcs_ll_client_destroy,
+            ),
+        }
+    }
+
+    fn prepare_batch(&self, len: usize) -> Result<(*mut KvcsClient, c_int)> {
+        Ok((self.ensure_client()?, checked_batch_len(len)?))
+    }
+
+    fn low_level_options(&self) -> KvcsLlBatchOptions {
+        let KvcsConfig::LowLevel {
+            mountpoint_index, ..
+        } = &self.config
+        else {
+            unreachable!("low-level operation is not exposed in Standard mode")
+        };
+        KvcsLlBatchOptions {
+            mountpoint_index: *mountpoint_index,
+        }
     }
 }
 
 impl NofBacking for KvcsCapiExecutor {
     fn object_limits(&self) -> Option<NofObjectLimits> {
-        self.executor
-            .standard()
-            .map(standard::StandardExecutor::capabilities)
+        (self.mode() == KvcsMode::Standard).then_some(NofObjectLimits {
+            max_value_size: self.max_value_size,
+            max_key_size: DEFAULT_MAX_KEY_SIZE as u64,
+        })
     }
 
     fn object_write(&self) -> Option<&dyn NofObjectWrite> {
-        self.executor
-            .standard()
-            .map(|executor| executor as &dyn NofObjectWrite)
+        (self.mode() == KvcsMode::Standard).then_some(self as &dyn NofObjectWrite)
     }
 
     fn object_read(&self) -> Option<&dyn NofObjectRead> {
-        self.executor
-            .standard()
-            .map(|executor| executor as &dyn NofObjectRead)
+        (self.mode() == KvcsMode::Standard).then_some(self as &dyn NofObjectRead)
     }
 
     fn object_query(&self) -> Option<&dyn NofObjectQuery> {
-        self.executor
-            .standard()
-            .map(|executor| executor as &dyn NofObjectQuery)
+        (self.mode() == KvcsMode::Standard).then_some(self as &dyn NofObjectQuery)
     }
 
     fn object_delete(&self) -> Option<&dyn NofObjectDelete> {
-        self.executor
-            .standard()
-            .map(|executor| executor as &dyn NofObjectDelete)
+        (self.mode() == KvcsMode::Standard).then_some(self as &dyn NofObjectDelete)
     }
 
     fn physical_write(&self) -> Option<&dyn NofPhysicalWrite> {
-        self.executor
-            .low_level()
-            .map(|executor| executor as &dyn NofPhysicalWrite)
+        (self.mode() == KvcsMode::LowLevel).then_some(self as &dyn NofPhysicalWrite)
     }
 
     fn physical_read(&self) -> Option<&dyn NofPhysicalRead> {
-        self.executor
-            .low_level()
-            .map(|executor| executor as &dyn NofPhysicalRead)
+        (self.mode() == KvcsMode::LowLevel).then_some(self as &dyn NofPhysicalRead)
     }
 
     fn physical_query(&self) -> Option<&dyn NofPhysicalQuery> {
-        self.executor
-            .low_level()
-            .map(|executor| executor as &dyn NofPhysicalQuery)
+        (self.mode() == KvcsMode::LowLevel).then_some(self as &dyn NofPhysicalQuery)
     }
 
     fn physical_delete(&self) -> Option<&dyn NofPhysicalDelete> {
-        self.executor
-            .low_level()
-            .map(|executor| executor as &dyn NofPhysicalDelete)
+        (self.mode() == KvcsMode::LowLevel).then_some(self as &dyn NofPhysicalDelete)
     }
 
     fn health_capability(&self) -> Option<&dyn NofHealth> {
-        self.executor
-            .low_level()
-            .map(|executor| executor as &dyn NofHealth)
+        (self.mode() == KvcsMode::LowLevel).then_some(self as &dyn NofHealth)
     }
 }
 
 mod standard {
     //! KVCS Standard SDK implementation of the NoF logical-object capabilities.
 
-    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::ffi::{c_int, CString};
     use std::ptr;
 
-    use libc::size_t;
     use mooncake_store_core::{NamespaceScope, Result, StoreError};
 
     use super::super::*;
     use super::{
-        encode_namespace, repeated_error, NofObject, NofObjectDelete, NofObjectLimits,
-        NofObjectMetadata, NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState,
-        NofObjectWrite,
+        encode_namespace, repeated_error, NofObject, NofObjectDelete, NofObjectMetadata,
+        NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
     };
 
     struct RawQuery {
+        namespace: CString,
+        key: CString,
         metadata: NofObjectMetadata,
         shards: Vec<(u32, usize)>,
     }
@@ -246,100 +344,14 @@ mod standard {
         Ok(shards)
     }
 
-    pub(super) struct StandardExecutor {
-        config: KvcsClientConfig,
-        _efc_socket: Option<CString>,
-        _redis_endpoints: Vec<CString>,
-        _redis_endpoint_ptrs: Vec<*const c_char>,
-        _redis_password: Option<CString>,
-        client: ClientSlot,
-        limits: CommonLimits,
-    }
-
-    unsafe impl Send for StandardExecutor {}
-    unsafe impl Sync for StandardExecutor {}
-
-    impl StandardExecutor {
-        pub(super) fn new() -> Result<Self> {
-            let limits = CommonLimits::default();
-            let efc_socket = optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")?;
-            let redis_password = optional_cstring("MOONCAKE_KVCS_REDIS_PASSWORD")?;
-            let redis_endpoints = optional_env("MOONCAKE_KVCS_REDIS_ENDPOINTS")?
-                .into_iter()
-                .flat_map(|value| {
-                    value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|endpoint| !endpoint.is_empty())
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .map(|endpoint| {
-                    CString::new(endpoint).map_err(|_| {
-                        StoreError::InvalidState("KVCS Redis endpoint contains NUL".to_string())
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let redis_endpoint_ptrs = redis_endpoints
-                .iter()
-                .map(|endpoint| endpoint.as_ptr())
-                .collect::<Vec<_>>();
-            let config = KvcsClientConfig {
-                efc_socket: efc_socket
-                    .as_ref()
-                    .map_or(ptr::null(), |value| value.as_ptr()),
-                redis_endpoints: if redis_endpoint_ptrs.is_empty() {
-                    ptr::null()
-                } else {
-                    redis_endpoint_ptrs.as_ptr()
-                },
-                redis_count: checked_batch_len(redis_endpoint_ptrs.len())?,
-                redis_password: redis_password
-                    .as_ref()
-                    .map_or(ptr::null(), |value| value.as_ptr()),
-                redis_pool_size: 0,
-                get_workers: 0,
-                set_workers: 0,
-                simple_workers: 0,
-                max_keys_per_batch: 0,
-                iov_size: 0,
-                max_value_size: 0,
-                max_key_size: 0,
-                perf_report_interval_sec: 0,
-                log_path: ptr::null(),
-                enable_metrics: 0,
-            };
-            Ok(Self {
-                config,
-                _efc_socket: efc_socket,
-                _redis_endpoints: redis_endpoints,
-                _redis_endpoint_ptrs: redis_endpoint_ptrs,
-                _redis_password: redis_password,
-                client: ClientSlot::default(),
-                limits,
-            })
-        }
-
-        fn ensure_client(&self) -> Result<*mut KvcsClient> {
-            self.client.get_or_create(
-                "Standard",
-                || unsafe { kvcs_client_create(&self.config) },
-                kvcs_client_destroy,
-            )
-        }
-
-        fn prepare_batch(&self, len: usize) -> Result<(*mut KvcsClient, c_int)> {
-            let count = checked_batch_len(len)?;
-            Ok((self.ensure_client()?, count))
-        }
-
+    impl KvcsCapiExecutor {
         fn namespace(&self, scope: &NamespaceScope) -> Result<CString> {
             let encoded = encode_namespace(scope)?;
             validate_string(&encoded, KVCS_NAMESPACE_MAX_BYTES, "namespace")
         }
 
         fn key(&self, key: &str) -> Result<CString> {
-            validate_string(key, self.limits.max_key_size, "object key")
+            validate_string(key, DEFAULT_MAX_KEY_SIZE, "object key")
         }
 
         fn query_raw(
@@ -377,8 +389,12 @@ mod standard {
                 )));
             }
             let raw = QueryResultGuard { raw };
-            let status = char_array_string(&raw.raw.status);
-            let parsed = match status.as_str() {
+            let status = char_array_str(&raw.raw.status).map_err(|error| {
+                StoreError::Transport(format!(
+                    "KVCS Standard query returned invalid status: {error}"
+                ))
+            })?;
+            match status {
                 "not_found" => Ok(NofObjectState::Missing),
                 "incomplete" => Ok(NofObjectState::Incomplete),
                 "ok" => {
@@ -403,9 +419,11 @@ mod standard {
                         with_shards,
                         length,
                         total_shards,
-                        self.limits.max_value_size,
+                        self.max_value_size,
                     )?;
                     Ok(NofObjectState::Found(RawQuery {
+                        namespace,
+                        key,
                         metadata: NofObjectMetadata {
                             length,
                             total_shards,
@@ -416,21 +434,11 @@ mod standard {
                 _ => Err(StoreError::Transport(format!(
                     "KVCS Standard query returned status {status:?}"
                 ))),
-            };
-            parsed
-        }
-    }
-
-    impl StandardExecutor {
-        pub(super) fn capabilities(&self) -> NofObjectLimits {
-            NofObjectLimits {
-                max_value_size: self.limits.max_value_size,
-                max_key_size: self.limits.max_key_size as u64,
             }
         }
     }
 
-    impl NofObjectWrite for StandardExecutor {
+    impl NofObjectWrite for KvcsCapiExecutor {
         fn init_namespace(&self, namespace: &NamespaceScope) -> Result<()> {
             let client = self.ensure_client()?;
             let namespace = self.namespace(namespace)?;
@@ -451,7 +459,6 @@ mod standard {
             if requests.is_empty() {
                 return Vec::new();
             }
-            let mut results = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
             let namespace = match self.namespace(requests[0].namespace) {
                 Ok(namespace) => namespace,
                 Err(error) => return repeated_error(requests.len(), error),
@@ -467,39 +474,27 @@ mod standard {
                     ),
                 );
             }
-            let valid = requests
-                .iter()
-                .enumerate()
-                .filter_map(|(index, request)| {
-                    let validation = self.key(request.key).and_then(|key| {
-                        if request.value.len() as u64 > self.limits.max_value_size {
-                            return Err(StoreError::InvalidState(format!(
-                                "KVCS Standard shard size {} exceeds provider limit {}",
-                                request.value.len(),
-                                self.limits.max_value_size
-                            )));
-                        }
-                        if request.total_shards == 0 || request.shard_id >= request.total_shards {
-                            return Err(StoreError::InvalidState(
-                                "KVCS Standard shard ID/count is invalid".to_string(),
-                            ));
-                        }
-                        if request.total_shards > c_int::MAX as u32 {
-                            return Err(StoreError::InvalidState(
-                                "KVCS Standard shard count exceeds the C ABI limit".to_string(),
-                            ));
-                        }
-                        Ok(key)
-                    });
-                    match validation {
-                        Ok(key) => Some((index, key, request)),
-                        Err(error) => {
-                            results[index] = Some(Err(error));
-                            None
-                        }
-                    }
-                })
-                .collect::<Vec<_>>();
+            let (mut results, valid) = prepare_positional(requests, |request| {
+                let key = self.key(request.key)?;
+                if request.value.len() as u64 > self.max_value_size {
+                    return Err(StoreError::InvalidState(format!(
+                        "KVCS Standard shard size {} exceeds provider limit {}",
+                        request.value.len(),
+                        self.max_value_size
+                    )));
+                }
+                if request.total_shards == 0 || request.shard_id >= request.total_shards {
+                    return Err(StoreError::InvalidState(
+                        "KVCS Standard shard ID/count is invalid".to_string(),
+                    ));
+                }
+                if request.total_shards > c_int::MAX as u32 {
+                    return Err(StoreError::InvalidState(
+                        "KVCS Standard shard count exceeds the C ABI limit".to_string(),
+                    ));
+                }
+                Ok((key, request))
+            });
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
@@ -507,24 +502,12 @@ mod standard {
                 Ok(prepared) => prepared,
                 Err(error) => return fail_positional_results(results, error),
             };
-            let value_ptrs = valid
-                .iter()
-                .map(|(_, _, request)| {
-                    if request.value.is_empty() {
-                        ptr::null()
-                    } else {
-                        request.value.as_ptr().cast()
-                    }
-                })
-                .collect::<Vec<*const c_void>>();
-            let value_lens = valid
-                .iter()
-                .map(|(_, _, request)| request.value.len())
-                .collect::<Vec<size_t>>();
+            let (value_ptrs, value_lens) =
+                input_segments(valid.iter().map(|(_, (_, request))| request.value));
             let items = valid
                 .iter()
                 .enumerate()
-                .map(|(offset, (_, key, request))| KvcsPutItem {
+                .map(|(offset, (_, (key, request)))| KvcsPutItem {
                     key: key.as_ptr(),
                     value_segs: &value_ptrs[offset],
                     seg_lens: &value_lens[offset],
@@ -556,7 +539,7 @@ mod standard {
             if status < 0 {
                 return fail_positional_results(results, map_call_status(status, "Standard put"));
             }
-            for ((index, _, _), native) in valid.iter().zip(native_results) {
+            for ((index, _), native) in valid.iter().zip(native_results) {
                 results[*index] = Some(if native.status == 0 {
                     Ok(())
                 } else {
@@ -567,7 +550,7 @@ mod standard {
         }
     }
 
-    impl NofObjectQuery for StandardExecutor {
+    impl NofObjectQuery for KvcsCapiExecutor {
         fn query_object(
             &self,
             namespace: &NamespaceScope,
@@ -579,7 +562,7 @@ mod standard {
         }
     }
 
-    impl NofObjectRead for StandardExecutor {
+    impl NofObjectRead for KvcsCapiExecutor {
         fn get_object(
             &self,
             namespace: &NamespaceScope,
@@ -591,13 +574,11 @@ mod standard {
                 NofObjectState::Incomplete => return Ok(NofObjectState::Incomplete),
             };
             let client = self.ensure_client()?;
-            let namespace = self.namespace(namespace)?;
-            let key = self.key(key)?;
             let items = query
                 .shards
                 .iter()
                 .map(|(shard_id, size)| KvcsGetItem {
-                    key: key.as_ptr(),
+                    key: query.key.as_ptr(),
                     shard_id: *shard_id as i32,
                     location: ptr::null(),
                     expected_value_size: *size,
@@ -610,24 +591,13 @@ mod standard {
                 .iter()
                 .map(|(_, size)| vec![0; *size])
                 .collect::<Vec<_>>();
-            let mut buffer_ptrs = buffers
-                .iter_mut()
-                .map(|buffer| {
-                    if buffer.is_empty() {
-                        ptr::null_mut()
-                    } else {
-                        buffer.as_mut_ptr().cast()
-                    }
-                })
-                .collect::<Vec<*mut c_void>>();
-            let capacities = buffers.iter().map(Vec::len).collect::<Vec<size_t>>();
-            let mut statuses = vec![0; items.len()];
-            let mut lengths = vec![0; items.len()];
+            let (mut buffer_ptrs, capacities, mut statuses, mut lengths) =
+                output_buffers(&mut buffers);
             let count = checked_batch_len(items.len())?;
             let status = unsafe {
                 kvcs_batch_get_into(
                     client,
-                    namespace.as_ptr(),
+                    query.namespace.as_ptr(),
                     items.as_ptr(),
                     count,
                     buffer_ptrs.as_mut_ptr(),
@@ -674,7 +644,7 @@ mod standard {
         }
     }
 
-    impl NofObjectDelete for StandardExecutor {
+    impl NofObjectDelete for KvcsCapiExecutor {
         fn delete_object(
             &self,
             namespace: &NamespaceScope,
@@ -686,13 +656,11 @@ mod standard {
                 NofObjectState::Incomplete => return Ok(NofObjectState::Incomplete),
             };
             let client = self.ensure_client()?;
-            let namespace = self.namespace(namespace)?;
-            let key = self.key(key)?;
             let items = query
                 .shards
                 .iter()
                 .map(|(shard_id, _)| KvcsDeleteItem {
-                    key: key.as_ptr(),
+                    key: query.key.as_ptr(),
                     shard_id: *shard_id as i32,
                     location: ptr::null(),
                 })
@@ -707,7 +675,7 @@ mod standard {
             let status = unsafe {
                 kvcs_batch_delete_items(
                     client,
-                    namespace.as_ptr(),
+                    query.namespace.as_ptr(),
                     items.as_ptr(),
                     count,
                     results.as_mut_ptr(),
@@ -777,7 +745,7 @@ mod low_level {
     //! KVCS Low-Level SDK executor for the NoF physical KV contract.
 
     use std::collections::HashSet;
-    use std::ffi::{c_int, c_void, CString};
+    use std::ffi::c_int;
     use std::ptr;
 
     use libc::size_t;
@@ -793,68 +761,7 @@ mod low_level {
         NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth, OpaquePhysicalKey,
     };
 
-    pub(super) struct LowLevelExecutor {
-        config: KvcsLlConfig,
-        _efc_socket: CString,
-        mountpoint_index: u32,
-        client: ClientSlot,
-        limits: CommonLimits,
-    }
-
-    unsafe impl Send for LowLevelExecutor {}
-    unsafe impl Sync for LowLevelExecutor {}
-
-    impl LowLevelExecutor {
-        pub(super) fn new() -> Result<Self> {
-            let limits = CommonLimits::default();
-            let efc_socket = match optional_cstring("MOONCAKE_KVCS_EFC_SOCKET")? {
-                Some(socket) => socket,
-                None => CString::new("/var/run/kvcs/efc-grpc.sock").map_err(|_| {
-                    StoreError::InvalidState("KVCS default EFC socket contains NUL".to_string())
-                })?,
-            };
-            let config = KvcsLlConfig {
-                // Public SDK 0.4.0 rejects NULL/empty for the low-level client.
-                efc_socket: efc_socket.as_ptr(),
-                max_keys_per_batch: 0,
-                iov_size: 0,
-                max_value_size: 0,
-                max_key_size: 0,
-                log_path: ptr::null(),
-                get_workers: 0,
-                set_workers: 0,
-                simple_workers: 0,
-                perf_report_interval_sec: 0,
-                enable_metrics: 0,
-            };
-            Ok(Self {
-                config,
-                _efc_socket: efc_socket,
-                mountpoint_index: env_u32("MOONCAKE_KVCS_MOUNTPOINT_INDEX", 0)?,
-                client: ClientSlot::default(),
-                limits,
-            })
-        }
-
-        fn ensure_client(&self) -> Result<*mut KvcsClient> {
-            self.client.get_or_create(
-                "low-level",
-                || unsafe { kvcs_ll_create(&self.config) },
-                kvcs_ll_client_destroy,
-            )
-        }
-
-        fn prepare_batch(&self, len: usize) -> Result<(*mut KvcsClient, c_int)> {
-            let count = checked_batch_len(len)?;
-            Ok((self.ensure_client()?, count))
-        }
-
-        fn options(&self) -> Option<KvcsLlBatchOptions> {
-            (self.mountpoint_index != 0).then_some(KvcsLlBatchOptions {
-                mountpoint_index: self.mountpoint_index,
-            })
-        }
-
+    impl KvcsCapiExecutor {
         fn call_get_into(
             &self,
             client: *mut KvcsClient,
@@ -862,21 +769,8 @@ mod low_level {
             buffers: &mut [Vec<u8>],
         ) -> Result<(Vec<c_int>, Vec<size_t>)> {
             let count = checked_batch_len(items.len())?;
-            let mut pointers = buffers
-                .iter_mut()
-                .map(|buffer| {
-                    if buffer.is_empty() {
-                        ptr::null_mut()
-                    } else {
-                        buffer.as_mut_ptr().cast()
-                    }
-                })
-                .collect::<Vec<*mut c_void>>();
-            let capacities = buffers.iter().map(Vec::len).collect::<Vec<size_t>>();
-            let mut statuses = vec![0; items.len()];
-            let mut lengths = vec![0; items.len()];
-            let options = self.options();
-            let options_ptr = options.as_ref().map_or(ptr::null(), |options| options);
+            let (mut pointers, capacities, mut statuses, mut lengths) = output_buffers(buffers);
+            let options = self.low_level_options();
             let status = unsafe {
                 kvcs_ll_batch_get_into(
                     client,
@@ -887,7 +781,7 @@ mod low_level {
                     statuses.as_mut_ptr(),
                     lengths.as_mut_ptr(),
                     0,
-                    options_ptr,
+                    &options,
                 )
             };
             if status < 0 {
@@ -896,39 +790,11 @@ mod low_level {
                 Ok((statuses, lengths))
             }
         }
-    }
 
-    impl LowLevelExecutor {
         fn put_records(&self, requests: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
-            if requests.is_empty() {
-                return Vec::new();
-            }
-            let mut results = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
-            let valid = requests
-                .iter()
-                .enumerate()
-                .filter_map(|(index, (key, value))| {
-                    let validation =
-                        encode_physical_key(key, self.limits.max_key_size).and_then(|key| {
-                            if value.len() as u64 > self.limits.max_value_size {
-                                Err(StoreError::InvalidState(format!(
-                                    "KVCS low-level value size {} exceeds provider limit {}",
-                                    value.len(),
-                                    self.limits.max_value_size
-                                )))
-                            } else {
-                                Ok(key)
-                            }
-                        });
-                    match validation {
-                        Ok(key) => Some((index, key, *value)),
-                        Err(error) => {
-                            results[index] = Some(Err(error));
-                            None
-                        }
-                    }
-                })
-                .collect::<Vec<_>>();
+            let (mut results, valid) = prepare_positional(requests, |(key, value)| {
+                Ok((encode_physical_key(key, DEFAULT_MAX_KEY_SIZE)?, *value))
+            });
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
@@ -936,24 +802,11 @@ mod low_level {
                 Ok(prepared) => prepared,
                 Err(error) => return fail_positional_results(results, error),
             };
-            let pointers = valid
-                .iter()
-                .map(|(_, _, value)| {
-                    if value.is_empty() {
-                        ptr::null()
-                    } else {
-                        value.as_ptr().cast()
-                    }
-                })
-                .collect::<Vec<*const c_void>>();
-            let lengths = valid
-                .iter()
-                .map(|(_, _, value)| value.len())
-                .collect::<Vec<size_t>>();
+            let (pointers, lengths) = input_segments(valid.iter().map(|(_, (_, value))| *value));
             let items = valid
                 .iter()
                 .enumerate()
-                .map(|(offset, (_, key, _))| KvcsLlPutItem {
+                .map(|(offset, (_, (key, _)))| KvcsLlPutItem {
                     key: key.as_ptr(),
                     value_segs: &pointers[offset],
                     seg_lens: &lengths[offset],
@@ -966,8 +819,7 @@ mod low_level {
                     status: 0,
                 })
                 .collect::<Vec<_>>();
-            let options = self.options();
-            let options_ptr = options.as_ref().map_or(ptr::null(), |options| options);
+            let options = self.low_level_options();
             let status = unsafe {
                 kvcs_ll_batch_put(
                     client,
@@ -976,13 +828,13 @@ mod low_level {
                     native_results.as_mut_ptr(),
                     count,
                     0,
-                    options_ptr,
+                    &options,
                 )
             };
             if status < 0 {
                 return fail_positional_results(results, map_call_status(status, "low-level put"));
             }
-            for ((index, _, _), native) in valid.iter().zip(native_results) {
+            for ((index, _), native) in valid.iter().zip(native_results) {
                 results[*index] = Some(if native.status == 0 {
                     Ok(())
                 } else {
@@ -991,43 +843,14 @@ mod low_level {
             }
             finish_positional_results(results)
         }
-    }
 
-    impl LowLevelExecutor {
         fn get_records(&self, requests: &[KvcsReadRecord]) -> Vec<Result<Option<Vec<u8>>>> {
-            if requests.is_empty() {
-                return Vec::new();
-            }
-            let mut results = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
-            let valid = requests
-                .iter()
-                .enumerate()
-                .filter_map(|(index, request)| {
-                    let validation = encode_physical_key(&request.key, self.limits.max_key_size)
-                        .and_then(|key| {
-                            let hint =
-                                u64::try_from(request.expected_value_size).map_err(|_| {
-                                    StoreError::InvalidState(
-                                        "KVCS low-level read size does not fit u64".to_string(),
-                                    )
-                                })?;
-                            if hint > self.limits.max_value_size {
-                                return Err(StoreError::InvalidState(format!(
-                                    "KVCS low-level read size {hint} exceeds provider limit {}",
-                                    self.limits.max_value_size
-                                )));
-                            }
-                            Ok(key)
-                        });
-                    match validation {
-                        Ok(key) => Some((index, key, request.expected_value_size)),
-                        Err(error) => {
-                            results[index] = Some(Err(error));
-                            None
-                        }
-                    }
-                })
-                .collect::<Vec<_>>();
+            let (mut results, valid) = prepare_positional(requests, |request| {
+                Ok((
+                    encode_physical_key(&request.key, DEFAULT_MAX_KEY_SIZE)?,
+                    request.expected_value_size,
+                ))
+            });
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
@@ -1037,11 +860,11 @@ mod low_level {
             };
             let items = valid
                 .iter()
-                .map(|(_, key, _)| KvcsLlGetItem { key: key.as_ptr() })
+                .map(|(_, (key, _))| KvcsLlGetItem { key: key.as_ptr() })
                 .collect::<Vec<_>>();
             let mut buffers = valid
                 .iter()
-                .map(|(_, _, hint)| vec![0; *hint])
+                .map(|(_, (_, hint))| vec![0; *hint])
                 .collect::<Vec<_>>();
             let (mut statuses, mut lengths) = match self.call_get_into(client, &items, &mut buffers)
             {
@@ -1053,11 +876,11 @@ mod low_level {
                     && lengths[index] > buffers[index].len()
                 {
                     let actual_len = match u64::try_from(lengths[index]) {
-                        Ok(actual_len) if actual_len <= self.limits.max_value_size => actual_len,
+                        Ok(actual_len) if actual_len <= self.max_value_size => actual_len,
                         Ok(actual_len) => {
                             results[valid[index].0] = Some(Err(StoreError::InvalidState(format!(
                                 "KVCS low-level value size {actual_len} exceeds provider limit {}",
-                                self.limits.max_value_size
+                                self.max_value_size
                             ))));
                             continue;
                         }
@@ -1085,8 +908,7 @@ mod low_level {
                     }
                 }
             }
-            for (offset, ((request_index, _, _), status)) in valid.iter().zip(statuses).enumerate()
-            {
+            for (offset, ((request_index, _), status)) in valid.iter().zip(statuses).enumerate() {
                 if results[*request_index].is_some() {
                     continue;
                 }
@@ -1107,28 +929,10 @@ mod low_level {
             }
             finish_positional_results(results)
         }
-    }
 
-    impl LowLevelExecutor {
         fn delete_records(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<()>> {
-            if keys.is_empty() {
-                return Vec::new();
-            }
-            let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
-            let valid = keys
-                .iter()
-                .enumerate()
-                .filter_map(|(index, key)| {
-                    let validation = encode_physical_key(key, self.limits.max_key_size);
-                    match validation {
-                        Ok(key) => Some((index, key)),
-                        Err(error) => {
-                            results[index] = Some(Err(error));
-                            None
-                        }
-                    }
-                })
-                .collect::<Vec<_>>();
+            let (mut results, valid) =
+                prepare_positional(keys, |key| encode_physical_key(key, DEFAULT_MAX_KEY_SIZE));
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
@@ -1141,8 +945,7 @@ mod low_level {
                 .map(|(_, key)| key.as_ptr())
                 .collect::<Vec<_>>();
             let mut statuses = vec![0; valid.len()];
-            let options = self.options();
-            let options_ptr = options.as_ref().map_or(ptr::null(), |options| options);
+            let options = self.low_level_options();
             let status = unsafe {
                 kvcs_ll_batch_delete(
                     client,
@@ -1151,7 +954,7 @@ mod low_level {
                     statuses.as_mut_ptr(),
                     count,
                     0,
-                    options_ptr,
+                    &options,
                 )
             };
             if status < 0 {
@@ -1169,27 +972,10 @@ mod low_level {
             }
             finish_positional_results(results)
         }
-    }
 
-    impl LowLevelExecutor {
         fn query_records(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
-            if keys.is_empty() {
-                return Vec::new();
-            }
-            let mut results = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
-            let valid = keys
-                .iter()
-                .enumerate()
-                .filter_map(|(index, key)| {
-                    match encode_physical_key(key, self.limits.max_key_size) {
-                        Ok(key) => Some((index, key)),
-                        Err(error) => {
-                            results[index] = Some(Err(error));
-                            None
-                        }
-                    }
-                })
-                .collect::<Vec<_>>();
+            let (mut results, valid) =
+                prepare_positional(keys, |key| encode_physical_key(key, DEFAULT_MAX_KEY_SIZE));
             if valid.is_empty() {
                 return finish_positional_results(results);
             }
@@ -1213,8 +999,7 @@ mod low_level {
                     shard_count: 0,
                 })
                 .collect::<Vec<_>>();
-            let options = self.options();
-            let options_ptr = options.as_ref().map_or(ptr::null(), |options| options);
+            let options = self.low_level_options();
             let written = unsafe {
                 kvcs_ll_batch_query(
                     client,
@@ -1222,7 +1007,7 @@ mod low_level {
                     count,
                     native_results.as_mut_ptr(),
                     count,
-                    options_ptr,
+                    &options,
                 )
             };
             if written < 0 {
@@ -1245,43 +1030,16 @@ mod low_level {
             finish_positional_results(results)
         }
 
-        fn put_record_batches(&self, records: &[(OpaquePhysicalKey, &[u8])]) -> Vec<Result<()>> {
-            records
-                .chunks(self.limits.max_batch_items)
-                .flat_map(|batch| self.put_records(batch))
-                .collect()
-        }
-
-        fn get_record_batches(&self, records: &[KvcsReadRecord]) -> Vec<Result<Option<Vec<u8>>>> {
-            records
-                .chunks(self.limits.max_batch_items)
-                .flat_map(|batch| self.get_records(batch))
-                .collect()
-        }
-
-        fn delete_record_batches(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<()>> {
-            keys.chunks(self.limits.max_batch_items)
-                .flat_map(|batch| self.delete_records(batch))
-                .collect()
-        }
-
-        fn query_record_batches(&self, keys: &[OpaquePhysicalKey]) -> Vec<Result<bool>> {
-            keys.chunks(self.limits.max_batch_items)
-                .flat_map(|batch| self.query_records(batch))
-                .collect()
-        }
-
         fn read_object(&self, request: &NofPhysicalReadRequest) -> Result<Option<Vec<u8>>> {
             let records =
                 read_records(&request.key, &request.locator, request.expected_value_size)?;
-            let results = self.get_record_batches(&records);
-            assemble_read(request.expected_value_size, results)
+            assemble_read(request.expected_value_size, self.get_records(&records))
         }
 
         fn delete_object(&self, request: &NofPhysicalDeleteRequest) -> Result<()> {
             let keys = object_keys(&request.key, &request.locator, request.expected_value_size)?;
             let mut deleted = false;
-            for result in self.delete_record_batches(&keys) {
+            for result in self.delete_records(&keys) {
                 match result {
                     Ok(()) => deleted = true,
                     Err(StoreError::NotFound(_)) => {}
@@ -1299,7 +1057,7 @@ mod low_level {
 
         fn query_object(&self, request: &NofPhysicalQueryRequest) -> Result<bool> {
             let keys = object_keys(&request.key, &request.locator, request.expected_value_size)?;
-            for result in self.query_record_batches(&keys) {
+            for result in self.query_records(&keys) {
                 if !result? {
                     return Ok(false);
                 }
@@ -1308,7 +1066,7 @@ mod low_level {
         }
     }
 
-    impl NofPhysicalWrite for LowLevelExecutor {
+    impl NofPhysicalWrite for KvcsCapiExecutor {
         fn put_batch(
             &self,
             requests: &[NofPhysicalWriteRequest<'_>],
@@ -1316,7 +1074,7 @@ mod low_level {
             let mut results = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
             let mut layouts = Vec::with_capacity(requests.len());
             for (index, request) in requests.iter().enumerate() {
-                match build_write_layout(&request.key, request.value, self.limits.max_value_size) {
+                match build_write_layout(&request.key, request.value, self.max_value_size) {
                     Ok(layout) => layouts.push((index, layout)),
                     Err(error) => results[index] = Some(Err(error)),
                 }
@@ -1364,7 +1122,7 @@ mod low_level {
                     (key.clone(), *value)
                 })
                 .collect::<Vec<_>>();
-            let record_results = self.put_record_batches(&records);
+            let record_results = self.put_records(&records);
             let mut layout_ok = vec![true; requests.len()];
             for ((_, request_index, _), status) in positions.into_iter().zip(record_results) {
                 if let Err(error) = status {
@@ -1383,7 +1141,7 @@ mod low_level {
         }
     }
 
-    impl NofPhysicalRead for LowLevelExecutor {
+    impl NofPhysicalRead for KvcsCapiExecutor {
         fn get_batch(&self, requests: &[NofPhysicalReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
             requests
                 .iter()
@@ -1392,7 +1150,7 @@ mod low_level {
         }
     }
 
-    impl NofPhysicalDelete for LowLevelExecutor {
+    impl NofPhysicalDelete for KvcsCapiExecutor {
         fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
             requests
                 .iter()
@@ -1401,7 +1159,7 @@ mod low_level {
         }
     }
 
-    impl NofPhysicalQuery for LowLevelExecutor {
+    impl NofPhysicalQuery for KvcsCapiExecutor {
         fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<bool>> {
             requests
                 .iter()
@@ -1410,7 +1168,7 @@ mod low_level {
         }
     }
 
-    impl NofHealth for LowLevelExecutor {
+    impl NofHealth for KvcsCapiExecutor {
         fn health(&self) -> Result<NofStorageHealth> {
             let probe = OpaquePhysicalKey::new(b"mooncake:nof:health:v1".to_vec());
             self.query_records(&[probe]).pop().ok_or_else(|| {
@@ -1421,25 +1179,21 @@ mod low_level {
     }
 
     fn kvcs_low_level_query_status(status: &[std::ffi::c_char; 32]) -> Result<bool> {
-        let len = status
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(status.len());
-        let bytes = unsafe { std::slice::from_raw_parts(status.as_ptr().cast::<u8>(), len) };
-        match std::str::from_utf8(bytes) {
-            Ok("ok") => Ok(true),
-            Ok("not_found") => Ok(false),
-            Ok("incomplete") => Err(StoreError::Backpressure(
+        match char_array_str(status).map_err(|error| {
+            StoreError::Transport(format!(
+                "KVCS low-level query returned invalid status: {error}"
+            ))
+        })? {
+            "ok" => Ok(true),
+            "not_found" => Ok(false),
+            "incomplete" => Err(StoreError::Backpressure(
                 "KVCS low-level query returned incomplete".to_string(),
             )),
-            Ok("unavailable") => Err(StoreError::Transport(
+            "unavailable" => Err(StoreError::Transport(
                 "KVCS low-level mountpoint is unavailable".to_string(),
             )),
-            Ok(other) => Err(StoreError::Transport(format!(
+            other => Err(StoreError::Transport(format!(
                 "KVCS low-level query returned status {other}"
-            ))),
-            Err(error) => Err(StoreError::Transport(format!(
-                "KVCS low-level query returned invalid status: {error}"
             ))),
         }
     }
@@ -1517,22 +1271,13 @@ mod low_level {
                 NofStorageHealth::default()
             );
             assert!(executor.object_read().is_none());
-            assert!(executor.metadata().is_none());
             assert!(executor.storage_management().is_none());
-            assert!(executor.device_management().is_none());
         }
 
         #[test]
         #[ignore = "requires a live KVCS EFC and configured mountpoint, or the official SDK mock"]
         fn live_low_level_round_trip_smoke() {
             round_trip(b"kvcs-capi-smoke");
-        }
-
-        #[test]
-        #[ignore = "requires a live KVCS EFC and configured mountpoint, or the official SDK mock"]
-        fn live_low_level_chunked_round_trip_smoke() {
-            let value = vec![7; usize::try_from(DEFAULT_MAX_VALUE_SIZE).unwrap() + 17];
-            round_trip(&value);
         }
     }
 }
@@ -1563,8 +1308,6 @@ mod mode_tests {
         assert!(low_level.physical_write().is_some());
         assert!(low_level.physical_query().is_some());
         assert!(low_level.health_capability().is_some());
-        assert!(low_level.metadata().is_none());
         assert!(low_level.storage_management().is_none());
-        assert!(low_level.device_management().is_none());
     }
 }

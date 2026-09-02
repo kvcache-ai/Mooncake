@@ -40,22 +40,8 @@ pub(in crate::client) struct NofPhysicalStorageBackend {
 }
 
 impl NofPhysicalStorageBackend {
-    pub(in crate::client) fn new(target_id: impl Into<String>, target: NofBackend) -> Result<Self> {
-        let target_id = target_id.into();
-        if target_id.is_empty() {
-            return Err(StoreError::InvalidState(
-                "NoF physical target ID must not be empty".to_string(),
-            ));
-        }
-        if target.backing.physical_write().is_none()
-            || target.backing.physical_read().is_none()
-            || target.backing.physical_delete().is_none()
-        {
-            return Err(StoreError::InvalidState(
-                "NoF physical backend requires read, write and delete capabilities".to_string(),
-            ));
-        }
-        Ok(Self { target_id, target })
+    pub(in crate::client) fn new(target_id: String, target: NofBackend) -> Self {
+        Self { target_id, target }
     }
 
     fn writer(&self) -> &dyn NofPhysicalWrite {
@@ -123,7 +109,6 @@ impl NofPhysicalStorageBackend {
         &self,
         route: Option<&ObjectRoute>,
         cold_backing: &ColdBackingRoute,
-        payload: &[u8],
     ) -> Result<OpaquePhysicalKey> {
         let route_version = route.map(|route| route.version.0).unwrap_or_default();
         let route_version = route_version.to_le_bytes();
@@ -132,14 +117,13 @@ impl NofPhysicalStorageBackend {
         let route_key = route
             .map(|route| route.key.0.as_bytes())
             .unwrap_or_else(|| cold_backing.object_locator.as_bytes());
-        let fields: [&[u8]; 7] = [
+        let fields: [&[u8]; 6] = [
             ROOT_KEY_DOMAIN,
             self.target_id.as_bytes(),
             route_key,
             &route_version,
             &length,
             &checksum,
-            payload,
         ];
         let key = self.target.key_codec.encode(PhysicalKeyInput {
             domain: &self.target.key_domain,
@@ -201,12 +185,22 @@ impl NofPhysicalStorageBackend {
         }
     }
 
+    fn decode_request(
+        cold_backing: &ColdBackingRoute,
+    ) -> Result<(OpaquePhysicalKey, NofPhysicalLocator, usize)> {
+        let (key, locator) = Self::decode_locator(&cold_backing.object_locator)?;
+        let expected_value_size = usize::try_from(cold_backing.length).map_err(|_| {
+            StoreError::InvalidState("NoF physical value length does not fit usize".to_string())
+        })?;
+        Ok((key, locator, expected_value_size))
+    }
+
     fn put_objects(&self, writes: &[ColdObjectWrite<'_>]) -> Vec<Result<ColdBackingRoute>> {
         let mut results = (0..writes.len()).map(|_| None).collect::<Vec<_>>();
         let mut prepared = Vec::with_capacity(writes.len());
         for (index, write) in writes.iter().enumerate() {
             let key = validate_payload(write.cold_backing, write.payload)
-                .and_then(|_| self.root_key(write.route, write.cold_backing, write.payload));
+                .and_then(|_| self.root_key(write.route, write.cold_backing));
             match key {
                 Ok(key) => prepared.push(PreparedWrite {
                     index,
@@ -316,10 +310,7 @@ impl NofPhysicalStorageBackend {
     }
 
     fn get_one(&self, cold_backing: &ColdBackingRoute) -> Result<Option<Vec<u8>>> {
-        let (key, locator) = Self::decode_locator(&cold_backing.object_locator)?;
-        let expected_value_size = usize::try_from(cold_backing.length).map_err(|_| {
-            StoreError::InvalidState("NoF physical value length does not fit usize".to_string())
-        })?;
+        let (key, locator, expected_value_size) = Self::decode_request(cold_backing)?;
         let value = one_batch_result(
             "physical get",
             self.reader().get_batch(&[NofPhysicalReadRequest {
@@ -335,10 +326,7 @@ impl NofPhysicalStorageBackend {
     }
 
     fn delete_one(&self, cold_backing: &ColdBackingRoute) -> Result<bool> {
-        let (key, locator) = Self::decode_locator(&cold_backing.object_locator)?;
-        let expected_value_size = usize::try_from(cold_backing.length).map_err(|_| {
-            StoreError::InvalidState("NoF physical value length does not fit usize".to_string())
-        })?;
+        let (key, locator, expected_value_size) = Self::decode_request(cold_backing)?;
         match one_batch_result(
             "physical delete",
             self.deleter().delete_batch(&[NofPhysicalDeleteRequest {
@@ -425,10 +413,7 @@ impl PersistentStorageBackend for NofPhysicalStorageBackend {
 
 fn one_batch_result<T>(operation: &str, results: Vec<Result<T>>) -> Result<T> {
     ensure_batch_len(operation, 1, results.len())?;
-    results
-        .into_iter()
-        .next()
-        .ok_or_else(|| StoreError::Transport(format!("NoF {operation} returned no result")))?
+    results.into_iter().next().expect("length checked above")
 }
 
 #[cfg(test)]
@@ -541,12 +526,14 @@ mod tests {
         }
     }
 
+    fn memory_backend(executor: Arc<MemoryExecutor>) -> NofPhysicalStorageBackend {
+        NofPhysicalStorageBackend::new("nof-test".to_string(), NofBackend::new(executor).unwrap())
+    }
+
     #[test]
     fn executor_receives_the_complete_value_and_owns_its_layout() {
         let executor = Arc::new(MemoryExecutor::default());
-        let backend =
-            NofPhysicalStorageBackend::new("nof-test", NofBackend::new(executor.clone()).unwrap())
-                .unwrap();
+        let backend = memory_backend(executor.clone());
         let payload = vec![7; 150];
         let materialized = backend
             .put_object(&route("logical@v1", &payload), &payload)
@@ -562,8 +549,7 @@ mod tests {
     #[test]
     fn backing_health_does_not_claim_mooncake_storage_management() {
         let executor = Arc::new(MemoryExecutor::default());
-        let backend =
-            NofPhysicalStorageBackend::new("nof-test", NofBackend::new(executor).unwrap()).unwrap();
+        let backend = memory_backend(executor);
 
         assert_eq!(
             backend.storage_management(),
@@ -577,8 +563,7 @@ mod tests {
     #[test]
     fn malformed_locator_fails_closed() {
         let executor = Arc::new(MemoryExecutor::default());
-        let backend =
-            NofPhysicalStorageBackend::new("nof-test", NofBackend::new(executor).unwrap()).unwrap();
+        let backend = memory_backend(executor);
         let mut backing = route("logical@v1", b"value");
         backing.object_locator = "file:v1:abcd".to_string();
         assert!(matches!(
@@ -601,7 +586,7 @@ mod tests {
         let target = NofBackend::new(executor.clone())
             .unwrap()
             .key_codec(Arc::new(CollidingCodec));
-        let backend = NofPhysicalStorageBackend::new("nof-test", target).unwrap();
+        let backend = NofPhysicalStorageBackend::new("nof-test".to_string(), target);
         let payload = vec![9; 150];
         let first = route("first", &payload);
         let second = route("second", &payload);
