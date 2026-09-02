@@ -7590,9 +7590,15 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica,
     std::vector<UUID>* mirror_clients) {
     const auto& segment_names = replica.get_segment_names();
+    // No source segment names means there is no usable source segment to
+    // offload from. Returning a silent {} here caused the caller to record an
+    // OffloadingTask + inc_refcnt for work that was never enqueued, leaking the
+    // refcount until TTL expiry (issue #2997). Return an explicit
+    // UNABLE_OFFLOADING so callers treat this as a no-op rather than a success.
     if (segment_names.empty()) {
-        return {};
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
+    bool any_enqueued = false;
     for (const auto& segment_name_it : segment_names) {
         if (!segment_name_it.has_value()) {
             continue;
@@ -7621,6 +7627,13 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (mirror_clients != nullptr) {
             mirror_clients->push_back(*client_id);
         }
+        any_enqueued = true;
+    }
+    // Every segment name was nullopt (or EnqueueOffload found no usable
+    // segment), so nothing was enqueued. Same invariant as the empty case:
+    // never report success when no task was actually submitted.
+    if (!any_enqueued) {
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
     return {};
 }

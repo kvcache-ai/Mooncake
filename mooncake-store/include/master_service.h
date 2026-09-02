@@ -101,6 +101,10 @@ class MasterServiceProcessingKeyDoubleEraseTest;
 // with a competing mount + register serialized between them, pinning the
 // interleaving instead of hoping a thread scheduler produces it.
 class LocalDiskUnmountInterleavingTest;
+// Friended so the #2997 regression test can call the private
+// PushOffloadingQueue directly with degenerate replica states that the
+// public PutStart/PutEnd path never produces.
+class MasterServiceSSDTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -159,6 +163,8 @@ class MasterService {
     // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
     friend class test::MasterServiceProcessingKeyDoubleEraseTest;
     friend class test::LocalDiskUnmountInterleavingTest;
+    // #2997 regression: exercises PushOffloadingQueue's no-op paths directly.
+    friend class test::MasterServiceSSDTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
