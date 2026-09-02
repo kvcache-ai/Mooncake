@@ -36,11 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-<<<<<<< HEAD
-	"os"
 	"strconv"
-=======
->>>>>>> 2b0ef06b ([Common] Narrow etcd RBAC/TLS wrapper scope and add tests)
 	"strings"
 	"sync"
 	"time"
@@ -48,14 +44,10 @@ import (
 
 	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
-<<<<<<< HEAD
 	"go.etcd.io/etcd/client/v3/concurrency"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-=======
->>>>>>> 2b0ef06b ([Common] Narrow etcd RBAC/TLS wrapper scope and add tests)
 )
 
+// prefixWatchInfo stores cancel function and callback context for a prefix watch
 type prefixWatchInfo struct {
 	cancel          context.CancelFunc
 	callbackContext unsafe.Pointer
@@ -970,11 +962,7 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 }
 
 //export EtcdStoreTxnCompareAndPutWrapper
-<<<<<<< HEAD
 func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareRevisions *int64, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
-=======
-func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
->>>>>>> 2b0ef06b ([Common] Narrow etcd RBAC/TLS wrapper scope and add tests)
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -991,10 +979,7 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 		compareKindList := (*[1 << 28]C.int)(unsafe.Pointer(compareKinds))[:cmpN:cmpN]
 		compareValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(compareValues))[:cmpN:cmpN]
 		compareValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(compareValueSizes))[:cmpN:cmpN]
-<<<<<<< HEAD
 		compareRevisionList := (*[1 << 28]int64)(unsafe.Pointer(compareRevisions))[:cmpN:cmpN]
-=======
->>>>>>> 2b0ef06b ([Common] Narrow etcd RBAC/TLS wrapper scope and add tests)
 		for i := 0; i < cmpN; i++ {
 			k := C.GoStringN(compareKeyPtrs[i], compareKeySizeList[i])
 			switch int(compareKindList[i]) {
@@ -1003,11 +988,8 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 				cmps = append(cmps, clientv3.Compare(clientv3.Value(k), "=", v))
 			case 1:
 				cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", 0))
-<<<<<<< HEAD
 			case 2:
 				cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", compareRevisionList[i]))
-=======
->>>>>>> 2b0ef06b ([Common] Narrow etcd RBAC/TLS wrapper scope and add tests)
 			default:
 				*errMsg = C.CString("unsupported compare kind")
 				return -1

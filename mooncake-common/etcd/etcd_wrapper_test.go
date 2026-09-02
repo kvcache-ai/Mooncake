@@ -1,9 +1,7 @@
 package main
 
 import (
-<<<<<<< HEAD
 	"context"
-=======
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -17,12 +15,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
->>>>>>> 2b0ef06b ([Common] Narrow etcd RBAC/TLS wrapper scope and add tests)
 	"testing"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
-<<<<<<< HEAD
 	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
@@ -55,8 +51,8 @@ func TestNewMaintenanceSessionCancelsStartup(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("maintenance session startup did not cancel")
-=======
-)
+	}
+}
 
 func resetSecurityStateForTest(t *testing.T) {
 	t.Helper()
@@ -337,7 +333,6 @@ func TestApplySecurityConfigLoadsRbacAndTLS(t *testing.T) {
 	}
 	if cfg.TLS.RootCAs == nil {
 		t.Fatalf("expected RootCAs to be populated")
->>>>>>> 2b0ef06b ([Common] Narrow etcd RBAC/TLS wrapper scope and add tests)
 	}
 }
 
