@@ -5,8 +5,7 @@
 
 #include <string>
 
-namespace conductor {
-namespace common {
+namespace mooncake::conductor::common {
 
 enum class LogLevel { kDebug, kInfo, kWarn, kError };
 
@@ -23,5 +22,4 @@ std::string LoadEnv(const std::string& env_name,
 // error and fall through to the default (with a warning).
 int LoadIntEnv(const std::string& env_name, int default_env);
 
-}  // namespace common
-}  // namespace conductor
+}  // namespace mooncake::conductor::common

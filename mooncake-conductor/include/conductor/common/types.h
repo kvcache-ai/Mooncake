@@ -5,8 +5,7 @@
 #include <string>
 #include <string_view>
 
-namespace conductor {
-namespace common {
+namespace mooncake::conductor::common {
 
 enum class PublisherKind { kVllm, kMooncake, kSglang };
 
@@ -70,5 +69,4 @@ struct ServiceConfig {
     bool operator==(const ServiceConfig&) const = default;
 };
 
-}  // namespace common
-}  // namespace conductor
+}  // namespace mooncake::conductor::common

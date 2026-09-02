@@ -7,8 +7,7 @@
 #include <cstdlib>
 #include <string>
 
-namespace conductor {
-namespace common {
+namespace mooncake::conductor::common {
 
 namespace {
 
@@ -87,5 +86,4 @@ int LoadIntEnv(const std::string& env_name, int default_env) {
     return default_env;
 }
 
-}  // namespace common
-}  // namespace conductor
+}  // namespace mooncake::conductor::common

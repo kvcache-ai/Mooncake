@@ -8,10 +8,10 @@
 
 namespace {
 
-using conductor::common::LoadEnv;
-using conductor::common::LoadIntEnv;
-using conductor::common::LogLevel;
-using conductor::common::ParseLogLevel;
+using mooncake::conductor::common::LoadEnv;
+using mooncake::conductor::common::LoadIntEnv;
+using mooncake::conductor::common::LogLevel;
+using mooncake::conductor::common::ParseLogLevel;
 
 class EnvGuard {
    public:
