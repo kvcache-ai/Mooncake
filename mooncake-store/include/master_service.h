@@ -66,6 +66,7 @@ class MasterSnapshotRepository;
 namespace ha {
 class SnapshotCatalogStore;
 class MasterSnapshotCodec;
+class MasterSnapshotCodecTest;
 struct MasterSnapshotPayloads;
 }  // namespace ha
 
@@ -130,8 +131,9 @@ class MasterService {
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ClientOffboardingWorker;
-    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
-                                           // members
+    // Allow the snapshot codec and its tests to inspect private state.
+    friend class ha::MasterSnapshotCodec;
+    friend class ha::MasterSnapshotCodecTest;
 
    public:
     using NoFProbeFn =
@@ -1538,6 +1540,8 @@ class MasterService {
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
+    tl::expected<void, ErrorCode> ReconcileDfsMetadataAfterSnapshot();
+    std::chrono::seconds DfsRecoveryOrphanQuarantineDuration() const;
     void RunDfsEviction();
     void RunShardDfsEviction();
     void RunBucketDfsEviction();
