@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -22,6 +23,7 @@
 
 #include "p2p/client/p2p_client_metric.h"
 #include "p2p/client/p2p_client_service.h"
+#include "p2p_client_process_test_helper.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"
 
@@ -75,12 +77,14 @@ class P2PClientIntegrationTest : public ::testing::Test {
         google::InitGoogleLogging("P2PClientIntegrationTest");
         FLAGS_logtostderr = 1;
 
-        // 1. Start in-process P2P master
-        ASSERT_TRUE(master_.Start()) << "Failed to start P2P master";
-        master_address_ = master_.master_address();
+        // Fork ordering: the P2P master child process must start before the
+        // first CreateP2PClient()/Init(). Init() spawns background threads;
+        // fork() after that can deadlock/hang the test parent.
+        ASSERT_TRUE(master_process_.Start()) << "Failed to start P2P master";
+        master_address_ = master_process_.master_address();
         LOG(INFO) << "P2P master started at " << master_address_;
 
-        // 2. Create two clients
+        // Create two clients
         client_ = CreateP2PClient("localhost:18801");
         ASSERT_NE(client_, nullptr);
         client2_ = CreateP2PClient("localhost:18802");
@@ -91,19 +95,19 @@ class P2PClientIntegrationTest : public ::testing::Test {
     static void TearDownTestSuite() {
         client2_.reset();
         client_.reset();
-        master_.Stop();
+        master_process_.Stop();
         google::ShutdownGoogleLogging();
     }
 
     // Shared across all tests in this suite
-    static InProcP2PMaster master_;
+    static ScopedP2PMasterProcess master_process_;
     static std::string master_address_;
     static std::shared_ptr<P2PClientService> client_;
     static std::shared_ptr<P2PClientService> client2_;
 };
 
 // Static member definitions
-InProcP2PMaster P2PClientIntegrationTest::master_;
+ScopedP2PMasterProcess P2PClientIntegrationTest::master_process_;
 std::string P2PClientIntegrationTest::master_address_;
 std::shared_ptr<P2PClientService> P2PClientIntegrationTest::client_ = nullptr;
 std::shared_ptr<P2PClientService> P2PClientIntegrationTest::client2_ = nullptr;
@@ -537,7 +541,7 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
     const std::string data1 = "version_1";
     const std::string data2 = "version_2_longer";
 
-    GetReplicaListRequestConfig config;
+    ReadRouteConfig config;
     config.max_candidates = GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
 
     // First put
@@ -547,11 +551,11 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
         auto r = client_->Put(key, s, WriteRouteRequestConfig{});
         ASSERT_TRUE(r.has_value());
 
-        auto replicas = master_.GetWrapped().GetReplicaList(key, config);
-        ASSERT_TRUE(replicas.has_value());
-        ASSERT_EQ(replicas.value().replicas.size(), 1);
+        auto query = client_->Query(key, config);
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query.value()->replicas.size(), 1u);
         auto p2p_proxy_descriptor =
-            replicas.value().replicas[0].get_p2p_proxy_descriptor();
+            query.value()->replicas[0].get_p2p_proxy_descriptor();
         ASSERT_EQ(p2p_proxy_descriptor.client_id, client_->GetClientID());
         ASSERT_EQ(p2p_proxy_descriptor.object_size, data1.size());
     }
@@ -566,11 +570,11 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
 
         // due to the write operation is canceled,
         // the object size of read route must not be changed
-        auto replicas = master_.GetWrapped().GetReplicaList(key, config);
-        ASSERT_TRUE(replicas.has_value());
-        ASSERT_EQ(replicas.value().replicas.size(), 1);
+        auto query = client_->Query(key, config);
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query.value()->replicas.size(), 1u);
         auto p2p_proxy_descriptor =
-            replicas.value().replicas[0].get_p2p_proxy_descriptor();
+            query.value()->replicas[0].get_p2p_proxy_descriptor();
         ASSERT_EQ(p2p_proxy_descriptor.client_id, client_->GetClientID());
         ASSERT_EQ(p2p_proxy_descriptor.object_size, data1.size());
     }
@@ -1663,3 +1667,24 @@ TEST_F(P2PClientIntegrationTest, KeyRetentionMetricsLifecycle) {
 
 }  // namespace testing
 }  // namespace mooncake
+
+int main(int argc, char** argv) {
+    mooncake::testing::SetP2PClientIntegrationTestBinaryPath(argv[0]);
+    if (auto child_exit =
+            mooncake::testing::MaybeRunP2PClientIntegrationTestChildProcess(
+                argc, argv);
+        child_exit.has_value()) {
+        return *child_exit;
+    }
+
+    ::testing::InitGoogleTest(&argc, argv);
+
+#if defined(__SANITIZE_ADDRESS__) || defined(ADDRESS_SANITIZER)
+    // Cross-process tests use fork()/execv() which deadlocks under ASAN.
+    // Skip all tests when built with -fsanitize=address.
+    std::puts("[  SKIPPED ] ASAN detected, fork incompatible");
+    return 0;
+#endif
+
+    return RUN_ALL_TESTS();
+}
