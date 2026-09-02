@@ -176,6 +176,11 @@ fn main() {
             build_dir.join("mooncake-common/src"),
             build_dir.join("mooncake-common/etcd"),
             build_dir.join("mooncake-transfer-engine/tent/src"),
+            // libtent_metrics.so is a SHARED lib built under tent/src/metrics.
+            // collect_tent_archives skips it (only .a), and has_library's
+            // /usr/local/lib fallback only gates the -l emit, not the -L search
+            // path — so the linker still needs this directory explicitly.
+            build_dir.join("mooncake-transfer-engine/tent/src/metrics"),
             build_dir.join("src"),
             build_dir.join("src/common/base"),
         ] {
@@ -200,6 +205,7 @@ fn main() {
         manifest_dir.join("../../build/mooncake-common"),
         manifest_dir.join("../../build/mooncake-common/etcd"),
         manifest_dir.join("../../build/mooncake-transfer-engine/tent/src"),
+        manifest_dir.join("../../build/mooncake-transfer-engine/tent/src/metrics"),
         manifest_dir.join("../tent/build/src"),
     ] {
         push_dir(&mut search_dirs, dir);
