@@ -91,6 +91,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    config/client_metric_config.cpp
     config/file_storage_config.cpp
     config/client_auto_port_config.cpp
     device/accelerator_device.cpp
