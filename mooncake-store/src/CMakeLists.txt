@@ -135,7 +135,8 @@ list(APPEND MOONCAKE_STORE_P2P_SOURCES
     p2p/client/p2p_client_metric.cpp
     p2p/client/peer_client.cpp
     p2p/client/client_rpc_service.cpp
-    p2p/client/data_manager.cpp
+    p2p/client/data_manager_types.cpp
+    p2p/client/v1/data_manager_v1.cpp
     p2p/client/route_cache.cpp
     p2p/client/async_memcpy_executor.cpp
     p2p/client/async_metadata_notifier.cpp

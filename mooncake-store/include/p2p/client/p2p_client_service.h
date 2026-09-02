@@ -552,7 +552,11 @@ class P2PClientService final : public ClientService {
 
     std::unique_ptr<coro_rpc::coro_rpc_server> client_rpc_server_;
     std::thread client_rpc_server_thread_;
-    std::optional<DataManager> data_manager_;
+    // Held by pointer, not by value: DataManager is now an abstract
+    // interface, so the concrete implementation is picked at construction
+    // time. A null pointer means "not created yet / already released",
+    // exactly like the old std::optional::has_value().
+    std::unique_ptr<DataManager> data_manager_;
     std::optional<ClientRpcService> client_rpc_service_;
 
     // Each PeerClient instance maintains its own fixed-size connection pool.

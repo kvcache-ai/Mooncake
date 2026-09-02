@@ -12,6 +12,7 @@
 #include <functional>
 #include <json/value.h>
 
+#include "p2p/client/data_manager_types.h"
 #include "p2p/client/tiered_cache/tiers/cache_tier.h"
 #include "p2p/client/tiered_cache/data_copier.h"
 #include "p2p/client/tiered_cache/scheduler/stats_collector.h"
@@ -35,24 +36,7 @@ struct TieredLocation {
     struct DataSource data;
 };
 
-/**
- * @struct TierView
- * @brief A snapshot of a tier's status, used for reporting topology to the
- * Master.
- */
-struct TierView {
-    UUID id;
-    MemoryType type;
-    size_t capacity;
-    size_t usage;
-    size_t free_space;
-    int priority;
-    std::vector<std::string> tags;
-
-    // Segment name reported to Master ("tier_<uuid>"), also used as the
-    // per-tier metric label.
-    std::string GetName() const;
-};
+// TierView now lives in p2p/client/data_manager_types.h.
 
 /**
  * @struct AllocationEntry
@@ -80,20 +64,8 @@ struct AllocationEntry {
  */
 using AllocationHandle = std::shared_ptr<AllocationEntry>;
 
-/**
- * @brief Callback for metadata synchronization when a replica is added.
- * Invoked after data copy is complete.
- * Returns true if sync succeeds, false otherwise.
- */
-using AddReplicaCallback = std::function<tl::expected<void, ErrorCode>(
-    std::string_view key, const UUID& tier_id, size_t size)>;
-
-/**
- * @brief Callback for metadata synchronization when a replica is removed.
- * Returns OK on success.
- */
-using RemoveReplicaCallback = std::function<tl::expected<void, ErrorCode>(
-    std::string_view key, const UUID& tier_id)>;
+// AddReplicaCallback / RemoveReplicaCallback now live in
+// p2p/client/data_manager_types.h.
 
 /**
  * @brief Result of TieredBackend::conditionalExecute.
@@ -109,13 +81,7 @@ struct ConditionalExecuteResult<void> {
     bool key_exists = false;
 };
 
-/**
- * @brief Callback for segment lifecycle synchronization.
- * Invoked when a tier is created (mount=true) or destroyed (mount=false).
- * The callback should register/unregister the segment with Master.
- */
-using SegmentSyncCallback = std::function<tl::expected<void, ErrorCode>(
-    const Segment& segment, bool mount)>;
+// SegmentSyncCallback now lives in p2p/client/data_manager_types.h.
 
 /**
  * @class TieredBackend

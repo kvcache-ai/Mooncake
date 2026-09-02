@@ -44,7 +44,7 @@ class HARecoveryManager {
 
     HARecoveryManager(
         const UUID& client_id, P2PMasterClient& master_client,
-        std::optional<DataManager>& data_manager,
+        std::unique_ptr<DataManager>& data_manager,
         std::unique_ptr<AsyncMetadataNotifier>& notifier,
         std::atomic<ViewVersionId>& view_version,
         HAClientState initial_state = HAClientState::FULL,
@@ -119,7 +119,13 @@ class HARecoveryManager {
 
     const UUID& client_id_;
     P2PMasterClient& master_client_;
-    std::optional<DataManager>& data_manager_;
+    // Slot reference, not a raw pointer: HARecoveryManager is
+    // constructed in P2PClientService::Init step 3, while the
+    // DataManager is only created in step 6. A pointer captured at
+    // construction time would be null forever; a reference to the slot
+    // observes both "not created yet" and "already released" as a
+    // null pointer.
+    std::unique_ptr<DataManager>& data_manager_;
     std::unique_ptr<AsyncMetadataNotifier>& notifier_;
     std::atomic<ViewVersionId>& view_version_;
     RecoveryMode recovery_mode_;

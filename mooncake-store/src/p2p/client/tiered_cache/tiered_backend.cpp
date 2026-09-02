@@ -24,12 +24,6 @@ static size_t ParseByteSize(const Json::Value& v) {
     return static_cast<size_t>(v.asUInt64());
 }
 
-static std::string MakeTierSegmentName(const UUID& id) {
-    return "tier_" + std::to_string(id.first) + "_" + std::to_string(id.second);
-}
-
-std::string TierView::GetName() const { return MakeTierSegmentName(id); }
-
 AllocationEntry::~AllocationEntry() {
     if (loc.tier) {
         // Keep the tier alive until the final handle has released the buffer.
