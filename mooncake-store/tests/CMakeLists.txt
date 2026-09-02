@@ -41,10 +41,15 @@ add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
+add_store_test(replica_selection_config_test replica_selection_config_test.cpp)
+set_tests_properties(replica_selection_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=0")
 add_test(
   NAME replica_selection_env_opt_in_test
-  COMMAND replica_selection_test
-          --gtest_filter=ReplicaSelectionTest.EnvironmentOptInUsesBuiltinScorer)
+  COMMAND
+    replica_selection_test
+    --gtest_filter=ReplicaSelectionTest.EnvironmentOptInUsesBuiltinScorer:ReplicaSelectionTest.EnvironmentIsCachedButInjectedScorerRemainsLive
+)
 set_tests_properties(replica_selection_env_opt_in_test
                      PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)

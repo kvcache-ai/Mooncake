@@ -66,7 +66,7 @@ struct ClientMetricEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC_INTERVAL);
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC_BANDWIDTH);
 };
-  
+
 struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_ROOT_DIR);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_ROOT_DIR);
@@ -82,6 +82,11 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(double, MOONCAKE_DFS_EVICTION_LOW_WATERMARK);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_DEFERRED_FREE_SECONDS);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_EVICTION_CHECK_INTERVAL);
+};
+
+struct ReplicaSelectionEnvironmentVariables {
+    // Only the exact string "1" enables scoring, unlike canonical bool parsing.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
 };
 
 #undef MC_DEFINE_ENV_VAR
