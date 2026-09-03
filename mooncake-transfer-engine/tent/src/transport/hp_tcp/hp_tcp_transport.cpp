@@ -97,11 +97,6 @@ Status RemoteWireStatus(HighPerformanceTcpStatus status) {
 
 }  // namespace
 
-struct HighPerformanceTcpTransport::TaskPlan {
-    std::shared_ptr<HighPerformanceTcpTaskState> task;
-    std::vector<HighPerformanceTcpWorkers::Command> commands;
-};
-
 HighPerformanceTcpTransport::HighPerformanceTcpTransport()
     : HighPerformanceTcpTransport(HighPerformanceTcpParams{}) {}
 
@@ -474,13 +469,10 @@ Status HighPerformanceTcpTransport::freeSubBatch(SubBatchRef& batch) {
     return Status::OK();
 }
 
-Status HighPerformanceTcpTransport::planTask(const Request& request,
-                                             HighPerformanceTcpSubBatch* batch,
-                                             TaskPlan* plan) {
-    if (batch == nullptr || plan == nullptr) {
-        return Status::InvalidArgument(
-            "invalid HP TCP task plan output" LOC_MARK);
-    }
+Status HighPerformanceTcpTransport::planTask(
+    const Request& request, HighPerformanceTcpSubBatch& batch,
+    std::shared_ptr<HighPerformanceTcpTaskState>& planned_task,
+    std::vector<HighPerformanceTcpWorkers::Command>& commands) {
     if (request.source == nullptr || request.length == 0 ||
         request.length > params_.max_transfer_bytes ||
         (request.opcode != Request::READ && request.opcode != Request::WRITE)) {
@@ -562,11 +554,10 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
     }
 
     auto task = std::make_shared<HighPerformanceTcpTaskState>(
-        request.length, batch->progress_batch_id, batch->notify_progress,
+        request.length, batch.progress_batch_id, batch.notify_progress,
         std::move(local_lease), slice_count);
     task->setRequestId(request_id);
-    plan->task = task;
-    plan->commands.reserve(slice_count);
+    planned_task = task;
 
     uint64_t slice_offset = 0;
     for (size_t slice = 0; slice < slice_count; ++slice) {
@@ -619,9 +610,9 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
                 };
         } else {
             operation.complete =
-                [task](TransferStatusEnum terminal, size_t bytes,
+                [task](TransferStatusEnum terminal, size_t,
                        std::optional<HighPerformanceTcpStatus> remote_status) {
-                    (void)task->completeSlice(terminal, bytes, remote_status);
+                    (void)task->completeSlice(terminal, remote_status);
                 };
         }
 
@@ -635,7 +626,7 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
                 if (slice_count == 1) {
                     (void)task->completeOnce(CANCELED, 0);
                 } else {
-                    (void)task->completeSlice(CANCELED, 0);
+                    (void)task->completeSlice(CANCELED);
                 }
                 return;
             }
@@ -645,10 +636,10 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
             if (slice_count == 1) {
                 (void)task->completeOnce(CANCELED, 0);
             } else {
-                (void)task->completeSlice(CANCELED, 0);
+                (void)task->completeSlice(CANCELED);
             }
         };
-        plan->commands.push_back(std::move(command));
+        commands.push_back(std::move(command));
         slice_offset += slice_length;
     }
     return Status::OK();
@@ -684,30 +675,19 @@ Status HighPerformanceTcpTransport::submitTransferTasks(
         total_bytes += request.length;
     }
 
-    std::vector<TaskPlan> plans;
+    std::vector<std::shared_ptr<HighPerformanceTcpTaskState>> planned_tasks;
     std::vector<HighPerformanceTcpWorkers::Command> commands;
     try {
-        plans.resize(requests.size());
+        planned_tasks.resize(requests.size());
+        commands.reserve(requests.size());
     } catch (...) {
         return Status::InternalError(
             "unable to allocate HP TCP task planning storage" LOC_MARK);
     }
 
     for (size_t i = 0; i < requests.size(); ++i) {
-        CHECK_STATUS(planTask(requests[i], hp_batch, &plans[i]));
-    }
-    try {
-        size_t command_count = 0;
-        for (const auto& plan : plans) command_count += plan.commands.size();
-        commands.reserve(command_count);
-        for (auto& plan : plans) {
-            for (auto& command : plan.commands) {
-                commands.push_back(std::move(command));
-            }
-        }
-    } catch (...) {
-        return Status::InternalError(
-            "unable to allocate HP TCP command storage" LOC_MARK);
+        CHECK_STATUS(
+            planTask(requests[i], *hp_batch, planned_tasks[i], commands));
     }
 
     // SubBatch capacity was reserved at allocateSubBatch(). The callback below
@@ -716,9 +696,9 @@ Status HighPerformanceTcpTransport::submitTransferTasks(
     const size_t old_size = hp_batch->tasks.size();
     Status committed = workers_->tryCommitBatch(
         commands, admission_.get(), requests.size(), total_bytes, [&] {
-            for (auto& plan : plans) {
-                plan.task->activateReservation(admission_.get());
-                hp_batch->tasks.push_back(std::move(plan.task));
+            for (auto& task : planned_tasks) {
+                task->activateReservation(admission_.get());
+                hp_batch->tasks.push_back(std::move(task));
             }
         });
     if (!committed.ok()) {
@@ -764,15 +744,16 @@ Status HighPerformanceTcpTransport::retryTransferTask(SubBatchRef batch,
             "HP TCP retry requires a failed attempt" LOC_MARK);
     }
 
-    TaskPlan plan;
-    CHECK_STATUS(planTask(request, hp_batch, &plan));
-    auto commands = std::move(plan.commands);
+    std::shared_ptr<HighPerformanceTcpTaskState> planned_task;
+    std::vector<HighPerformanceTcpWorkers::Command> commands;
+    commands.reserve(1);
+    CHECK_STATUS(planTask(request, *hp_batch, planned_task, commands));
 
     Status committed = workers_->tryCommitBatch(
         commands, admission_.get(), 1, request.length, [&] {
-            plan.task->activateReservation(admission_.get());
+            planned_task->activateReservation(admission_.get());
             hp_batch->tasks[static_cast<size_t>(task_id)] =
-                std::move(plan.task);
+                std::move(planned_task);
         });
     return committed;
 }

@@ -128,10 +128,10 @@ TEST(HighPerformanceTcpTaskTest, CompletionReleasesLeaseAndBudgetOnce) {
     auto task = std::make_shared<HighPerformanceTcpTaskState>(
         memory.size(), 1, [](BatchID) {}, std::move(lease), 2);
     task->activateReservation(&admission);
-    EXPECT_FALSE(task->completeSlice(COMPLETED, memory.size() / 2));
+    EXPECT_FALSE(task->completeSlice(COMPLETED));
     EXPECT_EQ(task->snapshot().s, PENDING);
     EXPECT_EQ(admission.outstandingTasks(), 1u);
-    EXPECT_TRUE(task->completeSlice(COMPLETED, memory.size() / 2));
+    EXPECT_TRUE(task->completeSlice(COMPLETED));
     EXPECT_FALSE(task->completeOnce(FAILED, 0));
     EXPECT_EQ(task->snapshot().transferred_bytes, memory.size());
     EXPECT_EQ(admission.outstandingTasks(), 0u);

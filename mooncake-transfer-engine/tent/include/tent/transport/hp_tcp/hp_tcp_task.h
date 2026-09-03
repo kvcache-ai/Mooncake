@@ -44,7 +44,7 @@ class HighPerformanceTcpTaskState {
     bool completeOnce(TransferStatusEnum terminal, size_t bytes,
                       std::optional<HighPerformanceTcpStatus> remote_status =
                           std::nullopt) noexcept;
-    bool completeSlice(TransferStatusEnum terminal, size_t bytes,
+    bool completeSlice(TransferStatusEnum terminal,
                        std::optional<HighPerformanceTcpStatus> remote_status =
                            std::nullopt) noexcept;
     TransferStatus snapshot() const noexcept;
@@ -79,10 +79,7 @@ class HighPerformanceTcpTaskState {
     std::atomic<bool> reservation_active_{false};
 
     std::atomic<size_t> remaining_slices_{1};
-    std::atomic<size_t> completed_bytes_{0};
-    std::atomic<bool> slice_failed_{false};
-    std::atomic<bool> slice_timed_out_{false};
-    std::atomic<bool> slice_canceled_{false};
+    std::atomic<TransferStatusEnum> slice_status_{COMPLETED};
     uint64_t request_id_{0};
 };
 

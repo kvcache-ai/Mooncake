@@ -6,16 +6,19 @@
 namespace mooncake::tent {
 
 bool HighPerformanceTcpTaskState::completeSlice(
-    TransferStatusEnum terminal, size_t bytes,
+    TransferStatusEnum terminal,
     std::optional<HighPerformanceTcpStatus> remote_status) noexcept {
-    if (terminal == COMPLETED) {
-        completed_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    } else if (terminal == TIMEOUT) {
-        slice_timed_out_.store(true, std::memory_order_relaxed);
-    } else if (terminal == CANCELED) {
-        slice_canceled_.store(true, std::memory_order_relaxed);
-    } else {
-        slice_failed_.store(true, std::memory_order_relaxed);
+    if (terminal == INITIAL || terminal == PENDING || terminal == INVALID) {
+        terminal = FAILED;
+    }
+    if (terminal != COMPLETED) {
+        TransferStatusEnum aggregate =
+            slice_status_.load(std::memory_order_relaxed);
+        while (transferStatusSeverity(terminal) >
+                   transferStatusSeverity(aggregate) &&
+               !slice_status_.compare_exchange_weak(
+                   aggregate, terminal, std::memory_order_relaxed)) {
+        }
     }
 
     if (remote_status.has_value() &&
@@ -29,17 +32,8 @@ bool HighPerformanceTcpTaskState::completeSlice(
         return false;
     }
 
-    if (slice_failed_.load(std::memory_order_acquire)) {
-        return completeOnce(FAILED, 0);
-    }
-    if (slice_timed_out_.load(std::memory_order_acquire)) {
-        return completeOnce(TIMEOUT, 0);
-    }
-    if (slice_canceled_.load(std::memory_order_acquire)) {
-        return completeOnce(CANCELED, 0);
-    }
-    return completeOnce(COMPLETED,
-                        completed_bytes_.load(std::memory_order_acquire));
+    terminal = slice_status_.load(std::memory_order_acquire);
+    return completeOnce(terminal, terminal == COMPLETED ? reserved_bytes_ : 0);
 }
 
 bool HighPerformanceTcpTaskState::completeOnce(
