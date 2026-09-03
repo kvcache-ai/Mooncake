@@ -10,6 +10,8 @@
 //      connection; the HA monitor owns that retry schedule.
 //   5. HA MasterClient bounds failed leader connections while non-HA clients
 //      retain the default initial-connection retry policy.
+//   6. HA MasterClient bounds control-plane probes without changing the
+//      foreground RPC retry policy.
 //
 // The end-to-end test points a MasterClient at a "black hole" TCP listener: a
 // socket that accepts the connection (so connect() succeeds) but never sends a
@@ -31,6 +33,7 @@
 
 #include "master_client.h"
 #include "pyclient.h"
+#include "test_server_helpers.h"
 #include "types.h"
 
 namespace mooncake {
@@ -157,7 +160,7 @@ TEST_F(RpcTimeoutEnvTest, RpcTimesOutAgainstUnresponsiveMaster) {
 // peer. Bind an ephemeral loopback port without listening on it so connection
 // attempts are rejected deterministically while the port remains reserved by
 // this test.
-TEST(RpcTimeoutTest, HaRuntimePolicyReplacesInitialConnectionPolicy) {
+TEST(RpcTimeoutTest, HaControlPolicyPreservesForegroundRetryPolicy) {
     int probe_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(probe_fd, 0) << "failed to create probe socket";
 
@@ -188,14 +191,22 @@ TEST(RpcTimeoutTest, HaRuntimePolicyReplacesInitialConnectionPolicy) {
             std::chrono::steady_clock::now() - initial_start)
             .count();
 
-    // Client initialization has now used the pool. Entering HA runtime must
-    // replace it, rather than silently retaining the initial retry policy.
+    // HA runtime uses a separate fast-fail pool for leader readiness probes.
     client.EnableHaConnectionPolicy();
     const auto start = std::chrono::steady_clock::now();
     const auto rc = client.Connect("127.0.0.1:" + std::to_string(port));
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - start)
                              .count();
+
+    // A foreground request still uses the original resilient pool even after
+    // the HA control policy has been enabled.
+    const auto foreground_start = std::chrono::steady_clock::now();
+    const auto foreground_rc = client.GetStorageConfig();
+    const auto foreground_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - foreground_start)
+            .count();
 
     ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
     EXPECT_EQ(::close(probe_fd), 0);
@@ -205,8 +216,43 @@ TEST(RpcTimeoutTest, HaRuntimePolicyReplacesInitialConnectionPolicy) {
         << "initial connection unexpectedly lost its retry resilience";
     EXPECT_EQ(rc, ErrorCode::RPC_FAIL);
     EXPECT_LT(elapsed, 750)
-        << "MasterClient retried a failed leader connection internally for "
+        << "HA readiness probe retried a failed leader internally for "
         << elapsed << "ms";
+    ASSERT_FALSE(foreground_rc.has_value());
+    EXPECT_EQ(foreground_rc.error(), ErrorCode::RPC_FAIL);
+    EXPECT_GE(foreground_elapsed, 2500)
+        << "foreground RPC unexpectedly inherited the HA fast-fail policy";
+}
+
+TEST(RpcTimeoutTest, FailedCandidateProbeDoesNotRetargetHeartbeat) {
+    testing::InProcMaster confirmed_leader;
+    ASSERT_TRUE(confirmed_leader.Start(InProcMasterConfigBuilder().build()));
+
+    int probe_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(probe_fd, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+    addr.sin_port = 0;
+    ASSERT_EQ(
+        ::bind(probe_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    socklen_t len = sizeof(addr);
+    ASSERT_EQ(::getsockname(probe_fd, reinterpret_cast<sockaddr*>(&addr), &len),
+              0);
+    const std::string candidate_address =
+        "127.0.0.1:" + std::to_string(ntohs(addr.sin_port));
+
+    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "100", 1), 0);
+    MasterClient client(generate_uuid());
+    ASSERT_EQ(ErrorCode::OK, client.Connect(confirmed_leader.master_address()));
+    client.EnableHaConnectionPolicy();
+
+    EXPECT_EQ(ErrorCode::RPC_FAIL, client.Connect(candidate_address));
+    auto heartbeat = client.Ping();
+
+    ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+    EXPECT_EQ(::close(probe_fd), 0);
+    ASSERT_TRUE(heartbeat.has_value());
 }
 
 // The offload data path (store->store) builds its own client pool, separate
