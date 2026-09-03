@@ -344,8 +344,8 @@ void RealClient::put_dummy_helper(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -458,8 +458,8 @@ void RealClient::put_batch_dummy_helper(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -565,8 +565,8 @@ void RealClient::put_parts_dummy_helper(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1053,8 +1053,8 @@ void RealClient::get_buffer_info_dummy_helper(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1197,8 +1197,8 @@ RealClient::batch_put_from_dummy_helper(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1399,8 +1399,8 @@ RealClient::batch_get_into_dummy_helper(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1530,8 +1530,8 @@ void RealClient::batchIsExist_internal_rpc(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1559,8 +1559,8 @@ void RealClient::isExist_internal_rpc(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1587,8 +1587,8 @@ void RealClient::remove_internal_rpc(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1615,8 +1615,8 @@ void RealClient::getSize_internal_rpc(
         RequestContext rc;
         if (!att.empty()) {
             rc = deserialize_request_context(att);
-            VLOG(2) << "hop-A bridge request_id=" << rc.request_id
-                    << " trace_id=" << rc.trace_id;
+            VLOG(2) << "hop-A bridge request_id=" << rc.request_id.value_or("")
+                    << " trace_id=" << rc.trace_id.value_or("");
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
