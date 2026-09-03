@@ -460,30 +460,26 @@ TEST(TransferMetadataVersionTest, SyncRejectsConflictingSameVersionMetadata) {
     EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
 }
 
-TEST(TransferMetadataVersionTest, PublishUsesWallTimeMicroseconds) {
+TEST(TransferMetadataVersionTest, P2PSegmentUpdateKeepsLegacyVersionZero) {
     TransferMetadata metadata(P2PHANDSHAKE);
     ASSERT_EQ(
         metadata.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
                                  makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
         0);
 
-    const auto before_us = static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
     ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
-    const auto after_us = static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
 
     auto desc = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
     ASSERT_NE(desc, nullptr);
-    EXPECT_GE(desc->metadata_version, before_us);
-    EXPECT_LE(desc->metadata_version, after_us);
+    EXPECT_EQ(desc->metadata_version, 0U);
 
-    const uint64_t first_version = desc->metadata_version;
     ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
     desc = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
     ASSERT_NE(desc, nullptr);
-    EXPECT_GT(desc->metadata_version, first_version);
+    EXPECT_EQ(desc->metadata_version, 0U);
 }
 
-TEST(TransferMetadataVersionTest, RpcMetaPublishUsesWallTimeMicroseconds) {
+TEST(TransferMetadataVersionTest, P2PRpcMetaKeepsLegacyVersionZero) {
     TransferMetadata metadata(P2PHANDSHAKE);
 
     int sockfd = -1;
@@ -495,16 +491,12 @@ TEST(TransferMetadataVersionTest, RpcMetaPublishUsesWallTimeMicroseconds) {
     rpc_desc.rpc_port = port;
     rpc_desc.sockfd = sockfd;
 
-    const auto before_us = static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
     ASSERT_EQ(
         metadata.addRpcMetaEntry("127.0.0.1:" + std::to_string(port), rpc_desc),
         0);
-    const auto after_us = static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
 
-    EXPECT_GE(metadata.localRpcMeta().metadata_version, before_us);
-    EXPECT_LE(metadata.localRpcMeta().metadata_version, after_us);
-    EXPECT_EQ(rpc_desc.metadata_version,
-              metadata.localRpcMeta().metadata_version);
+    EXPECT_EQ(rpc_desc.metadata_version, 0U);
+    EXPECT_EQ(metadata.localRpcMeta().metadata_version, 0U);
 }
 
 TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {

@@ -653,7 +653,9 @@ class LocalHttpMetadataServer {
                 continue;
             }
             value["ip_or_host_name"] = new_host;
-            uint64_t metadata_version = getCurrentTimeInNano() / 1000;
+            const int64_t now_ns = getCurrentTimeInNano();
+            uint64_t metadata_version =
+                now_ns > 0 ? static_cast<uint64_t>(now_ns / 1000) : 1;
             if (value.isMember("metadata_version") &&
                 value["metadata_version"].isUInt64() &&
                 value["metadata_version"].asUInt64() >= metadata_version) {

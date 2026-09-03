@@ -28,14 +28,14 @@
 #include "transfer_metadata_plugin.h"
 
 namespace mooncake {
-uint64_t currentWallTimeInMicroseconds() {
+static uint64_t currentWallTimeInMicroseconds() {
     const int64_t now_ns = getCurrentTimeInNano();
     if (now_ns <= 0) return 1;
     return static_cast<uint64_t>(now_ns / 1000);
 }
 
-uint64_t nextWallTimeMetadataVersion(uint64_t local_version,
-                                     uint64_t published_version) {
+static uint64_t nextWallTimeMetadataVersion(uint64_t local_version,
+                                            uint64_t published_version) {
     uint64_t version = currentWallTimeInMicroseconds();
     if (published_version >= version) version = published_version + 1;
     if (local_version >= version) version = local_version + 1;
@@ -43,8 +43,8 @@ uint64_t nextWallTimeMetadataVersion(uint64_t local_version,
     return version;
 }
 
-bool sameRpcMetaDesc(const TransferMetadata::RpcMetaDesc &lhs,
-                     const TransferMetadata::RpcMetaDesc &rhs) {
+static bool sameRpcMetaDesc(const TransferMetadata::RpcMetaDesc &lhs,
+                            const TransferMetadata::RpcMetaDesc &rhs) {
     if (lhs.ip_or_host_name != rhs.ip_or_host_name ||
         lhs.rpc_port != rhs.rpc_port) {
         return false;
@@ -55,7 +55,7 @@ bool sameRpcMetaDesc(const TransferMetadata::RpcMetaDesc &lhs,
     return true;
 }
 
-bool shouldInstallFetchedRpcMetaDesc(
+static bool shouldInstallFetchedRpcMetaDesc(
     const std::string &server_name,
     const std::optional<TransferMetadata::RpcMetaDesc> &old_desc,
     const TransferMetadata::RpcMetaDesc &new_desc) {
@@ -87,7 +87,7 @@ bool shouldInstallFetchedRpcMetaDesc(
     return true;
 }
 
-bool shouldInstallFetchedSegmentDesc(
+static bool shouldInstallFetchedSegmentDesc(
     const std::string &segment_name, TransferMetadata::SegmentID segment_id,
     const std::shared_ptr<TransferMetadata::SegmentDesc> &old_desc,
     const std::shared_ptr<TransferMetadata::SegmentDesc> &new_desc) {
@@ -1286,10 +1286,10 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
 }
 
 bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
-    // timestamp is intentionally excluded: metadata encoding may refresh it
-    // even when the operational descriptor is unchanged.
+    // timestamp and metadata_version are intentionally excluded: metadata
+    // encoding/publication may refresh them even when the operational
+    // descriptor is unchanged.
     return name == other.name && protocol == other.protocol &&
-           metadata_version == other.metadata_version &&
            devices == other.devices && topology == other.topology &&
            buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&
            cxl_name == other.cxl_name && cxl_base_addr == other.cxl_base_addr &&
@@ -1522,13 +1522,15 @@ int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
         segment_name = it->second->name;
     }
 
-    if (!p2p_handshake_mode_) {
-        Json::Value existing;
-        if (storage_plugin_->get(getFullMetadataKey(segment_name), existing) &&
-            existing.isMember("metadata_version") &&
-            existing["metadata_version"].isUInt64()) {
-            published_version = existing["metadata_version"].asUInt64();
-        }
+    if (p2p_handshake_mode_) {
+        return 0;
+    }
+
+    Json::Value existing;
+    if (storage_plugin_->get(getFullMetadataKey(segment_name), existing) &&
+        existing.isMember("metadata_version") &&
+        existing["metadata_version"].isUInt64()) {
+        published_version = existing["metadata_version"].asUInt64();
     }
 
     std::shared_ptr<SegmentDesc> desc;
@@ -1613,16 +1615,18 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
 int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
                                       RpcMetaDesc &desc) {
     uint64_t published_version = 0;
-    if (!p2p_handshake_mode_) {
+    if (p2p_handshake_mode_) {
+        desc.metadata_version = 0;
+    } else {
         Json::Value existing;
         if (storage_plugin_->get(rpc_meta_prefix_ + server_name, existing) &&
             existing.isMember("metadata_version") &&
             existing["metadata_version"].isUInt64()) {
             published_version = existing["metadata_version"].asUInt64();
         }
+        desc.metadata_version = nextWallTimeMetadataVersion(
+            desc.metadata_version, published_version);
     }
-    desc.metadata_version =
-        nextWallTimeMetadataVersion(desc.metadata_version, published_version);
     local_rpc_meta_ = desc;
 
     if (p2p_handshake_mode_) {
