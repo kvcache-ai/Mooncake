@@ -143,9 +143,12 @@ int tent_open_segment(tent_engine_t engine, tent_segment_id_t* handle,
 int tent_close_segment(tent_engine_t engine, tent_segment_id_t handle);
 
 // Eagerly establish connection state towards `handle` on every installed
-// transport that supports it (RDMA endpoint bootstrap, control-plane TCP
-// dial), so the first transfer does not pay the setup cost. Best effort and
-// idempotent; returns 0 when there is nothing to warm. Returns 0 on success.
+// transport that can warm one, so the first transfer does not pay the setup
+// cost. Only RDMA warms today: it brings up every enabled local context
+// against every RDMA NIC the target advertises. TCP is not warmed.
+// Idempotent. Returns 0 when every transport either warmed every pair it
+// attempted or had nothing to warm, and -1 when one of them left a connection
+// cold - a cold pair keeps its lazy path, so the target stays usable.
 int tent_warmup_segment(tent_engine_t engine, tent_segment_id_t handle);
 
 int tent_get_segment_info(tent_engine_t engine, tent_segment_id_t handle,
@@ -290,9 +293,11 @@ class TransferEngine {
 
     // Establishes connection state towards a segment ahead of the first
     // transfer, so the setup cost is paid where the caller chooses instead of
-    // inside the first request. Best effort and idempotent: a transport with
-    // nothing to warm, including the local segment, succeeds as a no-op, and
-    // a pair that cannot connect yet keeps the lazy path.
+    // inside the first request. Idempotent. A transport with nothing to warm,
+    // including the local segment, succeeds as a no-op; a transport that left
+    // any connection it attempted cold reports the first such failure, even
+    // when another transport succeeded. A cold pair keeps its lazy path, so
+    // the target stays usable either way.
     Status warmupSegment(SegmentID handle);
 
    public:

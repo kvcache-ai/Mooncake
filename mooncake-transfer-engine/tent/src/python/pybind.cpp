@@ -490,6 +490,15 @@ PYBIND11_MODULE(tent, m) {
             py::arg("segment_name"))
 
         .def(
+            "warmup_segment",
+            [](TransferEngine& self, uint64_t handle) {
+                py::gil_scoped_release release;
+                auto s = self.warmupSegment((SegmentID)handle);
+                ThrowStatus(s, "warmup_segment");
+            },
+            py::arg("handle"))
+
+        .def(
             "close_segment",
             [](TransferEngine& self, uint64_t handle) {
                 py::gil_scoped_release release;

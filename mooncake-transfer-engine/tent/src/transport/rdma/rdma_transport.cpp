@@ -810,34 +810,69 @@ Status RdmaTransport::warmupSegment(SegmentID target_id) {
     // All enabled local contexts x all remote RDMA NICs: the data plane may
     // route a slice over any of these pairs, and bootstrapping also brings
     // up the notification QP that rides on the same endpoint.
-    size_t attempted = 0, ready = 0;
-    Status first_error = Status::OK();
+    struct WarmupPair {
+        std::string peer_name;
+        std::string dev_name;
+        std::shared_ptr<RdmaEndPoint> endpoint;
+        bool ready = false;
+        Status error = Status::OK();
+    };
+    std::vector<WarmupPair> pairs;
     for (auto& ctx : context_set_) {
         if (!ctx || ctx->status() != RdmaContext::DEVICE_ENABLED) continue;
         for (const auto& dev_name : target_dev_names) {
-            ++attempted;
-            std::string peer_name = MakeNicPath(target_nic_path_name, dev_name);
-            auto endpoint = ctx->endpointStore()->getOrInsert(peer_name);
-            if (!endpoint) {
-                if (first_error.ok()) {
-                    first_error = Status::InternalError(
-                        "Cannot allocate endpoint " + peer_name + LOC_MARK);
-                }
-                continue;
+            WarmupPair pair;
+            pair.dev_name = dev_name;
+            pair.peer_name = MakeNicPath(target_nic_path_name, dev_name);
+            pair.endpoint = ctx->endpointStore()->getOrInsert(pair.peer_name);
+            if (!pair.endpoint) {
+                pair.error = Status::InternalError("Cannot allocate endpoint " +
+                                                   pair.peer_name + LOC_MARK);
+            } else if (pair.endpoint->status() == RdmaEndPoint::EP_READY) {
+                pair.ready = true;
             }
-            if (endpoint->status() == RdmaEndPoint::EP_READY) {
-                ++ready;
-                continue;
-            }
-            auto connect_status =
-                endpoint->connect(target_seg_name, dev_name, rpc_server_addr);
-            if (connect_status.ok()) {
-                ++ready;
-            } else {
-                if (first_error.ok()) first_error = connect_status;
-                LOG(WARNING) << "RDMA warmup: endpoint " << peer_name
-                             << " not ready: " << connect_status.ToString();
-            }
+            pairs.push_back(std::move(pair));
+        }
+    }
+
+    // Each cold pair is a full endpoint and queue pair bootstrap, tens of
+    // milliseconds on the fabric these numbers came from, so handshaking them
+    // one after another costs the sum over every pair and just moves the stall
+    // the caller asked to avoid into this call. Hand the cold ones out at once
+    // and collect them; a pair that is already up starts nothing.
+    std::vector<std::pair<size_t, std::future<Status>>> pending;
+    for (size_t index = 0; index < pairs.size(); ++index) {
+        const auto& pair = pairs[index];
+        if (pair.ready || !pair.endpoint) continue;
+        pending.emplace_back(
+            index,
+            std::async(
+                std::launch::async,
+                [endpoint = pair.endpoint, seg_name = target_seg_name,
+                 dev_name = pair.dev_name, server_addr = rpc_server_addr]() {
+                    return endpoint->connect(seg_name, dev_name, server_addr);
+                }));
+    }
+    for (auto& [index, result] : pending) {
+        auto connect_status = result.get();
+        if (connect_status.ok()) {
+            pairs[index].ready = true;
+        } else {
+            pairs[index].error = connect_status;
+            LOG(WARNING) << "RDMA warmup: endpoint " << pairs[index].peer_name
+                         << " not ready: " << connect_status.ToString();
+        }
+    }
+
+    // Fold in pair order, so a partial warmup reports the first pair that was
+    // left cold rather than whichever handshake happened to finish first.
+    size_t attempted = pairs.size(), ready = 0;
+    Status first_error = Status::OK();
+    for (const auto& pair : pairs) {
+        if (pair.ready) {
+            ++ready;
+        } else if (first_error.ok()) {
+            first_error = pair.error;
         }
     }
     LOG(INFO) << "RDMA warmup towards segment " << target_seg_name << ": "
