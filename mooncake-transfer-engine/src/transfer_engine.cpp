@@ -15,7 +15,6 @@
 #include <chrono>
 #include <cassert>
 #include <limits>
-#include <set>
 #include <thread>
 #include <unordered_map>
 
@@ -1208,18 +1207,6 @@ class TransferEngine::ScatterTransferOperation::Impl {
         if (requests_.empty()) {
             finish();
             return;
-        }
-
-        {
-            std::set<Transport::SegmentID> target_ids;
-            uint64_t total_bytes = 0;
-            for (const auto &req : requests_) {
-                target_ids.insert(req.target_id);
-                total_bytes += req.length;
-            }
-            LOG(INFO) << "[TE] submitScatter, request_count=" << requests_.size()
-                      << ", distinct_target=" << target_ids.size()
-                      << ", total_bytes=" << total_bytes;
         }
 
         done_.assign(requests_.size(), false);
