@@ -95,6 +95,11 @@ struct OffsetAllocatorBackendEnvironmentVariables {
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFSET_RECORD_CRC);
 };
 
+struct ReplicaSelectionEnvironmentVariables {
+    // Only the exact string "1" enables scoring, unlike canonical bool parsing.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake

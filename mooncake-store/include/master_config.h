@@ -1165,6 +1165,8 @@ class MasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Zero denotes a directly constructed, supervisor-unmanaged service;
+    // HA supervisor serving paths always inject the acquired non-zero view.
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;

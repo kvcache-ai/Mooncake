@@ -145,7 +145,10 @@ TEST(HighPerformanceTcpTransportTest, UnknownWriteOutcomeIsPermanent) {
 TEST(HighPerformanceTcpTransportTest,
      PublishesEndpointAndSeparatesLocalOnlyCapabilities) {
     auto metadata = MakeLocalMetadata();
-    HighPerformanceTcpTransport transport(MakeParams());
+    auto params = MakeParams();
+    params.bind_address.clear();
+    params.rail_addresses = {"127.0.0.1", "127.0.0.2"};
+    HighPerformanceTcpTransport transport(std::move(params));
     std::string segment_name = "hp_transport_test";
     ASSERT_TRUE(
         transport.install(segment_name, metadata, nullptr, nullptr).ok());
@@ -157,8 +160,11 @@ TEST(HighPerformanceTcpTransportTest,
     HighPerformanceTcpEndpointAttr endpoint;
     ASSERT_TRUE(
         DecodeHighPerformanceTcpEndpointAttr(attr_it->second, &endpoint).ok());
-    EXPECT_EQ(endpoint.host, "127.0.0.1");
-    EXPECT_NE(endpoint.port, 0);
+    ASSERT_EQ(endpoint.endpoints.size(), 2U);
+    EXPECT_EQ(endpoint.endpoints[0].host, "127.0.0.1");
+    EXPECT_EQ(endpoint.endpoints[1].host, "127.0.0.2");
+    EXPECT_NE(endpoint.endpoints[0].port, 0);
+    EXPECT_EQ(endpoint.endpoints[0].port, endpoint.endpoints[1].port);
 
     std::array<uint8_t, 64> local_only_storage{};
     BufferDesc local_only;
@@ -194,6 +200,16 @@ TEST(HighPerformanceTcpTransportTest,
     ASSERT_TRUE(transport.removeMemoryBuffer(local_only).ok());
     ASSERT_TRUE(transport.removeMemoryBuffer(global).ok());
     ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(HighPerformanceTcpTransportTest, RejectsMismatchedSingleRailListener) {
+    auto params = MakeParams();
+    params.rail_addresses = {"127.0.0.2"};
+    HighPerformanceTcpTransport transport(std::move(params));
+    std::string segment_name = "hp_transport_test";
+    EXPECT_TRUE(
+        transport.install(segment_name, MakeLocalMetadata(), nullptr, nullptr)
+            .IsInvalidArgument());
 }
 
 Status PublishBuffers(const std::shared_ptr<ControlService>& metadata,

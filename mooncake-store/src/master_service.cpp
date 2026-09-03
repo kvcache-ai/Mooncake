@@ -456,7 +456,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
                     toString(connect_err)));
             }
             auto backend = std::make_shared<EtcdHaKvBackend>();
-            ErrorCode err = InitializeBatchOpLogWriter(std::move(backend));
+            // Direct MasterService construction has no leadership session;
+            // supervisor-created services carry a non-zero acquired view.
+            ErrorCode err = InitializeBatchOpLogWriter(
+                std::move(backend),
+                /*require_fenced_writer=*/view_version_ > 0);
             if (err != ErrorCode::OK) {
                 throw std::runtime_error(fmt::format(
                     "failed to create HA batch-record OpLog writer: {}",
@@ -708,7 +712,9 @@ MasterService::~MasterService() {
 
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
     std::shared_ptr<HaKvBackend> backend) {
-    return InitializeBatchOpLogWriter(std::move(backend));
+    // Explicit test injection keeps the zero-view fixture API. A configured
+    // view still exercises the production fenced path.
+    return InitializeBatchOpLogWriter(std::move(backend), view_version_ > 0);
 }
 
 void MasterService::SetBatchOpLogWriterFactoryForTesting(
@@ -3125,6 +3131,24 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
         return std::make_pair(std::move(tenant_id), std::move(user_key));
     };
 
+    ReplicaID max_live_id = 0;
+    for (const auto& entry : objects) {
+        auto [tenant_id, user_key] = resolve_standby_object(entry);
+        std::unordered_set<ReplicaID> object_replica_ids;
+        for (const auto& desc : entry.metadata.replicas) {
+            if (desc.id == 0 ||
+                desc.id == std::numeric_limits<ReplicaID>::max() ||
+                !object_replica_ids.insert(desc.id).second) {
+                LOG(ERROR)
+                    << "RestoreFromStandbySnapshot: invalid or duplicate "
+                    << "replica id=" << desc.id
+                    << ", tenant=" << tenant_id.value() << ", key=" << user_key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            max_live_id = std::max(max_live_id, desc.id);
+        }
+    }
+
     std::vector<StandbySegmentInfo> restored_memory_segments;
     std::unordered_map<std::string, const StandbySegmentInfo*>
         memory_segments_by_alias;
@@ -3255,9 +3279,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                 }
 
                 auto alloc = restored_allocators.at(buffer.transport_endpoint_);
-                replicas.emplace_back(
-                    std::make_unique<AllocatedBuffer>(alloc, buffer),
-                    desc.status);
+                replicas.push_back(Replica(
+                    desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.status));
             } else if (desc.is_nof_replica()) {
                 const auto& buffer =
                     desc.get_nof_descriptor().buffer_descriptor;
@@ -3272,9 +3296,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     alloc = std::make_shared<DummyBufferAllocator>(
                         buffer.transport_endpoint_, buffer.transport_endpoint_);
                 }
-                replicas.emplace_back(
-                    std::make_unique<AllocatedBuffer>(alloc, buffer),
-                    desc.status, ReplicaType::NOF_SSD);
+                replicas.push_back(Replica(
+                    desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.status, ReplicaType::NOF_SSD));
             } else if (desc.is_disk_replica()) {
                 const auto& disk_desc = desc.get_disk_descriptor();
                 if (disk_desc.object_size != standby_meta.size) {
@@ -3283,9 +3307,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                                << ", key=" << user_key;
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                replicas.emplace_back(disk_desc.file_path,
-                                      disk_desc.object_size, desc.status);
-            } else {
+                replicas.push_back(Replica(desc.id, disk_desc.file_path,
+                                           disk_desc.object_size, desc.status));
+            } else if (desc.is_local_disk_replica()) {
                 const auto& local_disk_desc = desc.get_local_disk_descriptor();
                 if (local_disk_desc.object_size != standby_meta.size) {
                     LOG(ERROR)
@@ -3294,9 +3318,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                         << ", key=" << user_key;
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                replicas.emplace_back(
-                    local_disk_desc.client_id, local_disk_desc.object_size,
-                    local_disk_desc.transport_endpoint, desc.status);
+                replicas.push_back(Replica(desc.id, local_disk_desc.client_id,
+                                           local_disk_desc.object_size,
+                                           local_disk_desc.transport_endpoint,
+                                           desc.status));
+            } else {
+                LOG(ERROR) << "RestoreFromStandbySnapshot: unsupported replica "
+                           << "descriptor, tenant=" << tenant_id.value()
+                           << ", key=" << user_key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
         objects_by_shard[shard_idx].push_back({&entry, std::move(tenant_id),
@@ -3363,6 +3393,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     object.tenant_id, object.user_key, standby_meta.group_id);
             }
             tenant_state.processing_keys.erase(object.user_key);
+        }
+    }
+
+    if (max_live_id != 0) {
+        const ReplicaID desired_next_id = max_live_id + 1;
+        ReplicaID current_next_id = Replica::next_id_.load();
+        while (current_next_id < desired_next_id &&
+               !Replica::next_id_.compare_exchange_weak(current_next_id,
+                                                        desired_next_id)) {
         }
     }
 
@@ -7590,9 +7629,15 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica,
     std::vector<UUID>* mirror_clients) {
     const auto& segment_names = replica.get_segment_names();
+    // No source segment names means there is no usable source segment to
+    // offload from. Returning a silent {} here caused the caller to record an
+    // OffloadingTask + inc_refcnt for work that was never enqueued, leaking the
+    // refcount until TTL expiry (issue #2997). Return an explicit
+    // UNABLE_OFFLOADING so callers treat this as a no-op rather than a success.
     if (segment_names.empty()) {
-        return {};
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
+    bool any_enqueued = false;
     for (const auto& segment_name_it : segment_names) {
         if (!segment_name_it.has_value()) {
             continue;
@@ -7621,6 +7666,13 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (mirror_clients != nullptr) {
             mirror_clients->push_back(*client_id);
         }
+        any_enqueued = true;
+    }
+    // Every segment name was nullopt (or EnqueueOffload found no usable
+    // segment), so nothing was enqueued. Same invariant as the empty case:
+    // never report success when no task was actually submitted.
+    if (!any_enqueued) {
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
     return {};
 }
@@ -13210,8 +13262,13 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
 }
 
 ErrorCode MasterService::InitializeBatchOpLogWriter(
-    std::shared_ptr<HaKvBackend> backend) {
+    std::shared_ptr<HaKvBackend> backend, bool require_fenced_writer) {
     if (!backend || !backend->SupportsTxn()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (require_fenced_writer && view_version_ == 0) {
+        LOG(ERROR) << "Fenced batch OpLog writer requires a non-zero acquired "
+                      "producer view";
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -13221,14 +13278,28 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     if (err != ErrorCode::OK) {
         return err;
     }
+    if (require_fenced_writer) {
+        err = storage->ClaimProducerView(view_version_);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to claim producer view for batch OpLog "
+                       << "writer: " << toString(err);
+            return err;
+        }
+    }
 
     OrderedOpLogWriterConfig writer_config;
     writer_config.max_entries_per_batch = oplog_batch_max_entries_;
     writer_config.initial_durable_prefix = durable_prefix;
     OpLogBatchStorage* storage_ptr = storage.get();
+    const ViewVersionId producer_view_version = view_version_;
     OrderedOpLogWriter::WriteBatchFn write_batch =
-        [storage_ptr](const OpLogBatchRecord& batch,
-                      const DurablePrefix& expected_prefix) {
+        [storage_ptr, require_fenced_writer, producer_view_version](
+            const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            if (require_fenced_writer) {
+                return storage_ptr->WriteBatchAndAdvancePrefix(
+                    batch, expected_prefix, producer_view_version);
+            }
             return storage_ptr->WriteBatchAndAdvancePrefix(batch,
                                                            expected_prefix);
         };

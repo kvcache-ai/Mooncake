@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "tent/common/config.h"
 
@@ -13,6 +14,8 @@ namespace mooncake::tent {
 struct HighPerformanceTcpParams {
     std::string bind_address;
     std::string advertise_address;
+    // Ordered local rail addresses; peers must publish the same rail count.
+    std::vector<std::string> rail_addresses;
     uint16_t port{0};
     size_t worker_count{16};
     size_t connections_per_peer{4};
