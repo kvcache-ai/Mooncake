@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <array>
 
 #include <unistd.h>
 
@@ -358,6 +359,111 @@ TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
     ASSERT_EQ(results.size(), 1);
     ASSERT_FALSE(results[0].has_value());
     EXPECT_EQ(results[0].error(), ErrorCode::CHECKSUM_MISMATCH);
+}
+
+TEST_F(DfsSyncClientTest, DfsMetricsCountSuccessfulWriteAndRead) {
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const int64_t base_write_ops = metric->dfs_write_ops.value();
+    const int64_t base_write_bytes = metric->dfs_write_bytes.value();
+    const int64_t base_read_ops = metric->dfs_read_ops.value();
+    const int64_t base_read_bytes = metric->dfs_read_bytes.value();
+
+    const std::string key = "dfs_metric_success";
+    std::string value(4096, 'Q');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    EXPECT_EQ(metric->dfs_write_ops.value(), base_write_ops + 1);
+    EXPECT_EQ(metric->dfs_write_bytes.value(),
+              base_write_bytes + static_cast<int64_t>(value.size()));
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    std::vector<char> output(value.size());
+    std::vector<Slice> read_slices{{output.data(), output.size()}};
+    ASSERT_TRUE(writer_->Get(key, *query, read_slices).has_value());
+
+    EXPECT_EQ(metric->dfs_read_ops.value(), base_read_ops + 1);
+    EXPECT_EQ(metric->dfs_read_bytes.value(),
+              base_read_bytes + static_cast<int64_t>(value.size()));
+    // Host-resident slices never go through the D2H staging path.
+    EXPECT_EQ(metric->dfs_writes_skipped.value(), 0);
+}
+
+TEST_F(DfsSyncClientTest, DfsMetricsCountWriteFailureSeparatelyFromOps) {
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const std::array<std::string, 1> write_fail_label{
+        toString(ErrorCode::FILE_WRITE_FAIL)};
+    const int64_t base_write_ops = metric->dfs_write_ops.value();
+    const int64_t base_errors =
+        metric->dfs_write_errors.value(write_fail_label);
+
+    std::vector<std::string> keys{"dfs_metric_ok", "dfs_metric_fail"};
+    std::vector<std::string> values{std::string(4096, 'R'),
+                                    std::string(4096, 'S')};
+    auto slices = MakeSlices(values);
+    adapter_->FailWriteCall(adapter_->WriteCalls() + 2);
+
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_TRUE(results[0].has_value());
+    ASSERT_FALSE(results[1].has_value());
+
+    // The failed key must not inflate ops/bytes; it lands in the error family
+    // instead, keyed by the ErrorCode name.
+    EXPECT_EQ(metric->dfs_write_ops.value(), base_write_ops + 1);
+    EXPECT_EQ(metric->dfs_write_errors.value(write_fail_label),
+              base_errors + 1);
+}
+
+TEST_F(DfsSyncClientTest, DfsMetricsRecordUnavailableBackend) {
+    auto client_without_backend = CreateClient("127.0.0.1:18104");
+    ASSERT_NE(client_without_backend, nullptr);
+    auto* metric = client_without_backend->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const std::array<std::string, 1> unavailable_label{
+        toString(ErrorCode::DFS_SERVICE_UNAVAILABLE)};
+    ASSERT_EQ(metric->dfs_write_errors.value(unavailable_label), 0);
+
+    std::string value(4096, 'T');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    auto result =
+        client_without_backend->Put("dfs_metric_no_backend", slices,
+                                    DfsConfig());
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(metric->dfs_write_errors.value(unavailable_label), 1);
+    EXPECT_EQ(metric->dfs_write_ops.value(), 0);
+}
+
+TEST_F(DfsSyncClientTest, DfsMetricsAppearInSerializedOutput) {
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const std::string key = "dfs_metric_serialize";
+    std::string value(4096, 'U');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    auto serialized = writer_->SerializeMetrics();
+    ASSERT_TRUE(serialized.has_value());
+    EXPECT_NE(serialized->find("mooncake_dfs_write_bytes_total"),
+              std::string::npos);
+    EXPECT_NE(serialized->find("mooncake_dfs_write_ops_total"),
+              std::string::npos);
+
+    auto summary = writer_->GetSummaryMetrics();
+    ASSERT_TRUE(summary.has_value());
+    EXPECT_NE(summary->find("=== DFS Metrics Summary ==="), std::string::npos);
 }
 
 }  // namespace mooncake::test

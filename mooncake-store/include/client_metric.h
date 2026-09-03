@@ -653,6 +653,226 @@ struct SsdMetric {
     }
 };
 
+// DFS metrics. The DFS data plane is descriptor-addressed BatchWrite/BatchRead
+// against preallocated shard files and never passes through FileStorage, so
+// SsdMetric does not observe any of it; these counters are recorded in Client
+// instead. kSsdLatencyBucket is reused because DFS is 3fs/nfs backed and shares
+// the same 50us-30s latency envelope as the SSD offload path.
+struct DfsMetric {
+    // Failures are dimensioned by ErrorCode name so a scrape can tell
+    // DFS_SERVICE_UNAVAILABLE apart from FILE_WRITE_FAIL without log digging.
+    std::array<std::string, 1> error_label_names = {"error"};
+
+    explicit DfsMetric(std::map<std::string, std::string> labels = {})
+        : dfs_read_bytes("mooncake_dfs_read_bytes_total",
+                         "Total bytes read from DFS", labels),
+          dfs_write_bytes("mooncake_dfs_write_bytes_total",
+                          "Total bytes written to DFS", labels),
+          dfs_read_ops("mooncake_dfs_read_ops_total",
+                       "Total number of DFS read operations (key count)",
+                       labels),
+          dfs_write_ops("mooncake_dfs_write_ops_total",
+                        "Total number of DFS write operations (key count)",
+                        labels),
+          dfs_read_latency_us("mooncake_dfs_read_latency_us",
+                              "DFS BatchRead latency per batch (us)",
+                              kSsdLatencyBucket, labels),
+          dfs_write_latency_us(
+              "mooncake_dfs_write_latency_us",
+              "DFS BatchWrite latency per batch (us), excluding D2H staging",
+              kSsdLatencyBucket, labels),
+          dfs_write_staging_latency_us(
+              "mooncake_dfs_write_staging_latency_us",
+              "DFS device-to-host staging latency per batch (us)",
+              kSsdLatencyBucket, labels),
+          dfs_read_latency_summary("mooncake_dfs_read_latency_summary_us",
+                                   "DFS read latency quantiles (us)",
+                                   {0.5, 0.9, 0.99}, labels),
+          dfs_write_latency_summary("mooncake_dfs_write_latency_summary_us",
+                                    "DFS write latency quantiles (us)",
+                                    {0.5, 0.9, 0.99}, labels),
+          dfs_read_errors("mooncake_dfs_read_errors_total",
+                          "DFS read failures by error code (key count)", labels,
+                          error_label_names),
+          dfs_write_errors("mooncake_dfs_write_errors_total",
+                           "DFS write failures by error code (key count)",
+                           labels, error_label_names),
+          dfs_writes_skipped(
+              "mooncake_dfs_writes_skipped_total",
+              "DFS writes skipped without being attempted because a non-DFS "
+              "replica transfer failed first (key count)",
+              labels),
+          start_time_(std::chrono::steady_clock::now()) {}
+
+    ylt::metric::counter_t dfs_read_bytes;
+    ylt::metric::counter_t dfs_write_bytes;
+    ylt::metric::counter_t dfs_read_ops;
+    ylt::metric::counter_t dfs_write_ops;
+    ylt::metric::histogram_t dfs_read_latency_us;
+    ylt::metric::histogram_t dfs_write_latency_us;
+    ylt::metric::histogram_t dfs_write_staging_latency_us;
+    ylt::metric::summary_t dfs_read_latency_summary;
+    ylt::metric::summary_t dfs_write_latency_summary;
+    ylt::metric::hybrid_counter_1t dfs_read_errors;
+    ylt::metric::hybrid_counter_1t dfs_write_errors;
+    ylt::metric::counter_t dfs_writes_skipped;
+    std::chrono::steady_clock::time_point start_time_;
+
+    // One op is one key, matching the SsdMetric convention. Only successful
+    // keys are counted here; failures go to RecordReadErrors instead, so
+    // ops/bytes stay a clean measure of delivered work.
+    void ObserveRead(int64_t key_count, int64_t bytes, uint64_t latency_us) {
+        dfs_read_ops.inc(key_count);
+        dfs_read_bytes.inc(bytes);
+        dfs_read_latency_us.observe(latency_us);
+        dfs_read_latency_summary.observe(latency_us);
+    }
+
+    void ObserveWrite(int64_t key_count, int64_t bytes, uint64_t latency_us) {
+        dfs_write_ops.inc(key_count);
+        dfs_write_bytes.inc(bytes);
+        dfs_write_latency_us.observe(latency_us);
+        dfs_write_latency_summary.observe(latency_us);
+    }
+
+    // Staging is the GPU->host copy that precedes a DFS write. It is observed
+    // separately because it is neither DFS I/O nor attributable to the DFS
+    // backend, yet it sits inside the same put latency window.
+    void ObserveWriteStaging(uint64_t latency_us) {
+        dfs_write_staging_latency_us.observe(latency_us);
+    }
+
+    // error_name is the ErrorCode spelling from toString(); keeping it a string
+    // avoids pulling types.h into the metric header.
+    void RecordReadErrors(const std::string& error_name, int64_t count = 1) {
+        const std::array<std::string, 1> error_label = {error_name};
+        {
+            std::lock_guard<std::mutex> lock(observed_errors_mutex_);
+            observed_read_errors_.insert(error_name);
+        }
+        dfs_read_errors.inc(error_label, count);
+    }
+
+    void RecordWriteErrors(const std::string& error_name, int64_t count = 1) {
+        const std::array<std::string, 1> error_label = {error_name};
+        {
+            std::lock_guard<std::mutex> lock(observed_errors_mutex_);
+            observed_write_errors_.insert(error_name);
+        }
+        dfs_write_errors.inc(error_label, count);
+    }
+
+    void RecordSkippedWrites(int64_t count) { dfs_writes_skipped.inc(count); }
+
+    void serialize(std::string& str) {
+        dfs_read_bytes.serialize(str);
+        dfs_write_bytes.serialize(str);
+        dfs_read_ops.serialize(str);
+        dfs_write_ops.serialize(str);
+        dfs_read_latency_us.serialize(str);
+        dfs_write_latency_us.serialize(str);
+        dfs_write_staging_latency_us.serialize(str);
+        dfs_read_latency_summary.serialize(str);
+        dfs_write_latency_summary.serialize(str);
+        dfs_read_errors.serialize(str);
+        dfs_write_errors.serialize(str);
+        dfs_writes_skipped.serialize(str);
+    }
+
+    std::string summary_metrics() {
+        std::stringstream ss;
+        ss << "=== DFS Metrics Summary ===" << "\n";
+
+        const auto read_bytes = dfs_read_bytes.value();
+        const auto write_bytes = dfs_write_bytes.value();
+        const auto read_ops = dfs_read_ops.value();
+        const auto write_ops = dfs_write_ops.value();
+        const auto elapsed_s = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() -
+                                   start_time_)
+                                   .count();
+
+        ss << format_io_line("DFS Read", read_bytes, read_ops, elapsed_s);
+        ss << format_io_line("DFS Write", write_bytes, write_ops, elapsed_s);
+        ss << "DFS Writes Skipped: " << dfs_writes_skipped.value() << "\n";
+        ss << format_error_line("DFS Read Errors", observed_read_errors_,
+                                dfs_read_errors);
+        ss << format_error_line("DFS Write Errors", observed_write_errors_,
+                                dfs_write_errors);
+
+        ss << "\n" << "=== DFS Latency Summary (microseconds) ===" << "\n";
+        ss << "Read: " << format_percentiles(dfs_read_latency_summary) << "\n";
+        ss << "Write: " << format_percentiles(dfs_write_latency_summary)
+           << "\n";
+
+        return ss.str();
+    }
+
+   private:
+    std::mutex observed_errors_mutex_;
+    std::unordered_set<std::string> observed_read_errors_;
+    std::unordered_set<std::string> observed_write_errors_;
+
+    // Reads the label values seen so far so the text summary can enumerate the
+    // hybrid counter, mirroring TransferOperationMetric::snapshot_operations.
+    std::string format_error_line(
+        const std::string& label,
+        const std::unordered_set<std::string>& observed,
+        ylt::metric::hybrid_counter_1t& counter) {
+        std::vector<std::string> names;
+        {
+            std::lock_guard<std::mutex> lock(observed_errors_mutex_);
+            names.assign(observed.begin(), observed.end());
+        }
+        if (names.empty()) {
+            return "";
+        }
+        std::sort(names.begin(), names.end());
+
+        std::stringstream ss;
+        ss << label << ":";
+        for (const auto& name : names) {
+            const std::array<std::string, 1> error_label = {name};
+            ss << " " << name << "=" << counter.value(error_label);
+        }
+        ss << "\n";
+        return ss.str();
+    }
+
+    std::string format_io_line(const std::string& label, int64_t bytes,
+                               int64_t ops, double elapsed_s) {
+        std::stringstream ss;
+        ss << label << ": " << byte_size_to_string(bytes) << ", ops=" << ops;
+        if (elapsed_s > 0 && bytes > 0) {
+            ss << ", throughput="
+               << byte_size_to_string(static_cast<int64_t>(bytes / elapsed_s))
+               << "/s";
+            ss << ", IOPS=" << std::fixed << std::setprecision(1)
+               << (ops / elapsed_s);
+        }
+        ss << "\n";
+        return ss.str();
+    }
+
+    std::string format_percentiles(ylt::metric::summary_t& summary) {
+        double sum = 0;
+        uint64_t count = 0;
+        auto rates = summary.get_rates(sum, count);
+        if (count == 0) {
+            return "No data";
+        }
+
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(1);
+        ss << "count=" << count;
+        if (rates.size() >= 1) ss << ", p50=" << rates[0] << "us";
+        if (rates.size() >= 2) ss << ", p90=" << rates[1] << "us";
+        if (rates.size() >= 3) ss << ", p99=" << rates[2] << "us";
+        ss << ", avg=" << (sum / count) << "us";
+        return ss.str();
+    }
+};
+
 struct ClientMetricConfig {
     bool enabled = true;
     std::chrono::milliseconds reporting_interval{0};
@@ -666,6 +886,7 @@ struct ClientMetric {
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
+    DfsMetric dfs_metric;
     // Prometheus "info" pattern: the value carries no meaning and is always 1,
     // the version strings ride along as static labels next to any caller
     // supplied labels so a scrape can attribute samples to a concrete build.
