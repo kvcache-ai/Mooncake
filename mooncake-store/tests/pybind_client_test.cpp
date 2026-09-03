@@ -1277,6 +1277,101 @@ TEST_F(RealClientTest, TestPutGetSessionRanges) {
     ASSERT_EQ(py_client_->unregister_buffer(dst_data.data()), 0);
 }
 
+// Issue #3658: session get must read keys whose only replica is LOCAL_DISK.
+TEST_F(RealClientTest, TestGetSessionRangesFromSsdOffload) {
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_session_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string hostname = "localhost:17822";
+    ASSERT_EQ(py_client_->setup_real(
+                  hostname, "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, ssd_path_),
+              0);
+
+    constexpr size_t kPageSize = 64;
+    constexpr size_t kNumLayers = 2;
+    constexpr size_t kObjectSize = kPageSize * kNumLayers;
+    std::string src(kObjectSize, '\0');
+    std::string dst(kObjectSize, 'Z');
+    for (size_t i = 0; i < src.size(); ++i) {
+        src[i] = static_cast<char>('a' + (i % 26));
+    }
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst.data(), dst.size()), 0);
+
+    const std::string key = "session_ssd_offload_key";
+    ASSERT_EQ(py_client_->put(key, src), 0);
+
+    bool disk_ready = false;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                disk_ready = true;
+                break;
+            }
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready) << "LOCAL_DISK replica did not appear";
+
+    bool memory_cleared = false;
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, hostname).size() == 1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1u);
+    ASSERT_TRUE(replicas.front().is_local_disk_replica());
+
+    std::vector<std::string> keys = {key};
+    const auto reads_before = py_client_->get_offload_rpc_read_count();
+    auto start_rcs = py_client_->batch_get_session_start(keys);
+    ASSERT_EQ(start_rcs.size(), 1u);
+    ASSERT_EQ(start_rcs[0], 0)
+        << "batch_get_session_start should succeed for LOCAL_DISK-only keys";
+
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
+        auto get_rcs = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{dst.data() + layer * kPageSize}}, {{kPageSize}},
+            {{layer * kPageSize}});
+        ASSERT_EQ(get_rcs.size(), 1u);
+        EXPECT_EQ(get_rcs[0], static_cast<int>(kPageSize))
+            << "session range get failed for LOCAL_DISK layer " << layer;
+    }
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_GT(py_client_->get_offload_rpc_read_count(), reads_before)
+        << "session range get should read via SSD offload RPC";
+    EXPECT_EQ(dst, src);
+
+    ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
+}
+
 // Abnormal put/get session cases. See check table in PR / review notes.
 TEST_F(RealClientTest, TestPutGetSessionAbnormal) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))

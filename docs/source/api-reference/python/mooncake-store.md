@@ -2996,8 +2996,10 @@ Typical flow:
 - Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
-Get sessions cache a filtered `QueryResult` (single complete memory replica + lease).
-Range calls only check the cached lease locally (zero Master RPCs). Put sessions
+Get sessions cache a filtered `QueryResult` (single complete replica from
+`SelectBestReplica` + lease). SSD/file-backed replicas are eligible, matching
+`batch_get_into`. Range calls only check the cached lease locally (zero Master
+RPCs). Put sessions
 reserve object space via Master `BatchPutStart` and finalize with `BatchPutEnd`.
 
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for

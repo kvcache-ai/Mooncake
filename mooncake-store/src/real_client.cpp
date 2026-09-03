@@ -414,25 +414,6 @@ inline bool is_object_range_overflow(size_t offset, size_t size, size_t limit) {
     return size > limit || offset > limit - size;
 }
 
-inline const Replica::Descriptor *SelectCompleteMemoryReplica(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
-    const Replica::Descriptor *first_memory = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE || !r.is_memory_replica()) {
-            continue;
-        }
-        if (local_endpoints.count(r.get_memory_descriptor()
-                                      .buffer_descriptor.transport_endpoint_)) {
-            return &r;
-        }
-        if (!first_memory) {
-            first_memory = &r;
-        }
-    }
-    return first_memory;
-}
-
 inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
     for (const auto &r : replicas) {
         if (r.is_memory_replica()) {
@@ -3627,10 +3608,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     // Partial file-backed read: allocate temp buffer, invoke read_op to
     // fill it, then scatter [src_offset, src_offset+size) to dst.
     //
-    // buf_size controls how much to allocate / read. DISK/DFS must use
-    // total_size (allocateSlices requires full-object slices).
-    // LOCAL_DISK can use src_offset + size (offload RPC transfers
-    // sequentially from remote offset 0).
+    // buf_size controls how much to allocate / read. File-backed replicas
+    // (DISK/DFS/LOCAL_DISK) use total_size: allocateSlices and the SSD
+    // offload backend both require a full-object destination buffer.
     auto partial_disk_read =
         [&](auto &&read_op,
             size_t buf_size) -> tl::expected<int64_t, ErrorCode> {
@@ -3673,18 +3653,18 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(size);
         }
 
-        // LOCAL_DISK: offload RPC transfers sequentially from remote offset
-        // 0, so we only need src_offset + size bytes (not total_size).
+        // LOCAL_DISK: bucket/offload BatchLoad requires dest size to match
+        // the object size, so read the full object then scatter the range.
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::unordered_map<std::string, std::vector<Slice>> objects;
                 objects.emplace(
-                    key, std::vector<Slice>{{static_cast<char *>(tmp_buf),
-                                             src_offset + size}});
+                    key, std::vector<Slice>{
+                             {static_cast<char *>(tmp_buf), total_size}});
                 return batch_get_into_offload_object_internal(endpoint,
                                                               objects);
             },
-            src_offset + size);
+            total_size);
     }
 
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
@@ -5524,9 +5504,9 @@ std::vector<int> RealClient::batch_get_session_start(
         }
 
         const auto *replica =
-            SelectCompleteMemoryReplica(query_result.replicas, local_endpoints);
+            SelectBestReplica(query_result.replicas, local_endpoints);
         if (!replica) {
-            LOG(ERROR) << "No complete memory replica for key: " << keys[i];
+            LOG(ERROR) << "No complete replica for key: " << keys[i];
             results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             get_sessions_.erase(keys[i]);
             continue;
@@ -5556,13 +5536,20 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     }
 
     // No Master RPC here: use cached QueryResult from session start.
-    // RealClient owns session state (lease/overflow checks, replica lookup);
-    // the actual parallel transfer is delegated to Client.
-    std::vector<Replica::Descriptor> replicas;
-    std::vector<std::vector<Slice>> slices;
-    std::vector<std::vector<uint64_t>> src_offsets;
-    std::vector<size_t> idx_map;  // batch entry -> original key index
-    std::vector<std::chrono::steady_clock::time_point> lease_deadlines;
+    // RealClient owns session state (lease/overflow checks, replica lookup).
+    // MEMORY replicas keep the existing scatter range-read path; SSD/file-
+    // backed replicas reuse execute_ranged_read (same as get_into_ranges).
+    struct PreparedEntry {
+        size_t original_index;
+        std::string key;
+        Replica::Descriptor replica;
+        std::optional<uint64_t> object_checksum;
+        std::vector<Slice> slices;
+        std::vector<uint64_t> src_offsets;
+        std::chrono::steady_clock::time_point lease_deadline;
+    };
+    std::vector<PreparedEntry> memory_entries;
+    std::vector<PreparedEntry> other_entries;
 
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -5584,13 +5571,10 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
                 continue;
             }
-            // start cached a single complete memory replica via
-            // FilterQueryResult.
+            // start cached a single complete replica via FilterQueryResult.
             const auto &replica = it->second.replicas.front();
             const size_t replica_limit =
-                replica.is_memory_replica()
-                    ? replica.get_memory_descriptor().buffer_descriptor.size_
-                    : 0;
+                static_cast<size_t>(calculate_total_size(replica));
             bool overflow = false;
             std::vector<Slice> entry_slices;
             std::vector<uint64_t> entry_offsets;
@@ -5610,39 +5594,80 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 results[i] = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
                 continue;
             }
-            replicas.push_back(replica);
-            slices.push_back(std::move(entry_slices));
-            src_offsets.push_back(std::move(entry_offsets));
-            idx_map.push_back(i);
-            lease_deadlines.push_back(it->second.lease_timeout);
-        }
-    }
-
-    if (replicas.empty()) {
-        return results;
-    }
-
-    auto transfer =
-        client_->BatchTransferReadRanges(replicas, slices, src_offsets);
-
-    // Merge results; drop sessions whose lease expired during the wait.
-    {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        const auto now = std::chrono::steady_clock::now();
-        for (size_t k = 0; k < transfer.size(); ++k) {
-            const size_t i = idx_map[k];
-            if (transfer[k]) {
-                if (now >= lease_deadlines[k]) {
-                    results[i] =
-                        static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-                    get_sessions_.erase(keys[i]);
-                } else {
-                    results[i] = static_cast<int>(transfer[k].value());
-                }
+            PreparedEntry entry{i,
+                                keys[i],
+                                replica,
+                                it->second.object_checksum,
+                                std::move(entry_slices),
+                                std::move(entry_offsets),
+                                it->second.lease_timeout};
+            if (replica.is_memory_replica()) {
+                memory_entries.push_back(std::move(entry));
             } else {
-                results[i] = static_cast<int>(toInt(transfer[k].error()));
+                other_entries.push_back(std::move(entry));
             }
         }
+    }
+
+    auto apply_result = [&](size_t original_index, const std::string &key,
+                            std::chrono::steady_clock::time_point deadline,
+                            const tl::expected<int64_t, ErrorCode> &transfer) {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (transfer) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                results[original_index] =
+                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                get_sessions_.erase(key);
+            } else {
+                results[original_index] = static_cast<int>(transfer.value());
+            }
+        } else {
+            results[original_index] = static_cast<int>(toInt(transfer.error()));
+        }
+    };
+
+    if (!memory_entries.empty()) {
+        std::vector<Replica::Descriptor> replicas;
+        std::vector<std::vector<Slice>> slices;
+        std::vector<std::vector<uint64_t>> src_offsets;
+        replicas.reserve(memory_entries.size());
+        slices.reserve(memory_entries.size());
+        src_offsets.reserve(memory_entries.size());
+        for (auto &entry : memory_entries) {
+            replicas.push_back(entry.replica);
+            slices.push_back(std::move(entry.slices));
+            src_offsets.push_back(std::move(entry.src_offsets));
+        }
+        auto transfer =
+            client_->BatchTransferReadRanges(replicas, slices, src_offsets);
+        for (size_t k = 0; k < transfer.size(); ++k) {
+            apply_result(memory_entries[k].original_index,
+                         memory_entries[k].key,
+                         memory_entries[k].lease_deadline, transfer[k]);
+        }
+    }
+
+    for (auto &entry : other_entries) {
+        std::vector<Replica::Descriptor> replica_list{entry.replica};
+        RangedReadMetadata metadata{
+            QueryResult(std::move(replica_list), entry.lease_deadline,
+                        entry.object_checksum),
+            entry.replica, calculate_total_size(entry.replica)};
+        tl::expected<int64_t, ErrorCode> transferred = int64_t{0};
+        for (size_t j = 0; j < entry.slices.size(); ++j) {
+            auto fragment = execute_ranged_read(
+                entry.key, entry.slices[j].ptr, /*dst_offset=*/0,
+                static_cast<size_t>(entry.src_offsets[j]), entry.slices[j].size,
+                metadata,
+                /*size_is_buffer_capacity=*/false, /*verify_checksum=*/false);
+            if (!fragment) {
+                transferred = tl::unexpected(fragment.error());
+                break;
+            }
+            *transferred += fragment.value();
+        }
+        apply_result(entry.original_index, entry.key, entry.lease_deadline,
+                     transferred);
     }
     return results;
 }
