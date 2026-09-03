@@ -39,6 +39,21 @@ target_compile_definitions(
   PRIVATE "TENT_CONFIG_FIXTURE_PATH=\"${CONFIG_LIFECYCLE_FIXTURE}\"")
 add_test(NAME config_lifecycle_test COMMAND config_lifecycle_test)
 
+# Keep production Config access sites synchronized with the lifecycle inventory.
+# This scans source rather than relying only on the example config, so code-only
+# keys are covered as well.
+add_executable(config_lifecycle_source_audit_test
+               config_lifecycle_source_audit_test.cpp)
+target_link_libraries(config_lifecycle_source_audit_test
+                      PRIVATE tent_common gtest gtest_main)
+target_include_directories(config_lifecycle_source_audit_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_compile_definitions(
+  config_lifecycle_source_audit_test
+  PRIVATE "TENT_SOURCE_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}/..\"")
+add_test(NAME config_lifecycle_source_audit_test
+         COMMAND config_lifecycle_source_audit_test)
+
 # TENT Metrics HTTP server test: validates that initialize() detects a busy
 # metrics port and degrades to log-only metrics instead of falsely reporting a
 # listening endpoint.
