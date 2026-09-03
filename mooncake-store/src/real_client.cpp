@@ -414,25 +414,6 @@ inline bool is_object_range_overflow(size_t offset, size_t size, size_t limit) {
     return size > limit || offset > limit - size;
 }
 
-inline const Replica::Descriptor *SelectCompleteMemoryReplica(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
-    const Replica::Descriptor *first_memory = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE || !r.is_memory_replica()) {
-            continue;
-        }
-        if (local_endpoints.count(r.get_memory_descriptor()
-                                      .buffer_descriptor.transport_endpoint_)) {
-            return &r;
-        }
-        if (!first_memory) {
-            first_memory = &r;
-        }
-    }
-    return first_memory;
-}
-
 inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
     for (const auto &r : replicas) {
         if (r.is_memory_replica()) {
@@ -5524,9 +5505,9 @@ std::vector<int> RealClient::batch_get_session_start(
         }
 
         const auto *replica =
-            SelectCompleteMemoryReplica(query_result.replicas, local_endpoints);
+            SelectBestReplica(query_result.replicas, local_endpoints);
         if (!replica) {
-            LOG(ERROR) << "No complete memory replica for key: " << keys[i];
+            LOG(ERROR) << "No complete replica for key: " << keys[i];
             results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             get_sessions_.erase(keys[i]);
             continue;
@@ -5557,8 +5538,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
 
     // No Master RPC here: use cached QueryResult from session start.
     // RealClient owns session state (lease/overflow checks, replica lookup);
-    // the actual parallel transfer is delegated to Client.
+    // memory ranges use Client; other replicas reuse the batched restore path.
     std::vector<Replica::Descriptor> replicas;
+    std::vector<std::pair<size_t, QueryResult>> restore_entries;
     std::vector<std::vector<Slice>> slices;
     std::vector<std::vector<uint64_t>> src_offsets;
     std::vector<size_t> idx_map;  // batch entry -> original key index
@@ -5584,20 +5566,18 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
                 continue;
             }
-            // start cached a single complete memory replica via
-            // FilterQueryResult.
+            // start cached a single complete replica via FilterQueryResult.
             const auto &replica = it->second.replicas.front();
             const size_t replica_limit =
-                replica.is_memory_replica()
-                    ? replica.get_memory_descriptor().buffer_descriptor.size_
-                    : 0;
+                static_cast<size_t>(calculate_total_size(replica));
             bool overflow = false;
             std::vector<Slice> entry_slices;
             std::vector<uint64_t> entry_offsets;
             entry_slices.reserve(buffers.size());
             entry_offsets.reserve(buffers.size());
             for (size_t j = 0; j < buffers.size(); ++j) {
-                if (replica_limit == 0 ||
+                if ((buffers[j] == nullptr && sizes[j] != 0) ||
+                    replica_limit == 0 ||
                     is_object_range_overflow(offsets[j], sizes[j],
                                              replica_limit)) {
                     overflow = true;
@@ -5610,6 +5590,10 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 results[i] = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
                 continue;
             }
+            if (!replica.is_memory_replica()) {
+                restore_entries.emplace_back(i, it->second);
+                continue;
+            }
             replicas.push_back(replica);
             slices.push_back(std::move(entry_slices));
             src_offsets.push_back(std::move(entry_offsets));
@@ -5618,12 +5602,88 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         }
     }
 
-    if (replicas.empty()) {
+    if (replicas.empty() && restore_entries.empty()) {
         return results;
     }
 
     auto transfer =
         client_->BatchTransferReadRanges(replicas, slices, src_offsets);
+    const size_t memory_count = transfer.size();
+
+    std::vector<std::string> restore_keys;
+    std::vector<void *> restore_buffers;
+    std::vector<size_t> restore_sizes;
+    std::vector<tl::expected<QueryResult, ErrorCode>> restore_queries;
+    std::vector<BufferHandle> restore_handles;
+    std::unordered_map<std::string, size_t> restore_index;
+    for (const auto &[i, query_result] : restore_entries) {
+        idx_map.push_back(i);
+        lease_deadlines.push_back(query_result.lease_timeout);
+        transfer.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+        if (all_buffers[i].empty()) {
+            transfer.back() = 0;
+            continue;
+        }
+        if (!client_buffer_allocator_) {
+            continue;
+        }
+        if (restore_index.count(keys[i])) {
+            continue;
+        }
+        // The offload backend requires a full-object destination. Restore each
+        // key once per call, including duplicate keys with different ranges.
+        const size_t total_size =
+            calculate_total_size(query_result.replicas.front());
+        auto allocated = client_buffer_allocator_->allocate(total_size);
+        if (!allocated) {
+            transfer.back() = tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            continue;
+        }
+        restore_index.emplace(keys[i], restore_keys.size());
+        restore_keys.push_back(keys[i]);
+        restore_handles.emplace_back(std::move(*allocated));
+        restore_buffers.push_back(restore_handles.back().ptr());
+        restore_sizes.push_back(total_size);
+        restore_queries.push_back(query_result);
+    }
+    if (!restore_keys.empty()) {
+        // Cached queries avoid Master RPCs; the existing get path groups
+        // LOCAL_DISK objects by owner and handles DISK/DFS reads as well.
+        auto restored = batch_get_into_internal(
+            restore_keys, restore_buffers, restore_sizes, restore_queries,
+            [this](const std::string &endpoint,
+                   LocalDiskOffloadObjects &objects) {
+                return batch_get_into_offload_object_internal(endpoint,
+                                                              objects);
+            });
+        for (size_t j = 0; j < restore_entries.size(); ++j) {
+            const size_t i = restore_entries[j].first;
+            auto cached = restore_index.find(keys[i]);
+            if (all_buffers[i].empty() || cached == restore_index.end())
+                continue;
+            const size_t restored_index = cached->second;
+            auto &result = transfer[memory_count + j];
+            if (!restored[restored_index]) {
+                result = tl::unexpected(restored[restored_index].error());
+                continue;
+            }
+            result = 0;
+            for (size_t k = 0; k < all_buffers[i].size(); ++k) {
+                if (all_sizes[i][k] == 0) continue;
+                const auto *src =
+                    static_cast<const char *>(restore_buffers[restored_index]) +
+                    all_src_offsets[i][k];
+                auto copied = scatter_host_to_maybe_device(
+                    all_buffers[i][k], src, all_sizes[i][k],
+                    "session range read, key: " + keys[i]);
+                if (!copied) {
+                    result = tl::unexpected(copied.error());
+                    break;
+                }
+                *result += static_cast<int64_t>(all_sizes[i][k]);
+            }
+        }
+    }
 
     // Merge results; drop sessions whose lease expired during the wait.
     {

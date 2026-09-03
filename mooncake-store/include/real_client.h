@@ -992,7 +992,8 @@ class RealClient : public PyClient {
 
     // KV transfer sessions (process-local; not shared with DummyClient).
     // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
-    // memory replica + lease); ranges only compare lease locally (no Master).
+    // replica selected by SelectBestReplica + lease); ranges only compare
+    // lease locally (no Master).
     // Put sessions track writable + inflight so end/revoke can seal the
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
