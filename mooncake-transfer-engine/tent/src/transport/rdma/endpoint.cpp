@@ -56,10 +56,11 @@ static inline const std::string statusToString(
 }
 
 // Forward declaration for notification QP setup
-static int setupNotifyQpConnection(
-    ibv_qp* qp, RdmaContext* ctx, int local_gid_index,
-    const std::string& peer_gid_str, uint16_t peer_lid, uint32_t peer_qp_num,
-    uint16_t pkey_index, uint8_t service_level = 0, uint8_t traffic_class = 0);
+static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
+                                   const EndPointParams& params,
+                                   int local_gid_index,
+                                   const std::string& peer_gid_str,
+                                   uint16_t peer_lid, uint32_t peer_qp_num);
 
 // A peer that reused the same nic path after restarting retires the stale
 // endpoint on the first bootstrap and expects a retry. Older peers also
@@ -565,10 +566,9 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
 
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
-            rc = setupNotifyQpConnection(
-                notify_qp_, context_, local_address.gid_index, peer_gid,
-                peer_lid, peer_desc.notify_qp_num, params_->pkey_index,
-                params_->service_level, params_->traffic_class);
+            rc = setupNotifyQpConnection(notify_qp_, context_, *params_,
+                                         local_address.gid_index, peer_gid,
+                                         peer_lid, peer_desc.notify_qp_num);
             if (rc) {
                 LOG(WARNING)
                     << "Failed to setup notification QP, notification disabled";
@@ -667,9 +667,8 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
         rc = setupNotifyQpConnection(
-            notify_qp_, context_, local_address_.gid_index, peer_desc.local_gid,
-            peer_desc.local_lid, peer_desc.notify_qp_num, params_->pkey_index,
-            params_->service_level, params_->traffic_class);
+            notify_qp_, context_, *params_, local_address_.gid_index,
+            peer_desc.local_gid, peer_desc.local_lid, peer_desc.notify_qp_num);
         if (rc) {
             notify_connected_ = false;
         } else {
@@ -1119,12 +1118,17 @@ void RdmaEndPoint::repostAllNotifyRecvs() {
     }
 }
 
+// The path MTU, the RNR timer and the timeout/retry budget come from the
+// same EndPointParams the data QPs use (see setupOneQP), so a dead peer path
+// is reported on the notify QP in the time the data QPs take and tuning
+// send_timeout / the retry counts applies to both. The address-vector fields
+// (hop_limit, flow_label, src_path_bits, PSNs) deliberately keep the values
+// this function always used.
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
+                                   const EndPointParams& params,
                                    int local_gid_index,
                                    const std::string& peer_gid_str,
-                                   uint16_t peer_lid, uint32_t peer_qp_num,
-                                   uint16_t pkey_index, uint8_t service_level,
-                                   uint8_t traffic_class) {
+                                   uint16_t peer_lid, uint32_t peer_qp_num) {
     // Reconnect path may call this when QP is already in RTS; force a clean
     // state machine: RESET -> INIT -> RTR -> RTS.
     ibv_qp_attr qp_attr = {};
@@ -1137,7 +1141,7 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
 
     memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.qp_state = IBV_QPS_INIT;
-    qp_attr.pkey_index = pkey_index;
+    qp_attr.pkey_index = params.pkey_index;
     qp_attr.port_num = ctx->portNum();
     qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
     ret = ibv_modify_qp(
@@ -1159,23 +1163,24 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     }
 
     // Modify to RTR
+    const NotifyQpRtrAttrs rtr = buildNotifyQpRtrAttrs(params);
     memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.qp_state = IBV_QPS_RTR;
-    qp_attr.path_mtu = IBV_MTU_4096;
+    qp_attr.path_mtu = rtr.path_mtu;
     qp_attr.dest_qp_num = peer_qp_num;
     qp_attr.rq_psn = 0;
-    qp_attr.max_dest_rd_atomic = 1;
-    qp_attr.min_rnr_timer = 0x12;
+    qp_attr.max_dest_rd_atomic = rtr.max_dest_rd_atomic;
+    qp_attr.min_rnr_timer = rtr.min_rnr_timer;
     qp_attr.ah_attr.is_global = 1;
     qp_attr.ah_attr.dlid = peer_lid;
-    qp_attr.ah_attr.sl = service_level;
+    qp_attr.ah_attr.sl = params.service_level;
     qp_attr.ah_attr.src_path_bits = 0;
     qp_attr.ah_attr.port_num = ctx->portNum();
     memcpy(&qp_attr.ah_attr.grh.dgid, &peer_gid, 16);
     qp_attr.ah_attr.grh.flow_label = 0;
     qp_attr.ah_attr.grh.sgid_index = local_gid_index;
     qp_attr.ah_attr.grh.hop_limit = 255;
-    qp_attr.ah_attr.grh.traffic_class = traffic_class;
+    qp_attr.ah_attr.grh.traffic_class = params.traffic_class;
 
     ret = ibv_modify_qp(qp, &qp_attr,
                         IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
@@ -1187,13 +1192,14 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     }
 
     // Modify to RTS
+    const NotifyQpRtsAttrs rts = buildNotifyQpRtsAttrs(params);
     memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.qp_state = IBV_QPS_RTS;
     qp_attr.sq_psn = 0;
-    qp_attr.timeout = 0x12;
-    qp_attr.retry_cnt = 7;
-    qp_attr.rnr_retry = 7;
-    qp_attr.max_rd_atomic = 1;
+    qp_attr.timeout = rts.timeout;
+    qp_attr.retry_cnt = rts.retry_cnt;
+    qp_attr.rnr_retry = rts.rnr_retry;
+    qp_attr.max_rd_atomic = rts.max_rd_atomic;
 
     ret = ibv_modify_qp(qp, &qp_attr,
                         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
