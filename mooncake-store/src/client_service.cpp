@@ -65,6 +65,7 @@ std::optional<size_t> GetTransportRegistrationLimit(
 namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
+constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
 class ScopedObjectChecksumBuffer {
    public:
@@ -649,19 +650,22 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return coordinator.error();
         }
 
-        auto current_view = coordinator.value()->ReadCurrentView();
-        if (!current_view) {
-            LOG(ERROR) << "Failed to read current master view: "
-                       << toString(current_view.error());
-            return current_view.error();
+        auto master_view = ha::ReadCurrentViewOrWaitForReady(
+            *coordinator.value(), kInitialLeaderReadyTimeout);
+        if (!master_view) {
+            LOG(ERROR) << "Failed to discover a ready master view: "
+                       << toString(master_view.error());
+            return master_view.error();
         }
-        if (!current_view.value().has_value()) {
-            LOG(ERROR) << "No master is available in HA backend";
+        if (!master_view->has_value()) {
+            // An absent ready view can mean either no elected leader or an
+            // elected leader whose endpoint is still hidden during recovery.
+            LOG(ERROR) << "No master became ready within "
+                       << kInitialLeaderReadyTimeout.count() << " seconds";
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
 
-        const auto& master_view = current_view.value().value();
-        auto err = SwitchLeader(master_view);
+        auto err = SwitchLeader(master_view->value());
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to master";
             return err;
@@ -669,6 +673,10 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
+        if (!leader_monitor_running_.exchange(true)) {
+            leader_monitor_thread_ =
+                std::thread([this]() { this->LeaderMonitorThreadMain(); });
+        }
         return ErrorCode::OK;
     } else {
         auto err = master_client_.Connect(master_server_entry);
@@ -690,15 +698,10 @@ void Client::EnterHaRuntimeMode() {
         return;
     }
 
-    // Initial discovery and configuration reads deliberately use the normal
-    // retry budget. Once initialization succeeds, replace the pool before any
-    // HA background thread starts: runtime retries belong to the outer
-    // heartbeat/monitor loops, and each attempt must return promptly when an
-    // obsolete pod IP silently drops packets.
+    // Foreground RPCs keep their normal retry policy. Only the HA heartbeat
+    // and leader-readiness probes use the separately configured fast-fail
+    // control pool once initialization has completed.
     master_client_.EnableHaConnectionPolicy();
-    leader_monitor_running_ = true;
-    leader_monitor_thread_ =
-        std::thread([this]() { this->LeaderMonitorThreadMain(); });
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {

@@ -5,7 +5,6 @@
 #include <csignal>
 #include <cstdlib>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -480,20 +479,18 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
-        std::mutex serve_state_mutex;
-        bool serve_shutdown_requested = false;
+        detail::ServingStateGate serving_state;
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
-            *leadership_session,
-            [&server, &admin_server, &serve_state_mutex,
-             &serve_shutdown_requested, &label_reconciler](auto reason) {
-                std::lock_guard<std::mutex> lock(serve_state_mutex);
-                serve_shutdown_requested = true;
-                admin_server.SetServiceAvailable(false);
-                label_reconciler.SetLeader(false);
-                SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
-                LOG(INFO) << "Trying to stop server, reason="
-                          << LeadershipLossReasonToString(reason);
-                server.stop();
+            *leadership_session, [&server, &admin_server, &serving_state,
+                                  &label_reconciler](auto reason) {
+                serving_state.RequestShutdown([&]() {
+                    admin_server.SetServiceAvailable(false);
+                    label_reconciler.SetLeader(false);
+                    SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
+                    LOG(INFO) << "Trying to stop server, reason="
+                              << LeadershipLossReasonToString(reason);
+                    server.stop();
+                });
             });
         if (!leadership_monitor) {
             DeactivateServingState(admin_server, label_reconciler);
@@ -510,10 +507,21 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
         auto leadership_monitor_handle = std::move(leadership_monitor.value());
 
-        async_simple::Future<coro_rpc::err_code> ec = server.async_start();
-        if (ec.hasResult()) {
+        std::optional<async_simple::Future<coro_rpc::err_code>> ec;
+        serving_state.RunIfActive([&]() { ec.emplace(server.async_start()); });
+        if (!ec.has_value()) {
+            StopLeadershipMonitor(leadership_monitor_handle);
+            DeactivateServingState(admin_server, label_reconciler);
+            EnterStandbyMode(admin_server, *standby_controller,
+                             accept_standby_runtime_updates, std::nullopt);
+            LogLeadershipReleaseWarning(
+                "serve startup cancellation",
+                leader_coordinator.ReleaseLeadership(*leadership_session));
+            continue;
+        }
+        if (ec->hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
-                       << ec.result().value();
+                       << ec->result().value();
             StopLeadershipMonitor(leadership_monitor_handle);
             DeactivateServingState(admin_server, label_reconciler);
             EnterStandbyMode(admin_server, *standby_controller,
@@ -528,24 +536,22 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
 
         ErrorCode publish_ready_err = ErrorCode::OK;
-        {
-            std::lock_guard<std::mutex> lock(serve_state_mutex);
-            if (!serve_shutdown_requested) {
-                // Election ownership is acquired before promotion and server
-                // startup, but the endpoint must not become discoverable until
-                // the listener and the restored service are ready. Serialize
-                // publication with leadership loss so a stopped server cannot
-                // be advertised by a racing serve transition.
-                publish_ready_err =
-                    leader_coordinator.PublishServiceReady(*leadership_session);
-                if (publish_ready_err == ErrorCode::OK) {
+        if (serving_state.IsActive()) {
+            // The backend call can take several seconds. Keep it outside the
+            // transition gate so leadership loss can stop the listener
+            // promptly.
+            publish_ready_err =
+                leader_coordinator.PublishServiceReady(*leadership_session);
+            if (publish_ready_err == ErrorCode::OK) {
+                serving_state.RunIfActive([&]() {
                     ActivateServingState(admin_server, wrapped_master_service,
                                          label_reconciler);
-                } else {
-                    serve_shutdown_requested = true;
+                });
+            } else {
+                serving_state.RequestShutdown([&]() {
                     DeactivateServingState(admin_server, label_reconciler);
                     server.stop();
-                }
+                });
             }
         }
 
@@ -553,7 +559,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             LOG(ERROR) << "Failed to publish master service readiness: "
                        << toString(publish_ready_err);
             StopLeadershipMonitor(leadership_monitor_handle);
-            auto server_err = std::move(ec).get();
+            auto server_err = std::move(ec.value()).get();
             LOG(ERROR) << "Master service stopped after readiness failure: "
                        << server_err;
             EnterStandbyMode(admin_server, *standby_controller,
@@ -568,7 +574,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
-        auto server_err = std::move(ec).get();
+        auto server_err = std::move(ec.value()).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);

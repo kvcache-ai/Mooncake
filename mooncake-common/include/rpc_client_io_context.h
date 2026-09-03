@@ -58,19 +58,6 @@ class RpcClientPool {
         return client_pool_;
     }
 
-    void Reconfigure(PoolConfig config) {
-        std::lock_guard<std::shared_mutex> lock(mutex_);
-        // Address replacement supersedes background recovery of the old host.
-        config.host_alive_detect_duration = std::chrono::seconds(0);
-        config_ = std::move(config);
-        if (client_pool_) {
-            // Requests already in flight retain the old pool through their
-            // shared_ptr. New requests use a fresh pool with the new policy.
-            client_pool_ =
-                ClientPool::create(address_, config_, io_context_pool_);
-        }
-    }
-
    private:
     mutable std::shared_mutex mutex_;
     coro_io::io_context_pool& io_context_pool_;

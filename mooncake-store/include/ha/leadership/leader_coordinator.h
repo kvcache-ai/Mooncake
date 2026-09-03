@@ -51,5 +51,20 @@ class LeaderCoordinator {
     virtual ErrorCode ReleaseLeadership(const LeadershipSession& session) = 0;
 };
 
+inline tl::expected<std::optional<MasterView>, ErrorCode>
+ReadCurrentViewOrWaitForReady(LeaderCoordinator& coordinator,
+                              std::chrono::milliseconds timeout) {
+    auto current_view = coordinator.ReadCurrentView();
+    if (!current_view || current_view->has_value()) {
+        return current_view;
+    }
+
+    auto ready_view = coordinator.WaitForViewChange(std::nullopt, timeout);
+    if (!ready_view) {
+        return tl::make_unexpected(ready_view.error());
+    }
+    return ready_view->current_view;
+}
+
 }  // namespace ha
 }  // namespace mooncake

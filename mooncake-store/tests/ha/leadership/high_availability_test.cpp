@@ -118,7 +118,7 @@ class FakeLeaderCoordinator : public ha::LeaderCoordinator {
 
     tl::expected<std::optional<ha::MasterView>, ErrorCode> ReadCurrentView()
         override {
-        return std::optional<ha::MasterView>{};
+        return current_view_;
     }
 
     tl::expected<ha::AcquireLeadershipResult, ErrorCode> TryAcquireLeadership(
@@ -137,8 +137,10 @@ class FakeLeaderCoordinator : public ha::LeaderCoordinator {
 
     tl::expected<ha::ViewChangeResult, ErrorCode> WaitForViewChange(
         std::optional<ViewVersionId> /*known_version*/,
-        std::chrono::milliseconds /*timeout*/) override {
-        return ha::ViewChangeResult{};
+        std::chrono::milliseconds timeout) override {
+        ++wait_calls_;
+        last_wait_timeout_ = timeout;
+        return wait_result_;
     }
 
     tl::expected<std::unique_ptr<ha::LeadershipMonitorHandle>, ErrorCode>
@@ -153,8 +155,25 @@ class FakeLeaderCoordinator : public ha::LeaderCoordinator {
         return ErrorCode::OK;
     }
 
+    void SetCurrentView(std::optional<ha::MasterView> view) {
+        current_view_ = std::move(view);
+    }
+
+    void SetWaitResult(ha::ViewChangeResult result) {
+        wait_result_ = std::move(result);
+    }
+
+    size_t wait_calls() const { return wait_calls_; }
+    std::chrono::milliseconds last_wait_timeout() const {
+        return last_wait_timeout_;
+    }
+
    private:
     ha::LeadershipSession session_;
+    std::optional<ha::MasterView> current_view_;
+    ha::ViewChangeResult wait_result_;
+    size_t wait_calls_{0};
+    std::chrono::milliseconds last_wait_timeout_{0};
 };
 
 class SupervisorChildProcess {
@@ -313,6 +332,76 @@ TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
     auto ping = service.Ping(generate_uuid());
     ASSERT_TRUE(ping.has_value());
     EXPECT_EQ(kAcquiredView, ping->view_version_id);
+}
+
+TEST_F(HighAvailabilityTest, InitialDiscoveryWaitsForReadyView) {
+    FakeLeaderCoordinator coordinator(/*view_version=*/42);
+    const ha::MasterView ready_view{
+        .leader_address = "ready-leader",
+        .view_version = 43,
+    };
+    coordinator.SetWaitResult(ha::ViewChangeResult{
+        .changed = true,
+        .timed_out = false,
+        .current_view = ready_view,
+    });
+
+    constexpr auto kTimeout = std::chrono::milliseconds(1234);
+    auto result = ha::ReadCurrentViewOrWaitForReady(coordinator, kTimeout);
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->has_value());
+    EXPECT_EQ(result->value().leader_address, ready_view.leader_address);
+    EXPECT_EQ(result->value().view_version, ready_view.view_version);
+    EXPECT_EQ(coordinator.wait_calls(), 1u);
+    EXPECT_EQ(coordinator.last_wait_timeout(), kTimeout);
+}
+
+TEST_F(HighAvailabilityTest, InitialDiscoveryReturnsEmptyAfterTimeout) {
+    FakeLeaderCoordinator coordinator(/*view_version=*/42);
+    coordinator.SetWaitResult(ha::ViewChangeResult{
+        .changed = false,
+        .timed_out = true,
+        .current_view = std::nullopt,
+    });
+
+    auto result = ha::ReadCurrentViewOrWaitForReady(
+        coordinator, std::chrono::milliseconds(25));
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->has_value());
+    EXPECT_EQ(coordinator.wait_calls(), 1u);
+}
+
+TEST_F(HighAvailabilityTest, ServingStateLossDoesNotWaitForPublication) {
+    ha::detail::ServingStateGate serving_state;
+    std::promise<void> publication_started;
+    std::promise<void> finish_publication;
+    auto finish_publication_future = finish_publication.get_future();
+    std::atomic<bool> activated{false};
+    std::atomic<bool> stopped{false};
+
+    auto publication = std::async(std::launch::async, [&]() {
+        publication_started.set_value();
+        finish_publication_future.wait();
+        return serving_state.RunIfActive(
+            [&]() { activated.store(true, std::memory_order_release); });
+    });
+    publication_started.get_future().wait();
+
+    auto leadership_loss = std::async(std::launch::async, [&]() {
+        serving_state.RequestShutdown(
+            [&]() { stopped.store(true, std::memory_order_release); });
+    });
+
+    EXPECT_EQ(leadership_loss.wait_for(std::chrono::milliseconds(500)),
+              std::future_status::ready);
+    EXPECT_TRUE(stopped.load(std::memory_order_acquire));
+
+    finish_publication.set_value();
+    EXPECT_FALSE(publication.get());
+    leadership_loss.get();
+    EXPECT_FALSE(activated.load(std::memory_order_acquire));
 }
 
 #ifdef STORE_USE_ETCD
@@ -707,6 +796,44 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsCurrentViewImmediately) {
     ASSERT_TRUE(result->current_view.has_value());
     EXPECT_EQ(result->current_view->view_version, session.view.view_version);
     EXPECT_LT(elapsed, std::chrono::seconds(1));
+
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+}
+
+TEST_F(HighAvailabilityTest, WaitForViewChangeObservesWarmingLeaderReady) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:2222");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto warming_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(warming_view.has_value());
+    ASSERT_FALSE(warming_view->has_value());
+
+    auto publisher = std::async(std::launch::async, [&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        return coordinator->PublishServiceReady(session);
+    });
+
+    auto ready_view =
+        coordinator->WaitForViewChange(std::nullopt, std::chrono::seconds(5));
+    EXPECT_EQ(ErrorCode::OK, publisher.get());
+
+    ASSERT_TRUE(ready_view.has_value());
+    EXPECT_TRUE(ready_view->changed);
+    ASSERT_TRUE(ready_view->current_view.has_value());
+    EXPECT_EQ(ready_view->current_view->leader_address,
+              session.view.leader_address);
+    EXPECT_EQ(ready_view->current_view->view_version,
+              session.view.view_version);
 
     ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
 }
