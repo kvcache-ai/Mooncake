@@ -33,6 +33,7 @@
 #include "tent/runtime/admission_queue.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
+#include "tent/runtime/hp_tcp_transport_config.h"
 
 namespace mooncake {
 namespace tent {
@@ -63,11 +64,13 @@ void waitBeforeNextPoll(uint64_t poll_count);
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
-    bool derived{false};          // merged by other tasks
-    int xport_priority{0};        // transport priority (for fallback)
-    int failover_count{0};        // number of failover attempts
-    uint64_t device_mask{~0ULL};  // Device mask for quota allocation
-    std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
+    bool derived{false};                  // merged by other tasks
+    int xport_priority{0};                // transport priority (for fallback)
+    int failover_count{0};                // number of failover attempts
+    int metadata_refresh_retry_count{0};  // same-transport stale-cache retries
+    bool suppress_failover{false};        // permanent transport result
+    uint64_t device_mask{~0ULL};          // Device mask for quota allocation
+    std::string qp_pool;  // Named QP pool (RFC #2568 step 3), "" = none
     Request request;
     bool staging{false};
     bool cancel_requested{false};
@@ -84,6 +87,14 @@ struct TaskInfo {
     std::chrono::steady_clock::time_point attempt_post_time{};
     TransportType attempt_type{UNSPEC};
     bool attempt_active{false};
+    // Failure attribution for tent_task_failures_total (first failure wins):
+    // -1 = none, 0 = submit-stage, 1 = poll-stage. Set where the failure
+    // originates and never overwritten, so a poll-observed failure stays
+    // "poll" even when a later failover resubmit is synchronously rejected.
+    // Invariant for integrators: mark submit failures before any recovery
+    // attempt, so a task that recovers and later fails at poll still
+    // attributes its root cause to submit.
+    int8_t failure_stage{-1};
 
     TaskInfo() = default;
 
@@ -93,6 +104,8 @@ struct TaskInfo {
           derived(other.derived),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
+          metadata_refresh_retry_count(other.metadata_refresh_retry_count),
+          suppress_failover(other.suppress_failover),
           device_mask(other.device_mask),
           qp_pool(other.qp_pool),
           request(other.request),
@@ -105,7 +118,8 @@ struct TaskInfo {
           post_time(other.post_time),
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
-          attempt_active(other.attempt_active) {}
+          attempt_active(other.attempt_active),
+          failure_stage(other.failure_stage) {}
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -113,6 +127,8 @@ struct TaskInfo {
           derived(other.derived),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
+          metadata_refresh_retry_count(other.metadata_refresh_retry_count),
+          suppress_failover(other.suppress_failover),
           device_mask(other.device_mask),
           qp_pool(std::move(other.qp_pool)),
           request(std::move(other.request)),
@@ -125,7 +141,8 @@ struct TaskInfo {
           post_time(other.post_time),
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
-          attempt_active(other.attempt_active) {}
+          attempt_active(other.attempt_active),
+          failure_stage(other.failure_stage) {}
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -134,6 +151,8 @@ struct TaskInfo {
             derived = other.derived;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
+            metadata_refresh_retry_count = other.metadata_refresh_retry_count;
+            suppress_failover = other.suppress_failover;
             device_mask = other.device_mask;
             qp_pool = other.qp_pool;
             request = other.request;
@@ -149,6 +168,7 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+            failure_stage = other.failure_stage;
         }
         return *this;
     }
@@ -160,6 +180,8 @@ struct TaskInfo {
             derived = other.derived;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
+            metadata_refresh_retry_count = other.metadata_refresh_retry_count;
+            suppress_failover = other.suppress_failover;
             device_mask = other.device_mask;
             qp_pool = std::move(other.qp_pool);
             request = std::move(other.request);
@@ -175,6 +197,7 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+            failure_stage = other.failure_stage;
         }
         return *this;
     }
@@ -491,6 +514,7 @@ class TransferEngineImpl {
 
    private:
     std::shared_ptr<Config> conf_;
+    HpTcpTransportConfig hp_tcp_transport_config_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;

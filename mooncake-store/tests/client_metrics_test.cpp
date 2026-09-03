@@ -11,9 +11,11 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_metric.h"
+#include "environment_variables.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 #include "utils.h"
+#include "version.h"
 
 namespace mooncake::test {
 namespace {
@@ -205,6 +207,10 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     EXPECT_TRUE(summary.find("ExistKey: count=1") != std::string::npos);
     EXPECT_TRUE(summary.find("get_buffer: count=1") != std::string::npos);
     EXPECT_TRUE(summary.find("put_batch: count=1") != std::string::npos);
+    // The build is named inline so the summary alone identifies the binary.
+    EXPECT_TRUE(summary.find("Version: " + GetMooncakeStoreVersion()) !=
+                std::string::npos);
+    EXPECT_TRUE(summary.find(MOONCAKE_DISPLAY_VERSION) != std::string::npos);
 
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;
 }
@@ -291,15 +297,18 @@ TEST_F(ClientMetricsTest, ZeroSumHybridHistogramPreservesExistingMetrics) {
 }
 
 TEST_F(ClientMetricsTest, BandwidthSummaryRespectsEnvFlag) {
-    setenv("MC_STORE_CLIENT_METRIC_BANDWIDTH", "0", 1);
+    ScopedEnv bandwidth_env(
+        ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH
+            .name);
+    setenv(
+        ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH.name,
+        "0", 1);
     auto metrics = ClientMetric::Create();
     ASSERT_NE(metrics, nullptr);
 
     metrics->transfer_metric.total_read_bytes.inc(1024);
     std::string summary = metrics->summary_metrics();
     EXPECT_TRUE(summary.find("Average Read Throughput:") == std::string::npos);
-
-    unsetenv("MC_STORE_CLIENT_METRIC_BANDWIDTH");
 }
 
 TEST_F(ClientMetricsTest, SummaryCanOmitMasterRpcMetrics) {
@@ -407,6 +416,62 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
         metrics.serialize(serialized);
         verify(serialized);
     }
+}
+
+TEST_F(ClientMetricsTest, BuildInfoMetricIsSerialized) {
+    ClientMetric metrics(0);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    ASSERT_NE(serialized.find("mooncake_build_info{"), std::string::npos)
+        << "build info metric missing from serialized output";
+    // Label order inside the series is not asserted: only the presence of both
+    // labels with the compiled-in values matters for scraping and grouping.
+    EXPECT_NE(serialized.find("version=\"" + GetMooncakeStoreVersion() + "\""),
+              std::string::npos)
+        << "RPC handshake version missing from build info labels";
+    EXPECT_NE(serialized.find("display_version=\"" +
+                              std::string(MOONCAKE_DISPLAY_VERSION) + "\""),
+              std::string::npos)
+        << "display version missing from build info labels";
+
+    // Info-style metric: the value is fixed at 1, so exactly one series is
+    // emitted and its value follows the closing brace of the label set.
+    EXPECT_EQ(CountOccurrences(serialized, "mooncake_build_info{"), 1u);
+    const auto metric_pos = serialized.find("mooncake_build_info{");
+    const auto brace_end = serialized.find('}', metric_pos);
+    ASSERT_NE(brace_end, std::string::npos);
+    const auto line_end = serialized.find('\n', brace_end);
+    const std::string value_part =
+        serialized.substr(brace_end + 1, line_end == std::string::npos
+                                             ? std::string::npos
+                                             : line_end - brace_end - 1);
+    EXPECT_NE(value_part.find('1'), std::string::npos)
+        << "build info value should be 1, got:" << value_part;
+}
+
+TEST_F(ClientMetricsTest, BuildInfoMetricKeepsCallerLabels) {
+    // Caller supplied labels identify the instance; the version labels are
+    // added on top of them rather than replacing them.
+    std::map<std::string, std::string> static_labels = {
+        {"instance_id", "12345"}, {"cluster_id", "cluster1"}};
+    ClientMetric metrics(0, static_labels);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    const auto metric_pos = serialized.find("mooncake_build_info{");
+    ASSERT_NE(metric_pos, std::string::npos);
+    const auto brace_end = serialized.find('}', metric_pos);
+    ASSERT_NE(brace_end, std::string::npos);
+    const std::string labels =
+        serialized.substr(metric_pos, brace_end - metric_pos);
+
+    EXPECT_NE(labels.find("instance_id=\"12345\""), std::string::npos);
+    EXPECT_NE(labels.find("cluster_id=\"cluster1\""), std::string::npos);
+    EXPECT_NE(labels.find("version=\"" + GetMooncakeStoreVersion() + "\""),
+              std::string::npos);
 }
 
 TEST_F(ClientMetricsTest, HttpMetricsEndpointsReturnData) {
@@ -543,6 +608,16 @@ TEST_F(ClientMetricsTest, HttpMetricsEndpointReturns503WhenMetricsDisabled) {
         FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/metrics");
     EXPECT_EQ(metrics.status, 503);
     EXPECT_NE(metrics.body.find("metrics not available"), std::string::npos);
+
+    // `/version` is served without touching the metric collector, so disabling
+    // metrics must not take it down along with `/metrics`.
+    auto version =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/version");
+    EXPECT_EQ(version.status, 200);
+    EXPECT_NE(
+        version.body.find("\"version\":\"" + GetMooncakeStoreVersion() + "\""),
+        std::string::npos);
+    EXPECT_NE(version.body.find("display_version"), std::string::npos);
 
     EXPECT_EQ(client->tearDownAll(), 0);
 }

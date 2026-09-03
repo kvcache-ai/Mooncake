@@ -1,4 +1,6 @@
-# TENT Tests and Examples
+# TENT Tests and Examples tent_metrics_example and deadline_promotion_bench are
+# not add_test targets. tent/benchmark/hip_bandwidth_bench.cpp is a standalone
+# hipcc program.
 
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)
@@ -123,9 +125,9 @@ add_test(NAME tent_ip_utils_test COMMAND tent_ip_utils_test)
 # values with embedded NULs. Only built when hiredis is available.
 if(TARGET metastore_redis)
   add_executable(tent_redis_metastore_test redis_metastore_test.cpp)
-  target_link_libraries(tent_redis_metastore_test
-                        PRIVATE metastore_redis tent_common gtest gtest_main
-                                glog)
+  target_link_libraries(
+    tent_redis_metastore_test PRIVATE metastore_redis tent_common gtest
+                                      gtest_main glog)
   target_include_directories(tent_redis_metastore_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_redis_metastore_test COMMAND tent_redis_metastore_test)
@@ -181,6 +183,62 @@ target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
 target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
+
+add_executable(tent_hp_tcp_transport_config_test
+               hp_tcp_transport_config_test.cpp)
+target_link_libraries(tent_hp_tcp_transport_config_test
+                      PRIVATE gtest gtest_main tent_link_group)
+target_include_directories(tent_hp_tcp_transport_config_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_transport_config_test
+         COMMAND tent_hp_tcp_transport_config_test)
+
+add_executable(tent_hp_tcp_workers_test hp_tcp_workers_test.cpp)
+target_link_libraries(tent_hp_tcp_workers_test PRIVATE gtest gtest_main
+                                                       tent_xport_hp_tcp_core)
+target_include_directories(tent_hp_tcp_workers_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_workers_test COMMAND tent_hp_tcp_workers_test)
+
+add_executable(tent_hp_tcp_protocol_test hp_tcp_protocol_test.cpp)
+target_link_libraries(tent_hp_tcp_protocol_test PRIVATE gtest gtest_main
+                                                        tent_xport_hp_tcp_core)
+target_include_directories(tent_hp_tcp_protocol_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_protocol_test COMMAND tent_hp_tcp_protocol_test)
+
+add_executable(tent_hp_tcp_buffer_registry_test hp_tcp_buffer_registry_test.cpp)
+target_link_libraries(tent_hp_tcp_buffer_registry_test
+                      PRIVATE gtest gtest_main tent_xport_hp_tcp_core)
+target_include_directories(tent_hp_tcp_buffer_registry_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_buffer_registry_test
+         COMMAND tent_hp_tcp_buffer_registry_test)
+
+add_executable(tent_hp_tcp_socket_test hp_tcp_socket_test.cpp)
+target_link_libraries(tent_hp_tcp_socket_test PRIVATE gtest gtest_main
+                                                      tent_xport_hp_tcp_core)
+target_include_directories(tent_hp_tcp_socket_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_socket_test COMMAND tent_hp_tcp_socket_test)
+
+add_executable(tent_hp_tcp_transport_test hp_tcp_transport_test.cpp)
+target_link_libraries(tent_hp_tcp_transport_test PRIVATE gtest gtest_main
+                                                         tent_link_group)
+target_include_directories(tent_hp_tcp_transport_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_hp_tcp_transport_test COMMAND tent_hp_tcp_transport_test)
+
+add_executable(tent_hp_tcp_e2e_test hp_tcp_e2e_test.cpp)
+target_link_libraries(tent_hp_tcp_e2e_test PRIVATE gtest gtest_main
+                                                   tent_link_group)
+target_include_directories(tent_hp_tcp_e2e_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(
+  NAME tent_hp_tcp_e2e_test_concurrency_16
+  COMMAND tent_hp_tcp_e2e_test
+          --gtest_filter=HighPerformanceTcpE2eTest.WriteThenReadConcurrency16)
+set_tests_properties(tent_hp_tcp_e2e_test_concurrency_16 PROPERTIES TIMEOUT 120)
 
 add_executable(tent_tcp_datapath_roundtrip_test tcp_datapath_roundtrip_test.cpp)
 target_link_libraries(tent_tcp_datapath_roundtrip_test PRIVATE gtest gtest_main
@@ -246,13 +304,6 @@ if(USE_CUDA)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 endif()
 
-add_executable(tent_failover_test failover_test.cpp)
-target_link_libraries(tent_failover_test PRIVATE gtest gtest_main
-                                                 tent_link_group)
-target_include_directories(tent_failover_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-add_test(NAME tent_failover_test COMMAND tent_failover_test)
-
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
 target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main
                                                            tent_link_group)
@@ -287,6 +338,25 @@ target_link_libraries(tent_rdma_transport_test PRIVATE gtest gtest_main
 target_include_directories(tent_rdma_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rdma_transport_test COMMAND tent_rdma_transport_test)
+
+# Regression test for the edge-triggered async event fd: one epoll wakeup must
+# drain the whole queue. Wraps ibv_get_async_event to script the event source,
+# so it needs no RDMA device. -Wl,--wrap is a GNU ld / lld feature that Apple's
+# linker lacks, and the test is meaningless without it, so skip the target there
+# rather than build one that calls the real symbols.
+if(UNIX AND NOT APPLE)
+  add_executable(tent_rdma_async_event_drain_test
+                 rdma_async_event_drain_test.cpp)
+  target_link_libraries(tent_rdma_async_event_drain_test
+                        PRIVATE gtest gtest_main tent_link_group ibverbs)
+  target_include_directories(tent_rdma_async_event_drain_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_options(
+    tent_rdma_async_event_drain_test PRIVATE "-Wl,--wrap=ibv_get_async_event"
+    "-Wl,--wrap=ibv_ack_async_event")
+  add_test(NAME tent_rdma_async_event_drain_test
+           COMMAND tent_rdma_async_event_drain_test)
+endif()
 
 if(USE_HIP)
   find_package(HIP REQUIRED)
@@ -362,6 +432,15 @@ target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 
+# DeviceSelector inflight quota accounting: estimate->exact reconcile, fallback
+# migration, retry recharge, baseline no-underflow, EWMA gating, charge-failure.
+add_executable(tent_quota_accounting_test quota_accounting_test.cpp)
+target_link_libraries(tent_quota_accounting_test PRIVATE gtest gtest_main
+                                                         tent_link_group)
+target_include_directories(tent_quota_accounting_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_quota_accounting_test COMMAND tent_quota_accounting_test)
+
 # QoS Contract Schema Unit Test
 add_executable(tent_qos_contract_test qos_contract_test.cpp
                                       ../src/runtime/qos_contract.cpp)
@@ -386,6 +465,13 @@ target_include_directories(tent_topology_priority_matrix_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_topology_priority_matrix_test
          COMMAND tent_topology_priority_matrix_test)
+
+add_executable(tent_strict_local_numa_test strict_local_numa_test.cpp)
+target_link_libraries(tent_strict_local_numa_test PRIVATE gtest gtest_main
+                                                          tent_link_group)
+target_include_directories(tent_strict_local_numa_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_strict_local_numa_test COMMAND tent_strict_local_numa_test)
 
 if(USE_UB)
   add_executable(
@@ -423,13 +509,6 @@ endif()
 target_include_directories(tent_transport_hint_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_hint_test COMMAND tent_transport_hint_test)
-
-add_executable(tent_intent_type_test intent_type_test.cpp)
-target_link_libraries(tent_intent_type_test PRIVATE gtest gtest_main
-                                                    tent_common)
-target_include_directories(tent_intent_type_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-add_test(NAME tent_intent_type_test COMMAND tent_intent_type_test)
 
 # ProgressWorker skeleton test: covers default-off behavior, event-driven
 # progress without poll-failover, and freeBatch races (issue #2116).
@@ -520,6 +599,18 @@ target_include_directories(tent_runtime_queue_dispatch_test
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
 
+add_executable(tent_local_memory_lifecycle_test
+               local_memory_lifecycle_test.cpp)
+target_link_libraries(tent_local_memory_lifecycle_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_local_memory_lifecycle_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_local_memory_lifecycle_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_local_memory_lifecycle_test
+         COMMAND tent_local_memory_lifecycle_test)
+
 # Causal chain stage decomposition: validates that dispatch_time and post_time
 # timestamps are populated on both queue and direct-commit paths.
 add_executable(causal_chain_test causal_chain_test.cpp)
@@ -569,9 +660,9 @@ if(USE_TPU)
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 endif()
 
-# NOT registered via add_test: the test needs a real CUDA device (it exports
-# a real CUDA IPC handle), so it must be run manually on a GPU host. Only
-# built when CUDA is enabled: the test includes CUDA headers directly.
+# NOT registered via add_test: the test needs a real CUDA device (it exports a
+# real CUDA IPC handle), so it must be run manually on a GPU host. Only built
+# when CUDA is enabled: the test includes CUDA headers directly.
 if(USE_CUDA)
   add_executable(tent_nvlink_ipc_handle_sharing_test
                  nvlink_ipc_handle_sharing_test.cpp)

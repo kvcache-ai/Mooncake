@@ -74,13 +74,24 @@ jobs:
           - variant: non-cuda
             architecture: x86_64
             artifact-prefix: nightly-non-cuda-x86
+          - variant: non-cuda
+            architecture: arm64
+            artifact-prefix: nightly-non-cuda-arm64
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       variant: ${{ matrix.variant }}
       architecture: ${{ matrix.architecture }}
-      python-versions: '["3.10", "3.12"]'
       artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+
+  tone-sglang-integration:
+    needs: build-wheels
+    uses: ./.github/workflows/integration-test.yml
+    with:
+      pr_sha: ${{ github.sha }}
+      source_run_id: ${{ github.run_id }}
+      artifact_name: nightly-cuda13-x86-py312
+    secrets: inherit
 
   build-musa:
     runs-on: ubuntu-22.04
@@ -133,7 +144,7 @@ jobs:
         run: |
           docker build -f docker/mooncake.Dockerfile \
             --build-arg PYTHON_VERSION=3.10 \
-            --build-arg EP_TORCH_VERSIONS="2.13.0" \
+            --build-arg EP_TORCH_VERSIONS="2.14.0" \
             --build-arg CLEAN_BUILD_ARTIFACTS=1 \
             -t mooncake:from-source .
 
@@ -286,6 +297,7 @@ jobs:
           cd mooncake-transfer-engine/example/http-metadata-server-python
           pip install aiohttp
           python ./bootstrap_server.py &
+          echo "NIGHTLY_METADATA_SERVER_PID=$!" >> "$GITHUB_ENV"
           sleep 2
 
       - name: Run CTest unit tests
@@ -356,12 +368,102 @@ jobs:
           MC_METADATA_SERVER: http://127.0.0.1:8080/metadata
           RUN_TESTS_METADATA_SERVER_MODE: external
           DEFAULT_KV_LEASE_TTL: "500"
-          TEST_SSD_OFFLOAD_IN_EVICT: "1"
-          TEST_PROMOTION_ON_HIT: "1"
           TEST_CXL: "1"
         run: |
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           bash scripts/run_tests.sh
+
+      - name: Run Python API end-to-end tests
+        env:
+          MOONCAKE_MASTER: "127.0.0.1:50051"
+          MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+          MOONCAKE_PROTOCOL: "tcp"
+          LOCAL_HOSTNAME: "127.0.0.1"
+        run: |
+          export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+          kill "$NIGHTLY_METADATA_SERVER_PID" 2>/dev/null || true
+          for _ in {1..50}; do
+            if ! kill -0 "$NIGHTLY_METADATA_SERVER_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          if kill -0 "$NIGHTLY_METADATA_SERVER_PID" 2>/dev/null; then
+            kill -KILL "$NIGHTLY_METADATA_SERVER_PID"
+          fi
+          mkdir -p /tmp/mooncake_storage
+          mooncake_master \
+            --default_kv_lease_ttl=500 \
+            --eviction_high_watermark_ratio=0.95 \
+            --cluster_id=nightly_test_cluster \
+            --port 50051 \
+            --enable_http_metadata_server=true &
+          master_pid=$!
+          trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
+          sleep 3
+          python scripts/test_tensor_api.py -n 1
+          python scripts/test_async_store.py
+          python scripts/test_copy_move_api.py
+          python scripts/test_drain_http_api.py --timeout-sec 90
+
+      - name: Run RPC Communicator Bandwidth Test
+        run: |
+          rpc_server_pid=""
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ -n "$rpc_server_pid" ]; then
+              kill "$rpc_server_pid" 2>/dev/null || true
+              wait "$rpc_server_pid" 2>/dev/null || true
+            fi
+            if [ "$status" -ne 0 ]; then
+              cat "$RUNNER_TEMP/rpc-server.log" 2>/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          python -u mooncake-transfer-engine/tests/rpc_communicator_test.py \
+            server --url 127.0.0.1:9004 --data-size 1 \
+            >"$RUNNER_TEMP/rpc-server.log" 2>&1 &
+          rpc_server_pid=$!
+
+          rpc_ready=false
+          for _ in {1..50}; do
+            if ! kill -0 "$rpc_server_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/rpc-server.log"
+              echo "::error::RPC communicator server exited before becoming ready"
+              exit 1
+            fi
+            if ss -H -ltn 'sport = :9004' | grep -q .; then
+              rpc_ready=true
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$rpc_ready" != true ]; then
+            cat "$RUNNER_TEMP/rpc-server.log"
+            echo "::error::RPC communicator server did not become ready within 5 seconds"
+            exit 1
+          fi
+
+          client_rc=0
+          timeout 10 python -u \
+            mooncake-transfer-engine/tests/rpc_communicator_test.py \
+            client --url 127.0.0.1:9004 --threads 2 --data-size 1 \
+            >"$RUNNER_TEMP/rpc-client.log" 2>&1 || \
+            client_rc=$?
+          cat "$RUNNER_TEMP/rpc-client.log"
+          if [ "$client_rc" -ne 0 ] && [ "$client_rc" -ne 124 ]; then
+            echo "::error::RPC communicator client failed with exit code $client_rc"
+            exit "$client_rc"
+          fi
+          if ! grep -q '^bandwidth:' "$RUNNER_TEMP/rpc-client.log"; then
+            cat "$RUNNER_TEMP/rpc-server.log"
+            echo "::error::RPC communicator did not complete a successful transfer"
+            exit 1
+          fi
+        shell: bash
 
   nightly-coverage:
     runs-on: ubuntu-22.04
@@ -527,6 +629,7 @@ jobs:
     needs:
       - version-stamp
       - build-wheels
+      - tone-sglang-integration
       - build-musa
       - build-docker
       - ascend-test

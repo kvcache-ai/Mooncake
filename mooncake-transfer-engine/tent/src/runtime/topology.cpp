@@ -419,6 +419,13 @@ const Topology::NicEntry* Topology::getNicEntry(NicID id) const {
     return &nic_list_[id];
 }
 
+bool Topology::isCrossNuma(const MemEntry& mem, NicID nic_id) const {
+    if (mem.numa_node < 0) return false;
+    const auto* nic = getNicEntry(nic_id);
+    if (!nic || nic->numa_node < 0) return false;
+    return nic->numa_node != mem.numa_node;
+}
+
 const Topology::MemEntry* Topology::getMemEntry(MemID id) const {
     if (id < 0 || id >= (int)mem_list_.size()) return nullptr;
     return &mem_list_[id];

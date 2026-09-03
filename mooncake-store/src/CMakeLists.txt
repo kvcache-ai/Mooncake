@@ -8,6 +8,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
+    config/distributed_storage_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     utils/file_util.cpp)
@@ -19,6 +20,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
+    segment/region_driver.cpp
     segment.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
@@ -43,6 +45,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.cpp
     ha/snapshot/batch_oplog/writer.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.cpp
+    ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.cpp
     ha/snapshot/snapshot_maintenance_lease.cpp
     ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/local_ssd_codec.cpp
@@ -84,11 +87,15 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    config/registered_pinned_memory_config.cpp
     registered_pinned_memory.cpp
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    config/client_metric_config.cpp
     config/file_storage_config.cpp
+    config/client_auto_port_config.cpp
+    config/local_hot_cache_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -106,9 +113,46 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
 endif()
-
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
+
+# RISC-V toolchains may implement 16-byte atomic operations in libatomic rather
+# than emitting native instructions. Boost.Lockfree uses these operations in the
+# Store master, so detect and propagate the runtime library in RISC-V mode.
+if(USE_RISCV)
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles(
+    "
+alignas(16) volatile unsigned __int128 value = 0;
+int main(int argc, char**) {
+  __atomic_store_n(&value, static_cast<unsigned __int128>(argc),
+                   __ATOMIC_SEQ_CST);
+  return static_cast<int>(__atomic_load_n(&value, __ATOMIC_SEQ_CST));
+}
+"
+    MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
+  if(NOT MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
+    set(CMAKE_REQUIRED_LIBRARIES_SAVE ${CMAKE_REQUIRED_LIBRARIES})
+    set(CMAKE_REQUIRED_LIBRARIES atomic)
+    check_cxx_source_compiles(
+      "
+alignas(16) volatile unsigned __int128 value = 0;
+int main(int argc, char**) {
+  __atomic_store_n(&value, static_cast<unsigned __int128>(argc),
+                   __ATOMIC_SEQ_CST);
+  return static_cast<int>(__atomic_load_n(&value, __ATOMIC_SEQ_CST));
+}
+"
+      MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
+    set(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES_SAVE})
+    if(MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
+      list(APPEND EXTRA_LIBS atomic)
+      message(STATUS "16-byte atomics: using libatomic")
+    else()
+      message(FATAL_ERROR "16-byte atomic operations are not supported")
+    endif()
+  endif()
+endif()
 
 # Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)
@@ -299,12 +343,13 @@ check_pie_supported(LANGUAGES CXX)
 
 string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 
-# Store Client sources call GPU runtime APIs directly. Detect the available
-# runtime independently from the Transfer Engine feature flags so that each
-# target below can declare its own compile and link requirements.
-find_package(CUDAToolkit QUIET)
-if(NOT CUDAToolkit_FOUND)
-  find_package(hip QUIET)
+# Store Client accelerator staging follows the explicitly selected build
+# backend. In particular, non-CUDA wheels are built in a CUDA toolchain image,
+# so SDK presence must not enable CUDA support by itself.
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+elseif(USE_HIP)
+  find_package(hip REQUIRED)
 endif()
 
 # Sources used by both the Master and Client sides of Store.
@@ -413,13 +458,13 @@ endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_client_objects build_etcd_wrapper)
 endif()
-if(CUDAToolkit_FOUND)
-  message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
+if(USE_CUDA)
+  message(STATUS "mooncake_store: CUDA enabled, enabling D2H staging")
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_CUDA)
   target_include_directories(mooncake_store_client_objects
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-elseif(hip_FOUND)
-  message(STATUS "mooncake_store: HIP detected, enabling D2H staging")
+elseif(USE_HIP)
+  message(STATUS "mooncake_store: HIP enabled, enabling D2H staging")
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_HIP)
 endif()
 if(USE_ASCEND
@@ -493,9 +538,9 @@ if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_link_libraries(mooncake_store PUBLIC Mooncake::liburing)
 endif()
-if(CUDAToolkit_FOUND)
+if(USE_CUDA)
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
-elseif(hip_FOUND)
+elseif(USE_HIP)
   target_link_libraries(mooncake_store PRIVATE hip::host)
 endif()
 if(USE_ASCEND
@@ -549,12 +594,12 @@ set_target_properties(mooncake_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   mooncake_client PRIVATE mooncake_store transfer_engine asio_shared
                           gflags::gflags yalantinglibs::yalantinglibs)
-if(CUDAToolkit_FOUND)
+if(USE_CUDA)
   target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
   target_include_directories(mooncake_client
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(mooncake_client PRIVATE CUDA::cudart)
-elseif(hip_FOUND)
+elseif(USE_HIP)
   target_compile_definitions(mooncake_client PRIVATE USE_HIP)
   target_link_libraries(mooncake_client PRIVATE hip::host)
 endif()

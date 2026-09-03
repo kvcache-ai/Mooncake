@@ -55,6 +55,7 @@ constexpr uint8_t kRedisDefaultDbIndex = 0;
 // pass or two and a healthy-but-inflight batch reports PENDING (which resets
 // the counter), so only a permanently failing poll or queue retire gets here.
 constexpr size_t kMaxReclaimAttempts = 4096;
+constexpr int kMaxHpTcpMetadataRefreshRetries = 1;
 }  // namespace
 
 struct Batch {
@@ -336,6 +337,7 @@ Status TransferEngineImpl::setupLocalSegment() {
 }
 
 Status TransferEngineImpl::construct() {
+    CHECK_STATUS(ParseHpTcpTransportConfig(*conf_, &hp_tcp_transport_config_));
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
 
@@ -343,8 +345,18 @@ Status TransferEngineImpl::construct() {
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
+    // TCP SendData/RecvData copies are offloaded, but the RPC io_context still
+    // reads the full attachment. One thread serializes concurrent bulk TCP.
+    // Leave RDMA-only at 1; when TCP is on and the user did not set
+    // rpc_server_threads, use several so attachments can be read in parallel.
     size_t rpc_server_threads = 1;
-    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, 1, rpc_server_threads));
+    const size_t rpc_threads_default =
+        conf_->get("transports/tcp/enable", false)
+            ? std::min<size_t>(
+                  8, std::max<size_t>(4, std::thread::hardware_concurrency()))
+            : 1;
+    CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, rpc_threads_default,
+                                               rpc_server_threads));
     merge_requests_ = conf_->get("merge_requests", true);
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     enable_auto_failover_on_poll_ =
@@ -416,11 +428,30 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(loadTransports());
 
     std::string transport_string;
-    for (auto& transport : transport_list_) {
+    for (size_t transport_index = 0; transport_index < transport_list_.size();
+         ++transport_index) {
+        auto& transport = transport_list_[transport_index];
         if (transport) {
             auto status = transport->install(local_segment_name_, metadata_,
                                              topology_, conf_);
             if (!status.ok()) {
+                if (hp_tcp_transport_config_.enabled &&
+                    transport_index ==
+                        static_cast<size_t>(TransportType::HP_TCP)) {
+                    // HP TCP is explicitly required, so a failed install is a
+                    // construction failure rather than an optional-transport
+                    // skip. Unwind the already-started control service and
+                    // any preceding transports immediately; the destructor's
+                    // later deconstruct() call is intentionally idempotent.
+                    const Status cleanup = deconstruct();
+                    if (!cleanup.ok()) {
+                        LOG(ERROR)
+                            << "Failed to unwind TENT after required HP TCP "
+                               "install failure: "
+                            << cleanup.ToString();
+                    }
+                    return status;
+                }
                 LOG(WARNING) << "Transport " << transport->getName()
                              << " skipped: " << status.ToString();
                 transport = nullptr;
@@ -513,6 +544,16 @@ Status TransferEngineImpl::deconstruct() {
     // issue a final no-op wake while their workers are joining.
     if (progress_worker_) {
         progress_worker_->stop();
+    }
+
+    for (auto& transport : transport_list_) {
+        if (!transport) continue;
+        const Status status = transport->quiesce();
+        if (!status.ok()) {
+            LOG(ERROR) << "Transport " << transport->getName()
+                       << " quiesce failed during teardown: "
+                       << status.ToString();
+        }
     }
 
     // Destroy staging_proxy_ first: its destructor calls back into
@@ -700,15 +741,19 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = SHM;
         else if (transport_list_[RDMA])
             options.type = RDMA;
-        else
+        else if (transport_list_[TCP])
             options.type = TCP;
+        else
+            options.type = HP_TCP;
     } else {
         if (transport_list_[MNNVL])
             options.type = MNNVL;
         else if (transport_list_[RDMA])
             options.type = RDMA;
-        else
+        else if (transport_list_[TCP])
             options.type = TCP;
+        else
+            options.type = HP_TCP;
     }
     return allocateLocalMemory(addr, size, options);
 }
@@ -720,6 +765,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = RDMA;
         else if (transport_list_[TCP])
             options.type = TCP;
+        else if (transport_list_[HP_TCP])
+            options.type = HP_TCP;
         else
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
@@ -744,12 +791,22 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
          ++it) {
         if (it->addr == addr) {
             auto status = it->transport->freeLocalMemory(addr, it->size);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Failed to free local memory, addr=" << addr
+                    << ", size=" << it->size << ": " << status.ToString();
+                return status;
+            }
             allocated_memory_.erase(it);
-            return status;
+            return Status::OK();
         }
     }
     return Status::InvalidArgument("Address region not registered" LOC_MARK);
 }
+
+// Forward declaration: getTypeEnum() is defined below but is needed by the
+// registerLocalMemory location-override validation.
+static MemoryType getTypeEnum(const std::string& type);
 
 Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
                                                Permission permission) {
@@ -783,6 +840,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
+    if (transport_list_[HP_TCP]) result.push_back(HP_TCP);
     if (transport_list_[GDS]) result.push_back(GDS);
     if (transport_list_[MPCOMM]) result.push_back(MPCOMM);
     if (transport_list_[TPU]) result.push_back(TPU);
@@ -831,17 +889,61 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             desc.regions = coalesceRegions(entries);
         }
         desc.ref_count = 1;
-        if (options.location != kWildcardLocation)
-            desc.location = options.location;
+        // The probe is the source of truth for transport selection: it
+        // classifies the memory (cpu/cuda/...). A caller-supplied location
+        // may refine the probe within the SAME memory type (e.g. probe
+        // "cpu:0" -> caller "cpu:1"), but must not replace it with an
+        // incompatible or unknown type. Classic TE encodes NUMA-segmented
+        // host DRAM as "segments:4096:0,1"; that is a TE dialect TENT's
+        // type system does not understand, and blindly adopting it would
+        // make getTypeEnum() return MTYPE_UNKNOWN and break transport
+        // selection. Validate before overriding: keep the probe when the
+        // caller is a wildcard, unknown, or a different type.
+        if (options.location != kWildcardLocation &&
+            !options.location.empty()) {
+            auto probed_type =
+                getTypeEnum(LocationParser(desc.location).type());
+            auto caller_type =
+                getTypeEnum(LocationParser(options.location).type());
+            if (caller_type == MTYPE_UNKNOWN) {
+                LOG(WARNING)
+                    << "Ignoring unknown caller location '" << options.location
+                    << "' for registered memory at " << addr_list[i]
+                    << " (probed '" << desc.location
+                    << "'); keeping probed location";
+            } else if (caller_type != probed_type) {
+                LOG(WARNING) << "Ignoring caller location '" << options.location
+                             << "' (type mismatch with probed '"
+                             << desc.location << "') for registered memory at "
+                             << addr_list[i] << "; keeping probed location";
+            } else {
+                desc.location = options.location;
+            }
+        }
         if (options.internal) desc.internal = options.internal;
         desc_list.push_back(std::move(desc));
     }
 
     auto status = local_segment_tracker_->addInBatch(
         desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
+            const bool hp_tcp_required =
+                options.type == HP_TCP ||
+                (options.type == UNSPEC && transports.size() == 1 &&
+                 transports.front() == HP_TCP);
             for (auto type : transports) {
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
-                if (!s.ok()) LOG(WARNING) << s.ToString();
+                if (!s.ok()) {
+                    if (type == HP_TCP && hp_tcp_required) return s;
+                    LOG(WARNING) << s.ToString();
+                }
+            }
+            // desc.transports lists the transports that actually registered
+            // the buffer (each transport appends itself on success).
+            for (auto& desc : descs) {
+                for (auto type : desc.transports) {
+                    TentMetrics::instance().recordRegisteredBufferBytes(
+                        type, static_cast<int64_t>(desc.length));
+                }
             }
             return Status::OK();
         });
@@ -858,9 +960,23 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
     auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             removed = true;
-            for (auto type : desc.transports) {
-                auto status = transport_list_[type]->removeMemoryBuffer(desc);
+            const auto registered_transports = desc.transports;
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                auto& transport = transport_list_[type];
+                if (!transport) continue;
+                const auto transport_type = static_cast<TransportType>(type);
+                const bool advertised =
+                    std::find(registered_transports.begin(),
+                              registered_transports.end(),
+                              transport_type) != registered_transports.end();
+                if (!advertised && !transport->tracksLocalBuffer(desc))
+                    continue;
+                auto status = transport->removeMemoryBuffer(desc);
                 if (!status.ok()) LOG(WARNING) << status.ToString();
+            }
+            for (auto type : registered_transports) {
+                TentMetrics::instance().recordRegisteredBufferBytes(
+                    type, -static_cast<int64_t>(desc.length));
             }
             return Status::OK();
         });
@@ -882,9 +998,25 @@ Status TransferEngineImpl::unregisterLocalMemory(
             (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
             [&](BufferDesc& desc) -> Status {
                 removed = true;
-                for (auto type : desc.transports) {
-                    auto s = transport_list_[type]->removeMemoryBuffer(desc);
+                const auto registered_transports = desc.transports;
+                for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                    auto& transport = transport_list_[type];
+                    if (!transport) continue;
+                    const auto transport_type =
+                        static_cast<TransportType>(type);
+                    const bool advertised =
+                        std::find(registered_transports.begin(),
+                                  registered_transports.end(),
+                                  transport_type) !=
+                        registered_transports.end();
+                    if (!advertised && !transport->tracksLocalBuffer(desc))
+                        continue;
+                    auto s = transport->removeMemoryBuffer(desc);
                     if (!s.ok()) LOG(WARNING) << s.ToString();
+                }
+                for (auto type : registered_transports) {
+                    TentMetrics::instance().recordRegisteredBufferBytes(
+                        type, -static_cast<int64_t>(desc.length));
                 }
                 return Status::OK();
             });
@@ -1630,7 +1762,8 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
     // An empty stage location means "no staging needed on that side".
     if (transport_list_[TPU] &&
-        (transport_list_[RDMA] || transport_list_[TCP])) {
+        (transport_list_[RDMA] || transport_list_[TCP] ||
+         transport_list_[HP_TCP])) {
         if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
             policy.clear();
             policy.push_back(server_addr);
@@ -1685,7 +1818,7 @@ Status TransferEngineImpl::prepareSubmit(
         PreparedSubmit::Owner owner;
         owner.request = request;
         owner.route = resolveTransport(owner.request, 0);
-        if (owner.route.transport == TCP) {
+        if (owner.route.transport == TCP || owner.route.transport == HP_TCP) {
             findStagingPolicy(owner.request, owner.staging_params);
             owner.staging = !owner.staging_params.empty() && staging_proxy_;
         }
@@ -1879,11 +2012,16 @@ Status TransferEngineImpl::commitPreparedSubmit(
             auto status = transport->submitTransferTasks(sub_batch, requests);
             if (!status.ok()) {
                 auto attempt_end = std::chrono::steady_clock::now();
+                // failure_stage must be marked in this first segment, before
+                // any recovery/failover attempt on the failure: a task that
+                // recovers and later fails at poll must still attribute its
+                // root cause to submit.
                 for (const auto physical_task_id : group) {
                     for (const auto public_task_id :
                          public_tasks_by_physical_owner.at(physical_task_id)) {
-                        finishTransportAttempt(batch->task_list[public_task_id],
-                                               FAILED, attempt_end);
+                        auto& task = batch->task_list[public_task_id];
+                        if (task.failure_stage < 0) task.failure_stage = 0;
+                        finishTransportAttempt(task, FAILED, attempt_end);
                     }
                 }
                 // Recover by failing over to the remaining candidate
@@ -2070,7 +2208,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         return finishQueuedOwner(owner_id, FAILED);
     }
 
-    if (task.type == TCP) {
+    if (task.type == TCP || task.type == HP_TCP) {
         std::vector<std::string> staging_params;
         findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {
@@ -2106,6 +2244,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        if (task.failure_stage < 0) task.failure_stage = 0;
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
         // Submit-stage failover: walk the remaining candidate transports
         // before giving up (the queued path dispatches one owner task at a
@@ -2410,6 +2549,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        if (task.failure_stage < 0) task.failure_stage = 0;
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
     }
     return status;
@@ -2463,8 +2603,59 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     if (!transport || !sub_batch) {
         return Status::InvalidArgument("Transport not available" LOC_MARK);
     }
-    return transport->getTransferStatus(sub_batch, task.sub_task_id,
-                                        task_status);
+    // HP TCP classifies transport errors using the terminal output. Other
+    // transports retain their existing error-output contract.
+    if (task.type == HP_TCP) task_status = {PENDING, 0};
+    Status result =
+        transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
+    if (result.ok() || task.type != HP_TCP || task_status.s != FAILED) {
+        return result;
+    }
+
+    if (result.IsNeedsRefreshCache()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+        if (task.metadata_refresh_retry_count >=
+            kMaxHpTcpMetadataRefreshRetries) {
+            task.suppress_failover = true;
+            return Status::OK();
+        }
+        ++task.metadata_refresh_retry_count;
+        Status invalidated = metadata_->segmentManager().invalidateRemote(
+            task.request.target_id);
+        if (!invalidated.ok()) {
+            task.suppress_failover = true;
+            LOG(WARNING) << "HP TCP metadata cache invalidation failed: "
+                         << invalidated.ToString();
+            return Status::OK();
+        }
+
+        const auto retry_start = std::chrono::steady_clock::now();
+        startTransportAttempt(task, HP_TCP, retry_start);
+        Status retried = transport->retryTransferTask(
+            sub_batch, task.sub_task_id, task.request);
+        if (!retried.ok()) {
+            finishTransportAttempt(task, FAILED,
+                                   std::chrono::steady_clock::now());
+            task.suppress_failover = true;
+            LOG(WARNING) << "HP TCP metadata refresh retry failed: "
+                         << retried.ToString();
+            return Status::OK();
+        }
+        task.status = PENDING;
+        task_status.s = PENDING;
+        task_status.transferred_bytes = 0;
+        return Status::OK();
+    }
+
+    // A valid remote permission/range/protocol rejection, or a WRITE whose
+    // remote outcome is unknown because its ACK was lost, is permanent for
+    // this logical request. ShuttingDown maps to TooManyRequests and remains
+    // transient, so the existing failover policy may act on it.
+    if (!result.IsTooManyRequests()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+        task.suppress_failover = true;
+    }
+    return Status::OK();
 }
 
 void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
@@ -2472,8 +2663,16 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
     task.status = task_status.s;
-    if (!allow_failover || task.cancel_requested || task_status.s != FAILED ||
-        task.type == UNSPEC)
+    // First-failure attribution: a terminal failure observed by polling marks
+    // the poll stage. Submit-stage failures were already marked at their
+    // origin and are not overwritten (a poll failure followed by a rejected
+    // failover resubmit still counts as poll).
+    if (task_status.s == FAILED || task_status.s == TIMEOUT ||
+        task_status.s == CANCELED) {
+        if (task.failure_stage < 0) task.failure_stage = 1;
+    }
+    if (!allow_failover || task.cancel_requested || task.suppress_failover ||
+        task_status.s != FAILED || task.type == UNSPEC)
         return;
 
     // The current physical transport attempt has failed even if the logical
@@ -2618,11 +2817,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
     size_t total_tasks = 0;
     TransferStatusEnum worst_failure = PENDING;
     auto isWorse = [](TransferStatusEnum cur, TransferStatusEnum best) {
-        static const std::unordered_map<TransferStatusEnum, int> severity = {
-            {INITIAL, 0},  {PENDING, 0}, {COMPLETED, 0}, {INVALID, 1},
-            {CANCELED, 2}, {TIMEOUT, 3}, {FAILED, 4},
-        };
-        return severity.at(cur) > severity.at(best);
+        return transferStatusSeverity(cur) > transferStatusSeverity(best);
     };
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         auto& task = batch->task_list[task_id];
@@ -2850,6 +3045,35 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
 #if TENT_METRICS_ENABLED
     if (prev_status == PENDING && new_status != PENDING && !task.derived) {
         auto end_time = std::chrono::steady_clock::now();
+        // Failure reason: task.failure_stage marks where the first failure
+        // originated (0 = submit, 1 = poll), set at the failure site — a
+        // poll-observed failure stays "poll" even when the failover resubmit
+        // is synchronously rejected. TIMEOUT/CANCELED come from the status
+        // itself and were previously not recorded anywhere.
+        if (new_status == FAILED || new_status == TIMEOUT ||
+            new_status == CANCELED) {
+            TentMetrics::TaskFailureReason reason;
+            if (new_status == TIMEOUT) {
+                reason = TentMetrics::TaskFailureReason::Timeout;
+            } else if (new_status == CANCELED) {
+                reason = TentMetrics::TaskFailureReason::Canceled;
+            } else if (task.failure_stage == 0) {
+                reason = TentMetrics::TaskFailureReason::Submit;
+            } else if (task.failure_stage == 1) {
+                reason = TentMetrics::TaskFailureReason::Poll;
+            } else {
+                // Unmarked path: an attempt still in flight means the
+                // failure was observed by polling.
+                reason = task.attempt_active
+                             ? TentMetrics::TaskFailureReason::Poll
+                             : TentMetrics::TaskFailureReason::Submit;
+            }
+            // Prefer the attempt transport: task.type may already be UNSPEC
+            // after a submit-stage failure.
+            TransportType failure_tp =
+                task.attempt_type != UNSPEC ? task.attempt_type : task.type;
+            TentMetrics::instance().recordTaskFailure(failure_tp, reason);
+        }
         finishTransportAttempt(task, new_status, end_time);
         auto start_time = task.start_time;
         if (start_time.time_since_epoch().count() > 0) {
@@ -2951,6 +3175,7 @@ void TransferEngineImpl::startTransportAttempt(
 #if TENT_METRICS_ENABLED
     TentMetrics::instance().recordTransportAttemptStarted(type,
                                                           task.request.opcode);
+    TentMetrics::instance().recordInflightAttemptStarted(type);
 #else
     (void)type;
 #endif
@@ -2962,6 +3187,10 @@ void TransferEngineImpl::finishTransportAttempt(
     if (!task.attempt_active) return;
     task.attempt_active = false;
 #if TENT_METRICS_ENABLED
+    // Decrement before the early return below so the in-flight gauge stays
+    // symmetric with recordInflightAttemptStarted() for every attempt that
+    // actually started.
+    TentMetrics::instance().recordInflightAttemptFinished(task.attempt_type);
     auto post_time = task.attempt_post_time;
     if (post_time.time_since_epoch().count() == 0) return;
     double latency_us =

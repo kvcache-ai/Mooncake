@@ -85,6 +85,16 @@ static inline void setConfig(Config& config, const std::string& env_key,
     if (val) config.setFromString(config_key, std::string(val));
 }
 
+// Bool env vars: setFromString() stores "1" as int, so get(..., false) misses
+// it.
+static inline void setBoolConfig(Config& config, const std::string& env_key,
+                                 const std::string& config_key) {
+    const char* val = std::getenv(env_key.c_str());
+    if (!val) return;
+    config.set(config_key,
+               ConfigHelper::parseBool(val, config.get(config_key, false)));
+}
+
 // Like setConfig, but parses the env value as a comma-separated list and
 // stores it as a string array. Empty/whitespace-only items are dropped so a
 // trailing comma or spaces around names are tolerated (e.g. "mlx5_0, mlx5_1").
@@ -135,6 +145,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     }
 
     // Legacy keys for backward compatibility (MC_* env vars)
+    setConfig(config, "MOONCAKE_LOCAL_HOSTNAME", "rpc_server_hostname");
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",
               "transports/rdma/device/num_cq_list");
@@ -167,6 +178,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/disable_gpu_direct_rdma");
     setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
               "transports/rdma/log_slice_affinity");
+    setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
+                  "transports/rdma/strict_local_numa");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated
     // device names). MC_TE_FILTERS is an allow-list — same name and semantics
     // as the legacy Transfer Engine's device whitelist, so a single env works
@@ -179,9 +192,11 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // MC_CUSTOM_TOPO_JSON works under MC_USE_TENT. Inline
     // topology/priority_matrix in MC_TENT_CONF still takes precedence.
     setConfig(config, "MC_CUSTOM_TOPO_JSON", "topology/custom_json_path");
-    // TENT RPC server io_context threads. The TCP data-path handlers do
-    // full-payload blocking copies inline, so deployments pushing bulk data
-    // over the TENT TCP transport raise this above the default of 1.
+    // TENT RPC server io_context threads. TCP SendData/RecvData copies are
+    // offloaded onto the blocking executor; this pool still reads the RPC
+    // attachments. When TCP is enabled and this key is unset, the engine
+    // defaults to several threads so concurrent bulk transfers are not
+    // serialized on one io_context.
     setConfig(config, "MC_TENT_RPC_THREADS", "rpc_server_threads");
     return status;
 }
