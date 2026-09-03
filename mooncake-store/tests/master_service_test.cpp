@@ -636,6 +636,241 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+// DFS replicas live in their own variant branch, so is_disk_replica() does not
+// match them. KV subscribers still expect one logical tier per storage class,
+// which is what these assertions pin down.
+TEST_F(MasterServiceTest, DfsReplicaNormalizesToDiskMediumForKvEvents) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_kv_media_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        auto start = service.PutStart(context.client_id, "dfs_kv_media",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start.has_value());
+        ASSERT_EQ(start->size(), 2);
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "dfs_kv_media",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        // Memory + DFS collapse to exactly the two logical tiers, sorted the
+        // same way the publisher sorts them.
+        auto media = KvMediaForKey(service, "dfs_kv_media");
+        ASSERT_TRUE(media.has_value());
+        EXPECT_EQ(std::vector<std::string>({"cpu", "disk"}), *media);
+
+        auto removal_media = KvRemovalMediaForKey(service, "dfs_kv_media");
+        ASSERT_TRUE(removal_media.has_value());
+        EXPECT_EQ(std::vector<std::string>({"cpu", "disk"}), *removal_media);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+// A removal path can run while a replica is still PROCESSING. That medium was
+// never announced as available, but the removal snapshot must still name it:
+// otherwise a tier that a subscriber may have seen is never retracted. The
+// contrast with KvMediaForKey, which counts only completed replicas, is the
+// whole point of having two helpers.
+TEST_F(MasterServiceTest, ProcessingReplicaMediumAppearsInRemovalSnapshot) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // PutStart without PutEnd leaves the replica PROCESSING.
+    auto start = service.PutStart(context.client_id, "processing_kv_media",
+                                  TenantId::Default(), 4096, config);
+    ASSERT_TRUE(start.has_value());
+
+    auto media = KvMediaForKey(service, "processing_kv_media");
+    ASSERT_TRUE(media.has_value());
+    EXPECT_TRUE(media->empty()) << "a PROCESSING replica is not yet available "
+                                   "and must not be announced";
+
+    auto removal_media = KvRemovalMediaForKey(service, "processing_kv_media");
+    ASSERT_TRUE(removal_media.has_value());
+    EXPECT_EQ(std::vector<std::string>({"cpu"}), *removal_media);
+}
+
+// A RemoveAll whose oplog slot reservation fails must leave the object in
+// place. That is the state in which announcing `cleared` would be a lie, so the
+// skip has to be recorded rather than treated as a successful wipe.
+TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
+    // enable_oplog_ needs HA + oplog + the etcd backend, but the ordered oplog
+    // writer is only installed by a separate init that needs a live etcd. So
+    // this config reaches ReserveBatchOpLogSlot with a null writer, which is
+    // exactly the reservation-failure branch.
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_ha_backend_type("etcd")
+                      .build();
+    auto service = std::make_unique<MasterService>(config);
+    const auto context = PrepareSimpleSegment(*service);
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    ASSERT_TRUE(service
+                    ->PutStart(context.client_id, "reservation_fail_key",
+                               TenantId::Default(), 4096, replicate_config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(context.client_id, "reservation_fail_key",
+                             TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+
+    // force=true clears the lease gate, so the reservation is the only thing
+    // left that can stop the removal.
+    EXPECT_EQ(0, service->RemoveAll(TenantId::Default(), true));
+
+    auto exists =
+        service->ExistKey("reservation_fail_key", TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_TRUE(exists.value())
+        << "the object survived, so the tenant was never emptied";
+}
+
+// RemoveAll holds one shard lock at a time, so a commit can land in a shard the
+// scan already passed. The scan's own bookkeeping cannot see it, and publishing
+// `cleared` would order it after that commit's `stored` — telling subscribers
+// to drop an object that is live. Pause the scan right after the shard the new
+// key belongs to, commit there, and the clear must be withheld.
+TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
+    MasterService service;
+    service.SetKvTenantEpochTrackingForTesting(true);
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(service
+                    .PutStart(context.client_id, "victim_key",
+                              TenantId::Default(), 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "victim_key",
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+
+    const size_t racer_shard = ShardIndexForKey(service, "racer_key");
+    bool committed = false;
+    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
+        // Commit exactly once, immediately after the scan releases the shard
+        // the new key hashes to, so the scan can never observe it.
+        if (shard != racer_shard || committed) {
+            return;
+        }
+        committed = true;
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "racer_key",
+                                  TenantId::Default(), 1024, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "racer_key",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+    });
+
+    service.RemoveAll(true);
+    service.SetRemoveAllShardHookForTesting(nullptr);
+
+    ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
+    auto exists = service.ExistKey("racer_key", TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_TRUE(exists.value()) << "the raced commit must still be live";
+
+    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
+        << "a clear here would retract racer_key, which was just announced";
+    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+}
+
+// The mirror image: with no concurrent commit the epoch is unchanged, so the
+// clear must still go out. Without this the fix could pass by never publishing.
+TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
+    MasterService service;
+    service.SetKvTenantEpochTrackingForTesting(true);
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(service
+                    .PutStart(context.client_id, "lonely_key",
+                              TenantId::Default(), 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "lonely_key",
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+
+    service.RemoveAll(true);
+
+    EXPECT_EQ(1u, service.GetKvClearedPublishedForTesting());
+    EXPECT_EQ(0u, service.GetKvClearedSuppressedForTesting());
+}
+
+// The tenant-scoped overload reads the epoch before its scan instead of at
+// first sight of an object, so it needs its own coverage of the same ordering
+// rule.
+TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
+    MasterService service;
+    service.SetKvTenantEpochTrackingForTesting(true);
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(service
+                    .PutStart(context.client_id, "scoped_victim",
+                              TenantId::Default(), 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "scoped_victim",
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+
+    const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
+    bool committed = false;
+    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
+        if (shard != racer_shard || committed) {
+            return;
+        }
+        committed = true;
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "scoped_racer",
+                                  TenantId::Default(), 1024, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "scoped_racer",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+    });
+
+    service.RemoveAll(TenantId::Default(), true);
+    service.SetRemoveAllShardHookForTesting(nullptr);
+
+    ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
+    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting());
+    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+}
+
 TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
     auto run_case = [&](const std::string& case_name,
                         const std::vector<size_t>& leased_indexes,
