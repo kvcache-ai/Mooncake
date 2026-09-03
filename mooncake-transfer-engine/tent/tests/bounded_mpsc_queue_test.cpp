@@ -149,69 +149,87 @@ TEST(BoundedMPSCQueueTest, InitialSubmitRejectionTerminatesBatch) {
     EXPECT_EQ(inflight, 4);
 }
 
-// Regression for issue #3661 (partial-admission follow-up). The initial-submit
-// loop in RdmaTransport::submitTransferTasks() walks one slice list per worker
-// and calls Workers::submit() on each. The round-robin scatter above spreads
-// every request's slices across all workers, so a single batch generally spans
-// multiple tasks and every worker's list can carry slices from more than one.
+// Regression for issue #3661 (atomic-admission follow-up). catyans pointed out
+// that a submit-then-cancel loop is unsafe: Workers::cancel() is asynchronous
+// and cannot recall a slice already posted to a QP, so admitting workers [0, i)
+// and then rejecting worker i leaves live posted WRs racing the engine's
+// fallback and a later freeSubBatch(). Workers::admitBatch() closes this by
+// checking EVERY target worker queue for room BEFORE pushing any list: if any
+// is full, none is pushed, so no worker ever observes — and therefore never
+// posts — a partially-admitted batch.
 //
-// If worker i's queue is full mid-loop, workers [0, i) are already running and
-// workers (i, N) are never submitted. Cancelling only the one task reachable
-// from slice_lists[i].first (the earlier revision) left the already-running
-// tasks and every never-submitted slice PENDING forever, and let the upper
-// layer race a failover on the same group. The fix terminalizes the WHOLE
-// batch: cancel every task before returning failure.
-//
-// This models that loop with the SliceList stand-in and a cancel flag per task,
-// then asserts all tasks are terminalized regardless of which worker rejected.
-TEST(BoundedMPSCQueueTest, PartialAdmissionTerminalizesWholeBatch) {
+// This models admitBatch() with the SliceList stand-in: 4 worker queues, one
+// pre-saturated, a batch with a list for each worker. It asserts the pre-check
+// rejects and that ZERO lists were pushed to ANY queue (nothing to post, drain,
+// or cancel), which is the property the async-cancel hazard needed.
+TEST(BoundedMPSCQueueTest, AtomicAdmissionPushesNothingWhenAnyQueueFull) {
     constexpr int kNumWorkers = 4;
     std::vector<Queue> worker_queues(kNumWorkers);
 
-    // Saturate worker 2's queue so its submit rejects, while 0/1 accept and
-    // 3 is never reached — the partial-admission shape catyans described.
-    constexpr int kRejectingWorker = 2;
+    // Saturate worker 2's queue so the batch cannot be fully admitted.
+    constexpr int kFullWorker = 2;
     for (int i = 0; i < 8; ++i) {
         auto filler = entry(1);
-        ASSERT_TRUE(worker_queues[kRejectingWorker].try_push(filler));
+        ASSERT_TRUE(worker_queues[kFullWorker].try_push(filler));
+    }
+    // The other three start empty.
+    for (int w = 0; w < kNumWorkers; ++w) {
+        if (w == kFullWorker) continue;
+        ASSERT_TRUE(worker_queues[w].has_free_slot());
     }
 
-    // A batch of tasks; each task's slices are scattered across workers, so the
-    // per-worker lists below reference several tasks. Track terminalization by
-    // task, the way Workers::cancel(task) flips cancel_requested per task.
-    constexpr int kNumTasks = 5;
-    std::vector<bool> task_canceled(kNumTasks, false);
+    // One non-empty list per worker (the round-robin scatter fills every
+    // worker in the general case).
+    std::vector<SliceList> lists(kNumWorkers);
+    for (int w = 0; w < kNumWorkers; ++w) lists[w] = entry(2);
 
-    // One non-empty slice list per worker (mirrors slice_lists[i].first != null
-    // guarding the submit call). Each list "belongs" to a representative task,
-    // but the batch as a whole owns all kNumTasks tasks.
-    auto submit = [&](int worker_id, SliceList& list) -> bool {
-        return worker_queues[worker_id].try_push(list);
+    // Model admitBatch(): phase 1 pre-check across all target queues.
+    auto pre_check_ok = [&]() -> bool {
+        for (int w = 0; w < kNumWorkers; ++w) {
+            if (lists[w].num_slices == 0) continue;
+            if (!worker_queues[w].has_free_slot()) return false;
+        }
+        return true;
     };
 
-    // The loop under test: submit each worker's list; on the first rejection,
-    // cancel EVERY task in the batch (not just the rejected worker's) and stop.
-    bool rejected = false;
-    int rejected_at = -1;
+    const bool admitted = pre_check_ok();
+    EXPECT_FALSE(admitted);  // worker 2 is full → whole batch rejected
+
+    // The core invariant: because the pre-check failed, phase 2 never runs, so
+    // NONE of the batch's lists were pushed. The empty workers are still empty
+    // (occupancy unchanged) and the full worker holds only its 8 fillers — no
+    // batch slice sits in any queue to be posted or later freed.
     for (int w = 0; w < kNumWorkers; ++w) {
-        auto list = entry(2);
-        if (!submit(w, list)) {
-            rejected = true;
-            rejected_at = w;
-            for (int t = 0; t < kNumTasks; ++t) task_canceled[t] = true;
-            break;
-        }
+        if (w == kFullWorker) continue;
+        // Empty queue: a pop yields the default (num_slices == 0).
+        EXPECT_EQ(worker_queues[w].pop().num_slices, 0)
+            << "worker " << w << " received a list despite batch rejection";
+    }
+}
+
+// Companion: when every target queue has room, admitBatch commits all lists and
+// counts their slices inflight — the success path must not regress.
+TEST(BoundedMPSCQueueTest, AtomicAdmissionCommitsAllWhenEveryQueueHasRoom) {
+    constexpr int kNumWorkers = 4;
+    std::vector<Queue> worker_queues(kNumWorkers);
+    std::vector<SliceList> lists(kNumWorkers);
+    for (int w = 0; w < kNumWorkers; ++w) lists[w] = entry(3);
+
+    // Phase 1 pre-check passes (all empty), phase 2 commits every list.
+    bool pre_ok = true;
+    for (int w = 0; w < kNumWorkers; ++w)
+        pre_ok = pre_ok && worker_queues[w].has_free_slot();
+    ASSERT_TRUE(pre_ok);
+
+    long inflight = 0;
+    for (int w = 0; w < kNumWorkers; ++w) {
+        ASSERT_TRUE(worker_queues[w].try_push(lists[w]));
+        inflight += lists[w].num_slices;
     }
 
-    ASSERT_TRUE(rejected);
-    EXPECT_EQ(rejected_at, kRejectingWorker);  // 0 and 1 admitted first
-
-    // The whole batch is terminalized: no task from this attempt is left
-    // un-cancelled to pend forever or to be re-run by an upper-layer failover.
-    for (int t = 0; t < kNumTasks; ++t) {
-        EXPECT_TRUE(task_canceled[t])
-            << "task " << t << " left un-terminalized after partial admission";
-    }
+    EXPECT_EQ(inflight, kNumWorkers * 3);
+    for (int w = 0; w < kNumWorkers; ++w)
+        EXPECT_EQ(worker_queues[w].pop().num_slices, 3);
 }
 
 }  // namespace

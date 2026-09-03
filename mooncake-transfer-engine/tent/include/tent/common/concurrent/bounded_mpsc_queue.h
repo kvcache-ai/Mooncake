@@ -43,6 +43,21 @@ struct BoundedMPSCQueue {
 
     ~BoundedMPSCQueue() = default;
 
+    // Best-effort free-slot estimate for admission pre-checks (issue #3661).
+    // head/tail are monotonic counters, so (tail - head) is the occupancy.
+    // This is an MPSC queue, so the value can go stale the instant it is read
+    // (another producer may push, or the consumer may pop); callers must treat
+    // a positive result as "had room a moment ago", not a reservation, and
+    // still handle a failing try_push. It is used only to avoid *starting* a
+    // multi-queue admission that cannot complete, so no list is pushed — and
+    // thus no slice is posted — before every target queue is known to have had
+    // room.
+    bool has_free_slot() const {
+        uint64_t t = tail.load(std::memory_order_acquire);
+        uint64_t h = head.load(std::memory_order_acquire);
+        return (t - h) < Capacity;
+    }
+
     // Non-blocking push: returns false when the queue is full. Both the
     // producer (RdmaTransport::submitTransferTasks) and the worker thread
     // (submitFromTick) enqueue through this so a full queue is reported to

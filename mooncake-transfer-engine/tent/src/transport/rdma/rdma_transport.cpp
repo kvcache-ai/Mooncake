@@ -552,42 +552,40 @@ Status RdmaTransport::submitTransferTasks(
         }
     }
 
+    // Record every non-empty list head in slice_chain so freeSubBatch can
+    // reclaim the allocated slices regardless of whether admission succeeds.
     for (int i = 0; i < num_workers; ++i) {
         if (slice_lists[i].first) {
             rdma_batch->slice_chain.push_back(slice_lists[i].first);
-            Status submit_st = workers_->submit(slice_lists[i], i);
-            if (!submit_st.ok()) {
-                // The slices were allocated and attached to their tasks, but
-                // the initial submit to worker i was rejected (queue full).
-                // This is a *partial* admission: workers [0, i) already have
-                // their slice lists running, worker i's list was refused, and
-                // workers (i, num_workers) were never submitted. On top of
-                // that, the round-robin scatter above splits every request's
-                // slices across all workers, so a single worker's list — and
-                // this batch as a whole — generally spans multiple tasks.
-                //
-                // Cancelling only slice_lists[i].first->task (as an earlier
-                // revision did) would leave the already-running tasks and all
-                // never-submitted slices PENDING forever, and the upper layer
-                // (submitTransfer's fallback) could then race a second attempt
-                // on the same group. Terminalize the *whole* batch instead:
-                // cancel every task before returning failure. cancel() is
-                // idempotent (cancel_requested exchange guard) and wakes all
-                // workers, so it correctly drains a task's slices from any
-                // queue whether or not that worker was ever submitted. See
-                // #3636 and the partial-admission follow-up in #3661.
-                LOG(WARNING)
-                    << "Initial submit rejected for worker " << i << ": "
-                    << submit_st.message() << ", canceling all "
-                    << rdma_batch->task_list.size() << " task(s) in the batch";
-                for (auto* task : rdma_batch->task_list) {
-                    workers_->cancel(task);
-                }
-                return Status::TooManyRequests(
-                    "Initial slice submit rejected (worker queue "
-                    "full)" LOC_MARK);
-            }
         }
+    }
+
+    // Admit the whole batch atomically (issue #3661). admitBatch() checks
+    // every target worker queue for room BEFORE pushing any list, so on a
+    // queue-full rejection no worker ever observes a partially-admitted batch:
+    // nothing is posted to a QP, nothing needs draining, and the sub-batch is
+    // still in its pre-call state (only local slice allocations exist, which
+    // freeSubBatch reclaims). This replaces the earlier submit-then-cancel loop
+    // that could leave already-posted slices live while the engine started a
+    // fallback attempt on the same group (async cancel does not recall posted
+    // WRs) and could let freeSubBatch race late CQ completions.
+    Status admit_st = workers_->admitBatch(slice_lists);
+    if (!admit_st.ok()) {
+        // Terminalize the whole batch before returning: set cancel_requested
+        // on every task so that, in the rare MPSC commit-race path where some
+        // early lists were pushed, the worker drains them as CANCELED at its
+        // pre-post cancel check instead of posting them. cancel() is idempotent
+        // and wakes all workers, so a task's slices are cleared from whichever
+        // queue holds them. On the common pre-check rejection nothing was
+        // pushed, so these cancels are no-ops beyond flipping the flag.
+        LOG(WARNING) << "Batch admission rejected: " << admit_st.message()
+                     << ", canceling all " << rdma_batch->task_list.size()
+                     << " task(s) in the batch";
+        for (auto* task : rdma_batch->task_list) {
+            workers_->cancel(task);
+        }
+        return Status::TooManyRequests(
+            "Initial batch admission rejected (worker queue full)" LOC_MARK);
     }
     return Status::OK();
 }
