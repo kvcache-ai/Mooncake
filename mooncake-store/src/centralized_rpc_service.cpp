@@ -130,7 +130,6 @@ void WrappedCentralizedMasterService::PutStart(
         auto req_ctx = deserialize_request_context(att);
         VLOG(1) << "PutStart request_id=" << req_ctx.request_id
                 << " trace_id=" << req_ctx.trace_id;
-        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = PutStartInternal(client_id, key, slice_length, config);
@@ -268,7 +267,6 @@ void WrappedCentralizedMasterService::BatchPutStart(
         auto req_ctx = deserialize_request_context(att);
         VLOG(1) << "BatchPutStart request_id=" << req_ctx.request_id
                 << " trace_id=" << req_ctx.trace_id;
-        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = BatchPutStartInternal(client_id, keys, slice_lengths, config);

@@ -223,7 +223,6 @@ void WrappedMasterService::ExistKey(
         auto req_ctx = deserialize_request_context(att);
         VLOG(1) << "ExistKey request_id=" << req_ctx.request_id
                 << " trace_id=" << req_ctx.trace_id;
-        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = ExistKeyInternal(key);
@@ -401,7 +400,6 @@ void WrappedMasterService::Remove(
         auto req_ctx = deserialize_request_context(att);
         VLOG(1) << "Remove request_id=" << req_ctx.request_id
                 << " trace_id=" << req_ctx.trace_id;
-        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = RemoveInternal(key, force);
@@ -534,7 +532,6 @@ void WrappedMasterService::GetReplicaList(
         auto req_ctx = deserialize_request_context(att);
         VLOG(1) << "GetReplicaList request_id=" << req_ctx.request_id
                 << " trace_id=" << req_ctx.trace_id;
-        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = GetReplicaListInternal(key, config);
@@ -555,7 +552,6 @@ void WrappedMasterService::BatchGetReplicaList(
         auto req_ctx = deserialize_request_context(att);
         VLOG(1) << "BatchGetReplicaList request_id=" << req_ctx.request_id
                 << " trace_id=" << req_ctx.trace_id;
-        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto results = BatchGetReplicaListInternal(keys, config);
@@ -574,7 +570,6 @@ void WrappedMasterService::BatchExistKey(
         auto req_ctx = deserialize_request_context(att);
         VLOG(1) << "BatchExistKey request_id=" << req_ctx.request_id
                 << " trace_id=" << req_ctx.trace_id;
-        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = BatchExistKeyInternal(keys);

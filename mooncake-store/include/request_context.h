@@ -1,6 +1,5 @@
 #pragma once
 
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -81,35 +80,6 @@ inline RequestContext deserialize_request_context(std::string_view data) {
         struct_pack::deserialize_to(ctx, data.data(), data.size());
     }
     return ctx;
-}
-
-// --- Test/instrumentation seam (process-global; NOT a production hot path) ---
-// Lets an in-process integration test observe the attachment request_id that a
-// master handler actually received, instead of relying on VLOG. A test sets a
-// RequestContext on the calling thread, performs a synchronous single-key read
-// (invoke_rpc sends current_request_context_attachment() out-of-band), then
-// reads LastObservedRequestId(). The mutex is held only across a short
-// std::string copy, and only GetReplicaList/BatchGetReplicaList ever write
-// here.
-inline std::mutex& request_id_instrument_mutex() {
-    static std::mutex m;
-    return m;
-}
-inline std::string& request_id_instrument_store() {
-    static std::string s;
-    return s;
-}
-inline void RecordObservedRequestId(std::string_view id) {
-    std::lock_guard<std::mutex> lk(request_id_instrument_mutex());
-    request_id_instrument_store() = std::string(id);
-}
-inline std::string LastObservedRequestId() {
-    std::lock_guard<std::mutex> lk(request_id_instrument_mutex());
-    return request_id_instrument_store();
-}
-inline void ClearLastObservedRequestId() {
-    std::lock_guard<std::mutex> lk(request_id_instrument_mutex());
-    request_id_instrument_store().clear();
 }
 
 }  // namespace mooncake
