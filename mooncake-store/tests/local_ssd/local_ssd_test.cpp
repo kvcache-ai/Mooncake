@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <thread>
 
 #include "local_ssd/manager.h"
@@ -178,6 +180,34 @@ TEST(LocalSsdManagerTest, UnregisterSerializesWithConcurrentOperations) {
     stop.store(true, std::memory_order_relaxed);
     worker.join();
     EXPECT_TRUE(removed.has_value());
+    EXPECT_FALSE(manager.GetUsage(client).has_value());
+}
+
+TEST(LocalSsdManagerTest, UsageTransitionSerializesWithUnregister) {
+    LocalSsdManager manager;
+    UUID client{7, 8};
+    ASSERT_TRUE(manager.RegisterClient(client, true) == ErrorCode::OK);
+
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto release_future = release.get_future().share();
+    auto transition = std::async(std::launch::async, [&] {
+        return manager.ApplyUsageTransition(client, [&] {
+            entered.set_value();
+            release_future.wait();
+            return tl::expected<int64_t, ErrorCode>(128);
+        });
+    });
+    entered.get_future().wait();
+
+    auto unregister = std::async(
+        std::launch::async, [&] { return manager.UnregisterClient(client); });
+    EXPECT_EQ(std::future_status::timeout,
+              unregister.wait_for(std::chrono::milliseconds(20)));
+
+    release.set_value();
+    EXPECT_TRUE(transition.get().has_value());
+    EXPECT_TRUE(unregister.get().has_value());
     EXPECT_FALSE(manager.GetUsage(client).has_value());
 }
 

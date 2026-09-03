@@ -1979,6 +1979,18 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const TenantId& tenant_id);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
+    void ReleaseLocalDiskUsage(
+        const std::unordered_map<UUID, int64_t, boost::hash<UUID>>&
+            bytes_by_client);
+    struct LocalDiskReplicaTransition {
+        bool transferred_ownership = false;
+        std::unordered_map<UUID, int64_t, boost::hash<UUID>> replaced_usage;
+    };
+    auto AddReplicaImpl(const UUID& client_id, const std::string& key,
+                        const TenantId& tenant_id, Replica& replica,
+                        bool allow_existing_offloading_task,
+                        LocalDiskReplicaTransition& transition)
+        -> tl::expected<bool, ErrorCode>;
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
@@ -2071,15 +2083,6 @@ class MasterService {
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale,
         MetadataShardAccessorRW* shard = nullptr);
-
-    // True when client_id currently has a LOCAL_DISK registration.
-    // Momentarily takes the LocalSsdManager registry lock, so callers must not
-    // hold it; call before taking a metadata shard lock. Callers that need the
-    // answer to stay true across a later metadata write must hold
-    // snapshot_mutex_ (shared) across both -- UnmountLocalDiskSegment
-    // deregisters the client under the exclusive lock, so the check and the
-    // write cannot straddle a deregistration.
-    bool HasMountedLocalDiskSegment(const UUID& client_id);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -2922,6 +2925,9 @@ class MasterService {
         const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas) const;
+    std::string SerializeMetadataForOpLogFromReplicaDescriptors(
+        const UUID& client_id, uint64_t size,
         const std::vector<Replica::Descriptor>& replicas) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(

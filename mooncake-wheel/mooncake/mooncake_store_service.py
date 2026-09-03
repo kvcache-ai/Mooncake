@@ -178,6 +178,9 @@ class MooncakeStoreService:
                         "master_server_addr": self.config.master_server_address,
                         "enable_ssd_offload": self.config.enable_ssd_offload,
                         "ssd_offload_path": self.config.ssd_offload_path,
+                        "local_rpc_port": getattr(
+                            self.config, "local_rpc_port", 0
+                        ),
                         "tenant_id": self.config.tenant_id,
                         "enable_client_http_server": (
                             self.config.enable_client_http_server

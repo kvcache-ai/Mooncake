@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <boost/functional/hash.hpp>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -77,6 +78,10 @@ class LocalSsdManager {
 
     std::optional<Usage> GetUsage(const UUID& client_id) const;
     bool AdjustUsedBytes(const UUID& client_id, int64_t delta);
+    bool SetUsedBytes(const UUID& client_id, int64_t bytes);
+    tl::expected<void, ErrorCode> ApplyUsageTransition(
+        const UUID& client_id,
+        const std::function<tl::expected<int64_t, ErrorCode>()>& transition);
 
     ErrorCode EnqueueOffload(const UUID& client_id, OffloadTaskItem task,
                              size_t limit);

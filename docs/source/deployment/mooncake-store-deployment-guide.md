@@ -959,7 +959,7 @@ A client is configured through one of the **methods** introduced in [Start a Sto
 - **Method C — Resource-owning real client (`mooncake_client`)**: configured through `mooncake_client` CLI flags (see the **Method C** subsection below).
 - **Engine runtime tuning (`MC_*`)**: low-level variables read by the C++ Transfer Engine / store client at runtime. They are orthogonal to the above and **apply to all methods**.
 
-The Method A arguments and the `MOONCAKE_*` variables are the **same logical fields in two forms** (Method B maps onto Method A); note that the `mooncake_client` CLI (Method C) uses yet another spelling for some of them (e.g. `--device_names`, `--master_server_address`).
+The Method A arguments and the `MOONCAKE_*` variables are the **same logical fields in two forms** (Method B maps onto Method A); the standalone `mooncake_client` uses its `--port` for the same stable endpoint.
 
 ### Method A — Programmatic (`setup()` arguments)
 
@@ -980,9 +980,10 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 | `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
+| `local_rpc_port` | int | `0` | *(advanced)* SSD offload RPC port. `0` auto-binds for embedded clients; use a positive stable port for restart recovery |
 
 ```{note}
-The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, and client HTTP endpoint fields) are optional. In Method A, launcher-level `MOONCAKE_*` variables used only by `MooncakeConfig` are ignored. Variables consumed directly by the C++ client, including the FileStorage/DFS backend variables and low-level `MC_*` engine variables below, are still read.
+The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, client HTTP endpoint fields, and `local_rpc_port`) are optional. In Method A, launcher-level `MOONCAKE_*` variables used only by `MooncakeConfig` are ignored. Variables consumed directly by the C++ client, including the FileStorage/DFS backend variables and low-level `MC_*` engine variables below, are still read.
 ```
 
 ### Method B — Service / Integration (`MOONCAKE_*` + CLI)
@@ -1008,6 +1009,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; DFS shard data uses `MOONCAKE_DFS_ROOT_DIR` with the distributed backend |
+| `MOONCAKE_LOCAL_RPC_PORT` | `local_rpc_port` | `0` | SSD offload RPC port. `0` auto-binds for embedded clients; use a positive stable port for restart recovery |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
 | `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |

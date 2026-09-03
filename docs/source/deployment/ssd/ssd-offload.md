@@ -305,7 +305,7 @@ mooncake_client \
 ## Notes
 
 - `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected.
-- On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible. `offset_allocator_storage_backend` does not support restart recovery.
+- On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible when the advertised RPC endpoint stays stable. Use the same `--host` and `--port` for a standalone real client, or set a positive stable `local_rpc_port` for embedded clients. Embedded clients default to `local_rpc_port=0`, which preserves OS-assigned auto-bind behavior but cannot recover replicas after the endpoint changes. `offset_allocator_storage_backend` does not support restart recovery.
 - Eviction only notifies the master and deletes local files; objects replicated on other nodes are unaffected.
 - Each machine requires its own real client process. In multi-node deployments, ensure `--host` and `--port` are correctly set so nodes can reach each other.
 

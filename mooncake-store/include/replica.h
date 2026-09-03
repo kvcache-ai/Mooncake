@@ -503,6 +503,19 @@ class Replica {
         return std::nullopt;
     }
 
+    // The object size is immutable after a local-disk replica is created so
+    // that the replica's RAII-managed file accounting remains balanced.
+    bool update_local_disk_owner(const UUID& client_id,
+                                 const std::string& transport_endpoint) {
+        if (!is_local_disk_replica()) {
+            return false;
+        }
+        auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+        disk_data.client_id = client_id;
+        disk_data.transport_endpoint = transport_endpoint;
+        return true;
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);

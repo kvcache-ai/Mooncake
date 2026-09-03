@@ -96,7 +96,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        int local_rpc_port = 0);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -583,7 +584,7 @@ class RealClient : public PyClient {
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
-        const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
+        const std::string &ipc_socket_path = "", int local_rpc_port = 0,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
