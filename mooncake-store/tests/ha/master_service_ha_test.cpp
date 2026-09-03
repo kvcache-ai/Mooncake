@@ -804,6 +804,22 @@ class MasterServiceHATest : public ::testing::Test {
                    : allocators->front()->size();
     }
 
+    // Bytes held by replicas that were restored from a standby snapshot but
+    // whose segment is not mounted yet. Those replicas hang off
+    // DummyBufferAllocator, which is never attached to the segment usage
+    // tracker, so they are invisible to SegmentAllocatedSizeForTesting until
+    // ReMountSegment hands them over to a real allocator.
+    static uint64_t StandbyAccountedBytesForTesting(
+        const MasterService& service) {
+        uint64_t total = 0;
+        for (const auto& [segment, bytes] :
+             service.standby_accounted_memory_bytes_) {
+            (void)segment;
+            total += bytes;
+        }
+        return total;
+    }
+
     static void EraseObjectForTesting(MasterService& service,
                                       const TenantId& tenant_id,
                                       const std::string& key) {
@@ -1022,8 +1038,8 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
                     .RestoreFromStandbySnapshot(
                         {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
-    const auto metric_after_restore =
-        MasterMetricManager::instance().get_allocated_mem_size();
+    const auto accounted_after_restore =
+        StandbyAccountedBytesForTesting(service);
 
     auto invalid =
         MakeStandbyObject("standby_restore_invalid", "unknown_endpoint");
@@ -1038,8 +1054,8 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_restore_invalid"),
               0);
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
-              metric_after_restore);
+    EXPECT_EQ(StandbyAccountedBytesForTesting(service),
+              accounted_after_restore);
     ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
                     .has_value());
 }
@@ -1378,8 +1394,6 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
     const std::string endpoint = "standby_remount_segment";
-    const auto metric_before =
-        MasterMetricManager::instance().get_allocated_mem_size();
     const std::string first_key = "standby_remount_first_key";
     const std::string second_key = "standby_remount_second_key";
     auto first_object = MakeStandbyObject(first_key, endpoint);
@@ -1395,9 +1409,7 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
             .RestoreFromStandbySnapshot({first_object, second_object}, 7,
                                         {MakeStandbyMemorySegment(endpoint)})
             .has_value());
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
-                  metric_before,
-              2048);
+    EXPECT_EQ(StandbyAccountedBytesForTesting(service), 2048);
 
     auto before = service.GetReplicaList(first_key, kDefaultTenant);
     ASSERT_FALSE(before.has_value());
@@ -1437,9 +1449,8 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
                   .buffer_descriptor.buffer_address_,
               kDefaultSegmentBase + 4096);
     EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 2048);
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
-                  metric_before,
-              2048);
+    // The remount handed every restored byte over to the real allocator.
+    EXPECT_EQ(StandbyAccountedBytesForTesting(service), 0);
 
     const std::string new_key = "post_remount_allocation";
     PutObjectOnSegment(service, generate_uuid(), new_key, endpoint);
@@ -1450,14 +1461,10 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
                   .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_,
               kDefaultSegmentBase + 1024);
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
-                  metric_before,
-              3072);
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 3072);
 
     EraseObjectForTesting(service, kDefaultTenant, first_key);
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
-                  metric_before,
-              2048);
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 2048);
     const std::string replacement_key = "post_remount_replacement";
     PutObjectOnSegment(service, generate_uuid(), replacement_key, endpoint);
     auto replacement =
@@ -1467,9 +1474,7 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
                   .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_,
               kDefaultSegmentBase);
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
-                  metric_before,
-              3072);
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 3072);
 }
 
 TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
@@ -1480,8 +1485,6 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
             .build());
 
     const std::string endpoint = "standby_cachelib_remount_segment";
-    const auto metric_before =
-        MasterMetricManager::instance().get_allocated_mem_size();
     const std::string key = "standby_cachelib_remount_key";
     auto object = MakeStandbyObject(key, endpoint, 64);
     object.metadata.replicas.front()
@@ -1494,9 +1497,7 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
                     .RestoreFromStandbySnapshot(
                         {object}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
-                  metric_before,
-              64);
+    EXPECT_EQ(StandbyAccountedBytesForTesting(service), 64);
 
     auto single_before = service.GetReplicaList(key, kDefaultTenant);
     ASSERT_FALSE(single_before.has_value());
@@ -1519,9 +1520,8 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
                   .buffer_descriptor.protocol_,
               "rdma");
     EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 64);
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
-                  metric_before,
-              64);
+    // The remount handed every restored byte over to the real allocator.
+    EXPECT_EQ(StandbyAccountedBytesForTesting(service), 0);
 
     PutObjectOnSegment(service, generate_uuid(), "cachelib_after_remount",
                        endpoint, 64);
