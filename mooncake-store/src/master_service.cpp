@@ -11850,7 +11850,7 @@ MasterService::MetadataSerializer::Deserialize(
         if (shard_data_obj.type != msgpack::type::BIN) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
-                "Invalid MessagePack format: expected binary data for tenant_accessor"));
+                "Invalid MessagePack format: expected binary data for shard"));
         }
 
         // Parse shard binary data directly, avoiding copy
@@ -11865,7 +11865,7 @@ MasterService::MetadataSerializer::Deserialize(
         } catch (const std::exception& e) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
-                "Failed to unpack tenant_accessor data: " + std::string(e.what())));
+                "Failed to unpack shard data: " + std::string(e.what())));
         }
 
         const msgpack::object& shard_obj = shard_oh.get();
@@ -11989,7 +11989,7 @@ MasterService::MetadataSerializer::DeserializeTenant(
     const msgpack::object& obj) {
     if (obj.type != msgpack::type::MAP) {
         return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL, "Invalid tenant_accessor format: expected map"));
+            ErrorCode::DESERIALIZE_FAIL, "Invalid shard format: expected map"));
     }
 
     const msgpack::object* metadata_array = nullptr;
@@ -12010,7 +12010,7 @@ MasterService::MetadataSerializer::DeserializeTenant(
         metadata_array->type != msgpack::type::ARRAY) {
         return tl::make_unexpected(
             SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "Missing or invalid 'metadata' field in tenant_accessor"));
+                               "Missing or invalid 'metadata' field in shard"));
     }
 
     for (uint32_t j = 0; j < metadata_array->via.array.size; ++j) {
