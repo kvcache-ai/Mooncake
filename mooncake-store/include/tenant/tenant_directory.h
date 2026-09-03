@@ -26,7 +26,7 @@ namespace tenant {
 // mutates the targets themselves.
 template <class Handle>
 class TenantDirectory {
- public:
+   public:
     using Frame = std::unordered_map<TenantId, Handle, TenantIdHash>;
 
     // Returns a null Handle when the tenant is absent. Lock-free on the read
@@ -77,7 +77,7 @@ class TenantDirectory {
         }
     }
 
- private:
+   private:
     // GCC 11's libstdc++ lacks the C++20 std::atomic<std::shared_ptr<T>>
     // specialization, so use the portable free functions on a plain
     // std::shared_ptr. The read path stays lock-free.

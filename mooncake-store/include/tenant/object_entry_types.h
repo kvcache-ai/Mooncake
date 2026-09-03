@@ -82,8 +82,7 @@ struct PromotionCandidate {
     std::chrono::steady_clock::time_point first_seen;
     std::chrono::steady_clock::time_point last_seen;
     std::chrono::steady_clock::time_point retry_after;
-    PromotionCandidateReason last_reason{
-        PromotionCandidateReason::kQueueCap};
+    PromotionCandidateReason last_reason{PromotionCandidateReason::kQueueCap};
     ErrorCode last_error{ErrorCode::OK};
     uint32_t retry_count{0};
     // Execution failures in this admission chain (AllocStart / TE-write /
@@ -94,13 +93,13 @@ struct PromotionCandidate {
     uint32_t execution_failures{0};
 };
 
-// alloc_id is the new MEMORY replica staged by AllocStart; NotifyPromotionSuccess
-// commits it so a concurrent Put on the same key cannot be confused with ours.
-// start_time anchors the reaper deadline and is reset at AllocStart so each
-// phase (queue-wait and active transfer) gets its own full timeout window.
-// holder_id is the only client authorized to commit/abort the task (the source
-// LOCAL_DISK owner); without it another client could flip the staged PROCESSING
-// replica to COMPLETE before the holder's RDMA write landed.
+// alloc_id is the new MEMORY replica staged by AllocStart;
+// NotifyPromotionSuccess commits it so a concurrent Put on the same key cannot
+// be confused with ours. start_time anchors the reaper deadline and is reset at
+// AllocStart so each phase (queue-wait and active transfer) gets its own full
+// timeout window. holder_id is the only client authorized to commit/abort the
+// task (the source LOCAL_DISK owner); without it another client could flip the
+// staged PROCESSING replica to COMPLETE before the holder's RDMA write landed.
 struct PromotionTask {
     ReplicaID source_id;    // the LOCAL_DISK replica being promoted
     ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart

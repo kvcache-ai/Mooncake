@@ -53,7 +53,7 @@ TEST(TenantDirectoryTest,
     ASSERT_NE(new_handle, nullptr);
     EXPECT_EQ(*new_handle, 99);
     EXPECT_NE(old_handle.get(), new_handle.get());  // distinct generation
-    EXPECT_EQ(*old_handle, 7);                       // old generation untouched
+    EXPECT_EQ(*old_handle, 7);                      // old generation untouched
 }
 
 TEST(TenantDirectoryTest, ConcurrentReadsDuringWritesAreSafeAndLinearizable) {
@@ -118,7 +118,8 @@ TEST(TenantDirectoryTest, VisitEnumeratesEveryTenantSnapshotConsistently) {
     // by an in-flight Visit, but a fresh Visit sees it.
     dir.Upsert(TenantId("tenant-d"), std::make_shared<int>(4));
     size_t count_after = 0;
-    dir.Visit([&](const TenantId&, const std::shared_ptr<int>&) { ++count_after; });
+    dir.Visit(
+        [&](const TenantId&, const std::shared_ptr<int>&) { ++count_after; });
     EXPECT_EQ(count_after, 4u);
 }
 

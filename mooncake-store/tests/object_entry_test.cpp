@@ -15,10 +15,9 @@ namespace {
 std::unique_ptr<ObjectMetadata> MakeMetadata(const std::string& user_key) {
     return std::make_unique<ObjectMetadata>(
         UUID{1, 2}, std::chrono::system_clock::now(), 128,
-        std::vector<Replica>{}, std::nullopt, false,
-        ObjectDataType::UNKNOWN, std::string{}, TenantId(), user_key);
+        std::vector<Replica>{}, std::nullopt, false, ObjectDataType::UNKNOWN,
+        std::string{}, TenantId(), user_key);
 }
-
 
 TEST(ObjectEntryTest, HoldsAndScopesMetadataEnvelope) {
     auto entry = std::make_shared<ObjectEntry>("k1", "");
@@ -51,7 +50,8 @@ TEST(ObjectEntryTest, HoldsAndScopesMetadataEnvelope) {
     EXPECT_TRUE(entry->metadata()->object_checksum.has_value());
     EXPECT_EQ(*entry->metadata()->object_checksum, 42u);
 
-    // Taking ownership returns the previously-wired envelope and empties the slot.
+    // Taking ownership returns the previously-wired envelope and empties the
+    // slot.
     auto recovered = entry->TakeMetadata();
     EXPECT_EQ(recovered.get(), raw);
     EXPECT_FALSE(entry->has_metadata());

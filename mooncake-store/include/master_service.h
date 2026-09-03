@@ -1057,8 +1057,9 @@ class MasterService {
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
 
-        // Per-object route with a per-object mutation boundary (ObjectEntry::mutex)
-        // and the thin flat group membership (one shared Lease + member keys).
+        // Per-object route with a per-object mutation boundary
+        // (ObjectEntry::mutex) and the thin flat group membership (one shared
+        // Lease + member keys).
         mooncake::tenant::TenantStore object_route;
 
         // Count of objects with >=1 completed LOCAL_DISK replica; the eviction
@@ -1070,10 +1071,10 @@ class MasterService {
             return object_route.Pin(key);
         }
         // Insert a NEW ObjectEntry; returns false if `key` already present.
-        bool InsertObject(std::string key,
-                          std::shared_ptr<mooncake::tenant::ObjectEntry> entry) {
-            return object_route.InsertObject(std::move(key),
-                                             std::move(entry));
+        bool InsertObject(
+            std::string key,
+            std::shared_ptr<mooncake::tenant::ObjectEntry> entry) {
+            return object_route.InsertObject(std::move(key), std::move(entry));
         }
         bool EraseObject(const std::string& key) {
             return object_route.Erase(key);
@@ -1083,8 +1084,8 @@ class MasterService {
         }
         size_t ObjectCount() const { return object_route.ObjectCount(); }
         void VisitObjects(
-            const std::function<void(
-                const std::shared_ptr<mooncake::tenant::ObjectEntry>&)>&
+            const std::function<
+                void(const std::shared_ptr<mooncake::tenant::ObjectEntry>&)>&
                 visitor) const {
             object_route.VisitObjects(visitor);
         }
@@ -1230,7 +1231,6 @@ class MasterService {
         TenantState* state_{nullptr};
     };
 
-
     static ObjectIdentity MakeObjectIdentity(const std::string& user_key,
                                              TenantId tenant_id) {
         return {std::move(tenant_id), user_key};
@@ -1260,9 +1260,9 @@ class MasterService {
 
     // Register a member key under a group and return the group's shared Lease
     // (creating it on first member). Returns nullptr for empty group_id.
-    std::shared_ptr<Lease> RegisterGroupMember(
-        TenantState& tenant_state, const std::string& key,
-        const std::string& group_id);
+    std::shared_ptr<Lease> RegisterGroupMember(TenantState& tenant_state,
+                                               const std::string& key,
+                                               const std::string& group_id);
     void UnregisterGroupMember(TenantState& tenant_state,
                                const std::string& key,
                                const std::string& group_id);
@@ -1319,20 +1319,20 @@ class MasterService {
         kPreserveOld,
         kAbortOnly,
     };
-    void EraseMetadata(TenantState& tenant_state,
-                       const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                           entry,
-                       const TenantId& tenant_id);
-    void EraseMetadata(TenantState& tenant_state,
-                       const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                           entry,
-                       const TenantId& tenant_id, QuotaEraseMode quota_mode,
-                       TenantStateAccessorRW* shard,
-                       const std::vector<std::string>& previous_media_hint = {});
-    void EraseMetadata(TenantState& tenant_state,
-                       const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                           entry,
-                       const TenantId& tenant_id, QuotaEraseMode quota_mode);
+    void EraseMetadata(
+        TenantState& tenant_state,
+        const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
+        const TenantId& tenant_id);
+    void EraseMetadata(
+        TenantState& tenant_state,
+        const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
+        const TenantId& tenant_id, QuotaEraseMode quota_mode,
+        TenantStateAccessorRW* shard,
+        const std::vector<std::string>& previous_media_hint = {});
+    void EraseMetadata(
+        TenantState& tenant_state,
+        const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
+        const TenantId& tenant_id, QuotaEraseMode quota_mode);
     void EraseMetadata(TenantState& tenant_state, const std::string& key,
                        const TenantId& tenant_id, QuotaEraseMode quota_mode,
                        TenantStateAccessorRW* shard);
@@ -1349,7 +1349,8 @@ class MasterService {
         const TenantId& tenant_id);
     // Test-only seam (friend of MasterServiceHATest): return the tenant object
     // route lock EXCLUSIVE, so the test can gate a PutStart at its first Pin
-    // inside the snapshot barrier. Delegates to TenantStore's private LockRouteForTesting.
+    // inside the snapshot barrier. Delegates to TenantStore's private
+    // LockRouteForTesting.
     std::unique_lock<std::shared_mutex> LockObjectRouteForTesting(
         TenantState& tenant_state) const;
     TenantQuotaHandle GetBoundTenantQuotaHandle(
@@ -1723,9 +1724,9 @@ class MasterService {
             // teardown and releases it before the route mutation. The two locks
             // are never held together.
             lock_ = std::unique_lock<std::shared_mutex>();
-            service_->EraseMetadata(*tenant_state_, entry_, object_id_.tenant_id,
-                                    QuotaEraseMode::kFull, &shard_guard_,
-                                    previous_media_hint);
+            service_->EraseMetadata(*tenant_state_, entry_,
+                                    object_id_.tenant_id, QuotaEraseMode::kFull,
+                                    &shard_guard_, previous_media_hint);
             entry_.reset();
             MaybeEraseEmptyTenant();
         }
@@ -2174,8 +2175,8 @@ class MasterService {
     mutable std::shared_mutex snapshot_mutex_;
 
     // Test-only snapshot-barrier gate state (see ArmSnapshotBarrierForTesting).
-    // PutStart signals snapshot_barrier_test_reached_ (and notifies the CV) when
-    // it has released client_mutex_ and holds snapshot_mutex_ (inside the
+    // PutStart signals snapshot_barrier_test_reached_ (and notifies the CV)
+    // when it has released client_mutex_ and holds snapshot_mutex_ (inside the
     // barrier). Always no-ops in production (snapshot_barrier_test_armed_ is
     // false unless a test armed it).
     std::atomic<bool> snapshot_barrier_test_armed_{false};

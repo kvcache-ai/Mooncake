@@ -84,7 +84,8 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        auto tenant_handle = service.tenant_directory_.Lookup(normalized_tenant);
+        auto tenant_handle =
+            service.tenant_directory_.Lookup(normalized_tenant);
         if (!tenant_handle) {
             return std::nullopt;
         }
@@ -108,7 +109,8 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        auto tenant_handle = service.GetOrCreateTenantStateHandle(normalized_tenant);
+        auto tenant_handle =
+            service.GetOrCreateTenantStateHandle(normalized_tenant);
         auto entry = tenant_handle->Pin(key);
         ASSERT_TRUE(entry != nullptr && entry->has_metadata());
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
@@ -497,7 +499,8 @@ class MasterServiceTest : public ::testing::Test {
             service.ResolveRequestTenantId(TenantId(tenant_id));
         // Group membership is single-sourced in the tenant's own object_route,
         // so read it there (there is no global table).
-        auto tenant_handle = service.tenant_directory_.Lookup(normalized_tenant);
+        auto tenant_handle =
+            service.tenant_directory_.Lookup(normalized_tenant);
         if (!tenant_handle) {
             return {};
         }
@@ -508,10 +511,11 @@ class MasterServiceTest : public ::testing::Test {
         // Drop group membership from each tenant's object_route. Removing the
         // last member erases the (now-empty) group.
         service.tenant_directory_.Visit(
-            [&](const TenantId&, const std::shared_ptr<MasterService::TenantState>&
-                    handle) {
+            [&](const TenantId&,
+                const std::shared_ptr<MasterService::TenantState>& handle) {
                 auto& tenant_state = *handle;
-                std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
+                std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
+                    objs;
                 tenant_state.VisitObjects(
                     [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
                             entry) { objs.push_back(entry); });
@@ -533,11 +537,13 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        auto tenant_handle = service.tenant_directory_.Lookup(normalized_tenant);
+        auto tenant_handle =
+            service.tenant_directory_.Lookup(normalized_tenant);
         if (!tenant_handle) {
             return nullptr;
         }
-        // The shared group Lease is single-sourced in the tenant's object_route.
+        // The shared group Lease is single-sourced in the tenant's
+        // object_route.
         return tenant_handle->object_route.LeaseFor(group_id);
     }
 

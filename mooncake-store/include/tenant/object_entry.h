@@ -24,7 +24,7 @@ namespace mooncake {
 namespace tenant {
 
 class ObjectEntry {
- public:
+   public:
     ObjectEntry(std::string key, std::string group_id)
         : key_(std::move(key)), group_id_(std::move(group_id)) {}
     ~ObjectEntry() = default;
@@ -54,9 +54,9 @@ class ObjectEntry {
     std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
 
     // Per-object mutation boundary: the narrowest lock a point operation may
-    // hold after pinning this entry. ObjectMetadata has its own SpinLock for its
-    // enclosed lease/soft-pin state; a path that touches both holds this mutex
-    // and then takes the metadata lock (never the reverse).
+    // hold after pinning this entry. ObjectMetadata has its own SpinLock for
+    // its enclosed lease/soft-pin state; a path that touches both holds this
+    // mutex and then takes the metadata lock (never the reverse).
     mutable std::shared_mutex mutex;
 
     // Metadata is NON-movable / NON-copyable and self-locking, so it is owned
@@ -89,7 +89,7 @@ class ObjectEntry {
         }
     }
 
- private:
+   private:
     const std::string key_;
     const std::string group_id_;
     std::shared_ptr<Lease> lease_;

@@ -169,8 +169,8 @@ class BatchEvictBench {
         const auto base_expiration = now - std::chrono::hours(1);
         size_t ordinal = 0;
 
-        // Objects live in the default tenant's per-tenant route. Walk it via the
-        // ownership registry; per-object access is under the metadata lock.
+        // Objects live in the default tenant's per-tenant route. Walk it via
+        // the ownership registry; per-object access is under the metadata lock.
         service.tenant_directory_.Visit(
             [&](const TenantId& tenant_id,
                 const std::shared_ptr<MasterService::TenantState>& handle) {

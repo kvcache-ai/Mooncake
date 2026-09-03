@@ -28,8 +28,8 @@ TEST(TenantStoreTest, LeaseForCreatesAndSharesOneLeasePerGroup) {
     auto b = store.LeaseFor("g2");
 
     ASSERT_NE(a1, nullptr);
-    EXPECT_EQ(a1.get(), a2.get());   // same group -> same shared Lease
-    EXPECT_NE(a1.get(), b.get());    // different group -> distinct Lease
+    EXPECT_EQ(a1.get(), a2.get());  // same group -> same shared Lease
+    EXPECT_NE(a1.get(), b.get());   // different group -> distinct Lease
 }
 
 TEST(TenantStoreTest, AddRemoveGroupMembers) {
@@ -84,7 +84,6 @@ TEST(TenantStoreTest, SharedLeaseWiresGroupAllOrNoneExpiry) {
     shared->GrantReadLease(std::chrono::milliseconds(10'000));
     EXPECT_FALSE(shared->IsExpired(now));
 
-
     shared->SetDeadline(now);
     EXPECT_TRUE(shared->IsExpired(now));
 }
@@ -137,7 +136,8 @@ TEST(TenantStoreTest, VisitObjectsEnumeratesEveryEntry) {
     EXPECT_TRUE(std::find(keys.begin(), keys.end(), "k3") != keys.end());
 }
 
-TEST(TenantStoreTest, ObjectRouteAndGroupMembershipAreIndependentFlatStructures) {
+TEST(TenantStoreTest,
+     ObjectRouteAndGroupMembershipAreIndependentFlatStructures) {
     TenantStore store;
     // A grouped member is just a flat route entry with a group_id annotation.
     auto member = std::make_shared<ObjectEntry>("k2", "g1");
@@ -188,12 +188,12 @@ TEST(TenantStoreTest, InsertObjectRejectsDuplicateKey) {
     TenantStore store;
     store.InsertObject("k1", std::make_shared<ObjectEntry>("k1", "g1"));
     // Second insert for the same key is rejected; the original is intact.
-    EXPECT_FALSE(store.InsertObject("k1", std::make_shared<ObjectEntry>("k1", "g2")));
+    EXPECT_FALSE(
+        store.InsertObject("k1", std::make_shared<ObjectEntry>("k1", "g2")));
     EXPECT_EQ(store.ObjectCount(), 1u);
     EXPECT_EQ(store.Members("g1").size(), 1u);
     EXPECT_TRUE(store.Members("g2").empty());
 }
-
 
 // --- Accessors ---
 
@@ -214,8 +214,8 @@ TEST(TenantStoreTest, WithObjectScopeRespectsPresenceAndAbsence) {
     // per-object lock.
     singleton->SetMetadata(std::make_unique<ObjectMetadata>(
         UUID{1, 2}, std::chrono::system_clock::now(), 64,
-        std::vector<Replica>{}, std::nullopt, false,
-        ObjectDataType::UNKNOWN, std::string{}, TenantId(), "k1"));
+        std::vector<Replica>{}, std::nullopt, false, ObjectDataType::UNKNOWN,
+        std::string{}, TenantId(), "k1"));
     const auto* raw = singleton->metadata();
 
     called = false;
