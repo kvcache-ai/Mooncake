@@ -461,9 +461,12 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
     EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
     EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
 
+    // Zero the gauges the way a standby transition does, by projecting an
+    // empty snapshot. Nothing needs to be restored afterwards: the gauges no
+    // longer track allocator activity, so teardown emits no decrements that
+    // could underflow them.
     auto& metrics = MasterMetricManager::instance();
-    metrics.reset_allocated_nof_size();
-    metrics.reset_total_nof_capacity();
+    metrics.project_storage_usage({});
     EXPECT_EQ(metrics.get_allocated_nof_size(), 0);
     EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
 
@@ -476,24 +479,76 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
     EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
     EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
 
-    // Restore global gauges before teardown because allocator and segment
-    // cleanup still emit their matching decrements.
-    metrics.inc_allocated_nof_size("", kAllocationSize);
-    metrics.inc_total_nof_capacity("", kSegmentSize);
     buffer.reset();
     {
         auto segment_access = segment_manager.getNoFSegmentAccess();
-        size_t metrics_dec_capacity = 0;
-        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
-                                                       metrics_dec_capacity),
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id),
                   ErrorCode::OK);
-        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
-                                                      metrics_dec_capacity),
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id),
                   ErrorCode::OK);
     }
     allocator.reset();
     EXPECT_EQ(segment_manager.GetUsage().used_bytes, 0u);
     EXPECT_EQ(segment_manager.GetUsage().capacity_bytes, 0u);
+}
+
+// The NoF gauges are a projection: only project_storage_usage() writes them.
+// Mounting a segment and allocating from it must leave the previously
+// projected values untouched until the next projection runs.
+TEST_F(SegmentTest, NoFGaugesMoveOnlyWhenProjected) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+    constexpr int64_t kProjectedUsed = 111;
+    constexpr int64_t kProjectedCapacity = 222;
+
+    auto& metrics = MasterMetricManager::instance();
+    TieredStorageUsageSnapshot projected;
+    projected.nof.used_bytes = static_cast<size_t>(kProjectedUsed);
+    projected.nof.capacity_bytes = static_cast<size_t>(kProjectedCapacity);
+    metrics.project_storage_usage(projected);
+    ASSERT_EQ(metrics.get_allocated_nof_size(), kProjectedUsed);
+    ASSERT_EQ(metrics.get_total_nof_capacity(), kProjectedCapacity);
+
+    NoFSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "nof_projection_only_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x340000000;
+    segment.te_endpoint = "nof_projection_only_endpoint";
+    UUID client_id = generate_uuid();
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+    }
+    auto allocator = GetNoFAllocatorForTesting(segment_manager, segment.id);
+    ASSERT_NE(allocator, nullptr);
+    auto buffer = allocator->allocate(kAllocationSize);
+    ASSERT_NE(buffer, nullptr);
+
+    // Domain state moved; the gauges did not.
+    EXPECT_EQ(segment_manager.GetUsage().used_bytes, kAllocationSize);
+    EXPECT_EQ(metrics.get_allocated_nof_size(), kProjectedUsed);
+    EXPECT_EQ(metrics.get_total_nof_capacity(), kProjectedCapacity);
+
+    projected.nof = segment_manager.GetUsageSnapshot();
+    metrics.project_storage_usage(projected);
+    EXPECT_EQ(metrics.get_allocated_nof_size(),
+              static_cast<int64_t>(kAllocationSize));
+    EXPECT_EQ(metrics.get_total_nof_capacity(),
+              static_cast<int64_t>(kSegmentSize));
+
+    buffer.reset();
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id),
+                  ErrorCode::OK);
+    }
+    allocator.reset();
+    metrics.project_storage_usage({});
 }
 
 // MountSegmentDuplicate Tests:

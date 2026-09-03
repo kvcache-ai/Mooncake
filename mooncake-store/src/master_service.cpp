@@ -2857,8 +2857,6 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    size_t metrics_dec_capacity = 0;  // to update the metrics
-
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto alive_clients = ok_client_;
@@ -2868,8 +2866,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     {
         ScopedNoFSegmentAccess segment_access =
             nof_segment_manager_.getNoFSegmentAccess();
-        ErrorCode err = segment_access.PrepareUnmountSegment(
-            segment_id, metrics_dec_capacity);
+        ErrorCode err = segment_access.PrepareUnmountSegment(segment_id);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             // Return OK because this is an idempotent operation
             return {};
@@ -2886,8 +2883,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     // 3. Commit the unmount operation
     ScopedNoFSegmentAccess segment_access =
         nof_segment_manager_.getNoFSegmentAccess();
-    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                   metrics_dec_capacity);
+    auto err = segment_access.CommitUnmountSegment(segment_id, client_id);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -11282,15 +11278,14 @@ bool MasterService::ProbeNoFSegment(const std::string& te_endpoint,
 bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     const MountedNoFSegmentSnapshot& snapshot,
     const std::string& error_reason) {
-    size_t metrics_dec_capacity = 0;
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     auto alive_clients = ok_client_;
     client_lock.unlock();
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
-        ErrorCode err = nof_segment_access.PrepareUnmountSegment(
-            snapshot.segment_id, metrics_dec_capacity);
+        ErrorCode err =
+            nof_segment_access.PrepareUnmountSegment(snapshot.segment_id);
         if (err == ErrorCode::SEGMENT_NOT_FOUND ||
             err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
             std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
@@ -11315,7 +11310,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
         ErrorCode err = nof_segment_access.CommitUnmountSegment(
-            snapshot.segment_id, snapshot.client_id, metrics_dec_capacity);
+            snapshot.segment_id, snapshot.client_id);
         if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_NOT_FOUND) {
             LOG(ERROR) << "segment_id=" << snapshot.segment_id
                        << ", segment_name=" << snapshot.segment.name

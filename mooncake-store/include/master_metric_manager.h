@@ -50,14 +50,6 @@ class MasterMetricManager {
     void inc_valid_get_nums(int64_t val = 1);
     void inc_total_get_nums(int64_t val = 1);
 
-    // NoF segment Metrics
-    void inc_allocated_nof_size(const std::string& segment, int64_t val = 1);
-    void dec_allocated_nof_size(const std::string& segment, int64_t val = 1);
-    void reset_allocated_nof_size();
-    void inc_total_nof_capacity(const std::string& segment, int64_t val = 1);
-    void dec_total_nof_capacity(const std::string& segment, int64_t val = 1);
-    void reset_total_nof_capacity();
-
     /**
      * @brief Refresh storage gauges from authoritative allocator snapshots.
      *
@@ -102,13 +94,12 @@ class MasterMetricManager {
     // followed by client expiry / reaper cleanup).
     void remove_segment_metrics(const std::string& segment);
 
-    // NoF segment Metrics
+    // NoF segment Metrics. Write-only from project_storage_usage(); business
+    // code reads NoFSegmentManager::GetUsage() instead.
     int64_t get_allocated_nof_size();
     int64_t get_total_nof_capacity();
     int64_t get_segment_allocated_nof_size(const std::string& segment);
     int64_t get_segment_total_nof_capacity(const std::string& segment);
-    // Remove all per-segment NoF metric labels for the given segment.
-    void remove_nof_segment_metrics(const std::string& segment);
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);

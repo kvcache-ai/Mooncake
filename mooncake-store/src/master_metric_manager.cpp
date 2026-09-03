@@ -718,38 +718,6 @@ void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
 }
 
 // NoF segment Metrics
-void MasterMetricManager::inc_allocated_nof_size(const std::string& segment,
-                                                 int64_t val) {
-    nof_allocated_size_.inc(val);
-    if (!segment.empty()) nof_allocated_size_per_segment_.inc({segment}, val);
-}
-
-void MasterMetricManager::dec_allocated_nof_size(const std::string& segment,
-                                                 int64_t val) {
-    nof_allocated_size_.dec(val);
-    if (!segment.empty()) nof_allocated_size_per_segment_.dec({segment}, val);
-}
-
-void MasterMetricManager::reset_allocated_nof_size() {
-    nof_allocated_size_.reset();
-}
-
-void MasterMetricManager::inc_total_nof_capacity(const std::string& segment,
-                                                 int64_t val) {
-    nof_total_capacity_.inc(val);
-    if (!segment.empty()) nof_total_capacity_per_segment_.inc({segment}, val);
-}
-
-void MasterMetricManager::dec_total_nof_capacity(const std::string& segment,
-                                                 int64_t val) {
-    nof_total_capacity_.dec(val);
-    if (!segment.empty()) nof_total_capacity_per_segment_.dec({segment}, val);
-}
-
-void MasterMetricManager::reset_total_nof_capacity() {
-    nof_total_capacity_.reset();
-}
-
 int64_t MasterMetricManager::get_allocated_nof_size() {
     return nof_allocated_size_.value();
 }
@@ -806,12 +774,6 @@ int64_t MasterMetricManager::get_segment_allocated_nof_size(
 int64_t MasterMetricManager::get_segment_total_nof_capacity(
     const std::string& segment) {
     return nof_total_capacity_per_segment_.value({segment});
-}
-
-void MasterMetricManager::remove_nof_segment_metrics(
-    const std::string& segment) {
-    nof_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
-    nof_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
 }
 
 // File Storage Metrics

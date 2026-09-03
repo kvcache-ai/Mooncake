@@ -1212,7 +1212,6 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
     nof_segment_manager_->mounted_segments_[segment.id] = {
         segment, client_id, SegmentStatus::OK, std::move(allocator)};
     nof_segment_manager_->client_by_name_[segment.name] = client_id;
-    MasterMetricManager::instance().inc_total_nof_capacity(segment.name, size);
 
     return ErrorCode::OK;
 }
@@ -1243,7 +1242,7 @@ ErrorCode ScopedNoFSegmentAccess::ReMountSegment(
 }
 
 ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
-    const UUID& segment_id, size_t& metrics_dec_capacity) {
+    const UUID& segment_id) {
     auto it = nof_segment_manager_->mounted_segments_.find(segment_id);
     if (it == nof_segment_manager_->mounted_segments_.end()) {
         LOG(WARNING) << "NoF segment unmount: segment_id=" << segment_id
@@ -1258,7 +1257,6 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
 
     auto& mounted_segment = it->second;
     auto& segment = mounted_segment.segment;
-    metrics_dec_capacity = segment.size;
 
     std::shared_ptr<BufferAllocatorBase> allocator =
         mounted_segment.buf_allocator;
@@ -1274,8 +1272,7 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
 }
 
 ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
-    const UUID& segment_id, const UUID& client_id,
-    const size_t& metrics_dec_capacity) {
+    const UUID& segment_id, const UUID& client_id) {
     bool found_in_client_segments = false;
     auto client_it = nof_segment_manager_->client_segments_.find(client_id);
     if (client_it != nof_segment_manager_->client_segments_.end()) {
@@ -1303,9 +1300,6 @@ ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
     }
 
     nof_segment_manager_->mounted_segments_.erase(segment_id);
-    MasterMetricManager::instance().dec_total_nof_capacity(
-        segment_name, metrics_dec_capacity);
-    MasterMetricManager::instance().remove_nof_segment_metrics(segment_name);
 
     return ErrorCode::OK;
 }

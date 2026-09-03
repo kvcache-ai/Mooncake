@@ -264,15 +264,13 @@ class ScopedNoFSegmentAccess {
     /**
      * @brief Prepare to unmount a segment by deleting its allocator
      */
-    ErrorCode PrepareUnmountSegment(const UUID& segment_id,
-                                    size_t& metrics_dec_capacity);
+    ErrorCode PrepareUnmountSegment(const UUID& segment_id);
 
     /**
      * @brief Deleting the segment to complete the unmounting operation
      */
     ErrorCode CommitUnmountSegment(const UUID& segment_id,
-                                   const UUID& client_id,
-                                   const size_t& metrics_dec_capacity);
+                                   const UUID& client_id);
 
     /**
      * @brief Get all the segments of a client
