@@ -80,6 +80,22 @@ add_store_test(master_service_tenant_scenario_test
                master_service_tenant_scenario_test.cpp)
 target_link_libraries(master_service_tenant_scenario_test
                       PRIVATE master_service_test_dsl)
+add_store_test(master_service_placement_scenario_test
+               master_service_placement_scenario_test.cpp)
+target_link_libraries(master_service_placement_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_replication_scenario_test
+               master_service_replication_scenario_test.cpp)
+target_link_libraries(master_service_replication_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_task_scenario_test
+               master_service_task_scenario_test.cpp)
+target_link_libraries(master_service_task_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_segment_scenario_test
+               master_service_segment_scenario_test.cpp)
+target_link_libraries(master_service_segment_scenario_test
+                      PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
