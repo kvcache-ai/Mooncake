@@ -7,7 +7,7 @@
 //
 // ObjectMetadata is deliberately NON-copyable / NON-movable and self-locking
 // (holds a SpinLock). Callers must own it through a pointer
-// (e.g. shared_ptr<ObjectMetadata>), never by value in a resizing container.
+// (e.g. unique_ptr<ObjectMetadata>), never by value in a resizing container.
 
 #include <algorithm>
 #include <chrono>
