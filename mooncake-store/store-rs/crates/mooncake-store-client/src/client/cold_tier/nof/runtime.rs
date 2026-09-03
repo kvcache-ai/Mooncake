@@ -441,7 +441,10 @@ impl PersistentStorageBackend for NofObjectAdapter {
 
     fn get_object(&self, backing: &ColdBackingRoute) -> Result<Option<Vec<u8>>> {
         let key = Self::provider_key(&backing.object_locator)?;
-        match self.target.get_object(&self.namespace, &key)? {
+        match self
+            .target
+            .get_object_with_known_length(&self.namespace, &key, backing.length)?
+        {
             NofObjectState::Found(value) => {
                 if backing.length != 0 {
                     validate_payload(backing, &value)?;

@@ -154,6 +154,7 @@ impl NofObjectRead for FakeObjectNof {
         &self,
         namespace: &NamespaceScope,
         key: &str,
+        _known_length: Option<u64>,
     ) -> Result<NofObjectState<Vec<u8>>> {
         Ok(match self.objects.lock().get(&(namespace.clone(), key.to_string())) {
             Some(value) => NofObjectState::Found(value.clone()),

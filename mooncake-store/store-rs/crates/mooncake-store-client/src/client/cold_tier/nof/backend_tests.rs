@@ -31,6 +31,7 @@ impl NofObjectRead for ObjectReadWithoutLimits {
         &self,
         _namespace: &NamespaceScope,
         _key: &str,
+        _known_length: Option<u64>,
     ) -> Result<NofObjectState<Vec<u8>>> {
         Ok(NofObjectState::Missing)
     }
@@ -88,6 +89,7 @@ impl NofObjectRead for RecordingObjectBacking {
         &self,
         _namespace: &NamespaceScope,
         _key: &str,
+        _known_length: Option<u64>,
     ) -> Result<NofObjectState<Vec<u8>>> {
         Ok(NofObjectState::Missing)
     }
@@ -118,14 +120,16 @@ fn object_capability_requires_matching_limits() {
 }
 
 #[test]
-fn object_backing_uses_native_zero_based_shards() {
+fn object_backing_uses_root_fast_path_and_native_zero_based_shards() {
     let (backing, backend) = recording_backend(true);
     let scope = NamespaceScope::new("tenant", "domain", "set");
+    backend.put_object(&scope, "small", &[0; 4]).unwrap();
     backend.put_object(&scope, "key", &[0; 10]).unwrap();
     assert_eq!(
         *backing.shards.lock().unwrap(),
-        vec![(0, 3, 4), (1, 3, 4), (2, 3, 2)]
+        vec![(0, 1, 4), (0, 3, 4), (1, 3, 4), (2, 3, 2)]
     );
+    assert_eq!(*backing.batches.lock().unwrap(), vec![1, 3]);
 }
 
 #[test]

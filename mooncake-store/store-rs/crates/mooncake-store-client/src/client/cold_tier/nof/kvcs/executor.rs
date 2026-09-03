@@ -574,11 +574,27 @@ mod standard {
             &self,
             namespace: &NamespaceScope,
             key: &str,
+            known_length: Option<u64>,
         ) -> Result<NofObjectState<Vec<u8>>> {
-            let query = match self.query_raw(namespace, key, true)? {
-                NofObjectState::Found(query) => query,
-                NofObjectState::Missing => return Ok(NofObjectState::Missing),
-                NofObjectState::Incomplete => return Ok(NofObjectState::Incomplete),
+            let query = match known_length {
+                Some(length) if length > 0 && length <= self.max_value_size => RawQuery {
+                    namespace: self.namespace(namespace)?,
+                    key: self.key(key)?,
+                    length,
+                    shards: vec![(
+                        0,
+                        usize::try_from(length).map_err(|_| {
+                            StoreError::InvalidState(
+                                "KVCS object length does not fit this platform".to_string(),
+                            )
+                        })?,
+                    )],
+                },
+                _ => match self.query_raw(namespace, key, true)? {
+                    NofObjectState::Found(query) => query,
+                    NofObjectState::Missing => return Ok(NofObjectState::Missing),
+                    NofObjectState::Incomplete => return Ok(NofObjectState::Incomplete),
+                },
             };
             let client = self.ensure_client()?;
             let items = query
@@ -717,7 +733,9 @@ mod standard {
             };
             assert_eq!(length, value.len() as u64);
             assert!(matches!(
-                backend.get_object(&namespace, key).unwrap(),
+                backend
+                    .get_object_with_known_length(&namespace, key, length)
+                    .unwrap(),
                 NofObjectState::Found(got) if got == value
             ));
             assert!(matches!(
