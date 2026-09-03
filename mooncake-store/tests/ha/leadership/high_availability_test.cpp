@@ -404,6 +404,43 @@ TEST_F(HighAvailabilityTest, ServingStateLossDoesNotWaitForPublication) {
     EXPECT_FALSE(activated.load(std::memory_order_acquire));
 }
 
+TEST_F(HighAvailabilityTest, ServingStateSerializesActivationAndLoss) {
+    ha::detail::ServingStateGate serving_state;
+    std::promise<void> activation_started;
+    std::promise<void> finish_activation;
+    auto finish_activation_future = finish_activation.get_future();
+    std::promise<void> shutdown_started;
+    std::atomic<bool> activated{false};
+    std::atomic<bool> stopped{false};
+
+    auto activation = std::async(std::launch::async, [&]() {
+        return serving_state.RunIfActive([&]() {
+            activation_started.set_value();
+            finish_activation_future.wait();
+            activated.store(true, std::memory_order_release);
+        });
+    });
+    activation_started.get_future().wait();
+
+    auto leadership_loss = std::async(std::launch::async, [&]() {
+        shutdown_started.set_value();
+        return serving_state.RequestShutdown(
+            [&]() { stopped.store(true, std::memory_order_release); });
+    });
+    shutdown_started.get_future().wait();
+
+    EXPECT_EQ(leadership_loss.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    EXPECT_TRUE(serving_state.IsActive());
+
+    finish_activation.set_value();
+    EXPECT_TRUE(activation.get());
+    EXPECT_TRUE(leadership_loss.get());
+    EXPECT_TRUE(activated.load(std::memory_order_acquire));
+    EXPECT_TRUE(stopped.load(std::memory_order_acquire));
+    EXPECT_FALSE(serving_state.IsActive());
+}
+
 #ifdef STORE_USE_ETCD
 
 TEST_F(HighAvailabilityTest, HaWithoutOplogRestoresEmptyContextAndServes) {
