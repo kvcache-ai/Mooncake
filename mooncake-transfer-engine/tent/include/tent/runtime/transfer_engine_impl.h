@@ -444,9 +444,6 @@ class TransferEngineImpl {
     Status getBatchStatus(BatchID batch_id, TransferStatus& overall_status,
                           bool allow_failover);
 
-    SelectionResult resolveTransport(const Request& req, int transport_index,
-                                     bool invalidate_on_fail = true);
-
     ResolvedRoute resolveExecutionRoute(const Request& req, int transport_index,
                                         bool invalidate_on_fail = true);
 

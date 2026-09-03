@@ -1602,17 +1602,6 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     return boundaries;
 }
 
-SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
-                                                     int transport_index,
-                                                     bool invalidate_on_fail) {
-    auto result = getTransportType(req, transport_index);
-    if (result.transport == UNSPEC && invalidate_on_fail) {
-        metadata_->segmentManager().invalidateRemote(req.target_id);
-        result = getTransportType(req, transport_index);
-    }
-    return result;
-}
-
 TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
     const Request& req, int transport_index, bool invalidate_on_fail) {
     ResolvedRoute resolved;
@@ -2476,13 +2465,11 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
             "Failover limit exceeded, all transports exhausted");
     }
 
-    if (task.staging)
-        task.staging = false;
-    else
-        task.xport_priority = task.failover_count;
+    task.staging = false;
+    task.xport_priority = task.failover_count;
 
-    auto result = resolveTransport(task.request, task.xport_priority);
-    auto type = result.transport;
+    auto resolved = resolveExecutionRoute(task.request, task.xport_priority);
+    auto type = resolved.route.transport;
     if (type == UNSPEC) {
         LOG(WARNING) << "No more transports available after "
                      << transportTypeName(prev_type) << " failed";
@@ -2494,6 +2481,24 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
               << task.failover_count << "/" << max_failover_attempts_ << ")";
     TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
 
+    task.type = type;
+    task.device_mask = resolved.route.device_mask;
+    task.qp_pool = resolved.route.qp_pool.value_or("");
+    task.sub_task_id = -1;
+
+    if (resolved.staging) {
+        task.staging = true;
+        auto status = staging_proxy_->submit(&task, (BatchID)batch,
+                                             resolved.staging_params);
+        if (!status.ok()) {
+            task.staging = false;
+            task.type = UNSPEC;
+        } else {
+            task.post_time = std::chrono::steady_clock::now();
+        }
+        return status;
+    }
+
     auto& transport = transport_list_[type];
     if (!batch->sub_batch[type]) {
         CHECK_STATUS(transport->allocateSubBatch(batch->sub_batch[type],
@@ -2501,14 +2506,11 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         attachProgressNotifier(batch, batch->sub_batch[type]);
     }
     auto& sub_batch = batch->sub_batch[type];
-    task.device_mask = result.device_mask;
-    task.qp_pool = result.qp_pool.value_or("");
     if (type == RDMA) {
         sub_batch->device_mask = task.device_mask;
         sub_batch->qp_pool = task.qp_pool;
     }
     task.sub_task_id = sub_batch->size();
-    task.type = type;
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
