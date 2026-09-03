@@ -263,51 +263,28 @@ class Replica {
 
     // memory replica constructor
     Replica(std::unique_ptr<AllocatedBuffer> buffer, ReplicaStatus status)
-        : id_(next_id_.fetch_add(1)),
-          data_(MemoryReplicaData{std::move(buffer)}),
-          status_(status),
-          refcnt_(0) {}
+        : Replica(next_id_.fetch_add(1), std::move(buffer), status) {}
 
     // nof ssd replica constructor
     Replica(std::unique_ptr<AllocatedBuffer> buffer, ReplicaStatus status,
             ReplicaType replica_type)
-        : id_(next_id_.fetch_add(1)), status_(status), refcnt_(0) {
-        if (replica_type == ReplicaType::MEMORY) {
-            data_ = MemoryReplicaData{std::move(buffer)};
-        } else if (replica_type == ReplicaType::NOF_SSD) {
-            data_ = NoFReplicaData{std::move(buffer)};
-        } else {
-            LOG(ERROR) << "Invalid buffered replica type: " << replica_type;
-        }
-    }
+        : Replica(next_id_.fetch_add(1), std::move(buffer), status,
+                  replica_type) {}
 
     // disk replica constructor
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
-        : id_(next_id_.fetch_add(1)),
-          data_(DiskReplicaData{std::move(file_path), object_size}),
-          status_(status),
-          refcnt_(0) {
-        // Automatic update allocated_file_size via RAII
-        MasterMetricManager::instance().inc_allocated_file_size(object_size);
-    }
+        : Replica(next_id_.fetch_add(1), std::move(file_path), object_size,
+                  status) {}
 
     // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
             std::string transport_endpoint, ReplicaStatus status)
-        : id_(next_id_.fetch_add(1)),
-          data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint)}),
-          status_(status),
-          refcnt_(0) {
-        MasterMetricManager::instance().inc_allocated_file_size(object_size);
-    }
+        : Replica(next_id_.fetch_add(1), client_id, object_size,
+                  std::move(transport_endpoint), status) {}
 
     // dfs replica constructor
     Replica(DistributedFSDescriptor descriptor, ReplicaStatus status)
-        : id_(next_id_.fetch_add(1)),
-          data_(DfsReplicaData{std::move(descriptor)}),
-          status_(status),
-          refcnt_(0) {}
+        : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
 
     ~Replica() {
         if (status_ == ReplicaStatus::UNDEFINED) return;
@@ -580,7 +557,7 @@ class Replica {
     };
 
     struct Descriptor {
-        ReplicaID id;
+        ReplicaID id{0};
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
                      LocalDiskDescriptor, DistributedFSDescriptor>
             descriptor_variant;
@@ -710,6 +687,52 @@ class Replica {
     };
 
    private:
+    // Restore-only constructors preserve IDs without consuming next_id_.
+    Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
+            ReplicaStatus status)
+        : id_(id),
+          data_(MemoryReplicaData{std::move(buffer)}),
+          status_(status),
+          refcnt_(0) {}
+
+    Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
+            ReplicaStatus status, ReplicaType replica_type)
+        : id_(id), status_(status), refcnt_(0) {
+        if (replica_type == ReplicaType::MEMORY) {
+            data_ = MemoryReplicaData{std::move(buffer)};
+        } else if (replica_type == ReplicaType::NOF_SSD) {
+            data_ = NoFReplicaData{std::move(buffer)};
+        } else {
+            LOG(ERROR) << "Invalid buffered replica type: " << replica_type;
+        }
+    }
+
+    Replica(ReplicaID id, std::string file_path, uint64_t object_size,
+            ReplicaStatus status)
+        : id_(id),
+          data_(DiskReplicaData{std::move(file_path), object_size}),
+          status_(status),
+          refcnt_(0) {
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+    }
+
+    Replica(ReplicaID id, UUID client_id, uint64_t object_size,
+            std::string transport_endpoint, ReplicaStatus status)
+        : id_(id),
+          data_(LocalDiskReplicaData{client_id, object_size,
+                                     std::move(transport_endpoint)}),
+          status_(status),
+          refcnt_(0) {
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+    }
+
+    Replica(ReplicaID id, DistributedFSDescriptor descriptor,
+            ReplicaStatus status)
+        : id_(id),
+          data_(DfsReplicaData{std::move(descriptor)}),
+          status_(status),
+          refcnt_(0) {}
+
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;
