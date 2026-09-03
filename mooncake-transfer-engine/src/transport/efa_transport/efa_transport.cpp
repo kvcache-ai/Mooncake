@@ -835,7 +835,13 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
                         // slot is freed and the next warmup retry starts
                         // clean.  Cheap under the shared-endpoint model —
                         // no fi_endpoint teardown required.
-                        ctx->deleteEndpoint(path);
+                        //
+                        // ...IfIdle so we never fi_av_remove() a slot another
+                        // handle is still posting on: warmup runs concurrently
+                        // with regular traffic.  A busy peer keeps its handle
+                        // and is only retried when a later call path reaches
+                        // it (see deleteEndpointIfIdle).
+                        ctx->deleteEndpointIfIdle(path);
                     }
                     return rc;
                 }));
