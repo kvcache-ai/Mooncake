@@ -68,10 +68,11 @@ class MemoryBackend final : public HaKvBackend {
 
 std::unique_ptr<HotStandbyService> MakeBatchSnapshotStandby(
     const std::shared_ptr<MemoryBackend>& backend,
-    LocalFileSnapshotObjectStore& object_store) {
+    LocalFileSnapshotObjectStore& object_store,
+    bool enable_oplog_following = true) {
     HotStandbyConfig config;
     config.enable_snapshot_bootstrap = false;
-    config.enable_oplog_following = true;
+    config.enable_oplog_following = enable_oplog_following;
     config.enable_verification = false;
     config.oplog_poll_interval_ms = 1;
     config.batch_oplog_retry_timeout_sec = 0;
@@ -152,7 +153,7 @@ TEST(BatchOpLogPromotionTest, DetachesStoreWithFinalCursorAndProducerView) {
     EXPECT_FALSE(standby->ExportMetadataSnapshot(ignored));
 }
 
-TEST(BatchOpLogPromotionTest, MissingFinalCursorFailsBeforeDetach) {
+TEST(BatchOpLogPromotionTest, EmptyStoreWithoutDurablePrefixUsesZeroCursor) {
     auto backend = std::make_shared<MemoryBackend>();
     LocalFileSnapshotObjectStore object_store(
         "/tmp/mooncake-n07-promotion-missing-cursor");
@@ -161,11 +162,30 @@ TEST(BatchOpLogPromotionTest, MissingFinalCursorFailsBeforeDetach) {
 
     auto handoff = standby->PromoteAndDetachBatchOpLogStore();
 
-    ASSERT_FALSE(handoff.has_value());
-    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, handoff.error());
-    EXPECT_EQ(StandbyState::FAILED, standby->GetState());
+    ASSERT_TRUE(handoff.has_value());
+    EXPECT_EQ(DurablePrefix(), handoff->applied_cursor);
+    ASSERT_TRUE(handoff->metadata_store);
+    EXPECT_EQ(StandbyState::STOPPED, standby->GetState());
     std::vector<StandbyObjectEntry> retained;
-    EXPECT_TRUE(standby->ExportMetadataSnapshot(retained));
+    EXPECT_FALSE(standby->ExportMetadataSnapshot(retained));
+}
+
+TEST(BatchOpLogPromotionTest, SnapshotOnlyProviderFallsBackToLegacyExport) {
+    auto backend = std::make_shared<MemoryBackend>();
+    LocalFileSnapshotObjectStore object_store(
+        "/tmp/mooncake-n07-promotion-snapshot-only");
+    auto standby = MakeBatchSnapshotStandby(backend, object_store,
+                                            /*enable_oplog_following=*/false);
+    ASSERT_EQ(ErrorCode::OK, standby->Start("", "", "promotion-test"));
+
+    EXPECT_FALSE(standby->IsBatchOpLogSnapshotMode());
+    auto detach = standby->PromoteAndDetachBatchOpLogStore();
+    ASSERT_FALSE(detach.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, detach.error());
+    StandbySnapshot snapshot;
+    ASSERT_EQ(ErrorCode::OK, standby->PromoteAndExportSnapshot(snapshot));
+    EXPECT_EQ(0u, snapshot.oplog_sequence_id);
+    EXPECT_TRUE(snapshot.objects.empty());
 }
 
 TEST(BatchOpLogPromotionTest, EmptyStoreRestoresWithoutChunks) {

@@ -724,13 +724,16 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
 
 bool HotStandbyService::IsBatchOpLogSnapshotMode() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return batch_oplog_snapshot_provider_ != nullptr;
+    return config_.enable_oplog_following &&
+           batch_oplog_snapshot_provider_ != nullptr &&
+           batch_standby_reader_ != nullptr;
 }
 
 tl::expected<BatchOpLogPromotionHandoff, ErrorCode>
 HotStandbyService::PromoteAndDetachBatchOpLogStore() {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (!batch_oplog_snapshot_provider_) {
+    if (!batch_oplog_snapshot_provider_ || !config_.enable_oplog_following ||
+        !batch_standby_reader_) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (!IsReadyForPromotion()) {
@@ -750,10 +753,14 @@ HotStandbyService::PromoteAndDetachBatchOpLogStore() {
 
     const uint64_t latest_applied_seq_id =
         GetLocalLastAppliedSequenceIdLocked();
-    const auto applied_cursor =
+    auto applied_cursor =
         batch_standby_reader_
             ? batch_standby_reader_->GetLastAppliedDurablePrefix()
             : std::nullopt;
+    if (!applied_cursor && latest_applied_seq_id == 0 && metadata_store_ &&
+        metadata_store_->GetKeyCount() == 0) {
+        applied_cursor = DurablePrefix{};
+    }
     if (!metadata_store_ || !applied_cursor ||
         applied_cursor->last_seq != latest_applied_seq_id) {
         state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
