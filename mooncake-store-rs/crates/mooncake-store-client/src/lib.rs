@@ -14,7 +14,7 @@ pub use client::cold_tier::nof::{
     NofStorageHealth, NofTargetConfig, OpaquePhysicalKey, PhysicalKeyInput,
 };
 #[cfg(feature = "kvcs-capi")]
-pub use client::cold_tier::nof::{KvcsCapiExecutor, KvcsMode};
+pub use client::cold_tier::nof::{KvcsCapiExecutor, KvcsLowLevelClient, KvcsMode};
 pub use client::{
     stable_phase_spread_ms, BandwidthShaping, ColdTierKind, ColdTierOffloadMode,
     ColdTierShutdownMode, ColdTierSsdEngine, ColdTierTarget, ColdTierTargetConfig,

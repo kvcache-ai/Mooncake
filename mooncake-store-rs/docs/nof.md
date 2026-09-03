@@ -5,10 +5,11 @@ replica lifecycle, offload path, restore admission and batching, heartbeat owner
 state, and replica selection.
 
 The included provider is the KVCS 0.4.0 C API executor. `KvcsCapiExecutor::new()` reads process
-environment for a single target; `with_standard_config` and `with_low_level_config` create
-independent per-target clients. The selected mode exposes only the traits supported by that mode.
-Both KVCS modes are provider-owned: KVCS can find an object from its derived key, so Mooncake does
-not persist KVCS placement metadata.
+environment for a single target. For multiple Low-Level targets, one `KvcsLowLevelClient` owns the
+SDK client for an EFC socket and creates lightweight executors bound to different mountpoint
+indices. The selected mode exposes only the traits supported by that mode. Both KVCS modes are
+provider-owned: KVCS can find an object from its derived key, so Mooncake does not persist KVCS
+placement metadata.
 
 ## Architecture
 
@@ -292,34 +293,63 @@ export MOONCAKE_KVCS_MOUNTPOINT_INDEX=0
 export MOONCAKE_KVCS_MAX_VALUE_SIZE=3221225472
 ```
 
-Register the configured KVCS target on the existing client builder:
+### Static target registration
+
+KVCS 0.4.0 does not enumerate Low-Level mountpoints or expose a mountpoint change stream. The
+deployment inventory is therefore the target-list authority. The same inventory must generate the
+server-side EFC mountpoints and the Mooncake application configuration. It supplies a stable
+`target_id` and the corresponding local `mountpoint_index`; an index is not a stable target ID.
+
+The application bootstrap that constructs each `StoreClient` reads that static inventory and calls
+`nof_targets` once. Every client sharing a route namespace registers the same target IDs and data
+plane so that every client can query and read every target directly. Heartbeat ownership only
+distributes health probes; it does not register targets, proxy I/O, or authorize requests.
+
+Create one shared SDK client per EFC socket and bind its configured mountpoints:
 
 ```rust,ignore
 use std::sync::Arc;
 use mooncake_store_client::{
-    KvcsCapiExecutor, NofBackend, NofTargetConfig, StoreClientBuilder,
+    KvcsLowLevelClient, NofBackend, NofTargetConfig, StoreClientBuilder,
 };
 
-let executor = Arc::new(KvcsCapiExecutor::with_low_level_config(
+// Supplied by the deployment configuration that also generates EFC mountpoints.
+let configured_targets = [("nof-disk-a", 0), ("nof-disk-b", 1)];
+let kvcs = KvcsLowLevelClient::new(
     "/var/run/kvcs/efc-grpc.sock".to_string(),
-    0,
     3 * 1024 * 1024 * 1024,
-)?);
-let target = NofTargetConfig::new("kvcs-mount-0", NofBackend::new(executor)?)?;
+)?;
+let mut targets = Vec::with_capacity(configured_targets.len());
+for (target_id, mountpoint_index) in configured_targets {
+    let executor = Arc::new(kvcs.executor(mountpoint_index));
+    targets.push(NofTargetConfig::new(
+        target_id,
+        NofBackend::new(executor)?,
+    )?);
+}
 let client = StoreClientBuilder::new(metadata, "storage-0")
-    .nof_target(target)
-    .nof_replica_count(1)
+    .nof_targets(targets)
+    .nof_replica_count(2)
     .build(expires_at_ms)?;
 ```
 
 `KvcsCapiExecutor::new()` is the environment-variable convenience constructor for a single target.
-For multiple remote nodes or disks in one process, construct one executor per target with
-`with_low_level_config` or `with_standard_config`, then register each executor under its own target
-ID. Every client in one ownership group must configure the same target IDs and data plane. A target
-ID, its provider endpoint, mountpoint, mode, and maximum value size are immutable configuration.
-The ownership fingerprint identifies target IDs and data-plane shape; it cannot verify that two
-processes mapped a target ID to the same provider endpoint or mountpoint. Deployment configuration
-must enforce that mapping.
+`with_low_level_config` remains a single-target convenience API. Standard mode uses
+`with_standard_config`; the provider owns its internal placement, so it is registered as one
+logical target.
+
+The target list is immutable for the lifetime of a `StoreClient`. Temporary target availability is
+dynamic: the existing owner heartbeat excludes a target after three consecutive failures and
+restores it after one successful probe, without changing the registered list. Permanent additions
+or removals require a coordinated configuration rollout and client restart. A new target must not
+accept writes until every client has registered it, and a removed target must be drained by the
+provider before it disappears from the inventory. Mooncake does not parse private EFC
+configuration, invent target IDs, or implement an SDK-independent discovery protocol.
+
+A target ID, its provider endpoint, mountpoint, mode, and maximum value size are immutable
+configuration. The ownership fingerprint identifies target IDs and data-plane shape; it cannot
+verify that two processes mapped a target ID to the same provider endpoint or mountpoint.
+Deployment configuration must enforce that mapping.
 
 Standard sharded writes return an SDK error when any shard fails, after which Mooncake may retry the
 object write. Mooncake does not maintain a second shard manifest or independently clean up a
