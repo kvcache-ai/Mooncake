@@ -5104,6 +5104,8 @@ RealClient::batch_get_into_internal(
         return results;
     }
 
+    LOG(INFO) << "[Store] batch_get_into_internal, key_count=" << num_keys;
+
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;

@@ -179,6 +179,11 @@ Status MultiTransport::submitTransfer(
         i += count;
     }
     if (task_sizes) batch_desc.batch_size = task_list.size();
+    if (task_sizes) {
+        LOG(INFO) << "[MultiTransport] submitTransfer, request_count=" << entries.size()
+                  << ", task_count=" << task_list.size()
+                  << ", grouped=" << (entries.size() != task_list.size());
+    }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
