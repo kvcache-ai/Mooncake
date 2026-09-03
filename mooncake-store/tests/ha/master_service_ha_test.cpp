@@ -581,6 +581,21 @@ class MasterServiceHATest : public ::testing::Test {
         return replica;
     }
 
+    Replica::Descriptor MakeStandbyNoFReplica(const std::string& endpoint,
+                                              uintptr_t offset,
+                                              size_t size = 1024) const {
+        Replica::Descriptor replica;
+        replica.id = 1;
+        replica.status = ReplicaStatus::COMPLETE;
+
+        NoFDescriptor nof_desc;
+        nof_desc.buffer_descriptor.transport_endpoint_ = endpoint;
+        nof_desc.buffer_descriptor.buffer_address_ = offset;
+        nof_desc.buffer_descriptor.size_ = size;
+        replica.descriptor_variant = std::move(nof_desc);
+        return replica;
+    }
+
     StandbyObjectEntry MakeStandbyObject(const std::string& key,
                                          const std::string& endpoint,
                                          size_t size = 1024) const {
@@ -588,6 +603,18 @@ class MasterServiceHATest : public ::testing::Test {
         metadata.client_id = generate_uuid();
         metadata.size = size;
         metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint, size));
+        return StandbyObjectEntry{"default", key, std::move(metadata)};
+    }
+
+    StandbyObjectEntry MakeStandbyNoFObject(const std::string& key,
+                                            const std::string& endpoint,
+                                            uintptr_t offset,
+                                            size_t size = 1024) const {
+        StandbyObjectMetadata metadata;
+        metadata.client_id = generate_uuid();
+        metadata.size = size;
+        metadata.replicas.push_back(
+            MakeStandbyNoFReplica(endpoint, offset, size));
         return StandbyObjectEntry{"default", key, std::move(metadata)};
     }
 
@@ -769,6 +796,22 @@ class MasterServiceHATest : public ::testing::Test {
         }
         for (const auto& replica : accessor.Get().GetAllReplicas()) {
             if (replica.has_invalid_mem_handle()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool HasInvalidNoFHandleForTesting(MasterService& service,
+                                              const TenantId& tenant_id,
+                                              const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return true;
+        }
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            if (replica.has_invalid_nof_handle()) {
                 return true;
             }
         }
@@ -1146,6 +1189,85 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.protocol_, "tcp");
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
 }
+
+TEST_F(MasterServiceHATest, RestoreQuarantinesNoFReplicas) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_nof_restore_key";
+    const std::string endpoint = "standby_nof_restore_endpoint";
+    constexpr uintptr_t offset = 4096;
+    constexpr size_t size = 1024;
+
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot(
+                {MakeStandbyNoFObject(key, endpoint, offset, size)}, 7, {})
+            .has_value());
+
+    // The namespace allocator state is not part of the snapshot, so a later
+    // NoF mount would consider `offset` free. The restored replica must not
+    // be served while that is true.
+    auto get_result = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    // But the descriptor is kept intact so a later import can rebuild the
+    // real allocator from it. In particular the handle stays valid, which is
+    // what keeps transport_endpoint_ readable and keeps the invalid-handle
+    // sweep from reclaiming the replica.
+    EXPECT_FALSE(HasInvalidNoFHandleForTesting(service, kDefaultTenant, key));
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_nof_replica());
+    const auto& buffer =
+        replicas.front().get_nof_descriptor().buffer_descriptor;
+    EXPECT_EQ(buffer.transport_endpoint_, endpoint);
+    EXPECT_EQ(buffer.buffer_address_, offset);
+    EXPECT_EQ(buffer.size_, size);
+
+    ClearInvalidHandlesForTesting(service);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+}
+
+#ifdef USE_NOF
+TEST_F(MasterServiceHATest, QuarantinedNoFEndpointCannotBeMounted) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_nof_mount_gate_key";
+    const std::string endpoint = "standby_nof_mount_gate_endpoint";
+
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot(
+                {MakeStandbyNoFObject(key, endpoint, 4096, 1024)}, 7, {})
+            .has_value());
+
+    // Mounting the quarantined namespace would build a fresh allocator over
+    // the whole range and could hand the restored offset to another object,
+    // so it is refused until an import can reconcile the restored ranges.
+    const UUID client_id = generate_uuid();
+    NoFSegment quarantined = MakeNoFSegment("mount_gate_segment", endpoint);
+    auto mounted = service.MountNoFSegment(quarantined, client_id);
+    ASSERT_FALSE(mounted.has_value());
+    EXPECT_EQ(mounted.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    auto remounted = service.ReMountNoFSegment({quarantined}, client_id);
+    ASSERT_FALSE(remounted.has_value());
+    EXPECT_EQ(remounted.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    // The restored replica is still hidden, and still intact.
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+    EXPECT_FALSE(HasInvalidNoFHandleForTesting(service, kDefaultTenant, key));
+
+    // An unrelated namespace is unaffected by the quarantine.
+    NoFSegment other =
+        MakeNoFSegment("mount_gate_other_segment", "mount_gate_other_endpoint");
+    EXPECT_TRUE(service.MountNoFSegment(other, client_id).has_value());
+}
+#endif
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
     MasterService service(
@@ -2415,11 +2537,14 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesNoFBufferDescriptor) {
     EXPECT_EQ(restored.protocol_, "nvmeof");
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
 
+    // The descriptor is preserved, but the endpoint is quarantined until a
+    // mount can import these ranges, so the replica is not served yet. The
+    // snapshot carries no NoF allocator state, so serving it would race a
+    // fresh mount that considers `address` free (see #3826).
     auto public_replicas =
         service.GetReplicaList("standby_restore_nof_key", kDefaultTenant);
-    ASSERT_TRUE(public_replicas.has_value());
-    ASSERT_EQ(public_replicas->replicas.size(), 1);
-    EXPECT_TRUE(public_replicas->replicas.front().is_nof_replica());
+    ASSERT_FALSE(public_replicas.has_value());
+    EXPECT_EQ(public_replicas.error(), ErrorCode::REPLICA_IS_NOT_READY);
 }
 
 TEST_F(MasterServiceHATest, OplogDisabledByDefaultDoesNotCreateWriter) {
