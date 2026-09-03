@@ -456,7 +456,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
                     toString(connect_err)));
             }
             auto backend = std::make_shared<EtcdHaKvBackend>();
-            ErrorCode err = InitializeBatchOpLogWriter(std::move(backend));
+            // Direct MasterService construction has no leadership session;
+            // supervisor-created services carry a non-zero acquired view.
+            ErrorCode err = InitializeBatchOpLogWriter(
+                std::move(backend),
+                /*require_fenced_writer=*/view_version_ > 0);
             if (err != ErrorCode::OK) {
                 throw std::runtime_error(fmt::format(
                     "failed to create HA batch-record OpLog writer: {}",
@@ -708,7 +712,9 @@ MasterService::~MasterService() {
 
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
     std::shared_ptr<HaKvBackend> backend) {
-    return InitializeBatchOpLogWriter(std::move(backend));
+    // Explicit test injection keeps the zero-view fixture API. A configured
+    // view still exercises the production fenced path.
+    return InitializeBatchOpLogWriter(std::move(backend), view_version_ > 0);
 }
 
 void MasterService::SetBatchOpLogWriterFactoryForTesting(
@@ -13256,8 +13262,13 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
 }
 
 ErrorCode MasterService::InitializeBatchOpLogWriter(
-    std::shared_ptr<HaKvBackend> backend) {
+    std::shared_ptr<HaKvBackend> backend, bool require_fenced_writer) {
     if (!backend || !backend->SupportsTxn()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (require_fenced_writer && view_version_ == 0) {
+        LOG(ERROR) << "Fenced batch OpLog writer requires a non-zero acquired "
+                      "producer view";
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -13267,14 +13278,28 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     if (err != ErrorCode::OK) {
         return err;
     }
+    if (require_fenced_writer) {
+        err = storage->ClaimProducerView(view_version_);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to claim producer view for batch OpLog "
+                       << "writer: " << toString(err);
+            return err;
+        }
+    }
 
     OrderedOpLogWriterConfig writer_config;
     writer_config.max_entries_per_batch = oplog_batch_max_entries_;
     writer_config.initial_durable_prefix = durable_prefix;
     OpLogBatchStorage* storage_ptr = storage.get();
+    const ViewVersionId producer_view_version = view_version_;
     OrderedOpLogWriter::WriteBatchFn write_batch =
-        [storage_ptr](const OpLogBatchRecord& batch,
-                      const DurablePrefix& expected_prefix) {
+        [storage_ptr, require_fenced_writer, producer_view_version](
+            const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            if (require_fenced_writer) {
+                return storage_ptr->WriteBatchAndAdvancePrefix(
+                    batch, expected_prefix, producer_view_version);
+            }
             return storage_ptr->WriteBatchAndAdvancePrefix(batch,
                                                            expected_prefix);
         };

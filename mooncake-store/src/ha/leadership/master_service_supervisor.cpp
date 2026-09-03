@@ -14,6 +14,8 @@
 
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/leader_label_reconciler.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
@@ -197,6 +199,22 @@ void ApplyCurrentView(MasterAdminServer& admin_server,
                          wait_result.current_view);
 }
 
+ErrorCode ClaimProducerViewForServing(
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
+    ViewVersionId view_version) {
+    if (!config.enable_oplog || spec.type != HABackendType::ETCD ||
+        config.cluster_id.empty()) {
+        return ErrorCode::OK;
+    }
+    if (view_version == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    EtcdHaKvBackend backend;
+    OpLogBatchStorage storage(config.cluster_id, backend);
+    return storage.ClaimProducerView(view_version);
+}
+
 void EnterStandbyMode(MasterAdminServer& admin_server,
                       StandbyController& standby_controller,
                       std::atomic<bool>& accept_runtime_updates,
@@ -327,6 +345,21 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
 
         if (!leadership_session.has_value()) {
+            continue;
+        }
+
+        auto claim_error = ClaimProducerViewForServing(
+            spec, config, leadership_session->view.view_version);
+        if (claim_error != ErrorCode::OK) {
+            EnterStandbyMode(admin_server, *standby_controller,
+                             accept_standby_runtime_updates,
+                             leadership_session->view);
+            if (HandleLeadershipPhaseError(
+                    "producer view claim failure", "claim producer view",
+                    leader_coordinator, *leadership_session, claim_error,
+                    spec.type)) {
+                return -1;
+            }
             continue;
         }
 
