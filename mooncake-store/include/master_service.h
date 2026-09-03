@@ -1041,9 +1041,10 @@ class MasterService {
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const;
     // Caller holds the Replica owner's retaining guard.
-    auto AddReplicaForRetainedClient(
-        const UUID& client_id, const std::string& key,
-        const TenantId& tenant_id, Replica& replica)
+    auto AddReplicaForRetainedClient(const UUID& client_id,
+                                     const std::string& key,
+                                     const TenantId& tenant_id,
+                                     Replica& replica)
         -> tl::expected<bool, ErrorCode>;
     // Caller must hold client_mutex_.
     std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()

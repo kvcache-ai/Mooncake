@@ -1309,11 +1309,12 @@ TEST_F(MasterServiceTest, MoveEndReleasesSourceRefcountWhenTargetGone) {
     // the private invariant: the source refcount must be released before the
     // move task is erased.
     auto service = std::make_unique<MasterService>();
-    PrepareSimpleSegment(*service, "refcnt_source", kDefaultSegmentBase);
+    const auto source =
+        PrepareSimpleSegment(*service, "refcnt_source", kDefaultSegmentBase);
     const auto target = PrepareSimpleSegment(
         *service, "refcnt_target", kDefaultSegmentBase + kDefaultSegmentSize);
 
-    const UUID client_id = generate_uuid();
+    const UUID client_id = source.client_id;
     ReplicateConfig config;
     config.replica_num = 1;
     config.preferred_segment = "refcnt_source";
@@ -2562,8 +2563,8 @@ TEST_F(MasterServiceTest,
         ClientLivenessTransition::BECAME_SUSPECTED);
     MasterMetricManager::instance().client_liveness_became_suspected();
 
-    auto upsert = service.UpsertStart(client_id, key, TenantId::Default(), 1024,
-                                      config);
+    auto upsert =
+        service.UpsertStart(client_id, key, TenantId::Default(), 1024, config);
     ASSERT_FALSE(upsert.has_value());
     EXPECT_EQ(upsert.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 

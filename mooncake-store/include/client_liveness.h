@@ -128,16 +128,15 @@ class ClientLivenessRecord {
     [[nodiscard]] ClientLivenessTransition EvaluateAndRetire(
         TimePoint now, Clock::duration active_ttl,
         Clock::duration suspicion_ttl, RetireOperation&& retire_operation) {
-        return EvaluateAndRetire(now, active_ttl, suspicion_ttl, [] {},
-                                 std::forward<RetireOperation>(
-                                     retire_operation));
+        return EvaluateAndRetire(
+            now, active_ttl, suspicion_ttl, [] {},
+            std::forward<RetireOperation>(retire_operation));
     }
 
     template <typename ReserveRetirement, typename RetireOperation>
     [[nodiscard]] ClientLivenessTransition EvaluateAndRetire(
         TimePoint now, Clock::duration active_ttl,
-        Clock::duration suspicion_ttl,
-        ReserveRetirement&& reserve_retirement,
+        Clock::duration suspicion_ttl, ReserveRetirement&& reserve_retirement,
         RetireOperation&& retire_operation) {
         ClientLivenessTransition transition = ClientLivenessTransition::NONE;
         {

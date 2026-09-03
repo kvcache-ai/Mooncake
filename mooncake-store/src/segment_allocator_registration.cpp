@@ -37,7 +37,7 @@ std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
     buffer->bindClientLiveness(record);
     if (!allocation_lifetime_.isAvailable() ||
         record != std::atomic_load_explicit(&client_liveness_,
-                                             std::memory_order_acquire) ||
+                                            std::memory_order_acquire) ||
         (record && !record->IsServing())) {
         return nullptr;
     }

@@ -61,8 +61,8 @@ void ClientOffboardingWorker::ScheduleReserved(ClientOffboardingJob job) {
 
 std::chrono::seconds ClientOffboardingWorker::RetryDelay(uint64_t retry_count) {
     constexpr uint64_t kBackoffs[] = {1, 2, 4, 8, 16, 30};
-    const size_t index = static_cast<size_t>(std::min<uint64_t>(
-        retry_count - 1, std::size(kBackoffs) - 1));
+    const size_t index = static_cast<size_t>(
+        std::min<uint64_t>(retry_count - 1, std::size(kBackoffs) - 1));
     return std::chrono::seconds(kBackoffs[index]);
 }
 

@@ -103,8 +103,7 @@ TEST(ClientLivenessRecordTest, RetirementIsReservedBeforeOfflineIsPublished) {
     EXPECT_EQ(record.EvaluateAndRetire(
                   initial + 30s, 10s, 20s,
                   [&] {
-                      EXPECT_EQ(record.state(),
-                                ClientLivenessState::SUSPECTED);
+                      EXPECT_EQ(record.state(), ClientLivenessState::SUSPECTED);
                       reserved = true;
                   },
                   [&] {

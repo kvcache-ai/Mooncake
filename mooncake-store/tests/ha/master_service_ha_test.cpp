@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -245,6 +246,37 @@ class RejectingOrderedOpLogWriter : public OrderedOpLogWriter {
     size_t rejected_commits_{0};
 };
 
+class RejectOnceOrderedOpLogWriter : public OrderedOpLogWriter {
+   public:
+    RejectOnceOrderedOpLogWriter(OrderedOpLogWriterConfig config,
+                                 WriteBatchFn write_batch)
+        : OrderedOpLogWriter(std::move(config), std::move(write_batch)) {}
+
+    void RejectNextCommit() { reject_next_.store(true); }
+
+    void RejectNextSegmentUnmount() {
+        reject_next_segment_unmount_.store(true);
+    }
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        if (reject_next_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        if (entry.op_type == OpType::SEGMENT_UNMOUNT &&
+            reject_next_segment_unmount_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry), std::move(callback));
+    }
+
+   private:
+    std::atomic<bool> reject_next_{false};
+    std::atomic<bool> reject_next_segment_unmount_{false};
+};
+
 class MasterServiceHATest : public ::testing::Test {
    protected:
     static void EnableDfsForTesting(MasterService& service) {
@@ -452,6 +484,20 @@ class MasterServiceHATest : public ::testing::Test {
         EXPECT_EQ(ErrorCode::OK,
                   service.SetBatchOpLogBackendForTesting(std::move(backend)));
         return static_cast<RejectingOrderedOpLogWriter*>(
+            service.ordered_oplog_writer_.get());
+    }
+
+    static RejectOnceOrderedOpLogWriter* InstallRejectOnceWriter(
+        MasterService& service, std::shared_ptr<HaKvBackend> backend) {
+        service.SetBatchOpLogWriterFactoryForTesting(
+            [](OrderedOpLogWriterConfig config,
+               OrderedOpLogWriter::WriteBatchFn write_batch) {
+                return std::make_unique<RejectOnceOrderedOpLogWriter>(
+                    std::move(config), std::move(write_batch));
+            });
+        EXPECT_EQ(ErrorCode::OK,
+                  service.SetBatchOpLogBackendForTesting(std::move(backend)));
+        return static_cast<RejectOnceOrderedOpLogWriter*>(
             service.ordered_oplog_writer_.get());
     }
 
@@ -745,12 +791,11 @@ class MasterServiceHATest : public ::testing::Test {
         return service.FindClientRecord(client_id);
     }
 
-    static tl::expected<bool, ErrorCode>
-    AddReplicaForRetainedClientForTesting(
+    static tl::expected<bool, ErrorCode> AddReplicaForRetainedClientForTesting(
         MasterService& service, const UUID& client_id, const std::string& key,
         Replica& replica) {
-        return service.AddReplicaForRetainedClient(
-            client_id, key, kDefaultTenant, replica);
+        return service.AddReplicaForRetainedClient(client_id, key,
+                                                   kDefaultTenant, replica);
     }
 
     static bool ProcessClientOffboardingForTesting(MasterService& service,
@@ -849,14 +894,13 @@ class MasterServiceHATest : public ::testing::Test {
             service.segment_manager_.getSegmentAccess());
         auto task = std::async(std::launch::async, std::move(create_task));
         auto& metadata_mutex =
-            service
-                .metadata_shards_[service.getShardIndex(tenant_id, key)]
+            service.metadata_shards_[service.getShardIndex(tenant_id, key)]
                 .mutex;
         const auto wait_for_metadata = [&](bool available, auto timeout) {
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             while (std::chrono::steady_clock::now() < deadline) {
-                std::unique_lock<SharedMutex> metadata_lock(
-                    metadata_mutex, std::try_to_lock);
+                std::unique_lock<SharedMutex> metadata_lock(metadata_mutex,
+                                                            std::try_to_lock);
                 if (metadata_lock.owns_lock() == available) {
                     return true;
                 }
@@ -908,9 +952,10 @@ class MasterServiceHATest : public ::testing::Test {
             access.getAllocatorManager().getAllocators(name);
         EXPECT_NE(allocators, nullptr);
         EXPECT_EQ(allocators == nullptr ? 0 : allocators->size(), 1);
-        return allocators == nullptr || allocators->empty()
-                   ? 0
-                   : allocators->front()->allocator->size();
+        const auto allocator = allocators == nullptr || allocators->empty()
+                                   ? nullptr
+                                   : allocators->front()->GetAllocator();
+        return allocator ? allocator->size() : 0;
     }
 
     static void EraseObjectForTesting(MasterService& service,
@@ -1718,8 +1763,7 @@ TEST_F(MasterServiceHATest,
         add.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
     client_lock.unlock();
 
-    ASSERT_EQ(add.wait_for(std::chrono::seconds(5)),
-              std::future_status::ready);
+    ASSERT_EQ(add.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = add.get();
     ASSERT_TRUE(result.has_value()) << toString(result.error());
     EXPECT_TRUE(completed_while_client_locked);
@@ -4038,47 +4082,36 @@ TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
                               .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    OpLogBatchStorage storage(cluster_id, *backend);
 
     const UUID client_id = generate_uuid();
     Segment mounted = MakeSegment("batch_segment_mount");
     ASSERT_TRUE(service.MountSegment(mounted, client_id).has_value());
+    OpLogBatchRecord mount_batch;
+    ReadBatchEventually(storage, 1, mount_batch);
 
     const UUID remount_client_id = generate_uuid();
     Segment remounted = MakeSegment("batch_segment_remount",
                                     kDefaultSegmentBase + kDefaultSegmentSize);
     ASSERT_TRUE(
         service.ReMountSegment({remounted}, remount_client_id).has_value());
+    OpLogBatchRecord remount_batch;
+    ReadBatchEventually(storage, 2, remount_batch);
 
     ASSERT_TRUE(service.UnmountSegment(mounted.id, client_id).has_value());
+    OpLogBatchRecord unmount_batch;
+    ReadBatchEventually(storage, 3, unmount_batch);
 
-    OpLogBatchStorage storage(cluster_id, *backend);
-    auto read_batch = [&](uint64_t batch_id) {
-        OpLogBatchRecord batch;
-        ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
-        for (int i = 0; i < 50; ++i) {
-            read_err = storage.ReadBatch(batch_id, batch);
-            if (read_err == ErrorCode::OK) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        EXPECT_EQ(ErrorCode::OK, read_err);
-        return batch;
-    };
-
-    auto mount_batch = read_batch(1);
     ASSERT_EQ(1u, mount_batch.entries.size());
     EXPECT_EQ(OpType::SEGMENT_MOUNT, mount_batch.entries[0].op_type);
     EXPECT_EQ(1u, mount_batch.entries[0].sequence_id);
     EXPECT_FALSE(mount_batch.entries[0].payload.empty());
 
-    auto remount_batch = read_batch(2);
     ASSERT_EQ(1u, remount_batch.entries.size());
     EXPECT_EQ(OpType::SEGMENT_MOUNT, remount_batch.entries[0].op_type);
     EXPECT_EQ(2u, remount_batch.entries[0].sequence_id);
     EXPECT_FALSE(remount_batch.entries[0].payload.empty());
 
-    auto unmount_batch = read_batch(3);
     ASSERT_EQ(1u, unmount_batch.entries.size());
     EXPECT_EQ(OpType::SEGMENT_UNMOUNT, unmount_batch.entries[0].op_type);
     EXPECT_EQ(3u, unmount_batch.entries[0].sequence_id);

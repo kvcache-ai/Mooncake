@@ -293,13 +293,11 @@ void ScopedSegmentAccess::BindClientLiveness(
 
 void ScopedSegmentAccess::BindBufferToSegment(const UUID& segment_id,
                                               AllocatedBuffer& buffer) {
-    segment_manager_->mounted_segments_
-        .at(segment_id)
+    segment_manager_->mounted_segments_.at(segment_id)
         .allocator_registration->BindBuffer(buffer);
 }
 
-bool ScopedSegmentAccess::RebindBufferToOwningSegment(
-    AllocatedBuffer& buffer) {
+bool ScopedSegmentAccess::RebindBufferToOwningSegment(AllocatedBuffer& buffer) {
     for (auto& [segment_id, mounted] : segment_manager_->mounted_segments_) {
         (void)segment_id;
         if (mounted.allocator_registration &&

@@ -3357,8 +3357,7 @@ TEST_F(MasterServiceSnapshotTest, CopyStart) {
 
     // Mount 4 segments (segment_1, segment_2, segment_3, segment_4) with
     // PrepareSimpleSegment
-    const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
     [[maybe_unused]] const auto context3 =
@@ -3501,10 +3500,8 @@ TEST_F(MasterServiceSnapshotTest, CopyEnd) {
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
-    const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
-    const auto context2 =
-        PrepareSimpleSegment(*service_, "segment_2");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
+    const auto context2 = PrepareSimpleSegment(*service_, "segment_2");
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
@@ -3616,10 +3613,8 @@ TEST_F(MasterServiceSnapshotTest, CopyRevoke) {
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
-    const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
-    const auto context2 =
-        PrepareSimpleSegment(*service_, "segment_2");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
+    const auto context2 = PrepareSimpleSegment(*service_, "segment_2");
 
     UUID client_id = context1.client_id;
     UUID invalid_client_id = context2.client_id;
@@ -3707,10 +3702,8 @@ TEST_F(MasterServiceSnapshotTest, MoveEnd) {
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
-    const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
-    const auto context2 =
-        PrepareSimpleSegment(*service_, "segment_2");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
+    const auto context2 = PrepareSimpleSegment(*service_, "segment_2");
 
     UUID client_id = context1.client_id;
     UUID invalid_client_id = context2.client_id;
@@ -3789,10 +3782,8 @@ TEST_F(MasterServiceSnapshotTest, MoveRevoke) {
     service_.reset(new MasterService());
 
     // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment
-    const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
-    const auto context2 =
-        PrepareSimpleSegment(*service_, "segment_2");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
+    const auto context2 = PrepareSimpleSegment(*service_, "segment_2");
 
     UUID client_id = context1.client_id;
     UUID invalid_client_id = context2.client_id;
@@ -3887,8 +3878,7 @@ TEST_F(MasterServiceSnapshotTest, MoveStart) {
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
-    const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
     [[maybe_unused]] const auto context3 =
