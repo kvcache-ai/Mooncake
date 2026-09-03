@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -266,6 +267,80 @@ TEST(DeviceSelectorBandwidthTest, ReseedOnLinkSpeedChangeReleasesStaleClamp) {
     for (int i = 0; i < 64; ++i) observe(*sel, 3.1e9);
     // With the 400G clamp still in place this would sit at the 5 GB/s floor.
     EXPECT_NEAR(sel->getAggregateEwmaBandwidth(), 3.1e9, 3.1e9 * 0.02);
+}
+
+// What one device has been charged and not yet released.
+TEST(DeviceSelectorInflightTest, InflightBytesPerDevice) {
+    auto topo = oneRdmaNic();
+    Topology::MemEntry mem;
+    mem.name = "cpu:0";
+    mem.type = Topology::MEM_HOST;
+    mem.numa_node = 0;
+    mem.device_list[0].push_back(kDev);
+    topo->mem_list_.push_back(mem);
+    DeviceSelector sel;
+    ASSERT_TRUE(sel.loadTopology(topo).ok());
+
+    EXPECT_EQ(sel.getInflightBytes(kDev), 0u);
+    int chosen = -1;
+    ASSERT_TRUE(sel.allocate(kMiB, "cpu:0", chosen).ok());
+    ASSERT_EQ(chosen, kDev);
+    EXPECT_EQ(sel.getInflightBytes(kDev), kMiB);
+    EXPECT_EQ(sel.getInflightBytes(7), 0u);  // unknown device
+    ASSERT_TRUE(sel.release(kDev, kMiB, 0.0).ok());
+    EXPECT_EQ(sel.getInflightBytes(kDev), 0u);
+}
+
+// Smart-mode multi-path allocation must charge each device the bytes of the
+// slices it was assigned -- the caller cuts slices as min(block, remaining),
+// and release() returns exactly that -- not ceil(total / n) per slice, which
+// would drift per device (and wrap a device that receives less than it
+// released).
+TEST(DeviceSelectorInflightTest, MultiPathChargesActualSliceBytes) {
+    auto topo = oneRdmaNic();
+    Topology::NicEntry nic;
+    nic.name = "mlx5_1";
+    nic.type = Topology::NIC_RDMA;
+    nic.numa_node = 0;
+    topo->nic_list_.push_back(nic);
+    Topology::MemEntry mem;
+    mem.name = "cpu:0";
+    mem.type = Topology::MEM_HOST;
+    mem.numa_node = 0;
+    mem.device_list[0].push_back(0);
+    mem.device_list[0].push_back(1);
+    topo->mem_list_.push_back(mem);
+    DeviceSelector sel;
+    ASSERT_TRUE(sel.loadTopology(topo).ok());
+    DeviceSelector::SchedulingParams params;
+    params.score_jitter_range = 0.0;
+    sel.setSchedulingParams(params);
+
+    // 1,000,001 B in 64 KiB blocks: 15 full slices and one of 16,961 B;
+    // ceil(total / 16) = 62,501 would charge 1,000,016 in total.
+    constexpr uint64_t kTotal = 1'000'001;
+    constexpr uint64_t kBlock = 65536;
+    constexpr uint32_t kSlices = 16;
+    std::vector<int> ids;
+    ASSERT_TRUE(
+        sel.allocate(kTotal, kSlices, kBlock, "cpu:0", ids, PRIO_HIGH, ~0ULL)
+            .ok());
+    ASSERT_EQ(ids.size(), kSlices);
+
+    uint64_t expected[2] = {0, 0};
+    for (uint32_t i = 0; i < kSlices; ++i) {
+        ASSERT_TRUE(ids[i] == 0 || ids[i] == 1);
+        expected[ids[i]] += std::min<uint64_t>(kBlock, kTotal - i * kBlock);
+    }
+    EXPECT_EQ(sel.getInflightBytes(0), expected[0]);
+    EXPECT_EQ(sel.getInflightBytes(1), expected[1]);
+
+    for (uint32_t i = 0; i < kSlices; ++i) {
+        const uint64_t len = std::min<uint64_t>(kBlock, kTotal - i * kBlock);
+        ASSERT_TRUE(sel.release(ids[i], len, 0.0).ok());
+    }
+    EXPECT_EQ(sel.getInflightBytes(0), 0u);
+    EXPECT_EQ(sel.getInflightBytes(1), 0u);
 }
 
 }  // namespace

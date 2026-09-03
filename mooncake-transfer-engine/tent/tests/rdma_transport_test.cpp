@@ -33,9 +33,12 @@
 #include "tent/transfer_engine.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/rdma/context.h"
+#include "tent/transport/rdma/endpoint.h"
+#include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/params.h"
 #include "tent/transport/rdma/quota.h"
 #include "tent/transport/rdma/rdma_transport.h"
+#include "tent/transport/rdma/slice.h"
 #include "tent/transport/rdma/ibv_loader.h"
 #include "tent/transport/rdma/workers.h"
 
@@ -96,6 +99,68 @@ class RdmaTransportTestPeer {
         return RdmaTransport::classifyNotifyCompletion(status, endpoint_alive,
                                                        endpoint_ready);
     }
+
+    static void rechargeSlice(Workers& workers, RdmaSlice* slice, int dev_id) {
+        workers.rechargeSlice(slice, dev_id);
+    }
+
+    static void releaseSliceQuota(Workers& workers, RdmaSlice* slice,
+                                  double latency) {
+        workers.releaseSliceQuota(slice, latency);
+    }
+
+    static void handleCompletion(Workers& workers,
+                                 Workers::WorkerContext& worker,
+                                 RdmaContext& context, const ibv_wc& wc,
+                                 uint64_t poll_ts) {
+        workers.handleCompletion(worker, context, wc, poll_ts);
+    }
+
+    static void markPosted(Workers& workers, Workers::WorkerContext& worker,
+                           RdmaSlice* slice, uint64_t post_ts) {
+        workers.markPosted(worker, slice, post_ts);
+    }
+
+    using WorkerContext = Workers::WorkerContext;
+
+    // Stands in for start(): the lane array without any threads.
+    static void makeWorkerContexts(Workers& workers, size_t n) {
+        workers.worker_context_ = new WorkerContext[n];
+        workers.num_workers_ = n;
+    }
+    static void destroyWorkerContexts(Workers& workers) {
+        delete[] workers.worker_context_;
+        workers.worker_context_ = nullptr;
+        workers.num_workers_ = 0;
+    }
+    static WorkerContext& workerContext(Workers& workers, size_t i) {
+        return workers.worker_context_[i];
+    }
+    static void retireSweptSlice(Workers& workers, WorkerContext& self,
+                                 RdmaSlice* slice) {
+        workers.retireSweptSlice(self, slice, nullptr);
+    }
+    static void drainReclaimed(Workers& workers, WorkerContext& worker) {
+        workers.drainReclaimed(worker);
+    }
+    // Drop the handover list without touching the set, to model a lane that
+    // drained it just before another lane handed an entry over.
+    static void clearReclaimed(WorkerContext& worker) {
+        std::lock_guard<std::mutex> lock(worker.reclaim_mutex);
+        worker.reclaimed.clear();
+    }
+    static bool dropUnpostableSlice(Workers& workers, WorkerContext& worker,
+                                    RdmaSlice* slice) {
+        return workers.dropUnpostableSlice(worker, slice);
+    }
+
+    static void setSliceTimeout(Workers& workers, uint64_t ns) {
+        workers.slice_timeout_ns_ = ns;
+    }
+    static void expireTimedOutSlices(Workers& workers, WorkerContext& ctx,
+                                     uint64_t now_ns) {
+        workers.expireTimedOutSlices(ctx, now_ns);
+    }
 };
 
 // Friend accessor for RdmaContext: TENT reaches libibverbs through a table of
@@ -114,8 +179,41 @@ class RdmaContextTestPeer {
         context.params_ = std::move(params);
     }
 
+    // The rest of what enable() would build, for a test that only needs a
+    // context complete enough to construct endpoints on.
+    static void bindResources(RdmaContext& context, ibv_pd* pd,
+                              std::vector<RdmaCQ*> cqs, RdmaCQ* notify_cq) {
+        context.native_pd_ = pd;
+        context.cq_list_ = std::move(cqs);
+        context.notify_cq_ = notify_cq;
+        context.endpoint_store_ =
+            std::make_shared<SIEVEEndpointStore>(context, 16);
+    }
+
+    static void unbindResources(RdmaContext& context) {
+        context.native_pd_ = nullptr;
+        context.cq_list_.clear();
+        context.notify_cq_ = nullptr;
+        context.endpoint_store_.reset();
+    }
+
     static void unbindDevice(RdmaContext& context) {
         context.native_context_ = nullptr;
+    }
+};
+
+// Friend accessor for RdmaEndPoint. Posting is the one step in the data
+// path that does not go through the injectable verbs table (ibv_post_send is
+// an inline that dispatches through the queue pair), so a test stands in for
+// it and puts the slice on the queue pair the way submitSlices would.
+class RdmaEndPointTestPeer {
+   public:
+    static void pretendPosted(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                              int qp_index, RdmaSlice* slice) {
+        ASSERT_TRUE(endpoint->reserveQuota(qp_index, 1));
+        slice->qp_index = qp_index;
+        slice->ep_weak_ptr = endpoint;
+        endpoint->slice_queue_[qp_index].push(slice);
     }
 };
 
@@ -703,6 +801,643 @@ TEST(RdmaContextEventChainTest, PortActiveReseedsOnlyWhenTheSpeedChanged) {
     EXPECT_TRUE(selector->isDeviceAvailable(kDev));
 
     RdmaContextTestPeer::unbindDevice(context);
+}
+
+// A slice that hits the software timeout turns terminal here, not on the CQ,
+// and its flush completion is not guaranteed to be polled, so the timeout
+// path must return the selector's inflight charge itself.
+class RdmaWorkersTimeoutTest : public ::testing::Test {
+   protected:
+    static constexpr int kDev = 1;
+    static constexpr uint64_t kLen = 1 << 20;
+
+    void SetUp() override {
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(topology
+                        ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                        .ok());
+        Topology::MemEntry mem;
+        mem.name = "cpu:0";
+        mem.type = Topology::MEM_HOST;
+        mem.numa_node = 0;
+        mem.device_list[0].push_back(1);
+        topology->mem_list_.push_back(mem);
+
+        RdmaTransportTestPeer::bindTopology(transport_, topology);
+        ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport_), 0u);
+        workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
+        selector_ = workers_->getDeviceSelector();
+        ASSERT_TRUE(selector_->setDeviceAvailable(kDev, true).ok());
+
+        // Charge the slice to the NIC exactly as selectOptimalDevice() does.
+        task_ = RdmaTaskStorage::Get().allocate();
+        task_->num_slices = 1;
+        task_->status_word = PENDING;
+        task_->first_error = PENDING;
+        task_->ref();  // the batch's reference
+        task_->ref();  // the slice's reference, dropped by updateSliceStatus()
+        slice_ = RdmaSliceStorage::Get().allocate();
+        slice_->task = task_;
+        slice_->length = kLen;
+        slice_->word = PENDING;
+        slice_->enqueue_ts = 0;  // enqueued at t=0
+        slice_->rail_monitor = nullptr;
+        int chosen = -1;
+        ASSERT_TRUE(selector_->allocate(kLen, "cpu:0", chosen).ok());
+        ASSERT_EQ(chosen, kDev);
+        slice_->source_dev_id = chosen;
+        slice_->charged_dev = chosen;
+        slice_->counted_lane = 0;  // as Workers::submit() marks it
+        ASSERT_EQ(selector_->getInflightBytes(kDev), kLen);
+
+        ctx_.inflight_slice_set.insert(slice_);
+        RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000);  // 1 ms
+    }
+
+    void TearDown() override {
+        if (slice_) RdmaSliceStorage::Get().deallocate(slice_);
+        if (task_) task_->deref();  // drops the batch's reference; frees it
+    }
+
+    void expire() {
+        RdmaTransportTestPeer::expireTimedOutSlices(*workers_, ctx_,
+                                                    /*now_ns=*/2'000'000);
+    }
+
+    void expectTimedOutAndReleased() {
+        EXPECT_EQ(slice_->word, TIMEOUT);
+        EXPECT_TRUE(ctx_.inflight_slice_set.empty());
+        EXPECT_EQ(slice_->charged_dev, -1);
+        EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    }
+
+    RdmaTransport transport_;
+    std::unique_ptr<Workers> workers_;
+    DeviceSelector* selector_ = nullptr;
+    RdmaTask* task_ = nullptr;
+    RdmaSlice* slice_ = nullptr;
+    RdmaTransportTestPeer::WorkerContext ctx_;
+};
+
+TEST_F(RdmaWorkersTimeoutTest, EndpointGoneReleasesSelectorInflightCharge) {
+    slice_->ep_weak_ptr.reset();  // endpoint already gone
+    ctx_.inflight_slices.store(1);
+
+    expire();
+
+    expectTimedOutAndReleased();
+    EXPECT_EQ(ctx_.inflight_slices.load(), 0);
+}
+
+// The slice's endpoint is alive but no longer holds it (a neighbour's retry
+// popped it with PENDING and its count), so acknowledge() sweeps nothing;
+// the timeout path still has to fail it and return its charge.
+TEST_F(RdmaWorkersTimeoutTest, NotOnQueueStillReleasesSelectorInflightCharge) {
+    auto endpoint = std::make_shared<RdmaEndPoint>();  // never constructed
+    slice_->ep_weak_ptr = endpoint;
+    slice_->qp_index = 0;
+    ctx_.inflight_slices.store(0);  // already dropped with the neighbour's
+
+    expire();
+
+    expectTimedOutAndReleased();
+    EXPECT_EQ(ctx_.inflight_slices.load(), 0);
+}
+
+// Two RDMA NICs, both reachable from the host buffer, and a Workers whose
+// selector is set to adopt every selection sample outright.
+class RdmaWorkersChargeTest : public ::testing::Test {
+   protected:
+    static constexpr uint64_t kLen = 1 << 20;
+    static constexpr uint64_t kNow = 1'000'000'000;
+
+    void SetUp() override {
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(topology
+                        ->parse(R"({"nics":[
+                        {"name":"mc-absent-rnic-0","type":0,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                        .ok());
+        Topology::MemEntry mem;
+        mem.name = "cpu:0";
+        mem.type = Topology::MEM_HOST;
+        mem.numa_node = 0;
+        mem.device_list[0].push_back(0);
+        mem.device_list[0].push_back(1);
+        topology->mem_list_.push_back(mem);
+
+        RdmaTransportTestPeer::bindTopology(transport_, topology);
+        ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport_), 0u);
+        workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
+        selector_ = workers_->getDeviceSelector();
+        auto params = selector_->getSchedulingParams();
+        params.bandwidth_learning_rate = 0.0;  // adopt the sample
+        selector_->setSchedulingParams(params);
+        for (int dev : {0, 1}) {
+            ASSERT_TRUE(selector_->setDeviceAvailable(dev, true).ok());
+            ASSERT_TRUE(selector_->setDeviceBandwidth(dev, 25.0).ok());
+        }
+
+        task_ = RdmaTaskStorage::Get().allocate();
+        task_->num_slices = 1;
+        task_->status_word = PENDING;
+        task_->first_error = PENDING;
+        task_->ref();
+        slice_ = RdmaSliceStorage::Get().allocate();
+        slice_->task = task_;
+        slice_->length = kLen;
+        slice_->word = PENDING;
+        slice_->rail_monitor = nullptr;
+        // Allocated on NIC 0, as submitTransferTasks charges it.
+        int chosen = -1;
+        ASSERT_TRUE(
+            selector_->allocate(kLen, "cpu:0", chosen, PRIO_HIGH, 1ULL << 0)
+                .ok());
+        ASSERT_EQ(chosen, 0);
+        slice_->source_dev_id = chosen;
+        slice_->charged_dev = chosen;
+        ASSERT_EQ(selector_->getInflightBytes(0), kLen);
+    }
+
+    void TearDown() override {
+        RdmaSliceStorage::Get().deallocate(slice_);
+        task_->deref();
+    }
+
+    RdmaTransport transport_;
+    std::unique_ptr<Workers> workers_;
+    DeviceSelector* selector_ = nullptr;
+    RdmaTask* task_ = nullptr;
+    RdmaSlice* slice_ = nullptr;
+};
+
+// The CQ error path returns a slice's charge before re-submitting it, and
+// the retry picks its device again. Without a fresh charge the NIC's
+// inflight bytes miss the retry entirely and its completion teaches neither
+// estimate, because the release is a no-op on an uncharged slice.
+TEST_F(RdmaWorkersChargeTest, RetryIsRechargedAndStillLearns) {
+    // The error path hands the charge back and re-submits.
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, 0.0);
+    ASSERT_EQ(slice_->charged_dev, -1);
+    ASSERT_EQ(selector_->getInflightBytes(0), 0u);
+
+    // The retry settles on the fallback NIC.
+    RdmaTransportTestPeer::rechargeSlice(*workers_, slice_, 1);
+    slice_->source_dev_id = 1;  // as selectFallbackDevice does next
+    EXPECT_EQ(slice_->charged_dev, 1);
+    EXPECT_EQ(selector_->getInflightBytes(1), kLen);
+    EXPECT_EQ(selector_->getInflightBytes(0), 0u);
+
+    // Its completion returns the charge and teaches the selector the rate
+    // it saw. Without the recharge above the release would be a no-op on an
+    // uncharged slice: the bytes would stay charged to nobody and the
+    // sample would be lost.
+    const double before = selector_->getAggregateEwmaBandwidth();
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, kLen / 5e8);
+    EXPECT_EQ(selector_->getInflightBytes(1), 0u);
+    // Device 0 is untaught; device 1 adopted 0.5 GB/s in place of its seed.
+    EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(),
+                before - 3.125e9 + 0.5e9, 1.0);
+}
+
+// A first attempt that falls back to another NIC is still charged to the
+// one the allocator picked. The charge moves with the routing: the fallback
+// NIC is charged first, then the original is paid back, so a release racing
+// in between finds one of them on record and never both.
+TEST_F(RdmaWorkersChargeTest, FallbackMovesTheChargeToTheNicItPostsOn) {
+    RdmaTransportTestPeer::rechargeSlice(*workers_, slice_, 1);
+    slice_->source_dev_id = 1;
+
+    EXPECT_EQ(slice_->charged_dev, 1);
+    EXPECT_EQ(selector_->getInflightBytes(0), 0u);
+    EXPECT_EQ(selector_->getInflightBytes(1), kLen);
+
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, 0.0);
+    EXPECT_EQ(slice_->charged_dev, -1);
+    EXPECT_EQ(selector_->getInflightBytes(0), 0u);
+    EXPECT_EQ(selector_->getInflightBytes(1), 0u);
+}
+
+// A device the selector does not track cannot be charged. The slice keeps
+// the charge it has rather than ending up charged to nobody, so the release
+// still balances the NIC that was charged and nothing underflows.
+TEST_F(RdmaWorkersChargeTest, ChargeOnAnUntrackedDeviceKeepsTheOldOne) {
+    RdmaTransportTestPeer::rechargeSlice(*workers_, slice_, 999);
+
+    EXPECT_EQ(slice_->charged_dev, 0);
+    EXPECT_EQ(selector_->getInflightBytes(0), kLen);
+
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, 0.0);
+    EXPECT_EQ(slice_->charged_dev, -1);
+    EXPECT_EQ(selector_->getInflightBytes(0), 0u);
+}
+
+// With qp_pools several worker lanes share a queue pair, so the lane that
+// sweeps a slice off it is often not the lane that enqueued it. The sweep
+// must give the accounting back to the owner: its set entry, its place in
+// its inflight count, and its selector charge.
+TEST(RdmaWorkersOwnershipTest, SweepByAnotherLaneIsRoutedToTheOwner) {
+    constexpr int kDev = 1;
+    constexpr uint64_t kLen = 1 << 20;
+    auto topology = std::make_shared<Topology>();
+    ASSERT_TRUE(topology
+                    ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                    .ok());
+    Topology::MemEntry mem;
+    mem.name = "cpu:0";
+    mem.type = Topology::MEM_HOST;
+    mem.numa_node = 0;
+    mem.device_list[0].push_back(kDev);
+    topology->mem_list_.push_back(mem);
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport), 0u);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    auto* selector = workers->getDeviceSelector();
+    ASSERT_TRUE(selector->setDeviceAvailable(kDev, true).ok());
+    RdmaTransportTestPeer::makeWorkerContexts(*workers, 2);
+    auto& lane_a = RdmaTransportTestPeer::workerContext(*workers, 0);
+    auto& lane_b = RdmaTransportTestPeer::workerContext(*workers, 1);
+
+    // Lane B enqueued and posted the slice.
+    auto* task = RdmaTaskStorage::Get().allocate();
+    task->num_slices = 1;
+    task->status_word = PENDING;
+    task->first_error = PENDING;
+    task->ref();
+    auto* slice = RdmaSliceStorage::Get().allocate();
+    slice->task = task;
+    slice->length = kLen;
+    slice->word = PENDING;
+    slice->rail_monitor = nullptr;
+    slice->owner_worker = 1;
+    slice->counted_lane = 1;  // as Workers::submit() marks it
+    int chosen = -1;
+    ASSERT_TRUE(selector->allocate(kLen, "cpu:0", chosen).ok());
+    slice->source_dev_id = chosen;
+    slice->charged_dev = chosen;
+    lane_b.inflight_slice_set.insert(slice);
+    lane_b.inflight_slices.store(1);
+    // Lane A still holds an entry from an earlier attempt of the same slice
+    // (a retry moved it to lane B before A's set was drained).
+    lane_a.inflight_slice_set.insert(slice);
+    ASSERT_EQ(selector->getInflightBytes(kDev), kLen);
+
+    // Lane A sweeps it off the shared queue pair.
+    RdmaTransportTestPeer::retireSweptSlice(*workers, lane_a, slice);
+
+    EXPECT_EQ(lane_a.inflight_slices.load(), 0);  // not lane A's to discount
+    EXPECT_EQ(lane_b.inflight_slices.load(), 0);
+    // A took out its own stale entry; B's is handed over, not touched.
+    EXPECT_TRUE(lane_a.inflight_slice_set.empty());
+    EXPECT_EQ(lane_b.inflight_slice_set.count(slice), 1u);  // owner erases it
+    EXPECT_EQ(selector->getInflightBytes(kDev), 0u);
+
+    // ...on its own next pass.
+    RdmaTransportTestPeer::drainReclaimed(*workers, lane_b);
+    EXPECT_TRUE(lane_b.inflight_slice_set.empty());
+
+    RdmaTransportTestPeer::destroyWorkerContexts(*workers);
+    RdmaSliceStorage::Get().deallocate(slice);
+    task->deref();
+}
+
+// A queue pair shared by two worker lanes (the qp_pools layout): the lane
+// that sweeps a completion off it is not the lane that enqueued the slices,
+// so acknowledge() hands back slices belonging to somebody else. Everything
+// the sweep gives back has to land on the owner.
+class RdmaWorkersSharedQpTest : public ::testing::Test {
+   protected:
+    static constexpr int kDev = 1;
+    static constexpr uint64_t kLen = 1 << 20;
+
+    // Verbs stand-ins: enough for a context to hand out a protection domain
+    // and a completion queue, and for an endpoint to create its queue pairs.
+    struct FakeState {
+        ibv_context native{};
+        ibv_pd pd{};
+        ibv_cq cq{};
+        ibv_qp qp[8]{};
+        int next_qp = 0;
+        ibv_mr mr{};
+    };
+    static FakeState fake;
+
+    static ibv_cq* createCq(ibv_context*, int, void*, ibv_comp_channel*, int) {
+        return &fake.cq;
+    }
+    static int destroyCq(ibv_cq*) { return 0; }
+    static ibv_qp* createQp(ibv_pd*, ibv_qp_init_attr*) {
+        return &fake.qp[fake.next_qp++];
+    }
+    static int destroyQp(ibv_qp*) { return 0; }
+    static int modifyQp(ibv_qp*, ibv_qp_attr*, int) { return 0; }
+    static ibv_mr* regMr(ibv_pd*, void*, size_t, int) { return &fake.mr; }
+    static int deregMr(ibv_mr*) { return 0; }
+
+    void SetUp() override {
+        fake = FakeState{};
+        fake.native.num_comp_vectors = 1;
+
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(topology
+                        ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                        .ok());
+        Topology::MemEntry mem;
+        mem.name = "cpu:0";
+        mem.type = Topology::MEM_HOST;
+        mem.numa_node = 0;
+        mem.device_list[0].push_back(kDev);
+        topology->mem_list_.push_back(mem);
+        RdmaTransportTestPeer::bindTopology(transport_, topology);
+        ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport_), 0u);
+        workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
+        selector_ = workers_->getDeviceSelector();
+        ASSERT_TRUE(selector_->setDeviceAvailable(kDev, true).ok());
+        RdmaTransportTestPeer::makeWorkerContexts(*workers_, 2);
+
+        // One queue pair for both lanes, the layout that makes the sweep
+        // cross lanes.
+        params_ = std::make_shared<RdmaParams>();
+        params_->device.num_cq_list = 1;
+        params_->endpoint.qp_mul_factor = 1;
+
+        context_ = RdmaTransportTestPeer::contextSet(transport_)[kDev];
+        auto& verbs = RdmaContextTestPeer::verbs(*context_);
+        verbs.ibv_create_cq = createCq;
+        verbs.ibv_destroy_cq = destroyCq;
+        verbs.ibv_create_qp = createQp;
+        verbs.ibv_destroy_qp = destroyQp;
+        verbs.ibv_modify_qp = modifyQp;
+        verbs.ibv_reg_mr_default = regMr;
+        verbs.ibv_dereg_mr = deregMr;
+        RdmaContextTestPeer::bindDevice(*context_, &fake.native, params_);
+        ASSERT_EQ(cq_.construct(context_.get(), 4096, 0), 0);
+        ASSERT_EQ(notify_cq_.construct(context_.get(), 4096, 0), 0);
+        RdmaContextTestPeer::bindResources(*context_, &fake.pd, {&cq_},
+                                           &notify_cq_);
+
+        endpoint_ = std::make_shared<RdmaEndPoint>();
+        ASSERT_EQ(
+            endpoint_->construct(context_.get(), &params_->endpoint, "peer:0"),
+            0);
+    }
+
+    void TearDown() override {
+        // The endpoint goes first: deconstruct() returns its work-request
+        // quota through the context's completion queue, which
+        // unbindResources takes away below.
+        endpoint_.reset();
+        for (auto* slice : slices_) RdmaSliceStorage::Get().deallocate(slice);
+        for (auto* task : tasks_) task->deref();
+        if (workers_) RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+        if (context_) {
+            RdmaContextTestPeer::unbindResources(*context_);
+            RdmaContextTestPeer::unbindDevice(*context_);
+        }
+    }
+
+    // A slice charged to the NIC, owned by `lane`, and posted on the shared
+    // queue pair.
+    RdmaSlice* postSlice(int lane, uint64_t enqueue_ts) {
+        auto* task = RdmaTaskStorage::Get().allocate();
+        task->num_slices = 1;
+        task->status_word = PENDING;
+        task->first_error = PENDING;
+        task->ref();  // the batch's reference
+        task->ref();  // the slice's, dropped by updateSliceStatus()
+        auto* slice = RdmaSliceStorage::Get().allocate();
+        slice->task = task;
+        slice->length = kLen;
+        slice->word = PENDING;
+        slice->rail_monitor = nullptr;
+        slice->enqueue_ts = enqueue_ts;
+        slice->owner_worker = lane;
+        int chosen = -1;
+        EXPECT_TRUE(selector_->allocate(kLen, "cpu:0", chosen).ok());
+        slice->source_dev_id = chosen;
+        slice->charged_dev = chosen;
+        slice->counted_lane = lane;  // as Workers::submit() marks it
+        auto& ctx = RdmaTransportTestPeer::workerContext(*workers_, lane);
+        ctx.inflight_slices.fetch_add(1);
+        // Posted straight away, as the hook inside submitSlices does it.
+        RdmaTransportTestPeer::markPosted(*workers_, ctx, slice, enqueue_ts);
+        RdmaEndPointTestPeer::pretendPosted(endpoint_, 0, slice);
+        tasks_.push_back(task);
+        slices_.push_back(slice);
+        return slice;
+    }
+
+    // Drive one completion for `slice` through lane 0's poll path.
+    void completeWith(RdmaSlice* slice, ibv_wc_status status,
+                      uint64_t poll_ts = 1'000'000) {
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(slice);
+        wc.status = status;
+        RdmaTransportTestPeer::handleCompletion(
+            *workers_, RdmaTransportTestPeer::workerContext(*workers_, 0),
+            *context_, wc, poll_ts);
+    }
+
+    // What asyncPostSend does with a re-queued slice on its next pass, minus
+    // the routing it needs a live segment for: take it off the lane's queue,
+    // charge it again and put it back on the queue pair at `post_ts`.
+    void repost(RdmaSlice* slice, int lane, uint64_t post_ts = 1'000'000) {
+        auto& ctx = RdmaTransportTestPeer::workerContext(*workers_, lane);
+        std::vector<RdmaSliceList> drained;
+        ctx.queues[slice->priority].pop(drained);
+        ASSERT_EQ(drained.size(), 1u);
+        ASSERT_EQ(drained[0].first, slice);
+        RdmaTransportTestPeer::rechargeSlice(*workers_, slice, kDev);
+        RdmaTransportTestPeer::markPosted(*workers_, ctx, slice, post_ts);
+        RdmaEndPointTestPeer::pretendPosted(endpoint_, 0, slice);
+    }
+
+    RdmaTransport transport_;
+    std::shared_ptr<RdmaParams> params_;
+    std::shared_ptr<RdmaContext> context_;
+    RdmaCQ cq_;
+    RdmaCQ notify_cq_;
+    std::shared_ptr<RdmaEndPoint> endpoint_;
+    std::unique_ptr<Workers> workers_;
+    DeviceSelector* selector_ = nullptr;
+    std::vector<RdmaTask*> tasks_;
+    std::vector<RdmaSlice*> slices_;
+};
+
+RdmaWorkersSharedQpTest::FakeState RdmaWorkersSharedQpTest::fake;
+
+TEST_F(RdmaWorkersSharedQpTest, TimeoutSweepGivesTheOtherLaneItsSliceBack) {
+    // Lane 1 posted first, so lane 0's timeout sweeps it off the queue pair
+    // along with lane 0's own slice.
+    auto* theirs = postSlice(/*lane=*/1, /*enqueue_ts=*/0);
+    auto* ours = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    auto& lane1 = RdmaTransportTestPeer::workerContext(*workers_, 1);
+    ASSERT_EQ(selector_->getInflightBytes(kDev), 2 * kLen);
+
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000);  // 1 ms
+    RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane0,
+                                                /*now_ns=*/2'000'000);
+
+    // Both are terminal and neither is charged to the NIC any more.
+    EXPECT_EQ(ours->word, TIMEOUT);
+    EXPECT_EQ(theirs->word, TIMEOUT);
+    EXPECT_EQ(ours->charged_dev, -1);
+    EXPECT_EQ(theirs->charged_dev, -1);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+
+    // Each lane's own count came back down, and lane 1's set entry is waiting
+    // for lane 1 rather than having been erased from under it.
+    EXPECT_EQ(lane0.inflight_slices.load(), 0);
+    EXPECT_EQ(lane1.inflight_slices.load(), 0);
+    EXPECT_TRUE(lane0.inflight_slice_set.empty());
+    EXPECT_EQ(lane1.inflight_slice_set.count(theirs), 1u);
+    RdmaTransportTestPeer::drainReclaimed(*workers_, lane1);
+    EXPECT_TRUE(lane1.inflight_slice_set.empty());
+}
+
+// Tearing an endpoint down cancels whatever is still queued on it without
+// going through a sweep, so each lane is left holding a slice that will
+// never complete. The owner's next pass has to take those out: otherwise
+// their NIC charge, their share of its posted backlog and their place in the
+// lane's count are held for the life of the process, and the lane never goes
+// idle again.
+TEST_F(RdmaWorkersSharedQpTest, TeardownLeftoversAreReclaimedByTheirLane) {
+    auto* theirs = postSlice(/*lane=*/1, /*enqueue_ts=*/0);
+    auto* ours = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    auto& lane1 = RdmaTransportTestPeer::workerContext(*workers_, 1);
+
+    ASSERT_EQ(endpoint_->deconstruct(), 0);
+    ASSERT_EQ(ours->word, CANCELED);
+    ASSERT_EQ(theirs->word, CANCELED);
+
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000);
+    RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane0,
+                                                /*now_ns=*/2'000'000);
+    RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane1,
+                                                /*now_ns=*/2'000'000);
+
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(lane0.inflight_slices.load(), 0);
+    EXPECT_EQ(lane1.inflight_slices.load(), 0);
+    EXPECT_TRUE(lane0.inflight_slice_set.empty());
+    EXPECT_TRUE(lane1.inflight_slice_set.empty());
+}
+
+// A slice whose attempt fails with a transient error is swept off the queue
+// pair and put back on its lane's queue. The sweep takes it out of that
+// lane's count, so the re-submit puts it back in -- and whatever guards the
+// next decrement has to come back with it. Otherwise the completion that
+// finally resolves the slice cannot take it out of the count again, and the
+// lane it belongs to never reaches zero: it stops suspending, and it looks
+// permanently loaded to submit()'s least-loaded-lane pick.
+TEST_F(RdmaWorkersSharedQpTest, RetriedSliceIsStillCountedByItsLane) {
+    constexpr uint64_t kPosted = 1'000'000;
+
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/kPosted);
+    auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    ASSERT_EQ(lane0.inflight_slices.load(), 1);
+
+    // First attempt: a transient error, well short of max_retry_count.
+    completeWith(slice, IBV_WC_RETRY_EXC_ERR, kPosted + kLen);
+    ASSERT_EQ(slice->word, PENDING);
+    ASSERT_EQ(slice->retry_count, 1);
+    EXPECT_EQ(lane0.inflight_slices.load(), 1);  // queued again, still counted
+
+    // Second attempt reaches the hardware and succeeds.
+    repost(slice, /*lane=*/0, kPosted + 2 * kLen);
+    completeWith(slice, IBV_WC_SUCCESS, kPosted + 3 * kLen);
+
+    EXPECT_EQ(slice->word, COMPLETED);
+    EXPECT_EQ(lane0.inflight_slices.load(), 0);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+}
+
+// Same retry, on the layout this fixture exists for: lane 1 enqueued the
+// slice, lane 0 polls the queue pair they share. The re-submit goes onto
+// lane 0's queue, so lane 0 is the lane counting it from then on and the
+// slice's ownership has to move with it. Left pointing at lane 1, the
+// completion that finally resolves it discounts a lane that is no longer
+// carrying it -- lane 1 goes negative and lane 0 never comes back down.
+TEST_F(RdmaWorkersSharedQpTest, RetryPolledByAnotherLaneMovesOwnership) {
+    auto* slice = postSlice(/*lane=*/1, /*enqueue_ts=*/0);
+    auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    auto& lane1 = RdmaTransportTestPeer::workerContext(*workers_, 1);
+    ASSERT_EQ(lane1.inflight_slices.load(), 1);
+
+    completeWith(slice, IBV_WC_RETRY_EXC_ERR);  // polled by lane 0
+    ASSERT_EQ(slice->word, PENDING);
+    EXPECT_EQ(lane0.inflight_slices.load(), 1);  // lane 0 queued it
+    EXPECT_EQ(lane1.inflight_slices.load(), 0);
+
+    repost(slice, /*lane=*/0);
+    completeWith(slice, IBV_WC_SUCCESS);
+
+    EXPECT_EQ(slice->word, COMPLETED);
+    EXPECT_EQ(lane0.inflight_slices.load(), 0);
+    EXPECT_EQ(lane1.inflight_slices.load(), 0);
+    EXPECT_TRUE(lane0.inflight_slice_set.empty());
+}
+
+// The same retry seen from the lane the slice is leaving. Lane 1's set still
+// holds an entry for it: the handover goes through lane 1's reclaim list, and
+// until lane 1 drains that list its sweep can still walk onto the entry. What
+// decides whether a lane may take an entry out of its set is whether the entry
+// is in that set -- not whether the lane still owns the slice, which the retry
+// has just changed. Keyed on ownership, lane 1 hands its own entry to lane 0,
+// which does not have it, and lane 1 keeps walking a slice it no longer holds.
+TEST_F(RdmaWorkersSharedQpTest, StaleSetEntryIsTakenOutByTheLaneHoldingIt) {
+    auto* slice = postSlice(/*lane=*/1, /*enqueue_ts=*/0);
+    auto& lane1 = RdmaTransportTestPeer::workerContext(*workers_, 1);
+
+    completeWith(slice, IBV_WC_RETRY_EXC_ERR);  // lane 0 retries it
+    ASSERT_EQ(lane1.inflight_slice_set.count(slice), 1u);
+
+    // Lane 1 drained just before lane 0 handed the entry over, so the entry
+    // is in its set with nothing queued to take it out.
+    RdmaTransportTestPeer::clearReclaimed(lane1);
+
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000);
+    RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane1,
+                                                /*now_ns=*/2'000'000);
+
+    EXPECT_TRUE(lane1.inflight_slice_set.empty());
+}
+
+// The other half of that window. While the slice waits on lane 0's queue for
+// its re-post, lane 1's sweep resolves it. Posting it now would move bytes for
+// a transfer that is already over, and its completion returns early at
+// `word != PENDING` -- before any discount -- so lane 0's count would never
+// come back down. The pre-post check has to drop an already-resolved slice the
+// same way it drops a cancelled one.
+TEST_F(RdmaWorkersSharedQpTest, SliceResolvedWhileQueuedIsDroppedNotPosted) {
+    auto* slice = postSlice(/*lane=*/1, /*enqueue_ts=*/0);
+    auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    auto& lane1 = RdmaTransportTestPeer::workerContext(*workers_, 1);
+
+    completeWith(slice, IBV_WC_RETRY_EXC_ERR);  // re-queued on lane 0
+    ASSERT_EQ(lane0.inflight_slices.load(), 1);
+
+    RdmaTransportTestPeer::clearReclaimed(lane1);
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000);
+    RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane1,
+                                                /*now_ns=*/2'000'000);
+    ASSERT_EQ(slice->word, TIMEOUT);
+    ASSERT_FALSE(slice->task->cancel_requested.load());
+
+    // What lane 0's next pass does with it before generating a post path.
+    EXPECT_TRUE(
+        RdmaTransportTestPeer::dropUnpostableSlice(*workers_, lane0, slice));
+    EXPECT_EQ(lane0.inflight_slices.load(), 0);
 }
 
 TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {

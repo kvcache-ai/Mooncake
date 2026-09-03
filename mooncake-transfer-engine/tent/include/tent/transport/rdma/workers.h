@@ -39,10 +39,6 @@ class DeviceSelector;
 
 class Workers {
     friend class RdmaTransportTestPeer;
-    // Grants the quota-accounting unit test access to the private static
-    // charge/release reconcile helpers (they only need a DeviceSelector, so the
-    // test can exercise them without constructing a Workers / RdmaTransport).
-    friend class WorkersQuotaTestAccessor;
 
    public:
     static constexpr size_t kCapacity = 1024 * 8;
@@ -75,18 +71,78 @@ class Workers {
 
     void asyncPollCq();
 
-    bool cancelUnpostedSlice(WorkerContext& worker, RdmaSlice* slice);
+    // Resolve one completion: give back what the slice's lane accounts for
+    // and either finish, retry or fail it. Split from asyncPollCq so a test
+    // can drive it with a synthesized ibv_wc.
+    void handleCompletion(WorkerContext& worker, RdmaContext& context,
+                          const ibv_wc& wc, uint64_t poll_ts);
 
-    // Release a slice's inflight charge against the device it was charged on,
-    // unwinding exactly charged_bytes. static so the accounting can be unit
-    // tested with just a DeviceSelector (no Workers/RdmaTransport instance).
-    static void releaseSliceQuota(DeviceSelector* selector, RdmaSlice* slice,
-                                  double latency = 0.0);
+    // The lane whose inflight_slice_set holds `slice`'s entry, or nullptr
+    // when it cannot be resolved (no lane recorded, or the worker array is
+    // not up yet).
+    WorkerContext* ownerContext(const RdmaSlice* slice);
 
-    // Reconcile a slice's inflight charge onto its current routing NIC
-    // (source_dev_id), migrating a stale charge or re-charging after a retry.
-    // static for the same testability reason as releaseSliceQuota.
-    static void chargeSliceQuota(DeviceSelector* selector, RdmaSlice* slice);
+    // Index of `worker` in the lane array, or -1 when that array is not up
+    // yet: the inverse of ownerContext().
+    int laneIndex(const WorkerContext& worker) const;
+
+    // Give back everything a slice swept off a queue pair with a terminal
+    // status still holds: its selector charge, its place in whichever
+    // lane's inflight count has it, and its entry in whichever lane's set.
+    // `deferred`, when given, collects the entries `self` is to erase, so
+    // the caller can do it after it stops iterating that set.
+    void retireSweptSlice(WorkerContext& self, RdmaSlice* slice,
+                          std::vector<RdmaSlice*>* deferred);
+
+    // Take `slice` out of whichever lane's inflight count holds it, exactly
+    // once (`counted_lane` comes back -1 for everyone after): for a slice
+    // popped off a queue pair that is still in flight, for one dropped
+    // before it was posted, and for one finished by any path that leaves
+    // the count to be settled here. A re-submit needs no prior discount;
+    // submitFromTick moves the count itself.
+    void discountFromOwner(WorkerContext& self, RdmaSlice* slice);
+
+    // Decide who takes `slice` out of an inflight set. Returns true when the
+    // entry is `self`'s to erase -- because `self` holds it, or because
+    // nobody else does -- and false when it has been handed to the owning
+    // lane's reclaim list instead.
+    bool routeSetRemoval(WorkerContext& self, RdmaSlice* slice);
+
+    // Take out the slices other lanes swept on this lane's behalf.
+    void drainReclaimed(WorkerContext& worker);
+
+    // This lane's pass over its inflight set: take out what other lanes
+    // handed back, retire entries that turned terminal behind its back, and
+    // fail every slice that has waited longer than slice_timeout_ns_ since
+    // it was enqueued (software timeout). Split from asyncPollCq so it can
+    // be driven with a synthetic clock in tests.
+    void expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns);
+
+    // Charge `slice` to `dev_id`, moving or establishing the selector's
+    // accounting for it. Called when a retry or a fallback settles on a
+    // device: a retry's charge was returned by the failure path that
+    // re-submitted it, a fallback's still sits on the NIC the allocator
+    // picked. A device the selector does not know cannot be charged; the
+    // slice then keeps whatever charge it has, so the release still balances.
+    void rechargeSlice(RdmaSlice* slice, int dev_id);
+
+    // True when `slice` must not be posted -- the transfer was cancelled, or
+    // another lane resolved the slice while it waited for a re-post. Retires
+    // it like a sweep would (retireSweptSlice), so the caller can simply
+    // skip it.
+    bool dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice);
+
+    // Hand back the selector's allocation charge for this slice, to the
+    // device it was charged on. `latency` is a successful attempt's
+    // post->completion time in seconds; 0 = no sample. See
+    // DeviceSelector::release.
+    void releaseSliceQuota(RdmaSlice* slice, double latency = 0.0);
+
+    // What a posting lane writes for a slice the moment it goes on the
+    // wire: the post timestamp and the lane's set entry. Runs inside
+    // submitSlices, before ibv_post_send, so a completion polled on a
+    // shared queue pair finds both in place.
+    void markPosted(WorkerContext& worker, RdmaSlice* slice, uint64_t post_ts);
 
     void monitorThread();
 
@@ -255,7 +311,13 @@ class Workers {
         std::thread thread;
         BoundedSliceQueue queues[kNumPriorityLevels];  // Priority queues
         GroupedRequests requests;
+        // Only this lane may touch its own set, so slices swept by another
+        // lane are handed over here and erased on this lane's next pass.
+        // Empty unless queue pairs are shared (qp_pools), so the mutex is
+        // cold.
         std::unordered_set<RdmaSlice*> inflight_slice_set;
+        std::mutex reclaim_mutex;
+        std::vector<RdmaSlice*> reclaimed;
         std::atomic<int64_t> inflight_slices = 0;
 
         std::mutex mutex;
@@ -286,7 +348,8 @@ class Workers {
 
     // Tick-internal re-enqueue: the worker thread must never block on its own
     // queue (issue #3637), so these park into requeue_overflow on a full queue
-    // and the asyncPostSend drain consumes them first.
+    // and the asyncPostSend drain consumes them first. Moves the slice's
+    // inflight count to `worker` from whichever lane still holds it.
     void submitFromTick(WorkerContext& worker, RdmaSlice* slice);
 
     WorkerContext* worker_context_;

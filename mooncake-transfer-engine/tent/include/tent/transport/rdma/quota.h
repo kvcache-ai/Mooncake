@@ -135,15 +135,10 @@ class DeviceSelector {
     // Allocate devices for a request (new API)
     // slice_bytes: pre-calculated slice size from rdma_transport to ensure
     // consistency
-    // slice_charged_bytes (optional): filled, in lockstep with slice_dev_ids,
-    // with the exact inflight bytes charged for each slice so the caller can
-    // release precisely what was added (0 entries in baseline mode, which does
-    // not track inflight).
     Status allocate(uint64_t total_length, uint32_t num_slices,
                     uint64_t slice_bytes, const std::string &location,
                     std::vector<int> &slice_dev_ids, int priority = PRIO_HIGH,
-                    uint64_t device_mask = ~0ULL,
-                    std::vector<uint64_t> *slice_charged_bytes = nullptr);
+                    uint64_t device_mask = ~0ULL);
 
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id);
@@ -155,14 +150,17 @@ class DeviceSelector {
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id, int priority, uint64_t device_mask);
 
-    Status release(int dev_id, uint64_t length, double latency);
-
-    // Charge inflight bytes against a specific device without running device
-    // selection. Used when the routing NIC changes after the original charge
-    // (fallback re-route) or when a retry has to re-enter the inflight view, so
-    // that the charged device stays symmetric with the device release()
-    // unwinds.
+    // Charge `length` bytes to one device without running device selection,
+    // for a caller that has already settled on it: a retry re-posting a
+    // slice whose charge the failure path returned, or a first attempt
+    // falling back from the NIC the allocator picked. release() balances
+    // it. Fails only for a device the selector does not know.
     Status chargeDevice(int dev_id, uint64_t length);
+
+    // Return a slice's inflight charge and learn from its completion.
+    // `latency` is a successful attempt's post->completion time and feeds
+    // the selection EWMA; <= 0 means no sample.
+    Status release(int dev_id, uint64_t length, double latency);
 
     Status getNicLoadStats(std::vector<NicLoadStats> &stats) const;
 
@@ -185,6 +183,9 @@ class DeviceSelector {
     void printTrafficStats();
 
     double getAggregateEwmaBandwidth() const;
+
+    // Bytes charged to one device and not yet released, or 0 if unknown.
+    uint64_t getInflightBytes(int dev_id) const;
 
     void fillDevicePriorities();
     int getDevicePriority(int dev_id) const;
@@ -279,14 +280,15 @@ class DeviceSelector {
 
     void selectSinglePath(const std::vector<Candidate> &candidates,
                           uint32_t num_slices, uint64_t total_length,
-                          std::vector<int> &slice_dev_ids,
-                          std::vector<uint64_t> *slice_charged_bytes = nullptr);
+                          std::vector<int> &slice_dev_ids);
 
+    // `slice_bytes` is the caller's block size: slice i carries
+    // min(slice_bytes, total_length - i * slice_bytes), and that is what
+    // release() will return, so it is also what gets charged.
     void selectMultiPath(const std::vector<Candidate> &candidates,
                          uint32_t num_slices, uint64_t total_length,
-                         std::vector<int> &slice_dev_ids,
-                         bool probe_mode = false,
-                         std::vector<uint64_t> *slice_charged_bytes = nullptr);
+                         uint64_t slice_bytes, std::vector<int> &slice_dev_ids,
+                         bool probe_mode = false);
 };
 
 }  // namespace tent
