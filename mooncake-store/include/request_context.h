@@ -14,14 +14,15 @@ namespace mooncake {
 // This is independent of `client_id` (the stable lease/segment identity), which
 // intentionally must NOT be reused as a per-request correlation id.
 struct RequestContext {
-    struct_pack::compatible<std::string> request_id;  // application-level correlation id
-    struct_pack::compatible<std::string> trace_id;    // distributed trace id
-    struct_pack::compatible<std::string> span_id;
-    struct_pack::compatible<std::string> parent_span_id;
+    std::string request_id;       // application-level correlation id
+    std::string trace_id;         // distributed trace id
+    std::string span_id;
+    std::string parent_span_id;
 };
 
-// All fields use struct_pack::compatible so future fields appended at the end
-// are safely ignored by older binaries that lack the field in their YLT_REFL list.
+// Enable struct_pack field-name-based serialization. Future fields appended
+// as struct_pack::compatible<std::string> at the end are safely ignored by
+// older binaries that lack the field in their YLT_REFL list.
 YLT_REFL(RequestContext, request_id, trace_id, span_id, parent_span_id);
 
 // Per-thread current request context. Set on the calling (Python) thread before
