@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 var errBatchBusy = errors.New("BatchID cannot be freed until all tasks are done")
@@ -116,5 +117,56 @@ func TestPerformTransferOnceSubmitErrorFreesBatch(t *testing.T) {
 	}
 	if !fake.freed {
 		t.Fatal("batch ID leaked on submit failure")
+	}
+}
+
+// TestWaitTransferBacksOffAfterSpinBudget checks the polling schedule: within
+// the spin budget polls are back-to-back, after it the poller sleeps with
+// exponential backoff capped at pollMaxInterval, so a long transfer costs a
+// bounded number of status calls instead of one per scheduler slot.
+func TestWaitTransferBacksOffAfterSpinBudget(t *testing.T) {
+	const extraPolls = 40
+	fake := &fakeBatchTransport{pollsUntilDone: pollSpinBudget + extraPolls, finalStatus: STATUS_COMPLETED}
+	fake.submitted = true
+
+	start := time.Now()
+	status, err := waitTransfer(context.Background(), fake, BatchID(1))
+	elapsed := time.Since(start)
+	if err != nil || status != STATUS_COMPLETED {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	// The fake reports terminal state on poll number pollsUntilDone.
+	if fake.polls != pollSpinBudget+extraPolls {
+		t.Fatalf("polls = %d, want %d", fake.polls, pollSpinBudget+extraPolls)
+	}
+	// One sleep per in-flight poll past the budget: 100µs,200,400,800,1ms,1ms,...
+	var want time.Duration
+	interval := pollMinInterval
+	for i := 0; i < extraPolls-1; i++ {
+		want += interval
+		if interval < pollMaxInterval {
+			interval *= 2
+			if interval > pollMaxInterval {
+				interval = pollMaxInterval
+			}
+		}
+	}
+	if elapsed < want {
+		t.Fatalf("elapsed %v shorter than the scheduled backoff %v", elapsed, want)
+	}
+	if elapsed > want*4+50*time.Millisecond {
+		t.Fatalf("elapsed %v far exceeds the scheduled backoff %v", elapsed, want)
+	}
+}
+
+func TestWaitTransferWithinSpinBudgetDoesNotSleep(t *testing.T) {
+	fake := &fakeBatchTransport{pollsUntilDone: pollSpinBudget / 2, finalStatus: STATUS_COMPLETED}
+	fake.submitted = true
+	start := time.Now()
+	if _, err := waitTransfer(context.Background(), fake, BatchID(1)); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 20*time.Millisecond {
+		t.Fatalf("spin-budget path took %v, should not sleep", elapsed)
 	}
 }
