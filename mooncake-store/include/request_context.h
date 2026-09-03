@@ -14,8 +14,8 @@ namespace mooncake {
 // This is independent of `client_id` (the stable lease/segment identity), which
 // intentionally must NOT be reused as a per-request correlation id.
 struct RequestContext {
-    std::string request_id;       // application-level correlation id
-    std::string trace_id;         // distributed trace id
+    std::string request_id;  // application-level correlation id
+    std::string trace_id;    // distributed trace id
     std::string span_id;
     std::string parent_span_id;
 };
@@ -27,12 +27,13 @@ YLT_REFL(RequestContext, request_id, trace_id, span_id, parent_span_id);
 
 // Per-thread current request context. Set on the calling (Python) thread before
 // a store operation and consumed synchronously by the master-client wrappers on
-// the same thread. For coroutine/async paths, snapshot it at entry and forward it
-// explicitly instead of reading this in continuations.
+// the same thread. For coroutine/async paths, snapshot it at entry and forward
+// it explicitly instead of reading this in continuations.
 inline thread_local std::optional<RequestContext> g_current_ctx;
 
-// RAII scope that sets the current request context and restores the previous one
-// on destruction (handy for the hop A->B bridge and for test/Python helpers).
+// RAII scope that sets the current request context and restores the previous
+// one on destruction (handy for the hop A->B bridge and for test/Python
+// helpers).
 class CurrentCtxScope {
    public:
     CurrentCtxScope() = default;
@@ -59,10 +60,11 @@ inline const std::optional<RequestContext>& get_current_request_context() {
 // the entry of the master-client invoke_rpc* templates and handed to
 // coro_rpc_client::send_request_with_attachment so request_id rides the request
 // framing rather than a struct field. Server side: read it back via
-// ctx.get_context_info()->release_request_attachment() (a std::string, which drains the buffer); an
-// empty view means no per-request id was supplied.
+// ctx.get_context_info()->release_request_attachment() (a std::string, which
+// drains the buffer); an empty view means no per-request id was supplied.
 // Serialize the full RequestContext to wire bytes for out-of-band
-// attachment (coro_rpc send_request_with_attachment / release_request_attachment).
+// attachment (coro_rpc send_request_with_attachment /
+// release_request_attachment).
 inline std::string current_request_context_attachment() {
     if (g_current_ctx) {
         return struct_pack::serialize<std::string>(*g_current_ctx);
@@ -85,9 +87,10 @@ inline RequestContext deserialize_request_context(std::string_view data) {
 // Lets an in-process integration test observe the attachment request_id that a
 // master handler actually received, instead of relying on VLOG. A test sets a
 // RequestContext on the calling thread, performs a synchronous single-key read
-// (invoke_rpc sends current_request_context_attachment() out-of-band), then reads
-// LastObservedRequestId(). The mutex is held only across a short std::string
-// copy, and only GetReplicaList/BatchGetReplicaList ever write here.
+// (invoke_rpc sends current_request_context_attachment() out-of-band), then
+// reads LastObservedRequestId(). The mutex is held only across a short
+// std::string copy, and only GetReplicaList/BatchGetReplicaList ever write
+// here.
 inline std::mutex& request_id_instrument_mutex() {
     static std::mutex m;
     return m;

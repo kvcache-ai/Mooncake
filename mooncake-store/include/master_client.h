@@ -311,8 +311,9 @@ class MasterClient {
         // thread's per-request request_id once at entry and carry it into the
         // pool-work closure via send_request_with_attachment, so batch master
         // RPCs (BatchExistKey / BatchPutStart / ...) carry the id out-of-band
-        // just like single-result RPCs. An empty attachment is wire-identical to
-        // a plain send_request and is ignored by non-reading handlers (gray).
+        // just like single-result RPCs. An empty attachment is wire-identical
+        // to a plain send_request and is ignored by non-reading handlers
+        // (gray).
         std::string ctx_attachment = current_request_context_attachment();
         // Real-client-side hop-B inject trace. VLOG(2): off at -v=1 (where
         // only the master logs), on at -v>=2 for per-hop tracing. Fires on
@@ -328,10 +329,11 @@ class MasterClient {
                 auto ret = co_await pool->send_request(
                     [&](coro_io::client_reuse_hint,
                         coro_rpc::coro_rpc_client& client) {
-                        return client.send_request_with_attachment<ServiceMethod>(
-                            std::string_view(ctx_attachment.data(),
-                                             ctx_attachment.size()),
-                            std::forward<Args>(args)...);
+                        return client
+                            .send_request_with_attachment<ServiceMethod>(
+                                std::string_view(ctx_attachment.data(),
+                                                 ctx_attachment.size()),
+                                std::forward<Args>(args)...);
                     });
                 if (!ret.has_value()) {
                     LOG(ERROR) << "Client not available";

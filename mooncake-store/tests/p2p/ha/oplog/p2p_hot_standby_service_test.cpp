@@ -807,7 +807,8 @@ TEST_F(P2PHotStandbyServiceTest, RestorePromotedMetadataIntoWrappedRuntime) {
                   standby.ExportMetadata(), promoted_sequence_id),
               ErrorCode::OK);
 
-    auto replica_result = promoted_runtime.GetReplicaListInternal("runtime-key");
+    auto replica_result =
+        promoted_runtime.GetReplicaListInternal("runtime-key");
     ASSERT_TRUE(replica_result.has_value()) << toString(replica_result.error());
     ASSERT_EQ(replica_result.value().replicas.size(), 1);
 

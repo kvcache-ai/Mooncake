@@ -94,10 +94,9 @@ void WrappedCentralizedMasterService::init_centralized_http_server() {
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-WrappedCentralizedMasterService::PutStartInternal(const UUID& client_id,
-                                          const std::string& key,
-                                          const uint64_t slice_length,
-                                          const ReplicateConfig& config) {
+WrappedCentralizedMasterService::PutStartInternal(
+    const UUID& client_id, const std::string& key, const uint64_t slice_length,
+    const ReplicateConfig& config) {
     return execute_rpc(
         "PutStart",
         [&] {
@@ -116,13 +115,11 @@ WrappedCentralizedMasterService::PutStartInternal(const UUID& client_id,
         });
 }
 
-void
-WrappedCentralizedMasterService::PutStart(
-    coro_rpc::context<
-        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+void WrappedCentralizedMasterService::PutStart(
+    coro_rpc::context<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         ctx,
-    const UUID& client_id, const std::string& key,
-    const uint64_t slice_length, const ReplicateConfig& config) {
+    const UUID& client_id, const std::string& key, const uint64_t slice_length,
+    const ReplicateConfig& config) {
     // Bypass: log the per-request request_id carried in the out-of-band
     // attachment (set client-side by invoke_rpc via
     // send_request_with_attachment), delegate to the value-returning
@@ -256,10 +253,9 @@ WrappedCentralizedMasterService::BatchPutStartInternal(
     return results;
 }
 
-void
-WrappedCentralizedMasterService::BatchPutStart(
-    coro_rpc::context<std::vector<
-        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>>
+void WrappedCentralizedMasterService::BatchPutStart(
+    coro_rpc::context<
+        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>>
         ctx,
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config) {

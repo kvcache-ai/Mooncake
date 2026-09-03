@@ -210,9 +210,9 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKeyInternal(
         [] { MasterMetricManager::instance().inc_exist_key_failures(); });
 }
 
-void
-WrappedMasterService::ExistKey(coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
-                               std::string_view key) {
+void WrappedMasterService::ExistKey(
+    coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+    std::string_view key) {
     // Bypass: the per-request request_id rides the out-of-band request
     // attachment (set client-side from g_current_ctx via
     // send_request_with_attachment). Log it here, then delegate to the
@@ -230,7 +230,8 @@ WrappedMasterService::ExistKey(coro_rpc::context<tl::expected<bool, ErrorCode>> 
     ctx.response_msg(std::move(result));
 }
 
-std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKeyInternal(
+std::vector<tl::expected<bool, ErrorCode>>
+WrappedMasterService::BatchExistKeyInternal(
     const std::vector<std::string_view>& keys) {
     ScopedVLogTimer timer(1, "BatchExistKey");
     const size_t total_keys = keys.size();
@@ -380,8 +381,8 @@ WrappedMasterService::BatchGetReplicaListInternal(
     return results;
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::RemoveInternal(std::string_view key,
-                                                           bool force) {
+tl::expected<void, ErrorCode> WrappedMasterService::RemoveInternal(
+    std::string_view key, bool force) {
     return execute_rpc(
         "Remove", [&] { return GetMasterService().Remove(key, force); },
         [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
@@ -389,9 +390,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::RemoveInternal(std::string_v
         [] { MasterMetricManager::instance().inc_remove_failures(); });
 }
 
-void
-WrappedMasterService::Remove(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
-                             std::string_view key, bool force) {
+void WrappedMasterService::Remove(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx, std::string_view key,
+    bool force) {
     // Bypass: see ExistKey. Log the per-request request_id from the attachment,
     // delegate to RemoveInternal (shared with in-process tests), reply via
     // ctx.response_msg.
@@ -518,8 +519,7 @@ WrappedMasterService::HeartbeatServiceReady() {
     return response;
 }
 
-void
-WrappedMasterService::GetReplicaList(
+void WrappedMasterService::GetReplicaList(
     coro_rpc::context<tl::expected<GetReplicaListResponse, ErrorCode>> ctx,
     std::string_view key, const GetReplicaListRequestConfig& config) {
     // Bypass: the per-request request_id rides the out-of-band request
@@ -527,8 +527,8 @@ WrappedMasterService::GetReplicaList(
     // send_request_with_attachment). The read struct no longer carries a
     // request_id field, so this handler logs the id from the attachment and
     // delegates the read/log/metric logic to the value-returning
-    // GetReplicaListInternal (also used in-process by HTTP /batch_query_keys and
-    // tests), then replies via ctx.response_msg.
+    // GetReplicaListInternal (also used in-process by HTTP /batch_query_keys
+    // and tests), then replies via ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         auto req_ctx = deserialize_request_context(att);
@@ -541,16 +541,15 @@ WrappedMasterService::GetReplicaList(
     ctx.response_msg(std::move(result));
 }
 
-void
-WrappedMasterService::BatchGetReplicaList(
+void WrappedMasterService::BatchGetReplicaList(
     coro_rpc::context<
         std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>
         ctx,
     const std::vector<std::string_view>& keys,
     const GetReplicaListRequestConfig& config) {
     // See GetReplicaList: log the out-of-band attachment request_id, then
-    // delegate to the shared value-returning BatchGetReplicaListInternal (one source
-    // of read/log/metric logic) and reply via ctx.response_msg.
+    // delegate to the shared value-returning BatchGetReplicaListInternal (one
+    // source of read/log/metric logic) and reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         auto req_ctx = deserialize_request_context(att);
@@ -563,14 +562,13 @@ WrappedMasterService::BatchGetReplicaList(
     ctx.response_msg(std::move(results));
 }
 
-void
-WrappedMasterService::BatchExistKey(
+void WrappedMasterService::BatchExistKey(
     coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
     const std::vector<std::string_view>& keys) {
     // Bypass: the per-request request_id rides the out-of-band attachment set
     // client-side by invoke_batch_rpc (send_request_with_attachment). Log it
-    // here, then delegate to the value-returning BatchExistKeyInternal (shared with
-    // in-process/tests) and reply via ctx.response_msg.
+    // here, then delegate to the value-returning BatchExistKeyInternal (shared
+    // with in-process/tests) and reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         auto req_ctx = deserialize_request_context(att);

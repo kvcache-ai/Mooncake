@@ -9,12 +9,12 @@
 // (GetReplicaList) and the batch-exist route (BatchExistKey) to prove the
 // attachment bypass works for both the single and batch invocation templates.
 //
-// The seam: the context-handler overloads in rpc_service.cpp / centralized_rpc_service.cpp
-// call RecordObservedRequestId(attachment) inside their attachment block. After
-// the synchronous client call returns (syncAwait guarantees the handler already
-// replied, hence happens-before), the test reads LastObservedRequestId(). A
-// nonexistent key still records the attachment before the lookup, so the key
-// need not exist.
+// The seam: the context-handler overloads in rpc_service.cpp /
+// centralized_rpc_service.cpp call RecordObservedRequestId(attachment) inside
+// their attachment block. After the synchronous client call returns (syncAwait
+// guarantees the handler already replied, hence happens-before), the test reads
+// LastObservedRequestId(). A nonexistent key still records the attachment
+// before the lookup, so the key need not exist.
 
 #include <gtest/gtest.h>
 
@@ -128,7 +128,7 @@ TEST_F(RequestIdAttachmentTest, CarriesRequestIdOnRemoveRoute) {
     // Remove of a nonexistent key still records the attachment before the
     // (failing) lookup in the value-returning body.
     auto result = client_->Remove("nonexistent_key_remove_attachment_test",
-                                   /*force=*/false);
+                                  /*force=*/false);
     (void)result;
 
     EXPECT_EQ(LastObservedRequestId(), "attach-remove")

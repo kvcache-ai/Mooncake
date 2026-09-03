@@ -448,8 +448,8 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
 void RealClient::put_batch_dummy_helper(
     coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
     const std::vector<std::string>& keys,
-    const std::vector<std::span<const char>>& values,
-    const WriteConfig& config, const UUID& client_id) {
+    const std::vector<std::span<const char>>& values, const WriteConfig& config,
+    const UUID& client_id) {
     // Bridge the per-request id from hop A's out-of-band attachment to hop B
     // (master RPC: BatchPutStart). See put_dummy_helper.
     std::optional<CurrentCtxScope> ctx_guard;
@@ -1004,8 +1004,8 @@ std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
 RealClient::get_buffer_info_dummy_helper_impl(const std::string& key,
-                                         const ReadRouteConfig& config,
-                                         const UUID& client_id) {
+                                              const ReadRouteConfig& config,
+                                              const UUID& client_id) {
     auto context_ptr = find_shm_context(client_id);
     if (!context_ptr) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
@@ -1040,8 +1040,7 @@ RealClient::get_buffer_info_dummy_helper_impl(const std::string& key,
 }
 
 void RealClient::get_buffer_info_dummy_helper(
-    coro_rpc::context<
-        tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
+    coro_rpc::context<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
         ctx,
     const std::string& key, const ReadRouteConfig& config,
     const UUID& client_id) {
@@ -1181,8 +1180,7 @@ std::vector<int> RealClient::batch_put_from(
     return results;
 }
 
-void
-RealClient::batch_put_from_dummy_helper(
+void RealClient::batch_put_from_dummy_helper(
     coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& dummy_buffers,
@@ -1383,8 +1381,7 @@ std::vector<int64_t> RealClient::batch_get_into(
     return results;
 }
 
-void
-RealClient::batch_get_into_dummy_helper(
+void RealClient::batch_get_into_dummy_helper(
     coro_rpc::context<std::vector<tl::expected<int64_t, ErrorCode>>> ctx,
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& dummy_buffers,
@@ -1522,8 +1519,8 @@ void RealClient::batchIsExist_internal_rpc(
     // install a CurrentCtxScope so the synchronous hop B master RPC
     // (client_service_->BatchIsExist -> master_client_.BatchExistKey, run via
     // syncAwait on this same coro_rpc server thread) re-attaches the same id.
-    // The value-returning batchIsExist_internal stays the shared body (also used
-    // in-process by the real path).
+    // The value-returning batchIsExist_internal stays the shared body (also
+    // used in-process by the real path).
     std::optional<CurrentCtxScope> ctx_guard;
     {
         auto att = ctx.get_context_info()->release_request_attachment();
@@ -1551,8 +1548,8 @@ void RealClient::isExist_internal_rpc(
     // V3 hop A entry (dummy path only). isExist_internal stays the
     // value-returning body used in-process by the real path. Read the
     // out-of-band attachment, install a CurrentCtxScope so the synchronous hop
-    // B master RPC (client_service_->IsExist -> master_client_.ExistKey) on this
-    // same coro_rpc server thread re-attaches the id, delegate and reply.
+    // B master RPC (client_service_->IsExist -> master_client_.ExistKey) on
+    // this same coro_rpc server thread re-attaches the id, delegate and reply.
     std::optional<CurrentCtxScope> ctx_guard;
     {
         auto att = ctx.get_context_info()->release_request_attachment();
@@ -1607,8 +1604,8 @@ void RealClient::getSize_internal_rpc(
     const std::string& key) {
     // V3 hop A entry (dummy path only). getSize_internal stays the
     // value-returning body used in-process by the real path. Bridge the per-
-    // request id to hop B (client_service_->Query -> master_client_.GetReplicaList)
-    // via CurrentCtxScope.
+    // request id to hop B (client_service_->Query ->
+    // master_client_.GetReplicaList) via CurrentCtxScope.
     std::optional<CurrentCtxScope> ctx_guard;
     {
         auto att = ctx.get_context_info()->release_request_attachment();

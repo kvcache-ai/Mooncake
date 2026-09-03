@@ -271,7 +271,8 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string_view>& keys,
 
     auto result = invoke_rpc<
         &WrappedMasterService::BatchGetReplicaList,
-        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>(keys, config);
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>(keys,
+                                                                      config);
     if (result.has_value()) {
         timer.LogResponse("result=", result.value().size(), " requests");
     }

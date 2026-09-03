@@ -547,7 +547,8 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
         auto r = client_->Put(key, s, WriteRouteRequestConfig{});
         ASSERT_TRUE(r.has_value());
 
-        auto replicas = master_.GetWrapped().GetReplicaListInternal(key, config);
+        auto replicas =
+            master_.GetWrapped().GetReplicaListInternal(key, config);
         ASSERT_TRUE(replicas.has_value());
         ASSERT_EQ(replicas.value().replicas.size(), 1);
         auto p2p_proxy_descriptor =
@@ -566,7 +567,8 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
 
         // due to the write operation is canceled,
         // the object size of read route must not be changed
-        auto replicas = master_.GetWrapped().GetReplicaListInternal(key, config);
+        auto replicas =
+            master_.GetWrapped().GetReplicaListInternal(key, config);
         ASSERT_TRUE(replicas.has_value());
         ASSERT_EQ(replicas.value().replicas.size(), 1);
         auto p2p_proxy_descriptor =
