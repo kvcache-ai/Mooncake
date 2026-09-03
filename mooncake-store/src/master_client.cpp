@@ -15,6 +15,7 @@
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
+#include "request_context.h"
 
 namespace mooncake {
 

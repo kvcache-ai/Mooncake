@@ -12,9 +12,20 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
     // Initialize centralized-specific HTTP handlers
     void init_centralized_http_server();
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStartInternal(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config);
+
+    // Bypass (out-of-band attachment) RPC handler for single-key put-start.
+    // Mirrors BatchPutStart: log the per-request request_id from the coro_rpc
+    // attachment (set client-side by invoke_rpc), delegate to the
+    // value-returning PutStartInternal (shared with in-process tests), and
+    // reply via ctx.response_msg.
+    void PutStart(coro_rpc::context<
+                      tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+                      ctx,
+                  const UUID& client_id, const std::string& key,
+                  const uint64_t slice_length, const ReplicateConfig& config);
 
     tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
                                          const std::string& key,
@@ -25,9 +36,23 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
                                             ReplicaType replica_type);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
-                  const std::vector<uint64_t>& slice_lengths,
-                  const ReplicateConfig& config);
+    BatchPutStartInternal(const UUID& client_id,
+                          const std::vector<std::string>& keys,
+                          const std::vector<uint64_t>& slice_lengths,
+                          const ReplicateConfig& config);
+
+    // Bypass (out-of-band attachment) RPC handler for the batch-put-start
+    // route. Mirrors the read-route context-handler entries: log the
+    // per-request request_id from the coro_rpc attachment (set client-side by
+    // invoke_batch_rpc), delegate to the value-returning BatchPutStartInternal
+    // (shared with in-process tests), and reply via ctx.response_msg.
+    void BatchPutStart(
+        coro_rpc::context<std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>>
+            ctx,
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& slice_lengths,
+        const ReplicateConfig& config);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys);

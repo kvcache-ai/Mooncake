@@ -18,6 +18,7 @@
 #include "client_metric.h"
 #include "types.h"
 #include "rpc_types.h"
+#include "request_context.h"
 
 namespace mooncake {
 
@@ -237,10 +238,28 @@ class MasterClient {
             metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
         }
 
+        // Bypass inject: snapshot the calling thread's per-request request_id
+        // (empty when no per-request context is set) ONCE at entry, then carry
+        // it into the pool-work closure. We never read g_current_ctx from a
+        // (possibly different) pool worker thread. An empty attachment is
+        // wire-identical to a plain send_request; non-reading server handlers
+        // ignore it, so this is gray across all master RPCs.
+        auto current_request_context = get_current_request_context();
+        std::string ctx_attachment = current_request_context_attachment();
+        // Real-client-side hop-B inject trace. VLOG(2): off at -v=1 (where
+        // only the master logs), on at -v>=2 for per-hop tracing. Fires on
+        // both the real path (in-proc) and the dummy path (real-client server
+        // thread) since master_client_ is shared.
+        if (current_request_context) {
+            VLOG(2) << "hop-B inject request_id="
+                    << current_request_context->request_id;
+        }
         auto start_time = std::chrono::steady_clock::now();
         auto ret = co_await pool->send_request(
             [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-                return client.send_request<ServiceMethod>(
+                return client.send_request_with_attachment<ServiceMethod>(
+                    std::string_view(ctx_attachment.data(),
+                                     ctx_attachment.size()),
                     std::forward<Args>(args)...);
             });
         if (!ret.has_value()) {
@@ -290,6 +309,23 @@ class MasterClient {
             metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
         }
 
+        // Bypass inject (see invoke_rpc_async_with_pool): snapshot the calling
+        // thread's per-request request_id once at entry and carry it into the
+        // pool-work closure via send_request_with_attachment, so batch master
+        // RPCs (BatchExistKey / BatchPutStart / ...) carry the id out-of-band
+        // just like single-result RPCs. An empty attachment is wire-identical
+        // to a plain send_request and is ignored by non-reading handlers
+        // (gray).
+        auto current_request_context = get_current_request_context();
+        std::string ctx_attachment = current_request_context_attachment();
+        // Real-client-side hop-B inject trace. VLOG(2): off at -v=1 (where
+        // only the master logs), on at -v>=2 for per-hop tracing. Fires on
+        // both the real path (in-proc) and the dummy path (real-client server
+        // thread) since master_client_ is shared.
+        if (current_request_context) {
+            VLOG(2) << "hop-B inject request_id="
+                    << current_request_context->request_id;
+        }
         auto start_time = std::chrono::steady_clock::now();
         return async_simple::coro::syncAwait(
             [&]() -> async_simple::coro::Lazy<
@@ -297,8 +333,11 @@ class MasterClient {
                 auto ret = co_await pool->send_request(
                     [&](coro_io::client_reuse_hint,
                         coro_rpc::coro_rpc_client& client) {
-                        return client.send_request<ServiceMethod>(
-                            std::forward<Args>(args)...);
+                        return client
+                            .send_request_with_attachment<ServiceMethod>(
+                                std::string_view(ctx_attachment.data(),
+                                                 ctx_attachment.size()),
+                                std::forward<Args>(args)...);
                     });
                 if (!ret.has_value()) {
                     LOG(ERROR) << "Client not available";

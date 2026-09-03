@@ -14,6 +14,7 @@
 #include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 #include "rpc_types.h"
+#include "request_context.h"
 #include "types.h"
 #include "default_config.h"
 
@@ -186,12 +187,20 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
         }
     }
 
+    // Bypass inject: snapshot the calling (Python) thread's per-request
+    // request_id once at entry, then carry it on hop A via
+    // send_request_with_attachment. The hop A server handler reads it back
+    // (when it is a V3 context handler) and bridges it to hop B; non-reading
+    // handlers ignore it. Empty attachment == plain send_request (gray).
+    std::string ctx_attachment = current_request_context_attachment();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
+                    return client.send_request_with_attachment<ServiceMethod>(
+                        std::string_view(ctx_attachment.data(),
+                                         ctx_attachment.size()),
                         std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
@@ -222,13 +231,19 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
         return error_results;
     }
 
+    // Bypass inject (see invoke_rpc): snapshot the per-request request_id on
+    // the calling thread once at entry and carry it on hop A via
+    // send_request_with_attachment.
+    std::string ctx_attachment = current_request_context_attachment();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
+                    return client.send_request_with_attachment<ServiceMethod>(
+                        std::string_view(ctx_attachment.data(),
+                                         ctx_attachment.size()),
                         std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
@@ -521,7 +536,7 @@ int DummyClient::put_parts(const std::string& key,
 
 int DummyClient::remove(const std::string& key, bool force) {
     return to_py_ret(
-        invoke_rpc<&RealClient::remove_internal, void>(key, force));
+        invoke_rpc<&RealClient::remove_internal_rpc, void>(key, force));
 }
 
 long DummyClient::removeByRegex(const std::string& str, bool force) {
@@ -544,7 +559,7 @@ int DummyClient::removeLocal(const std::string& key) {
 }
 
 int DummyClient::isExist(const std::string& key) {
-    auto result = invoke_rpc<&RealClient::isExist_internal, bool>(key);
+    auto result = invoke_rpc<&RealClient::isExist_internal_rpc, bool>(key);
 
     if (result.has_value()) {
         return *result ? 1 : 0;  // 1 if exists, 0 if not
@@ -556,8 +571,8 @@ int DummyClient::isExist(const std::string& key) {
 std::vector<int> DummyClient::batchIsExist(
     const std::vector<std::string>& keys) {
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batchIsExist_internal, bool>(keys.size(),
-                                                                   keys);
+        invoke_batch_rpc<&RealClient::batchIsExist_internal_rpc, bool>(
+            keys.size(), keys);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -574,7 +589,8 @@ std::vector<int> DummyClient::batchIsExist(
 }
 
 int64_t DummyClient::getSize(const std::string& key) {
-    return to_py_ret(invoke_rpc<&RealClient::getSize_internal, int64_t>(key));
+    return to_py_ret(
+        invoke_rpc<&RealClient::getSize_internal_rpc, int64_t>(key));
 }
 
 std::shared_ptr<BufferHandle> DummyClient::get_buffer(

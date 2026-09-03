@@ -1,5 +1,6 @@
 #include "centralized_master_client.h"
 #include "centralized_rpc_service.h"
+#include "request_context.h"
 #include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
