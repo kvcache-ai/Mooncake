@@ -96,6 +96,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     file_storage.cpp
     config/client_metric_config.cpp
     config/file_storage_config.cpp
+    config/file_per_key_config.cpp
     config/client_auto_port_config.cpp
     config/local_hot_cache_config.cpp
     config/offset_allocator_backend_config.cpp
