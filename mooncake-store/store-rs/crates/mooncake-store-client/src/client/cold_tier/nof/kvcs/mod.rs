@@ -8,7 +8,7 @@ include!("capi.rs");
 
 mod executor;
 mod physical_layout;
-pub use executor::{KvcsCapiExecutor, KvcsMode};
+pub use executor::{KvcsCapiExecutor, KvcsLowLevelClient, KvcsMode};
 
 #[cfg(test)]
 mod capi_tests;

@@ -1,5 +1,6 @@
 use std::ffi::{c_int, CString};
 use std::ptr;
+use std::sync::Arc;
 
 use mooncake_store_core::{Result, StoreError};
 
@@ -45,17 +46,74 @@ enum KvcsConfig {
         efc_socket: Option<CString>,
         redis_endpoints: Vec<CString>,
         redis_password: Option<CString>,
+        client: ClientSlot,
     },
     LowLevel {
-        efc_socket: CString,
+        client: KvcsLowLevelClient,
         mountpoint_index: u32,
     },
+}
+
+/// One shareable KVCS Low-Level SDK client.
+///
+/// The SDK selects a filesystem with the per-batch `mountpoint_index`, so callers should create
+/// one client per EFC socket and bind all statically configured targets through [`Self::executor`].
+#[derive(Clone)]
+pub struct KvcsLowLevelClient {
+    inner: Arc<KvcsLowLevelClientInner>,
+}
+
+struct KvcsLowLevelClientInner {
+    efc_socket: CString,
+    client: ClientSlot,
+    max_value_size: u64,
+}
+
+impl KvcsLowLevelClient {
+    pub fn new(efc_socket: String, max_value_size: u64) -> Result<Self> {
+        validate_max_value_size(max_value_size)?;
+        let efc_socket = CString::new(efc_socket)
+            .map_err(|_| StoreError::InvalidState("KVCS EFC socket contains NUL".to_string()))?;
+        Ok(Self {
+            inner: Arc::new(KvcsLowLevelClientInner {
+                efc_socket,
+                client: ClientSlot::default(),
+                max_value_size,
+            }),
+        })
+    }
+
+    /// Binds one static Mooncake target to an SDK mountpoint index.
+    pub fn executor(&self, mountpoint_index: u32) -> KvcsCapiExecutor {
+        KvcsCapiExecutor {
+            config: KvcsConfig::LowLevel {
+                client: self.clone(),
+                mountpoint_index,
+            },
+            max_value_size: self.inner.max_value_size,
+        }
+    }
+
+    fn ensure_client(&self) -> Result<*mut KvcsClient> {
+        self.inner.client.get_or_create(
+            "low-level",
+            || {
+                let raw = KvcsLlConfig {
+                    // Public SDK 0.4.0 rejects NULL/empty for the low-level client.
+                    efc_socket: self.inner.efc_socket.as_ptr(),
+                    max_value_size: self.inner.max_value_size as i64,
+                    ..KvcsLlConfig::default()
+                };
+                unsafe { kvcs_ll_create(&raw) }
+            },
+            kvcs_ll_client_destroy,
+        )
+    }
 }
 
 /// KVCS C API executor whose exposed NoF traits are selected by `MOONCAKE_KVCS_MODE`.
 pub struct KvcsCapiExecutor {
     config: KvcsConfig,
-    client: ClientSlot,
     max_value_size: u64,
 }
 
@@ -125,6 +183,7 @@ impl KvcsCapiExecutor {
                 redis_password: redis_password
                     .map(|value| to_cstring(value, "Redis password"))
                     .transpose()?,
+                client: ClientSlot::default(),
             },
             max_value_size,
         )
@@ -135,26 +194,13 @@ impl KvcsCapiExecutor {
         mountpoint_index: u32,
         max_value_size: u64,
     ) -> Result<Self> {
-        let efc_socket = CString::new(efc_socket)
-            .map_err(|_| StoreError::InvalidState("KVCS EFC socket contains NUL".to_string()))?;
-        Self::from_config(
-            KvcsConfig::LowLevel {
-                efc_socket,
-                mountpoint_index,
-            },
-            max_value_size,
-        )
+        Ok(KvcsLowLevelClient::new(efc_socket, max_value_size)?.executor(mountpoint_index))
     }
 
     fn from_config(config: KvcsConfig, max_value_size: u64) -> Result<Self> {
-        if !(1..=SDK_MAX_VALUE_SIZE).contains(&max_value_size) {
-            return Err(StoreError::InvalidState(format!(
-                "KVCS max value size must be in 1..={SDK_MAX_VALUE_SIZE}, got {max_value_size}"
-            )));
-        }
+        validate_max_value_size(max_value_size)?;
         Ok(Self {
             config,
-            client: ClientSlot::default(),
             max_value_size,
         })
     }
@@ -172,7 +218,8 @@ impl KvcsCapiExecutor {
                 efc_socket,
                 redis_endpoints,
                 redis_password,
-            } => self.client.get_or_create(
+                client,
+            } => client.get_or_create(
                 "Standard",
                 || {
                     let endpoint_ptrs = redis_endpoints
@@ -197,19 +244,7 @@ impl KvcsCapiExecutor {
                 },
                 kvcs_client_destroy,
             ),
-            KvcsConfig::LowLevel { efc_socket, .. } => self.client.get_or_create(
-                "low-level",
-                || {
-                    let raw = KvcsLlConfig {
-                        // Public SDK 0.4.0 rejects NULL/empty for the low-level client.
-                        efc_socket: efc_socket.as_ptr(),
-                        max_value_size: self.max_value_size as i64,
-                        ..KvcsLlConfig::default()
-                    };
-                    unsafe { kvcs_ll_create(&raw) }
-                },
-                kvcs_ll_client_destroy,
-            ),
+            KvcsConfig::LowLevel { client, .. } => client.ensure_client(),
         }
     }
 
@@ -228,6 +263,15 @@ impl KvcsCapiExecutor {
             mountpoint_index: *mountpoint_index,
         }
     }
+}
+
+fn validate_max_value_size(max_value_size: u64) -> Result<()> {
+    if !(1..=SDK_MAX_VALUE_SIZE).contains(&max_value_size) {
+        return Err(StoreError::InvalidState(format!(
+            "KVCS max value size must be in 1..={SDK_MAX_VALUE_SIZE}, got {max_value_size}"
+        )));
+    }
+    Ok(())
 }
 
 impl NofBacking for KvcsCapiExecutor {
@@ -1372,18 +1416,27 @@ mod mode_tests {
     }
 
     #[test]
-    fn explicit_config_keeps_per_target_connection_state() {
-        for (socket, expected) in [("/run/kvcs-a.sock", 3), ("/run/kvcs-b.sock", 7)] {
-            let executor = KvcsCapiExecutor::with_low_level_config(
-                socket.to_string(),
-                expected,
-                SDK_DEFAULT_MAX_VALUE_SIZE,
-            )
-            .unwrap();
-            assert!(matches!(
-                executor.config,
-                KvcsConfig::LowLevel { mountpoint_index, .. } if mountpoint_index == expected
-            ));
-        }
+    fn low_level_client_binds_static_targets_to_one_sdk_client() {
+        let client =
+            KvcsLowLevelClient::new("/run/kvcs.sock".to_string(), SDK_DEFAULT_MAX_VALUE_SIZE)
+                .unwrap();
+        let first = client.executor(3);
+        let second = client.executor(7);
+        let KvcsConfig::LowLevel {
+            client: first_client,
+            mountpoint_index: first_index,
+        } = &first.config
+        else {
+            unreachable!()
+        };
+        let KvcsConfig::LowLevel {
+            client: second_client,
+            mountpoint_index: second_index,
+        } = &second.config
+        else {
+            unreachable!()
+        };
+        assert_eq!((*first_index, *second_index), (3, 7));
+        assert!(Arc::ptr_eq(&first_client.inner, &second_client.inner));
     }
 }
