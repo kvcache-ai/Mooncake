@@ -494,10 +494,15 @@ const (
 	pollMaxInterval = time.Millisecond
 )
 
+// sleepFn is the sleep used between polls. Tests replace it to observe the
+// backoff schedule without depending on wall-clock timing.
+var sleepFn = time.Sleep
+
 // waitTransfer polls task 0 of batchID until it reaches a terminal state.
-// On context cancellation it keeps polling until the task is terminal
-// (the engine refuses to free a batch with in-flight tasks) and then
-// returns ctx.Err().
+// The task is always driven to a terminal state, even if ctx is cancelled
+// (the engine refuses to free a batch with in-flight tasks). Cancellation
+// is then authoritative: if ctx is done by the time the task is terminal,
+// ctx.Err() is returned regardless of the observed status.
 //
 // doGetReplica starts one goroutine per shard, so for a checkpoint-sized
 // payload hundreds of pollers may be active at once. Spinning them all at
@@ -507,7 +512,6 @@ const (
 func waitTransfer(ctx context.Context, transport batchTransport, batchID BatchID) (int, error) {
 	status := STATUS_WAITING
 	interval := pollMinInterval
-	cancelled := false
 	for polls := 0; ; polls++ {
 		var err error
 		status, _, err = transport.getTransferStatus(batchID, 0)
@@ -517,13 +521,10 @@ func waitTransfer(ctx context.Context, transport batchTransport, batchID BatchID
 		if !isTransferInFlight(status) {
 			break
 		}
-		if !cancelled && ctx.Err() != nil {
-			cancelled = true
-		}
 		if polls < pollSpinBudget {
 			continue
 		}
-		time.Sleep(interval)
+		sleepFn(interval)
 		if interval < pollMaxInterval {
 			interval *= 2
 			if interval > pollMaxInterval {
@@ -531,8 +532,8 @@ func waitTransfer(ctx context.Context, transport batchTransport, batchID BatchID
 			}
 		}
 	}
-	if cancelled {
-		return STATUS_FAILED, ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return STATUS_FAILED, err
 	}
 	return status, nil
 }
