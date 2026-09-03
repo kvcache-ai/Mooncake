@@ -21,6 +21,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_repository.cpp
     master_metric_manager.cpp
     segment/region_driver.cpp
+    placement/index.cpp
+    placement/replica_allocator.cpp
     segment.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
