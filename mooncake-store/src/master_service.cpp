@@ -3237,8 +3237,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         std::string user_key;
         std::vector<Replica> replicas;
     };
+    const bool bounded_restore = metadata_store != nullptr;
+    // Batch restore spans chunks, so it needs an ordered cross-chunk index;
+    // legacy restore keeps its contiguous vector-and-sort validation path.
+    std::unordered_map<const StandbySegmentInfo*,
+                       std::vector<std::pair<uintptr_t, uint64_t>>>
+        legacy_memory_ranges;
     std::unordered_map<const StandbySegmentInfo*, std::map<uintptr_t, uint64_t>>
-        memory_ranges;
+        bounded_memory_ranges;
     std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
     size_t restored_object_count = 0;
 
@@ -3322,22 +3328,30 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                             return tl::make_unexpected(
                                 ErrorCode::INVALID_PARAMS);
                         }
-                        auto& ranges = memory_ranges[segment];
-                        auto next = ranges.lower_bound(buffer.buffer_address_);
-                        const uintptr_t end =
-                            buffer.buffer_address_ + buffer.size_;
-                        if ((next != ranges.end() && end > next->first) ||
-                            (next != ranges.begin() &&
-                             std::prev(next)->first + std::prev(next)->second >
-                                 buffer.buffer_address_)) {
-                            LOG(ERROR)
-                                << "RestoreFromStandbySnapshot: overlapping "
-                                   "memory descriptors";
-                            return tl::make_unexpected(
-                                ErrorCode::INVALID_PARAMS);
+                        if (bounded_restore) {
+                            auto& ranges = bounded_memory_ranges[segment];
+                            auto next =
+                                ranges.lower_bound(buffer.buffer_address_);
+                            const uintptr_t end =
+                                buffer.buffer_address_ + buffer.size_;
+                            if ((next != ranges.end() && end > next->first) ||
+                                (next != ranges.begin() &&
+                                 std::prev(next)->first +
+                                         std::prev(next)->second >
+                                     buffer.buffer_address_)) {
+                                LOG(ERROR) << "RestoreFromStandbySnapshot: "
+                                              "overlapping "
+                                              "memory descriptors";
+                                return tl::make_unexpected(
+                                    ErrorCode::INVALID_PARAMS);
+                            }
+                            ranges.emplace(buffer.buffer_address_,
+                                           buffer.size_);
+                        } else {
+                            legacy_memory_ranges[segment].emplace_back(
+                                buffer.buffer_address_, buffer.size_);
                         }
                         bytes += buffer.size_;
-                        ranges.emplace(buffer.buffer_address_, buffer.size_);
                     }
 
                     auto alloc =
@@ -3414,6 +3428,22 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     tenant->second.metadata.contains(object.user_key)) {
                     return tl::make_unexpected(
                         ErrorCode::OBJECT_ALREADY_EXISTS);
+                }
+            }
+        }
+
+        if (!bounded_restore) {
+            for (auto& [segment, ranges] : legacy_memory_ranges) {
+                (void)segment;
+                std::sort(ranges.begin(), ranges.end());
+                for (size_t i = 1; i < ranges.size(); ++i) {
+                    if (ranges[i].first <
+                        ranges[i - 1].first + ranges[i - 1].second) {
+                        LOG(ERROR)
+                            << "RestoreFromStandbySnapshot: overlapping memory "
+                               "descriptors";
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
                 }
             }
         }

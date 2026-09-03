@@ -83,6 +83,9 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     if (verification_thread_.joinable()) {
         verification_thread_.join();
     }
+    if (!metadata_store_) {
+        metadata_store_ = std::make_unique<StandbyMetadataStore>();
+    }
     batch_standby_reader_.reset();
     batch_standby_kv_backend_.reset();
     batch_snapshot_baseline_.reset();

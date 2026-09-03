@@ -188,6 +188,19 @@ TEST(BatchOpLogPromotionTest, SnapshotOnlyProviderFallsBackToLegacyExport) {
     EXPECT_TRUE(snapshot.objects.empty());
 }
 
+TEST(BatchOpLogPromotionTest, RecreatesStoreAfterBatchDetachOnRestart) {
+    auto backend = std::make_shared<MemoryBackend>();
+    LocalFileSnapshotObjectStore object_store(
+        "/tmp/mooncake-n07-promotion-restart");
+    auto standby = MakeBatchSnapshotStandby(backend, object_store);
+    ASSERT_EQ(ErrorCode::OK, standby->Start("", "", "promotion-test"));
+    ASSERT_TRUE(standby->PromoteAndDetachBatchOpLogStore().has_value());
+
+    ASSERT_EQ(ErrorCode::OK, standby->Start("", "", "promotion-test"));
+    EXPECT_EQ(StandbyState::WATCHING, standby->GetState());
+    EXPECT_EQ(0u, standby->GetMetadataCount());
+}
+
 TEST(BatchOpLogPromotionTest, EmptyStoreRestoresWithoutChunks) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
