@@ -123,6 +123,46 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
+TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    auto suspected = std::make_shared<ClientLivenessRecord>(initial);
+    ASSERT_EQ(
+        suspected->Evaluate(initial + std::chrono::seconds(1),
+                            std::chrono::seconds(1), std::chrono::seconds(10)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
+    auto active = std::make_shared<ClientLivenessRecord>(initial);
+
+    auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected");
+    auto active_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active");
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("shared", suspected_allocator, suspected);
+    allocator_manager.addAllocator("shared", active_allocator, active);
+
+    // No SSD usage is registered: the SSD strategy still picks the serving
+    // registration.
+    LocalSsdManager local_ssd;
+    for (const auto strategy_type :
+         {AllocationStrategyType::RANDOM,
+          AllocationStrategyType::FREE_RATIO_FIRST,
+          AllocationStrategyType::SSD_FREE_RATIO_FIRST,
+          AllocationStrategyType::CXL}) {
+        auto strategy = CreateAllocationStrategy(strategy_type, local_ssd);
+        auto result =
+            strategy->Allocate(allocator_manager, 1024, 1, {"shared"}, {});
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->size(), 1);
+        const auto expected_endpoint =
+            strategy_type == AllocationStrategyType::CXL ? "shared" : "active";
+        EXPECT_EQ((*result)[0]
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  expected_endpoint);
+    }
+}
+
 // Test preferred segment allocation when available
 TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentAllocation) {
     auto allocator1 = CreateTestAllocator("segment1", 0);
@@ -813,6 +853,29 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
     ASSERT_TRUE(descriptor.is_memory_replica());
     const auto& mem_desc = descriptor.get_memory_descriptor();
     EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_, "2-segment");
+}
+
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstSnapshotPreservesOwnerRanking) {
+    const size_t kSegmentSize = 64 * MiB;
+    SsdPlacementTestState state;
+    state.AddSegment("busy", 0, kSegmentSize, 1000 * MiB, 900 * MiB);
+    state.AddSegment("free", 1, kSegmentSize, 1000 * MiB, 100 * MiB);
+
+    AllocatorManager snapshot;
+    {
+        auto placement = state.GetPlacement();
+        snapshot = placement.SnapshotAllocatorManager();
+    }
+
+    SsdFreeRatioFirstAllocationStrategy strategy(state.local_ssd);
+    auto result = strategy.Allocate(snapshot, 64 * 1024);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "free");
 }
 
 TEST_F(AllocationStrategyTest, SsdFreeRatioFirstWithoutUsageAllocates) {

@@ -39,11 +39,33 @@ class BlockingOffsetBufferAllocator : public OffsetBufferAllocator {
     std::binary_semaphore resume_{0};
 };
 
+class BlockingAllocateOffsetBufferAllocator : public OffsetBufferAllocator {
+   public:
+    BlockingAllocateOffsetBufferAllocator(
+        std::string segment_name, size_t base, size_t size,
+        std::string transport_endpoint)
+        : OffsetBufferAllocator(std::move(segment_name), base, size,
+                                std::move(transport_endpoint)) {}
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+        entered_.release();
+        resume_.acquire();
+        return OffsetBufferAllocator::allocate(size);
+    }
+
+    std::binary_semaphore entered_{0};
+    std::binary_semaphore resume_{0};
+};
+
 }  // namespace
 
 // Test fixture for Segment tests
 class SegmentTest : public ::testing::Test {
    protected:
+    std::shared_ptr<ClientLivenessRecord> client_liveness_ =
+        std::make_shared<ClientLivenessRecord>(
+            ClientLivenessRecord::Clock::now());
+
     void SetUp() override {
         // Initialize glog for logging
         google::InitGoogleLogging("EvictionStrategyTest");
@@ -106,9 +128,8 @@ class SegmentTest : public ::testing::Test {
             // validate allocator exist in allocator_manager
             MountedSegment mounted_segment =
                 segment_manager.mounted_segments_.at(segment.id);
-            auto allocator = mounted_segment.buf_allocator;
             ASSERT_NE(std::find(allocators->begin(), allocators->end(),
-                                mounted_segment.buf_allocator),
+                                mounted_segment.allocator_registration),
                       allocators->end());
         }
     }
@@ -139,7 +160,8 @@ class SegmentTest : public ::testing::Test {
         }
 
         return std::find(allocators->begin(), allocators->end(),
-                         mounted_segment.buf_allocator) != allocators->end();
+                         mounted_segment.allocator_registration) !=
+               allocators->end();
     }
     void InstallSharedCxlAllocatorForTesting(
         SegmentManager& segment_manager,
@@ -151,7 +173,7 @@ class SegmentTest : public ::testing::Test {
         }
         for (const auto& segment : segments) {
             segment_manager.mounted_segments_[segment.id] = {
-                segment, SegmentStatus::OK, allocator};
+                segment, SegmentStatus::OK, allocator, nullptr};
         }
     }
 
@@ -184,7 +206,8 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
 
     // Get segment access and attempt to mount
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+              ErrorCode::OK);
 
     // Verify segment is properly mounted
     ValidateMountedSegment(segment_manager, segment, client_id);
@@ -205,7 +228,8 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     std::shared_ptr<BufferAllocatorBase> allocator;
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id,
+                                              client_liveness_),
                   ErrorCode::OK);
         allocator = segment_access.GetAllocator(segment.id);
     }
@@ -288,7 +312,8 @@ TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
         segment.name, segment.base, segment.size, segment.te_endpoint);
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id,
+                                              client_liveness_),
                   ErrorCode::OK);
         auto original = segment_access.GetAllocator(segment.id);
         ASSERT_NE(original, nullptr);
@@ -346,7 +371,8 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
     std::shared_ptr<BufferAllocatorBase> old_allocator;
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id,
+                                              client_liveness_),
                   ErrorCode::OK);
         old_allocator = segment_access.GetAllocator(segment.id);
     }
@@ -499,9 +525,7 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
 // MountSegmentDuplicate Tests:
 // 1. MountSegment with the same segment id. The second mount operation return
 // SEGMENT_ALREADY_EXISTS.
-// 2. MountSegment with different segment id and the same segment name should be
-// considered as different segments. Validate the status of SegmentManager use
-// ValidateMountedSegments function.
+// 2. Different segment ids may share the client hostname as their name.
 TEST_F(SegmentTest, MountSegmentDuplicate) {
     SegmentManager segment_manager;
     // Create a valid segment and client ID
@@ -515,13 +539,14 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
 
     // Get segment access and mount first time
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+              ErrorCode::OK);
 
     // Verify first mount
     ValidateMountedSegment(segment_manager, segment, client_id);
 
     // Test duplicate mount - mount the same segment again
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
               ErrorCode::SEGMENT_ALREADY_EXISTS);
 
     // Verify state remains the same after duplicate mount
@@ -534,13 +559,14 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
     segment2.size = segment.size * 2;
     segment2.base = segment.base + segment.size;
 
-    // Mount the second segment
-    ASSERT_EQ(segment_access.MountSegment(segment2, client_id), ErrorCode::OK);
+    // RealClient may split one allocation into several segments, all named
+    // after the same client hostname.
+    ASSERT_EQ(
+        segment_access.MountSegment(segment2, client_id, client_liveness_),
+        ErrorCode::OK);
 
-    // Verify both segments are mounted correctly
-    std::vector<Segment> segments = {segment, segment2};
-    std::vector<UUID> client_ids = {client_id, client_id};
-    ValidateMountedSegments(segment_manager, segments, client_ids);
+    ValidateMountedSegments(segment_manager, {segment, segment2},
+                            {client_id, client_id});
 }
 
 // UnmountSegmentSuccess:
@@ -561,7 +587,8 @@ TEST_F(SegmentTest, UnmountSegmentSuccess) {
 
     // Get segment access and mount
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+              ErrorCode::OK);
 
     // Verify segment is mounted correctly
     ValidateMountedSegment(segment_manager, segment, client_id);
@@ -604,7 +631,8 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
 
     // Get segment access and mount
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+              ErrorCode::OK);
 
     // Verify initial mounted state
     ValidateMountedSegment(segment_manager, segment, client_id);
@@ -647,7 +675,8 @@ TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
     UUID client_id = generate_uuid();
 
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+              ErrorCode::OK);
 
     SegmentStatus status = SegmentStatus::UNDEFINED;
     ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
@@ -684,6 +713,62 @@ TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
     EXPECT_TRUE(HasAllocatorForSegment(segment_manager, segment.id));
 }
 
+TEST_F(SegmentTest,
+       GracefulUnmountStopsDetachedAllocationButKeepsExistingBuffers) {
+    SegmentManager segment_manager;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "graceful_snapshot_segment";
+    segment.base = DEFAULT_CXL_BASE;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = "graceful_snapshot_endpoint";
+    const UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id,
+                                              client_liveness_),
+                  ErrorCode::OK);
+    }
+
+    AllocatorManager snapshot;
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        snapshot = allocator_access.SnapshotAllocatorManager();
+    }
+    auto registrations = snapshot.getAllocators(segment.name);
+    ASSERT_NE(registrations, nullptr);
+    ASSERT_EQ(registrations->size(), 1u);
+    auto existing_buffer = registrations->front()->Allocate(1024);
+    ASSERT_NE(existing_buffer, nullptr);
+    EXPECT_TRUE(existing_buffer->isAvailable());
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.PrepareGracefulUnmountSegment(segment.id),
+                  ErrorCode::OK);
+    }
+
+    RandomAllocationStrategy strategy;
+    auto allocation = strategy.AllocateFrom(snapshot, 1024, segment.name);
+    ASSERT_FALSE(allocation.has_value());
+    EXPECT_EQ(allocation.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_TRUE(existing_buffer->isAvailable());
+
+    size_t metrics_dec_capacity = 0;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(
+                      segment.id, metrics_dec_capacity),
+                  ErrorCode::OK);
+        EXPECT_FALSE(existing_buffer->isAvailable());
+        ASSERT_EQ(segment_access.CommitUnmountSegment(
+                      segment.id, client_id, metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+    EXPECT_FALSE(existing_buffer->isAvailable());
+}
+
 TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
     SegmentManager segment_manager;
 
@@ -705,10 +790,12 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
 
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment0, client_id),
-                  ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountSegment(segment1, client_id),
-                  ErrorCode::OK);
+        ASSERT_EQ(
+            segment_access.MountSegment(segment0, client_id, client_liveness_),
+            ErrorCode::OK);
+        ASSERT_EQ(
+            segment_access.MountSegment(segment1, client_id, client_liveness_),
+            ErrorCode::OK);
     }
 
     {
@@ -757,7 +844,61 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
     }
 }
 
-TEST_F(SegmentTest, HostOrderedSegmentsKeepsNameUntilLastSameNameSegmentGone) {
+TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "allocation_liveness_transition_segment";
+    segment.base = DEFAULT_CXL_BASE;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = "allocation_liveness_transition_endpoint";
+    const UUID client_id = generate_uuid();
+
+    auto blocking = std::make_shared<BlockingAllocateOffsetBufferAllocator>(
+        segment.name, segment.base, segment.size, segment.te_endpoint);
+    AllocatorManager snapshot;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id,
+                                              client_liveness_),
+                  ErrorCode::OK);
+        auto original = segment_access.GetAllocator(segment.id);
+        ASSERT_TRUE(segment_access.ReplaceAllocators(
+            {{segment.id, original, blocking}}));
+    }
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        snapshot = allocator_access.SnapshotAllocatorManager();
+    }
+    const auto* registrations = snapshot.getAllocators(segment.name);
+    ASSERT_NE(registrations, nullptr);
+    ASSERT_EQ(registrations->size(), 1u);
+
+    auto allocation = std::async(std::launch::async, [&] {
+        return registrations->front()->Allocate(1024);
+    });
+    const bool allocation_entered =
+        blocking->entered_.try_acquire_for(std::chrono::seconds(5));
+    if (!allocation_entered) {
+        blocking->resume_.release();
+    }
+    ASSERT_TRUE(allocation_entered);
+    auto transition = std::async(std::launch::async, [&] {
+        return client_liveness_->Evaluate(
+            ClientLivenessRecord::Clock::now(), std::chrono::seconds::zero(),
+            std::chrono::hours(1));
+    });
+    const bool transitioned_during_allocation =
+        transition.wait_for(std::chrono::seconds(1)) ==
+        std::future_status::ready;
+    blocking->resume_.release();
+
+    EXPECT_EQ(transition.get(), ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_TRUE(transitioned_during_allocation);
+    EXPECT_EQ(allocation.get(), nullptr);
+}
+
+TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
     SegmentManager segment_manager;
 
     Segment segment0;
@@ -777,10 +918,38 @@ TEST_F(SegmentTest, HostOrderedSegmentsKeepsNameUntilLastSameNameSegmentGone) {
     UUID client_id = generate_uuid();
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment0, client_id),
+        ASSERT_EQ(
+            segment_access.MountSegment(segment0, client_id, client_liveness_),
+            ErrorCode::OK);
+        ASSERT_EQ(
+            segment_access.MountSegment(segment1, client_id, client_liveness_),
+            ErrorCode::OK);
+    }
+
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        auto ordered =
+            allocator_access.GetHostOrderedSegments("host1", "test_key");
+        ASSERT_EQ(ordered.size(), 1u);
+        EXPECT_EQ(ordered[0], segment0.name);
+    }
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment1.id,
+                                                       metrics_dec_capacity),
                   ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountSegment(segment1, client_id),
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment1.id, client_id,
+                                                      metrics_dec_capacity),
                   ErrorCode::OK);
+        EXPECT_TRUE(segment_access.ExistsSegmentName(segment0.name));
+        EXPECT_TRUE(segment_access.IsSegmentAllocatable(segment0.name));
+        UUID indexed_owner;
+        ASSERT_EQ(segment_access.GetClientIdBySegmentName(segment0.name,
+                                                         indexed_owner),
+                  ErrorCode::OK);
+        EXPECT_EQ(indexed_owner, client_id);
     }
 
     {
@@ -800,15 +969,67 @@ TEST_F(SegmentTest, HostOrderedSegmentsKeepsNameUntilLastSameNameSegmentGone) {
         ASSERT_EQ(segment_access.CommitUnmountSegment(segment0.id, client_id,
                                                       metrics_dec_capacity),
                   ErrorCode::OK);
+        EXPECT_FALSE(segment_access.ExistsSegmentName(segment0.name));
     }
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
-        ASSERT_EQ(ordered.size(), 1u);
-        EXPECT_EQ(ordered[0], segment1.name);
+        EXPECT_TRUE(ordered.empty());
     }
+}
+
+TEST_F(SegmentTest, SharedNameRegistrationsSurviveSegmentSnapshotRestore) {
+    SegmentManager source(BufferAllocatorType::OFFSET);
+    Segment first;
+    first.id = generate_uuid();
+    first.name = "snapshot-shared-hostname";
+    first.base = DEFAULT_CXL_BASE;
+    first.size = 64 * 1024 * 1024;
+    first.te_endpoint = "snapshot-first-endpoint";
+    Segment second = first;
+    second.id = generate_uuid();
+    second.base += first.size;
+    second.te_endpoint = "snapshot-second-endpoint";
+    const UUID first_owner = generate_uuid();
+    const UUID second_owner = generate_uuid();
+
+    {
+        auto segment_access = source.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(first, first_owner,
+                                              client_liveness_),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(
+                      second, second_owner,
+                      std::make_shared<ClientLivenessRecord>(
+                          ClientLivenessRecord::Clock::now())),
+                  ErrorCode::OK);
+    }
+    auto serialized =
+        SegmentSerializer(&source).Serialize(LocalSsdPersistedState{});
+    ASSERT_TRUE(serialized.has_value());
+
+    SegmentManager restored(BufferAllocatorType::OFFSET);
+    auto restored_state = SegmentSerializer(&restored).Deserialize(*serialized);
+    ASSERT_TRUE(restored_state.has_value());
+    {
+        auto allocator_access = restored.getAllocatorAccess();
+        const auto* registrations =
+            allocator_access.getAllocatorManager().getAllocators(first.name);
+        ASSERT_NE(registrations, nullptr);
+        EXPECT_EQ(registrations->size(), 2u);
+    }
+
+    std::vector<std::pair<Segment, UUID>> segments;
+    ASSERT_EQ(restored.getSegmentAccess().GetAllSegments(segments),
+              ErrorCode::OK);
+    std::unordered_map<UUID, UUID, boost::hash<UUID>> owners;
+    for (const auto& [segment, owner] : segments) {
+        owners.emplace(segment.id, owner);
+    }
+    EXPECT_EQ(owners.at(first.id), first_owner);
+    EXPECT_EQ(owners.at(second.id), second_owner);
 }
 
 TEST_F(SegmentTest, HostOrderedSegmentsRotateWithinSameHostByKey) {
@@ -831,10 +1052,12 @@ TEST_F(SegmentTest, HostOrderedSegmentsRotateWithinSameHostByKey) {
     UUID client_id = generate_uuid();
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment_a, client_id),
-                  ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountSegment(segment_b, client_id),
-                  ErrorCode::OK);
+        ASSERT_EQ(
+            segment_access.MountSegment(segment_a, client_id, client_liveness_),
+            ErrorCode::OK);
+        ASSERT_EQ(
+            segment_access.MountSegment(segment_b, client_id, client_liveness_),
+            ErrorCode::OK);
     }
 
     const std::string key = "stable_rotation_key";
@@ -862,7 +1085,8 @@ TEST_F(SegmentTest, PrepareUnmountDrainedSegment) {
     UUID client_id = generate_uuid();
 
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+              ErrorCode::OK);
     ASSERT_EQ(segment_access.SetSegmentStatusByName(segment.name,
                                                     SegmentStatus::DRAINED),
               ErrorCode::OK);
@@ -900,7 +1124,9 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
 
     // Get segment access and mount segment A
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment_a, client_id), ErrorCode::OK);
+    ASSERT_EQ(
+        segment_access.MountSegment(segment_a, client_id, client_liveness_),
+        ErrorCode::OK);
 
     // Verify segment A is mounted correctly
     ValidateMountedSegment(segment_manager, segment_a, client_id);
@@ -914,7 +1140,8 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
 
     // Remount both segments A and B
     std::vector<Segment> segments_to_remount = {segment_a, segment_b};
-    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id),
+    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id,
+                                            client_liveness_),
               ErrorCode::OK);
 
     // Verify both segments are mounted correctly
@@ -944,7 +1171,9 @@ TEST_F(SegmentTest, ReMountUnmountingSegment) {
 
     // Get segment access and mount segment A
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment_a, client_id), ErrorCode::OK);
+    ASSERT_EQ(
+        segment_access.MountSegment(segment_a, client_id, client_liveness_),
+        ErrorCode::OK);
 
     // Verify segment A is mounted correctly
     ValidateMountedSegment(segment_manager, segment_a, client_id);
@@ -957,7 +1186,8 @@ TEST_F(SegmentTest, ReMountUnmountingSegment) {
 
     // Attempt to remount segment A while it's in UNMOUNTING state
     std::vector<Segment> segments_to_remount = {segment_a};
-    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id),
+    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id,
+                                            client_liveness_),
               ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 
     // Complete the unmount process
@@ -1000,8 +1230,9 @@ TEST_F(SegmentTest, QuerySegments) {
         UUID client_id = generate_uuid();
 
         // Mount segment
-        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
-                  ErrorCode::OK);
+        ASSERT_EQ(
+            segment_access.MountSegment(segment, client_id, client_liveness_),
+            ErrorCode::OK);
 
         // Store for verification
         segments.push_back(segment);

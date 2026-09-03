@@ -58,6 +58,7 @@ struct MountedSegment {
     Segment segment;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    std::shared_ptr<SegmentAllocatorRegistration> allocator_registration;
 };
 
 struct MountedNoFSegment {
@@ -65,6 +66,7 @@ struct MountedNoFSegment {
     UUID client_id;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    std::shared_ptr<SegmentAllocatorRegistration> allocator_registration;
 };
 
 struct MountedNoFSegmentSnapshot {
@@ -109,7 +111,9 @@ class ScopedSegmentAccess {
     /**
      * @brief Mount a segment
      */
-    ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
+    ErrorCode MountSegment(
+        const Segment& segment, const UUID& client_id,
+        std::shared_ptr<ClientLivenessRecord> client_liveness);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -117,8 +121,9 @@ class ScopedSegmentAccess {
      * errors. When encounters unsolvable errors, the segment will not be
      * mounted while the return value will be OK.
      */
-    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
-                             const UUID& client_id);
+    ErrorCode ReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        std::shared_ptr<ClientLivenessRecord> client_liveness);
 
     ErrorCode ValidateRemountSegment(const Segment& segment,
                                      const UUID& client_id) const;
@@ -153,13 +158,28 @@ class ScopedSegmentAccess {
      */
     ErrorCode CommitUnmountSegment(const UUID& segment_id,
                                    const UUID& client_id,
-                                   const size_t& metrics_dec_capacity);
+                                   const size_t& metrics_dec_capacity,
+                                   bool retain_name_registration = false);
+
+    void ReleaseUnmountedSegmentName(const UUID& segment_id,
+                                     const std::string& segment_name);
 
     /**
      * @brief Get all the segments of a client
      */
     ErrorCode GetClientSegments(const UUID& client_id,
                                 std::vector<Segment>& segments) const;
+
+    /**
+     * @brief Rebind restored client-owned segment resources to a fresh
+     *        liveness record. Segment snapshots intentionally do not persist
+     *        record implementation state.
+     */
+    void BindClientLiveness(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& client_liveness);
+    void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
+    [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**
      * @brief Get the names of all the segments
@@ -227,6 +247,9 @@ class ScopedSegmentAccess {
                                      SegmentStatus status);
 
    private:
+    void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,
+                                        const std::string& segment_name);
+
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
 };
@@ -324,6 +347,10 @@ class ScopedAllocatorAccess {
 
     const AllocatorManager& getAllocatorManager() const {
         return allocator_manager_;
+    }
+
+    AllocatorManager SnapshotAllocatorManager() const {
+        return allocator_manager_.Snapshot(client_by_name_);
     }
 
     std::vector<std::string> GetHostOrderedSegments(

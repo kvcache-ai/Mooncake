@@ -41,4 +41,29 @@ SsdFreeRatioFirstAllocationStrategy::Allocate(
         });
 }
 
+tl::expected<std::vector<Replica>, ErrorCode>
+SsdFreeRatioFirstAllocationStrategy::Allocate(
+    const AllocatorManager& allocator_manager, const size_t slice_length,
+    const size_t replica_num,
+    const std::vector<std::string>& preferred_segments,
+    const std::set<std::string>& excluded_segments,
+    const ReplicaType replica_type) {
+    return AllocateRanked(
+        allocator_manager, slice_length, replica_num, preferred_segments,
+        excluded_segments, replica_type, [&](const std::string& name) {
+            auto client_id = allocator_manager.GetOwnerClientId(name);
+            if (!client_id) {
+                return 1.0;
+            }
+            auto usage = local_ssd_.GetUsage(*client_id);
+            if (!usage || usage->total_capacity_bytes <= 0) {
+                return 1.0;
+            }
+            const int64_t used = std::clamp<int64_t>(
+                usage->used_bytes, 0, usage->total_capacity_bytes);
+            return static_cast<double>(usage->total_capacity_bytes - used) /
+                   static_cast<double>(usage->total_capacity_bytes);
+        });
+}
+
 }  // namespace mooncake

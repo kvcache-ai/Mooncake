@@ -16,6 +16,8 @@ set(MOONCAKE_STORE_SHARED_SOURCES
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    segment_allocator_registration.cpp
+    client_offboarding.cpp
     master_service.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp

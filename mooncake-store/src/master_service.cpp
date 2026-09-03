@@ -197,7 +197,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
-      client_live_ttl_sec_(config.client_live_ttl_sec),
+      client_active_ttl_sec_(config.client_active_ttl_sec),
+      client_suspicion_ttl_sec_(config.client_suspicion_ttl_sec),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -475,6 +476,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
 #endif
     }
 
+    // This worker is part of the Client lifecycle protocol. Start it before
+    // any raw std::thread so a startup failure can unwind the constructor
+    // normally instead of encountering joinable thread destructors.
+    client_offboarding_worker_.Start();
+    VLOG(1) << "action=start_client_offboarding_worker";
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -636,10 +643,6 @@ MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
 }
 
 MasterService::~MasterService() {
-    if (ordered_oplog_writer_) {
-        ordered_oplog_writer_->Stop();
-    }
-
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
@@ -688,10 +691,14 @@ MasterService::~MasterService() {
         dynamic_replication_admission_thread_.join();
     }
 
-    // Reset snapshot manager after all other threads have joined
-    // This triggers the destructor which joins the snapshot thread
+    // Join the snapshot producer before dropping queued/backoff offboarding
+    // work. No snapshot can observe those residual jobs after this point.
     if (snapshot_manager_) {
         snapshot_manager_.reset();
+    }
+    client_offboarding_worker_.Stop();
+    if (ordered_oplog_writer_) {
+        ordered_oplog_writer_->Stop();
     }
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
@@ -704,6 +711,13 @@ MasterService::~MasterService() {
     // MasterMetricManager stays consistent when the next leadership term
     // constructs a fresh MasterService and the clients remount.
     segment_manager_.releaseCapacityMetrics();
+
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    auto& metrics = MasterMetricManager::instance();
+    for (const auto& [_, record] : client_liveness_records_) {
+        metrics.on_client_liveness_record_removed(record->state());
+    }
+    client_liveness_records_.clear();
 }
 
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
@@ -880,47 +894,54 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    ErrorCode mount_result = ErrorCode::OK;
+    ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
-        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-
-        // Tell the client monitor thread to start timing for this client. To
-        // avoid the following undesired situations, this message must be sent
-        // after locking the segment mutex and before the mounting operation
-        // completes:
-        // 1. Sending the message before the lock: the client expires and
-        // unmouting invokes before this mounting are completed, which prevents
-        // this segment being able to be unmounted forever;
-        // 2. Sending the message after mounting the segment: After mounting
-        // this segment, when trying to push id to the queue, the queue is
-        // already full. However, at this point, the message must be sent,
-        // otherwise this client cannot be monitored and expired.
-        {
-            PodUUID pod_client_id;
-            pod_client_id.first = client_id.first;
-            pod_client_id.second = client_id.second;
-            if (!client_ping_queue_.push(pod_client_id)) {
-                LOG(ERROR) << "segment_name=" << segment.name
-                           << ", error=client_ping_queue_full";
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
+        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        auto [record_it, inserted] = client_liveness_records_.try_emplace(
+            client_id, std::make_shared<ClientLivenessRecord>(
+                           ClientLivenessRecord::Clock::now()));
+        const auto record = record_it->second;
+        if (inserted) {
+            MasterMetricManager::instance().client_liveness_record_created();
         }
-
-        LOG(INFO) << "client_id=" << client_id
-                  << ", action=mount_segment, segment_name=" << segment.name;
-
-        auto err = segment_access.MountSegment(segment, client_id);
-        if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-            // Return OK because this is an idempotent operation
-            mount_result = err;
-        } else if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
+        const auto observation =
+            record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
+                std::shared_lock<std::shared_mutex> snapshot_lock(
+                    snapshot_mutex_);
+                ScopedSegmentAccess segment_access =
+                    segment_manager_.getSegmentAccess();
+                LOG(INFO) << "client_id=" << client_id
+                          << ", action=mount_segment, segment_name="
+                          << segment.name;
+                mount_result =
+                    segment_access.MountSegment(segment, client_id, record);
+                return mount_result == ErrorCode::OK ||
+                       mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
+            });
+        if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        if (mount_result != ErrorCode::OK &&
+            mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
+            if (inserted) {
+                client_liveness_records_.erase(client_id);
+                MasterMetricManager::instance()
+                    .on_client_liveness_record_removed(
+                        ClientLivenessState::ACTIVE);
+            }
+            return tl::make_unexpected(mount_result);
+        }
+        if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
+            MasterMetricManager::instance().client_liveness_recovered();
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=client_liveness_recovered, "
+                         "signal=memory_mount";
         }
     }
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
+    if (mount_result == ErrorCode::OK && enable_oplog_ &&
+        ordered_oplog_writer_) {
         SegmentMountOp op;
         op.segment_name = segment.name;
         op.transport_endpoint = segment.te_endpoint;
@@ -932,8 +953,8 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                                        segment.te_endpoint,
                                        std::string(bytes.begin(), bytes.end()));
     }
-    UpdateClientHostId(client_id, segment.host_id);
     if (mount_result == ErrorCode::OK) {
+        UpdateClientHostId(client_id, segment.host_id);
         RecomputeTenantEffectiveQuotas();
     }
     return {};
@@ -993,6 +1014,27 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     -> tl::expected<void, ErrorCode> {
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        auto [record_it, record_inserted] =
+            client_liveness_records_.try_emplace(
+                client_id, std::make_shared<ClientLivenessRecord>(
+                               ClientLivenessRecord::Clock::now()));
+        const auto record = record_it->second;
+        if (record_inserted) {
+            MasterMetricManager::instance().client_liveness_record_created();
+        }
+        auto remount_guard = record->TryAcquireRetainingGuard();
+        if (!remount_guard) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        const auto discard_provisional_record = [&] {
+            if (!record_inserted) {
+                return;
+            }
+            client_liveness_records_.erase(client_id);
+            MasterMetricManager::instance().on_client_liveness_record_removed(
+                ClientLivenessState::ACTIVE);
+        };
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
@@ -1006,11 +1048,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 auto standby_validation =
                     ValidateStandbyRemountSegment(segment);
                 if (standby_validation != ErrorCode::OK) {
+                    discard_provisional_record();
                     return tl::make_unexpected(standby_validation);
                 }
                 auto validation =
                     segment_access.ValidateRemountSegment(segment, client_id);
                 if (validation != ErrorCode::OK) {
+                    discard_provisional_record();
                     return tl::make_unexpected(validation);
                 }
             }
@@ -1059,6 +1103,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         auto fail_remount =
             [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
             rollback_new_segments();
+            discard_provisional_record();
             return tl::make_unexpected(error);
         };
 
@@ -1071,29 +1116,10 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     segment_access.GetAllocator(segments[i].id) != nullptr;
             }
 
-            // Tell the client monitor thread to start timing for this client.
-            // To avoid the following undesired situations, this message must be
-            // sent after locking the segment mutex or client mutex and before
-            // the remounting operation completes:
-            // 1. Sending the message before the lock: the client expires and
-            // unmouting invokes before this remounting are completed, which
-            // prevents this segment being able to be unmounted forever;
-            // 2. Sending the message after remounting the segments: After
-            // remounting these segments, when trying to push id to the queue,
-            // the queue is already full. However, at this point, the message
-            // must be sent, otherwise this client cannot be monitored and
-            // expired.
-            PodUUID pod_client_id;
-            pod_client_id.first = client_id.first;
-            pod_client_id.second = client_id.second;
-            if (!client_ping_queue_.push(pod_client_id)) {
-                LOG(ERROR) << "client_id=" << client_id
-                           << ", error=client_ping_queue_full";
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-
-            remount_error = segment_access.ReMountSegment(segments, client_id);
+            remount_error =
+                segment_access.ReMountSegment(segments, client_id, record);
             if (remount_error == ErrorCode::OK) {
+                segment_access.BindClientLiveness(client_id, record);
                 for (const auto& segment : segments) {
                     auto allocator = segment_access.GetAllocator(segment.id);
                     Segment authoritative;
@@ -1250,6 +1276,16 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         if (!allocators_replaced) {
             return fail_remount(ErrorCode::INTERNAL_ERROR);
         }
+        {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            for (auto& restore : restores) {
+                for (auto& buffer : restore.buffers) {
+                    segment_access.BindBufferToSegment(restore.segment.id,
+                                                       *buffer);
+                }
+            }
+        }
         for (auto& restore : restores) {
             if (restore.imported_size != 0) {
                 MasterMetricManager::instance().dec_allocated_mem_size(
@@ -1317,6 +1353,25 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
     }
     return {};
 #endif
+}
+
+std::shared_ptr<ClientLivenessRecord> MasterService::FindClientRecord(
+    const UUID& client_id) const {
+    std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    const auto it = client_liveness_records_.find(client_id);
+    return it == client_liveness_records_.end() ? nullptr : it->second;
+}
+
+std::unordered_set<UUID, boost::hash<UUID>>
+MasterService::GetRetainingClientIdsLocked() const {
+    std::unordered_set<UUID, boost::hash<UUID>> clients;
+    clients.reserve(client_liveness_records_.size());
+    for (const auto& [client_id, record] : client_liveness_records_) {
+        if (record->ShouldRetainResources()) {
+            clients.insert(client_id);
+        }
+    }
+    return clients;
 }
 
 void MasterService::UpdateClientHostId(const UUID& client_id,
@@ -2094,12 +2149,13 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
 MasterService::StaleHandleCleanupPlan
 MasterService::BuildStaleHandleCleanupPlan(
     const ObjectMetadata& metadata,
-    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const {
+    const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+    const {
     return BuildStaleHandleCleanupPlan(
-        metadata, [&alive_clients](const Replica& replica) {
+        metadata, [&retaining_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(alive_clients)) &&
+                    replica.has_stale_local_disk_client(retaining_clients)) &&
                    replica.is_completed();
         });
 }
@@ -2158,6 +2214,9 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
                                                 QuotaEraseMode::kFull);
         });
     if (!result) {
+        metadata.VisitReplicas(
+            [&ids](const Replica& replica) { return ids.contains(replica.id()); },
+            [](Replica& replica) { replica.cancel_remove(); });
         LOG(WARNING) << why
                      << ": stale cleanup OpLog queue failed for key=" << key
                      << ", err=" << static_cast<int>(result.error());
@@ -2626,30 +2685,31 @@ void MasterService::CleanupExpiredSoftPins(
 void MasterService::ClearInvalidHandles() {
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
+    auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
-    ClearInvalidHandles(alive_clients);
+    ClearInvalidHandles(retaining_clients);
 }
 
 void MasterService::ClearInvalidHandles(
-    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
-    ClearStaleHandles([&alive_clients](const Replica& replica) {
+    const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
+    (void)ClearStaleHandles([&retaining_clients](const Replica& replica) {
         return (replica.has_invalid_mem_handle() ||
                 replica.has_invalid_nof_handle() ||
-                replica.has_stale_local_disk_client(alive_clients)) &&
+                replica.has_stale_local_disk_client(retaining_clients)) &&
                replica.is_completed();
     });
 }
 
 void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
-    ClearStaleHandles([&owner](const Replica& replica) {
+    (void)ClearStaleHandles([&owner](const Replica& replica) {
         return replica.is_local_disk_replica() && replica.is_completed() &&
                replica.get_local_disk_client_id() == owner;
     });
 }
 
-void MasterService::ClearStaleHandles(
+tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
+    std::optional<ErrorCode> first_persist_error;
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         for (auto tenant_it = shard->tenants.begin();
@@ -2667,6 +2727,10 @@ void MasterService::ClearStaleHandles(
                                     "ClearStaleHandles", tenant_it->first,
                                     it->first, it->second, cleanup_plan);
                             if (!persist_result) {
+                                if (!first_persist_error) {
+                                    first_persist_error =
+                                        persist_result.error();
+                                }
                                 ++it;
                                 continue;
                             }
@@ -2699,6 +2763,10 @@ void MasterService::ClearStaleHandles(
                                     << ": REMOVE persist failed for key="
                                     << it->first << ", err="
                                     << static_cast<int>(persist_result.error());
+                                if (!first_persist_error) {
+                                    first_persist_error =
+                                        persist_result.error();
+                                }
                                 ++it;
                                 continue;
                             }
@@ -2719,6 +2787,186 @@ void MasterService::ClearStaleHandles(
             }
         }
     }
+    if (first_persist_error) {
+        return tl::make_unexpected(*first_persist_error);
+    }
+    return {};
+}
+
+bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
+    bool quota_recompute_needed = false;
+    {
+        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+
+        if (!job.pending_prepare_segments.empty()) {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            for (auto it = job.pending_prepare_segments.begin();
+                 it != job.pending_prepare_segments.end();) {
+                SegmentStatus status = SegmentStatus::UNDEFINED;
+                const auto status_err =
+                    segment_access.GetSegmentStatusById(it->segment_id, status);
+                if (status_err == ErrorCode::SEGMENT_NOT_FOUND) {
+                    it = job.pending_prepare_segments.erase(it);
+                    continue;
+                }
+                if (status_err == ErrorCode::OK &&
+                    status == SegmentStatus::UNMOUNTING) {
+                    ++it;
+                    continue;
+                }
+
+                size_t metrics_dec_capacity = 0;
+                const auto err = segment_access.PrepareUnmountSegment(
+                    it->segment_id, metrics_dec_capacity);
+                if (err == ErrorCode::OK) {
+                    job.prepared_segments.push_back(
+                        {.segment_id = it->segment_id,
+                         .segment_name = it->segment_name,
+                         .transport_endpoint = it->transport_endpoint,
+                         .metrics_dec_capacity = metrics_dec_capacity});
+                    it = job.pending_prepare_segments.erase(it);
+                    continue;
+                }
+                if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+                    it = job.pending_prepare_segments.erase(it);
+                    continue;
+                }
+                LOG(ERROR) << "client_id=" << job.client_id
+                           << ", segment_name=" << it->segment_name
+                           << ", action=prepare_client_offboarding"
+                           << ", error=" << toString(err);
+                ++it;
+            }
+            if (!job.pending_prepare_segments.empty()) {
+                return false;
+            }
+        }
+
+        if (!job.metadata_cleanup_accepted) {
+            const auto cleanup_result =
+                ClearStaleHandles([&job](const Replica& replica) {
+                    if (!replica.is_completed()) {
+                        return false;
+                    }
+                    if (replica.is_local_disk_replica()) {
+                        return replica.get_local_disk_client_id() ==
+                               job.client_id;
+                    }
+                    return replica.is_memory_replica() &&
+                           replica.isAffiliatedWith(job.liveness);
+                });
+            if (!cleanup_result) {
+                LOG(ERROR) << "client_id=" << job.client_id
+                           << ", action=queue_client_offboarding_metadata"
+                           << ", error=" << toString(cleanup_result.error());
+                return false;
+            }
+            bool unfinished_affiliated_replica = false;
+            for (size_t shard_index = 0;
+                 !unfinished_affiliated_replica && shard_index < kNumShards;
+                 ++shard_index) {
+                MetadataShardAccessorRO shard(this, shard_index);
+                for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+                    (void)tenant_id;
+                    for (const auto& [key, metadata] : tenant_state.metadata) {
+                        (void)key;
+                        if (metadata.HasReplica([&job](const Replica& replica) {
+                                return replica.is_processing() &&
+                                       replica.isAffiliatedWith(job.liveness);
+                            })) {
+                            unfinished_affiliated_replica = true;
+                            break;
+                        }
+                    }
+                    if (unfinished_affiliated_replica) {
+                        break;
+                    }
+                }
+            }
+            if (unfinished_affiliated_replica) {
+                LOG(ERROR)
+                    << "client_id=" << job.client_id
+                    << ", action=wait_client_offboarding_processing_replica";
+                return false;
+            }
+            job.metadata_cleanup_accepted = true;
+        }
+
+        if (!job.local_ssd_unregistered) {
+            auto capacity = local_ssd_manager_.UnregisterClient(job.client_id);
+            if (capacity && *capacity > 0) {
+                MasterMetricManager::instance().dec_total_file_capacity(
+                    *capacity);
+                quota_recompute_needed = true;
+            }
+            job.local_ssd_unregistered = true;
+        }
+
+        for (auto it = job.prepared_segments.begin();
+             it != job.prepared_segments.end();) {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            const auto commit_result = segment_access.CommitUnmountSegment(
+                it->segment_id, job.client_id, it->metrics_dec_capacity,
+                /*retain_name_registration=*/true);
+            if (commit_result != ErrorCode::OK &&
+                commit_result != ErrorCode::SEGMENT_NOT_FOUND) {
+                LOG(ERROR) << "client_id=" << job.client_id
+                           << ", segment_name=" << it->segment_name
+                           << ", action=commit_client_offboarding"
+                           << ", error=" << toString(commit_result);
+                ++it;
+                continue;
+            }
+
+            if (enable_oplog_ && ordered_oplog_writer_ &&
+                !it->transport_endpoint.empty()) {
+                SegmentUnmountOp op{it->transport_endpoint};
+                auto bytes = struct_pack::serialize(op);
+                auto persist_result = AppendOpLogVisibleBeforeDurable(
+                    OpType::SEGMENT_UNMOUNT, TenantId::Default().value(),
+                    it->transport_endpoint,
+                    std::string(bytes.begin(), bytes.end()));
+                if (!persist_result) {
+                    LOG(ERROR)
+                        << "client_id=" << job.client_id
+                        << ", segment_name=" << it->segment_name
+                        << ", action=queue_client_offboarding_unmount"
+                        << ", error=" << toString(persist_result.error());
+                    ++it;
+                    continue;
+                }
+            }
+
+            cleanupHttpMetadata(it->segment_name);
+            segment_access.ReleaseUnmountedSegmentName(it->segment_id,
+                                                       it->segment_name);
+            LOG(INFO) << "client_id=" << job.client_id
+                      << ", segment_name=" << it->segment_name
+                      << ", action=unmount_offline_mem_segment";
+            quota_recompute_needed = true;
+            it = job.prepared_segments.erase(it);
+        }
+    }
+
+    if (quota_recompute_needed) {
+        RecomputeTenantEffectiveQuotas();
+    }
+    if (!job.prepared_segments.empty()) {
+        return false;
+    }
+
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    const auto current = client_liveness_records_.find(job.client_id);
+    if (current != client_liveness_records_.end() &&
+        current->second == job.liveness) {
+        const auto state = current->second->state();
+        client_liveness_records_.erase(current);
+        MasterMetricManager::instance().on_client_liveness_record_removed(
+            state);
+    }
+    return true;
 }
 
 void MasterService::TaskCleanupThreadFunc() {
@@ -2755,7 +3003,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
+    auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
     // 1. Prepare to unmount the segment by deleting its allocator
     {
@@ -2778,7 +3026,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
-        ClearInvalidHandles(alive_clients);
+        ClearInvalidHandles(retaining_clients);
     }
 
     // Cache endpoint before commit removes segment from registry.
@@ -2861,7 +3109,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
+    auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
 
     // 1. Prepare to unmount the segment by deleting its allocator
@@ -2881,7 +3129,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
        // deadlocks
 
     // 2. Remove the metadata of the related objects
-    ClearInvalidHandles(alive_clients);
+    ClearInvalidHandles(retaining_clients);
 
     // 3. Commit the unmount operation
     ScopedNoFSegmentAccess segment_access =
@@ -3114,7 +3362,22 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     // The ordered writer initializes its sequence from durable_prefix.
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
     std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        new_known_owner_records;
+    const auto record_for_known_owner = [&](const UUID& owner) {
+        const auto existing = client_liveness_records_.find(owner);
+        if (existing != client_liveness_records_.end()) {
+            return existing->second;
+        }
+        auto [record, inserted] = new_known_owner_records.try_emplace(
+            owner, std::make_shared<ClientLivenessRecord>(
+                       ClientLivenessRecord::Clock::now()));
+        (void)inserted;
+        return record->second;
+    };
 
     const auto resolve_standby_object = [](const StandbyObjectEntry& entry) {
         auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(entry.key);
@@ -3255,9 +3518,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                 }
 
                 auto alloc = restored_allocators.at(buffer.transport_endpoint_);
-                replicas.emplace_back(
-                    std::make_unique<AllocatedBuffer>(alloc, buffer),
-                    desc.status);
+                auto restored_buffer =
+                    std::make_unique<AllocatedBuffer>(alloc, buffer);
+                replicas.emplace_back(std::move(restored_buffer), desc.status);
             } else if (desc.is_nof_replica()) {
                 const auto& buffer =
                     desc.get_nof_descriptor().buffer_descriptor;
@@ -3272,9 +3535,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     alloc = std::make_shared<DummyBufferAllocator>(
                         buffer.transport_endpoint_, buffer.transport_endpoint_);
                 }
-                replicas.emplace_back(
-                    std::make_unique<AllocatedBuffer>(alloc, buffer),
-                    desc.status, ReplicaType::NOF_SSD);
+                auto restored_buffer =
+                    std::make_unique<AllocatedBuffer>(alloc, buffer);
+                replicas.emplace_back(std::move(restored_buffer), desc.status,
+                                      ReplicaType::NOF_SSD);
             } else if (desc.is_disk_replica()) {
                 const auto& disk_desc = desc.get_disk_descriptor();
                 if (disk_desc.object_size != standby_meta.size) {
@@ -3296,7 +3560,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                 }
                 replicas.emplace_back(
                     local_disk_desc.client_id, local_disk_desc.object_size,
-                    local_disk_desc.transport_endpoint, desc.status);
+                    local_disk_desc.transport_endpoint, desc.status,
+                    record_for_known_owner(local_disk_desc.client_id));
             }
         }
         objects_by_shard[shard_idx].push_back({&entry, std::move(tenant_id),
@@ -3340,6 +3605,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     standby_memory_segments_ = std::move(restored_memory_segments);
     standby_allocator_keepalive_ = std::move(restored_allocators);
     invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
+    for (auto& [client_id, record] : new_known_owner_records) {
+        client_liveness_records_.emplace(client_id, std::move(record));
+        MasterMetricManager::instance().client_liveness_record_created();
+    }
 
     const auto now = std::chrono::system_clock::now();
     for (auto& [shard_idx, shard_objects] : objects_by_shard) {
@@ -3658,12 +3927,15 @@ auto MasterService::BatchReplicaClear(
     return cleared_keys;
 }
 
-bool MasterService::IsReplicaReadable(const Replica& replica) const {
+bool MasterService::TryGetReadableReplicaDescriptor(
+    const Replica& replica, Replica::Descriptor& descriptor) const {
     if (!replica.is_completed() || replica.has_invalid_mem_handle() ||
         replica.has_invalid_nof_handle()) {
         return false;
     }
-    const auto descriptor = replica.get_descriptor();
+    if (!replica.getDescriptorIfAvailable(descriptor)) {
+        return false;
+    }
     std::optional<std::string> endpoint;
     if (descriptor.is_memory_replica()) {
         endpoint = descriptor.get_memory_descriptor()
@@ -3674,7 +3946,30 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
     } else if (descriptor.is_local_disk_replica()) {
         endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
     }
-    return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
+    if (endpoint && invalid_replica_endpoints_.contains(*endpoint)) {
+        return false;
+    }
+    return true;
+}
+
+std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
+    const ObjectMetadata& metadata) const {
+    std::vector<Replica::Descriptor> descriptors;
+    descriptors.reserve(metadata.CountReplicas());
+    metadata.VisitReplicas(
+        [](const Replica&) { return true; },
+        [this, &descriptors](const Replica& replica) {
+            Replica::Descriptor descriptor;
+            if (TryGetReadableReplicaDescriptor(replica, descriptor)) {
+                descriptors.push_back(std::move(descriptor));
+            }
+        });
+    return descriptors;
+}
+
+bool MasterService::IsReplicaReadable(const Replica& replica) const {
+    Replica::Descriptor descriptor;
+    return TryGetReadableReplicaDescriptor(replica, descriptor);
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
@@ -3713,14 +4008,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
         }
         for (const auto& [key, metadata] : tenant_it->second.metadata) {
             if (std::regex_search(key, pattern)) {
-                std::vector<Replica::Descriptor> replica_list;
-                metadata.VisitReplicas(
-                    [this](const Replica& replica) {
-                        return IsReplicaReadable(replica);
-                    },
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
-                    });
+                auto replica_list = GetReadableReplicaDescriptors(metadata);
 
                 if (replica_list.empty()) {
                     LOG(WARNING)
@@ -3759,19 +4047,16 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
         const auto& metadata = accessor.Get();
 
-        std::vector<Replica::Descriptor> replica_list;
-        metadata.VisitReplicas(
-            [this](const Replica& replica) {
-                return IsReplicaReadable(replica);
-            },
-            [this, &key, &replica_list](const Replica& replica) {
-                replica_list.emplace_back(replica.get_descriptor());
-                if (replica.is_dfs_replica() && dfs_allocator_) {
+        auto replica_list = GetReadableReplicaDescriptors(metadata);
+        if (dfs_allocator_) {
+            for (const auto& replica : replica_list) {
+                if (replica.is_dfs_replica()) {
                     const auto& desc = replica.get_dfs_descriptor();
                     dfs_allocator_->UpdateAccess(key, desc.shard_idx,
                                                  desc.offset);
                 }
-            });
+            }
+        }
 
         if (replica_list.empty()) {
             if (metadata.AllReplicas([](const Replica& replica) {
@@ -3807,19 +4092,23 @@ auto MasterService::GetReplicaList(const std::string& key,
         // release the accessor below to avoid lock-upgrade complexity.
         if (promotion_on_hit_) {
             const bool any_memory =
-                metadata.HasReplica(&Replica::fn_is_memory_replica);
+                std::any_of(replica_list.begin(), replica_list.end(),
+                            [](const auto& descriptor) {
+                                return descriptor.is_memory_replica();
+                            });
             const bool any_local_disk =
-                metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+                std::any_of(replica_list.begin(), replica_list.end(),
+                            [](const auto& descriptor) {
+                                return descriptor.is_local_disk_replica();
+                            });
             promotion_eligible = !any_memory && any_local_disk;
         }
         if (DynamicReplicationEnabled()) {
-            size_t memory_replicas = 0;
-            metadata.VisitReplicas(
-                [this](const Replica& replica) {
-                    return IsReplicaReadable(replica) &&
-                           replica.is_memory_replica();
-                },
-                [&memory_replicas](const Replica&) { ++memory_replicas; });
+            const size_t memory_replicas =
+                std::count_if(replica_list.begin(), replica_list.end(),
+                              [](const auto& descriptor) {
+                                  return descriptor.is_memory_replica();
+                              });
             dynamic_replication_observed =
                 memory_replicas > 0 &&
                 memory_replicas < dynamic_replication_max_memory_replicas_;
@@ -3854,16 +4143,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     }
     const auto& metadata = accessor.Get();
 
-    std::vector<Replica::Descriptor> replica_list;
-    metadata.VisitReplicas(
-        [](const Replica& replica) {
-            return replica.is_completed() &&
-                   !replica.has_invalid_mem_handle() &&
-                   !replica.has_invalid_nof_handle();
-        },
-        [&replica_list](const Replica& replica) {
-            replica_list.emplace_back(replica.get_descriptor());
-        });
+    auto replica_list = GetReadableReplicaDescriptors(metadata);
 
     if (replica_list.empty()) {
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
@@ -3940,14 +4220,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second;
-                std::vector<Replica::Descriptor> replica_list;
-                metadata.VisitReplicas(
-                    [this](const Replica& replica) {
-                        return IsReplicaReadable(replica);
-                    },
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
-                    });
+                auto replica_list = GetReadableReplicaDescriptors(metadata);
 
                 if (replica_list.empty()) {
                     if (metadata.AllReplicas([](const Replica& replica) {
@@ -3980,24 +4253,26 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
                 if (promotion_on_hit_) {
                     const bool any_memory =
-                        metadata.HasReplica(&Replica::fn_is_memory_replica);
-                    const bool any_local_disk =
-                        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+                        std::any_of(replica_list.begin(), replica_list.end(),
+                                    [](const auto& descriptor) {
+                                        return descriptor.is_memory_replica();
+                                    });
+                    const bool any_local_disk = std::any_of(
+                        replica_list.begin(), replica_list.end(),
+                        [](const auto& descriptor) {
+                            return descriptor.is_local_disk_replica();
+                        });
                     if (!any_memory && any_local_disk) {
                         promotion_candidates.push_back(
                             MakeObjectIdentity(key, normalized_tenant));
                     }
                 }
                 if (DynamicReplicationEnabled()) {
-                    size_t memory_replicas = 0;
-                    metadata.VisitReplicas(
-                        [this](const Replica& replica) {
-                            return IsReplicaReadable(replica) &&
-                                   replica.is_memory_replica();
-                        },
-                        [&memory_replicas](const Replica&) {
-                            ++memory_replicas;
-                        });
+                    const size_t memory_replicas =
+                        std::count_if(replica_list.begin(), replica_list.end(),
+                                      [](const auto& descriptor) {
+                                          return descriptor.is_memory_replica();
+                                      });
                     if (memory_replicas > 0 &&
                         memory_replicas <
                             dynamic_replication_max_memory_replicas_) {
@@ -4089,16 +4364,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second;
-                std::vector<Replica::Descriptor> replica_list;
-                metadata.VisitReplicas(
-                    [](const Replica& replica) {
-                        return replica.is_completed() &&
-                               !replica.has_invalid_mem_handle() &&
-                               !replica.has_invalid_nof_handle();
-                    },
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
-                    });
+                auto replica_list = GetReadableReplicaDescriptors(metadata);
 
                 if (replica_list.empty()) {
                     results[original_idx] =
@@ -4153,12 +4419,6 @@ auto MasterService::AllocateAndInsertMetadata(
     size_t allocated_nof_replicas = 0;
     bool has_enough_memory_segments = false;
     if (config.replica_num > 0) {
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
-        has_enough_memory_segments =
-            allocator_manager.getNames().size() >= config.replica_num;
-
         std::vector<std::string> preferred_segments;
         auto append_preferred_segment = [&preferred_segments](
                                             const std::string& segment_name) {
@@ -4175,22 +4435,33 @@ auto MasterService::AllocateAndInsertMetadata(
                 append_preferred_segment(preferred_segment);
             }
         }
-        if (!writer_host_id.empty()) {
-            auto host_ordered_segments =
-                allocator_access.GetHostOrderedSegments(writer_host_id, key);
-            for (const auto& segment_name : host_ordered_segments) {
-                append_preferred_segment(segment_name);
+        AllocatorManager allocator_snapshot;
+        {
+            ScopedAllocatorAccess allocator_access =
+                segment_manager_.getAllocatorAccess();
+            has_enough_memory_segments =
+                allocator_access.getAllocatorManager()
+                    .getServingNames()
+                    .size() >= config.replica_num;
+            if (!writer_host_id.empty()) {
+                auto host_ordered_segments =
+                    allocator_access.GetHostOrderedSegments(writer_host_id,
+                                                            key);
+                for (const auto& segment_name : host_ordered_segments) {
+                    append_preferred_segment(segment_name);
+                }
+                if (!host_ordered_segments.empty()) {
+                    VLOG(1) << "key=" << key
+                            << ", writer_host_id=" << writer_host_id
+                            << ", local_first_preferred_segments="
+                            << host_ordered_segments.size();
+                }
             }
-            if (!host_ordered_segments.empty()) {
-                VLOG(1) << "key=" << key
-                        << ", writer_host_id=" << writer_host_id
-                        << ", local_first_preferred_segments="
-                        << host_ordered_segments.size();
-            }
+            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
         }
 
         auto allocation_result = allocation_strategy_->Allocate(
-            allocator_access, value_length, config.replica_num,
+            allocator_snapshot, value_length, config.replica_num,
             preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
 
         if (!allocation_result.has_value()) {
@@ -4479,7 +4750,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         {
             std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            auto alive_clients = ok_client_;
+            auto retaining_clients = GetRetainingClientIdsLocked();
             client_lock.unlock();
             const size_t lookup_shard_idx =
                 getShardIndex(object_id.tenant_id, object_id.user_key);
@@ -4498,7 +4769,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             auto it = tenant_state.metadata.find(key);
             if (it != tenant_state.metadata.end()) {
                 auto cleanup_plan =
-                    BuildStaleHandleCleanupPlan(it->second, alive_clients);
+                    BuildStaleHandleCleanupPlan(it->second, retaining_clients);
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "PutStart(stale cleanup)", object_id.tenant_id, key,
@@ -4510,7 +4781,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(tenant_state, it->second,
-                                                   alive_clients, &shard)) {
+                                                   retaining_clients, &shard)) {
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &shard);
                         it = tenant_state.metadata.end();
@@ -4735,6 +5006,21 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                const TenantId& tenant_id, Replica& replica)
+    -> tl::expected<bool, ErrorCode> {
+    const auto client_liveness = FindClientRecord(client_id);
+    auto retaining_guard =
+        client_liveness ? client_liveness->TryAcquireRetainingGuard()
+                        : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    replica.bindClientLiveness(client_liveness);
+    return AddReplicaForRetainedClient(client_id, key, tenant_id, replica);
+}
+
+auto MasterService::AddReplicaForRetainedClient(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    Replica& replica)
     -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
     TenantId normalized_tenant;
@@ -5119,7 +5405,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // --- Lock acquisition ---
             std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            auto alive_clients = ok_client_;
+            auto retaining_clients = GetRetainingClientIdsLocked();
             client_lock.unlock();
             // Objects are always routed by hash(tenant, key); group_id does
             // not affect routing.
@@ -5142,7 +5428,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // --- Step 0: stale handle cleanup ---
             if (it != tenant_state.metadata.end()) {
                 auto cleanup_plan =
-                    BuildStaleHandleCleanupPlan(it->second, alive_clients);
+                    BuildStaleHandleCleanupPlan(it->second, retaining_clients);
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "UpsertStart(stale cleanup)", object_id.tenant_id, key,
@@ -5154,7 +5440,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(tenant_state, it->second,
-                                                   alive_clients, &shard)) {
+                                                   retaining_clients, &shard)) {
                         // EraseMetadata handles processing_keys,
                         // replication_tasks, offloading_tasks (with
                         // dec_refcnt), and promotion task cleanup.
@@ -5192,6 +5478,23 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         << "key=" << key << ", error=object_has_promotion_task";
                     return tl::make_unexpected(
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                }
+
+                // An in-place Upsert returns and overwrites the existing
+                // buffers, so every completed Client-owned target must still
+                // be serving before any queue or metadata state is changed.
+                if (metadata.size == slice_length &&
+                    metadata.HasReplica([](const Replica& replica) {
+                        if (!replica.is_completed() ||
+                            (!replica.is_memory_replica() &&
+                             !replica.is_local_disk_replica())) {
+                            return false;
+                        }
+                        Replica::Descriptor descriptor;
+                        return !replica.getDescriptorIfAvailable(descriptor);
+                    })) {
+                    return tl::make_unexpected(
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
                 }
 
                 // Cancel a still-queued offload so the upsert can take the key
@@ -5668,6 +5971,12 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
                                    key};
     const bool dynamic_copy = dynamic_replication_lease_id != UUID{};
+    const auto record = FindClientRecord(client_id);
+    auto serving_guard =
+        record ? record->TryAcquireServingGuard() : std::nullopt;
+    if (!serving_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (!dynamic_copy) {
         ScopedSegmentAccess segment_access =
@@ -5752,6 +6061,13 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         }
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
     }
+    Replica::Descriptor source_descriptor;
+    if (!TryGetReadableReplicaDescriptor(*source, source_descriptor)) {
+        if (dynamic_copy) {
+            ClearDynamicReplicationStateForKey(tenant_state, key);
+        }
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 
     const uint64_t pending_quota_charge =
         SaturatingMultiply(static_cast<uint64_t>(metadata.size),
@@ -5777,31 +6093,40 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     replicas.reserve(new_replica_count);
     std::vector<std::string> new_target_segments;
     new_target_segments.reserve(new_replica_count);
+    // Target allocation acquires the target owner's guard. Do not retain the
+    // executor's guard across it: source/target Clients may be identical, and
+    // two opposite copy operations must not hold their source guards while
+    // waiting for each other's target guard. This CopyStart was already
+    // admitted while the source guard was held; the metadata shard remains
+    // locked, so terminal cleanup cannot pass this operation before its
+    // metadata changes become visible.
+    serving_guard.reset();
+    AllocatorManager allocator_snapshot;
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
+        allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+    }
 
-        for (auto& tgt_segment : tgt_segments) {
-            if (metadata.GetReplicaBySegmentName(tgt_segment) != nullptr) {
-                // Skip used segments.
-                continue;
-            }
-
-            auto replica = allocation_strategy_->AllocateFrom(
-                allocator_manager, metadata.size, tgt_segment);
-            if (!replica.has_value()) {
-                LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
-                           << ", failed to allocate replica";
-                refund_pending_quota();
-                if (dynamic_copy) {
-                    ClearDynamicReplicationStateForKey(tenant_state, key);
-                }
-                return tl::make_unexpected(replica.error());
-            }
-            replicas.push_back(std::move(*replica));
-            new_target_segments.push_back(tgt_segment);
+    for (auto& tgt_segment : tgt_segments) {
+        if (metadata.GetReplicaBySegmentName(tgt_segment) != nullptr) {
+            // Skip used segments.
+            continue;
         }
+
+        auto replica = allocation_strategy_->AllocateFrom(
+            allocator_snapshot, metadata.size, tgt_segment);
+        if (!replica.has_value()) {
+            LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                       << ", failed to allocate replica";
+            refund_pending_quota();
+            if (dynamic_copy) {
+                ClearDynamicReplicationStateForKey(tenant_state, key);
+            }
+            return tl::make_unexpected(replica.error());
+        }
+        replicas.push_back(std::move(*replica));
+        new_target_segments.push_back(tgt_segment);
     }
 
     CopyStartResponse response;
@@ -5809,10 +6134,19 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     std::vector<ReplicaID> replica_ids;
     replica_ids.reserve(replicas.size());
 
-    response.source = source->get_descriptor();
+    response.source = std::move(source_descriptor);
     for (const auto& replica : replicas) {
         replica_ids.push_back(replica.id());
-        response.targets.emplace_back(replica.get_descriptor());
+        Replica::Descriptor descriptor;
+        if (!replica.getDescriptorIfAvailable(descriptor)) {
+            refund_pending_quota();
+            if (dynamic_copy) {
+                ClearDynamicReplicationStateForKey(tenant_state, key);
+            }
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        response.targets.push_back(std::move(descriptor));
     }
 
     // Create replication task for tracking.
@@ -5850,6 +6184,12 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -6022,6 +6362,12 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -6095,6 +6441,12 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const std::string& src_segment, const std::string& tgt_segment) {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    const auto record = FindClientRecord(client_id);
+    auto serving_guard =
+        record ? record->TryAcquireServingGuard() : std::nullopt;
+    if (!serving_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (src_segment == tgt_segment) {
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
@@ -6138,8 +6490,16 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
                    << ", replica not found or not completed";
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
     }
+    Replica::Descriptor source_descriptor;
+    if (!TryGetReadableReplicaDescriptor(*source, source_descriptor)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 
     std::vector<Replica> replicas;
+    // See CopyStart: target allocation owns its own Client guard and must not
+    // be nested under the source executor's guard. The metadata shard keeps
+    // terminal cleanup ordered after this already-admitted MoveStart.
+    serving_guard.reset();
     if (metadata.GetReplicaBySegmentName(tgt_segment) == nullptr) {
         const uint64_t pending_quota_charge =
             SaturatingMultiply(static_cast<uint64_t>(metadata.size), 1);
@@ -6157,12 +6517,14 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
                                pending_quota_charge);
         };
 
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
-
+        AllocatorManager allocator_snapshot;
+        {
+            ScopedAllocatorAccess allocator_access =
+                segment_manager_.getAllocatorAccess();
+            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+        }
         auto replica = allocation_strategy_->AllocateFrom(
-            allocator_manager, metadata.size, tgt_segment);
+            allocator_snapshot, metadata.size, tgt_segment);
         if (!replica.has_value()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", failed to allocate replica";
@@ -6186,10 +6548,17 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     MoveStartResponse response;
     std::vector<ReplicaID> replica_ids;
 
-    response.source = source->get_descriptor();
+    response.source = std::move(source_descriptor);
     if (!replicas.empty()) {
         replica_ids.push_back(replicas[0].id());
-        response.target = replicas[0].get_descriptor();
+        Replica::Descriptor descriptor;
+        if (!replicas[0].getDescriptorIfAvailable(descriptor)) {
+            ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                               pending_quota_charge);
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        response.target = std::move(descriptor);
     } else {
         response.target = std::nullopt;
     }
@@ -6219,6 +6588,12 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
 tl::expected<void, ErrorCode> MasterService::MoveEnd(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id) {
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -6404,6 +6779,12 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
 
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id) {
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -6832,7 +7213,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
+    auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
 
     // Process each shard once, acquiring lock per shard
@@ -6861,7 +7242,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Clean up stale replica handles (consistent with single Remove).
             auto cleanup_plan =
-                BuildStaleHandleCleanupPlan(it->second, alive_clients);
+                BuildStaleHandleCleanupPlan(it->second, retaining_clients);
             if (!cleanup_plan.removed_ids.empty()) {
                 auto persist_result = PersistStaleHandleCleanupForHA(
                     "BatchRemove(stale cleanup)", normalized_tenant, key,
@@ -6878,7 +7259,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                             : ErrorCode::OBJECT_ALREADY_EXISTS);
                     continue;
                 } else if (CleanupStaleHandles(tenant_state, it->second,
-                                               alive_clients, &shard)) {
+                                               retaining_clients, &shard)) {
                     EraseMetadata(tenant_state, it, normalized_tenant,
                                   QuotaEraseMode::kFull, &shard);
                     if (tenant_state.Empty()) {
@@ -6995,19 +7376,20 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
 
 bool MasterService::CleanupStaleHandles(
     TenantState& tenant_state, ObjectMetadata& metadata,
-    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
+    const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
     MetadataShardAccessorRW* shard) {
     // Removes replicas with invalid allocators (memory replicas on unmounted
-    // segments) and local_disk replicas whose owner client is no longer alive.
+    // segments) and local_disk replicas whose owner no longer retains
+    // resources.
     // Kept as a thin wrapper over the predicate form so the owner-targeted
     // LOCAL_DISK sweep (ClearLocalDiskHandlesOwnedBy) shares this accounting
     // rather than duplicating it.
     return CleanupStaleHandles(
         tenant_state, metadata,
-        [&alive_clients](const Replica& replica) {
+        [&retaining_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(alive_clients)) &&
+                    replica.has_stale_local_disk_client(retaining_clients)) &&
                    replica.is_completed();
         },
         shard);
@@ -7205,23 +7587,24 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    ClientStatus client_status;
-    {
-        std::shared_lock<std::shared_mutex> lock(client_mutex_);
-        auto it = ok_client_.find(client_id);
-        if (it != ok_client_.end()) {
-            client_status = ClientStatus::OK;
-        } else {
-            client_status = ClientStatus::NEED_REMOUNT;
+    std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    const auto record_it = client_liveness_records_.find(client_id);
+    bool observation_accepted = false;
+    if (record_it != client_liveness_records_.end()) {
+        const auto observation =
+            record_it->second->Observe(ClientLivenessRecord::Clock::now());
+        observation_accepted =
+            observation != ClientLivenessObservation::REJECTED_OFFLINE;
+        if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
+            MasterMetricManager::instance().client_liveness_recovered();
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=client_liveness_recovered, signal=ping";
         }
     }
-    PodUUID pod_client_id = {client_id.first, client_id.second};
-    if (!client_ping_queue_.push(pod_client_id)) {
-        // Queue is full
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+    const ClientStatus client_status =
+        observation_accepted && ok_client_.contains(client_id)
+            ? ClientStatus::OK
+            : ClientStatus::NEED_REMOUNT;
     return PingResponse(view_version_, client_status);
 }
 
@@ -7255,26 +7638,39 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto err = local_ssd_manager_.RegisterClient(client_id, enable_offloading);
-    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
-        return {};
-    } else if (err != ErrorCode::OK) {
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    auto [record_it, inserted] = client_liveness_records_.try_emplace(
+        client_id, std::make_shared<ClientLivenessRecord>(
+                       ClientLivenessRecord::Clock::now()));
+    const auto record = record_it->second;
+    if (inserted) {
+        MasterMetricManager::instance().client_liveness_record_created();
+    }
+    ErrorCode err = ErrorCode::INTERNAL_ERROR;
+    const auto observation =
+        record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
+            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+            err =
+                local_ssd_manager_.RegisterClient(client_id, enable_offloading);
+            return err == ErrorCode::OK ||
+                   err == ErrorCode::SEGMENT_ALREADY_EXISTS;
+        });
+    if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_ALREADY_EXISTS) {
+        if (inserted) {
+            client_liveness_records_.erase(client_id);
+            MasterMetricManager::instance().on_client_liveness_record_removed(
+                ClientLivenessState::ACTIVE);
+        }
         return tl::make_unexpected(err);
     }
-
-    // Notify the client monitor thread to start tracking this client's TTL.
-    // Without this, a client that only registers LocalSSD (and
-    // doesn't ping) would be considered expired by ClientMonitorFunc, which
-    // would then clear all its LOCAL_DISK replicas.
-    PodUUID pod_client_id;
-    pod_client_id.first = client_id.first;
-    pod_client_id.second = client_id.second;
-    if (!client_ping_queue_.push(pod_client_id)) {
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
+        MasterMetricManager::instance().client_liveness_recovered();
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=client_liveness_recovered, "
+                     "signal=local_disk_mount";
     }
 
     return {};
@@ -7340,6 +7736,12 @@ bool MasterService::HasMountedLocalDiskSegment(const UUID& client_id) {
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {
+    const auto record = FindClientRecord(client_id);
+    auto serving_guard =
+        record ? record->TryAcquireServingGuard() : std::nullopt;
+    if (!serving_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto pending = local_ssd_manager_.SetOffloadingAndTakePending(
         client_id, enable_offloading);
@@ -7386,6 +7788,15 @@ auto MasterService::PollRemoveAll(const UUID& client_id)
 auto MasterService::ReportSsdCapacity(const UUID& client_id,
                                       int64_t ssd_total_capacity_bytes)
     -> tl::expected<void, ErrorCode> {
+    if (ssd_total_capacity_bytes < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto capacity =
         local_ssd_manager_.ReportCapacity(client_id, ssd_total_capacity_bytes);
@@ -7416,6 +7827,12 @@ auto MasterService::NotifyOffloadSuccess(
     -> tl::expected<void, ErrorCode> {
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     // Set when an entry's replica registration is refused because the client
     // no longer has a LOCAL_DISK segment entry (see the per-entry checks
@@ -7454,7 +7871,8 @@ auto MasterService::NotifyOffloadSuccess(
         }
 
         Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE,
+                        record);
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {
@@ -7551,8 +7969,8 @@ auto MasterService::NotifyOffloadSuccess(
                 std::move(normalized_tenant_result.value()),
                 request_object_id.user_key};
 
-            auto res = AddReplica(client_id, object_id.user_key,
-                                  object_id.tenant_id, replica);
+            auto res = AddReplicaForRetainedClient(
+                client_id, object_id.user_key, object_id.tenant_id, replica);
             if (!res) {
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
                     continue;
@@ -7595,23 +8013,51 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     // OffloadingTask + inc_refcnt for work that was never enqueued, leaking the
     // refcount until TTL expiry (issue #2997). Return an explicit
     // UNABLE_OFFLOADING so callers treat this as a no-op rather than a success.
-    if (segment_names.empty()) {
+    if (segment_names.empty() ||
+        std::none_of(segment_names.begin(), segment_names.end(),
+                     [](const auto& name) { return name.has_value(); })) {
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
+    Replica::Descriptor source_descriptor;
+    if (!TryGetReadableReplicaDescriptor(replica, source_descriptor) ||
+        !source_descriptor.is_memory_replica()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     bool any_enqueued = false;
+    const auto liveness = replica.getClientLiveness();
+    if (!liveness) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     for (const auto& segment_name_it : segment_names) {
         if (!segment_name_it.has_value()) {
             continue;
         }
-        auto allocator_access = segment_manager_.getAllocatorAccess();
-        auto client_id =
-            allocator_access.GetOwnerClientId(segment_name_it.value());
+        std::optional<UUID> client_id;
+        {
+            auto allocator_access = segment_manager_.getAllocatorAccess();
+            client_id =
+                allocator_access.GetOwnerClientId(segment_name_it.value());
+        }
         if (!client_id) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
-        const int64_t size = replica.get_descriptor()
-                                 .get_memory_descriptor()
-                                 .buffer_descriptor.size_;
+        // Callers hold the source metadata shard. This serving observation is
+        // the admission point; terminal cleanup must acquire the same shard
+        // before it can remove the source or unregister the destination.
+        if (!liveness->IsServing()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        auto allocator_access = segment_manager_.getAllocatorAccess();
+        const auto current_owner =
+            allocator_access.GetOwnerClientId(segment_name_it.value());
+        if (!current_owner || *current_owner != *client_id ||
+            !TryGetReadableReplicaDescriptor(replica, source_descriptor)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        const int64_t size =
+            source_descriptor.get_memory_descriptor().buffer_descriptor.size_;
         auto err = local_ssd_manager_.EnqueueOffload(
             *client_id,
             OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
@@ -7673,6 +8119,15 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
     auto holder_id = source_replica.get_local_disk_client_id();
     if (!holder_id.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto liveness = source_replica.getClientLiveness();
+    if (!liveness) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    // TryPushPromotionQueue holds the source metadata shard, which orders a
+    // concurrently accepted enqueue before terminal cleanup.
+    if (!liveness->IsServing()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     auto err = local_ssd_manager_.EnqueuePromotion(
         *holder_id, PromotionTaskItem{.tenant_id = object_id.tenant_id.value(),
@@ -8302,6 +8757,8 @@ MasterService::SelectDynamicReplicaPlan(
     std::unordered_set<std::string> existing_segments;
     std::unordered_set<std::string> existing_hosts;
     std::vector<std::string> source_segments;
+    std::unordered_map<std::string, std::shared_ptr<ClientLivenessRecord>>
+        source_liveness_by_segment;
     size_t memory_replicas = 0;
 
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
@@ -8321,12 +8778,14 @@ MasterService::SelectDynamicReplicaPlan(
         },
         [&](const Replica& replica) {
             memory_replicas++;
+            const auto liveness = replica.getClientLiveness();
             for (const auto& segment_name : replica.get_segment_names()) {
                 if (!segment_name.has_value()) {
                     continue;
                 }
                 existing_segments.insert(*segment_name);
                 source_segments.push_back(*segment_name);
+                source_liveness_by_segment[*segment_name] = liveness;
                 auto segment_it = segments_by_name.find(*segment_name);
                 if (segment_it != segments_by_name.end() &&
                     !segment_it->second.host_id.empty()) {
@@ -8423,9 +8882,18 @@ MasterService::SelectDynamicReplicaPlan(
     if (!target_segment.has_value()) {
         return std::nullopt;
     }
-    return DynamicReplicaPlan{.source_segment = source_segment,
-                              .target_segment = *target_segment,
-                              .target_domain = std::move(target_domain)};
+    const auto source_liveness =
+        source_liveness_by_segment.find(source_segment);
+    if (source_liveness == source_liveness_by_segment.end() ||
+        !source_liveness->second) {
+        return std::nullopt;
+    }
+    return DynamicReplicaPlan{
+        .source_segment = source_segment,
+        .target_segment = *target_segment,
+        .target_domain = std::move(target_domain),
+        .source_liveness = source_liveness->second,
+    };
 }
 
 tl::expected<ReplicaActionLease, ErrorCode>
@@ -8585,12 +9053,32 @@ MasterService::SubmitReplicaActionProposalLocked(
 tl::expected<UUID, ErrorCode> MasterService::SubmitDynamicReplicaCopyTask(
     const ObjectIdentity& object_id, const DynamicReplicaPlan& plan,
     const UUID& lease_id, uint64_t version_epoch) {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     UUID source_client;
-    ErrorCode error = segment_access.GetClientIdBySegmentName(
-        plan.source_segment, source_client);
-    if (error != ErrorCode::OK) {
-        return tl::make_unexpected(error);
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        ErrorCode error = segment_access.GetClientIdBySegmentName(
+            plan.source_segment, source_client);
+        if (error != ErrorCode::OK) {
+            return tl::make_unexpected(error);
+        }
+    }
+    const auto& liveness = plan.source_liveness;
+    if (!liveness) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    // The proposal caller holds the object's metadata shard. Observe serving
+    // eligibility without blocking on the Client transition mutex while that
+    // shard is held; offboarding cleanup is ordered after this shard section.
+    if (!liveness->IsServing()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    UUID current_source_client;
+    if (segment_access.GetClientIdBySegmentName(
+            plan.source_segment, current_source_client) != ErrorCode::OK ||
+        current_source_client != source_client) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_COPY>(
@@ -8764,6 +9252,12 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
 
 auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
     -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode> {
+    const auto record = FindClientRecord(client_id);
+    auto serving_guard =
+        record ? record->TryAcquireServingGuard() : std::nullopt;
+    if (!serving_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Return at most promotion_max_per_heartbeat_ tasks. Each task does
     // a synchronous SSD read + RDMA write on the client side; allowing
@@ -8781,6 +9275,12 @@ auto MasterService::PromotionAllocStart(
     uint64_t size, const std::vector<std::string>& preferred_segments)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    const auto record = FindClientRecord(client_id);
+    auto serving_guard =
+        record ? record->TryAcquireServingGuard() : std::nullopt;
+    if (!serving_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
@@ -8849,18 +9349,25 @@ auto MasterService::PromotionAllocStart(
     }
 
     std::vector<Replica> staged_replicas;
+    // Allocation is guarded by the selected memory Segment owner. Release the
+    // holder guard first so a co-located holder cannot self-deadlock and two
+    // Clients cannot form a source/target lock cycle. The holder operation was
+    // already admitted and its metadata shard stays locked until the staged
+    // replica and task state are committed or rolled back.
+    serving_guard.reset();
+    AllocatorManager allocator_snapshot;
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, size, config.replica_num, preferred_segments);
-        if (!allocation_result) {
-            refund_pending_quota();
-            return tl::make_unexpected(allocation_result.error());
-        }
-        staged_replicas = std::move(allocation_result.value());
+        allocator_snapshot = allocator_access.SnapshotAllocatorManager();
     }
+    auto allocation_result = allocation_strategy_->Allocate(
+        allocator_snapshot, size, config.replica_num, preferred_segments);
+    if (!allocation_result) {
+        refund_pending_quota();
+        return tl::make_unexpected(allocation_result.error());
+    }
+    staged_replicas = std::move(allocation_result.value());
     if (staged_replicas.empty()) {
         refund_pending_quota();
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -8868,7 +9375,11 @@ auto MasterService::PromotionAllocStart(
 
     // Append the new PROCESSING MEMORY replica to the existing object's
     // metadata. Visible only after NotifyPromotionSuccess flips it COMPLETE.
-    Replica::Descriptor desc = staged_replicas[0].get_descriptor();
+    Replica::Descriptor desc;
+    if (!staged_replicas[0].getDescriptorIfAvailable(desc)) {
+        refund_pending_quota();
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     const ReplicaID new_id = staged_replicas[0].id();
     std::vector<Replica> to_add;
     to_add.push_back(std::move(staged_replicas[0]));
@@ -8899,6 +9410,12 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
                                            const std::string& key,
                                            const TenantId& tenant_id)
     -> tl::expected<void, ErrorCode> {
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -9020,6 +9537,12 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
                                            const std::string& key,
                                            const TenantId& tenant_id)
     -> tl::expected<void, ErrorCode> {
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -9631,14 +10154,113 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
         ok_client_.clear();
-    }
-    PodUUID pod_uuid;
-    while (client_ping_queue_.pop(pod_uuid)) {
+        client_host_id_.clear();
+        client_liveness_records_.clear();
     }
 
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
     MasterMetricManager::instance().reset_cache_total_nums();
+    MasterMetricManager::instance().reset_client_liveness_metrics();
+}
+
+tl::expected<void, SerializationError>
+MasterService::RebuildClientLivenessAfterSnapshotRestore() {
+    std::vector<std::pair<Segment, UUID>> segments;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        const auto err = segment_access.GetAllSegments(segments);
+        if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_NOT_FOUND) {
+            return tl::make_unexpected(SerializationError(
+                err, "failed to enumerate restored memory segments"));
+        }
+    }
+
+    std::unordered_set<UUID, boost::hash<UUID>> client_ids;
+    for (const auto& [segment, owner] : segments) {
+        (void)segment;
+        client_ids.insert(owner);
+    }
+    for (const auto& client_id : local_ssd_manager_.GetClientIds()) {
+        client_ids.insert(client_id);
+    }
+
+    for (const auto& shard : metadata_shards_) {
+        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
+            (void)tenant_id;
+            for (const auto& [key, metadata] : tenant_state.metadata) {
+                (void)key;
+                for (const auto& replica : metadata.GetAllReplicas()) {
+                    if (replica.is_local_disk_replica()) {
+                        const auto owner = replica.get_local_disk_client_id();
+                        if (owner) {
+                            client_ids.insert(*owner);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        records;
+    records.reserve(client_ids.size());
+    const auto now = ClientLivenessRecord::Clock::now();
+    for (const auto& client_id : client_ids) {
+        records.emplace(client_id, std::make_shared<ClientLivenessRecord>(now));
+    }
+
+    bool missing_memory_registration = false;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& [client_id, record] : records) {
+            segment_access.BindClientLiveness(client_id, record);
+        }
+        for (auto& shard : metadata_shards_) {
+            for (auto& [tenant_id, tenant_state] : shard.tenants) {
+                (void)tenant_id;
+                for (auto& [key, metadata] : tenant_state.metadata) {
+                    (void)key;
+                    metadata.VisitReplicas(
+                        [](const Replica&) { return true; },
+                        [&](Replica& replica) {
+                            if (replica.is_memory_replica()) {
+                                auto& buffer = *std::get<MemoryReplicaData>(
+                                                    replica.data_)
+                                                    .buffer;
+                                if (!segment_access
+                                         .RebindBufferToOwningSegment(buffer)) {
+                                    missing_memory_registration = true;
+                                }
+                            } else if (replica.is_local_disk_replica()) {
+                                const auto owner =
+                                    replica.get_local_disk_client_id();
+                                if (owner) {
+                                    replica.bindClientLiveness(
+                                        records.at(*owner));
+                                }
+                            }
+                        });
+                }
+            }
+        }
+    }
+    if (missing_memory_registration) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "restored memory replica has no Segment registration"));
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(client_mutex_);
+        client_liveness_records_ = std::move(records);
+    }
+    MasterMetricManager::instance().reset_client_liveness_metrics(
+        static_cast<int64_t>(client_ids.size()));
+    return {};
 }
 
 tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
@@ -9646,6 +10268,11 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
     // Note: Codec has already called Deserialize() on all payloads,
     // so the internal state is already restored. This method handles
     // post-restore cleanup and metrics rebuilding.
+
+    auto liveness_result = RebuildClientLivenessAfterSnapshotRestore();
+    if (!liveness_result) {
+        return tl::make_unexpected(liveness_result.error());
+    }
 
     std::vector<std::string> segment_names;
     {
@@ -11130,122 +11757,119 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 }
 
 void MasterService::ClientMonitorFunc() {
-    std::unordered_map<UUID, std::chrono::steady_clock::time_point,
-                       boost::hash<UUID>>
-        client_ttl;
     while (client_monitor_running_) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Update the client ttl
-        PodUUID pod_client_id;
-        while (client_ping_queue_.pop(pod_client_id)) {
-            UUID client_id = {pod_client_id.first, pod_client_id.second};
-            client_ttl[client_id] =
-                now + std::chrono::seconds(client_live_ttl_sec_);
-        }
-
-        // Find out expired clients
-        std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
+        const auto now = ClientLivenessRecord::Clock::now();
+        std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
+            clients;
+        {
+            std::shared_lock<std::shared_mutex> lock(client_mutex_);
+            clients.reserve(client_liveness_records_.size());
+            for (const auto& entry : client_liveness_records_) {
+                clients.push_back(entry);
             }
         }
 
-        // Update the client status to NEED_REMOUNT
-        if (!expired_clients.empty()) {
-            // Notify graceful unmount scheduler to drop pending records
-            // for expired clients. The actual unmount is handled below.
-            for (auto& cid : expired_clients) {
-                graceful_unmount_scheduler_.RemoveIf(
-                    [&cid](const GracefulUnmountDeadlineRecord& record) {
-                        return record.client_id == cid;
-                    });
-            }
-
-            // Record which segments are unmounted, will be used in the commit
-            // phase.
-            std::vector<UUID> unmount_segments;
-            std::vector<size_t> dec_capacities;
-            std::vector<UUID> client_ids;
-            std::vector<std::string> segment_names;
-            std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
-            std::shared_lock<std::shared_mutex> snapshot_lock;
-            {
-                std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
-                snapshot_lock =
-                    std::shared_lock<std::shared_mutex>(snapshot_mutex_);
-                for (auto& client_id : expired_clients) {
-                    auto it = ok_client_.find(client_id);
-                    if (it != ok_client_.end()) {
-                        ok_client_.erase(it);
-                        MasterMetricManager::instance().dec_active_clients();
+        for (const auto& [client_id, record] : clients) {
+            const auto transition = record->EvaluateAndRetire(
+                now, std::chrono::seconds(client_active_ttl_sec_),
+                std::chrono::seconds(client_suspicion_ttl_sec_),
+                [&] { client_offboarding_worker_.ReserveJob(); }, [&] {
+                    {
+                        std::unique_lock<std::shared_mutex> client_lock(
+                            client_mutex_);
+                        const auto current =
+                            client_liveness_records_.find(client_id);
+                        CHECK(current != client_liveness_records_.end());
+                        CHECK(current->second == record);
+                        if (ok_client_.erase(client_id) != 0) {
+                            MasterMetricManager::instance()
+                                .dec_active_clients();
+                        }
+                        client_host_id_.erase(client_id);
                     }
-                    client_host_id_.erase(client_id);
-                }
-                alive_clients = ok_client_;
+                    graceful_unmount_scheduler_.RemoveIf(
+                        [&client_id](
+                            const GracefulUnmountDeadlineRecord& pending) {
+                            return pending.client_id == client_id;
+                        });
 
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                for (auto& client_id : expired_clients) {
-                    // mounted mem segemtns of this expired client
-                    std::vector<Segment> segments;
-                    segment_access.GetClientSegments(client_id, segments);
-                    for (auto& seg : segments) {
-                        size_t metrics_dec_capacity = 0;
-                        if (segment_access.PrepareUnmountSegment(
-                                seg.id, metrics_dec_capacity) ==
-                            ErrorCode::OK) {
-                            unmount_segments.push_back(seg.id);
-                            dec_capacities.push_back(metrics_dec_capacity);
-                            client_ids.push_back(client_id);
-                            segment_names.push_back(seg.name);
-                        } else {
-                            LOG(ERROR) << "client_id=" << client_id
-                                       << ", segment_name=" << seg.name
-                                       << ", "
-                                          "error=prepare_unmount_expired_"
-                                          "mem_segment_failed";
+                    ClientOffboardingJob job;
+                    job.client_id = client_id;
+                    job.liveness = record;
+                    std::shared_lock<std::shared_mutex> snapshot_lock(
+                        snapshot_mutex_);
+                    {
+                        ScopedSegmentAccess segment_access =
+                            segment_manager_.getSegmentAccess();
+                        std::vector<Segment> segments;
+                        const auto get_result =
+                            segment_access.GetClientSegments(client_id,
+                                                             segments);
+                        if (get_result == ErrorCode::OK) {
+                            for (const auto& segment : segments) {
+                                SegmentStatus status = SegmentStatus::UNDEFINED;
+                                const auto status_result =
+                                    segment_access.GetSegmentStatusById(
+                                        segment.id, status);
+                                if (status_result ==
+                                    ErrorCode::SEGMENT_NOT_FOUND) {
+                                    continue;
+                                }
+                                if (status_result == ErrorCode::OK &&
+                                    status == SegmentStatus::UNMOUNTING) {
+                                    job.pending_prepare_segments.push_back(
+                                        {.segment_id = segment.id,
+                                         .segment_name = segment.name,
+                                         .transport_endpoint =
+                                             segment.te_endpoint});
+                                    continue;
+                                }
+
+                                size_t metrics_dec_capacity = 0;
+                                const auto prepare_result =
+                                    segment_access.PrepareUnmountSegment(
+                                        segment.id, metrics_dec_capacity);
+                                if (prepare_result == ErrorCode::OK) {
+                                    job.prepared_segments.push_back(
+                                        {.segment_id = segment.id,
+                                         .segment_name = segment.name,
+                                         .transport_endpoint =
+                                             segment.te_endpoint,
+                                         .metrics_dec_capacity =
+                                             metrics_dec_capacity});
+                                } else if (prepare_result !=
+                                           ErrorCode::SEGMENT_NOT_FOUND) {
+                                    job.pending_prepare_segments.push_back(
+                                        {.segment_id = segment.id,
+                                         .segment_name = segment.name,
+                                         .transport_endpoint =
+                                             segment.te_endpoint});
+                                    LOG(ERROR)
+                                        << "client_id=" << client_id
+                                        << ", segment_name=" << segment.name
+                                        << ", action=prepare_client_offboarding"
+                                        << ", error="
+                                        << toString(prepare_result);
+                                }
+                            }
                         }
                     }
-                }
-            }  // Release the mutex before long-running ClearInvalidHandles and
-               // avoid deadlocks
 
-            // Always clean up invalid handles when there are expired clients,
-            // even if no memory segments were unmounted. This is necessary
-            // to clean up local_disk replicas whose owner client has expired.
-            ClearInvalidHandles(alive_clients);
+                    MasterMetricManager::instance()
+                        .client_liveness_became_offline();
+                    client_offboarding_worker_.ScheduleReserved(
+                        std::move(job));
+                });
 
-            // Commit unmount of memory segments and clean up local_disk
-            // segments for expired clients. Both require the exclusive
-            // segment lock.
-            {
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                for (size_t i = 0; i < unmount_segments.size(); i++) {
-                    segment_access.CommitUnmountSegment(
-                        unmount_segments[i], client_ids[i], dec_capacities[i]);
-                    LOG(INFO) << "client_id=" << client_ids[i]
-                              << ", segment_name=" << segment_names[i]
-                              << ", action=unmount_expired_mem_segment";
-                    // Clean up HTTP metadata if enabled
-                    cleanupHttpMetadata(segment_names[i]);
-                }
+            if (transition == ClientLivenessTransition::BECAME_SUSPECTED) {
+                MasterMetricManager::instance()
+                    .client_liveness_became_suspected();
+                LOG(INFO) << "client_id=" << client_id
+                          << ", action=client_liveness_suspected";
+            } else if (transition == ClientLivenessTransition::BECAME_OFFLINE) {
+                LOG(INFO) << "client_id=" << client_id
+                          << ", action=client_liveness_offline";
             }
-            for (const auto& client_id : expired_clients) {
-                auto capacity = local_ssd_manager_.UnregisterClient(client_id);
-                if (capacity && *capacity > 0) {
-                    MasterMetricManager::instance().dec_total_file_capacity(
-                        *capacity);
-                }
-            }
-            RecomputeTenantEffectiveQuotas();
         }
 
         std::this_thread::sleep_for(
@@ -11285,7 +11909,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     size_t metrics_dec_capacity = 0;
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
+    auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
@@ -11310,7 +11934,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         }
     }
 
-    ClearInvalidHandles(alive_clients);
+    ClearInvalidHandles(retaining_clients);
 
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
@@ -12188,50 +12812,104 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     }
     const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
                                    key};
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    MetadataAccessorRO accessor(this, object_id);
-    if (!accessor.Exists()) {
-        VLOG(1) << "key=" << key << ", info=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+
+    std::vector<
+        std::tuple<std::string, UUID, std::shared_ptr<ClientLivenessRecord>>>
+        serving_sources;
+    {
+        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        MetadataAccessorRO accessor(this, object_id);
+        if (!accessor.Exists()) {
+            VLOG(1) << "key=" << key << ", info=object_not_found";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+
+        const auto& metadata = accessor.Get();
+        ScopedSegmentAccess segment_accessor =
+            segment_manager_.getSegmentAccess();
+        for (const auto& target : targets) {
+            if (!segment_accessor.ExistsSegmentName(target)) {
+                LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                           << ", error=target_segment_not_mounted";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            if (!segment_accessor.IsSegmentAllocatable(target)) {
+                LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                           << ", error=target_segment_not_allocatable";
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+
+        metadata.VisitReplicas(
+            [this](const Replica& replica) {
+                return IsReplicaReadable(replica);
+            },
+            [&](const Replica& replica) {
+                for (const auto& segment_name : replica.get_segment_names()) {
+                    if (!segment_name) {
+                        continue;
+                    }
+                    UUID owner;
+                    if (segment_accessor.GetClientIdBySegmentName(
+                            *segment_name, owner) == ErrorCode::OK) {
+                        const auto liveness = replica.getClientLiveness();
+                        if (liveness) {
+                            serving_sources.emplace_back(*segment_name, owner,
+                                                         std::move(liveness));
+                        }
+                    }
+                }
+            });
+    }
+    if (serving_sources.empty()) {
+        LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
-    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
+    const auto& [selected_source_segment, select_client, liveness] =
+        serving_sources[randomIndex(serving_sources.size())];
+    auto serving_guard = liveness->TryAcquireServingGuard();
+    if (!serving_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    // Completion paths acquire the Client guard before the metadata shard.
+    // Reacquire and validate in that same order after discovery.
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    MetadataAccessorRO submission_metadata(this, object_id);
+    if (!submission_metadata.Exists()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    const auto& metadata = submission_metadata.Get();
+    ScopedSegmentAccess submission_access = segment_manager_.getSegmentAccess();
+    UUID current_source_client;
+    if (submission_access.GetClientIdBySegmentName(
+            selected_source_segment, current_source_client) != ErrorCode::OK ||
+        current_source_client != select_client ||
+        !metadata.HasReplica(
+            [this, &selected_source_segment](const Replica& replica) {
+                if (!IsReplicaReadable(replica)) {
+                    return false;
+                }
+                const auto names = replica.get_segment_names();
+                return std::any_of(
+                    names.begin(), names.end(),
+                    [&selected_source_segment](const auto& name) {
+                        return name && *name == selected_source_segment;
+                    });
+            })) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     for (const auto& target : targets) {
-        if (!segment_accessor.ExistsSegmentName(target)) {
-            LOG(ERROR) << "key=" << key << ", target_segment=" << target
-                       << ", error=target_segment_not_mounted";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (!segment_accessor.IsSegmentAllocatable(target)) {
-            LOG(ERROR) << "key=" << key << ", target_segment=" << target
-                       << ", error=target_segment_not_allocatable";
+        if (!submission_access.IsSegmentAllocatable(target)) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
-    }
-
-    const auto& metadata = accessor.Get();
-    const auto& segment_names = metadata.GetReplicaSegmentNames();
-    if (segment_names.empty()) {
-        LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    // Randomly pick a segment from the source replicas
-    std::string selected_source_segment =
-        segment_names[randomIndex(segment_names.size())];
-    UUID select_client;
-    ErrorCode error = segment_accessor.GetClientIdBySegmentName(
-        selected_source_segment, select_client);
-    if (error != ErrorCode::OK) {
-        LOG(ERROR) << "key=" << key
-                   << ", segment_name=" << selected_source_segment
-                   << ", error=client_id_not_found";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_COPY>(
@@ -12250,13 +12928,6 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     }
     const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
                                    key};
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this, object_id);
-    if (!accessor.Exists()) {
-        VLOG(1) << "key=" << key << ", info=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
     if (source == target) {
         LOG(ERROR) << "key=" << key << ", source_segment=" << source
                    << ", target_segment=" << target
@@ -12264,35 +12935,103 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
-    if (!segment_accessor.ExistsSegmentName(target)) {
-        LOG(ERROR) << "key=" << key << ", target_segment=" << target
-                   << ", error=target_segment_not_mounted";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    bool source_exists = false;
+    bool source_is_serving = false;
+    UUID select_client;
+    std::shared_ptr<ClientLivenessRecord> source_liveness;
+    {
+        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        MetadataAccessorRO accessor(this, object_id);
+        if (!accessor.Exists()) {
+            VLOG(1) << "key=" << key << ", info=object_not_found";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+
+        const auto& metadata = accessor.Get();
+        ScopedSegmentAccess segment_accessor =
+            segment_manager_.getSegmentAccess();
+        if (!segment_accessor.ExistsSegmentName(target)) {
+            LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                       << ", error=target_segment_not_mounted";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!segment_accessor.IsSegmentAllocatable(target)) {
+            LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                       << ", error=target_segment_not_allocatable";
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+
+        metadata.VisitReplicas(
+            [](const Replica&) { return true; },
+            [this, &source, &source_exists, &source_is_serving,
+             &source_liveness](const Replica& replica) {
+                const auto names = replica.get_segment_names();
+                const bool matches = std::any_of(
+                    names.begin(), names.end(), [&source](const auto& name) {
+                        return name && *name == source;
+                    });
+                if (matches) {
+                    source_exists = true;
+                    if (IsReplicaReadable(replica)) {
+                        source_is_serving = true;
+                        source_liveness = replica.getClientLiveness();
+                    }
+                }
+            });
+        if (!source_exists) {
+            LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                       << ", error=source_replica_not_found";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!source_is_serving) {
+            LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                       << ", error=source_segment_not_serving";
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        ErrorCode error =
+            segment_accessor.GetClientIdBySegmentName(source, select_client);
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "key=" << key << ", segment_name=" << source
+                       << ", error=client_id_not_found";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
     }
-    if (!segment_accessor.IsSegmentAllocatable(target)) {
-        LOG(ERROR) << "key=" << key << ", target_segment=" << target
-                   << ", error=target_segment_not_allocatable";
+
+    if (!source_liveness) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    auto serving_guard = source_liveness->TryAcquireServingGuard();
+    if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
-    const auto& metadata = accessor.Get();
-    const auto& segment_names = metadata.GetReplicaSegmentNames();
-    if (std::find(segment_names.begin(), segment_names.end(), source) ==
-        segment_names.end()) {
-        LOG(ERROR) << "key=" << key << ", source_segment=" << source
-                   << ", error=source_segment_not_found";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    // Do not hold a metadata shard while acquiring the Client guard: MoveEnd
+    // takes those locks in the opposite order.
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    MetadataAccessorRO submission_metadata(this, object_id);
+    if (!submission_metadata.Exists()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-
-    UUID select_client;
-    ErrorCode error =
-        segment_accessor.GetClientIdBySegmentName(source, select_client);
-
-    if (error != ErrorCode::OK) {
-        LOG(ERROR) << "key=" << key << ", segment_name=" << source
-                   << ", error=client_id_not_found";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    const auto& metadata = submission_metadata.Get();
+    ScopedSegmentAccess submission_access = segment_manager_.getSegmentAccess();
+    UUID current_source_client;
+    if (submission_access.GetClientIdBySegmentName(
+            source, current_source_client) != ErrorCode::OK ||
+        current_source_client != select_client ||
+        !submission_access.IsSegmentAllocatable(target) ||
+        !metadata.HasReplica([this, &source](const Replica& replica) {
+            if (!IsReplicaReadable(replica)) {
+                return false;
+            }
+            const auto names = replica.get_segment_names();
+            return std::any_of(names.begin(), names.end(),
+                               [&source](const auto& name) {
+                                   return name && *name == source;
+                               });
+        })) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
     return task_manager_.get_write_access()
@@ -12316,6 +13055,14 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     const UUID& client_id, size_t batch_size) {
+    const auto liveness = FindClientRecord(client_id);
+    if (!liveness) {
+        return std::vector<TaskAssignment>{};
+    }
+    auto serving_guard = liveness->TryAcquireServingGuard();
+    if (!serving_guard) {
+        return std::vector<TaskAssignment>{};
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto& tasks =
         task_manager_.get_write_access().pop_tasks(client_id, batch_size);
@@ -12328,6 +13075,14 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
 
 tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     const UUID& client_id, const TaskCompleteRequest& request) {
+    const auto liveness = FindClientRecord(client_id);
+    if (!liveness) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    auto retaining_guard = liveness->TryAcquireRetainingGuard();
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto write_access = task_manager_.get_write_access();
     ErrorCode err = write_access.complete_task(client_id, request.id,
@@ -12642,6 +13397,27 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         if (std::find(replica_segments.begin(),
                                       replica_segments.end(), source_segment) ==
                             replica_segments.end()) {
+                            continue;
+                        }
+
+                        bool source_is_serving = false;
+                        metadata.VisitReplicas(
+                            [this, &source_segment](const Replica& replica) {
+                                if (!IsReplicaReadable(replica)) {
+                                    return false;
+                                }
+                                const auto names = replica.get_segment_names();
+                                return std::any_of(
+                                    names.begin(), names.end(),
+                                    [&source_segment](const auto& name) {
+                                        return name && *name == source_segment;
+                                    });
+                            },
+                            [&source_is_serving](const Replica&) {
+                                source_is_serving = true;
+                            });
+                        if (!source_is_serving) {
+                            blocked_unit_keys.insert(unit_key);
                             continue;
                         }
 
