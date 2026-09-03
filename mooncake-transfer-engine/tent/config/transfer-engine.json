@@ -86,6 +86,7 @@
             "enable": false,
             "bind_address": "",
             "advertise_address": "",
+            "rail_addresses": [],
             "port": 0,
             "worker_count": 16,
             "connections_per_peer": 4,

@@ -40,6 +40,7 @@ class HighPerformanceTcpClient {
         SegmentID peer_id{0};
         std::string incarnation;
         std::string host;
+        std::string local_host;
         uint16_t port{0};
         uint32_t lane_id{0};
         uint64_t registration_id{0};

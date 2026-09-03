@@ -145,23 +145,54 @@ class HighPerformanceTcpClient::Lane
                  asio::ip::tcp::resolver::results_type results) {
         std::error_code ignored;
         socket_.close(ignored);
+        if (!current_->local_host.empty()) {
+            if (results.empty()) {
+                finishIoError(asio::error::host_not_found);
+                return;
+            }
+            std::error_code error;
+            socket_.open(results.begin()->endpoint().protocol(), error);
+            if (error) {
+                finishIoError(error);
+                return;
+            }
+            const auto source =
+                asio::ip::make_address(current_->local_host, error);
+            if (error) {
+                finishIoError(error);
+                return;
+            }
+            socket_.bind(asio::ip::tcp::endpoint(source, 0), error);
+            if (error) {
+                finishIoError(error);
+                return;
+            }
+        }
         auto self = shared_from_this();
-        asio::async_connect(
-            socket_, results,
-            [self, epoch](const std::error_code& error,
-                          const asio::ip::tcp::endpoint&) {
-                self->runHandler(epoch, [&] {
-                    if (self->finishForcedIfAny()) return;
-                    if (error) {
-                        self->finishIoError(error);
-                        return;
-                    }
-                    self->cancelTimer();
-                    self->parent_->connections_created_.fetch_add(
-                        1, std::memory_order_relaxed);
-                    self->writeHeader(epoch);
-                });
+        const auto connected = [self, epoch](const std::error_code& error) {
+            self->runHandler(epoch, [&] {
+                if (self->finishForcedIfAny()) return;
+                if (error) {
+                    self->finishIoError(error);
+                    return;
+                }
+                self->cancelTimer();
+                self->parent_->connections_created_.fetch_add(
+                    1, std::memory_order_relaxed);
+                self->writeHeader(epoch);
             });
+        };
+        if (!current_->local_host.empty()) {
+            // The endpoint-range overload closes and reopens the socket while
+            // trying endpoints, which discards the source bind above.
+            socket_.async_connect(results.begin()->endpoint(), connected);
+        } else {
+            asio::async_connect(socket_, results,
+                                [connected](const std::error_code& error,
+                                            const asio::ip::tcp::endpoint&) {
+                                    connected(error);
+                                });
+        }
     }
 
     void writeHeader(uint64_t epoch) {
