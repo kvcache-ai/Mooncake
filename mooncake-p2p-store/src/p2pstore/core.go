@@ -401,48 +401,12 @@ func (store *P2PStore) performTransfer(ctx context.Context, source uintptr, shar
 	retryCount := 0
 	maxRetryCount := max(3, shard.Count())
 	for retryCount < maxRetryCount {
-		batchID, err := store.transfer.allocateBatchID(1)
-		if err != nil {
-			return err
-		}
-
 		location := shard.GetLocation(retryCount)
 		if location == nil {
 			break
 		}
 
-		targetID, err := store.transfer.openSegment(location.SegmentName, retryCount == 0)
-		if err != nil {
-			return err
-		}
-
-		request := TransferRequest{
-			Opcode:       OPCODE_READ,
-			Source:       uint64(source),
-			TargetID:     targetID,
-			TargetOffset: location.Offset,
-			Length:       shard.Length,
-		}
-
-		err = store.transfer.submitTransfer(batchID, []TransferRequest{request})
-		if err != nil {
-			return err
-		}
-
-		var status int
-		for status == STATUS_WAITING || status == STATUS_PENDING {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				status, _, err = store.transfer.getTransferStatus(batchID, 0)
-				if err != nil {
-					return err
-				}
-			}
-		}
-
-		err = store.transfer.freeBatchID(batchID)
+		status, err := performTransferOnce(ctx, store.transfer, source, shard.Length, location, retryCount == 0)
 		if err != nil {
 			return err
 		}
@@ -455,6 +419,92 @@ func (store *P2PStore) performTransfer(ctx context.Context, source uintptr, shar
 	}
 
 	return ErrTooManyRetries
+}
+
+// batchTransport is the subset of TransferEngine a single transfer attempt
+// needs. It lets the batch lifecycle be exercised without the native engine.
+type batchTransport interface {
+	allocateBatchID(batchSize int) (BatchID, error)
+	openSegment(segmentName string, useCache bool) (int64, error)
+	submitTransfer(batchID BatchID, requests []TransferRequest) error
+	getTransferStatus(batchID BatchID, taskID int) (int, uint64, error)
+	freeBatchID(batchID BatchID) error
+}
+
+func isTransferInFlight(status int) bool {
+	return status == STATUS_WAITING || status == STATUS_PENDING
+}
+
+// performTransferOnce runs a single transfer attempt against the given
+// location. The allocated batch ID is released on every return path.
+//
+// The engine refuses to free a batch while any of its tasks is still in
+// flight (BatchBusy), so on context cancellation the task is drained to a
+// terminal state before the deferred free runs. Cancellation latency is
+// therefore bounded by the engine's own transfer timeout.
+func performTransferOnce(ctx context.Context, transport batchTransport, source uintptr, length uint64, location *Location, useCache bool) (status int, err error) {
+	batchID, err := transport.allocateBatchID(1)
+	if err != nil {
+		return STATUS_FAILED, err
+	}
+	defer func() {
+		freeErr := transport.freeBatchID(batchID)
+		if freeErr != nil {
+			log.Println("cascading error: failed to free batch ID:", freeErr)
+			if err == nil {
+				err = freeErr
+			}
+		}
+	}()
+
+	targetID, err := transport.openSegment(location.SegmentName, useCache)
+	if err != nil {
+		return STATUS_FAILED, err
+	}
+
+	request := TransferRequest{
+		Opcode:       OPCODE_READ,
+		Source:       uint64(source),
+		TargetID:     targetID,
+		TargetOffset: location.Offset,
+		Length:       length,
+	}
+
+	err = transport.submitTransfer(batchID, []TransferRequest{request})
+	if err != nil {
+		return STATUS_FAILED, err
+	}
+
+	for isTransferInFlight(status) {
+		select {
+		case <-ctx.Done():
+			if _, drainErr := drainTransfer(transport, batchID); drainErr != nil {
+				return STATUS_FAILED, drainErr
+			}
+			return STATUS_FAILED, ctx.Err()
+		default:
+			status, _, err = transport.getTransferStatus(batchID, 0)
+			if err != nil {
+				return STATUS_FAILED, err
+			}
+		}
+	}
+
+	return status, nil
+}
+
+// drainTransfer polls the batch until its task reaches a terminal state so
+// the batch can be freed.
+func drainTransfer(transport batchTransport, batchID BatchID) (int, error) {
+	status := STATUS_WAITING
+	for isTransferInFlight(status) {
+		var err error
+		status, _, err = transport.getTransferStatus(batchID, 0)
+		if err != nil {
+			return STATUS_FAILED, err
+		}
+	}
+	return status, nil
 }
 
 func (store *P2PStore) updatePayloadMetadata(ctx context.Context, name string, addrList []uintptr, sizeList []uint64, payload *Payload, revision int64) error {
