@@ -3287,12 +3287,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
 
     // Tolerant restore: one bad entry or descriptor must not cost the whole
     // index. Validation runs in three phases — cheap per-entry validation,
-    // keep-latest overlap resolution, then construction for the survivors —
-    // and only segment-level structural corruption stays fail-fast (#3760).
+    // ambiguity-discard overlap resolution, then construction for the
+    // survivors — and only segment-level structural corruption stays
+    // fail-fast (#3760).
     size_t rejected_count = 0;
     // Objects skipped because the live index already holds them are not
     // losses: their state is present, just not from this snapshot.
     size_t already_existing_count = 0;
+    // Conflict-derived discards become durable repair records after the index
+    // installs, so a later promotion cannot replay them: full drops as
+    // key-level REMOVE, partial discards as a canonical PUT_END carrying only
+    // the survivors.
+    std::vector<std::pair<TenantId, std::string>> repair_remove_keys;
+    std::vector<std::pair<TenantId, std::string>> repair_canonical_keys;
     const auto reject_standby_object = [&](const StandbyObjectEntry& entry,
                                            const char* reason) {
         ++rejected_count;
@@ -3444,7 +3451,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
         }
         if (reliable == 0) {
             reject_standby_object(*accepted_entry.entry, "no_reliable_replica");
+            repair_remove_keys.emplace_back(accepted_entry.tenant_id,
+                                            accepted_entry.user_key);
             accepted_entry.entry = nullptr;
+        } else {
+            // Survives with some descriptors discarded: the canonical repair
+            // record carries only the survivors.
+            repair_canonical_keys.emplace_back(accepted_entry.tenant_id,
+                                               accepted_entry.user_key);
         }
     }
 
@@ -3628,6 +3642,78 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
 
     if (enable_multi_tenants_) {
         RebuildTenantQuotaUsageFromMetadata();
+    }
+
+    // Durable repair for conflict-derived discards: a later promotion must
+    // not replay what this one dropped. One record per affected object goes
+    // through the fenced writer (REMOVE for full drops, canonical PUT_END
+    // carrying only the survivors for partial ones), and the restore fails
+    // unless the batch becomes durable, so the candidate never serves an
+    // index whose discards could resurrect. With no OpLog configured there
+    // is nothing to replay into, so the local filter stands alone.
+    if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
+        enable_oplog_ && ordered_oplog_writer_) {
+        const size_t total =
+            repair_remove_keys.size() + repair_canonical_keys.size();
+        auto remaining = std::make_shared<std::atomic<size_t>>(total);
+        auto done = std::make_shared<std::promise<void>>();
+        std::future<void> durable_future = done->get_future();
+        auto on_durable = [remaining, done](const OpLogEntry&) {
+            if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                done->set_value();
+            }
+        };
+
+        ErrorCode repair_err = ErrorCode::OK;
+        for (const auto& [tenant, key] : repair_remove_keys) {
+            auto r = AppendOpLogWithDurableFinalize(
+                OpType::REMOVE, tenant.value(), key, {}, on_durable);
+            if (!r) {
+                repair_err = r.error();
+                break;
+            }
+        }
+        for (const auto& [tenant, key] : repair_canonical_keys) {
+            if (repair_err != ErrorCode::OK) break;
+            const size_t shard_idx = getShardIndex(tenant, key);
+            MetadataShardAccessorRO shard(this, shard_idx);
+            auto tenant_it = shard->tenants.find(tenant);
+            if (tenant_it == shard->tenants.end() ||
+                !tenant_it->second.metadata.contains(key)) {
+                // Survived the conflict but failed construction (e.g.
+                // capacity): nothing installed, so the canonical state is
+                // absence. Repudiate the key outright.
+                auto r = AppendOpLogWithDurableFinalize(
+                    OpType::REMOVE, tenant.value(), key, {}, on_durable);
+                if (!r) {
+                    repair_err = r.error();
+                    break;
+                }
+                continue;
+            }
+            auto r = AppendOpLogWithDurableFinalize(
+                OpType::PUT_END, tenant.value(), key,
+                SerializeMetadataForOpLog(tenant_it->second.metadata.at(key)),
+                on_durable);
+            if (!r) {
+                repair_err = r.error();
+            }
+        }
+        if (repair_err == ErrorCode::OK &&
+            durable_future.wait_for(std::chrono::seconds(10)) !=
+                std::future_status::ready) {
+            LOG(ERROR) << "RestoreFromStandbySnapshot: repair batch not "
+                          "durable within 10s, failing the restore";
+            repair_err = ErrorCode::INTERNAL_ERROR;
+        }
+        if (repair_err != ErrorCode::OK) {
+            LOG(ERROR) << "RestoreFromStandbySnapshot: durable repair failed, "
+                          "error="
+                       << toString(repair_err);
+            return tl::make_unexpected(repair_err);
+        }
+        LOG(INFO) << "RestoreFromStandbySnapshot: durable repair records="
+                  << total;
     }
 
     LOG(INFO) << "Restored from standby: " << objects.size() << " objects, "
