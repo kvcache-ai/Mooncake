@@ -71,11 +71,11 @@ class TenantStore {
         if (it == groups_.end()) {
             return false;
         }
-        it->second.member_keys.erase(member_key);
-        if (it->second.Empty()) {
+        const bool erased = it->second.member_keys.erase(member_key) > 0;
+        if (erased && it->second.Empty()) {
             groups_.erase(it);
         }
-        return true;
+        return erased;
     }
 
     std::vector<std::string> Members(const std::string& group_id) const {
@@ -116,6 +116,12 @@ class TenantStore {
     // fails, so a concurrently-pinned entry never observes a non-wired grouped
     // member or a stale membership entry.
     bool InsertObject(std::string key, std::shared_ptr<ObjectEntry> entry) {
+        // Enforce the route/membership invariant: the caller's `key` and the
+        // entry's key() must agree, otherwise the route and the grouped
+        // membership would disagree for this object.
+        if (key != entry->key()) {
+            return false;
+        }
         const std::string group_id = entry->group_id();
         if (!group_id.empty()) {
             entry->set_lease(LeaseFor(group_id));
@@ -123,7 +129,7 @@ class TenantStore {
                 return false;
             }
         }
-        if (!Insert(std::move(key), entry)) {
+        if (!Insert(entry->key(), entry)) {
             if (!group_id.empty()) {
                 RemoveMember(group_id, entry->key());
             }
