@@ -25,12 +25,12 @@ class ServingStateGate {
 
     template <typename Action>
     bool RequestShutdown(Action&& action) {
+        std::lock_guard<std::mutex> lock(transition_mutex_);
         const bool first_request =
             !shutdown_requested_.exchange(true, std::memory_order_acq_rel);
         if (!first_request) {
             return false;
         }
-        std::lock_guard<std::mutex> lock(transition_mutex_);
         std::forward<Action>(action)();
         return true;
     }
