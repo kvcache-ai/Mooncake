@@ -4003,15 +4003,6 @@ RealClient::get_into_ranges_internal(
 
     // Planning may consume most of a short lease; renew before submission.
     if (!scatter_leases.empty()) refresh_leases();
-    {
-        size_t fragment_count = 0;
-        for (const auto &transfer : memory_transfers) {
-            fragment_count += transfer.lengths.size();
-        }
-        LOG(INFO) << "[Store] SubmitScatter (get_into_ranges), range_count="
-                  << memory_transfers.size()
-                  << ", fragment_count=" << fragment_count;
-    }
     auto operation = client_->SubmitScatter(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =

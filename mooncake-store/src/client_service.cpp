@@ -1465,6 +1465,12 @@ std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
+    size_t fragment_count = 0;
+    for (const auto& transfer : transfers) {
+        fragment_count += transfer.lengths.size();
+    }
+    LOG(INFO) << "[Store] SubmitScatter, range_count=" << transfers.size()
+              << ", fragment_count=" << fragment_count;
     return transfer_submitter_->submitScatter(transfers);
 }
 
@@ -4351,9 +4357,6 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         return results;
     }
 
-    LOG(INFO) << "[Store] SubmitScatter (batch range read), entry_count="
-              << replicas.size() << ", range_count=" << builder.ranges().size()
-              << ", fragment_count=" << fragment_count;
     auto operation = SubmitScatter(builder.ranges());
     if (!operation) {
         LOG(ERROR) << "Failed to submit batch range read";
