@@ -217,13 +217,6 @@ class MasterService {
      */
     void SetKvTenantEpochTrackingForTesting(bool enabled);
     /**
-     * @brief Installs a callback invoked after each shard's lock is released
-     *        during a RemoveAll scan, receiving the shard index just finished.
-     *        Lets a test commit into an already-scanned shard
-     *        deterministically.
-     */
-    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
-    /**
      * @brief Counts of `cleared` publications and of clears withheld because a
      *        concurrent commit advanced the tenant epoch mid-scan.
      */
@@ -821,9 +814,9 @@ class MasterService {
     /**
      * @brief Heartbeat-driven pull of pending promotion work for a client.
      * Returns tenant-scoped promotion tasks for the holder client and clears
-     * its per-client promotion_objects queue. The per-shard promotion_tasks
-     * map remains populated as the source of truth until NotifyPromotionSuccess
-     * commits the new MEMORY replica.
+     * its per-client promotion_objects queue. The task stays tracked on the
+     * object's `ObjectEntry::promotion_task` as the source of truth until
+     * NotifyPromotionSuccess commits the new MEMORY replica.
      */
     auto PromotionObjectHeartbeat(const UUID& client_id)
         -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode>;
@@ -847,7 +840,7 @@ class MasterService {
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; decrement source
-     * refcnt; erase per-shard and per-client task entries. Mirror of
+     * refcnt; erase the object-level and per-client task entries. Mirror of
      * NotifyOffloadSuccess.
      */
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key,
@@ -1020,14 +1013,14 @@ class MasterService {
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
-    // Clear completed LOCAL_DISK replicas owned by exactly this client, in
-    // all shards. Owner-targeted on purpose: a liveness-complement sweep
+    // Clear completed LOCAL_DISK replicas owned by exactly this client, across
+    // all tenants. Owner-targeted on purpose: a liveness-complement sweep
     // classifies by absence from a point-in-time set, so an owner that
     // mounts and registers between taking that set and the sweep reaching
-    // its shard would be swept as stale. A predicate on the owner id cannot
+    // its tenant would be swept as stale. A predicate on the owner id cannot
     // misclassify a concurrent mount, whatever the interleaving.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
-    // Shard walk shared by the two sweeps above; removes completed replicas
+    // Tenant walk shared by the two sweeps above; removes completed replicas
     // matching is_stale, erasing a key when no valid replica remains.
     void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale);
 
@@ -1286,14 +1279,13 @@ class MasterService {
         ErrorCode error{ErrorCode::OK};
     };
 
-    // Evicts every member of `group_id` across its metadata shards. MUST be
-    // called WITHOUT holding any metadata shard lock: the caller releases the
-    // trigger shard lock first, so a caller-held trigger lock is never held
-    // while other shard locks are acquired (that ordering is the AB/BA
-    // cross-shard deadlock this function exists to remove). It acquires each
-    // member shard lock itself in canonical ascending shard order, so any two
-    // concurrent group evictions that touch the same shards acquire them in the
-    // same global order and cannot deadlock.
+    // Evicts every member of `group_id`, reading the membership from the
+    // tenant's own object_route. It must be called WITHOUT holding any
+    // per-object lock; each member is re-looked-up and re-validated under its
+    // own `ObjectEntry::mutex`, which is released before the member is erased.
+    // Because all members live in one tenant container, there is no cross-shard
+    // lock ordering to worry about — the only ordering invariant is that
+    // `entry->mutex` and `route_lock_` are never held together.
     //
     // Each member is re-looked-up and re-validated under its own lock (lease,
     // hard/soft pin, evictable replica — all against `now`) because state may
@@ -1327,7 +1319,7 @@ class MasterService {
         TenantState& tenant_state,
         const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
         const TenantId& tenant_id, QuotaEraseMode quota_mode,
-        TenantStateAccessorRW* shard,
+        TenantStateAccessorRW* tenant_accessor,
         const std::vector<std::string>& previous_media_hint = {});
     void EraseMetadata(
         TenantState& tenant_state,
@@ -1335,7 +1327,7 @@ class MasterService {
         const TenantId& tenant_id, QuotaEraseMode quota_mode);
     void EraseMetadata(TenantState& tenant_state, const std::string& key,
                        const TenantId& tenant_id, QuotaEraseMode quota_mode,
-                       TenantStateAccessorRW* shard);
+                       TenantStateAccessorRW* tenant_accessor);
     void EraseMetadata(TenantState& tenant_state, const std::string& key,
                        const TenantId& tenant_id);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
@@ -1418,29 +1410,30 @@ class MasterService {
         const std::string& key, const TenantId& tenant_id,
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-        TenantStateAccessorRW* shard = nullptr);
+        TenantStateAccessorRW* tenant_accessor = nullptr);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
-    // accounting (quota release, promotion-task cancellation, disk-replica
-    // shard bookkeeping) instead of duplicating it.
+    // accounting (quota release, promotion-task cancellation, disk-object
+    // count) instead of duplicating it.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale,
-        TenantStateAccessorRW* shard = nullptr);
+        TenantStateAccessorRW* tenant_accessor = nullptr);
 
     // True when client_id currently has a LOCAL_DISK registration.
     // Momentarily takes the LocalSsdManager registry lock, so callers must not
-    // hold it; call before taking a metadata shard lock. Callers that need the
+    // hold it; call before taking any object/tenant lock. Callers that need the
     // answer to stay true across a later metadata write must hold
     // snapshot_mutex_ (shared) across both -- UnmountLocalDiskSegment
     // deregisters the client under the exclusive lock, so the check and the
     // write cannot straddle a deregistration.
     bool HasMountedLocalDiskSegment(const UUID& client_id);
 
-    // Helper: allocate replicas, create ObjectMetadata, insert into shard,
-    // and return descriptor list.  Shared by PutStart and UpsertStart.
+    // Helper: allocate replicas, create ObjectMetadata, insert into the tenant
+    // container, and return descriptor list.  Shared by PutStart and
+    // UpsertStart.
     auto AllocateAndInsertMetadata(
-        TenantStateAccessorRW& shard, const UUID& client_id,
+        TenantStateAccessorRW& tenant_accessor, const UUID& client_id,
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& writer_host_id,
         const std::string& group_id, const TenantId& tenant_id,
@@ -1455,7 +1448,7 @@ class MasterService {
      * @brief Helper to discard expired processing keys.
      */
     void DiscardExpiredProcessingReplicas(
-        TenantStateAccessorRW& shard,
+        TenantStateAccessorRW& tenant_accessor,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
@@ -1506,7 +1499,7 @@ class MasterService {
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
      * task into the holder client's LocalSSD mailbox.
      * Caller is responsible for refcnt-pinning the source replica and
-     * recording the task in the shard's promotion_tasks map.
+     * recording the task on the object's `ObjectEntry::promotion_task`.
      */
     tl::expected<void, ErrorCode> PushPromotionQueue(
         const ObjectIdentity& object_id, Replica& source_replica);
@@ -1516,7 +1509,7 @@ class MasterService {
      * observed. Applies the gating chain (frequency / watermark / dedup /
      * cap), refcnt-pins the source LOCAL_DISK replica, records a
      * PromotionTask, and pushes onto the holder client's LocalSSD mailbox.
-     * Acquires its own RW shard accessor; safe to call after
+     * Acquires its own RW tenant accessor; safe to call after
      * GetReplicaList's RO accessor has been released.
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
@@ -1607,7 +1600,7 @@ class MasterService {
               tenant_handle_(
                   service_->tenant_directory_.Lookup(object_id_.tenant_id)),
               tenant_state_(tenant_handle_ ? tenant_handle_.get() : nullptr),
-              shard_guard_(tenant_state_),
+              tenant_guard_(tenant_state_),
               entry_(tenant_state_ != nullptr
                          ? tenant_state_->Pin(object_id_.user_key)
                          : nullptr),
@@ -1619,7 +1612,8 @@ class MasterService {
             }
             // Automatically clean up invalid handles (memory replicas only).
             // Note: We only check memory replicas here to avoid lock order
-            // violation (client_mutex_ must be acquired before metadata shard).
+            // violation (client_mutex_ must be acquired before the tenant
+            // accessor / per-object mutex).
             // local_disk replicas are cleaned up by ClearInvalidHandles() in
             // ClientMonitorFunc.
             if (!(service_->enable_ha_ && service_->enable_oplog_) &&
@@ -1694,8 +1688,8 @@ class MasterService {
             return entry_ != nullptr && entry_->replication_task.has_value();
         }
 
-        TenantStateAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
-            return shard_guard_;
+        TenantStateAccessorRW& GetTenantAccessor() NO_THREAD_SAFETY_ANALYSIS {
+            return tenant_guard_;
         }
 
         TenantState& GetTenantState() NO_THREAD_SAFETY_ANALYSIS {
@@ -1726,7 +1720,7 @@ class MasterService {
             lock_ = std::unique_lock<std::shared_mutex>();
             service_->EraseMetadata(*tenant_state_, entry_,
                                     object_id_.tenant_id, QuotaEraseMode::kFull,
-                                    &shard_guard_, previous_media_hint);
+                                    &tenant_guard_, previous_media_hint);
             entry_.reset();
             MaybeEraseEmptyTenant();
         }
@@ -1795,13 +1789,13 @@ class MasterService {
                 return;
             }
             // Rebind the handle to the (now-existing) tenant. Dropping the lock
-            // is not needed because shard_guard_ is a non-locking disk-counter.
+            // is not needed because tenant_guard_ is a non-locking disk-counter.
             entry_.reset();
             lock_ = std::unique_lock<std::shared_mutex>();
             tenant_handle_ =
                 service_->GetOrCreateTenantStateHandle(object_id_.tenant_id);
             tenant_state_ = tenant_handle_.get();
-            shard_guard_ = TenantStateAccessorRW(tenant_state_);
+            tenant_guard_ = TenantStateAccessorRW(tenant_state_);
             entry_ = tenant_state_->Pin(object_id_.user_key);
             if (entry_ != nullptr) {
                 lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
@@ -1816,7 +1810,7 @@ class MasterService {
             tenant_state_ = nullptr;
             entry_.reset();
             lock_ = std::unique_lock<std::shared_mutex>();
-            shard_guard_ = TenantStateAccessorRW(nullptr);
+            tenant_guard_ = TenantStateAccessorRW(nullptr);
         }
 
         MasterService* service_;
@@ -1826,7 +1820,7 @@ class MasterService {
         std::shared_ptr<TenantState> tenant_handle_;
         TenantState* tenant_state_;
         // Non-locking disk-count helper bound to tenant_state_.
-        TenantStateAccessorRW shard_guard_;
+        TenantStateAccessorRW tenant_guard_;
         // Pinned ObjectEntry (keeps the object alive) whose per-object mutex is
         // held for the accessor's lifetime.
         std::shared_ptr<mooncake::tenant::ObjectEntry> entry_;
@@ -1837,7 +1831,7 @@ class MasterService {
        public:
         MetadataSerializer(MasterService* service) : service_(service) {}
 
-        // Serialize metadata of all shards
+        // Serialize the metadata of all tenants.
         tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
 
         tl::expected<void, SerializationError> Deserialize(
@@ -2286,10 +2280,10 @@ class MasterService {
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 
-    // RemoveAll releases each shard lock before moving to the next one, so a
-    // concurrent commit can land in an already-scanned shard. Publishing
-    // `cleared` from the scan's own bookkeeping would then order it after that
-    // commit's `stored` and tell subscribers to drop a live object. Every
+    // RemoveAll serializes the whole scan under an exclusive snapshot lock, so
+    // no commit can interleave mid-scan. Publishing `cleared` from the scan's
+    // own bookkeeping would otherwise risk ordering it after a commit's
+    // `stored` and telling subscribers to drop a live object. Every
     // announcement of a newly available object bumps its tenant's epoch, and a
     // clear is published only if the epoch still matches the value read before
     // the scan began. A racing commit therefore suppresses the
@@ -2309,15 +2303,13 @@ class MasterService {
     bool kv_track_tenant_epochs_{false};
     std::atomic<uint64_t> kv_cleared_published_{0};
     std::atomic<uint64_t> kv_cleared_suppressed_by_epoch_{0};
-    // Fires after each shard's lock is released during a RemoveAll scan, which
-    // is the only point where a test can commit into an already-scanned shard.
-    std::function<void(size_t)> kv_remove_all_shard_hook_;
 
     static size_t KvTenantEpochSlot(const std::string& tenant) {
         return std::hash<std::string>{}(tenant) % kKvTenantEpochSlots;
     }
-    // Called while the object's shard lock is held, before the `stored` is
-    // enqueued, so any clear that observes the old epoch has not yet published.
+    // Called while the object's per-object mutex is held, before the `stored`
+    // status is enqueued, so any clear that observes the old epoch has not yet
+    // published.
     void BumpKvTenantEpoch(const std::string& tenant) {
         if (!kv_track_tenant_epochs_) {
             return;
