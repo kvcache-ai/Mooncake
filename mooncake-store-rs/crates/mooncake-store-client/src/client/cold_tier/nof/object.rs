@@ -43,7 +43,12 @@ pub trait NofObjectWrite: Send + Sync {
 
 /// Logical-object reads exposed by a NoF backing.
 pub trait NofObjectRead: Send + Sync {
-    fn get_object(&self, namespace: &NamespaceScope, key: &str) -> Result<NofObjectState<Vec<u8>>>;
+    fn get_object(
+        &self,
+        namespace: &NamespaceScope,
+        key: &str,
+        known_length: Option<u64>,
+    ) -> Result<NofObjectState<Vec<u8>>>;
 }
 
 /// Logical-object metadata queries exposed by a NoF backing.

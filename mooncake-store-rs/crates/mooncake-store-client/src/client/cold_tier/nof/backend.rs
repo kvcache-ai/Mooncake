@@ -117,7 +117,20 @@ impl NofBackend {
         self.backing
             .object_read()
             .ok_or_else(|| unsupported("logical-object reads"))?
-            .get_object(namespace, key)
+            .get_object(namespace, key, None)
+    }
+
+    pub(crate) fn get_object_with_known_length(
+        &self,
+        namespace: &NamespaceScope,
+        key: &str,
+        length: u64,
+    ) -> Result<NofObjectState<Vec<u8>>> {
+        self.validate_key(key)?;
+        self.backing
+            .object_read()
+            .ok_or_else(|| unsupported("logical-object reads"))?
+            .get_object(namespace, key, Some(length))
     }
 
     pub fn delete_object(

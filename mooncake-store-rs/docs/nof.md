@@ -33,8 +33,9 @@ request-local I/O descriptor and is never published through route CAS or exposed
 Mooncake remains authoritative for logical object existence, while KVCS remains authoritative for
 provider layout and provider-internal metadata:
 
-- Standard stores its namespace and shard manifest in KVCS/Redis. Reads query KVCS and then fetch
-  the shards reported by the provider.
+- Standard values at or below the configured limit use one non-sharded root key
+  (`shard_id=0`, `total_shard=1`). Larger values use KVCS shards, whose manifest is owned by
+  KVCS/Redis.
 - Low-Level stores raw values in KVCS. A value that exceeds the configured record limit uses an
   executor-private sidecar and derived record keys in the same KVCS key space.
 
@@ -55,10 +56,12 @@ payload. A Standard write goes to one provider target because KVCS owns its inte
 A Low-Level write succeeds only after every target selected by `nof_replica_count` accepts the
 value. No target list is written back to metadata.
 
-When no hot or local-disk copy is available, the client derives the same key and queries provider
-metadata for existence and length. The existing Cold Tier target selector, singleflight,
-admission control, and batch restore path then call the provider batch-get API and promote the
-payload to a hot copy. Provider payload I/O does not run during route resolution.
+Mooncake resolves the logical route first. Only an `Active` route without a readable hot or
+local-disk copy causes the client to derive the provider key and query provider metadata for
+existence and length. This keeps KVCS queries off the hot-hit path. The existing Cold Tier target
+selector, singleflight, admission control, and batch restore path then call the provider batch-get
+API and promote the payload to a hot copy. Route lookup and provider query are deliberately not
+issued speculatively in parallel.
 
 Removal first changes the logical route from `Active` to `Deleting`. It then fans out the stable
 provider key to the current target set. A provider error is returned to the caller and the
@@ -80,13 +83,19 @@ route and target configuration.
 
 Cold Tier's existing `ValueChunkPlan` is the only object-splitting planner:
 
-- Standard maps the plan to KVCS `shard_id` and `total_shards`; KVCS owns the manifest.
+- Standard stores values at or below the configured limit directly under the root key with
+  `shard_id=0` and `total_shard=1`. This path creates no Mooncake chunk key or manifest. Larger
+  values reuse `ValueChunkPlan` and map its ranges to KVCS shards; KVCS owns their manifest.
 - Low-Level stores values at or below the configured limit directly at the root key.
 - Larger Low-Level values use derived chunk keys and an executor-private 32-byte sidecar containing
   total length, chunk size, and chunk count.
 
 Low-Level writes send data records first and publish the sidecar last. The inline path remains one
 direct root-record write and does not execute sidecar or chunk logic.
+
+After provider discovery has supplied the object length, a Standard read at or below the limit
+issues `kvcs_batch_get_into` directly for root shard 0. It does not make a second query for shard
+details. Larger Standard reads query the KVCS-owned shard manifest before issuing the batch get.
 
 The Low-Level inline put/get path uses one root key. It does not encode a sidecar, generate chunk
 keys, or iterate a chunk plan. Inline delete calls the SDK delete API directly. Physical layout
