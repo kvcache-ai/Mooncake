@@ -20,6 +20,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // When the data size larger than MAX_CHUNK_SIZE bytes, we split them into multiple buffers and registered separately.
@@ -475,34 +476,63 @@ func performTransferOnce(ctx context.Context, transport batchTransport, source u
 		return STATUS_FAILED, err
 	}
 
-	for isTransferInFlight(status) {
-		select {
-		case <-ctx.Done():
-			if _, drainErr := drainTransfer(transport, batchID); drainErr != nil {
-				return STATUS_FAILED, drainErr
-			}
-			return STATUS_FAILED, ctx.Err()
-		default:
-			status, _, err = transport.getTransferStatus(batchID, 0)
-			if err != nil {
-				return STATUS_FAILED, err
-			}
-		}
+	status, err = waitTransfer(ctx, transport, batchID)
+	if err != nil {
+		return STATUS_FAILED, err
 	}
-
 	return status, nil
 }
 
-// drainTransfer polls the batch until its task reaches a terminal state so
-// the batch can be freed.
-func drainTransfer(transport batchTransport, batchID BatchID) (int, error) {
+// Polling schedule for waitTransfer. The first pollSpinBudget polls run
+// back-to-back so short transfers still complete with no added latency;
+// after that the poller backs off exponentially from pollMinInterval to
+// pollMaxInterval. The cap stays small because some transports (for example
+// the NVLink async transport) only advance completion state when polled.
+const (
+	pollSpinBudget  = 128
+	pollMinInterval = 100 * time.Microsecond
+	pollMaxInterval = time.Millisecond
+)
+
+// waitTransfer polls task 0 of batchID until it reaches a terminal state.
+// On context cancellation it keeps polling until the task is terminal
+// (the engine refuses to free a batch with in-flight tasks) and then
+// returns ctx.Err().
+//
+// doGetReplica starts one goroutine per shard, so for a checkpoint-sized
+// payload hundreds of pollers may be active at once. Spinning them all at
+// full speed for a transfer that takes seconds buys nothing in completion
+// latency and saturates cores; the spin budget plus backoff keeps the
+// fast path for small transfers while bounding CPU on large ones.
+func waitTransfer(ctx context.Context, transport batchTransport, batchID BatchID) (int, error) {
 	status := STATUS_WAITING
-	for isTransferInFlight(status) {
+	interval := pollMinInterval
+	cancelled := false
+	for polls := 0; ; polls++ {
 		var err error
 		status, _, err = transport.getTransferStatus(batchID, 0)
 		if err != nil {
 			return STATUS_FAILED, err
 		}
+		if !isTransferInFlight(status) {
+			break
+		}
+		if !cancelled && ctx.Err() != nil {
+			cancelled = true
+		}
+		if polls < pollSpinBudget {
+			continue
+		}
+		time.Sleep(interval)
+		if interval < pollMaxInterval {
+			interval *= 2
+			if interval > pollMaxInterval {
+				interval = pollMaxInterval
+			}
+		}
+	}
+	if cancelled {
+		return STATUS_FAILED, ctx.Err()
 	}
 	return status, nil
 }
