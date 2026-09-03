@@ -1880,6 +1880,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     // Start put operation
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    if (!start_result &&
+        start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
+        healDanglingLocalDiskReplica(key)) {
+        start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    }
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -1991,6 +1996,61 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     return {};
+}
+
+namespace {
+
+// Every COMPLETE replica in the list is a LOCAL_DISK replica owned by this
+// client, so nothing else can serve reads for the key.
+bool HasOnlyClientLocalDiskReplicas(
+    const std::vector<Replica::Descriptor>& replicas, const UUID& client_id) {
+    bool has_local_disk = false;
+    for (const auto& replica : replicas) {
+        if (replica.status != ReplicaStatus::COMPLETE) {
+            continue;
+        }
+        if (replica.is_local_disk_replica() &&
+            replica.get_local_disk_descriptor().client_id == client_id) {
+            has_local_disk = true;
+            continue;
+        }
+        // A completed replica owned elsewhere (memory, remote disk, DFS) can
+        // still serve reads, so there is nothing for this client to heal.
+        return false;
+    }
+    return has_local_disk;
+}
+
+}  // namespace
+
+bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
+    auto replicas = master_client_.GetReplicaList(key);
+    if (!replicas ||
+        !HasOnlyClientLocalDiskReplicas(replicas->replicas, client_id_) ||
+        !local_disk_probe_fn_) {
+        return false;
+    }
+    // RemoveAll wipes client SSD files while master keeps the metadata
+    // (issue #3709), leaving a completed entry whose backing file is gone.
+    // Reporting success for a Put on top of it would store nothing. Ask the
+    // installed probe (the offload file storage owned by RealClient) whether
+    // the file is still there. Only a proven-gone answer evicts; present or
+    // unknown (transport/config trouble) keeps the old idempotent path, so a
+    // healthy replica can never be evicted by mistake.
+    const std::optional<bool> file_gone = local_disk_probe_fn_(key);
+    if (file_gone != true) {
+        return false;
+    }
+    auto evicted =
+        master_client_.EvictDiskReplica(key, ReplicaType::LOCAL_DISK);
+    if (!evicted) {
+        LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for key="
+                     << key << ": " << toString(evicted.error());
+        return false;
+    }
+    LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key=" << key
+                 << " (backing file already gone)";
+    return true;
 }
 
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
@@ -2325,6 +2385,99 @@ void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
     }
 }
 
+void Client::healDanglingLocalDiskBatchStarts(
+    std::vector<PutOperation>& ops, const std::vector<size_t>& active_indices,
+    const std::vector<size_t>& already_exists,
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<uint64_t>>& slice_lengths,
+    const ReplicateConfig& config) {
+    if (already_exists.empty() || !local_disk_probe_fn_) {
+        return;
+    }
+    std::vector<std::string> candidate_keys;
+    candidate_keys.reserve(already_exists.size());
+    for (size_t i : already_exists) {
+        candidate_keys.emplace_back(keys[i]);
+    }
+    // One round trip for the whole subset: a healthy idempotent batch pays a
+    // single batched query and no evictions, and the per-key work left over
+    // is a local filesystem probe.
+    auto replica_lists = master_client_.BatchGetReplicaList(candidate_keys);
+    if (replica_lists.size() != candidate_keys.size()) {
+        return;
+    }
+    std::vector<std::string> evict_keys;
+    std::vector<size_t> evict_positions;
+    for (size_t j = 0; j < candidate_keys.size(); ++j) {
+        if (!replica_lists[j] || !HasOnlyClientLocalDiskReplicas(
+                                     replica_lists[j]->replicas, client_id_)) {
+            continue;
+        }
+        const std::optional<bool> file_gone =
+            local_disk_probe_fn_(candidate_keys[j]);
+        if (file_gone != true) {
+            continue;
+        }
+        evict_keys.emplace_back(candidate_keys[j]);
+        evict_positions.emplace_back(j);
+    }
+    if (evict_keys.empty()) {
+        return;
+    }
+    auto evicted = master_client_.BatchEvictDiskReplica(
+        evict_keys, ReplicaType::LOCAL_DISK);
+    if (evicted.size() != evict_keys.size()) {
+        return;
+    }
+    std::vector<std::string> retry_keys;
+    std::vector<std::vector<uint64_t>> retry_slices;
+    std::vector<size_t> retry_positions;
+    for (size_t j = 0; j < evict_keys.size(); ++j) {
+        if (!evicted[j]) {
+            LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for "
+                         << "key=" << evict_keys[j] << ": "
+                         << toString(evicted[j].error());
+            continue;
+        }
+        LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key="
+                     << evict_keys[j] << " (backing file already gone)";
+        retry_positions.emplace_back(evict_positions[j]);
+        retry_keys.emplace_back(keys[already_exists[evict_positions[j]]]);
+        retry_slices.emplace_back(
+            slice_lengths[already_exists[evict_positions[j]]]);
+    }
+    if (retry_keys.empty()) {
+        return;
+    }
+    auto retry_responses =
+        master_client_.BatchPutStart(retry_keys, retry_slices, config);
+    if (retry_responses.size() != retry_keys.size()) {
+        return;
+    }
+    for (size_t r = 0; r < retry_keys.size(); ++r) {
+        auto& op = ops[active_indices[already_exists[retry_positions[r]]]];
+        if (!retry_responses[r]) {
+            // OBJECT_ALREADY_EXISTS again means another writer won the race;
+            // the idempotent skip applies. Any other error is reported as is.
+            if (retry_responses[r].error() !=
+                ErrorCode::OBJECT_ALREADY_EXISTS) {
+                op.SetTerminalError(retry_responses[r].error(),
+                                    PutOperationState::MASTER_FAILED,
+                                    "Master failed to start put operation");
+            }
+            continue;
+        }
+        op.replicas = retry_responses[r].value();
+        op.RecordAllocatedReplicas();
+        if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+            op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
+                                PutOperationState::MASTER_FAILED,
+                                "Allocated replicas do not satisfy "
+                                "requested replica policy");
+        }
+    }
+}
+
 void Client::StartBatchPut(std::vector<PutOperation>& ops,
                            const ReplicateConfig& config) {
     std::vector<std::string> keys;
@@ -2379,10 +2532,19 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     }
 
     // Process individual responses with robust error handling
+    std::vector<size_t> already_exists;
     for (size_t i = 0; i < active_indices.size(); ++i) {
         auto& op = ops[active_indices[i]];
         op.InitializeRequestedReplicas(config);
         if (!start_responses[i]) {
+            if (start_responses[i].error() ==
+                ErrorCode::OBJECT_ALREADY_EXISTS) {
+                // Decided after the heal pass below: retried when the
+                // replica proves dangling, or the idempotent skip that
+                // CollectResults already grants.
+                already_exists.emplace_back(i);
+                continue;
+            }
             op.SetTerminalError(start_responses[i].error(),
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start put operation");
@@ -2400,6 +2562,17 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
             // until fully successful
             VLOG(1) << "Successfully started put for key " << op.key << " with "
                     << op.replicas.size() << " replicas";
+        }
+    }
+
+    healDanglingLocalDiskBatchStarts(ops, active_indices, already_exists, keys,
+                                     slice_lengths, config);
+    for (size_t i : already_exists) {
+        auto& op = ops[active_indices[i]];
+        if (!op.IsResolved() && op.replicas.empty()) {
+            op.SetTerminalError(ErrorCode::OBJECT_ALREADY_EXISTS,
+                                PutOperationState::MASTER_FAILED,
+                                "Master failed to start put operation");
         }
     }
 }
