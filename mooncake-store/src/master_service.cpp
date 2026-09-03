@@ -3353,11 +3353,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                                << ", key=" << user_key;
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                auto& alloc = restored_allocators[buffer.transport_endpoint_];
-                if (!alloc) {
-                    alloc = std::make_shared<DummyBufferAllocator>(
-                        buffer.transport_endpoint_, buffer.transport_endpoint_);
-                }
+                // A NoF descriptor points at a physical offset inside a
+                // remote NVMe namespace, and the namespace allocator state
+                // is not part of the snapshot. The next NoF mount builds an
+                // empty allocator over the whole namespace and may hand this
+                // offset to another object, so the restored replica must not
+                // survive as a usable reference. The allocator below is
+                // deliberately scoped to this iteration: the replica keeps
+                // its descriptor but reports has_invalid_nof_handle(), which
+                // already excludes it from every read path and lets
+                // ClearInvalidHandles reap it like any other replica whose
+                // backing segment is gone.
+                auto alloc = std::make_shared<DummyBufferAllocator>(
+                    buffer.transport_endpoint_, buffer.transport_endpoint_);
                 replicas.push_back(Replica(
                     desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
                     desc.status, ReplicaType::NOF_SSD));
