@@ -2392,6 +2392,29 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
+        .def(
+            "probe_key",
+            [](MooncakeStorePyWrapper &self, const std::string &key) {
+                py::gil_scoped_release release;
+                return self.store_->probeKey(key);
+            },
+            py::arg("key"),
+            "Point-in-time existence check that grants no read lease. "
+            "Returns 1 if the object existed at the time of the call, 0 if "
+            "not exists, -1 if error. The object may still be evicted "
+            "before a subsequent get.")
+        .def(
+            "batch_probe_key",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                py::gil_scoped_release release;
+                return self.store_->batchProbeKey(keys);
+            },
+            py::arg("keys"),
+            "Point-in-time existence check for multiple objects that grants "
+            "no read leases. Returns list of results: 1 if existed at the "
+            "time of the call, 0 if not exists, -1 if error. Objects may "
+            "still be evicted before a subsequent get.")
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;

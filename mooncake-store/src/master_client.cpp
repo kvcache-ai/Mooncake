@@ -28,8 +28,18 @@ struct RpcNameTraits<&WrappedMasterService::ExistKey> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ProbeKey> {
+    static constexpr const char* value = "ProbeKey";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
     static constexpr const char* value = "BatchExistKey";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchProbeKey> {
+    static constexpr const char* value = "BatchProbeKey";
 };
 
 template <>
@@ -482,6 +492,28 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     timer.LogRequest("keys_count=", object_keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
+        object_keys.size(), object_keys, tenant_id_.value());
+    timer.LogResponse("result=", result.size(), " keys");
+    return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::ProbeKey(
+    const std::string& object_key) {
+    ScopedVLogTimer timer(1, "MasterClient::ProbeKey");
+    timer.LogRequest("object_key=", object_key);
+
+    auto result = invoke_rpc<&WrappedMasterService::ProbeKey, bool>(
+        object_key, tenant_id_.value());
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchProbeKey(
+    const std::vector<std::string>& object_keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchProbeKey");
+    timer.LogRequest("keys_count=", object_keys.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchProbeKey, bool>(
         object_keys.size(), object_keys, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " keys");
     return result;
