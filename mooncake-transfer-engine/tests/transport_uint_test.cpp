@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <fstream>
@@ -26,8 +28,12 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
+#include "common.h"
+#include "config.h"
+#include "multi_transport.h"
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
 #include "transport/transport.h"
@@ -70,6 +76,58 @@ class TransferEngineImplTestPeer {
 
     static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
         engine.use_barex_ = use_barex;
+    }
+
+    static void prepareBusyBatch(MultiTransport& transport,
+                                 Transport::BatchID batch_id,
+                                 Transport* task_transport) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+        task.transport_ = task_transport;
+    }
+
+    static Transport::Slice* prepareAgedSliceBatch(MultiTransport& transport,
+                                                   Transport::BatchID batch_id,
+                                                   int64_t slice_age_ns) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+
+        auto* slice = new Transport::Slice();
+        slice->source_addr = nullptr;
+        slice->length = 1;
+        slice->status = Transport::Slice::PENDING;
+        slice->task = &task;
+        slice->ts = getCurrentTimeInNano() - slice_age_ns;
+        task.slice_list.push_back(slice);
+        return slice;
+    }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    static void prepareFinishedBatchWithActiveCallback(
+        MultiTransport& transport, Transport::BatchID batch_id) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+        task.is_finished = true;
+        batch.active_completion_callbacks.store(1, std::memory_order_release);
+    }
+
+    static void finishActiveCompletionCallback(MultiTransport& transport,
+                                               Transport::BatchID batch_id) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        batch.active_completion_callbacks.store(0, std::memory_order_release);
+    }
+#endif
+
+    static bool isCleanupDeferred(MultiTransport& transport,
+                                  Transport::BatchID batch_id) {
+        std::lock_guard<std::mutex> guard(transport.deferred_cleanup_mutex_);
+        return transport.deferred_cleanup_batches_.count(batch_id) != 0;
     }
 };
 
@@ -271,6 +329,34 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
     bool extra_slice_ = false;
 };
 
+class ScopedSliceTimeout {
+   public:
+    explicit ScopedSliceTimeout(int64_t timeout_sec)
+        : old_timeout_(globalConfig().slice_timeout) {
+        globalConfig().slice_timeout = timeout_sec;
+    }
+
+    ~ScopedSliceTimeout() { globalConfig().slice_timeout = old_timeout_; }
+
+   private:
+    int64_t old_timeout_;
+};
+
+class TimeoutThenFailureTransport : public BatchResultTransport {
+   public:
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = status_.load(std::memory_order_acquire);
+        return Status::OK();
+    }
+
+    void fail() {
+        status_.store(TransferStatusEnum::FAILED, std::memory_order_release);
+    }
+
+   private:
+    std::atomic<TransferStatusEnum> status_{TransferStatusEnum::TIMEOUT};
+};
+
 class TransportTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -317,6 +403,97 @@ TEST_F(TransportTest, parseHostNameWithPortTest) {
     ASSERT_EQ(res.first, "1.2.3.4");
     ASSERT_EQ(res.second, 12001);
 }
+
+TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
+    ScopedSliceTimeout timeout(/*timeout_sec=*/1);
+    std::string server_name = "unit-test-server:1234";
+    MultiTransport multi_transport(nullptr, server_name);
+    auto batch_id = multi_transport.allocateBatchID(1);
+    auto* slice = TransferEngineImplTestPeer::prepareAgedSliceBatch(
+        multi_transport, batch_id, /*slice_age_ns=*/2'000'000'000LL);
+
+    Transport::TransferStatus status;
+    ASSERT_EQ(multi_transport.getTransferStatus(batch_id, 0, status),
+              Status::OK());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::TIMEOUT);
+
+    Status free_status = multi_transport.freeBatchID(batch_id);
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
+    EXPECT_EQ(free_status.ToString(),
+              "BatchCleanupDeferred: BatchID is invalid because cleanup has "
+              "been deferred");
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
+    EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                              batch_id));
+
+    slice->markFailed();
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                         batch_id) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                               batch_id));
+}
+
+TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
+    std::string server_name = "unit-test-server:1234";
+    TimeoutThenFailureTransport task_transport;
+    MultiTransport multi_transport(nullptr, server_name);
+    auto batch_id = multi_transport.allocateBatchID(1);
+    TransferEngineImplTestPeer::prepareBusyBatch(multi_transport, batch_id,
+                                                 &task_transport);
+
+    Status free_status = multi_transport.freeBatchID(batch_id);
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
+    EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                              batch_id));
+
+    task_transport.fail();
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                         batch_id) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                               batch_id));
+}
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
+    std::string server_name = "unit-test-server:1234";
+    MultiTransport multi_transport(nullptr, server_name);
+    auto batch_id = multi_transport.allocateBatchID(1);
+    TransferEngineImplTestPeer::prepareFinishedBatchWithActiveCallback(
+        multi_transport, batch_id);
+
+    Status free_status = multi_transport.freeBatchID(batch_id);
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
+    EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                              batch_id));
+
+    TransferEngineImplTestPeer::finishActiveCompletionCallback(multi_transport,
+                                                               batch_id);
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                         batch_id) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                               batch_id));
+}
+#endif
 
 TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
     int cleanup_count = 0;

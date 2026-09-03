@@ -234,6 +234,8 @@ class Transport {
                                                   bool count_slice = true) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             auto &batch_desc = toBatchDesc(task->batch_id);
+            batch_desc.active_completion_callbacks.fetch_add(
+                1, std::memory_order_acq_rel);
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
             }
@@ -283,6 +285,8 @@ class Transport {
                     batch_desc.completion_cv.notify_all();
                 }
             }
+            batch_desc.active_completion_callbacks.fetch_sub(
+                1, std::memory_order_acq_rel);
 #endif
         }
     };
@@ -392,6 +396,10 @@ class Transport {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Event-driven completion: tracks batch progress and notifies waiters
         std::atomic<uint64_t> finished_task_count{0};
+        // Number of completion callbacks currently inside
+        // check_batch_completion and therefore still allowed to read or update
+        // this BatchDesc.
+        std::atomic<uint64_t> active_completion_callbacks{0};
 
         // Synchronization primitives for direct notification
         std::mutex completion_mutex;
