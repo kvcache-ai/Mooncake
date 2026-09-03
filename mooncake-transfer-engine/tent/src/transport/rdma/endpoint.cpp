@@ -1216,7 +1216,11 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
                notify_pending_count_ < kNotifyMaxPendingSends;
     });
     if (!notify_connected_) {
-        LOG(ERROR) << "Notification QP not connected";
+        // Every send on this endpoint fails the same way until it is
+        // rebuilt, and the caller has a fallback path; one line per hundred
+        // is enough to show it is happening.
+        LOG_EVERY_N(WARNING, 100)
+            << "Notification QP not connected on endpoint " << endpoint_name_;
         return false;
     }
     std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);

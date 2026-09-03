@@ -808,7 +808,8 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
-                                                         int device_id) {
+                                                         int device_id,
+                                                         Status* failure) {
     std::string rpc_server_addr, target_seg_name, target_dev_name,
         target_nic_path_name;
 
@@ -836,6 +837,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
 
     if (!status.ok()) {
         LOG(ERROR) << status.ToString();
+        if (failure) *failure = status;
         return nullptr;
     }
 
@@ -849,6 +851,10 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         }
     }
     if (!context) {
+        if (failure) {
+            *failure =
+                Status::DeviceNotFound("No enabled RDMA context" LOC_MARK);
+        }
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
@@ -856,6 +862,10 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
+        if (failure) {
+            *failure =
+                Status::InternalError("Cannot allocate endpoint" LOC_MARK);
+        }
         return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
@@ -869,21 +879,39 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                 LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
                            << status.ToString();
             }
+            if (failure) *failure = status;
             return nullptr;
         }
     }
     return endpoint;
 }
 
+Status RdmaTransport::notifyStatusForEndpointFailure(const Status& failure) {
+    if (failure.IsRpcServiceError()) {
+        return Status::RpcServiceError(
+            "RDMA notification endpoint bootstrap failed; peer control "
+            "plane unreachable, not falling back to RPC: " +
+            std::string{failure.message()} + LOC_MARK);
+    }
+    return Status::DeviceNotFound("RDMA notification endpoint unavailable: " +
+                                  std::string{failure.message()} + LOC_MARK);
+}
+
 Status RdmaTransport::sendNotification(SegmentID target_id,
                                        const Notification& notify) {
-    auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID);
-    if (!endpoint) {
-        return Status::InternalError(
-            "Endpoint not found for notification" LOC_MARK);
-    }
+    // Both failures below mean nothing left this host. Unless the bootstrap
+    // RPC itself failed (see notifyStatusForEndpointFailure), the engine may
+    // still reach the peer over the control plane, so they are reported with
+    // codes TransferEngineImpl::sendNotification() recognizes as "channel
+    // unavailable" rather than as a generic internal error.
+    Status failure;
+    auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID, &failure);
+    if (!endpoint) return notifyStatusForEndpointFailure(failure);
+    // Notify QP not connected (the peer has none, or it was disabled after a
+    // fault), or the post itself was refused.
     if (!endpoint->sendNotification(notify.name, notify.msg)) {
-        return Status::InternalError("Failed to send notification" LOC_MARK);
+        return Status::RdmaError(
+            "RDMA notification channel unavailable" LOC_MARK);
     }
     return Status::OK();
 }
