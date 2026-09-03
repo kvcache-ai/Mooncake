@@ -250,9 +250,9 @@ class MasterClient {
         // only the master logs), on at -v>=2 for per-hop tracing. Fires on
         // both the real path (in-proc) and the dummy path (real-client server
         // thread) since master_client_ is shared.
-        if (!ctx_attachment.empty()) {
+        if (current_request_context) {
             VLOG(2) << "hop-B inject request_id="
-                    << current_request_context.request_id;
+                    << current_request_context->request_id;
         }
         auto start_time = std::chrono::steady_clock::now();
         auto ret = co_await pool->send_request(
@@ -322,9 +322,9 @@ class MasterClient {
         // only the master logs), on at -v>=2 for per-hop tracing. Fires on
         // both the real path (in-proc) and the dummy path (real-client server
         // thread) since master_client_ is shared.
-        if (!ctx_attachment.empty()) {
+        if (current_request_context) {
             VLOG(2) << "hop-B inject request_id="
-                    << current_request_context.request_id;
+                    << current_request_context->request_id;
         }
         auto start_time = std::chrono::steady_clock::now();
         return async_simple::coro::syncAwait(
