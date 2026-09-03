@@ -144,7 +144,7 @@ jobs:
         run: |
           docker build -f docker/mooncake.Dockerfile \
             --build-arg PYTHON_VERSION=3.10 \
-            --build-arg EP_TORCH_VERSIONS="2.13.0" \
+            --build-arg TORCH_VERSION="2.14.0" \
             --build-arg CLEAN_BUILD_ARTIFACTS=1 \
             -t mooncake:from-source .
 

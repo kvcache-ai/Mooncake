@@ -135,10 +135,15 @@ class DeviceSelector {
     // Allocate devices for a request (new API)
     // slice_bytes: pre-calculated slice size from rdma_transport to ensure
     // consistency
+    // slice_charged_bytes (optional): filled, in lockstep with slice_dev_ids,
+    // with the exact inflight bytes charged for each slice so the caller can
+    // release precisely what was added (0 entries in baseline mode, which does
+    // not track inflight).
     Status allocate(uint64_t total_length, uint32_t num_slices,
                     uint64_t slice_bytes, const std::string &location,
                     std::vector<int> &slice_dev_ids, int priority = PRIO_HIGH,
-                    uint64_t device_mask = ~0ULL);
+                    uint64_t device_mask = ~0ULL,
+                    std::vector<uint64_t> *slice_charged_bytes = nullptr);
 
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id);
@@ -151,6 +156,13 @@ class DeviceSelector {
                     int &chosen_dev_id, int priority, uint64_t device_mask);
 
     Status release(int dev_id, uint64_t length, double latency);
+
+    // Charge inflight bytes against a specific device without running device
+    // selection. Used when the routing NIC changes after the original charge
+    // (fallback re-route) or when a retry has to re-enter the inflight view, so
+    // that the charged device stays symmetric with the device release()
+    // unwinds.
+    Status chargeDevice(int dev_id, uint64_t length);
 
     Status getNicLoadStats(std::vector<NicLoadStats> &stats) const;
 
@@ -181,6 +193,10 @@ class DeviceSelector {
         // NUMA tier penalties (rank 0 = local, should be smallest)
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};
+
+        // Hard-exclude known cross-NUMA NICs; unknown NUMA keeps
+        // numa_tier_weights.
+        bool strict_local_numa = false;
 
         // EWMA bandwidth learning rate (0.0 = full adaptation, 1.0 = no
         // learning)
@@ -222,6 +238,9 @@ class DeviceSelector {
         return sched_params_;
     }
 
+    // Startup warning if the flag excludes every NIC or classifies none.
+    void auditStrictLocalNuma() const;
+
    private:
     std::shared_ptr<Topology> local_topology_;
     std::unordered_map<int, DeviceInfo> devices_;
@@ -240,6 +259,19 @@ class DeviceSelector {
                it->second.available.load(std::memory_order_relaxed);
     }
 
+    const char *noEligibleDeviceReason() const {
+        return sched_params_.strict_local_numa
+                   ? "no eligible devices (strict_local_numa excludes "
+                     "cross-NUMA NICs)"
+                   : "no eligible devices";
+    }
+
+    bool isNumaEligible(const Topology::MemEntry *entry, int dev_id) const {
+        if (!sched_params_.strict_local_numa) return true;
+        if (!entry || !local_topology_) return true;
+        return !local_topology_->isCrossNuma(*entry, dev_id);
+    }
+
     Status buildCandidates(const Topology::MemEntry *entry,
                            uint64_t slice_bytes, uint64_t device_mask,
                            std::vector<Candidate> &candidates,
@@ -247,12 +279,14 @@ class DeviceSelector {
 
     void selectSinglePath(const std::vector<Candidate> &candidates,
                           uint32_t num_slices, uint64_t total_length,
-                          std::vector<int> &slice_dev_ids);
+                          std::vector<int> &slice_dev_ids,
+                          std::vector<uint64_t> *slice_charged_bytes = nullptr);
 
     void selectMultiPath(const std::vector<Candidate> &candidates,
                          uint32_t num_slices, uint64_t total_length,
                          std::vector<int> &slice_dev_ids,
-                         bool probe_mode = false);
+                         bool probe_mode = false,
+                         std::vector<uint64_t> *slice_charged_bytes = nullptr);
 };
 
 }  // namespace tent

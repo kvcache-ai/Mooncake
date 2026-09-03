@@ -85,6 +85,16 @@ static inline void setConfig(Config& config, const std::string& env_key,
     if (val) config.setFromString(config_key, std::string(val));
 }
 
+// Bool env vars: setFromString() stores "1" as int, so get(..., false) misses
+// it.
+static inline void setBoolConfig(Config& config, const std::string& env_key,
+                                 const std::string& config_key) {
+    const char* val = std::getenv(env_key.c_str());
+    if (!val) return;
+    config.set(config_key,
+               ConfigHelper::parseBool(val, config.get(config_key, false)));
+}
+
 // Like setConfig, but parses the env value as a comma-separated list and
 // stores it as a string array. Empty/whitespace-only items are dropped so a
 // trailing comma or spaces around names are tolerated (e.g. "mlx5_0, mlx5_1").
@@ -135,6 +145,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     }
 
     // Legacy keys for backward compatibility (MC_* env vars)
+    setConfig(config, "MOONCAKE_LOCAL_HOSTNAME", "rpc_server_hostname");
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",
               "transports/rdma/device/num_cq_list");
@@ -167,6 +178,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/disable_gpu_direct_rdma");
     setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
               "transports/rdma/log_slice_affinity");
+    setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
+                  "transports/rdma/strict_local_numa");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated
     // device names). MC_TE_FILTERS is an allow-list — same name and semantics
     // as the legacy Transfer Engine's device whitelist, so a single env works

@@ -143,11 +143,18 @@ int processBatchSizes(
                    deadline_us * 1000ull;
         };
 
+        auto failTask = [&]() {
+            measurement_started.store(true, std::memory_order_release);
+            return -1;
+        };
+
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {
-            runner.runSingleTransfer(local_addr, target_id, target_addr,
-                                     thread_block_size, thread_batch_size,
-                                     opcode, deadlineNs(), intent_type);
+            if (runner.runSingleTransfer(
+                    local_addr, target_id, target_addr, thread_block_size,
+                    thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
+                return failTask();
+            }
         }
         if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
             num_threads) {
@@ -174,6 +181,7 @@ int processBatchSizes(
                 auto val = runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
+                if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
                 transfer_duration.push_back(val);
@@ -182,6 +190,7 @@ int processBatchSizes(
                 val = runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
+                if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
                 if (XferBenchConfig::check_consistency)
@@ -206,6 +215,7 @@ int processBatchSizes(
                 auto val = runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
+                if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
                 if (read_verify) {
@@ -459,5 +469,5 @@ int main(int argc, char* argv[]) {
         }
         runner->stopInitiator();
     }
-    return 0;
+    return interrupted ? EXIT_FAILURE : EXIT_SUCCESS;
 }

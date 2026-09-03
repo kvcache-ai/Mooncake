@@ -554,7 +554,7 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 | `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
 | `ssd_free_ratio_first` | SSD-aware memory allocation when SSD offloading is enabled | Depends on SSD usage metrics; falls back to random allocation when needed |
 | `cxl` | CXL memory hardware | CXL-specific; single-replica only |
-| `local_first` | Colocated inference workers and memory store segments | Requires stable host identity in `local_hostname`; single memory replica only |
+| `local_first` | Colocated inference workers and memory store segments | Requires stable host identity from `MOONCAKE_HOST_ID` or `local_hostname`; single memory replica only |
 
 **Use `random`** (default) when your cluster is relatively stable (segments rarely join or leave) and you want the highest possible allocation throughput.
 
@@ -566,7 +566,7 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 
 **Use `cxl`** only when your hardware includes CXL (Compute Express Link) memory devices and you want to allocate data exclusively on CXL segments.
 
-**Use `local_first`** when inference workers and Mooncake Store memory segments are colocated and you want writes to prefer the writer's host before falling back to other hosts. For this strategy to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique host part in `local_hostname`.
+**Use `local_first`** when inference workers and Mooncake Store memory segments are colocated and you want writes to prefer the writer's host before falling back to other hosts. For this strategy to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique `MOONCAKE_HOST_ID`. When the variable is unset or empty, Mooncake derives the host identity from `local_hostname` by removing the port.
 
 For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../../performance/mooncake/allocation-strategy-benchmark-result.md).
 
@@ -604,6 +604,8 @@ An SSD-aware variant of the free-ratio-first strategy. It first tries preferred 
 **`local_first` — Local-first allocation**
 
 Host-aware local-first allocation reuses the normal preferred-segment flow. The master derives the writer host id from the request's client host identity and builds an ordered preferred segment list: active hosts are visited in cyclic lexicographic host-id order, starting from the writer host when it has active segments, or otherwise from the next greater active host id. Within the same host, segment names are sorted and rotated by key hash so multiple local segments do not always receive the first allocation attempt.
+
+The C++ client reads `MOONCAKE_HOST_ID` as an explicit deployment override for the client identity carried in allocation requests and the identity recorded for mounted segments. This lets containerized deployments keep `local_hostname` as a routable per-pod transfer endpoint while using a shared node-level placement identity. Loopback and wildcard overrides are rejected; an empty override preserves the derived-hostname behavior.
 
 This strategy currently applies to memory allocation with `replica_num == 1`. Explicit `preferred_segment` or `preferred_segments` in `ReplicateConfig` are still tried first; if they are unavailable or full, allocation continues with the local-first ordered fallback list.
 
