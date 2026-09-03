@@ -82,6 +82,7 @@ class RedisOpLogStore : public OpLogStore {
     void StopAsyncWorkers();
     void AsyncWriteLoop(size_t worker_id);
     ErrorCode PersistEntryNoLatest(redisContext* ctx, const OpLogEntry& entry);
+    bool HasCommittableLatestUnlocked() const;
     ErrorCode AdvanceCommittedLatestUnlocked(redisContext* ctx);
     void CompleteWrite(redisContext* ctx,
                        const std::shared_ptr<PendingWrite>& pending,
@@ -105,7 +106,7 @@ class RedisOpLogStore : public OpLogStore {
     // while best-effort entries use bounded retries.
     //
     // Redis oplog key model:
-    // - latest: committed progress watermark; dropped entries may leave holes
+    // - latest: committed progress watermark; dropped entries may bridge holes
     // - trimmed: highest sequence already removed by cleanup
     // - entry:<seq>: serialized oplog payload
     // OpLog keys intentionally avoid Redis Cluster hash tags so

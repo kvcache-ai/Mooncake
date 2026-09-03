@@ -168,10 +168,11 @@ class RedisOpLogStoreTest : public ::testing::Test {
     }
 
     OpLogEntry MakeEntry(uint64_t sequence_id,
-                         const std::string& key = "redis_key") const {
+                         const std::string& key = "redis_key",
+                         OpType op_type = OpType::PUT_END) const {
         OpLogEntry entry;
         entry.sequence_id = sequence_id;
-        entry.op_type = OpType::PUT_END;
+        entry.op_type = op_type;
         entry.object_key = key;
         entry.payload = "payload_" + std::to_string(sequence_id);
         entry.timestamp_ms = sequence_id * 10;
@@ -343,6 +344,52 @@ TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
               writer->ReadOpLogSinceWithProgress(0, 10, entries, progress));
     ASSERT_EQ(1u, entries.size());
     EXPECT_EQ(2u, progress.last_scanned_sequence_id);
+}
+
+TEST_F(RedisOpLogStoreTest, DroppedSequenceNeedsLaterPersistedEntry) {
+    auto writer = std::make_unique<RedisOpLogStore>(
+        cluster_id_, redis_endpoint_, /*enable_write=*/true,
+        /*poll_interval_ms=*/10, redis_password_, redis_username_,
+        /*db_index=*/0, /*async_queue_max_entries=*/1,
+        OpLogAsyncQueueOverflowMode::BYPASS,
+        /*best_effort_max_retries=*/3);
+    ASSERT_EQ(ErrorCode::OK, writer->Init());
+
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(3), false));
+    OpLogEntry stored;
+    for (int i = 0; i < 100; ++i) {
+        if (writer->ReadOpLog(3, stored) == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(3u, stored.sequence_id);
+
+    ASSERT_EQ(ErrorCode::OK,
+              writer->WriteOpLog(
+                  MakeEntry(1, "best_effort", OpType_PUBLISH_ROUTE), false));
+
+    uint64_t latest = 0;
+    for (int i = 0; i < 20; ++i) {
+        ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+        EXPECT_EQ(0u, latest);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
+    ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+    EXPECT_EQ(3u, latest);
+
+    std::vector<OpLogEntry> entries;
+    OpLogReadProgress progress;
+    ASSERT_EQ(ErrorCode::OK,
+              writer->ReadOpLogSinceWithProgress(0, 10, entries, progress));
+    ASSERT_EQ(2u, entries.size());
+    EXPECT_EQ(2u, entries[0].sequence_id);
+    EXPECT_EQ(3u, entries[1].sequence_id);
+    EXPECT_EQ(
+        std::vector<uint64_t>{1},
+        FindMissingSequenceIds(0, entries, progress.last_scanned_sequence_id));
 }
 
 TEST_F(RedisOpLogStoreTest, SparseReadLimitsScannedSequenceRange) {

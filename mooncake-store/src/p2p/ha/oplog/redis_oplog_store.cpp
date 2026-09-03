@@ -289,8 +289,7 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
             std::unique_lock<std::mutex> lock(async_mutex_);
             async_cv_.wait(lock, [&] {
                 return !async_running_.load() || !pending_writes_.empty() ||
-                       dropped_sequences_.count(committed_sequence_id_ + 1) !=
-                           0;
+                       HasCommittableLatestUnlocked();
             });
             if (!async_running_.load() && pending_writes_.empty()) {
                 break;
@@ -413,11 +412,36 @@ ErrorCode RedisOpLogStore::PersistEntryNoLatest(redisContext* ctx,
     return ErrorCode::OK;
 }
 
+bool RedisOpLogStore::HasCommittableLatestUnlocked() const {
+    uint64_t scan = committed_sequence_id_;
+    for (;;) {
+        const uint64_t next = scan + 1;
+        if (persisted_sequences_.count(next) != 0) {
+            return true;
+        }
+        if (dropped_sequences_.count(next) != 0) {
+            ++scan;
+            continue;
+        }
+        return false;
+    }
+}
+
 ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
+    uint64_t scan = committed_sequence_id_;
     uint64_t target = committed_sequence_id_;
-    while (persisted_sequences_.count(target + 1) != 0 ||
-           dropped_sequences_.count(target + 1) != 0) {
-        ++target;
+    for (;;) {
+        const uint64_t next = scan + 1;
+        if (persisted_sequences_.count(next) != 0) {
+            scan = next;
+            target = next;
+            continue;
+        }
+        if (dropped_sequences_.count(next) != 0) {
+            scan = next;
+            continue;
+        }
+        break;
     }
     if (target == committed_sequence_id_) {
         return ErrorCode::OK;
