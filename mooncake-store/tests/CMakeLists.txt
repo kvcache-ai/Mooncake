@@ -37,14 +37,20 @@ endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
+add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
+add_store_test(replica_selection_config_test replica_selection_config_test.cpp)
+set_tests_properties(replica_selection_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=0")
 add_test(
   NAME replica_selection_env_opt_in_test
-  COMMAND replica_selection_test
-          --gtest_filter=ReplicaSelectionTest.EnvironmentOptInUsesBuiltinScorer)
+  COMMAND
+    replica_selection_test
+    --gtest_filter=ReplicaSelectionTest.EnvironmentOptInUsesBuiltinScorer:ReplicaSelectionTest.EnvironmentIsCachedButInjectedScorerRemainsLive
+)
 set_tests_properties(replica_selection_env_opt_in_test
                      PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
@@ -74,6 +80,22 @@ target_link_libraries(master_service_group_scenario_test
 add_store_test(master_service_tenant_scenario_test
                master_service_tenant_scenario_test.cpp)
 target_link_libraries(master_service_tenant_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_placement_scenario_test
+               master_service_placement_scenario_test.cpp)
+target_link_libraries(master_service_placement_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_replication_scenario_test
+               master_service_replication_scenario_test.cpp)
+target_link_libraries(master_service_replication_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_task_scenario_test
+               master_service_task_scenario_test.cpp)
+target_link_libraries(master_service_task_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_segment_scenario_test
+               master_service_segment_scenario_test.cpp)
+target_link_libraries(master_service_segment_scenario_test
                       PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
@@ -145,6 +167,7 @@ add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
+add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
@@ -155,9 +178,12 @@ endif()
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
+add_store_test(client_metric_config_test client_metric_config_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
 add_store_test(dfs_posix_test dfs_posix_test.cpp)
+add_store_test(distributed_storage_config_test
+               distributed_storage_config_test.cpp)
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
 add_test(NAME dfs_batch_read_checksum_test
          COMMAND dfs_sync_client_test
@@ -197,6 +223,8 @@ add_store_test(master_service_test_for_snapshot
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv_storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(offset_allocator_backend_config_test
+               offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)

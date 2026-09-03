@@ -62,11 +62,13 @@ class WorkerPool {
 
     void performPostSend(int thread_id);
 
-    void performPollCq(int thread_id);
-    void processCompletions(int thread_id, const std::vector<ibv_wc> &wc_list);
+    int performPollCq(int thread_id, bool defer_local_redispatch = false);
+    void processCompletions(int thread_id, const std::vector<ibv_wc> &wc_list,
+                            bool defer_local_redispatch = false);
 
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
-                    bool handoff_to_local_worker = false);
+                    bool handoff_to_local_worker = false,
+                    bool defer_local_redispatch = false);
 
     void transferWorker(int thread_id);
 

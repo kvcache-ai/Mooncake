@@ -482,6 +482,16 @@ class Client {
     tl::expected<void, ErrorCode> UnmountLocalDiskSegment();
 
     /**
+     * @brief Installs the existence probe used by the dangling-replica heal.
+     * The probe lives outside this class because the offload file storage is
+     * owned by the caller (RealClient), not by Client.
+     */
+    void SetLocalDiskProbe(
+        std::function<std::optional<bool>(const std::string& key)> probe) {
+        local_disk_probe_fn_ = std::move(probe);
+    }
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
@@ -775,6 +785,24 @@ class Client {
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
+    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
+    // completed replica is a LOCAL_DISK replica owned by this client, and ask
+    // the installed probe (FileStorage::Exists over the offload files) whether
+    // the backing file is gone (issue #3709). Only then evict the dangling
+    // replica so the Put can be retried; any other outcome keeps the old
+    // idempotent path. Returns true only when a replica was actually evicted.
+    bool healDanglingLocalDiskReplica(const ObjectKey& key);
+    // The BatchPutStart counterpart: heals the OBJECT_ALREADY_EXISTS subset
+    // with one batched replica-list query and one batched evict, then retries
+    // PutStart for just the evicted keys and splices the responses back, so a
+    // healthy idempotent batch pays one extra RPC and no evictions.
+    void healDanglingLocalDiskBatchStarts(
+        std::vector<PutOperation>& ops,
+        const std::vector<size_t>& active_indices,
+        const std::vector<size_t>& already_exists,
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<uint64_t>>& slice_lengths,
+        const ReplicateConfig& config);
     ErrorCode InitTransferEngine(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
@@ -814,8 +842,8 @@ class Client {
                         const DiskDescriptor& disk_descriptor);
     /**
      * @brief Initialize local hot cache
-     * @return ErrorCode::OK if use local hot cache,
-     * ErrorCode::INVALID_PARAMS if invalid MC_STORE_LOCAL_HOT_CACHE_SIZE config
+     * @return ErrorCode::OK if disabled or initialized successfully;
+     * ErrorCode::INVALID_PARAMS if cache allocation or registration fails
      */
     ErrorCode InitLocalHotCache();
 
@@ -823,21 +851,6 @@ class Client {
      * @brief Unregister local hot cache backing memory from TransferEngine.
      */
     void UnregisterLocalHotCacheMemory();
-
-    /**
-     * @brief Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment variable
-     * @return Cache size in bytes, or 0 if not set or invalid
-     */
-    size_t GetLocalHotCacheSizeFromEnv();
-
-    /**
-     * @brief Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment variable
-     * @param default_value Default block size to use if env var is not set or
-     * invalid
-     * @return Parsed block size from environment, or default_value if not
-     * set/invalid
-     */
-    size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
 
     /**
      * @brief Redirect replica descriptor to local hot cache if cache hit
@@ -957,6 +970,14 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+
+    // Probe used by healDanglingLocalDiskReplica to prove a completed
+    // LOCAL_DISK replica's backing file is gone. Installed by the owner of
+    // the offload file storage (RealClient); unset means no local-disk
+    // offload is active and the heal stays inert. true: file is gone,
+    // false: file present, nullopt: unknown (keep the old path).
+    std::function<std::optional<bool>(const std::string& key)>
+        local_disk_probe_fn_;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;

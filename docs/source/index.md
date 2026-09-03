@@ -131,6 +131,8 @@ design/reshard-manifest
 design/model-weight-reshard-planner
 design/tent/overview
 design/store/mooncake-store
+design/kv-event/publisher-design
+design/kv-event/subscriber-guide
 design/nvme-kv-backend
 design/mooncake-backend-pg
 design/mooncake-ep

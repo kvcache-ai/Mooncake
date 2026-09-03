@@ -8,6 +8,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
+    config/distributed_storage_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     utils/file_util.cpp)
@@ -20,6 +21,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_repository.cpp
     master_metric_manager.cpp
     segment/region_driver.cpp
+    placement/index.cpp
+    placement/replica_allocator.cpp
     segment.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
@@ -86,12 +89,17 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    config/registered_pinned_memory_config.cpp
     registered_pinned_memory.cpp
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    config/client_metric_config.cpp
     config/file_storage_config.cpp
     config/client_auto_port_config.cpp
+    config/local_hot_cache_config.cpp
+    config/offset_allocator_backend_config.cpp
+    config/replica_selection_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -111,6 +119,44 @@ if(BUILD_UNIT_TESTS)
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
+
+# RISC-V toolchains may implement 16-byte atomic operations in libatomic rather
+# than emitting native instructions. Boost.Lockfree uses these operations in the
+# Store master, so detect and propagate the runtime library in RISC-V mode.
+if(USE_RISCV)
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles(
+    "
+alignas(16) volatile unsigned __int128 value = 0;
+int main(int argc, char**) {
+  __atomic_store_n(&value, static_cast<unsigned __int128>(argc),
+                   __ATOMIC_SEQ_CST);
+  return static_cast<int>(__atomic_load_n(&value, __ATOMIC_SEQ_CST));
+}
+"
+    MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
+  if(NOT MOONCAKE_HAS_NATIVE_16BYTE_ATOMICS)
+    set(CMAKE_REQUIRED_LIBRARIES_SAVE ${CMAKE_REQUIRED_LIBRARIES})
+    set(CMAKE_REQUIRED_LIBRARIES atomic)
+    check_cxx_source_compiles(
+      "
+alignas(16) volatile unsigned __int128 value = 0;
+int main(int argc, char**) {
+  __atomic_store_n(&value, static_cast<unsigned __int128>(argc),
+                   __ATOMIC_SEQ_CST);
+  return static_cast<int>(__atomic_load_n(&value, __ATOMIC_SEQ_CST));
+}
+"
+      MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
+    set(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES_SAVE})
+    if(MOONCAKE_HAS_LIBATOMIC_16BYTE_ATOMICS)
+      list(APPEND EXTRA_LIBS atomic)
+      message(STATUS "16-byte atomics: using libatomic")
+    else()
+      message(FATAL_ERROR "16-byte atomic operations are not supported")
+    endif()
+  endif()
+endif()
 
 # Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)

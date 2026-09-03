@@ -39,6 +39,10 @@ class DeviceSelector;
 
 class Workers {
     friend class RdmaTransportTestPeer;
+    // Grants the quota-accounting unit test access to the private static
+    // charge/release reconcile helpers (they only need a DeviceSelector, so the
+    // test can exercise them without constructing a Workers / RdmaTransport).
+    friend class WorkersQuotaTestAccessor;
 
    public:
     static constexpr size_t kCapacity = 1024 * 8;
@@ -73,7 +77,16 @@ class Workers {
 
     bool cancelUnpostedSlice(WorkerContext& worker, RdmaSlice* slice);
 
-    void releaseSliceQuota(RdmaSlice* slice, double latency = 0.0);
+    // Release a slice's inflight charge against the device it was charged on,
+    // unwinding exactly charged_bytes. static so the accounting can be unit
+    // tested with just a DeviceSelector (no Workers/RdmaTransport instance).
+    static void releaseSliceQuota(DeviceSelector* selector, RdmaSlice* slice,
+                                  double latency = 0.0);
+
+    // Reconcile a slice's inflight charge onto its current routing NIC
+    // (source_dev_id), migrating a stale charge or re-charging after a retry.
+    // static for the same testability reason as releaseSliceQuota.
+    static void chargeSliceQuota(DeviceSelector* selector, RdmaSlice* slice);
 
     void monitorThread();
 
@@ -84,6 +97,9 @@ class Workers {
 
     // dev_id is the NicID (context_set_ index), which is also the
     // DeviceSelector id, so port events can flip that device's availability.
+    // Drains the whole async event queue: the async fd is edge-triggered and
+    // ibv_get_async_event() dequeues one record per call, so an event left
+    // behind waits for an unrelated later event to release it.
     int handleContextEvents(int dev_id, std::shared_ptr<RdmaContext>& context);
 
     // The decision half of handleContextEvents, kept apart from
@@ -94,10 +110,23 @@ class Workers {
     void applyContextEvent(int dev_id, RdmaContext& context,
                            const ibv_async_event& event);
 
+    // Everything a recovered port needs: resume the context, re-seed its
+    // bandwidth and make it selectable again. Shared by the
+    // IBV_EVENT_PORT_ACTIVE path and by resumePausedContexts().
+    void activateContext(int dev_id, RdmaContext& context);
+
     // Re-read the link speed after a port event and re-seed the selector if
     // it changed; a link that returns at the same speed keeps what it
     // learned.
     void refreshLinkSpeed(int dev_id, RdmaContext& context);
+
+    // 1 Hz heartbeat from monitorThread(): safety net for a lost
+    // IBV_EVENT_PORT_ACTIVE. Nothing else ever leaves DEVICE_PAUSED, so a
+    // context whose recovery event was dropped (edge-triggered fd, event
+    // queue overflow, ...) would fail every transfer on that NIC forever.
+    // Polls the port state of paused contexts and activates the ones the
+    // hardware reports as up.
+    void resumePausedContexts();
 
     Status generatePostPath(RdmaSlice* slice);
 
