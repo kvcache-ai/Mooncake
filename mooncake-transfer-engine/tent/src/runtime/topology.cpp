@@ -108,11 +108,6 @@ void Topology::print() const {
 }
 
 Status Topology::discover(const std::vector<Platform*>& platforms) {
-    return discover(platforms, false);
-}
-
-Status Topology::discover(const std::vector<Platform*>& platforms,
-                          bool discover_ub) {
     clear();
     for (auto& entry : platforms) {
         CHECK_STATUS(entry->probe(nic_list_, mem_list_));
@@ -121,7 +116,7 @@ Status Topology::discover(const std::vector<Platform*>& platforms,
     // UB discovery is intentionally adapter-backed instead of inferring UB
     // devices from verbs/sysfs names. One topology NIC is emitted per EID and
     // carries both the globally serialized identity and the native URMA name.
-    auto adapter = discover_ub ? ub::createDefaultUrmaAdapter() : nullptr;
+    auto adapter = ub::createDefaultUrmaAdapter();
     if (adapter && adapter->available()) {
         auto status = adapter->initialize();
         if (status.ok()) {
@@ -182,7 +177,6 @@ Status Topology::discover(const std::vector<Platform*>& platforms,
         }
     }
 #endif
-    (void)discover_ub;
     return Status::OK();
 }
 

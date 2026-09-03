@@ -80,11 +80,7 @@ class Topology {
 
     void clear();
 
-    // Preserve the original one-argument symbol for source and binary
-    // compatibility with callers that do not opt into UB discovery.
     Status discover(const std::vector<Platform*>& platforms);
-
-    Status discover(const std::vector<Platform*>& platforms, bool discover_ub);
 
     Status parse(const std::string& json_content);
 
