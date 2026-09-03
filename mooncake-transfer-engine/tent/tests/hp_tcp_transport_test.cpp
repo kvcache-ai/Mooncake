@@ -12,6 +12,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -34,6 +35,11 @@ class HighPerformanceTcpTransportTestPeer {
 
     static bool hasFailedWorker(const HighPerformanceTcpTransport& transport) {
         return transport.workers_->hasFailedWorker();
+    }
+
+    static uint64_t connectionsCreated(
+        const HighPerformanceTcpTransport& transport) {
+        return transport.client_->connectionsCreatedForTest();
     }
 };
 
@@ -233,6 +239,94 @@ Status WaitForTransportResult(HighPerformanceTcpTransport& transport,
         std::this_thread::yield();
     }
     return Status::InternalError("HP TCP test transfer did not finish");
+}
+
+TEST(HighPerformanceTcpTransportTest, SlicesSingleLargeReadAcrossTwoRails) {
+    constexpr size_t kLength = 4ULL << 20;
+    auto params = MakeParams();
+    params.bind_address.clear();
+    params.rail_addresses = {"127.0.0.1", "127.0.0.2"};
+    params.max_outstanding_bytes = 8ULL << 20;
+    params.max_transfer_bytes = 8ULL << 20;
+
+    auto server_metadata = MakeLocalMetadata();
+    uint16_t rpc_port = 0;
+    ASSERT_TRUE(server_metadata->start(rpc_port).ok());
+    const std::string server_name = "127.0.0.1:" + std::to_string(rpc_port);
+    ASSERT_TRUE(server_metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) -> Status {
+                        segment.name = server_name;
+                        segment.rpc_server_addr = server_name;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    HighPerformanceTcpTransport server(params);
+    std::string installed_server_name = server_name;
+    ASSERT_TRUE(
+        server.install(installed_server_name, server_metadata, nullptr, nullptr)
+            .ok());
+    std::vector<uint8_t> remote(kLength);
+    for (size_t i = 0; i < remote.size(); ++i) {
+        remote[i] = static_cast<uint8_t>((i * 17) & 0xff);
+    }
+    BufferDesc remote_desc;
+    remote_desc.addr = reinterpret_cast<uint64_t>(remote.data());
+    remote_desc.length = remote.size();
+    remote_desc.location = "cpu:0";
+    MemoryOptions remote_options;
+    remote_options.type = HP_TCP;
+    remote_options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(server.addMemoryBuffer(remote_desc, remote_options).ok());
+    ASSERT_TRUE(PublishBuffers(server_metadata, {remote_desc}).ok());
+
+    auto client_metadata = MakeLocalMetadata();
+    HighPerformanceTcpTransport client(params);
+    std::string client_name = "hp_transport_client";
+    ASSERT_TRUE(
+        client.install(client_name, client_metadata, nullptr, nullptr).ok());
+    SegmentID target = 0;
+    ASSERT_TRUE(
+        client_metadata->segmentManager().openRemote(target, server_name).ok());
+
+    std::vector<uint8_t> local(kLength, 0);
+    BufferDesc local_desc;
+    local_desc.addr = reinterpret_cast<uint64_t>(local.data());
+    local_desc.length = local.size();
+    local_desc.location = "cpu:0";
+    MemoryOptions local_options;
+    local_options.type = HP_TCP;
+    local_options.perm = kLocalReadWrite;
+    ASSERT_TRUE(client.addMemoryBuffer(local_desc, local_options).ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(client.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::READ;
+    request.source = local.data();
+    request.target_id = target;
+    request.target_offset = remote_desc.addr;
+    request.length = remote_desc.length;
+    request.transport_hint = HP_TCP;
+    ASSERT_TRUE(client.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer_status;
+    const Status result =
+        WaitForTransportResult(client, batch, transfer_status);
+    EXPECT_TRUE(result.ok()) << result.ToString();
+    EXPECT_EQ(transfer_status.s, COMPLETED);
+    EXPECT_EQ(transfer_status.transferred_bytes, kLength);
+    EXPECT_EQ(std::memcmp(local.data(), remote.data(), kLength), 0);
+    EXPECT_EQ(HighPerformanceTcpTransportTestPeer::connectionsCreated(client),
+              2);
+
+    ASSERT_TRUE(client.freeSubBatch(batch).ok());
+    ASSERT_TRUE(client.removeMemoryBuffer(local_desc).ok());
+    ASSERT_TRUE(server.removeMemoryBuffer(remote_desc).ok());
+    ASSERT_TRUE(client.quiesce().ok());
+    ASSERT_TRUE(server.quiesce().ok());
+    ASSERT_TRUE(client.uninstall().ok());
+    ASSERT_TRUE(server.uninstall().ok());
 }
 
 TEST(HighPerformanceTcpTransportTest,

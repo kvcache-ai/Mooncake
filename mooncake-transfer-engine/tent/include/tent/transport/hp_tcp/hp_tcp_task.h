@@ -23,11 +23,13 @@ class HighPerformanceTcpTaskState {
     HighPerformanceTcpTaskState(
         uint64_t reserved_bytes, BatchID progress_batch_id,
         std::function<void(BatchID)> notify_progress,
-        HighPerformanceTcpBufferRegistry::Lease local_lease)
+        HighPerformanceTcpBufferRegistry::Lease local_lease,
+        size_t slice_count = 1)
         : progress_batch_id_(progress_batch_id),
           notify_progress_(std::move(notify_progress)),
           local_lease_(std::move(local_lease)),
-          reserved_bytes_(reserved_bytes) {}
+          reserved_bytes_(reserved_bytes),
+          remaining_slices_(slice_count) {}
 
     HighPerformanceTcpTaskState(const HighPerformanceTcpTaskState&) = delete;
     HighPerformanceTcpTaskState& operator=(const HighPerformanceTcpTaskState&) =
@@ -42,15 +44,15 @@ class HighPerformanceTcpTaskState {
     bool completeOnce(TransferStatusEnum terminal, size_t bytes,
                       std::optional<HighPerformanceTcpStatus> remote_status =
                           std::nullopt) noexcept;
+    bool completeSlice(TransferStatusEnum terminal, size_t bytes,
+                       std::optional<HighPerformanceTcpStatus> remote_status =
+                           std::nullopt) noexcept;
     TransferStatus snapshot() const noexcept;
     std::optional<HighPerformanceTcpStatus> remoteStatus() const noexcept;
 
-    void setDispatchIdentity(size_t owner_worker,
-                             uint64_t request_id) noexcept {
-        owner_worker_ = owner_worker;
+    void setRequestId(uint64_t request_id) noexcept {
         request_id_ = request_id;
     }
-    size_t ownerWorker() const noexcept { return owner_worker_; }
     uint64_t requestId() const noexcept { return request_id_; }
 
     void requestCancel() noexcept {
@@ -76,7 +78,11 @@ class HighPerformanceTcpTaskState {
     uint64_t reserved_bytes_{0};
     std::atomic<bool> reservation_active_{false};
 
-    size_t owner_worker_{0};
+    std::atomic<size_t> remaining_slices_{1};
+    std::atomic<size_t> completed_bytes_{0};
+    std::atomic<bool> slice_failed_{false};
+    std::atomic<bool> slice_timed_out_{false};
+    std::atomic<bool> slice_canceled_{false};
     uint64_t request_id_{0};
 };
 

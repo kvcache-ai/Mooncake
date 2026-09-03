@@ -5,6 +5,43 @@
 
 namespace mooncake::tent {
 
+bool HighPerformanceTcpTaskState::completeSlice(
+    TransferStatusEnum terminal, size_t bytes,
+    std::optional<HighPerformanceTcpStatus> remote_status) noexcept {
+    if (terminal == COMPLETED) {
+        completed_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    } else if (terminal == TIMEOUT) {
+        slice_timed_out_.store(true, std::memory_order_relaxed);
+    } else if (terminal == CANCELED) {
+        slice_canceled_.store(true, std::memory_order_relaxed);
+    } else {
+        slice_failed_.store(true, std::memory_order_relaxed);
+    }
+
+    if (remote_status.has_value() &&
+        *remote_status != HighPerformanceTcpStatus::kOk) {
+        HighPerformanceTcpStatus expected = HighPerformanceTcpStatus::kOk;
+        (void)remote_status_.compare_exchange_strong(expected, *remote_status,
+                                                     std::memory_order_relaxed);
+    }
+
+    if (remaining_slices_.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return false;
+    }
+
+    if (slice_failed_.load(std::memory_order_acquire)) {
+        return completeOnce(FAILED, 0);
+    }
+    if (slice_timed_out_.load(std::memory_order_acquire)) {
+        return completeOnce(TIMEOUT, 0);
+    }
+    if (slice_canceled_.load(std::memory_order_acquire)) {
+        return completeOnce(CANCELED, 0);
+    }
+    return completeOnce(COMPLETED,
+                        completed_bytes_.load(std::memory_order_acquire));
+}
+
 bool HighPerformanceTcpTaskState::completeOnce(
     TransferStatusEnum terminal, size_t bytes,
     std::optional<HighPerformanceTcpStatus> remote_status) noexcept {
