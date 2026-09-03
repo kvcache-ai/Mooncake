@@ -3703,6 +3703,11 @@ tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
     return result;
 }
 
+tl::expected<bool, ErrorCode> Client::ProbeKey(const std::string& key) {
+    auto result = master_client_.ProbeKey(key);
+    return result;
+}
+
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     const std::vector<std::string>& keys) {
     auto response = master_client_.BatchExistKey(keys);
@@ -3722,6 +3727,26 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 
     // Return the response directly as it's already in the correct
     // format
+    return response;
+}
+
+std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
+    const std::vector<std::string>& keys) {
+    auto response = master_client_.BatchProbeKey(keys);
+
+    // Check if we got the expected number of responses
+    if (response.size() != keys.size()) {
+        LOG(ERROR) << "BatchProbeKey response size mismatch. Expected: "
+                   << keys.size() << ", Got: " << response.size();
+        // Return vector of RPC_FAIL errors
+        std::vector<tl::expected<bool, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return results;
+    }
+
     return response;
 }
 
