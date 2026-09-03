@@ -105,15 +105,19 @@ class RdmaTransportTestPeer {
     }
 
     static void releaseSliceQuota(Workers& workers, RdmaSlice* slice,
-                                  double latency) {
-        workers.releaseSliceQuota(slice, latency);
+                                  uint64_t now_ns, double latency) {
+        workers.releaseSliceQuota(slice, now_ns, latency);
+    }
+
+    static void notePostedSlice(Workers& workers, RdmaSlice* slice) {
+        workers.notePostedSlice(slice);
     }
 
     static void handleCompletion(Workers& workers,
                                  Workers::WorkerContext& worker,
                                  RdmaContext& context, const ibv_wc& wc,
-                                 uint64_t poll_ts) {
-        workers.handleCompletion(worker, context, wc, poll_ts);
+                                 uint64_t poll_ts, bool last_in_pass = true) {
+        workers.handleCompletion(worker, context, wc, poll_ts, last_in_pass);
     }
 
     static void markPosted(Workers& workers, Workers::WorkerContext& worker,
@@ -137,8 +141,9 @@ class RdmaTransportTestPeer {
         return workers.worker_context_[i];
     }
     static void retireSweptSlice(Workers& workers, WorkerContext& self,
-                                 RdmaSlice* slice) {
-        workers.retireSweptSlice(self, slice, nullptr);
+                                 RdmaSlice* slice, uint64_t now_ns,
+                                 bool bytes_moved = false) {
+        workers.retireSweptSlice(self, slice, now_ns, nullptr, bytes_moved);
     }
     static void drainReclaimed(Workers& workers, WorkerContext& worker) {
         workers.drainReclaimed(worker);
@@ -979,7 +984,7 @@ class RdmaWorkersChargeTest : public ::testing::Test {
 // estimate, because the release is a no-op on an uncharged slice.
 TEST_F(RdmaWorkersChargeTest, RetryIsRechargedAndStillLearns) {
     // The error path hands the charge back and re-submits.
-    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, 0.0);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, kNow, 0.0);
     ASSERT_EQ(slice_->charged_dev, -1);
     ASSERT_EQ(selector_->getInflightBytes(0), 0u);
 
@@ -995,7 +1000,8 @@ TEST_F(RdmaWorkersChargeTest, RetryIsRechargedAndStillLearns) {
     // uncharged slice: the bytes would stay charged to nobody and the
     // sample would be lost.
     const double before = selector_->getAggregateEwmaBandwidth();
-    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, kLen / 5e8);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, kNow + kLen,
+                                             kLen / 5e8);
     EXPECT_EQ(selector_->getInflightBytes(1), 0u);
     // Device 0 is untaught; device 1 adopted 0.5 GB/s in place of its seed.
     EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(),
@@ -1014,7 +1020,7 @@ TEST_F(RdmaWorkersChargeTest, FallbackMovesTheChargeToTheNicItPostsOn) {
     EXPECT_EQ(selector_->getInflightBytes(0), 0u);
     EXPECT_EQ(selector_->getInflightBytes(1), kLen);
 
-    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, 0.0);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, kNow, 0.0);
     EXPECT_EQ(slice_->charged_dev, -1);
     EXPECT_EQ(selector_->getInflightBytes(0), 0u);
     EXPECT_EQ(selector_->getInflightBytes(1), 0u);
@@ -1029,7 +1035,7 @@ TEST_F(RdmaWorkersChargeTest, ChargeOnAnUntrackedDeviceKeepsTheOldOne) {
     EXPECT_EQ(slice_->charged_dev, 0);
     EXPECT_EQ(selector_->getInflightBytes(0), kLen);
 
-    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, 0.0);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, kNow, 0.0);
     EXPECT_EQ(slice_->charged_dev, -1);
     EXPECT_EQ(selector_->getInflightBytes(0), 0u);
 }
@@ -1081,15 +1087,18 @@ TEST(RdmaWorkersOwnershipTest, SweepByAnotherLaneIsRoutedToTheOwner) {
     ASSERT_TRUE(selector->allocate(kLen, "cpu:0", chosen).ok());
     slice->source_dev_id = chosen;
     slice->charged_dev = chosen;
+    RdmaTransportTestPeer::notePostedSlice(*workers, slice);
     lane_b.inflight_slice_set.insert(slice);
     lane_b.inflight_slices.store(1);
     // Lane A still holds an entry from an earlier attempt of the same slice
     // (a retry moved it to lane B before A's set was drained).
     lane_a.inflight_slice_set.insert(slice);
     ASSERT_EQ(selector->getInflightBytes(kDev), kLen);
+    ASSERT_EQ(selector->getPostedBytes(kDev), kLen);
 
     // Lane A sweeps it off the shared queue pair.
-    RdmaTransportTestPeer::retireSweptSlice(*workers, lane_a, slice);
+    RdmaTransportTestPeer::retireSweptSlice(*workers, lane_a, slice,
+                                            getCurrentTimeInNano());
 
     EXPECT_EQ(lane_a.inflight_slices.load(), 0);  // not lane A's to discount
     EXPECT_EQ(lane_b.inflight_slices.load(), 0);
@@ -1097,6 +1106,7 @@ TEST(RdmaWorkersOwnershipTest, SweepByAnotherLaneIsRoutedToTheOwner) {
     EXPECT_TRUE(lane_a.inflight_slice_set.empty());
     EXPECT_EQ(lane_b.inflight_slice_set.count(slice), 1u);  // owner erases it
     EXPECT_EQ(selector->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector->getPostedBytes(kDev), 0u);
 
     // ...on its own next pass.
     RdmaTransportTestPeer::drainReclaimed(*workers, lane_b);
@@ -1105,6 +1115,253 @@ TEST(RdmaWorkersOwnershipTest, SweepByAnotherLaneIsRoutedToTheOwner) {
     RdmaTransportTestPeer::destroyWorkerContexts(*workers);
     RdmaSliceStorage::Get().deallocate(slice);
     task->deref();
+}
+
+// What the completion path owes the NIC's accounting, driven with a
+// synthesized work completion: a successful one hands back the slice's
+// charge and its place in the backlog, then feeds the meter the bytes it
+// moved. An unsuccessful one returns the same accounting but teaches
+// nothing -- a flush burst must not drag the estimate down.
+class RdmaWorkersCompletionTest : public ::testing::Test {
+   protected:
+    static constexpr int kDev = 1;
+    static constexpr uint64_t kLen = 1 << 20;
+    static constexpr uint64_t kNow = 1'000'000'000;
+
+    void SetUp() override {
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(topology
+                        ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                        .ok());
+        Topology::MemEntry mem;
+        mem.name = "cpu:0";
+        mem.type = Topology::MEM_HOST;
+        mem.numa_node = 0;
+        mem.device_list[0].push_back(kDev);
+        topology->mem_list_.push_back(mem);
+
+        RdmaTransportTestPeer::bindTopology(transport_, topology);
+        ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport_), 0u);
+        workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
+        selector_ = workers_->getDeviceSelector();
+        ASSERT_TRUE(selector_->setDeviceAvailable(kDev, true).ok());
+        auto params = selector_->getSchedulingParams();
+        params.transmit_bandwidth_learning_rate = 0.0;  // adopt outright
+        params.transmit_meter_interval_ns = 0;          // sample on demand
+        selector_->setSchedulingParams(params);
+        ASSERT_TRUE(selector_->setDeviceBandwidth(kDev, 25.0).ok());
+
+        task_ = RdmaTaskStorage::Get().allocate();
+        task_->num_slices = 1;
+        task_->status_word = PENDING;
+        task_->first_error = PENDING;
+        task_->ref();  // the batch's reference
+        task_->ref();  // the slice's, dropped when it turns terminal
+        slice_ = RdmaSliceStorage::Get().allocate();
+        slice_->task = task_;
+        slice_->length = kLen;
+        slice_->word = PENDING;
+        slice_->rail_monitor = nullptr;
+        // Queued for a while before it was posted: the busy stretch must
+        // start at submit_ts, not enqueue_ts.
+        slice_->enqueue_ts = kNow - kLen;
+        slice_->submit_ts = kNow;
+        int chosen = -1;
+        ASSERT_TRUE(selector_->allocate(kLen, "cpu:0", chosen).ok());
+        ASSERT_EQ(chosen, kDev);
+        slice_->source_dev_id = chosen;
+        slice_->charged_dev = chosen;
+        // Posted to the hardware, and its endpoint is still around (never
+        // constructed, so acknowledge() sweeps nothing).
+        endpoint_ = std::make_shared<RdmaEndPoint>();
+        slice_->ep_weak_ptr = endpoint_;
+        RdmaTransportTestPeer::notePostedSlice(*workers_, slice_);
+        ASSERT_EQ(selector_->getPostedBytes(kDev), kLen);
+        // The meter's interval opens with the NIC holding this backlog.
+        selector_->maybeSampleTransmit(kDev, kNow);
+    }
+
+    void TearDown() override {
+        for (auto* slice : extra_slices_)
+            RdmaSliceStorage::Get().deallocate(slice);
+        for (auto* task : extra_tasks_) releaseTask(task);
+        if (slice_) RdmaSliceStorage::Get().deallocate(slice_);
+        if (task_) releaseTask(task_);
+    }
+
+    // The endpoint is never constructed, so acknowledge() sweeps nothing
+    // and a slice completed here never turns terminal; only the cancel
+    // paths drop the slice's reference. Drop whatever is left.
+    static void releaseTask(RdmaTask* task) {
+        for (int n = task->ref_count.load(); n > 0; --n) task->deref();
+    }
+
+    // Another slice on the same NIC, charged and posted at `submit_ts` the
+    // way asyncPostSend does it.
+    RdmaSlice* makeSlice(uint64_t submit_ts) {
+        auto* task = RdmaTaskStorage::Get().allocate();
+        task->num_slices = 1;
+        task->status_word = PENDING;
+        task->first_error = PENDING;
+        task->ref();  // the batch's reference
+        task->ref();  // the slice's, dropped when it turns terminal
+        auto* slice = RdmaSliceStorage::Get().allocate();
+        slice->task = task;
+        slice->length = kLen;
+        slice->word = PENDING;
+        slice->rail_monitor = nullptr;
+        slice->enqueue_ts = submit_ts - kLen;
+        slice->submit_ts = submit_ts;
+        int chosen = -1;
+        EXPECT_TRUE(selector_->allocate(kLen, "cpu:0", chosen).ok());
+        slice->source_dev_id = chosen;
+        slice->charged_dev = chosen;
+        slice->ep_weak_ptr = endpoint_;
+        RdmaTransportTestPeer::notePostedSlice(*workers_, slice);
+        extra_tasks_.push_back(task);
+        extra_slices_.push_back(slice);
+        return slice;
+    }
+
+    void completeAt(RdmaSlice* slice, ibv_wc_status status, uint64_t poll_ts,
+                    bool last_in_pass = true) {
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(slice);
+        wc.status = status;
+        RdmaTransportTestPeer::handleCompletion(
+            *workers_, ctx_, *RdmaTransportTestPeer::contextSet(transport_)[0],
+            wc, poll_ts, last_in_pass);
+    }
+
+    void complete(ibv_wc_status status) {
+        completeAt(slice_, status, kNow + kLen);  // one byte per nanosecond
+    }
+
+    RdmaTransport transport_;
+    std::unique_ptr<Workers> workers_;
+    DeviceSelector* selector_ = nullptr;
+    RdmaTask* task_ = nullptr;
+    RdmaSlice* slice_ = nullptr;
+    std::shared_ptr<RdmaEndPoint> endpoint_;
+    RdmaTransportTestPeer::WorkerContext ctx_;
+    std::vector<RdmaTask*> extra_tasks_;
+    std::vector<RdmaSlice*> extra_slices_;
+};
+
+// One poll pass stamps every completion it reaps with the same timestamp.
+// Sampled at each of them, the first would divide its own bytes by the
+// busy time of the whole group, and the rest -- same timestamp, no later
+// than the baseline it just moved -- would be ignored: 0.5 GB/s for a
+// link that moved 2 MiB in 2 MiB ns. The pass samples once, at its end.
+TEST_F(RdmaWorkersCompletionTest, OnlyTheLastCompletionOfAPassSamples) {
+    auto* second = makeSlice(kNow);  // same burst: 2 MiB posted at kNow
+    ASSERT_EQ(selector_->getPostedBytes(kDev), 2 * kLen);
+
+    completeAt(slice_, IBV_WC_SUCCESS, kNow + 2 * kLen, /*last_in_pass=*/false);
+    completeAt(second, IBV_WC_SUCCESS, kNow + 2 * kLen, /*last_in_pass=*/true);
+
+    EXPECT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
+}
+
+TEST_F(RdmaWorkersCompletionTest, SuccessFeedsTheMeter) {
+    complete(IBV_WC_SUCCESS);
+
+    EXPECT_EQ(slice_->charged_dev, -1);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+    EXPECT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
+}
+
+// The workers' half of the busy-time meter. Which stretches get charged for
+// the bytes is decided by the timestamps this layer hands down -- the
+// slice's submit_ts when it reaches the hardware, the poll timestamp when it
+// leaves -- and nothing else pins that wiring. Two bursts far apart, each
+// moved at one byte per nanosecond, have to read as one byte per nanosecond:
+// the wait between them is the NIC having nothing to do, not a slow link.
+TEST_F(RdmaWorkersCompletionTest, IdleBetweenBurstsIsNotChargedToTheLink) {
+    complete(IBV_WC_SUCCESS);  // kNow -> kNow + kLen
+    ASSERT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
+    ASSERT_EQ(selector_->getPostedBytes(kDev), 0u);  // the NIC goes idle
+
+    // The next burst starts ten times its own wire time later.
+    const uint64_t start = kNow + 10 * kLen;
+    auto* second = makeSlice(start);
+    completeAt(second, IBV_WC_SUCCESS, start + kLen);
+
+    EXPECT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
+}
+
+// A slice that fails carries no wire time to learn from, but it does end a
+// busy stretch: the meter must not later charge its bytes-less span to the
+// next sample.
+TEST_F(RdmaWorkersCompletionTest, AFailedSliceEndsItsStretchWithoutTeaching) {
+    task_->cancel_requested.store(true);  // stop short of a re-submit
+    complete(IBV_WC_RETRY_EXC_ERR);
+    ASSERT_DOUBLE_EQ(selector_->getTransmitBandwidth(kDev), 3.125e9);  // seed
+    ASSERT_EQ(selector_->getPostedBytes(kDev), 0u);
+
+    // The failure abandoned the meter's interval: the next completion only
+    // rebuilds the baselines, and its busy time -- not the failed slice's --
+    // is what the completion after that divides its bytes into.
+    const uint64_t start = kNow + 10 * kLen;
+    auto* second = makeSlice(start);
+    completeAt(second, IBV_WC_SUCCESS, start + kLen);
+    ASSERT_DOUBLE_EQ(selector_->getTransmitBandwidth(kDev), 3.125e9);
+
+    auto* third = makeSlice(start + kLen);
+    completeAt(third, IBV_WC_SUCCESS, start + 2 * kLen);  // one byte per ns
+    EXPECT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
+}
+
+// A slice resolved before its completion is polled -- timed out through a
+// stale entry on another lane, or cancelled by a teardown -- was re-counted
+// here when it was re-queued, and nothing but its completion is left to
+// take it out of this lane's count again.
+TEST_F(RdmaWorkersCompletionTest, ResolvedSliceStillLeavesTheLaneCount) {
+    slice_->word = TIMEOUT;
+    slice_->counted_lane = 0;
+    ctx_.inflight_slices.store(1);
+
+    complete(IBV_WC_SUCCESS);
+
+    EXPECT_EQ(ctx_.inflight_slices.load(), 0);
+    EXPECT_EQ(slice_->charged_dev, -1);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+}
+
+// A predecessor swept along with a COMPLETED slice did move its bytes; its
+// own completion is still coming to credit them, so the meter's interval
+// must survive the sweep.
+TEST_F(RdmaWorkersCompletionTest, SweptAsCompletedKeepsTheMeterInterval) {
+    RdmaTransportTestPeer::retireSweptSlice(*workers_, ctx_, slice_,
+                                            kNow + kLen, /*bytes_moved=*/true);
+    selector_->noteCompleted(kDev, kLen);
+    selector_->maybeSampleTransmit(kDev, kNow + kLen);  // one byte per ns
+    EXPECT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
+}
+
+// One swept with FAILED or TIMEOUT did not: its busy time has nothing to be
+// divided into, so the next sample only rebuilds the baselines.
+TEST_F(RdmaWorkersCompletionTest, SweptAsFailedAbandonsTheMeterInterval) {
+    RdmaTransportTestPeer::retireSweptSlice(*workers_, ctx_, slice_,
+                                            kNow + kLen);
+    selector_->noteCompleted(kDev, kLen);
+    selector_->maybeSampleTransmit(kDev, kNow + kLen);
+    EXPECT_DOUBLE_EQ(selector_->getTransmitBandwidth(kDev), 3.125e9);  // seed
+}
+
+TEST_F(RdmaWorkersCompletionTest, FlushedCompletionTeachesNothing) {
+    // A queue pair reset flushes every posted work request at once; those
+    // completions carry no wire time.
+    task_->cancel_requested.store(true);  // stop short of a re-submit
+    complete(IBV_WC_WR_FLUSH_ERR);
+
+    EXPECT_EQ(slice_->charged_dev, -1);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+    EXPECT_DOUBLE_EQ(selector_->getTransmitBandwidth(kDev), 3.125e9);  // seed
 }
 
 // A queue pair shared by two worker lanes (the qp_pools layout): the lane
@@ -1282,6 +1539,7 @@ TEST_F(RdmaWorkersSharedQpTest, TimeoutSweepGivesTheOtherLaneItsSliceBack) {
     auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
     auto& lane1 = RdmaTransportTestPeer::workerContext(*workers_, 1);
     ASSERT_EQ(selector_->getInflightBytes(kDev), 2 * kLen);
+    ASSERT_EQ(selector_->getPostedBytes(kDev), 2 * kLen);
 
     RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000);  // 1 ms
     RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane0,
@@ -1293,6 +1551,7 @@ TEST_F(RdmaWorkersSharedQpTest, TimeoutSweepGivesTheOtherLaneItsSliceBack) {
     EXPECT_EQ(ours->charged_dev, -1);
     EXPECT_EQ(theirs->charged_dev, -1);
     EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
 
     // Each lane's own count came back down, and lane 1's set entry is waiting
     // for lane 1 rather than having been erased from under it.
@@ -1315,6 +1574,7 @@ TEST_F(RdmaWorkersSharedQpTest, TeardownLeftoversAreReclaimedByTheirLane) {
     auto* ours = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
     auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
     auto& lane1 = RdmaTransportTestPeer::workerContext(*workers_, 1);
+    ASSERT_EQ(selector_->getPostedBytes(kDev), 2 * kLen);
 
     ASSERT_EQ(endpoint_->deconstruct(), 0);
     ASSERT_EQ(ours->word, CANCELED);
@@ -1327,6 +1587,7 @@ TEST_F(RdmaWorkersSharedQpTest, TeardownLeftoversAreReclaimedByTheirLane) {
                                                 /*now_ns=*/2'000'000);
 
     EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
     EXPECT_EQ(lane0.inflight_slices.load(), 0);
     EXPECT_EQ(lane1.inflight_slices.load(), 0);
     EXPECT_TRUE(lane0.inflight_slice_set.empty());
@@ -1339,8 +1600,14 @@ TEST_F(RdmaWorkersSharedQpTest, TeardownLeftoversAreReclaimedByTheirLane) {
 // next decrement has to come back with it. Otherwise the completion that
 // finally resolves the slice cannot take it out of the count again, and the
 // lane it belongs to never reaches zero: it stops suspending, and it looks
-// permanently loaded to submit()'s least-loaded-lane pick.
+// permanently loaded to submit()'s least-loaded-lane pick. The retry's
+// own completion is a transmit sample like any other.
 TEST_F(RdmaWorkersSharedQpTest, RetriedSliceIsStillCountedByItsLane) {
+    auto params = selector_->getSchedulingParams();
+    params.transmit_bandwidth_learning_rate = 0.0;  // adopt outright
+    params.transmit_meter_interval_ns = 0;          // sample on demand
+    selector_->setSchedulingParams(params);
+    ASSERT_TRUE(selector_->setDeviceBandwidth(kDev, 25.0).ok());
     constexpr uint64_t kPosted = 1'000'000;
 
     auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/kPosted);
@@ -1352,14 +1619,56 @@ TEST_F(RdmaWorkersSharedQpTest, RetriedSliceIsStillCountedByItsLane) {
     ASSERT_EQ(slice->word, PENDING);
     ASSERT_EQ(slice->retry_count, 1);
     EXPECT_EQ(lane0.inflight_slices.load(), 1);  // queued again, still counted
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
 
-    // Second attempt reaches the hardware and succeeds.
+    // Second attempt reaches the hardware and succeeds. The failure ended
+    // the meter's interval, so the next sample only rebuilds its baselines:
+    // taken at the re-post, as a poll pass in between would, so that the
+    // retry's own 1 MiB over its own 1 MiB ns is what the completion
+    // measures.
     repost(slice, /*lane=*/0, kPosted + 2 * kLen);
+    selector_->maybeSampleTransmit(kDev, kPosted + 2 * kLen);
+    ASSERT_DOUBLE_EQ(selector_->getTransmitBandwidth(kDev), 3.125e9);
     completeWith(slice, IBV_WC_SUCCESS, kPosted + 3 * kLen);
 
     EXPECT_EQ(slice->word, COMPLETED);
     EXPECT_EQ(lane0.inflight_slices.load(), 0);
     EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+    EXPECT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
+}
+
+// A completion sweeps everything posted before it on the queue pair off
+// with COMPLETED. Those bytes moved -- their own completions, still to be
+// polled, credit them -- so the sweep must not abandon the meter's
+// interval the way a FAILED or TIMEOUT sweep does. The completion samples
+// before it sweeps, so the evidence is the sample after: 1 MiB over the
+// next 1 MiB ns reads 1 GB/s, where a reset would have that sample rebuild
+// its baselines and learn nothing.
+TEST_F(RdmaWorkersSharedQpTest, CompletionSweepKeepsTheMeterInterval) {
+    auto params = selector_->getSchedulingParams();
+    params.transmit_bandwidth_learning_rate = 0.0;  // adopt outright
+    params.transmit_meter_interval_ns = 0;          // sample on demand
+    selector_->setSchedulingParams(params);
+    ASSERT_TRUE(selector_->setDeviceBandwidth(kDev, 25.0).ok());
+    constexpr uint64_t kPosted = 1'000'000;
+
+    auto* first = postSlice(/*lane=*/0, /*enqueue_ts=*/kPosted);
+    auto* second = postSlice(/*lane=*/0, /*enqueue_ts=*/kPosted);
+    selector_->maybeSampleTransmit(kDev, kPosted);  // baseline
+    ASSERT_DOUBLE_EQ(selector_->getTransmitBandwidth(kDev), 3.125e9);
+
+    // Its own sample, with `first` still posted: 1 MiB over 2 MiB ns.
+    completeWith(second, IBV_WC_SUCCESS, kPosted + 2 * kLen);
+    ASSERT_EQ(first->word, COMPLETED);
+    ASSERT_EQ(second->word, COMPLETED);
+    ASSERT_EQ(selector_->getPostedBytes(kDev), 0u);
+    ASSERT_NEAR(selector_->getTransmitBandwidth(kDev), 0.5e9, 1.0);
+
+    auto* third = postSlice(/*lane=*/0, /*enqueue_ts=*/kPosted + 2 * kLen);
+    completeWith(third, IBV_WC_SUCCESS, kPosted + 3 * kLen);
+
+    EXPECT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
 }
 
 // Same retry, on the layout this fixture exists for: lane 1 enqueued the

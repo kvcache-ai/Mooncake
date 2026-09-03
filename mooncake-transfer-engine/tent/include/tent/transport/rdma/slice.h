@@ -138,6 +138,10 @@ struct RdmaSlice {
     // source_dev_id cannot misdirect the release. Atomic because on a pooled
     // QP the timeout sweep and the CQ poller run on different workers.
     std::atomic<int> charged_dev{-1};
+    // Device whose posted backlog counts this slice: set when the work
+    // request reaches the hardware, -1 again once the slice leaves the queue
+    // pair. A charged slice waiting in a worker queue is not posted.
+    std::atomic<int> posted_dev{-1};
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
     // Non-owning pointer to the per-worker RailMonitor for this slice's

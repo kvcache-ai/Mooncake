@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/admission_queue.h"
+#include "tent/runtime/deadline_mlu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -274,17 +275,19 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         });
     }
 
-    // Predicted MLU = predicted_transfer_time / remaining_window. Returns true
-    // if the owner is predicted to miss its deadline hard enough to drop.
-    auto shouldDrop = [&](const QueueOwner& owner) -> bool {
-        if (!drop_enabled || !owner.degradation_eligible || bw_bps <= 0.0)
-            return false;
-        const uint64_t deadline_ns = owner.request.deadline_ns;
-        if (deadline_ns == 0) return false;      // no deadline
-        if (deadline_ns <= now_ns) return true;  // already past
-        const double window_s = (deadline_ns - now_ns) / 1e9;
-        const double predicted_time_s = owner.request.length / bw_bps;
-        const double mlu = predicted_time_s / window_s;
+    // True if the owner is predicted to miss its deadline hard enough to
+    // drop, by the same DeadlineMlu the RDMA workers order QP slots with.
+    // `bytes_ahead`: eligible bytes dispatched and still in flight,
+    // including what this call already picked. No deadline or no bandwidth
+    // (<= 0) means nothing to predict from, so never a drop -- not even
+    // past the deadline; DeadlineMlu yields 0 there too, the explicit
+    // checks just keep the rule readable here.
+    auto shouldDrop = [&](const QueueOwner& owner, size_t bytes_ahead) {
+        if (!drop_enabled || !owner.degradation_eligible) return false;
+        if (owner.request.deadline_ns == 0 || bw_bps <= 0.0) return false;
+        const double mlu =
+            DeadlineMlu(bytes_ahead, owner.request.length,
+                        owner.request.deadline_ns, now_ns, bw_bps);
         return mlu >= limits_.mlu_local_threshold;
     };
 
@@ -321,7 +324,7 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         // dispatched) and does not consume the dispatch budget. Because the
         // queue is EDF-ordered, later owners have looser deadlines, so we keep
         // scanning rather than stopping.
-        if (shouldDrop(owner_it->second)) {
+        if (shouldDrop(owner_it->second, dispatching_bytes_)) {
             fifo_.pop_front();
             dropOwner(owner_id, owner_it->second);
             continue;
@@ -333,6 +336,8 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
 
         fifo_.pop_front();
         owner_it->second.state = QueueState::Dispatching;
+        if (owner.degradation_eligible)
+            dispatching_bytes_ += owner.request.length;
         picked.push_back(owner_id);
         ++used_owners;
         used_bytes += owner.request.length;
@@ -360,6 +365,7 @@ Status LocalTransferAdmissionQueue::complete(
 
     owner.state = QueueState::Terminal;
     owner.terminal_status = terminal_status;
+    if (owner.degradation_eligible) dispatching_bytes_ -= owner.request.length;
     --outstanding_owners_;
     outstanding_bytes_ -= owner.request.length;
     if (owner.kind == QueueOwnerKind::User) {

@@ -35,8 +35,9 @@ Status DeviceSelector::loadTopology(std::shared_ptr<Topology>& local_topology) {
         info.dev_id = dev_id;
         info.bw_gbps.store(0.0, std::memory_order_relaxed);  // unknown
         info.numa_id = entry->numa_node;
-        info.ewma_bandwidth_bps.store(theoreticalBandwidth(info),
-                                      std::memory_order_relaxed);
+        const double seed = theoreticalBandwidth(info);
+        info.ewma_bandwidth_bps.store(seed, std::memory_order_relaxed);
+        info.ewma_transmit_bps.store(seed, std::memory_order_relaxed);
     }
     // Initialize device base priorities after all devices are loaded
     fillDevicePriorities();
@@ -64,10 +65,11 @@ Status DeviceSelector::setDeviceBandwidth(int dev_id, double gbps) {
                      << ", assuming " << p.default_bandwidth_gbps << " Gbps";
     }
     dev.bw_gbps.store(gbps, std::memory_order_relaxed);
-    // A worker completing between these two stores clamps the old EWMA
-    // against the new rate once; the seed below overwrites it.
-    dev.ewma_bandwidth_bps.store(theoreticalBandwidth(dev),
-                                 std::memory_order_relaxed);
+    // A worker completing between these stores clamps the old EWMA against
+    // the new rate once; the seeds below overwrite it.
+    const double seed = theoreticalBandwidth(dev);
+    dev.ewma_bandwidth_bps.store(seed, std::memory_order_relaxed);
+    dev.ewma_transmit_bps.store(seed, std::memory_order_relaxed);
     return Status::OK();
 }
 
@@ -401,6 +403,129 @@ Status DeviceSelector::chargeDevice(int dev_id, uint64_t length) {
     return Status::OK();
 }
 
+void DeviceSelector::learnRate(const DeviceInfo& dev,
+                               std::atomic<double>& series, double alpha,
+                               double observed_bps) const {
+    // EWMA update: new = α × old + (1-α) × observed
+    // α = 0: always use observed (full adaptation)
+    // α = 1: never update (no learning)
+    // Clamped to [min_multiplier, max_multiplier] of theoretical bandwidth.
+    const double theoretical_bw = theoreticalBandwidth(dev);
+    const double current = series.load(std::memory_order_relaxed);
+    double updated = alpha * current + (1.0 - alpha) * observed_bps;
+    updated = std::max(
+        sched_params_.ewma_min_multiplier * theoretical_bw,
+        std::min(sched_params_.ewma_max_multiplier * theoretical_bw, updated));
+    series.store(updated, std::memory_order_relaxed);
+}
+
+void DeviceSelector::notePosted(int dev_id, uint64_t bytes, uint64_t now_ns) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return;
+    auto& dev = it->second;
+    // The read-modify-write picks exactly one thread to see each transition,
+    // so a busy stretch is opened once however many workers post at once.
+    if (dev.posted_bytes.fetch_add(bytes, std::memory_order_relaxed) == 0)
+        dev.busy_since.store(now_ns, std::memory_order_relaxed);
+}
+
+void DeviceSelector::notePostEnded(int dev_id, uint64_t bytes,
+                                   uint64_t now_ns) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return;
+    auto& dev = it->second;
+    if (dev.posted_bytes.fetch_sub(bytes, std::memory_order_relaxed) != bytes)
+        return;  // still busy
+    // Bank the stretch that just ended. A neighbour opening the next stretch
+    // between the subtraction above and this read would leave `since` ahead
+    // of `now_ns`; bank nothing rather than an underflowed interval. It
+    // costs one burst's busy time and reads the link fast, so it is bounded
+    // and the smoothing absorbs it.
+    const uint64_t since = dev.busy_since.load(std::memory_order_relaxed);
+    if (now_ns > since)
+        dev.busy_ns.fetch_add(now_ns - since, std::memory_order_relaxed);
+}
+
+uint64_t DeviceSelector::getBusyNs(int dev_id) const {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return 0;
+    return it->second.busy_ns.load(std::memory_order_relaxed);
+}
+
+uint64_t DeviceSelector::getPostedBytes(int dev_id) const {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return 0;
+    return it->second.getPostedBytes();
+}
+
+void DeviceSelector::noteCompleted(int dev_id, uint64_t bytes) {
+    auto it = devices_.find(dev_id);
+    if (it != devices_.end())
+        it->second.completed_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+uint64_t DeviceSelector::busyNsAt(const DeviceInfo& dev, uint64_t now_ns) {
+    uint64_t busy = dev.busy_ns.load(std::memory_order_relaxed);
+    if (dev.posted_bytes.load(std::memory_order_relaxed) > 0) {
+        const uint64_t since = dev.busy_since.load(std::memory_order_relaxed);
+        if (now_ns > since) busy += now_ns - since;
+    }
+    return busy;
+}
+
+void DeviceSelector::resetTransmitMeter(int dev_id) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return;
+    // One store, so it cannot interleave with a sampler's two baseline
+    // exchanges: the next maybeSampleTransmit sees prev == 0, takes both
+    // baselines itself under its CAS, and learns nothing from them.
+    it->second.meter_ts.store(0, std::memory_order_relaxed);
+}
+
+void DeviceSelector::maybeSampleTransmit(int dev_id, uint64_t now_ns) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return;
+    auto& dev = it->second;
+
+    uint64_t prev = dev.meter_ts.load(std::memory_order_relaxed);
+    // `now_ns <= prev`: a lane whose poll timestamp predates another lane's
+    // sample; letting it through would move the baseline backwards.
+    if (prev != 0 && (now_ns <= prev ||
+                      now_ns - prev < sched_params_.transmit_meter_interval_ns))
+        return;
+    // One sampler per interval: the loser leaves the counters alone.
+    if (!dev.meter_ts.compare_exchange_strong(
+            prev, now_ns, std::memory_order_acq_rel, std::memory_order_relaxed))
+        return;
+
+    const uint64_t completed =
+        dev.completed_bytes.load(std::memory_order_relaxed);
+    const uint64_t before =
+        dev.meter_completed.exchange(completed, std::memory_order_relaxed);
+
+    // Busy time up to now: what has been banked by the stretches that ended,
+    // plus the one still open. Charging the bytes to this instead of to
+    // elapsed wall time is what keeps a NIC that bursts and then waits from
+    // reading as a slow link -- the gap between bursts is not the link, and
+    // asking whether the NIC was busy when the interval opened cannot see it
+    // (a burst's first completion always has the rest of that burst behind
+    // it, so every interval opens busy).
+    const uint64_t busy = busyNsAt(dev, now_ns);
+    const uint64_t busy_before =
+        dev.meter_busy_ns.exchange(busy, std::memory_order_relaxed);
+
+    if (prev == 0) return;  // first sample: it only sets the baseline
+    // A sample spanning this much wall time describes a link too far back to
+    // attribute to the link as it is now, however busy it was.
+    if (now_ns - prev > sched_params_.transmit_meter_max_interval_ns) return;
+    if (completed <= before || busy <= busy_before) return;
+
+    learnRate(
+        dev, dev.ewma_transmit_bps,
+        sched_params_.transmit_bandwidth_learning_rate,
+        static_cast<double>(completed - before) / ((busy - busy_before) / 1e9));
+}
+
 Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     auto it = devices_.find(dev_id);
     if (it == devices_.end())
@@ -416,22 +541,9 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     // swept off a queue pair, or moved to another device -- learns nothing.
     if (latency <= 0.0) return Status::OK();
 
-    // Update EWMA bandwidth: new = α × old + (1-α) × observed
-    // α = 0: always use observed (full adaptation)
-    // α = 1: never update (no learning)
-    double observed_bw = static_cast<double>(length) / latency;
-    double current_ewma = dev.getEwmaBandwidth();
-
-    double alpha = sched_params_.bandwidth_learning_rate;
-    double new_ewma = alpha * current_ewma + (1.0 - alpha) * observed_bw;
-
-    // Clamp to [min_multiplier, max_multiplier] of theoretical bandwidth
-    double theoretical_bw = theoreticalBandwidth(dev);
-    new_ewma = std::max(
-        sched_params_.ewma_min_multiplier * theoretical_bw,
-        std::min(sched_params_.ewma_max_multiplier * theoretical_bw, new_ewma));
-
-    dev.ewma_bandwidth_bps.store(new_ewma, std::memory_order_relaxed);
+    learnRate(dev, dev.ewma_bandwidth_bps,
+              sched_params_.bandwidth_learning_rate,
+              static_cast<double>(length) / latency);
     return Status::OK();
 }
 
@@ -508,6 +620,21 @@ uint64_t DeviceSelector::getInflightBytes(int dev_id) const {
     auto it = devices_.find(dev_id);
     if (it == devices_.end()) return 0;
     return it->second.getInflightBytes();
+}
+
+double DeviceSelector::getTransmitBandwidth(int dev_id) const {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return -1.0;
+    return it->second.getTransmitBandwidth();
+}
+
+double DeviceSelector::getAggregateTransmitBandwidth() const {
+    double total = 0.0;
+    for (const auto& [id, dev] : devices_) {
+        if (!dev.available.load(std::memory_order_relaxed)) continue;
+        total += dev.getTransmitBandwidth();
+    }
+    return total > 0.0 ? total : -1.0;
 }
 
 }  // namespace tent

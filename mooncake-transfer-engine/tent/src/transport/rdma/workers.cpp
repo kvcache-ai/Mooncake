@@ -123,6 +123,20 @@ Workers::Workers(RdmaTransport* transport)
     params.bandwidth_learning_rate =
         conf->get("transports/rdma/bandwidth_learning_rate", 0.01);
 
+    // Same convention for the transmit estimate the deadline predictors read
+    params.transmit_bandwidth_learning_rate =
+        conf->get("transports/rdma/transmit_bandwidth_learning_rate",
+                  params.transmit_bandwidth_learning_rate);
+
+    // How often that estimate is metered, and how stale an interval may be
+    // before it is re-baselined instead of learned from.
+    params.transmit_meter_interval_ns =
+        conf->get("transports/rdma/transmit_meter_interval_ns",
+                  params.transmit_meter_interval_ns);
+    params.transmit_meter_max_interval_ns =
+        conf->get("transports/rdma/transmit_meter_max_interval_ns",
+                  params.transmit_meter_max_interval_ns);
+
     // EWMA bounds as multipliers of theoretical bandwidth
     params.ewma_min_multiplier =
         conf->get("transports/rdma/ewma_min_bandwidth_multiplier", 0.1);
@@ -410,15 +424,20 @@ bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
     // back where they came from, each idempotently, since whichever path
     // resolved the slice may already have run them -- and updateSliceStatus
     // is a no-op once the slice is terminal.
-    retireSweptSlice(worker, slice, nullptr);
+    retireSweptSlice(worker, slice, getCurrentTimeInNano(), nullptr);
     updateSliceStatus(slice, CANCELED);
     return true;
 }
 
-void Workers::releaseSliceQuota(RdmaSlice* slice, double latency) {
+void Workers::releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
+                                double latency) {
     if (!slice || !device_selector_) return;
-    // The field names the device it was charged to, so the release goes
+    // Each field names the device it was charged to, so the release goes
     // there even if a fallback has since rewritten source_dev_id.
+    const int posted =
+        slice->posted_dev.exchange(-1, std::memory_order_acq_rel);
+    if (posted >= 0)
+        device_selector_->notePostEnded(posted, slice->length, now_ns);
     const int charged =
         slice->charged_dev.exchange(-1, std::memory_order_acq_rel);
     if (charged >= 0)
@@ -453,9 +472,18 @@ bool Workers::routeSetRemoval(WorkerContext& self, RdmaSlice* slice) {
 }
 
 void Workers::retireSweptSlice(WorkerContext& self, RdmaSlice* slice,
-                               std::vector<RdmaSlice*>* deferred) {
+                               uint64_t now_ns,
+                               std::vector<RdmaSlice*>* deferred,
+                               bool bytes_moved) {
     if (!slice) return;
-    releaseSliceQuota(slice);
+    const int posted_dev = slice->posted_dev.load(std::memory_order_relaxed);
+    releaseSliceQuota(slice, now_ns);
+    // A slice swept off with FAILED or TIMEOUT leaves the hardware without
+    // its bytes being counted, so the stretch it was part of cannot be
+    // divided into the next sample. One swept with COMPLETED did move them;
+    // its own completion, still to be polled, credits them.
+    if (posted_dev >= 0 && !bytes_moved && device_selector_)
+        device_selector_->resetTransmitMeter(posted_dev);
     discountFromOwner(self, slice);
     if (!routeSetRemoval(self, slice)) return;
     if (deferred)
@@ -487,9 +515,19 @@ void Workers::drainReclaimed(WorkerContext& worker) {
     for (auto* slice : taken) worker.inflight_slice_set.erase(slice);
 }
 
+void Workers::notePostedSlice(RdmaSlice* slice) {
+    if (!slice || !device_selector_) return;
+    int none = -1;
+    if (slice->posted_dev.compare_exchange_strong(none, slice->source_dev_id,
+                                                  std::memory_order_acq_rel))
+        device_selector_->notePosted(slice->source_dev_id, slice->length,
+                                     slice->submit_ts);
+}
+
 void Workers::markPosted(WorkerContext& worker, RdmaSlice* slice,
                          uint64_t post_ts) {
     slice->submit_ts = post_ts;
+    notePostedSlice(slice);
     worker.inflight_slice_set.insert(slice);
 }
 
@@ -608,7 +646,7 @@ void Workers::asyncPostSend() {
             if (!status.ok()) {
                 LOG(ERROR) << "Failed to generate post path for slice " << slice
                            << ": " << status.ToString();
-                releaseSliceQuota(slice);
+                releaseSliceQuota(slice, getCurrentTimeInNano());
                 updateSliceStatus(slice, slice->task->cancel_requested.load(
                                              std::memory_order_acquire)
                                              ? CANCELED
@@ -646,7 +684,7 @@ void Workers::asyncPostSend() {
             for (auto slice : clone) {
                 if (dropUnpostableSlice(worker, slice)) continue;
                 slice->retry_count++;
-                releaseSliceQuota(slice);
+                releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
                     LOG(WARNING)
@@ -707,7 +745,8 @@ void Workers::asyncPostSend() {
         // Everything a completion's poller must find is written before the
         // work request can reach the wire: with a shared queue pair another
         // lane may poll the completion before submitSlices returns, and a
-        // poller that finds no set entry cannot route it home.
+        // poller that finds no posted device on the slice would leave the
+        // device's backlog holding these bytes for good.
         const uint64_t post_ts = getCurrentTimeInNano();
         int num_submitted = endpoint->submitSlices(
             slices, tl_wid,
@@ -718,7 +757,7 @@ void Workers::asyncPostSend() {
             // Rejected by the hardware: it never went on the wire, so take
             // back what the hook put in place.
             worker.inflight_slice_set.erase(slice);
-            releaseSliceQuota(slice);
+            releaseSliceQuota(slice, post_ts);
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 updateSliceStatus(slice, CANCELED);
                 discountFromOwner(worker, slice);
@@ -817,10 +856,12 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
     struct Sweep {
         Workers* self;
         WorkerContext* worker;
+        uint64_t now_ns;
         std::vector<RdmaSlice*>* deferred;
-    } sweep{this, &worker, &slice_to_remove};
+    } sweep{this, &worker, now_ns, &slice_to_remove};
     auto retire = [&sweep](RdmaSlice* swept) {
-        sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.deferred);
+        sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                     sweep.deferred);
     };
     for (auto& slice : worker.inflight_slice_set) {
         if (slice->word != PENDING) {
@@ -852,7 +893,7 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
                 // A neighbour's retry already popped it off the queue pair
                 // and discounted it there, so only its charge and its set
                 // entry are still outstanding.
-                releaseSliceQuota(slice);
+                releaseSliceQuota(slice, now_ns);
                 if (routeSetRemoval(worker, slice))
                     slice_to_remove.push_back(slice);
                 updateSliceStatus(slice, TIMEOUT);
@@ -863,7 +904,8 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
 }
 
 void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
-                               const ibv_wc& wc, uint64_t poll_ts) {
+                               const ibv_wc& wc, uint64_t poll_ts,
+                               bool last_in_pass) {
     auto slice = (RdmaSlice*)wc.wr_id;
     // What the acknowledge callbacks below need, behind one reference so
     // the std::function stays in its small-buffer storage (no allocation
@@ -871,7 +913,8 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
     struct Sweep {
         Workers* self;
         WorkerContext* worker;
-    } sweep{this, &worker};
+        uint64_t now_ns;
+    } sweep{this, &worker, poll_ts};
     // The lane that enqueued this slice owns its set entry; with a
     // shared queue pair that is not necessarily this one.
     if (routeSetRemoval(worker, slice)) worker.inflight_slice_set.erase(slice);
@@ -887,7 +930,33 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         ep && slice->word == PENDING && wc.status == IBV_WC_SUCCESS;
     const double sample_lat_sec =
         ewma_sample ? (poll_ts - slice->submit_ts) / 1e9 : 0.0;
-    releaseSliceQuota(slice, sample_lat_sec);
+    const int dev_id = slice->source_dev_id;
+    const uint64_t moved = slice->length;
+    releaseSliceQuota(slice, poll_ts, sample_lat_sec);
+    // The transmit estimate is metered from bytes completed over the time
+    // the NIC spent busy, so it needs the release above to have taken this
+    // slice out of the backlog first -- that is what closes the stretch.
+    // Only successful bytes moved on the wire.
+    if (device_selector_) {
+        if (wc.status == IBV_WC_SUCCESS) {
+            device_selector_->noteCompleted(dev_id, moved);
+            // Only once the whole poll pass has been counted. Every work
+            // request it reaps carries the same timestamp, so a sample taken
+            // partway through would end its interval at that timestamp while
+            // leaving the rest of the pass's bytes to the next one -- which
+            // then gets them for free. The estimate is an average of
+            // per-interval rates, so the short interval that is paid twice
+            // and the long one that is paid once do not cancel: at 2 GB/s
+            // with sixteen-deep polling that read 8% high.
+            if (last_in_pass)
+                device_selector_->maybeSampleTransmit(dev_id, poll_ts);
+        } else {
+            // The bytes of a failed or flushed work request never moved, but
+            // the stretch the NIC held it for did. Start over here rather
+            // than divide that time into whatever completes next.
+            device_selector_->resetTransmitMeter(dev_id);
+        }
+    }
     if (slice->word != PENDING) {
         // Resolved before its completion was polled -- swept off the queue
         // pair by a neighbour, timed out, or cancelled by a teardown. The
@@ -939,7 +1008,8 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
             LOG(WARNING) << "Slice " << slice
                          << " failed: retry count exceeded";
             ep->acknowledge(slice, FAILED, [&sweep](RdmaSlice* swept) {
-                sweep.self->retireSweptSlice(*sweep.worker, swept, nullptr);
+                sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                             nullptr);
             });
             disableEndpoint(slice);
         } else {
@@ -958,7 +1028,8 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         }
     } else {
         ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
-            sweep.self->retireSweptSlice(*sweep.worker, swept, nullptr);
+            sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                         nullptr, /*bytes_moved=*/true);
         });
         // A successful GPU transfer re-admits any learned GDR
         // unreachability for the (GPU, NIC) pair(s) it used, so a
@@ -1006,7 +1077,8 @@ void Workers::asyncPollCq() {
         if (nr_poll < 0) continue;
         auto poll_ts = getCurrentTimeInNano();
         for (int i = 0; i < nr_poll; ++i)
-            handleCompletion(worker, *context, wc[i], poll_ts);
+            handleCompletion(worker, *context, wc[i], poll_ts,
+                             i + 1 == nr_poll);
     }
 }
 

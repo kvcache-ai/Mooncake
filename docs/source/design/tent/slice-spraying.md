@@ -81,7 +81,7 @@ The penalty is applied as a multiplier to predicted completion time, making remo
 
 ### EWMA Bandwidth Estimation
 
-Each device maintains an EWMA (Exponentially Weighted Moving Average) of its effective bandwidth:
+Each device maintains a **selection EWMA** (Exponentially Weighted Moving Average) of its effective bandwidth, the series that device selection scores with:
 
 ```
 initial_value = theoretical_bandwidth
@@ -109,6 +109,56 @@ The EWMA provides:
 - **Memory**: Recent observations have more influence than old ones
 - **Stability**: Smooths out transient fluctuations
 - **Adaptability**: Tracks gradual changes in link quality
+
+#### Transmit Estimate
+
+Each device also keeps a second series, the **transmit estimate**, for the
+admission queue's deadline-infeasible drop (`runtime_queue/mlu_local_threshold`,
+which reads the sum over devices). It predicts the MLU from it as:
+
+```
+predicted_mlu = ((bytes_ahead + length) / transmit_bandwidth) / remaining_window
+```
+
+`bytes_ahead` is what the request must wait behind before its own bytes move:
+every drop-eligible owner (RDMA, not staged) already dispatched and not yet
+completed — owners on other transports share the queue but not the NIC.
+
+The deadline is absolute, so that wait counts against the window — as an
+additive delay over the wire rate, not as a slower bandwidth (which would
+multiply the wait by the request's slice count).
+
+It uses the same update rule and clamp as the selection EWMA, but it is fed
+from a different measurement because it answers a different question:
+
+| | Selection EWMA | Transmit estimate |
+|---|---|---|
+| Question | Which NIC should the next slice go to? | How fast does this NIC move bytes? |
+| Sample | one successful completion: bytes / (post → completion), so the NIC's own queueing behind earlier work requests is included and a backed-up NIC scores worse | one meter interval: bytes completed / time the NIC spent with work posted |
+| α | `bandwidth_learning_rate` = 0.01 (~99% latest sample) | `transmit_bandwidth_learning_rate` = 0.9 (~10 intervals, ≈100 ms, to follow a change) |
+
+Per-completion timing cannot answer the second question. Up to `max_qp_wr`
+work requests are posted in one call with timestamps that are effectively
+one, and a poll pass timestamps every completion it collects alike, so a
+slice's own "post → completion" grows with the depth of the batch it
+travelled in — deep enough and the estimate would sit on its lower clamp on
+a healthy link. Bytes over the NIC's busy time does not care how the work was
+batched.
+
+Busy time is the time the device has had at least one work request posted:
+a stretch opens when its posted bytes go from zero to non-zero and closes
+when they return to zero, so the gaps of a workload that bursts and waits are
+not charged to the link. A sample is offered only at the last completion of a
+poll pass (every completion in a pass carries the same timestamp), and one
+that spans more than `transmit_meter_max_interval_ns` of wall clock is
+dropped rather than learned from: it describes a link too far in the past. A
+posted slice that ends without moving its bytes — failed, flushed, timed
+out — makes its stretch unusable, so the meter starts its next interval
+fresh. With no usable interval the estimate keeps its last value, or the
+link-speed seed — the optimistic direction, which cannot cause a false drop.
+
+With queueing carried by `bytes_ahead`, the rate itself must exclude
+queueing or the wait would be counted twice.
 
 ### Multi-Path Allocation
 
@@ -243,6 +293,9 @@ cross-node outage.
   "transports": {
     "rdma": {
       "bandwidth_learning_rate": 0.01,
+      "transmit_bandwidth_learning_rate": 0.9,
+      "transmit_meter_interval_ns": 10000000,
+      "transmit_meter_max_interval_ns": 50000000,
       "ewma_min_bandwidth_multiplier": 0.1,
       "ewma_max_bandwidth_multiplier": 10.0
     }
@@ -252,15 +305,20 @@ cross-node outage.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `bandwidth_learning_rate` | float | `0.01` | EWMA learning rate (0.0 = full adaptation, 1.0 = no learning) |
+| `bandwidth_learning_rate` | float | `0.01` | Selection EWMA learning rate (0.0 = full adaptation, 1.0 = no learning) |
+| `transmit_bandwidth_learning_rate` | float | `0.9` | Transmit estimate learning rate, same convention; read by the deadline predictors |
+| `transmit_meter_interval_ns` | uint | `10000000` | How often a device's throughput is sampled (10 ms) |
+| `transmit_meter_max_interval_ns` | uint | `50000000` | An interval longer than this is re-baselined instead of learned from |
 | `ewma_min_bandwidth_multiplier` | float | `0.1` | Minimum bandwidth as fraction of theoretical |
 | `ewma_max_bandwidth_multiplier` | float | `10.0` | Maximum bandwidth as fraction of theoretical |
 
 **Guidelines**:
 - Lower α (e.g., 0.001) → faster adaptation, more volatile → responds quickly to changes
 - Higher α (e.g., 0.1) → slower adaptation, more stable → smooths out transient fluctuations
-- Default α = 0.01 provides balanced adaptation
-- Multipliers constrain EWMA to reasonable range [0.1×, 10.0×] of theoretical bandwidth
+- Default α = 0.01 provides balanced adaptation for device selection
+- Keep `transmit_bandwidth_learning_rate` high: it backs an irreversible
+  drop decision, so it should follow sustained change, not single samples
+- Multipliers constrain both series to [0.1×, 10.0×] of theoretical bandwidth
 
 ### Device Selection Scoring
 

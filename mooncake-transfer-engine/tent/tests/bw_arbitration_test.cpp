@@ -15,10 +15,12 @@
 // Unit tests for the deadline-aware bandwidth arbitration ordering (#2792).
 
 #include "tent/transport/rdma/bw_arbitration.h"
+#include "tent/runtime/deadline_mlu.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace mooncake {
@@ -31,6 +33,34 @@ constexpr double kBw = 1e9;               // 1 GB/s -> 16 B takes 16 ns
 // A flow whose window is `window_ns` from now, transferring `len` bytes.
 ArbFlow flow(uint64_t window_ns, size_t len) {
     return ArbFlow{kNow + window_ns, len};
+}
+
+// The admission queue's drop predictor and the NIC arbitration must compute
+// the same MLU from the same inputs; DeadlineMlu is that one definition.
+TEST(DeadlineMluTest, PredictedTimeOverWindow) {
+    // 16 B at 1 GB/s = 16 ns; a 32 ns window is half used.
+    EXPECT_DOUBLE_EQ(DeadlineMlu(0, 16, kNow + 32, kNow, kBw), 0.5);
+}
+
+// A deadline is absolute, so time spent behind bytes already in the pipeline
+// counts against the window: it is an additive delay, not a slower link.
+TEST(DeadlineMluTest, BytesAheadAddToPredictedTime) {
+    EXPECT_DOUBLE_EQ(DeadlineMlu(16, 16, kNow + 32, kNow, kBw), 1.0);
+    // Queueing alone can exhaust the window even for a tiny request.
+    EXPECT_DOUBLE_EQ(DeadlineMlu(64, 0, kNow + 32, kNow, kBw), 2.0);
+}
+
+TEST(DeadlineMluTest, NoDeadlineOrNoBandwidthIsNotUrgent) {
+    EXPECT_DOUBLE_EQ(DeadlineMlu(0, 16, 0, kNow, kBw), 0.0);
+    EXPECT_DOUBLE_EQ(DeadlineMlu(0, 16, kNow + 32, kNow, 0.0), 0.0);
+    EXPECT_DOUBLE_EQ(DeadlineMlu(0, 16, kNow + 32, kNow, -1.0), 0.0);
+}
+
+TEST(DeadlineMluTest, PastDeadlineIsInfinitelyUrgent) {
+    EXPECT_EQ(DeadlineMlu(0, 16, kNow, kNow, kBw),
+              std::numeric_limits<double>::max());
+    EXPECT_EQ(DeadlineMlu(0, 16, kNow - 1, kNow, kBw),
+              std::numeric_limits<double>::max());
 }
 
 TEST(BwArbitrationTest, TighterDeadlineSortsFirst) {

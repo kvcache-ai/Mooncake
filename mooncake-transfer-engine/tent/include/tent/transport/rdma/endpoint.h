@@ -165,9 +165,10 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // return how many were taken (posted or marked `failed`). `on_post`,
     // when given, runs for each of those before ibv_post_send: on a shared
     // queue pair another lane can poll a completion before this call
-    // returns, so whatever the poller must find in place (the set entry)
-    // has to be written first. Slices the hardware rejects come back with
-    // `failed` set; the caller undoes what it did for them.
+    // returns, so whatever the poller must find in place (the posted
+    // device, the set entry) has to be written first. Slices the hardware
+    // rejects come back with `failed` set; the caller undoes what it did for
+    // them.
     int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index,
                      const std::function<void(RdmaSlice*)>& on_post = {});
 

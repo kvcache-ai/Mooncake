@@ -51,6 +51,19 @@ class SharedSlotManager;
  * EWMA update:
  *     ewma_bandwidth <- alpha * ewma_bandwidth + (1 - alpha) *
  * observed_bandwidth
+ *
+ * Besides the selection EWMA, each device carries a transmit estimate for
+ * the deadline predictors (admission drop, NIC arbitration): the same update
+ * rule and clamp, but fed from a meter -- bytes completed over the time the
+ * NIC spent with work posted to it, so idle gaps inside an interval are not
+ * charged -- rather than from any one completion's latency. Per-completion
+ * timing cannot answer "how fast does this NIC move bytes": work requests
+ * are posted in batches whose timestamps are effectively one, and a poll
+ * pass timestamps their completions together, so a slice's own
+ * post-to-completion grows with the depth of the batch it travelled in. The
+ * selection EWMA goes on learning from each successful completion's own
+ * post-to-completion time on purpose, so that a NIC backed up behind
+ * earlier work requests scores worse.
  */
 class DeviceSelector {
    public:
@@ -61,7 +74,10 @@ class DeviceSelector {
         bool is_cross_numa;
     };
 
-    struct DeviceInfo {
+    // 64-byte aligned so the padding below really does put each hot atomic
+    // on a cache line of its own (the map's nodes would otherwise place the
+    // struct at any 8-byte boundary).
+    struct alignas(64) DeviceInfo {
         int dev_id;
         // Negotiated link speed in Gbps. setDeviceBandwidth() may rewrite it
         // after traffic has started while workers read it in release(), so
@@ -79,8 +95,38 @@ class DeviceSelector {
         uint64_t padding1[7];
         std::atomic<double> ewma_bandwidth_bps{50e9};
         uint64_t padding2[7];
+        std::atomic<double> ewma_transmit_bps{50e9};
+        uint64_t padding4[7];
         std::atomic<uint64_t> total_bytes{0};
-        uint64_t padding3[5];
+        uint64_t padding3[7];
+        // Bytes handed to the hardware: charged when a WR is posted and
+        // returned when it leaves the queue pair. Unlike inflight_bytes
+        // (charged at allocation) this is the NIC's own backlog.
+        std::atomic<uint64_t> posted_bytes{0};
+        uint64_t padding5[7];
+        // Bytes that completed successfully, monotonic.
+        std::atomic<uint64_t> completed_bytes{0};
+        uint64_t padding6[7];
+        // Transmit meter: the counters as of the last sample, which the
+        // next one measures against. Whichever worker wins the CAS on
+        // meter_ts owns that sample and is the only one touching the other
+        // two. resetTransmitMeter only zeroes meter_ts, so the next sample
+        // rebuilds both baselines under its own CAS instead of learning; a
+        // sampler that had already won before the reset finishes on the
+        // baselines it took, which are at least consistent with each other.
+        std::atomic<uint64_t> meter_ts{0};
+        std::atomic<uint64_t> meter_completed{0};
+        std::atomic<uint64_t> meter_busy_ns{0};
+        // Time this NIC has spent with something posted to it, and when the
+        // stretch in progress began. Advanced only on the posted_bytes
+        // 0 <-> non-zero transitions, so the cost is one timestamp per burst
+        // edge rather than per slice. busy_since is never cleared: a stale
+        // value can only over-count busy time, which reads the link slow,
+        // whereas a zero would charge it the whole clock and read it as
+        // stopped.
+        std::atomic<uint64_t> busy_ns{0};
+        std::atomic<uint64_t> busy_since{0};
+        uint64_t padding7[3];
 
         uint64_t getInflightBytes() const {
             return inflight_bytes.load(std::memory_order_relaxed);
@@ -96,6 +142,14 @@ class DeviceSelector {
 
         double getEwmaBandwidth() const {
             return ewma_bandwidth_bps.load(std::memory_order_relaxed);
+        }
+
+        double getTransmitBandwidth() const {
+            return ewma_transmit_bps.load(std::memory_order_relaxed);
+        }
+
+        uint64_t getPostedBytes() const {
+            return posted_bytes.load(std::memory_order_relaxed);
         }
     };
 
@@ -150,6 +204,40 @@ class DeviceSelector {
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id, int priority, uint64_t device_mask);
 
+    // The NIC's own backlog: `notePosted` when a WR reaches the hardware,
+    // `notePostEnded` when it leaves the queue pair (completion, sweep or
+    // cancellation). This is the queue a slice posted now waits behind --
+    // work still sitting in a worker queue is not part of it. `now_ns` marks
+    // the transitions between an idle and a busy NIC, which is the time the
+    // transmit meter charges its bytes to.
+    void notePosted(int dev_id, uint64_t bytes, uint64_t now_ns);
+    void notePostEnded(int dev_id, uint64_t bytes, uint64_t now_ns);
+    uint64_t getPostedBytes(int dev_id) const;
+    // Nanoseconds this device has spent with something posted to it.
+    uint64_t getBusyNs(int dev_id) const;
+
+    // A successful completion moved `bytes` on the wire.
+    void noteCompleted(int dev_id, uint64_t bytes);
+
+    // Abandon the meter's current interval without learning from it. Busy
+    // time is only worth dividing into bytes that the NIC spent it moving,
+    // so a posted slice that ends without its bytes being counted -- failed,
+    // flushed, timed out -- makes the stretch it belonged to unusable. The
+    // next sample starts over from fresh baselines. A NIC that keeps
+    // producing such slices faster than the meter interval therefore never
+    // closes an interval and keeps its last estimate.
+    void resetTransmitMeter(int dev_id);
+
+    // Feed the transmit estimate one throughput sample -- bytes completed
+    // over the busy time accrued since the last sample -- if this device's
+    // meter interval has passed. Per-completion latency cannot serve here:
+    // work requests are posted in batches whose timestamps are effectively
+    // one, and a poll pass timestamps every completion it reaps alike, so a
+    // slice's own "post to completion" grows with the batch depth. Bytes
+    // over busy time does not care how the work was batched, and charges
+    // nothing for the gaps in which the NIC had nothing posted.
+    void maybeSampleTransmit(int dev_id, uint64_t now_ns);
+
     // Charge `length` bytes to one device without running device selection,
     // for a caller that has already settled on it: a retry re-posting a
     // slice whose charge the failure path returned, or a first attempt
@@ -159,7 +247,8 @@ class DeviceSelector {
 
     // Return a slice's inflight charge and learn from its completion.
     // `latency` is a successful attempt's post->completion time and feeds
-    // the selection EWMA; <= 0 means no sample.
+    // the selection EWMA; <= 0 means no sample. The transmit estimate is
+    // fed by the meter instead, see maybeSampleTransmit().
     Status release(int dev_id, uint64_t length, double latency);
 
     Status getNicLoadStats(std::vector<NicLoadStats> &stats) const;
@@ -186,6 +275,10 @@ class DeviceSelector {
 
     // Bytes charged to one device and not yet released, or 0 if unknown.
     uint64_t getInflightBytes(int dev_id) const;
+    // Transmit estimate (bytes/s) for one device, or -1 if unknown.
+    double getTransmitBandwidth(int dev_id) const;
+    // Sum of the transmit estimates over all devices, or -1 if none.
+    double getAggregateTransmitBandwidth() const;
 
     void fillDevicePriorities();
     int getDevicePriority(int dev_id) const;
@@ -202,6 +295,20 @@ class DeviceSelector {
         // EWMA bandwidth learning rate (0.0 = full adaptation, 1.0 = no
         // learning)
         double bandwidth_learning_rate = 0.01;
+
+        // Transmit estimate learning rate, same convention. One sample per
+        // meter interval below, so 0.9 is ~10 intervals (100 ms) to follow a
+        // change -- slow enough that one odd interval cannot flip an
+        // irreversible drop decision.
+        double transmit_bandwidth_learning_rate = 0.9;
+
+        // How often a device's throughput is sampled, and how far back a
+        // sample may reach before it is dropped instead of learned from: the
+        // meter charges bytes to busy time, so idle gaps do not spoil an
+        // interval, but a sample spanning this much wall clock describes a
+        // link too far in the past to attribute to the link as it is now.
+        uint64_t transmit_meter_interval_ns = 10'000'000;      // 10 ms
+        uint64_t transmit_meter_max_interval_ns = 50'000'000;  // 50 ms
 
         // Enable priority-based filtering
         bool enable_priority_filtering = true;
@@ -233,6 +340,17 @@ class DeviceSelector {
 
     void setSchedulingParams(const SchedulingParams &params) {
         sched_params_ = params;
+        // Both are weights on the old EWMA value; outside [0, 1] the update
+        // is meaningless (negative or runaway estimates).
+        sched_params_.bandwidth_learning_rate =
+            std::clamp(params.bandwidth_learning_rate, 0.0, 1.0);
+        sched_params_.transmit_bandwidth_learning_rate =
+            std::clamp(params.transmit_bandwidth_learning_rate, 0.0, 1.0);
+        // A staleness bound shorter than the sampling interval would reject
+        // every sample, silently freezing the estimate on its seed.
+        sched_params_.transmit_meter_max_interval_ns =
+            std::max(params.transmit_meter_max_interval_ns,
+                     params.transmit_meter_interval_ns);
     }
 
     const SchedulingParams &getSchedulingParams() const {
@@ -252,6 +370,16 @@ class DeviceSelector {
     // Bytes/s the device is rated for: bw_gbps when it is inside the
     // configured [min, max], default_bandwidth_gbps otherwise.
     double theoreticalBandwidth(const DeviceInfo &dev) const;
+
+    // Nanoseconds `dev` has spent with work posted, up to `now_ns`: the
+    // stretches that have ended plus the one still open. Both the sample
+    // and the reset measure against this, so they cannot drift apart.
+    static uint64_t busyNsAt(const DeviceInfo &dev, uint64_t now_ns);
+
+    // EWMA step with the [min, max] x theoretical clamp: new = alpha * old
+    // + (1 - alpha) * observed.
+    void learnRate(const DeviceInfo &dev, std::atomic<double> &series,
+                   double alpha, double observed_bps) const;
 
     // Known to the selector and currently able to carry traffic.
     bool usable(int dev_id) const {

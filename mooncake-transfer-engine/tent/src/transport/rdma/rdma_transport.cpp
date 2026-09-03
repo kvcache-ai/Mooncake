@@ -526,6 +526,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->retry_count = 0;
             slice->last_fallback_idx = -1;
             slice->charged_dev = -1;
+            slice->posted_dev = -1;
             slice->counted_lane = -1;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
@@ -947,7 +948,11 @@ double RdmaTransport::getEstimatedBandwidth() const {
     if (!workers_) return -1.0;
     auto* sel = workers_->getDeviceSelector();
     if (!sel) return -1.0;
-    return sel->getAggregateEwmaBandwidth();
+    // The transmit estimate, not the selection EWMA: the admission queue
+    // asks "how fast do bytes move once they are sent", and adds the wait
+    // behind earlier work itself (DeadlineMlu's bytes_ahead), so the rate
+    // must not fold that wait in the way the selection sample does.
+    return sel->getAggregateTransmitBandwidth();
 }
 
 }  // namespace tent

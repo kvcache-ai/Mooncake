@@ -71,11 +71,15 @@ class Workers {
 
     void asyncPollCq();
 
-    // Resolve one completion: give back what the slice's lane accounts for
-    // and either finish, retry or fail it. Split from asyncPollCq so a test
-    // can drive it with a synthesized ibv_wc.
+    // Resolve one completion: give back what the slice's lane accounts for,
+    // feed the transmit meter, and either finish, retry or fail it. Split
+    // from asyncPollCq so a test can drive it with a synthesized ibv_wc.
+    // `last_in_pass` is true for the final work completion of a poll pass:
+    // the meter is only offered a sample there, so an interval never ends
+    // partway through a group of completions that share one timestamp.
     void handleCompletion(WorkerContext& worker, RdmaContext& context,
-                          const ibv_wc& wc, uint64_t poll_ts);
+                          const ibv_wc& wc, uint64_t poll_ts,
+                          bool last_in_pass = true);
 
     // The lane whose inflight_slice_set holds `slice`'s entry, or nullptr
     // when it cannot be resolved (no lane recorded, or the worker array is
@@ -89,10 +93,14 @@ class Workers {
     // Give back everything a slice swept off a queue pair with a terminal
     // status still holds: its selector charge, its place in whichever
     // lane's inflight count has it, and its entry in whichever lane's set.
-    // `deferred`, when given, collects the entries `self` is to erase, so
-    // the caller can do it after it stops iterating that set.
+    // Unless `bytes_moved` (the sweep finished it with COMPLETED and its own
+    // completion will credit the bytes), a posted slice also ends a stretch
+    // of busy time with nothing to show for it, so the transmit meter
+    // starts over. `deferred`, when given, collects the entries `self` is
+    // to erase, so the caller can do it after it stops iterating that set.
     void retireSweptSlice(WorkerContext& self, RdmaSlice* slice,
-                          std::vector<RdmaSlice*>* deferred);
+                          uint64_t now_ns, std::vector<RdmaSlice*>* deferred,
+                          bool bytes_moved = false);
 
     // Take `slice` out of whichever lane's inflight count holds it, exactly
     // once (`counted_lane` comes back -1 for everyone after): for a slice
@@ -132,16 +140,25 @@ class Workers {
     // skip it.
     bool dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice);
 
-    // Hand back the selector's allocation charge for this slice, to the
-    // device it was charged on. `latency` is a successful attempt's
-    // post->completion time in seconds; 0 = no sample. See
+    // Hand back everything the selector accounts for this slice: its
+    // allocation charge and, if it reached the hardware, its share of the
+    // NIC's posted backlog. `now_ns` closes the NIC's busy stretch when
+    // that share was the last of it, so it must come from the same clock as
+    // the timestamps the slice was posted with. `latency` is a successful
+    // attempt's post->completion time in seconds; 0 = no sample. See
     // DeviceSelector::release.
-    void releaseSliceQuota(RdmaSlice* slice, double latency = 0.0);
+    void releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
+                           double latency = 0.0);
+
+    // Record that `slice` has reached its source device's hardware. Its
+    // submit_ts opens the device's busy stretch when nothing else was
+    // posted to it.
+    void notePostedSlice(RdmaSlice* slice);
 
     // What a posting lane writes for a slice the moment it goes on the
-    // wire: the post timestamp and the lane's set entry. Runs inside
-    // submitSlices, before ibv_post_send, so a completion polled on a
-    // shared queue pair finds both in place.
+    // wire: the post timestamp, the device's posted backlog and the lane's
+    // set entry. Runs inside submitSlices, before ibv_post_send, so a
+    // completion polled on a shared queue pair finds all three in place.
     void markPosted(WorkerContext& worker, RdmaSlice* slice, uint64_t post_ts);
 
     void monitorThread();
