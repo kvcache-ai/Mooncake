@@ -261,13 +261,19 @@ func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrL
 	var offset uint64 = 0
 	taskID := 0
 	maxShardSize := payload.MaxShardSize
+	var registered []Buffer
 
 	for i := 0; i < len(addrList); i++ {
 		addr, size := addrList[i], sizeList[i]
 		err := store.memory.Add(addr, size, maxShardSize, "cpu:0")
 		if err != nil {
+			// Wait for transfers already started in earlier iterations:
+			// unregistering memory that in-flight transfers still use is unsafe.
+			wg.Wait()
+			store.unregisterBuffers(registered, maxShardSize)
 			return err
 		}
+		registered = append(registered, Buffer{addr: addr, size: size})
 		offset = 0
 		for ; offset < size; offset += maxShardSize {
 			source := addr + uintptr(offset)
@@ -292,11 +298,29 @@ func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrL
 	select {
 	case err := <-errChan:
 		if err != nil {
+			store.unregisterBuffers(registered, maxShardSize)
 			return err
 		}
 	default:
 	}
 	return nil
+}
+
+func buffersFromLists(addrList []uintptr, sizeList []uint64) []Buffer {
+	buffers := make([]Buffer, 0, len(addrList))
+	for i := range addrList {
+		buffers = append(buffers, Buffer{addr: addrList[i], size: sizeList[i]})
+	}
+	return buffers
+}
+
+// unregisterBuffersTimes undoes `times` rounds of registration. Each successful
+// doGetReplica pass increments the refcount of every buffer once, so rollback
+// must unregister the same number of times to actually release them.
+func (store *P2PStore) unregisterBuffersTimes(bufferList []Buffer, maxShardSize uint64, times int) {
+	for i := 0; i < times; i++ {
+		store.unregisterBuffers(bufferList, maxShardSize)
+	}
 }
 
 func contains(slice []Location, value Location) bool {
@@ -343,13 +367,19 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 	if payload == nil {
 		return ErrPayloadNotFound
 	}
+	replicaBuffers := buffersFromLists(addrList, sizeList)
+	successfulRounds := 0
 	for {
 		err = store.doGetReplica(ctx, payload, addrList, sizeList)
 		if err != nil {
+			// doGetReplica rolled back its own round; undo earlier rounds.
+			store.unregisterBuffersTimes(replicaBuffers, payload.MaxShardSize, successfulRounds)
 			return err
 		}
+		successfulRounds++
 		newPayload, recheckRevision, err := store.metadata.Get(ctx, name)
 		if err != nil {
+			store.unregisterBuffersTimes(replicaBuffers, payload.MaxShardSize, successfulRounds)
 			return err
 		}
 		if revision == recheckRevision {
@@ -359,7 +389,12 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 			break
 		}
 	}
-	return store.updatePayloadMetadata(ctx, name, addrList, sizeList, payload, revision)
+	err = store.updatePayloadMetadata(ctx, name, addrList, sizeList, payload, revision)
+	if err != nil {
+		store.unregisterBuffersTimes(replicaBuffers, payload.MaxShardSize, successfulRounds)
+		return err
+	}
+	return nil
 }
 
 func (store *P2PStore) performTransfer(ctx context.Context, source uintptr, shard Shard) error {
