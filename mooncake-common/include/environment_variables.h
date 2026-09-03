@@ -84,6 +84,17 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_EVICTION_CHECK_INTERVAL);
 };
 
+struct OffsetAllocatorBackendEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_EVICTION_POLICY);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_HIGH_RATIO);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_LOW_RATIO);
+    MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFSET_MAX_CAPACITY_NODES);
+    MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_PERSIST_MODE);
+    MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFSET_RECORD_CRC);
+};
+
 struct ReplicaSelectionEnvironmentVariables {
     // Only the exact string "1" enables scoring, unlike canonical bool parsing.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
