@@ -4351,6 +4351,9 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         return results;
     }
 
+    LOG(INFO) << "[Store] SubmitScatter (batch range read), entry_count="
+              << replicas.size() << ", range_count=" << builder.ranges().size()
+              << ", fragment_count=" << fragment_count;
     auto operation = SubmitScatter(builder.ranges());
     if (!operation) {
         LOG(ERROR) << "Failed to submit batch range read";
