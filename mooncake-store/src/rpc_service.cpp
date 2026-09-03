@@ -218,7 +218,7 @@ WrappedMasterService::ExistKey(coro_rpc::context<tl::expected<bool, ErrorCode>> 
     // send_request_with_attachment). Log it here, then delegate to the
     // value-returning ExistKeyInternal (also used in-process by tests) and
     // reply via ctx.response_msg.
-    if (auto att = ctx.get_context_info()->get_request_attachment();
+    if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         VLOG(1) << "ExistKey request_id=" << att;
         RecordObservedRequestId(att);
@@ -393,7 +393,7 @@ WrappedMasterService::Remove(coro_rpc::context<tl::expected<void, ErrorCode>> ct
     // Bypass: see ExistKey. Log the per-request request_id from the attachment,
     // delegate to RemoveInternal (shared with in-process tests), reply via
     // ctx.response_msg.
-    if (auto att = ctx.get_context_info()->get_request_attachment();
+    if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         VLOG(1) << "Remove request_id=" << att;
         RecordObservedRequestId(att);
@@ -525,7 +525,7 @@ WrappedMasterService::GetReplicaList(
     // delegates the read/log/metric logic to the value-returning
     // GetReplicaListInternal (also used in-process by HTTP /batch_query_keys and
     // tests), then replies via ctx.response_msg.
-    if (auto att = ctx.get_context_info()->get_request_attachment();
+    if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         VLOG(1) << "GetReplicaList request_id=" << att;
         RecordObservedRequestId(att);
@@ -545,7 +545,7 @@ WrappedMasterService::BatchGetReplicaList(
     // See GetReplicaList: log the out-of-band attachment request_id, then
     // delegate to the shared value-returning BatchGetReplicaListInternal (one source
     // of read/log/metric logic) and reply via ctx.response_msg.
-    if (auto att = ctx.get_context_info()->get_request_attachment();
+    if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         VLOG(1) << "BatchGetReplicaList request_id=" << att;
         RecordObservedRequestId(att);
@@ -563,7 +563,7 @@ WrappedMasterService::BatchExistKey(
     // client-side by invoke_batch_rpc (send_request_with_attachment). Log it
     // here, then delegate to the value-returning BatchExistKeyInternal (shared with
     // in-process/tests) and reply via ctx.response_msg.
-    if (auto att = ctx.get_context_info()->get_request_attachment();
+    if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         VLOG(1) << "BatchExistKey request_id=" << att;
         RecordObservedRequestId(att);

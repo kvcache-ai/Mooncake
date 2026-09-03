@@ -340,11 +340,11 @@ void RealClient::put_dummy_helper(
     // master_client_.PutStart) re-attaches the same id.
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -453,11 +453,11 @@ void RealClient::put_batch_dummy_helper(
     // (master RPC: BatchPutStart). See put_dummy_helper.
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -559,11 +559,11 @@ void RealClient::put_parts_dummy_helper(
     // (master RPC: PutStart). See put_dummy_helper.
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1046,11 +1046,11 @@ void RealClient::get_buffer_info_dummy_helper(
     // (master RPC: GetReplicaList via Query). See put_dummy_helper.
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1189,11 +1189,11 @@ RealClient::batch_put_from_dummy_helper(
     // synchronous master RPC below re-attaches the same id.
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1390,11 +1390,11 @@ RealClient::batch_get_into_dummy_helper(
     // synchronous master RPC below re-attaches the same id.
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1520,11 +1520,11 @@ void RealClient::batchIsExist_internal_rpc(
     // in-process by the real path).
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1548,11 +1548,11 @@ void RealClient::isExist_internal_rpc(
     // same coro_rpc server thread re-attaches the id, delegate and reply.
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1575,11 +1575,11 @@ void RealClient::remove_internal_rpc(
     // via CurrentCtxScope.
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.
@@ -1602,11 +1602,11 @@ void RealClient::getSize_internal_rpc(
     // via CurrentCtxScope.
     std::optional<CurrentCtxScope> ctx_guard;
     {
-        auto att = ctx.get_context_info()->get_request_attachment();
+        auto att = ctx.get_context_info()->release_request_attachment();
         RequestContext rc;
         if (!att.empty()) {
             VLOG(2) << "hop-A bridge request_id=" << att;
-            rc.request_id = std::string(att);
+            rc.request_id = std::move(att);
         }
         // Always install a scope (even for an empty attachment) so the hop B
         // inject reads THIS request's id, not residue left on this io thread.

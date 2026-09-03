@@ -53,7 +53,7 @@ inline const std::optional<RequestContext>& get_current_request_context() {
 // the entry of the master-client invoke_rpc* templates and handed to
 // coro_rpc_client::send_request_with_attachment so request_id rides the request
 // framing rather than a struct field. Server side: read it back via
-// ctx.get_context_info()->get_request_attachment() (a std::string_view); an
+// ctx.get_context_info()->release_request_attachment() (a std::string, which drains the buffer); an
 // empty view means no per-request id was supplied.
 inline std::string current_request_id_attachment() {
     if (g_current_ctx) {

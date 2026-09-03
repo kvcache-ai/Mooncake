@@ -128,7 +128,7 @@ WrappedCentralizedMasterService::PutStart(
     // send_request_with_attachment), delegate to the value-returning
     // PutStartInternal (shared with in-process tests), and reply via
     // ctx.response_msg.
-    if (auto att = ctx.get_context_info()->get_request_attachment();
+    if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         VLOG(1) << "PutStart request_id=" << att;
         RecordObservedRequestId(att);
@@ -265,7 +265,7 @@ WrappedCentralizedMasterService::BatchPutStart(
     // attachment (set client-side by invoke_batch_rpc via
     // send_request_with_attachment), delegate to the value-returning
     // BatchPutStartInternal, and reply via ctx.response_msg.
-    if (auto att = ctx.get_context_info()->get_request_attachment();
+    if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
         VLOG(1) << "BatchPutStart request_id=" << att;
         RecordObservedRequestId(att);
