@@ -75,7 +75,7 @@ class LifecycleConfigView {
    public:
     template <typename T>
     T get(const std::string& key_path, const T& default_value) const {
-        if (!allows(key_path) || !values_) return default_value;
+        if (!canRead(key_path)) return default_value;
         return values_->get<T>(key_path, default_value);
     }
 
@@ -98,14 +98,18 @@ class LifecycleConfigView {
    protected:
     LifecycleConfigView(std::shared_ptr<const Config> values,
                         ConfigLifecycle lifecycle)
-        : values_(std::move(values)), lifecycle_(lifecycle) {}
+        : values_(std::move(values)), lifecycle_(lifecycle) {
+        if (values_) configured_paths_ = values_->paths();
+    }
     ~LifecycleConfigView() = default;
 
    private:
     bool allows(std::string_view key_path) const;
+    bool canRead(std::string_view key_path) const;
 
     std::shared_ptr<const Config> values_;
     ConfigLifecycle lifecycle_;
+    std::vector<std::string> configured_paths_;
 };
 
 class BootstrapConfig final : public LifecycleConfigView {

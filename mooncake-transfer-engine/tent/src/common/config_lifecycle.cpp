@@ -194,13 +194,27 @@ bool LifecycleConfigView::allows(std::string_view key_path) const {
     return classifyConfigPath(key_path) == lifecycle_;
 }
 
+bool LifecycleConfigView::canRead(std::string_view key_path) const {
+    if (!values_ || !allows(key_path)) return false;
+
+    for (const auto& configured_path : configured_paths_) {
+        if (configured_path.size() <= key_path.size() ||
+            configured_path.compare(0, key_path.size(), key_path) != 0 ||
+            configured_path[key_path.size()] != '/') {
+            continue;
+        }
+        if (!allows(configured_path)) return false;
+    }
+    return true;
+}
+
 bool LifecycleConfigView::contains(const std::string& key_path) const {
-    return allows(key_path) && values_ && values_->contains(key_path);
+    return canRead(key_path) && values_->contains(key_path);
 }
 
 bool LifecycleConfigView::dumpSubtree(const std::string& key_path,
                                       std::string* out) const {
-    return allows(key_path) && values_ && values_->dumpSubtree(key_path, out);
+    return canRead(key_path) && values_->dumpSubtree(key_path, out);
 }
 
 TentConfigBundle buildTentConfigBundle(const Config& effective_config,

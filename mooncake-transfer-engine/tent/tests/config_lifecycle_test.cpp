@@ -108,6 +108,44 @@ TEST(ConfigLifecycleTest, BundleViewsEnforceLifecycleBoundaries) {
     EXPECT_EQ(bundle.runtime->generation, 17);
 }
 
+TEST(ConfigLifecycleTest, RejectsMixedLifecycleSubtreeReads) {
+    Config config;
+    ASSERT_TRUE(config
+                    .load(R"({
+                        "metrics": {
+                            "enabled": true,
+                            "report_interval_seconds": 5
+                        },
+                        "staging": {"shutdown_drain_timeout_ms": 1000},
+                        "transports": {
+                            "rdma": {
+                                "device": {"max_cqe": 4096},
+                                "strict_local_numa": true
+                            }
+                        }
+                    })")
+                    .ok());
+
+    auto bundle = buildTentConfigBundle(config);
+    const json rejected_default = {{"rejected", true}};
+    std::string subtree = "unchanged";
+
+    EXPECT_FALSE(bundle.bootstrap->contains("metrics"));
+    EXPECT_FALSE(bundle.bootstrap->dumpSubtree("metrics", &subtree));
+    EXPECT_EQ(subtree, "unchanged");
+    EXPECT_EQ(bundle.bootstrap->get<json>("transports/rdma", rejected_default),
+              rejected_default);
+
+    EXPECT_TRUE(bundle.bootstrap->get("metrics/enabled", false));
+    EXPECT_EQ(bundle.runtime->config->get("metrics/report_interval_seconds", 0),
+              5);
+    EXPECT_TRUE(bundle.runtime->config->get("transports/rdma/strict_local_numa",
+                                            false));
+
+    EXPECT_EQ(bundle.bootstrap->get<json>("staging", json::object()),
+              json({{"shutdown_drain_timeout_ms", 1000}}));
+}
+
 TEST(ConfigLifecycleTest, SnapshotDoesNotChangeWithLegacyConfig) {
     Config config;
     config.set("rpc_server_port", 18080);
