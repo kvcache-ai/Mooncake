@@ -17,6 +17,7 @@
 
 #include "tent/transport/rdma/quota.h"
 
+#include "tent/transport/rdma/bw_arbitration.h"
 
 #include <gtest/gtest.h>
 
@@ -817,6 +818,20 @@ TEST(DeviceSelectorTransmitAccuracyTest, DutyCyclePastTheCutOffIsRejected) {
     const double got = runDutyCycle(*sel, 8.0, kMiB, 16, 60'000'000ull, 100);
     RecordProperty("estimate", std::to_string(got));
     EXPECT_DOUBLE_EQ(got, 3.125e9);  // the 25 Gbps seed, never updated
+}
+
+// The ordering half of the estimate's job is immune to all of this: one
+// arbitration call scores every contender against the same bw, so scaling it
+// scales every MLU alike and the order is unchanged. Only the admission
+// layer's absolute threshold can be moved by a wrong rate.
+TEST(DeviceSelectorTransmitAccuracyTest, OrderingIsUnaffectedByARateError) {
+    const std::vector<ArbFlow> flows{
+        {kT0 + 40, 16}, {kT0 + 10, 8}, {kT0 + 80, 64}};
+    const auto truth = OrderByUrgency(flows, kT0, 8e9, 1024);
+    for (double wrong : {8e9 / 5, 8e9 / 2, 8e9 * 3}) {
+        EXPECT_EQ(OrderByUrgency(flows, kT0, wrong, 1024), truth)
+            << "bw=" << wrong;
+    }
 }
 
 // The worst case for the poll cadence: sixteen 1 MiB slices at 2 GB/s put one

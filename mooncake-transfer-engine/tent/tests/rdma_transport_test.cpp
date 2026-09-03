@@ -100,6 +100,12 @@ class RdmaTransportTestPeer {
                                                        endpoint_ready);
     }
 
+    static void orderByDeadline(Workers& workers,
+                                std::vector<RdmaSlice*>& slices, int dev_id,
+                                uint64_t now_ns) {
+        workers.orderByDeadline(slices, dev_id, now_ns);
+    }
+
     static void rechargeSlice(Workers& workers, RdmaSlice* slice, int dev_id) {
         workers.rechargeSlice(slice, dev_id);
     }
@@ -909,6 +915,123 @@ TEST_F(RdmaWorkersTimeoutTest, NotOnQueueStillReleasesSelectorInflightCharge) {
 
     expectTimedOutAndReleased();
     EXPECT_EQ(ctx_.inflight_slices.load(), 0);
+}
+
+// The selector charges every slice when it is allocated, before it reaches a
+// worker queue, so a NIC's inflight bytes already cover the slices being
+// ordered. What actually precedes them is what the NIC owes minus this
+// batch; each slice then also waits for the ones ordered ahead of it.
+class RdmaWorkersArbitrationTest : public ::testing::Test {
+   protected:
+    static constexpr int kDev = 0;
+    static constexpr uint64_t kNow = 1'000'000'000;
+
+    void SetUp() override {
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(
+            topology
+                ->parse(
+                    R"({"nics":[{"name":"mc-absent-rnic-0","type":0,"numa_node":0}]})")
+                .ok());
+        Topology::MemEntry mem;
+        mem.name = "cpu:0";
+        mem.type = Topology::MEM_HOST;
+        mem.numa_node = 0;
+        mem.device_list[0].push_back(kDev);
+        topology->mem_list_.push_back(mem);
+
+        RdmaTransportTestPeer::bindTopology(transport_, topology);
+        ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport_), 0u);
+        workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
+        selector_ = workers_->getDeviceSelector();
+        ASSERT_TRUE(selector_->setDeviceAvailable(kDev, true).ok());
+
+        // Pin the transmit estimate at exactly 1 GB/s, so one byte of
+        // queueing is one nanosecond of predicted time: one metered interval
+        // that moved 1 MiB in 1 MiB nanoseconds.
+        auto params = selector_->getSchedulingParams();
+        params.transmit_bandwidth_learning_rate = 0.0;  // adopt outright
+        params.transmit_meter_interval_ns = 0;          // sample on demand
+        selector_->setSchedulingParams(params);
+        ASSERT_TRUE(selector_->setDeviceBandwidth(kDev, 25.0).ok());
+        selector_->notePosted(kDev, 1 << 20, kNow);
+        selector_->maybeSampleTransmit(kDev, kNow);
+        selector_->notePostEnded(kDev, 1 << 20, kNow + (1 << 20));
+        selector_->noteCompleted(kDev, 1 << 20);
+        selector_->maybeSampleTransmit(kDev, kNow + (1 << 20));
+        ASSERT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
+        ASSERT_EQ(selector_->getPostedBytes(kDev), 0u);
+    }
+
+    void TearDown() override {
+        for (auto* slice : slices_) RdmaSliceStorage::Get().deallocate(slice);
+        for (auto* task : tasks_) task->deref();
+    }
+
+    // A slice of `length` bytes due `window_ns` from kNow, charged to the NIC
+    // by the selector exactly as selectOptimalDevice() charges it.
+    RdmaSlice* makeSlice(uint64_t length, uint64_t window_ns) {
+        auto* task = RdmaTaskStorage::Get().allocate();
+        task->num_slices = 1;
+        task->status_word = PENDING;
+        task->first_error = PENDING;
+        task->ref();  // the batch's reference, dropped in TearDown
+        task->request.deadline_ns = kNow + window_ns;
+        auto* slice = RdmaSliceStorage::Get().allocate();
+        slice->task = task;
+        slice->length = length;
+        slice->word = PENDING;
+        slice->rail_monitor = nullptr;
+        int chosen = -1;
+        EXPECT_TRUE(selector_->allocate(length, "cpu:0", chosen).ok());
+        EXPECT_EQ(chosen, kDev);
+        slice->source_dev_id = chosen;
+        slice->charged_dev = chosen;
+        tasks_.push_back(task);
+        slices_.push_back(slice);
+        return slice;
+    }
+
+    RdmaTransport transport_;
+    std::unique_ptr<Workers> workers_;
+    DeviceSelector* selector_ = nullptr;
+    std::vector<RdmaTask*> tasks_;
+    std::vector<RdmaSlice*> slices_;
+};
+
+TEST_F(RdmaWorkersArbitrationTest, QueueAheadExcludesTheSlicesBeingOrdered) {
+    auto* big = makeSlice(40'000, 200'000);    // 40us of a 200us window: 0.20
+    auto* small = makeSlice(15'000, 100'000);  // 15us of a 100us window: 0.15
+    // Charged to the NIC by the selector, but not yet handed to hardware.
+    ASSERT_EQ(selector_->getInflightBytes(kDev), 55'000u);
+    ASSERT_EQ(selector_->getPostedBytes(kDev), 0u);
+
+    std::vector<RdmaSlice*> slices{small, big};
+    RdmaTransportTestPeer::orderByDeadline(*workers_, slices, kDev, kNow);
+
+    // The NIC has nothing to move yet, so `big` is simply the more urgent of
+    // the two. Reading the allocation charge as queueing would count the
+    // batch's own 55'000 bytes and put `small`'s tighter window on top
+    // instead (0.70 vs 0.48).
+    EXPECT_EQ(slices[0], big);
+    EXPECT_EQ(slices[1], small);
+}
+
+TEST_F(RdmaWorkersArbitrationTest, QueueAheadCountsWorkOutsideTheBatch) {
+    auto* big = makeSlice(40'000, 200'000);
+    auto* small = makeSlice(15'000, 100'000);
+    // Another batch's slices, already posted to this NIC: 200us of work
+    // these two really do wait behind.
+    selector_->notePosted(kDev, 200'000, kNow);
+
+    std::vector<RdmaSlice*> slices{big, small};
+    RdmaTransportTestPeer::orderByDeadline(*workers_, slices, kDev, kNow);
+
+    // Behind it `small`'s 100us window is already gone (2.15) while `big`'s
+    // 200us one is not (1.20), so the order flips.
+    EXPECT_EQ(slices[0], small);
+    EXPECT_EQ(slices[1], big);
+    selector_->notePostEnded(kDev, 200'000, kNow);
 }
 
 // Two RDMA NICs, both reachable from the host buffer, and a Workers whose

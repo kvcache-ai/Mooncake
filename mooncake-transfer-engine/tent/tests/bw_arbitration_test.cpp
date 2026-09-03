@@ -63,6 +63,50 @@ TEST(DeadlineMluTest, PastDeadlineIsInfinitelyUrgent) {
               std::numeric_limits<double>::max());
 }
 
+TEST(DeadlineMluTest, ArbitrationUsesTheSameDefinition) {
+    const ArbFlow f = flow(32, 16);
+    EXPECT_DOUBLE_EQ(PredictedMlu(f, kNow, kBw),
+                     DeadlineMlu(0, f.length, f.deadline_ns, kNow, kBw));
+    EXPECT_DOUBLE_EQ(PredictedMlu(f, kNow, kBw, 48),
+                     DeadlineMlu(48, f.length, f.deadline_ns, kNow, kBw));
+}
+
+TEST(BwArbitrationTest, BytesAheadFavorTheTighterWindow) {
+    std::vector<ArbFlow> flows = {
+        flow(100'000, 4096),  // idx0: 4.1us of 100us  -> MLU 0.041
+        flow(30'000, 1024),   // idx1: 1.0us of 30us   -> MLU 0.034
+    };
+    // On an idle NIC the bigger request is (slightly) more urgent...
+    auto idle = OrderByUrgency(flows, kNow, kBw);
+    EXPECT_EQ(idle[0], 0u);
+    // ...but behind 64 KiB already queued (65.5us) the 30us window is gone
+    // while the 100us one still has room, so the small flow must go first.
+    auto busy = OrderByUrgency(flows, kNow, kBw, 65536);
+    EXPECT_EQ(busy[0], 1u);
+    EXPECT_EQ(busy[1], 0u);
+}
+
+// Ordering is decided one slot at a time: once a flow takes a slot, the
+// flows still waiting sit behind its bytes too, so the queue-ahead term
+// grows as the order is built. Scoring everyone once against the same value
+// would miss that.
+TEST(BwArbitrationTest, EachSlotIsScoredBehindTheOnesBeforeIt) {
+    // 1 GB/s: 1 byte == 1 ns of wire time.
+    std::vector<ArbFlow> flows = {
+        flow(40'000, 100'000),  // idx0: 100us of a 40us window -> 2.50
+        flow(100'000, 20'000),  // idx1: 20us of a 100us window -> 0.20
+        flow(50'000, 5'000),    // idx2: 5us of a 50us window   -> 0.10
+    };
+    // Scored once, the order would be its own MLU ranking: 0, 1, 2.
+    // Behind idx0's 100us, though, idx2's 50us window is blown (105/50 =
+    // 2.10) while idx1 still fits (120/100 = 1.20), so idx2 goes first.
+    auto order = OrderByUrgency(flows, kNow, kBw);
+    ASSERT_EQ(order.size(), 3u);
+    EXPECT_EQ(order[0], 0u);
+    EXPECT_EQ(order[1], 2u);
+    EXPECT_EQ(order[2], 1u);
+}
+
 TEST(BwArbitrationTest, TighterDeadlineSortsFirst) {
     std::vector<ArbFlow> flows = {
         flow(1'000'000, 4096),  // idx0: loose (1ms window)

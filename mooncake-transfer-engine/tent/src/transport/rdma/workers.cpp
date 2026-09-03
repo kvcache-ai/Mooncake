@@ -38,12 +38,6 @@ namespace tent {
 thread_local int tl_wid = -1;
 
 namespace {
-struct ArbitrationEntry {
-    RdmaSlice* slice;
-    double mlu;
-    size_t order;
-};
-
 // Look up (or create) the RailMonitor for `machine_id` on this worker's
 // map. Returning a stable reference is safe because the map stores values
 // via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
@@ -386,6 +380,41 @@ Status Workers::cancel(RdmaTask* task) {
     return Status::OK();
 }
 
+void Workers::orderByDeadline(std::vector<RdmaSlice*>& slices, int dev_id,
+                              uint64_t now_ns) {
+    if (!device_selector_ || slices.size() < 2) return;
+    // This NIC's transmit estimate answers "how fast do these bytes move";
+    // <= 0 means nothing to predict from, so the order stays as it is.
+    const double bw_bps = device_selector_->getTransmitBandwidth(dev_id);
+    if (bw_bps <= 0.0) return;
+
+    thread_local std::vector<ArbFlow> flows;
+    flows.clear();
+    flows.reserve(slices.size());
+    bool any_deadline = false;
+    for (const RdmaSlice* s : slices) {
+        flows.push_back(s && s->task
+                            ? ArbFlow{s->task->request.deadline_ns, s->length}
+                            : ArbFlow{0, 0});
+        any_deadline |= flows.back().deadline_ns != 0;
+    }
+    // Without a deadline anywhere every MLU is 0 and the order would come
+    // out as it went in; skip the greedy pass rather than run it for that.
+    if (!any_deadline) return;
+
+    // What actually precedes these slices: bytes already posted to the NIC.
+    // None of the candidates is in it -- they are about to be posted -- and
+    // neither is work still sitting in a worker queue.
+    const size_t bytes_ahead = device_selector_->getPostedBytes(dev_id);
+    const auto order = OrderByUrgency(flows, now_ns, bw_bps, bytes_ahead);
+
+    thread_local std::vector<RdmaSlice*> ordered;
+    ordered.clear();
+    ordered.reserve(order.size());
+    for (size_t i : order) ordered.push_back(slices[i]);
+    std::copy(ordered.begin(), ordered.end(), slices.begin());
+}
+
 void Workers::rechargeSlice(RdmaSlice* slice, int dev_id) {
     if (!device_selector_ || !slice || dev_id < 0) return;
     if (slice->charged_dev.load(std::memory_order_relaxed) == dev_id) return;
@@ -707,39 +736,9 @@ void Workers::asyncPostSend() {
         // its deadline claims the shared NIC's QP slots ahead of looser flows.
         // Default (deadline_bw_arbitration_ == false) leaves order untouched,
         // so behavior is byte-identical to today's FIFO / equal split.
-        if (deadline_bw_arbitration_ && slices.size() > 1) {
-            const uint64_t now_ns = getCurrentTimeInNano();
-            const double bw_bps = device_selector_
-                                      ? device_selector_->getSchedulingParams()
-                                                .default_bandwidth_gbps *
-                                            1e9 / 8.0
-                                      : 0.0;
-            if (bw_bps > 0.0) {
-                thread_local std::vector<ArbitrationEntry> scratch;
-                scratch.clear();
-                scratch.reserve(slices.size());
-
-                for (size_t i = 0; i < slices.size(); ++i) {
-                    const RdmaSlice* s = slices[i];
-                    ArbFlow flow{0, 0};
-                    if (s && s->task) {
-                        flow = ArbFlow{s->task->request.deadline_ns, s->length};
-                    }
-                    scratch.push_back(ArbitrationEntry{
-                        slices[i], PredictedMlu(flow, now_ns, bw_bps), i});
-                }
-
-                std::sort(
-                    scratch.begin(), scratch.end(),
-                    [](const ArbitrationEntry& a, const ArbitrationEntry& b) {
-                        if (a.mlu > b.mlu) return true;
-                        if (a.mlu < b.mlu) return false;
-                        return a.order < b.order;
-                    });
-                for (size_t i = 0; i < scratch.size(); ++i) {
-                    slices[i] = scratch[i].slice;
-                }
-            }
+        if (deadline_bw_arbitration_) {
+            orderByDeadline(slices, path.local_device_id,
+                            getCurrentTimeInNano());
         }
 
         // Everything a completion's poller must find is written before the

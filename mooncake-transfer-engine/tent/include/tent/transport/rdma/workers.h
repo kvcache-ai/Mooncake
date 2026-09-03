@@ -126,6 +126,12 @@ class Workers {
     // be driven with a synthetic clock in tests.
     void expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns);
 
+    // Reorder `slices` (all contending for one NIC path) most-urgent-first
+    // by predicted MLU, RFC #2792. Split from asyncPostSend so a test can
+    // drive it with a live DeviceSelector and no endpoint.
+    void orderByDeadline(std::vector<RdmaSlice*>& slices, int dev_id,
+                         uint64_t now_ns);
+
     // Charge `slice` to `dev_id`, moving or establishing the selector's
     // accounting for it. Called when a retry or a fallback settles on a
     // device: a retry's charge was returned by the failure path that
