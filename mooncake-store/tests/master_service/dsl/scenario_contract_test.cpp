@@ -121,6 +121,13 @@ static_assert(!SupportsThen<UnspecifiedObjects>);
 static_assert(SupportsThen<MissingObjects>);
 static_assert(SupportsThen<ReadableObjects>);
 
+MasterServiceConfig ContractOffloadConfig() {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;
+    return config;
+}
+
 }  // namespace
 
 TEST(MasterScenarioContractTest, HonorsRequestedPutStartReplicaCount) {
@@ -388,6 +395,90 @@ TEST(MasterScenarioContractTest, CollectionFailureIdentifiesObjectKey) {
             .Given(Objects({"present"}).Size(1_KB).CompleteOn("memory"))
             .Then(Objects({"present", "missing"}).AreReadable()),
         "Object(missing) is not readable: OBJECT_NOT_FOUND");
+}
+
+TEST(MasterScenarioContractTest, ReportsUnexpectedMountLocalDiskError) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("mount local disk without offload mode")
+            .Given(MemoryNode("memory"))
+            .When(MountLocalDisk("memory")),
+        "MountLocalDisk(memory) failed: UNABLE_OFFLOAD");
+}
+
+TEST(MasterScenarioContractTest, ReportsWrongUnmountLocalDiskErrorCode) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("wrong unmount local disk error code")
+            .Given(MemoryNode("memory"))
+            .When(UnmountLocalDisk("memory").ExpectError(
+                ErrorCode::ILLEGAL_CLIENT)),
+        "UnmountLocalDisk(memory) failed with UNABLE_OFFLOAD; expected "
+        "ILLEGAL_CLIENT");
+}
+
+TEST(MasterScenarioContractTest, ReportsUnexpectedReportSsdCapacityError) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("ssd capacity report without a mounted local disk",
+                       ContractOffloadConfig())
+            .Given(MemoryNode("memory"))
+            .When(ReportSsdCapacity("memory", 1000)),
+        "ReportSsdCapacity(memory) failed: SEGMENT_NOT_FOUND");
+}
+
+TEST(MasterScenarioContractTest, ReportsOffloadHeartbeatTaskCountMismatch) {
+    MasterScenario scenario("offload heartbeat task count mismatch",
+                            ContractOffloadConfig());
+    scenario.Given(MemoryNode("memory"))
+        .When(MountLocalDisk("memory"))
+        .Given(
+            Objects({"queued"}).Size(1_KB).By("memory").CompleteOn("memory"));
+    EXPECT_NONFATAL_FAILURE(
+        scenario.When(OffloadHeartbeat("memory").ExpectNoTasks()),
+        "OffloadHeartbeat(memory) returned 1 offload tasks; expected 0");
+}
+
+TEST(MasterScenarioContractTest, ReportsMissingOffloadTask) {
+    MasterScenario scenario("offload heartbeat missing task",
+                            ContractOffloadConfig());
+    scenario.Given(MemoryNode("memory"))
+        .When(MountLocalDisk("memory"))
+        .Given(
+            Objects({"queued"}).Size(1_KB).By("memory").CompleteOn("memory"));
+    EXPECT_NONFATAL_FAILURE(
+        scenario.When(OffloadHeartbeat("memory").ExpectTasks({"other"}, 1024)),
+        "OffloadHeartbeat(memory) is missing an offload task for other");
+}
+
+TEST(MasterScenarioContractTest, ReportsCompleteOffloadWithoutRecordedSize) {
+    MasterScenario scenario("complete offload without a recorded size",
+                            ContractOffloadConfig());
+    scenario.Given(MemoryNode("memory")).When(MountLocalDisk("memory"));
+    EXPECT_NONFATAL_FAILURE(
+        scenario.When(
+            CompleteOffload({"unknown"}).By("memory").OnNode("memory")),
+        "CompleteOffload(unknown) has no PutStart-recorded size; use OfSize");
+}
+
+TEST(MasterScenarioContractTest, ReportsUnexpectedEvictDiskReplicaError) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("evict disk replica of a missing key",
+                       ContractOffloadConfig())
+            .Given(MemoryNode("memory"))
+            .When(EvictDiskReplica("missing")),
+        "EvictDiskReplica(missing) failed: OBJECT_NOT_FOUND");
+}
+
+TEST(MasterScenarioContractTest, CompletesOffloadUsingRecordedPutStartSize) {
+    MasterScenario("complete offload sized from the recorded PutStart",
+                   ContractOffloadConfig())
+        .Given(MemoryNode("memory"))
+        .When(MountLocalDisk("memory"))
+        .When(PutStart("recorded", 2_KB).By("memory"))
+        .When(PutEnd("recorded").By("memory"))
+        .When(CompleteOffload({"recorded"}).By("memory").OnNode("memory"))
+        .Then(Object("recorded")
+                  .HasReplicas(2)
+                  .HasMemoryReplicas(1)
+                  .HasLocalDiskReplicas(1));
 }
 
 }  // namespace mooncake::test
