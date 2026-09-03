@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "tent/common/config.h"
+#include "tent/common/config_lifecycle.h"
 #include "tent/common/types.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -367,6 +368,46 @@ TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledLeavesTaskFailed) {
     EXPECT_TRUE(engine.freeBatch(batch.batch_id).ok());
     EXPECT_TRUE(
         engine.unregisterLocalMemory(batch.buf.data(), batch.buf.size()).ok());
+}
+
+TEST(EngineFailoverE2E, FailoverPolicyIsPinnedAtSubmit) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("max_failover_attempts", 1);
+    cfg->set("enable_auto_failover_on_poll", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    CorruptedRdmaBatch old_generation;
+    submitCorruptedRdmaBatch(engine, old_generation, 0xB1);
+
+    auto next_cfg = makeMinimalP2PConfig();
+    next_cfg->set("max_failover_attempts", 0);
+    next_cfg->set("enable_auto_failover_on_poll", false);
+    engine.publishRuntimeConfigForTest(
+        buildTentConfigBundle(*next_cfg, 1).runtime);
+
+    auto old_status = pollUntilDone(engine, old_generation.batch_id, 0);
+    EXPECT_EQ(old_status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(old_generation.fake_tcp->submit_calls.load(), 1);
+
+    CorruptedRdmaBatch new_generation;
+    submitCorruptedRdmaBatch(engine, new_generation, 0xB2);
+    TransferStatus new_status{};
+    ASSERT_TRUE(
+        engine.getTransferStatus(new_generation.batch_id, 0, new_status).ok());
+    EXPECT_EQ(new_status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(new_generation.fake_tcp->submit_calls.load(), 0);
+
+    EXPECT_TRUE(engine.freeBatch(old_generation.batch_id).ok());
+    EXPECT_TRUE(engine
+                    .unregisterLocalMemory(old_generation.buf.data(),
+                                           old_generation.buf.size())
+                    .ok());
+    EXPECT_TRUE(engine.freeBatch(new_generation.batch_id).ok());
+    EXPECT_TRUE(engine
+                    .unregisterLocalMemory(new_generation.buf.data(),
+                                           new_generation.buf.size())
+                    .ok());
 }
 
 TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledAppliesToVectorStatus) {
