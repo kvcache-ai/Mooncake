@@ -1776,8 +1776,8 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
         // persist, offload, publish) and may invalidate this member, which
         // invalidates the route membership; we keep the strong handle (entry)
         // alive and do not use `member_metadata` after the call.
-        EvictMemberOutcome member_outcome =
-            evict_one_member(member_key, member_metadata, tenant_state, tenant_accessor);
+        EvictMemberOutcome member_outcome = evict_one_member(
+            member_key, member_metadata, tenant_state, tenant_accessor);
         result.freed_bytes += member_outcome.freed_bytes;
         result.evicted_objects += member_outcome.evicted_objects;
         if (member_outcome.stop_scan) {
@@ -3714,8 +3714,8 @@ auto MasterService::BatchReplicaClear(
                     return r.is_local_disk_replica() && r.is_completed();
                 })) {
                 auto& tenant_accessor = accessor.GetTenantAccessor();
-                tenant_accessor.OnDiskReplicaRemoved(had_completed_disk_on_segment,
-                                           metadata);
+                tenant_accessor.OnDiskReplicaRemoved(
+                    had_completed_disk_on_segment, metadata);
             }
 
             // If no valid replicas remain, erase the entire metadata
@@ -4154,10 +4154,11 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 }
 
 auto MasterService::AllocateAndInsertMetadata(
-    TenantStateAccessorRW& tenant_accessor, const UUID& client_id, const std::string& key,
-    uint64_t value_length, const ReplicateConfig& config,
-    const std::string& writer_host_id, const std::string& group_id,
-    const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
+    TenantStateAccessorRW& tenant_accessor, const UUID& client_id,
+    const std::string& key, uint64_t value_length,
+    const ReplicateConfig& config, const std::string& writer_host_id,
+    const std::string& group_id, const TenantId& tenant_id,
+    const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     uint64_t& quota_deficit_bytes,
     std::optional<std::chrono::system_clock::time_point>
@@ -4561,7 +4562,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(
                                    key, object_id.tenant_id, tenant_state,
-                                   *entry->metadata(), alive_clients, &tenant_accessor)) {
+                                   *entry->metadata(), alive_clients,
+                                   &tenant_accessor)) {
                         entry_lock.unlock();
                         EraseMetadata(tenant_state, entry, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &tenant_accessor);
@@ -4606,9 +4608,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
             if (!entry) {
                 return AllocateAndInsertMetadata(
-                    tenant_accessor, client_id, key, slice_length, config, writer_host_id,
-                    group_id, object_id.tenant_id, now, *soft_pin_request,
-                    quota_deficit_bytes);
+                    tenant_accessor, client_id, key, slice_length, config,
+                    writer_host_id, group_id, object_id.tenant_id, now,
+                    *soft_pin_request, quota_deficit_bytes);
             }
             // Logically unreachable: the object-exists paths above always
             // return or erase the entry. Kept for -Wreturn-type.
@@ -5212,10 +5214,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (enable_oplog_) {
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
-                    } else if (CleanupStaleHandles(key, object_id.tenant_id,
-                                                   tenant_state,
-                                                   *object_entry->metadata(),
-                                                   alive_clients, &tenant_accessor)) {
+                    } else if (CleanupStaleHandles(
+                                   key, object_id.tenant_id, tenant_state,
+                                   *object_entry->metadata(), alive_clients,
+                                   &tenant_accessor)) {
                         // EraseMetadata handles processing,
                         // replication_tasks, offloading_tasks (with
                         // dec_refcnt), and promotion task cleanup.
@@ -5316,9 +5318,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             if (!object_entry) {
                 VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
                 return AllocateAndInsertMetadata(
-                    tenant_accessor, client_id, key, slice_length, config, writer_host_id,
-                    group_id, object_id.tenant_id, now, *soft_pin_request,
-                    quota_deficit_bytes,
+                    tenant_accessor, client_id, key, slice_length, config,
+                    writer_host_id, group_id, object_id.tenant_id, now,
+                    *soft_pin_request, quota_deficit_bytes,
                     std::move(case_a_committed_soft_pin_timeout));
             } else {
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
@@ -5461,10 +5463,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 VLOG(1) << "key=" << key
                         << ", action=upsert_start_case_c_reallocate";
                 auto allocate_result = AllocateAndInsertMetadata(
-                    tenant_accessor, client_id, key, slice_length, merged_config,
-                    writer_host_id, existing_group_id, object_id.tenant_id, now,
-                    *soft_pin_request, quota_deficit_bytes,
-                    std::move(committed_soft_pin_timeout));
+                    tenant_accessor, client_id, key, slice_length,
+                    merged_config, writer_host_id, existing_group_id,
+                    object_id.tenant_id, now, *soft_pin_request,
+                    quota_deficit_bytes, std::move(committed_soft_pin_timeout));
                 if (!allocate_result) {
                     if (has_replacement_charge) {
                         auto rollback_result =
@@ -7023,9 +7025,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                             ? ErrorCode::OBJECT_NOT_FOUND
                             : ErrorCode::OBJECT_ALREADY_EXISTS);
                     continue;
-                } else if (CleanupStaleHandles(key, normalized_tenant,
-                                               tenant_state, metadata,
-                                               alive_clients, &tenant_accessor)) {
+                } else if (CleanupStaleHandles(
+                               key, normalized_tenant, tenant_state, metadata,
+                               alive_clients, &tenant_accessor)) {
                     EraseMetadata(tenant_state, key, normalized_tenant,
                                   QuotaEraseMode::kFull, &tenant_accessor);
                     results[original_idx] =

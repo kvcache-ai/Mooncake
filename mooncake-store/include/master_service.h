@@ -1789,7 +1789,8 @@ class MasterService {
                 return;
             }
             // Rebind the handle to the (now-existing) tenant. Dropping the lock
-            // is not needed because tenant_guard_ is a non-locking disk-counter.
+            // is not needed because tenant_guard_ is a non-locking
+            // disk-counter.
             entry_.reset();
             lock_ = std::unique_lock<std::shared_mutex>();
             tenant_handle_ =
