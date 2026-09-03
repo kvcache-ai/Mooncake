@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "kv_event/kv_event_config.h"
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 
 namespace mooncake {
 

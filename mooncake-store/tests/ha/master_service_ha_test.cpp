@@ -593,18 +593,22 @@ class MasterServiceHATest : public ::testing::Test {
     static void SeedPromotionTaskForTesting(
         MasterService* service, const TenantId& tenant, const std::string& key,
         const UUID& holder_id, ReplicaID alloc_id, uint64_t object_size) {
-        const size_t shard_idx = service->getShardIndex(tenant, key);
-        auto shard_access =
-            MasterService::MetadataShardAccessorRW(service, shard_idx);
-        auto& tenant_state =
-            service->GetOrCreateTenantState(shard_access.get(), tenant);
-        tenant_state.promotion_tasks.emplace(
-            key, MasterService::PromotionTask{
-                     .source_id = 0,
-                     .alloc_id = alloc_id,
-                     .object_size = object_size,
-                     .start_time = std::chrono::system_clock::now(),
-                     .holder_id = holder_id});
+        // The tenant container is resolved by tenant_id (there is no shard
+        // routing); create it on demand.
+        auto tenant_handle = service->GetOrCreateTenantStateHandle(tenant);
+        auto& tenant_state = *tenant_handle;
+        auto entry = tenant_state.Pin(key);
+        if (!entry) {
+            entry = std::make_shared<mooncake::tenant::ObjectEntry>(key, "");
+            tenant_state.InsertObject(key, entry);
+        }
+        std::unique_lock<SharedMutex> entry_lock(tenant_handle->mutex);
+        entry->promotion_task = mooncake::PromotionTask{
+            .source_id = 0,
+            .alloc_id = alloc_id,
+            .object_size = object_size,
+            .start_time = std::chrono::system_clock::now(),
+            .holder_id = holder_id};
     }
 
     static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
@@ -769,9 +773,12 @@ class MasterServiceHATest : public ::testing::Test {
     static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        const size_t shard_idx = service.getShardIndex(tenant_id, key);
-        return std::unique_lock<SharedMutex>(
-            service.metadata_shards_[shard_idx].mutex);
+        // TenantStore's route lock. Holding it EXCLUSIVE gates PutStart at its
+        // first Pin inside the snapshot barrier, letting the test observe the
+        // barrier (snapshot held, client_mutex_ released) without racing the
+        // async PutStart.
+        auto tenant_handle = service.GetOrCreateTenantStateHandle(tenant_id);
+        return service.LockObjectRouteForTesting(*tenant_handle);
     }
 
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
@@ -1415,23 +1422,18 @@ TEST_F(MasterServiceHATest,
 
     ReplicateConfig config;
     config.replica_num = 1;
+    // Deterministically gate PutStart inside the snapshot barrier: holding the
+    // owning route shard EXCLUSIVE parks it at its first Pin, after it released
+    // client_mutex_ and while it holds snapshot_mutex_ (shared).
+    service.ArmSnapshotBarrierForTesting();
     auto shard_lock = LockMetadataShardForTesting(service, kDefaultTenant, key);
     auto put = std::async(std::launch::async, [&] {
         return service.PutStart(client_id, key, kDefaultTenant, 1024, config);
     });
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    bool reached_snapshot = false;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(
-                service, kDefaultTenant, key)) {
-            reached_snapshot = true;
-            break;
-        }
-        std::this_thread::yield();
-    }
-    if (!reached_snapshot) {
+    if (!service.WaitForSnapshotBarrierForTesting(std::chrono::seconds(5))) {
+        // PutStart never entered the barrier within the deadline. Unblock it
+        // and drain the future so the service destructs cleanly, then fail.
         shard_lock.unlock();
         EXPECT_EQ(put.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
@@ -1439,6 +1441,7 @@ TEST_F(MasterServiceHATest,
             std::future_status::ready) {
             (void)put.get();
         }
+        service.DisarmSnapshotBarrierForTesting();
         FAIL() << "PutStart did not reach the snapshot barrier";
     }
 
@@ -1446,10 +1449,14 @@ TEST_F(MasterServiceHATest,
     // snapshot barrier. PutStart must not reacquire it inside that barrier.
     auto client_lock = LockClientForTesting(service);
     shard_lock.unlock();
+    // A real re-acquire would block PutStart forever on client_mutex_ (held by
+    // the test), so a generous window still catches it; a slow-but-legal
+    // LOCAL_FIRST allocation completes far within it.
     const bool completed_while_client_locked =
-        put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+        put.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     client_lock.unlock();
 
+    service.DisarmSnapshotBarrierForTesting();
     ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = put.get();
     ASSERT_TRUE(result.has_value()) << toString(result.error());

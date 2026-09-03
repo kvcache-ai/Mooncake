@@ -11,7 +11,7 @@
 #include "master_service.h"
 #include "segment.h"
 #include "task_manager.h"
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 #include "utils/zstd_util.h"
 
 namespace mooncake::ha {
