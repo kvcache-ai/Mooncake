@@ -4,7 +4,7 @@
 // round-trip a deterministic CI assertion rather than a VLOG-only observation.
 //
 // Both single-key (invoke_rpc) and batch (invoke_batch_rpc) client templates
-// snapshot current_request_id_attachment() at entry and send it via
+// snapshot current_request_context_attachment() at entry and send it via
 // send_request_with_attachment. We exercise the single-key read route
 // (GetReplicaList) and the batch-exist route (BatchExistKey) to prove the
 // attachment bypass works for both the single and batch invocation templates.

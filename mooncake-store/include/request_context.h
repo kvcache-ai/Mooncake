@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <ylt/struct_pack.hpp>
 
 namespace mooncake {
 
@@ -18,6 +19,11 @@ struct RequestContext {
     std::string span_id;
     std::string parent_span_id;
 };
+
+// Enable struct_pack field-name-based serialization. Future fields appended
+// as struct_pack::compatible<std::string> at the end are safely ignored by
+// older binaries that lack the field in their YLT_REFL list.
+YLT_REFL(RequestContext, request_id, trace_id, span_id, parent_span_id);
 
 // Per-thread current request context. Set on the calling (Python) thread before
 // a store operation and consumed synchronously by the master-client wrappers on
@@ -55,18 +61,31 @@ inline const std::optional<RequestContext>& get_current_request_context() {
 // framing rather than a struct field. Server side: read it back via
 // ctx.get_context_info()->release_request_attachment() (a std::string, which drains the buffer); an
 // empty view means no per-request id was supplied.
-inline std::string current_request_id_attachment() {
+// Serialize the full RequestContext to wire bytes for out-of-band
+// attachment (coro_rpc send_request_with_attachment / release_request_attachment).
+inline std::string current_request_context_attachment() {
     if (g_current_ctx) {
-        return g_current_ctx->request_id;
+        return struct_pack::serialize<std::string>(*g_current_ctx);
     }
     return {};
+}
+
+// Deserialize a RequestContext from wire bytes (received via
+// release_request_attachment). Returns an empty RequestContext when
+// data is empty or deserialization fails.
+inline RequestContext deserialize_request_context(std::string_view data) {
+    RequestContext ctx;
+    if (!data.empty()) {
+        struct_pack::deserialize_to(ctx, data.data(), data.size());
+    }
+    return ctx;
 }
 
 // --- Test/instrumentation seam (process-global; NOT a production hot path) ---
 // Lets an in-process integration test observe the attachment request_id that a
 // master handler actually received, instead of relying on VLOG. A test sets a
 // RequestContext on the calling thread, performs a synchronous single-key read
-// (invoke_rpc sends current_request_id_attachment() out-of-band), then reads
+// (invoke_rpc sends current_request_context_attachment() out-of-band), then reads
 // LastObservedRequestId(). The mutex is held only across a short std::string
 // copy, and only GetReplicaList/BatchGetReplicaList ever write here.
 inline std::mutex& request_id_instrument_mutex() {

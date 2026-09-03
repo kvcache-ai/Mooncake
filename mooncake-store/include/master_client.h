@@ -244,7 +244,7 @@ class MasterClient {
         // (possibly different) pool worker thread. An empty attachment is
         // wire-identical to a plain send_request; non-reading server handlers
         // ignore it, so this is gray across all master RPCs.
-        std::string ctx_attachment = current_request_id_attachment();
+        std::string ctx_attachment = current_request_context_attachment();
         // Real-client-side hop-B inject trace. VLOG(2): off at -v=1 (where
         // only the master logs), on at -v>=2 for per-hop tracing. Fires on
         // both the real path (in-proc) and the dummy path (real-client server
@@ -313,7 +313,7 @@ class MasterClient {
         // RPCs (BatchExistKey / BatchPutStart / ...) carry the id out-of-band
         // just like single-result RPCs. An empty attachment is wire-identical to
         // a plain send_request and is ignored by non-reading handlers (gray).
-        std::string ctx_attachment = current_request_id_attachment();
+        std::string ctx_attachment = current_request_context_attachment();
         // Real-client-side hop-B inject trace. VLOG(2): off at -v=1 (where
         // only the master logs), on at -v>=2 for per-hop tracing. Fires on
         // both the real path (in-proc) and the dummy path (real-client server

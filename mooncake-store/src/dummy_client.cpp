@@ -192,7 +192,7 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
     // send_request_with_attachment. The hop A server handler reads it back
     // (when it is a V3 context handler) and bridges it to hop B; non-reading
     // handlers ignore it. Empty attachment == plain send_request (gray).
-    std::string ctx_attachment = current_request_id_attachment();
+    std::string ctx_attachment = current_request_context_attachment();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
             auto ret = co_await pool->send_request(
@@ -234,7 +234,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     // Bypass inject (see invoke_rpc): snapshot the per-request request_id on
     // the calling thread once at entry and carry it on hop A via
     // send_request_with_attachment.
-    std::string ctx_attachment = current_request_id_attachment();
+    std::string ctx_attachment = current_request_context_attachment();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {

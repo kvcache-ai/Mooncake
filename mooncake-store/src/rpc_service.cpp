@@ -220,8 +220,10 @@ WrappedMasterService::ExistKey(coro_rpc::context<tl::expected<bool, ErrorCode>> 
     // reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
-        VLOG(1) << "ExistKey request_id=" << att;
-        RecordObservedRequestId(att);
+        auto req_ctx = deserialize_request_context(att);
+        VLOG(1) << "ExistKey request_id=" << req_ctx.request_id
+                << " trace_id=" << req_ctx.trace_id;
+        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = ExistKeyInternal(key);
@@ -395,8 +397,10 @@ WrappedMasterService::Remove(coro_rpc::context<tl::expected<void, ErrorCode>> ct
     // ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
-        VLOG(1) << "Remove request_id=" << att;
-        RecordObservedRequestId(att);
+        auto req_ctx = deserialize_request_context(att);
+        VLOG(1) << "Remove request_id=" << req_ctx.request_id
+                << " trace_id=" << req_ctx.trace_id;
+        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = RemoveInternal(key, force);
@@ -527,8 +531,10 @@ WrappedMasterService::GetReplicaList(
     // tests), then replies via ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
-        VLOG(1) << "GetReplicaList request_id=" << att;
-        RecordObservedRequestId(att);
+        auto req_ctx = deserialize_request_context(att);
+        VLOG(1) << "GetReplicaList request_id=" << req_ctx.request_id
+                << " trace_id=" << req_ctx.trace_id;
+        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = GetReplicaListInternal(key, config);
@@ -547,8 +553,10 @@ WrappedMasterService::BatchGetReplicaList(
     // of read/log/metric logic) and reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
-        VLOG(1) << "BatchGetReplicaList request_id=" << att;
-        RecordObservedRequestId(att);
+        auto req_ctx = deserialize_request_context(att);
+        VLOG(1) << "BatchGetReplicaList request_id=" << req_ctx.request_id
+                << " trace_id=" << req_ctx.trace_id;
+        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto results = BatchGetReplicaListInternal(keys, config);
@@ -565,8 +573,10 @@ WrappedMasterService::BatchExistKey(
     // in-process/tests) and reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
-        VLOG(1) << "BatchExistKey request_id=" << att;
-        RecordObservedRequestId(att);
+        auto req_ctx = deserialize_request_context(att);
+        VLOG(1) << "BatchExistKey request_id=" << req_ctx.request_id
+                << " trace_id=" << req_ctx.trace_id;
+        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = BatchExistKeyInternal(keys);

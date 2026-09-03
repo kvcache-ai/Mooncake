@@ -130,8 +130,10 @@ WrappedCentralizedMasterService::PutStart(
     // ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
-        VLOG(1) << "PutStart request_id=" << att;
-        RecordObservedRequestId(att);
+        auto req_ctx = deserialize_request_context(att);
+        VLOG(1) << "PutStart request_id=" << req_ctx.request_id
+                << " trace_id=" << req_ctx.trace_id;
+        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = PutStartInternal(client_id, key, slice_length, config);
@@ -267,8 +269,10 @@ WrappedCentralizedMasterService::BatchPutStart(
     // BatchPutStartInternal, and reply via ctx.response_msg.
     if (auto att = ctx.get_context_info()->release_request_attachment();
         !att.empty()) {
-        VLOG(1) << "BatchPutStart request_id=" << att;
-        RecordObservedRequestId(att);
+        auto req_ctx = deserialize_request_context(att);
+        VLOG(1) << "BatchPutStart request_id=" << req_ctx.request_id
+                << " trace_id=" << req_ctx.trace_id;
+        RecordObservedRequestId(req_ctx.request_id);
     }
 
     auto result = BatchPutStartInternal(client_id, keys, slice_lengths, config);
