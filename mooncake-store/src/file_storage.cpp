@@ -1,16 +1,12 @@
 #include "file_storage.h"
 
-#include <cmath>
-#include <locale>
+#include <algorithm>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <utility>
 #include <vector>
 
 #include "aligned_client_buffer.h"
-#include "bool_parser.h"
-#include "environ.h"
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
@@ -23,47 +19,6 @@
 namespace mooncake {
 
 namespace {
-
-double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
-    if (raw_value.empty()) {
-        return default_value;
-    }
-
-    std::istringstream stream(raw_value);
-    stream.imbue(std::locale::classic());
-
-    double value = 0.0;
-    stream >> value;
-    if (stream.fail()) {
-        return default_value;
-    }
-    if (!stream.eof() || !std::isfinite(value) || value <= 0.0 || value > 1.0) {
-        return default_value;
-    }
-    return value;
-}
-
-double GetEnvRatioOr(const char* name, double default_value) {
-    const auto raw_value = Environ::GetString(name, "");
-    return ParseEnvRatioOr(raw_value, default_value);
-}
-
-double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
-                     double default_value) {
-    const auto preferred_value = Environ::GetString(preferred_name, "");
-    if (!preferred_value.empty()) {
-        return ParseEnvRatioOr(preferred_value, default_value);
-    }
-    return GetEnvRatioOr(fallback_name, default_value);
-}
-
-bool GetEnvBoolStringOr(const char* name, bool default_value) {
-    const auto raw_value =
-        Environ::GetString(name, default_value ? "true" : "false");
-    return TryParseBool(raw_value, {.token_set = BoolTokenSet::kTrueFalse,
-                                    .trim_ascii_whitespace = false})
-        .value_or(default_value);
-}
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
@@ -82,188 +37,6 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 }
 
 }  // namespace
-
-FileStorageConfig FileStorageConfig::FromEnvironment() {
-    FileStorageConfig config;
-
-    auto storage_backend_descriptor =
-        Environ::GetString("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                           "bucket_storage_backend");
-
-    if (storage_backend_descriptor == "bucket_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kBucket;
-    } else if (storage_backend_descriptor == "file_per_key_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kFilePerKey;
-    } else if (storage_backend_descriptor ==
-               "offset_allocator_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    } else if (storage_backend_descriptor == "distributed_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kDistributed;
-        config.enable_dfs = true;
-    } else if (storage_backend_descriptor == "nvme_kv_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kNvmeKv;
-    } else {
-        LOG(ERROR) << "Unknown storage backend.";
-    }
-
-    config.storage_filepath = Environ::GetString(
-        "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
-
-    config.local_buffer_size = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
-
-    config.pinned_restore_arena_size =
-        Environ::GetInt64("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",
-                          config.pinned_restore_arena_size);
-
-    config.scanmeta_iterator_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
-        Environ::GetInt64("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
-                          config.scanmeta_iterator_keys_limit));
-
-    config.total_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
-
-    config.total_size_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
-
-    config.heartbeat_interval_seconds =
-        Environ::GetUInt32("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
-                           config.heartbeat_interval_seconds);
-    config.client_buffer_gc_interval_seconds =
-        Environ::GetUInt32("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
-                           config.client_buffer_gc_interval_seconds);
-
-    config.client_buffer_gc_ttl_ms =
-        Environ::GetUInt64("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
-                           config.client_buffer_gc_ttl_ms);
-
-    config.enable_disk_watermark_eviction =
-        GetEnvBoolStringOr("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION",
-                           config.enable_disk_watermark_eviction);
-    config.disk_eviction_high_watermark_ratio =
-        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO",
-                      "MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO",
-                      config.disk_eviction_high_watermark_ratio);
-    config.disk_eviction_low_watermark_ratio =
-        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO",
-                      "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
-                      config.disk_eviction_low_watermark_ratio);
-
-    const auto use_uring_str =
-        Environ::GetString("MOONCAKE_OFFLOAD_USE_URING",
-                           Environ::GetString("MOONCAKE_USE_URING", "false"));
-    config.use_uring =
-        TryParseBool(use_uring_str, {.token_set = BoolTokenSet::kTrueFalse,
-                                     .trim_ascii_whitespace = false})
-            .value_or(false);
-
-    return config;
-}
-
-bool FileStorageConfig::ValidatePath(std::string path) const {
-    if (path.empty()) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is invalid";
-        return false;
-    }
-    namespace fs = std::filesystem;
-    // 1. Must be an absolute path
-    if (!fs::path(path).is_absolute()) {
-        LOG(ERROR)
-            << "FileStorageConfig: storage_filepath must be an absolute path: "
-            << path;
-        return false;
-    }
-
-    // 2. Check if the path contains ".." components that could lead to path
-    // traversal (static check)
-    fs::path p(path);
-    for (const auto& component : p) {
-        if (component == "..") {
-            LOG(ERROR) << "FileStorageConfig: path traversal is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    struct stat stat_buf;
-
-    // 3. Use stat() to check if the path exists
-    if (::stat(path.c_str(), &stat_buf) != 0) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath does not exist: "
-                   << path;
-        return false;
-    }
-    // Path exists — check if it is a directory
-    if (!S_ISDIR(stat_buf.st_mode)) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is not a directory: "
-                   << path;
-        return false;
-    }
-
-    // (Optional) Check write permission
-    if (::access(path.c_str(), W_OK) != 0) {
-        LOG(ERROR) << "FileStorageConfig: no write permission on directory: "
-                   << path;
-        return false;
-    }
-
-    // 4. Additional security: prevent symlink bypass (optional)
-    // Use lstat to avoid automatic dereferencing of symbolic links
-    struct stat lstat_buf;
-    if (::lstat(path.c_str(), &lstat_buf) == 0) {
-        if (S_ISLNK(lstat_buf.st_mode)) {
-            LOG(ERROR) << "FileStorageConfig: symbolic link is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
-        return false;
-    }
-    if (total_keys_limit <= 0) {
-        LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
-        return false;
-    }
-    if (total_size_limit == 0) {
-        LOG(ERROR) << "FileStorageConfig: total_size_limit should not be zero";
-        return false;
-    }
-    if (pinned_restore_arena_size < 0) {
-        LOG(ERROR) << "FileStorageConfig: pinned_restore_arena_size must be "
-                      "non-negative";
-        return false;
-    }
-    if (heartbeat_interval_seconds <= 0) {
-        LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
-        return false;
-    }
-    if (disk_eviction_low_watermark_ratio <= 0.0 ||
-        disk_eviction_low_watermark_ratio > 1.0) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_low_watermark_ratio must be in (0, 1]";
-        return false;
-    }
-    if (disk_eviction_high_watermark_ratio <= 0.0 ||
-        disk_eviction_high_watermark_ratio > 1.0) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_high_watermark_ratio must be in (0, 1]";
-        return false;
-    }
-    if (disk_eviction_low_watermark_ratio >=
-        disk_eviction_high_watermark_ratio) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_low_watermark_ratio must be lower than "
-                   << "disk_eviction_high_watermark_ratio";
-        return false;
-    }
-    return true;
-}
 
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
@@ -1329,13 +1102,14 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        // Allocate oversized buffer for O_DIRECT alignment:
-        //   +4096 for aligning the ptr to 4096 boundary
-        //   +4096 for aligned read tail padding (actual_offset may not be
-        //   aligned)
         size_t data_size = static_cast<size_t>(sizes[i]);
-        size_t alloc_size =
-            align_up(data_size, kDirectIOAlignment) + 2 * kDirectIOAlignment;
+        size_t alloc_size = std::max<size_t>(data_size, 1);
+        if (config_.use_uring) {
+            // O_DIRECT reads need room to align the pointer and to round an
+            // unaligned file range out to full pages.
+            alloc_size = align_up(data_size, kDirectIOAlignment) +
+                         2 * kDirectIOAlignment;
+        }
 
         auto alloc_result = allocator.allocate(alloc_size);
         if (!alloc_result && !gc_triggered &&
@@ -1359,19 +1133,19 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
 
-        // Align ptr to 4096 boundary for O_DIRECT
-        void* raw_ptr = alloc_result->ptr();
-        void* aligned_ptr = reinterpret_cast<void*>(
-            (reinterpret_cast<uintptr_t>(raw_ptr) + kDirectIOAlignment - 1) &
-            ~(kDirectIOAlignment - 1));
+        void* data_ptr = alloc_result->ptr();
+        if (config_.use_uring) {
+            data_ptr =
+                reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(data_ptr) +
+                                         kDirectIOAlignment - 1) &
+                                        ~(kDirectIOAlignment - 1));
+        }
 
         total_size += data_size;
-        // Slice records data_size; the buffer behind aligned_ptr is oversized
-        // to accommodate aligned reads
-        result->slices.emplace(keys[i], Slice{aligned_ptr, data_size});
+        result->slices.emplace(keys[i], Slice{data_ptr, data_size});
         // pointers will be adjusted after BatchLoad (offset_in_buffer
         // correction)
-        result->pointers.emplace_back(reinterpret_cast<uintptr_t>(aligned_ptr));
+        result->pointers.emplace_back(reinterpret_cast<uintptr_t>(data_ptr));
         result->handles.emplace_back(std::move(alloc_result.value()));
         result->lease_timeout = lease_timeout;
     }
@@ -1402,6 +1176,14 @@ void FileStorage::ClientBufferGCThreadFunc() {
             std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
+}
+
+tl::expected<bool, ErrorCode> FileStorage::Exists(const std::string& key) {
+    if (!storage_backend_) {
+        LOG(ERROR) << "Storage backend is not initialized. Call Init() first.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return storage_backend_->IsExist(key);
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {

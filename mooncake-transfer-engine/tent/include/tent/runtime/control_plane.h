@@ -48,7 +48,7 @@ struct BootstrapDesc {
     // RDMA address of local_nic_path.
     uint16_t local_lid = 0;
     std::string local_gid;
-    std::string reply_msg;       // on error
+    std::string reply_msg;  // non-empty means the bootstrap callback failed
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
 
    public:
@@ -81,6 +81,11 @@ class ControlClient {
                             const BootstrapDesc& request,
                             BootstrapDesc& response);
 
+    // Parse a BootstrapRdma RPC body. A non-empty reply_msg or missing GID is
+    // a handshake failure even when the RPC transport itself succeeded.
+    static Status decodeBootstrapResponse(const std::string& response_raw,
+                                          BootstrapDesc& response);
+
     static Status sendData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
                            size_t length);
@@ -97,7 +102,7 @@ class ControlClient {
     static Status delegate(const std::string& server_addr,
                            const Request& request);
 
-    using DelegateCallback = std::function<void(Status)>;
+    using DelegateCallback = std::function<void(Status, bool confirmed)>;
     static void delegateAsync(const std::string& server_addr,
                               const Request& request,
                               DelegateCallback callback);
@@ -107,6 +112,11 @@ class ControlClient {
 
     static Status unpinStageBuffer(const std::string& server_addr,
                                    uint64_t addr);
+
+    using UnpinStageBufferCallback = std::function<void(Status)>;
+    static void unpinStageBufferAsync(const std::string& server_addr,
+                                      uint64_t addr,
+                                      UnpinStageBufferCallback callback);
 
     static void subscribeSegmentUpdateAsync(const std::string& server_addr,
                                             const std::string& subscriber_addr);

@@ -1462,6 +1462,11 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+TieredStorageUsageSnapshot WrappedMasterService::GetStorageUsageSnapshot()
+    const {
+    return master_service_.GetStorageUsageSnapshot();
+}
+
 tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
 WrappedMasterService::ListTenantQuotaSnapshots() {
     if (!master_service_.IsTenantQuotaEnabled()) {

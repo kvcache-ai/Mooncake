@@ -112,6 +112,7 @@ typedef struct tent_notifi_info tent_notifi_info;
 #define TRANSPORT_TPU (10)
 #define TRANSPORT_UB (11)
 #define TRANSPORT_MPCOMM (12)
+#define TRANSPORT_HP_TCP (13)
 
 struct tent_memory_options {
     char location[64];
@@ -207,6 +208,7 @@ int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
 int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
                           tent_status_t* statuses, size_t* count);
 
+// Only NICs currently able to carry traffic are reported (see NicLoadStats).
 struct tent_nic_load_stat {
     char device_name[64];
     uint64_t inflight_bytes;

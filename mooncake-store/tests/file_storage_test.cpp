@@ -3,8 +3,9 @@
 
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
-#include <optional>
+#include <string>
 #include <thread>
 
 #include "allocator.h"
@@ -13,6 +14,7 @@
 #include "storage_backend.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
+#include "utils.h"
 #include "utils/common.h"
 
 namespace mooncake {
@@ -29,6 +31,7 @@ class FileStorageTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
+        UnsetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR");
         UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
         UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
         UnsetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES");
@@ -39,12 +42,17 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS");
         UnsetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION");
         UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
-        data_path = std::filesystem::current_path().string() + "/data";
+        UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
+        UnsetEnv("MOONCAKE_USE_URING");
+        data_path = (std::filesystem::current_path() / "file_storage_test_data")
+                        .string();
         fs::create_directories(data_path);
         for (const auto& entry : fs::directory_iterator(data_path)) {
             std::error_code ec;
@@ -231,6 +239,255 @@ class FileStorageTest : public ::testing::Test {
             }
         }
     }
+    void RunPutHealWipeScenario(const std::string& data_path,
+                                StorageBackendType backend_type,
+                                const std::string& suffix) {
+        std::filesystem::path master_root =
+            std::filesystem::path(data_path) / ("heal_master" + suffix);
+        std::filesystem::create_directories(master_root);
+
+        testing::InProcMaster master;
+        auto master_config = InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_root_fs_dir(master_root.string())
+                                 .build();
+        ASSERT_TRUE(master.Start(master_config));
+
+        std::string local_rpc_addr =
+            "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto client =
+            Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                           std::nullopt, master.master_address());
+        ASSERT_TRUE(client.has_value());
+        ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+        // Memory segment and registered buffers, so the retried PutStart can
+        // allocate a memory replica and Get can read it back.
+        constexpr size_t kSegSize = 64 * 1024 * 1024;
+        void* seg_ptr = allocate_buffer_allocator_memory(kSegSize);
+        ASSERT_NE(seg_ptr, nullptr);
+        ASSERT_TRUE(
+            client.value()->MountSegment(seg_ptr, kSegSize, "tcp").has_value());
+        SimpleAllocator allocator(16 * 1024 * 1024);
+        ASSERT_TRUE(client.value()
+                        ->RegisterLocalMemory(allocator.getBase(),
+                                              16 * 1024 * 1024, "cpu:0", false,
+                                              false)
+                        .has_value());
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = backend_type;
+        config.storage_filepath = data_path + "/heal_ssd" + suffix;
+        config.local_buffer_size = 4 * 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        FileStorage file_storage(config, client.value(), local_rpc_addr);
+        ASSERT_TRUE(file_storage.storage_backend_->Init());
+        {
+            MutexLocker locker(&file_storage.offloading_mutex_);
+            file_storage.enable_offloading_ = true;
+        }
+
+        // Offload one key so master tracks a LOCAL_DISK replica backed by a
+        // real file on the client SSD.
+        const std::string key = "heal_key" + suffix;
+        std::string original(512, 'x');
+        std::unordered_map<std::string, std::vector<Slice>> batch_object;
+        batch_object.emplace(key,
+                             std::vector<Slice>{Slice{original.data(), 512}});
+        auto offload_result = file_storage.storage_backend_->BatchOffload(
+            batch_object,
+            [&file_storage](const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas) {
+                for (auto& metadata : metadatas) {
+                    metadata.transport_endpoint = file_storage.local_rpc_addr_;
+                }
+                auto result =
+                    file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
+                return result ? ErrorCode::OK : result.error();
+            });
+        ASSERT_TRUE(offload_result.has_value());
+
+        // Wire the probe the way RealClient does in production: existence
+        // against this process's offload files.
+        client.value()->SetLocalDiskProbe(
+            [&file_storage](const std::string& k) -> std::optional<bool> {
+                auto exists = file_storage.Exists(k);
+                if (!exists) {
+                    return std::nullopt;
+                }
+                return !*exists;
+            });
+
+        auto query = client.value()->Query(key);
+        ASSERT_TRUE(query.has_value());
+        bool has_local_disk = false;
+        for (const auto& replica : query->replicas) {
+            has_local_disk |= replica.is_local_disk_replica();
+        }
+        ASSERT_TRUE(has_local_disk);
+
+        // Simulate the #3709 divergence: the SSD file is wiped physically while
+        // master keeps the metadata.
+        file_storage.storage_backend_->RemoveAll();
+        auto exists = file_storage.Exists(key);
+        ASSERT_TRUE(exists.has_value());
+        ASSERT_FALSE(exists.value());
+        // QueryResult is not assignable, so re-query into a fresh variable.
+        auto query_after_wipe = client.value()->Query(key);
+        ASSERT_TRUE(query_after_wipe.has_value());
+
+        // Put the same key again: the dangling replica must be evicted and the
+        // Put must really store new data.
+        void* buf = allocator.allocate(512);
+        ASSERT_NE(buf, nullptr);
+        std::string updated(512, 'y');
+        std::memcpy(buf, updated.data(), 512);
+        std::vector<Slice> slices{Slice{buf, 512}};
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto put = client.value()->Put(key, slices, cfg);
+        ASSERT_TRUE(put.has_value())
+            << "Put over a dangling replica failed: " << toString(put.error());
+        allocator.deallocate(buf, 512);
+
+        // The new data is readable through the normal Get path.
+        void* read_buf = allocator.allocate(512);
+        ASSERT_NE(read_buf, nullptr);
+        std::vector<Slice> read_slices{Slice{read_buf, 512}};
+        auto get = client.value()->Get(key, read_slices);
+        ASSERT_TRUE(get.has_value())
+            << "Get after self-heal failed: " << toString(get.error());
+        EXPECT_EQ(std::memcmp(read_slices[0].ptr, updated.data(), 512), 0);
+        allocator.deallocate(read_buf, 512);
+
+        auto unmount = client.value()->UnmountSegment(seg_ptr, kSegSize);
+        EXPECT_TRUE(unmount.has_value());
+        std::free(seg_ptr);
+    }
+    void RunBatchPutHealWipeScenario(const std::string& data_path) {
+        std::filesystem::path master_root =
+            std::filesystem::path(data_path) / "heal_master_batch";
+        std::filesystem::create_directories(master_root);
+
+        testing::InProcMaster master;
+        auto master_config = InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_root_fs_dir(master_root.string())
+                                 .build();
+        ASSERT_TRUE(master.Start(master_config));
+
+        std::string local_rpc_addr =
+            "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto client =
+            Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                           std::nullopt, master.master_address());
+        ASSERT_TRUE(client.has_value());
+        ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+        constexpr size_t kSegSize = 64 * 1024 * 1024;
+        void* seg_ptr = allocate_buffer_allocator_memory(kSegSize);
+        ASSERT_NE(seg_ptr, nullptr);
+        ASSERT_TRUE(
+            client.value()->MountSegment(seg_ptr, kSegSize, "tcp").has_value());
+        SimpleAllocator allocator(16 * 1024 * 1024);
+        ASSERT_TRUE(client.value()
+                        ->RegisterLocalMemory(allocator.getBase(),
+                                              16 * 1024 * 1024, "cpu:0", false,
+                                              false)
+                        .has_value());
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = StorageBackendType::kFilePerKey;
+        config.storage_filepath = data_path + "/heal_ssd_batch";
+        config.local_buffer_size = 4 * 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        FileStorage file_storage(config, client.value(), local_rpc_addr);
+        ASSERT_TRUE(file_storage.storage_backend_->Init());
+        {
+            MutexLocker locker(&file_storage.offloading_mutex_);
+            file_storage.enable_offloading_ = true;
+        }
+
+        // Offload two keys, then wipe the backing files to recreate the #3709
+        // divergence on both.
+        const std::vector<std::string> wiped_keys = {"heal_batch_a",
+                                                     "heal_batch_b"};
+        std::string original(512, 'x');
+        std::unordered_map<std::string, std::vector<Slice>> batch_object;
+        for (const auto& key : wiped_keys) {
+            batch_object.emplace(
+                key, std::vector<Slice>{Slice{original.data(), 512}});
+        }
+        auto offload_result = file_storage.storage_backend_->BatchOffload(
+            batch_object,
+            [&file_storage](const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas) {
+                for (auto& metadata : metadatas) {
+                    metadata.transport_endpoint = file_storage.local_rpc_addr_;
+                }
+                auto result =
+                    file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
+                return result ? ErrorCode::OK : result.error();
+            });
+        ASSERT_TRUE(offload_result.has_value());
+
+        client.value()->SetLocalDiskProbe(
+            [&file_storage](const std::string& k) -> std::optional<bool> {
+                auto exists = file_storage.Exists(k);
+                if (!exists) {
+                    return std::nullopt;
+                }
+                return !*exists;
+            });
+
+        file_storage.storage_backend_->RemoveAll();
+        auto exists = file_storage.Exists(wiped_keys[0]);
+        ASSERT_TRUE(exists.has_value());
+        ASSERT_FALSE(exists.value());
+
+        // One batch with both wiped keys and a fresh key.
+        const std::string fresh_key = "heal_batch_fresh";
+        const std::string updated(512, 'y');
+        std::vector<ObjectKey> keys = {wiped_keys[0], wiped_keys[1], fresh_key};
+        std::vector<std::vector<Slice>> batched_slices;
+        std::vector<void*> buffers;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            void* buf = allocator.allocate(512);
+            ASSERT_NE(buf, nullptr);
+            std::memcpy(buf, updated.data(), 512);
+            buffers.push_back(buf);
+            batched_slices.push_back({Slice{buf, 512}});
+        }
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto results = client.value()->BatchPut(keys, batched_slices, cfg);
+        ASSERT_EQ(results.size(), keys.size());
+        for (size_t i = 0; i < results.size(); ++i) {
+            ASSERT_TRUE(results[i].has_value())
+                << "BatchPut over a dangling replica failed for " << keys[i]
+                << ": " << toString(results[i].error());
+        }
+
+        // Every key, healed or fresh, reads the new data back.
+        for (const auto& key : keys) {
+            void* read_buf = allocator.allocate(512);
+            ASSERT_NE(read_buf, nullptr);
+            std::vector<Slice> read_slices{Slice{read_buf, 512}};
+            auto get = client.value()->Get(key, read_slices);
+            ASSERT_TRUE(get.has_value())
+                << "Get after batch self-heal failed for " << key << ": "
+                << toString(get.error());
+            EXPECT_EQ(std::memcmp(read_slices[0].ptr, updated.data(), 512), 0);
+            allocator.deallocate(read_buf, 512);
+        }
+        for (void* buf : buffers) {
+            allocator.deallocate(buf, 512);
+        }
+
+        auto unmount = client.value()->UnmountSegment(seg_ptr, kSegSize);
+        EXPECT_TRUE(unmount.has_value());
+        std::free(seg_ptr);
+    }
 };
 
 TEST_F(FileStorageTest, IsEnableOffloading) {
@@ -279,21 +536,26 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
-    constexpr size_t kArenaSize = 2 * 1024 * 1024;
-    std::vector<char> restore_arena(kArenaSize + 4096);
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+
+    size_t payload_size = 0;
+    for (const auto size : sizes) {
+        payload_size += static_cast<size_t>(size);
+    }
+    const size_t arena_size = payload_size * 3 / 2;
+    std::vector<char> restore_arena(arena_size + 4096);
     const auto arena_begin =
         (reinterpret_cast<uintptr_t>(restore_arena.data()) + 4095) & ~4095ULL;
     SetPinnedRestoreArena(fileStorage, reinterpret_cast<void*>(arena_begin),
-                          kArenaSize);
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+                          arena_size);
 
     auto pinned_result = fileStorage.BatchGetLocal(keys, sizes);
     ASSERT_TRUE(pinned_result);
     ASSERT_EQ(pinned_result->pointers.size(), keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         EXPECT_GE(pinned_result->pointers[i], arena_begin);
-        EXPECT_LT(pinned_result->pointers[i], arena_begin + kArenaSize);
+        EXPECT_LT(pinned_result->pointers[i], arena_begin + arena_size);
         EXPECT_EQ(
             std::string(reinterpret_cast<char*>(pinned_result->pointers[i]),
                         sizes[i]),
@@ -305,11 +567,36 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
     ASSERT_EQ(fallback_result->pointers.size(), keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         EXPECT_TRUE(fallback_result->pointers[i] < arena_begin ||
-                    fallback_result->pointers[i] >= arena_begin + kArenaSize);
+                    fallback_result->pointers[i] >= arena_begin + arena_size);
         EXPECT_EQ(
             std::string(reinterpret_cast<char*>(fallback_result->pointers[i]),
                         sizes[i]),
             batch_data.at(keys[i]));
+    }
+}
+
+TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 64 * 1024;
+    file_storage_config.use_uring = false;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    for (size_t i = 0; i < 16; ++i) {
+        keys.emplace_back("key" + std::to_string(i));
+        sizes.emplace_back(4 * 1024);
+    }
+
+    auto allocate_result = FileStorageAllocateBatch(fileStorage, keys, sizes);
+    ASSERT_TRUE(allocate_result)
+        << "POSIX reads should not reserve O_DIRECT padding";
+    EXPECT_EQ(allocate_result.value()->total_size,
+              file_storage_config.local_buffer_size);
+    ASSERT_EQ(allocate_result.value()->handles.size(), keys.size());
+    for (const auto& handle : allocate_result.value()->handles) {
+        EXPECT_EQ(handle.size(), 4 * 1024);
     }
 }
 
@@ -452,76 +739,13 @@ TEST_F(FileStorageTest,
         fileStorage, offloading_objects, buckets_keys));
 }
 
-TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
-    auto config = FileStorageConfig::FromEnvironment();
-    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-
-    EXPECT_EQ(config.storage_filepath, "/data/file_storage");
-    EXPECT_EQ(config.local_buffer_size, 1280 * 1024 * 1024);
-    EXPECT_EQ(config.scanmeta_iterator_keys_limit, 20000);
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
-    EXPECT_EQ(bucket_backend_config.bucket_size_limit, 256 * 1024 * 1024);
-    EXPECT_EQ(config.total_keys_limit, 10'000'000);
-    EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
-    EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
-    EXPECT_TRUE(config.enable_disk_watermark_eviction);
-    EXPECT_EQ(config.pinned_restore_arena_size, 0);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
-}
-
-TEST_F(FileStorageTest, ReadStringFromEnv) {
-    SetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/storage");
-
-    auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.storage_filepath, "/tmp/storage");
-}
-
-TEST_F(FileStorageTest, ReadInt64FromEnv) {
-    SetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "2147483648");  // 2GB
-    SetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "67108864");
+TEST_F(FileStorageTest, ReadBucketBackendValues) {
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
-    SetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", "5000000");
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "536870912");
 
-    auto config = FileStorageConfig::FromEnvironment();
-    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-
-    EXPECT_EQ(config.local_buffer_size, 2147483648);
-    EXPECT_EQ(config.pinned_restore_arena_size, 64 * 1024 * 1024);
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 1000);
-    EXPECT_EQ(config.total_keys_limit, 5000000);
-}
-
-TEST_F(FileStorageTest, ReadUint32FromEnv) {
-    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "5");
-
-    auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.heartbeat_interval_seconds, 5u);
-}
-
-TEST_F(FileStorageTest, ReadDiskWatermarkConfigFromEnv) {
-    SetEnv("MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO", "0.77");
-    SetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO", "0.55");
-
-    auto alias_config = FileStorageConfig::FromEnvironment();
-    EXPECT_DOUBLE_EQ(alias_config.disk_eviction_high_watermark_ratio, 0.77);
-    EXPECT_DOUBLE_EQ(alias_config.disk_eviction_low_watermark_ratio, 0.55);
-
-    SetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION", "0");
-    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO", "0.75");
-    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO", "0.50");
-
-    auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_FALSE(config.enable_disk_watermark_eviction);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.75);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.50);
-
-    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO", "0,75");
-    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO", "nan");
-
-    auto invalid_config = FileStorageConfig::FromEnvironment();
-    EXPECT_DOUBLE_EQ(invalid_config.disk_eviction_high_watermark_ratio, 0.90);
-    EXPECT_DOUBLE_EQ(invalid_config.disk_eviction_low_watermark_ratio, 0.80);
+    const auto config = BucketBackendConfig::FromEnvironment();
+    EXPECT_EQ(config.bucket_keys_limit, 1000);
+    EXPECT_EQ(config.bucket_size_limit, 512 * 1024 * 1024);
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
@@ -741,103 +965,6 @@ TEST_F(FileStorageTest, DuplicateOffloadErrorIsPerBucketSoftError) {
     EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::OK));
 }
 
-TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "abc");
-    SetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "sdfsdf");
-    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-1");
-
-    auto config = FileStorageConfig::FromEnvironment();
-    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
-    EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
-    EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
-    EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
-}
-
-TEST_F(FileStorageTest, OutOfRangeValueUsesDefault) {
-    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
-           "4294967296");  // > UINT32_MAX
-    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-10");  // negative
-
-    auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.heartbeat_interval_seconds, 10u);  // fallback to default
-}
-
-TEST_F(FileStorageTest, EmptyEnvValueUsesDefault) {
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "");  // empty string
-
-    auto config = FileStorageConfig::FromEnvironment();
-    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);  // fallback
-}
-
-TEST_F(FileStorageTest, ValidateSuccessWithValidConfig) {
-    FileStorageConfig config;
-    config.storage_filepath = std::filesystem::current_path().string();
-    config.total_keys_limit = 1000000;
-    config.total_size_limit = 1073741824;  // 1GB
-    config.heartbeat_interval_seconds = 5;
-
-    EXPECT_TRUE(config.Validate());
-}
-
-TEST_F(FileStorageTest, ValidateFailsOnEmptyStoragePath) {
-    FileStorageConfig config;
-    config.storage_filepath = "";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "   ";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "relative/path";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "./data";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "../data";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "/valid/../invalid";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "/path/./sub";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = "/tmp/this_directory_does_not_exist_12345";
-    EXPECT_FALSE(config.Validate());
-    config.storage_filepath = data_path;
-    EXPECT_TRUE(config.Validate());
-}
-
-TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {
-    FileStorageConfig config;
-    config.storage_filepath = "/tmp";
-
-    config.total_keys_limit = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.total_keys_limit = 1;
-    config.total_size_limit = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.total_size_limit = 1;
-    config.pinned_restore_arena_size = -1;
-    EXPECT_FALSE(config.Validate());
-
-    config.pinned_restore_arena_size = 0;
-    config.heartbeat_interval_seconds = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.heartbeat_interval_seconds = 1;
-    config.disk_eviction_low_watermark_ratio = 0.9;
-    config.disk_eviction_high_watermark_ratio = 0.8;
-    EXPECT_FALSE(config.Validate());
-
-    config.disk_eviction_low_watermark_ratio = 0.0;
-    config.disk_eviction_high_watermark_ratio = 0.8;
-    EXPECT_FALSE(config.Validate());
-
-    config.disk_eviction_low_watermark_ratio = 0.8;
-    config.disk_eviction_high_watermark_ratio = 1.1;
-    EXPECT_FALSE(config.Validate());
-}
-
 TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
@@ -991,6 +1118,35 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
         FileStorageBatchLoad(fileStorage, allocate_res.value()->slices);
     ASSERT_TRUE(load_result);
     // No crash = success. No metrics pointer, so nothing to verify.
+}
+
+// Issue #3709: a RemoveAll-style physical wipe of the SSD files while master
+// still tracks the key's LOCAL_DISK replica leaves a dangling entry. A Put
+// for the same key must not report success while storing nothing: the client
+// evicts the dangling replica and retries PutStart, so the new data is
+// actually written.
+
+TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
+    // The per-key file backend reports the wiped file as OBJECT_NOT_FOUND /
+    // FILE_OPEN_FAIL, the original proof set.
+    RunPutHealWipeScenario(data_path, StorageBackendType::kFilePerKey,
+                           "_per_key");
+}
+
+TEST_F(FileStorageTest,
+       PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket) {
+    // The bucket backend's BatchLoad reports a missing key as INVALID_KEY
+    // (fanganpai's production trace in #3709); the heal must still fire.
+    RunPutHealWipeScenario(data_path, StorageBackendType::kBucket, "_bucket");
+}
+
+TEST_F(FileStorageTest,
+       BatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
+    // The BatchPut twin of the scenario above: OBJECT_ALREADY_EXISTS results
+    // on the batch path must not be converted to success for keys whose
+    // backing file is gone. Two wiped keys and one fresh key go through one
+    // batch; every key must really store.
+    RunBatchPutHealWipeScenario(data_path);
 }
 
 }  // namespace mooncake

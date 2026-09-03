@@ -446,7 +446,17 @@ To support the operational needs of P2P Store, Transfer Engine provides a Golang
 When compiling the project, enable the `-DWITH_P2P_STORE=ON` option to compile the P2P Store example program at the same time.
 
 ### Using Rust Interface
-Under `mooncake-transfer-engine/rust`, the Rust interface implementation of TransferEngine is provided, and a Rust version of the benchmark is implemented based on the interface, similar to [transfer_engine_bench.cpp](gh-file:mooncake-transfer-engine/example/transfer_engine_bench.cpp). To compile the rust example, you need to install the Rust SDK and add `-DWITH_RUST_EXAMPLE=ON` in the cmake command.
+`mooncake-transfer-engine/rust` ships `transfer_engine_rust`, a library crate
+that wraps the Transfer Engine C API (`transfer_engine_c.h`). Hot-path types
+(`TransferRequest`, `BufferEntry`, `TransferStatus`) match the C ABI so
+`submit_transfer` is a zero-copy FFI call. A throughput benchmark example
+(`examples/transfer_engine_bench.rs`) mirrors
+[transfer_engine_bench.cpp](gh-file:mooncake-transfer-engine/example/transfer_engine_bench.cpp).
+
+To build the library and example, install a Rust toolchain and libclang, then
+configure CMake with `-DWITH_RUST_EXAMPLE=ON`. See the
+[Transfer Engine Rust API](../../api-reference/rust/transfer-engine.md) for
+signatures and the crate `README.md` for Cargo-only builds.
 
 ## Advanced Runtime Options
 For advanced users, TransferEngine provides the following advanced runtime options, all of which can be passed in through **environment variables**.
@@ -487,7 +497,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
 - `MC_TRACK_RDMA_POSTED_SLICES` Enable RDMA posted-slice tracking for timeout diagnostics. When enabled, CQ timeout logs include stuck transfer groups by peer NIC path, slice count, bytes, oldest post age, and sample addresses. This adds synchronization on the RDMA post and poll hot paths, so it is disabled by default and should be enabled only while diagnosing stuck completions.
 - `MC_ENABLE_PARALLEL_REG_MR` Control parallel memory region registration across multiple RDMA NICs. Valid values: -1 (auto, default), 0 (disabled), 1 (enabled). When set to -1, parallel registration is automatically enabled when multiple RNICs exist and memory has been pre-touched. Note: If memory hasn't been touched before registration, parallel registration can be slower than sequential registration
-- `MC_MAX_CONCURRENT_REG_MR` Cap on how many buffers `registerLocalMemoryBatch` registers concurrently (EFA transport). The default 0 means unbounded — one thread per buffer, the historical behavior. Note the cap is **per process**, so a framework running one `TransferEngine` per TP rank multiplies it by the rank count. Capping can cut registration time substantially when a batch holds many large GPU buffers. Registration is CPU-bound, so a reasonable value is `cores / processes-per-node` — on a 192-core node running 8 ranks, around 16. Oversubscribing costs more than undersubscribing, and the result also depends on the order the caller passes buffers in, so a poorly chosen cap can be slower than unbounded — hence opt-in.
+- `MC_MAX_CONCURRENT_REG_MR` Cap how many buffers the EFA and RDMA transports process concurrently in `registerLocalMemoryBatch` and `unregisterLocalMemoryBatch`. The default 0 means unbounded — one thread per buffer, the historical behavior. Note the cap is **per process**, so a framework running one `TransferEngine` per TP rank multiplies it by the rank count. Capping can cut registration time substantially when a batch holds many large GPU buffers. Registration is CPU-bound, so a reasonable value is `cores / processes-per-node` — on a 192-core node running 8 ranks, around 16. Oversubscribing costs more than undersubscribing, and the result also depends on the order the caller passes buffers in, so a poorly chosen cap can be slower than unbounded — hence opt-in.
 - `MC_EFA_NIC_SELECTION` Which NICs the EFA transport registers a buffer on. `all` (the default) registers every buffer on every NIC. `local` restricts **device** memory to the NICs the topology reports as closest to that GPU, which on p5.48xlarge is the 4 EFA devices sharing the GPU's PCIe root complex. Because EFA charges device-memory registration in proportion to the device bytes already registered on the same libfabric domain, narrowing the NIC set cuts registration time by close to the fan-out ratio. Set it when registering many GPU buffers is a startup bottleneck; it is opt-in because fewer NICs can serve a transfer touching that buffer, so a job whose working set sits behind a single GPU is capped at that rail group's bandwidth rather than the node's. Host memory is unaffected. Combine with `MC_MAX_CONCURRENT_REG_MR`, which bounds a different variable: this reduces the cost per registration, that one reduces how many run at once.
 - `MC_EFA_CQ_THREADS` Cap on the number of CQ polling threads in the EFA transport, default value 1 (which already reaches ~99.9% of peak throughput). Pollers busy-wait, so each extra thread costs a full core. Set 0 to lift the cap (one poller per EFA device). Values above the device count are ignored
 - `MC_FORCE_HCA` Force to use RDMA as the active transport, return error if no HCA has been found.
@@ -545,6 +555,14 @@ heterogeneous_ascend
 
 kunpeng_ub_transport
 sunrise_link_transport
+:::
+
+## FlagOS FlagCX Transport Component
+
+:::{toctree}
+:maxdepth: 1
+
+flagcx_transport
 :::
 
 ## MPComm Transport Component

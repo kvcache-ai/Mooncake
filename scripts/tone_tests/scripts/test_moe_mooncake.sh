@@ -14,6 +14,12 @@ run_test()
 
     echo "Running tests in container and saving output to: $log_file"
 
+    if ! ${docker_exec} "command -v sgl-eval >/dev/null 2>&1"; then
+        echo "ERROR: sgl-eval is missing from the SGLang test container" >&2
+        echo "The T-One setup must install the pinned sgl-eval dependency before pytest." >&2
+        return 1
+    fi
+
     # Use local HF cache (offline) when the model is already downloaded.
     local offline_prefix=$(hf_offline_prefix "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
 

@@ -51,6 +51,10 @@ using RdmaTaskStorage = Slab<RdmaTask>;
 struct RdmaTask {
     int num_slices;
     Request request;
+    // Resolved by TransportSelector and copied from RdmaSubBatch. The
+    // per-slice path runs later on worker threads, so it must carry the same
+    // device policy as the aggregate allocation path.
+    uint64_t device_mask{~0ULL};
     // Named QP pool this task's slices should use (RFC #2568 step 3). Empty =
     // no pool selected: slices spray across all data QPs as before. Resolved
     // from SelectionResult.qp_pool at task creation.
@@ -109,9 +113,22 @@ struct RdmaSlice {
     // rotate through all combinations with wraparound instead of hammering one.
     int last_fallback_idx = -1;
     bool failed = false;
-    // True while DeviceSelector accounts this slice against source_dev_id.
-    // The worker clears it exactly once on completion, failure, or cancel.
+    // True while DeviceSelector accounts this slice's inflight bytes against
+    // charged_dev_id. The worker clears it exactly once on completion, failure,
+    // or cancel.
     bool quota_charged = false;
+    // Device the inflight bytes are actually charged against. This is tracked
+    // separately from source_dev_id because a fallback re-route (or a retry)
+    // can change the routing NIC after the charge was made; releasing against
+    // source_dev_id would then leak the original NIC's charge and underflow the
+    // fallback NIC. Kept in sync with the routing device by chargeSliceQuota.
+    int charged_dev_id = -1;
+    // Exact number of inflight bytes charged for this slice, recorded at charge
+    // time so release unwinds precisely what was added. The allocator charges a
+    // per-slice estimate (ceil(total/num_slices)) that can differ from the
+    // slice's real length; releasing by length would otherwise leave residue on
+    // some NICs and underflow others.
+    uint64_t charged_bytes = 0;
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
     // Non-owning pointer to the per-worker RailMonitor for this slice's

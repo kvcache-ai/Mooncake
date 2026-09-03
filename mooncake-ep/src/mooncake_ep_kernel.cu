@@ -484,7 +484,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
               void* workspace, cudaStream_t stream,
               int64_t timeout_ticks, int phases, int active_qps_per_rank) {
-    constexpr int kNumMaxTopK = 11;
+    constexpr int kNumMaxTopK = 17;
     constexpr int kNumWarpsPerGroup = 4;
     int num_warp_groups = 8;
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -770,7 +770,7 @@ void combine(void* combined_x, int32_t* active_ranks,
              int active_qps_per_rank) {
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
-    constexpr int kNumMaxTopk = 11;
+    constexpr int kNumMaxTopk = 17;
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const auto num_sms = cell_div(num_experts, kNumWarpGroups);
