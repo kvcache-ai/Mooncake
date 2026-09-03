@@ -128,6 +128,12 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     max_sge_per_wr_ = max_sge_per_wr;
     max_inline_bytes_ = max_inline_bytes;
 
+    if (num_qp_list == 0) {
+        ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+        status_.store(UNCONNECTED, std::memory_order_relaxed);
+        return 0;
+    }
+
     wr_depth_list_ = new std::atomic<int>[num_qp_list]();
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
