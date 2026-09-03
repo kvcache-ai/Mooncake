@@ -45,6 +45,7 @@
 #include "replica.h"
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/batch_oplog/promotion.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
 #include "ha/oplog/oplog_types.h"
@@ -923,6 +924,9 @@ class MasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments);
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        BatchOpLogPromotionHandoff handoff,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     /**
      * @brief Query the status of a task
@@ -965,6 +969,14 @@ class MasterService {
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
+    tl::expected<void, ErrorCode> RestoreFromStandbyState(
+        const std::vector<StandbyObjectEntry>* legacy_objects,
+        std::unique_ptr<StandbyMetadataStore> metadata_store,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments,
+        size_t chunk_object_count,
+        std::optional<ReplicaID> expected_max_replica_id);
+
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
 

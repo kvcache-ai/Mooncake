@@ -1013,6 +1013,8 @@ TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
             batch_backend->Put(BuildBatchRecordKey(cluster_id_, id),
                                EncodeOpLogBatchRecord(MakeBatch(id, id, id))));
     }
+    config_.batch_oplog_retry_timeout_sec = 0;
+    service_ = std::make_unique<HotStandbyService>(config_);
     service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
 
     auto err = service_->Start("", oplog_endpoints_, cluster_id_);

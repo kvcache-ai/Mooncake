@@ -428,9 +428,21 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // Restore is the serving gate: do not register or expose a candidate
         // service until the complete promotion context has been applied.
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
-        auto restore_result = wrapped_master_service->RestoreFromStandby(
-            promotion_ctx->objects, promotion_ctx->applied_seq_id,
-            promotion_ctx->segments);
+        auto restore_result =
+            promotion_ctx->metadata_store
+                ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
+                      BatchOpLogPromotionHandoff{
+                          .metadata_store =
+                              std::move(promotion_ctx->metadata_store),
+                          .segments = std::move(promotion_ctx->segments),
+                          .applied_cursor = promotion_ctx->applied_cursor,
+                          .producer_view_version =
+                              promotion_ctx->producer_view_version,
+                          .max_replica_id = promotion_ctx->max_replica_id,
+                      })
+                : wrapped_master_service->RestoreFromStandby(
+                      promotion_ctx->objects, promotion_ctx->applied_seq_id,
+                      promotion_ctx->segments);
         if (!restore_result) {
             LOG(ERROR) << "Standby restore failed: "
                        << toString(restore_result.error());
