@@ -48,8 +48,7 @@ DistributedStorageBackend::DistributedStorageBackend(
     : StorageBackendInterface(file_storage_config),
       fs_adapter_(std::move(fs_adapter)),
       object_storage_adapter_(std::move(object_storage_adapter)),
-      distributed_config_(distributed_config),
-      root_dir_(distributed_config.fsdir) {
+      distributed_config_(distributed_config) {
     CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
         << "DistributedStorageBackend: exactly one I/O adapter is required";
     if (object_storage_adapter_) {
@@ -82,23 +81,33 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
         return {};
     }
 
-    std::error_code ec;
-    std::filesystem::create_directories(root_dir_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS root directory " << root_dir_
-                   << ": " << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (!distributed_config_.Validate()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto init_result = fs_adapter_->Init(root_dir_);
+    const auto& primary_root = distributed_config_.RootForShard(0);
+    if (distributed_config_.root_dirs.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(primary_root, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to create DFS root directory " << primary_root
+                       << ": " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+    }
+
+    auto init_result = fs_adapter_->Init(primary_root);
     if (!init_result) return init_result;
 
     shard_files_.reserve(distributed_config_.shard_count);
     for (int i = 0; i < distributed_config_.shard_count; ++i) {
-        std::string path = root_dir_ + "/dfs_shard_" +
-                           DfsGlobalAllocator::FormatShardIdx(
-                               i, distributed_config_.shard_count) +
-                           ".data";
+        std::string path =
+            (std::filesystem::path(distributed_config_.RootForShard(i)) /
+             ("dfs_shard_" +
+              DfsGlobalAllocator::FormatShardIdx(
+                  i, distributed_config_.shard_count) +
+              ".data"))
+                .string();
         auto fd_result = fs_adapter_->OpenFile(path);
         if (!fd_result) {
             LOG(ERROR) << "Failed to open DFS shard " << path << ": "

@@ -742,8 +742,8 @@ limitations below.
 
 #### Master configuration
 
-Enable the DFS allocator in the master process and select a shared root and
-shard layout. For example, to use HF3FS:
+Enable the DFS allocator in the master process and select the shared root or
+roots and shard layout. For example, to use HF3FS with one root:
 
 ```bash
 export MOONCAKE_ENABLE_DFS=1
@@ -767,13 +767,28 @@ The `hf3fs` adapter requires Mooncake to be built with `USE_3FS=ON`. Use
 `MOONCAKE_DFS_FS_ADAPTER=posix` for development and integration testing on a
 regular shared filesystem.
 
+The POSIX adapter can stripe shard files across multiple pre-mounted roots. All
+roots must already exist and be absolute, unique directory paths:
+
+```bash
+export MOONCAKE_DFS_ROOT_DIRS=/mnt/mooncake/nfs0,/mnt/mooncake/nfs1
+export MOONCAKE_DFS_FS_ADAPTER=posix
+```
+
+Shard `i` is placed under root `i % root_count`. The ordered root list is part
+of the storage layout: configure the same count, ordering, and local mount paths
+on the master and every client. Changing the list after shard files have been
+created is unsupported. `MOONCAKE_DFS_ROOT_DIRS` is not supported by the
+`hf3fs` adapter.
+
 #### Client configuration
 
 Every client that may read or write a DFS replica must initialize
-`FileStorage` and select the distributed backend. Use an absolute DFS root path;
-the root string, shard count, shard capacity, and alignment must match the
-master configuration. Select an adapter that can access the same underlying
-shared files; the examples use the same adapter in every process.
+`FileStorage` and select the distributed backend. Use an absolute DFS root path
+or ordered root list; the root configuration, shard count, shard capacity, and
+alignment must match the master configuration. Select an adapter that can
+access the same underlying shared files; the examples use the same adapter in
+every process.
 
 ```bash
 export MOONCAKE_OFFLOAD_ENABLED=true
@@ -797,9 +812,10 @@ backend-specific `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` and
 supplied as Python arguments. The
 `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` directory must already exist and be an
 absolute, writable, non-symlink directory. DFS shard data is stored under
+`MOONCAKE_DFS_ROOT_DIRS` when configured, otherwise under
 `MOONCAKE_DFS_ROOT_DIR`; the FileStorage path is still required for client
 initialization because the shared `FileStorageConfig` validates it even when
-the selected backend stores data in the DFS root.
+the selected backend stores data in the DFS roots.
 
 Native C++ clients must initialize a `DistributedStorageBackend` with the same
 DFS layout and attach it to the client with `SetDfsStorageBackend()` before
@@ -812,6 +828,7 @@ is required.
 | Variable | Scope | Default | Description |
 |----------|-------|---------|-------------|
 | `MOONCAKE_ENABLE_DFS` | Master | `false` | Enable master-side DFS allocation. `MOONCAKE_DFS_ENABLED` is accepted as a compatibility fallback. |
+| `MOONCAKE_DFS_ROOT_DIRS` | Master and clients | unset | Ordered, comma-separated POSIX shard roots. Each path must be absolute, unique, and already exist. Shard `i` uses root `i % root_count`. Takes precedence over `MOONCAKE_DFS_ROOT_DIR`; unsupported with `hf3fs`. |
 | `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared shard root; use the same path string in every process. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
 | `MOONCAKE_DFS_FS_ADAPTER` | Master and clients | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. Falls back to `MOONCAKE_DISTRIBUTED_FS_TYPE`. |
 | `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Number of DFS shard files. |
@@ -982,7 +999,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `master_server_addr` | str | required | Master `host:port`. **Keyword is `master_server_addr`, not `master_server_address`** |
 | `engine` | TransferEngine | `None` | *(advanced)* Reuse an existing Transfer Engine instance instead of creating one |
 | `enable_ssd_offload` | bool | `false` | *(advanced)* Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
-| `ssd_offload_path` | str | empty | *(advanced)* FileStorage path; with the distributed backend, DFS data uses `MOONCAKE_DFS_ROOT_DIR` |
+| `ssd_offload_path` | str | empty | *(advanced)* FileStorage path; with the distributed backend, DFS data uses `MOONCAKE_DFS_ROOT_DIRS` when set, otherwise `MOONCAKE_DFS_ROOT_DIR` |
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 | `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
@@ -1013,7 +1030,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
-| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; DFS shard data uses `MOONCAKE_DFS_ROOT_DIR` with the distributed backend |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; DFS shard data uses `MOONCAKE_DFS_ROOT_DIRS` when set, otherwise `MOONCAKE_DFS_ROOT_DIR` |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
 | `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |

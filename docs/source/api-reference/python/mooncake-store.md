@@ -1147,8 +1147,9 @@ the positional overload.
   Defaults to `False`.
 - `ssd_offload_path` (str): FileStorage directory. When provided, it overrides
   `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. With the distributed backend, DFS shard
-  data is stored under `MOONCAKE_DFS_ROOT_DIR`, but this separate directory is
-  still validated during FileStorage initialization.
+  data is stored under `MOONCAKE_DFS_ROOT_DIRS` when configured, otherwise
+  under `MOONCAKE_DFS_ROOT_DIR`, but this separate directory is still validated
+  during FileStorage initialization.
 - `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
 - `enable_client_http_server` (bool): Enable the client-local `/health`, `/metrics`, `/metrics/summary`, and `/version` HTTP endpoints. Defaults to `False`.
 - `client_http_port` (int): Port for the client-local HTTP endpoints. Defaults to `9300`.
