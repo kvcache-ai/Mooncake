@@ -18,7 +18,6 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_io/coro_io.hpp>
 
-#include "p2p/client/v1/data_manager_v1.h"
 #include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
@@ -315,43 +314,37 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
 }
 
 ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
-    auto tiered_backend =
-        std::make_unique<TieredBackend>(config.lock_shard_count);
-
-    auto add_replica_callback = BuildAddReplicaCallback();
-    auto remove_replica_callback = BuildRemoveReplicaCallback();
-    auto segment_sync_callback = BuildSegmentSyncCallback();
-
-    auto init_result = tiered_backend->Init(
-        config.tiered_backend_config, transfer_engine_.get(),
-        add_replica_callback, remove_replica_callback, segment_sync_callback,
-        metrics_ ? metrics_->tier_metric : nullptr,
-        metrics_ ? metrics_->key_retention : nullptr);
-    if (!init_result) {
-        LOG(ERROR) << "Failed to init TieredBackend: " << init_result.error();
-        return init_result.error();
+    DataManagerConfig dm_config;
+    auto parsed_version = ParseDataManagerVersion(config.data_manager_version);
+    if (!parsed_version) {
+        LOG(ERROR) << "Invalid data_manager_version='"
+                   << config.data_manager_version << "', expected v1 or v2";
+        return ErrorCode::INVALID_PARAMS;
     }
+    dm_config.version = *parsed_version;
+    dm_config.tier_config = config.tiered_backend_config;
+    dm_config.v1_lock_shard_count = config.lock_shard_count;
 
-    LocalTransferConfig local_transfer_config;
-    local_transfer_config.mode = config.local_transfer_mode;
-    local_transfer_config.te_async_poll_worker_num =
+    dm_config.local_transfer.mode = config.local_transfer_mode;
+    dm_config.local_transfer.te_async_poll_worker_num =
         config.te_async_poll_worker_num;
     if (config.local_transfer_mode == LocalTransferMode::TE) {
-        local_transfer_config.te_endpoint = get_te_endpoint();
+        dm_config.local_transfer.te_endpoint = get_te_endpoint();
     } else {
-        local_transfer_config.local_memcpy_async_worker_num =
+        dm_config.local_transfer.local_memcpy_async_worker_num =
             config.local_memcpy_async_worker_num;
     }
-    KeyLeaseConfig key_lease_config;
-    key_lease_config.duration_ms = config.p2p_key_lease_duration_ms;
-    key_lease_config.scan_interval_ms = config.p2p_key_lease_scan_interval_ms;
+    dm_config.key_lease.duration_ms = config.p2p_key_lease_duration_ms;
+    dm_config.key_lease.scan_interval_ms =
+        config.p2p_key_lease_scan_interval_ms;
 
-    data_manager_ = std::make_unique<DataManagerV1>(
-        std::move(tiered_backend), transfer_engine_, config.lock_shard_count,
-        local_transfer_config, key_lease_config);
-    // Set rectify callback on DataManager to remove stale replicas from master
-    data_manager_->SetRectifyCallback([this](std::string_view key,
-                                             std::optional<UUID> tier_id) {
+    MetadataCallbacks callbacks;
+    callbacks.add_replica = BuildAddReplicaCallback();
+    callbacks.remove_replica = BuildRemoveReplicaCallback();
+    callbacks.segment_sync = BuildSegmentSyncCallback();
+    // Remove stale replicas from master when a read misses locally.
+    callbacks.rectify_route = [this](std::string_view key,
+                                     std::optional<UUID> tier_id) {
         if (async_route_notifier_) {
             if (!tier_id.has_value()) {
                 auto tier_views = data_manager_->GetTierViews();
@@ -382,7 +375,22 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
                 SyncRemoveReplica(key, *tier_id);
             }
         }
-    });
+    };
+
+    DataManagerMetrics dm_metrics;
+    if (metrics_) {
+        dm_metrics.tier_metric = metrics_->tier_metric;
+        dm_metrics.key_retention = metrics_->key_retention;
+    }
+
+    auto data_manager = CreateDataManager(dm_config, transfer_engine_,
+                                          std::move(callbacks), dm_metrics);
+    if (!data_manager) {
+        LOG(ERROR) << "Failed to create DataManager: "
+                   << toString(data_manager.error());
+        return data_manager.error();
+    }
+    data_manager_ = std::move(data_manager.value());
 
     // Initialize route cache
     if (config.route_cache_max_memory_bytes > 0 &&

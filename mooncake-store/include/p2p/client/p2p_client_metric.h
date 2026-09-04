@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -172,9 +173,33 @@ struct TierMetric {
         "Keys moved from each tier up to a higher-priority tier",
         {"tier"}};
 
-    // NOT thread-safe
+    /**
+     * @brief Live usage of a registered tier, polled only when metrics are
+     *        serialized.
+     *
+     * A callback rather than a CacheTier: the V2 data plane has no CacheTier
+     * and must not depend on that tree, and the metric only ever needed one
+     * number from it.
+     */
+    using TierUsageFn = std::function<size_t()>;
+
+    /**
+     * @brief Register a tier's metric series.
+     *
+     * NOT thread-safe; call during initialization only.
+     *
+     * @param usage Polled from serialize()/summary_metrics(). It must stay
+     *        valid for as long as this metric object does -- both
+     *        implementations own their tiers and the metric together, and both
+     *        outlive it, so the callback captures a borrowed pointer rather
+     *        than keeping the tier alive and skewing shutdown.
+     */
     void RegisterTier(const UUID& tier_id, const std::string& label,
-                      const std::shared_ptr<CacheTier>& tier, int priority);
+                      MemoryType memory_type, int priority, size_t capacity,
+                      TierUsageFn usage);
+
+    /** True once a tier id has a series. Lets a caller avoid double work. */
+    bool HasTier(const UUID& tier_id) const;
 
     void OnReplicaAdded(const UUID& tier_id);
     void OnReplicaRemoved(const UUID& tier_id);
@@ -193,11 +218,11 @@ struct TierMetric {
         MemoryType memory_type = MemoryType::UNKNOWN;
         int priority = 0;
         size_t capacity = 0;
-        std::weak_ptr<CacheTier> tier;
+        TierUsageFn usage;
     };
 
-    // Polls CacheTier::GetUsage() of every live tier into used_bytes. Only
-    // called from serialize()/summary_metrics(), never from the data path.
+    // Polls each tier's usage into used_bytes. Only called from
+    // serialize()/summary_metrics(), never from the data path.
     void RefreshUsage();
 
     std::unordered_map<UUID, TierEntry> tiers_;

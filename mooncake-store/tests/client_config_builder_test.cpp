@@ -39,6 +39,36 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
     EXPECT_EQ(config.redis_heartbeat_interval_sec, 1);
 }
 
+// The rollback switch. It lives in the same JSON document as `tiers` so an
+// operator flips one file and restarts, with no client wiring to change; and
+// it defaults to v1, so an existing deployment keeps the implementation it has
+// been running until someone asks for the other one.
+TEST(ClientConfigBuilderTest, DataManagerVersionDefaultsToV1) {
+    auto config = ClientConfigBuilder::build_p2p_real_client(
+        "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
+        std::nullopt, "127.0.0.1:50051", kTieredConfigJson);
+    EXPECT_EQ(config.data_manager_version, "v1");
+}
+
+TEST(ClientConfigBuilderTest, DataManagerVersionIsReadFromTheTierConfig) {
+    static constexpr const char* kV2Config = R"({
+  "data_manager_version": "v2",
+  "tiers": [
+    {
+      "type": "DRAM",
+      "capacity": 1048576,
+      "priority": 10
+    }
+  ]
+})";
+    auto config = ClientConfigBuilder::build_p2p_real_client(
+        "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
+        std::nullopt, "127.0.0.1:50051", kV2Config);
+    EXPECT_EQ(config.data_manager_version, "v2");
+    // The tier list is unaffected by the selector sitting next to it.
+    EXPECT_EQ(config.tiered_backend_config["tiers"].size(), 1u);
+}
+
 TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesRedisDiscoveryDefaults) {
     std::unordered_map<std::string, std::string> raw_config = {
         {"local_hostname", "127.0.0.1:12345"},

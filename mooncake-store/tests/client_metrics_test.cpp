@@ -737,7 +737,9 @@ TEST_F(ClientMetricsTest, TierMetricRegisterAndCountTest) {
         std::make_shared<StubStatsTier>(tier_id, /*capacity=*/1024,
                                         /*usage=*/256, MemoryType::DRAM);
 
-    metric.RegisterTier(tier_id, label, tier, /*priority=*/10);
+    metric.RegisterTier(tier_id, label, tier->GetMemoryType(), /*priority=*/10,
+                        tier->GetCapacity(),
+                        [tier]() { return tier->GetUsage(); });
 
     std::array<std::string, 1> label_array = {label};
     EXPECT_EQ(metric.capacity_bytes.value(label_array), 1024);
@@ -788,7 +790,9 @@ TEST_F(ClientMetricsTest, TierMetricExpiredTierKeepsLastUsageTest) {
     auto tier =
         std::make_shared<StubStatsTier>(tier_id, /*capacity=*/2048,
                                         /*usage=*/100, MemoryType::NVME);
-    metric.RegisterTier(tier_id, label, tier, /*priority=*/5);
+    metric.RegisterTier(tier_id, label, tier->GetMemoryType(), /*priority=*/5,
+                        tier->GetCapacity(),
+                        [tier]() { return tier->GetUsage(); });
 
     tier->SetUsage(999);
     std::string serialized;
@@ -807,8 +811,12 @@ TEST_F(ClientMetricsTest, TierMetricDuplicateRegistrationTest) {
     auto tier = std::make_shared<StubStatsTier>(tier_id, /*capacity=*/1024,
                                                 /*usage=*/0, MemoryType::DRAM);
 
-    metric.RegisterTier(tier_id, "tier_5_6", tier, /*priority=*/1);
-    metric.RegisterTier(tier_id, "tier_5_6_dup", tier, /*priority=*/1);
+    metric.RegisterTier(tier_id, "tier_5_6", tier->GetMemoryType(),
+                        /*priority=*/1, tier->GetCapacity(),
+                        [tier]() { return tier->GetUsage(); });
+    metric.RegisterTier(tier_id, "tier_5_6_dup", tier->GetMemoryType(),
+                        /*priority=*/1, tier->GetCapacity(),
+                        [tier]() { return tier->GetUsage(); });
 
     // The duplicate registration is rejected; only the first label exists.
     std::string summary = metric.summary_metrics();
@@ -836,8 +844,12 @@ TEST_F(ClientMetricsTest, TierMetricMovementCountersTest) {
     auto low_tier = std::make_shared<StubStatsTier>(
         low, /*capacity=*/2048, /*usage=*/0, MemoryType::NVME);
 
-    metric.RegisterTier(high, "tier_1_1", high_tier, /*priority=*/20);
-    metric.RegisterTier(low, "tier_2_2", low_tier, /*priority=*/10);
+    metric.RegisterTier(high, "tier_1_1", high_tier->GetMemoryType(),
+                        /*priority=*/20, high_tier->GetCapacity(),
+                        [high_tier]() { return high_tier->GetUsage(); });
+    metric.RegisterTier(low, "tier_2_2", low_tier->GetMemoryType(),
+                        /*priority=*/10, low_tier->GetCapacity(),
+                        [low_tier]() { return low_tier->GetUsage(); });
 
     std::array<std::string, 1> high_label = {"tier_1_1"};
     std::array<std::string, 1> low_label = {"tier_2_2"};
@@ -868,7 +880,9 @@ TEST_F(ClientMetricsTest, TierMetricMovementCountersTest) {
     const UUID peer{3, 3};
     auto peer_tier = std::make_shared<StubStatsTier>(
         peer, /*capacity=*/512, /*usage=*/0, MemoryType::DRAM);
-    metric.RegisterTier(peer, "tier_3_3", peer_tier, /*priority=*/20);
+    metric.RegisterTier(peer, "tier_3_3", peer_tier->GetMemoryType(),
+                        /*priority=*/20, peer_tier->GetCapacity(),
+                        [peer_tier]() { return peer_tier->GetUsage(); });
     metric.OnMoved(high, peer);
     std::array<std::string, 1> peer_label = {"tier_3_3"};
     EXPECT_EQ(metric.offloaded_keys.value(high_label), 1);
