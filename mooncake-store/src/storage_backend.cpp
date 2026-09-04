@@ -51,6 +51,7 @@ struct FdGuard {
 
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#include "storage/local/log_structured/log_structured_backend.h"
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
@@ -5545,6 +5546,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
         }
         case StorageBackendType::kNvmeKv:
             return std::make_shared<NvmeKvStorageBackend>(config);
+
+        case StorageBackendType::kLogStructured:
+            return std::make_shared<LogStructuredStorageBackend>(config);
 
         case StorageBackendType::kDistributed: {
             auto distributed_config =

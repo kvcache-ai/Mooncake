@@ -77,6 +77,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
+    storage/local/log_structured/log_structured_backend.cpp
     nvme_kv_backend.cpp
     nvme_kv_connector.cpp
     nvme_kv_executor_io_uring.cpp
@@ -543,6 +544,8 @@ if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_link_libraries(mooncake_store PUBLIC Mooncake::liburing)
 endif()
+target_link_libraries(mooncake_store PRIVATE mooncake_log_structured_storage)
+
 if(USE_CUDA)
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
 elseif(USE_HIP)
