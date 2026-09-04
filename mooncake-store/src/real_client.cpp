@@ -3291,8 +3291,8 @@ RealClient::batch_get_buffer_internal(
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-        std::vector<size_t> round_ops;      // valid_ops indices in this round
-        std::vector<size_t> deferred_ops;   // duplicate keys for a later round
+        std::vector<size_t> round_ops;     // valid_ops indices in this round
+        std::vector<size_t> deferred_ops;  // duplicate keys for a later round
         batch_keys.reserve(pending_ops.size());
         batch_query_results.reserve(pending_ops.size());
         round_ops.reserve(pending_ops.size());
