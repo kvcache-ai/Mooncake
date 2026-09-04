@@ -491,6 +491,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcudart.so* \
     --exclude libmooncake_ep_device.so* \
     --exclude libmooncake_pg_device.so* \
+    --exclude libnccl.so* \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \

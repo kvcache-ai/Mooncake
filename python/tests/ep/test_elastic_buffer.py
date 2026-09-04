@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-topk", type=int, default=8)
     parser.add_argument("--num-sms", type=int, default=24)
     parser.add_argument(
+        "--transport",
+        choices=("auto", "ibgda", "nccl"),
+        default=os.getenv("MOONCAKE_EP_TRANSPORT", "auto"),
+        help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA.",
+    )
+    parser.add_argument(
         "--route",
         choices=("alltoall", "local", "cross"),
         default="alltoall",
@@ -217,6 +223,7 @@ def main() -> None:
     if num_experts % world_size != 0:
         raise ValueError("num_experts must be divisible by world_size")
 
+    transport_kwargs = {} if args.transport == "auto" else {"transport": args.transport}
     buffer = ElasticBuffer(
         dist.group.WORLD,
         num_max_tokens_per_rank=max_tokens,
@@ -227,6 +234,7 @@ def main() -> None:
         allow_hybrid_mode=args.allow_hybrid_mode,
         allow_multiple_reduction=True,
         num_gpu_timeout_secs=10,
+        **transport_kwargs,
     )
 
     route_plan = make_route_plan(
@@ -409,12 +417,14 @@ def main() -> None:
             "MOONCAKE_ELASTIC_TEST_OK",
             f"world={world_size}",
             f"route={args.route}",
+            f"transport={buffer.transport}",
             f"recv={route_plan.expected_recv_tokens}",
             f"expanded={expanded_output}",
             f"scaleout={buffer.num_scaleout_ranks}",
             f"scaleup={buffer.num_scaleup_ranks}",
             flush=True,
         )
+    buffer.destroy()
     dist.destroy_process_group()
 
 
