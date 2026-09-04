@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +41,17 @@ class HighPerformanceTcpTransportTestPeer {
     static uint64_t connectionsCreated(
         const HighPerformanceTcpTransport& transport) {
         return transport.client_->connectionsCreatedForTest();
+    }
+
+    static void blockLane(HighPerformanceTcpTransport& transport,
+                          SegmentID peer, uint32_t lane,
+                          std::atomic<bool>& entered,
+                          std::atomic<bool>& release) {
+        const size_t owner = transport.workers_->affinityOwner(peer, lane);
+        asio::post(transport.workers_->ioContext(owner), [&entered, &release] {
+            entered.store(true);
+            while (!release.load()) std::this_thread::yield();
+        });
     }
 };
 
@@ -330,7 +342,20 @@ TEST(HighPerformanceTcpTransportTest, SlicesSingleLargeReadAcrossTwoRails) {
 }
 
 TEST(HighPerformanceTcpTransportTest,
-     StaleRegistrationRefreshRetriesSameTransportWithFreshMetadata) {
+     SlicedStaleRegistrationCancelsAndRetries) {
+    constexpr size_t kLength = 4ULL << 20;
+    std::atomic<bool> blocker_entered{false};
+    std::atomic<bool> release_blocker{false};
+    auto params = MakeParams();
+    params.bind_address.clear();
+    params.rail_addresses = {"127.0.0.1", "127.0.0.2"};
+    params.max_outstanding_bytes = 8ULL << 20;
+    params.max_transfer_bytes = 8ULL << 20;
+    params.progress_timeout_ms = 5000;
+    asio::io_context stalled_io;
+    asio::ip::tcp::acceptor stalled_peer(
+        stalled_io, {asio::ip::make_address("127.0.0.1"), 0});
+
     auto server_metadata = MakeLocalMetadata();
     uint16_t rpc_port = 0;
     ASSERT_TRUE(server_metadata->start(rpc_port).ok());
@@ -344,12 +369,12 @@ TEST(HighPerformanceTcpTransportTest,
                     })
                     .ok());
 
-    HighPerformanceTcpTransport server(MakeParams());
+    HighPerformanceTcpTransport server(params);
     std::string installed_server_name = server_name;
     ASSERT_TRUE(
         server.install(installed_server_name, server_metadata, nullptr, nullptr)
             .ok());
-    std::array<uint8_t, 64> remote_storage{};
+    std::vector<uint8_t> remote_storage(kLength, 0x5a);
     BufferDesc registration_a;
     registration_a.addr = reinterpret_cast<uint64_t>(remote_storage.data());
     registration_a.length = remote_storage.size();
@@ -374,7 +399,7 @@ TEST(HighPerformanceTcpTransportTest,
                         return Status::OK();
                     })
                     .ok());
-    HighPerformanceTcpTransport client(MakeParams());
+    HighPerformanceTcpTransport client(params);
     std::string client_name = "hp_transport_client";
     ASSERT_TRUE(
         client.install(client_name, client_metadata, nullptr, nullptr).ok());
@@ -388,6 +413,19 @@ TEST(HighPerformanceTcpTransportTest,
     const BufferDesc* cached_buffer_a =
         cached_a->findBuffer(registration_a.addr, registration_a.length);
     ASSERT_NE(cached_buffer_a, nullptr);
+    auto& cached_memory = std::get<MemorySegmentDesc>(cached_a->detail);
+    auto& encoded_endpoint = cached_memory.transport_attrs.at(
+        static_cast<int>(TransportType::HP_TCP));
+    HighPerformanceTcpEndpointAttr mixed_endpoint;
+    ASSERT_TRUE(
+        DecodeHighPerformanceTcpEndpointAttr(encoded_endpoint, &mixed_endpoint)
+            .ok());
+    ASSERT_EQ(mixed_endpoint.endpoints.size(), 2U);
+    mixed_endpoint.endpoints[1] = {"127.0.0.1",
+                                   stalled_peer.local_endpoint().port()};
+    ASSERT_TRUE(
+        EncodeHighPerformanceTcpEndpointAttr(mixed_endpoint, &encoded_endpoint)
+            .ok());
 
     ASSERT_TRUE(server.removeMemoryBuffer(registration_a).ok());
     BufferDesc registration_b;
@@ -403,7 +441,7 @@ TEST(HighPerformanceTcpTransportTest,
     ASSERT_NE(attr_a.registration_id, attr_b.registration_id);
     ASSERT_TRUE(PublishBuffers(server_metadata, {registration_b}).ok());
 
-    std::array<uint8_t, 64> local_storage{};
+    std::vector<uint8_t> local_storage(kLength);
     BufferDesc local;
     local.addr = reinterpret_cast<uint64_t>(local_storage.data());
     local.length = local_storage.size();
@@ -422,7 +460,22 @@ TEST(HighPerformanceTcpTransportTest,
     request.target_offset = registration_b.addr;
     request.length = registration_b.length;
     request.transport_hint = HP_TCP;
-    ASSERT_TRUE(client.submitTransferTasks(batch, {request}).ok());
+
+    HighPerformanceTcpTransportTestPeer::blockLane(
+        client, target, 0, blocker_entered, release_blocker);
+    const bool entered = WaitUntil([&] { return blocker_entered.load(); });
+    if (!entered) release_blocker.store(true);
+    ASSERT_TRUE(entered);
+
+    const Status submitted = client.submitTransferTasks(batch, {request});
+    if (!submitted.ok()) release_blocker.store(true);
+    ASSERT_TRUE(submitted.ok()) << submitted.ToString();
+    const bool sibling_active = WaitUntil([&] {
+        return HighPerformanceTcpTransportTestPeer::connectionsCreated(
+                   client) == 1;
+    });
+    release_blocker.store(true);
+    ASSERT_TRUE(sibling_active);
 
     TransferStatus transfer_status;
     Status first_result =
@@ -430,9 +483,6 @@ TEST(HighPerformanceTcpTransportTest,
     EXPECT_EQ(transfer_status.s, FAILED);
     EXPECT_TRUE(first_result.IsNeedsRefreshCache()) << first_result.ToString();
 
-    int metadata_refresh_retry_count = 0;
-    ASSERT_LT(metadata_refresh_retry_count, 1);
-    ++metadata_refresh_retry_count;
     ASSERT_TRUE(
         client_metadata->segmentManager().invalidateRemote(target).ok());
     ASSERT_TRUE(client.retryTransferTask(batch, 0, request).ok());
@@ -442,7 +492,6 @@ TEST(HighPerformanceTcpTransportTest,
     EXPECT_TRUE(retry_result.ok()) << retry_result.ToString();
     EXPECT_EQ(transfer_status.s, COMPLETED);
     EXPECT_EQ(transfer_status.transferred_bytes, request.length);
-    EXPECT_EQ(metadata_refresh_retry_count, 1);
 
     SegmentDescRef refreshed;
     ASSERT_TRUE(client_metadata->segmentManager()
