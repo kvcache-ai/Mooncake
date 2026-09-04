@@ -1,5 +1,9 @@
 #include <gflags/gflags.h>
 #include <csignal>
+#include <chrono>
+#include <thread>
+#include <asio/io_context.hpp>
+#include <asio/signal_set.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
@@ -28,6 +32,14 @@ DEFINE_bool(start_offload_rpc_server, true,
             "(batch_get_offload_object / release_offload_buffer). "
             "Effective only when --enable_offload is true. "
             "Disable for a write-only owner.");
+DEFINE_uint32(graceful_unmount_seconds, 0,
+              "Grace period, in seconds, for unmounting segments on shutdown. "
+              "0 (default) unmounts immediately. When greater than zero, a "
+              "termination signal first asks the master to stop allocating on "
+              "this client's segments while keeping them readable, and the "
+              "process stays alive (holding its memory registrations) until "
+              "the master released them, so peers that already hold segment "
+              "information can finish their reads. Standalone client only.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -105,6 +117,13 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
 }  // namespace mooncake
 
 int main(int argc, char *argv[]) {
+    // This binary owns SIGINT/SIGTERM/SIGHUP through the asio::signal_set
+    // below, so the shared tracker must not also run its sigwait consumer for
+    // them: POSIX leaves it unspecified which one receives a signal that is
+    // handled by sigaction and awaited by sigwait at the same time. Has to
+    // happen before the first getInstance().
+    mooncake::ResourceTracker::DisableSignalHandling();
+
     // Attention !!!
     // Initialization of ResourceTracker must be the most earliest.
     // Otherwise, the main thread will not apply signal mask before other
@@ -149,8 +168,64 @@ int main(int argc, char *argv[]) {
     coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, rpc_bind_host);
     RegisterClientRpcService(server, *client_inst);
 
+    // This entry point only owns signal registration and configuration; the
+    // shutdown transition itself lives in RealClient::Close(), which every
+    // frontend shares. ResourceTracker's own consumer was disabled above, so
+    // asio is the single owner of these signals.
+    asio::io_context signal_io;
+    asio::signal_set signals(signal_io, SIGINT, SIGTERM, SIGHUP);
+    signals.async_wait([&](const asio::error_code &ec, int sig) {
+        if (ec) {
+            return;
+        }
+        LOG(INFO) << "Received signal " << sig << ", shutting down";
+
+        // Stop ingress before the graceful wait. Close() can block for the
+        // grace period plus the confirmation budget, and while the server is
+        // still serving, a handler could mount a segment that
+        // GracefulUnmountAll() has already snapshotted past, or still be
+        // running when Close() resets the client. stop() closes the acceptors,
+        // closes the live connections and joins the handler pool, so no handler
+        // is running by the time it returns.
+        //
+        // This does not shorten the grace period. What the grace period keeps
+        // alive is peers reading these segments directly through the transfer
+        // engine, which only needs the memory registrations and the master-side
+        // segment state that Close() holds; it does not go through this RPC
+        // port. The port only serves this host's own dummy clients, which are
+        // going away with the process anyway.
+        server.stop();
+
+        CloseOptions options;
+        options.grace_period =
+            std::chrono::seconds(FLAGS_graceful_unmount_seconds);
+        auto closed = client_inst->Close(options);
+        if (!closed) {
+            LOG(ERROR) << "Client shutdown reported an error: "
+                       << toString(closed.error());
+        }
+    });
+
+    std::thread signal_thread([&signal_io]() { signal_io.run(); });
+
     LOG(INFO) << "Starting real client service on " << rpc_bind_host << ":"
               << FLAGS_port;
 
-    return server.start();
+    const auto rc = server.start();
+
+    // Safe to call from any thread, and it does not interrupt a handler that is
+    // already executing. If no signal arrived, this is what lets run() return
+    // instead of blocking on the pending async_wait; if one did, the handler
+    // keeps running Close() and this has no effect on it.
+    signal_io.stop();
+
+    // The handler calls server.stop() first, so start() returns while Close()
+    // may still be running. This join is what actually waits for it, and it has
+    // to happen before client_inst goes out of scope. `signals` is deliberately
+    // left alone: asio's signal_set is not safe for concurrent access, and
+    // ~signal_set cancels any operation that is still pending.
+    if (signal_thread.joinable()) {
+        signal_thread.join();
+    }
+    return rc;
 }

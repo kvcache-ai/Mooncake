@@ -65,6 +65,16 @@ namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 
+// Time the client needs, on top of the announced grace period, to observe that
+// the master has released every segment. Derived from the client's own
+// confirmation schedule (first check one interval after the period elapses,
+// then kGracefulUnmountConfirmRetries retries one interval apart) plus one
+// interval of margin for the master round trips. Used when
+// CloseOptions::timeout is left unset. The schedule is driven by a single
+// aggregate task, so this bound holds for any number of segments.
+constexpr std::chrono::seconds kGracefulCloseConfirmationBudget =
+    kGracefulUnmountConfirmInterval * (kGracefulUnmountConfirmRetries + 2);
+
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
 }
@@ -588,13 +598,28 @@ ResourceTracker &ResourceTracker::getInstance() {
     return *instance;
 }
 
+namespace {
+// Set by ResourceTracker::DisableSignalHandling() before the singleton is
+// constructed, when the surrounding process owns the termination signals.
+std::atomic<bool> g_resource_tracker_signals_disabled{false};
+}  // namespace
+
+void ResourceTracker::DisableSignalHandling() {
+    g_resource_tracker_signals_disabled.store(true, std::memory_order_release);
+}
+
 ResourceTracker::ResourceTracker() {
     // In embedded environments (e.g. Python), the host runtime owns signal
     // handling.  Blocking SIGINT with pthread_sigmask (done inside
     // startSignalThread) would prevent Python from raising KeyboardInterrupt,
     // causing the process to hang on Ctrl-C.  Detect Python at runtime via
     // dlsym so we don't need to include <Python.h> or change any public API.
-    if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
+    //
+    // A process that installs its own handlers opts out explicitly, because a
+    // signal must have a single consumer: POSIX does not define the behaviour
+    // when sigaction and sigwait handle the same signal concurrently.
+    if (!g_resource_tracker_signals_disabled.load(std::memory_order_acquire) &&
+        !dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
         // Standalone C/C++ process – install our own signal handling.
         startSignalThread();
     }
@@ -1358,11 +1383,47 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    // Immediate shutdown: the zero-grace-period case of Close().
+    return Close(CloseOptions{});
+}
+
+tl::expected<void, ErrorCode> RealClient::Close(const CloseOptions &options) {
+    // Validate before entering the closing state: a rejected call must leave
+    // the client fully usable, so this has to happen before closed_ is set.
+    // Only exactly zero carries the documented immediate/derived semantics;
+    // CloseOptions uses signed durations, so a negative value is a caller bug
+    // rather than a request for the default.
+    if (options.grace_period < std::chrono::milliseconds::zero() ||
+        options.timeout < std::chrono::milliseconds::zero()) {
+        LOG(ERROR) << "Close() rejected negative CloseOptions: grace_period_ms="
+                   << options.grace_period.count()
+                   << ", timeout_ms=" << options.timeout.count();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
         return {};
+    }
+
+    // Graceful phase, before anything is torn down. The Client object owns the
+    // thread pool that drives the graceful-unmount timers and holds the memory
+    // registrations that keep remote reads working, so it has to stay alive for
+    // the whole wait, i.e. this must run before client_.reset() below.
+    if (options.grace_period > std::chrono::milliseconds::zero() && client_) {
+        client_->GracefulUnmountAll(options.grace_period.count());
+        // Waits for the entire pending set, so segments that a caller had
+        // already started unmounting with a grace period are covered as well.
+        // On expiry we simply continue: ~Client() releases whatever is left and
+        // the master still applies its own scheduler and client expiry.
+        const auto timeout =
+            options.timeout > std::chrono::milliseconds::zero()
+                ? options.timeout
+                : options.grace_period + kGracefulCloseConfirmationBudget;
+        client_->WaitForGracefulUnmountAll(std::chrono::steady_clock::now() +
+                                           timeout);
     }
 
     stop_ipc_server();
@@ -1686,6 +1747,11 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
 int RealClient::allocateAndMountSegment(
     size_t size, const std::string &protocol, const std::string &location,
     std::vector<std::string> &out_segment_ids, size_t *out_allocated_size) {
+    if (IsClosing()) {
+        LOG(WARNING) << "Rejecting allocateAndMountSegment: client is closing";
+        return -1;
+    }
+
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
@@ -2381,6 +2447,11 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
 tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     int fd, uint64_t dummy_base_addr, size_t shm_size, bool is_local_buffer,
     int32_t physical_device_id, const UUID &client_id) {
+    if (IsClosing()) {
+        LOG(WARNING) << "Rejecting map_shm: client is closing";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     std::stringstream addr_stream;
     addr_stream << "0x" << std::hex << dummy_base_addr;
 
@@ -2503,6 +2574,10 @@ tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
     uint64_t dummy_base_addr, size_t vmm_size, bool is_local_buffer,
     const std::string &shareable_handle_bytes, int32_t device_id,
     const UUID &client_id) {
+    if (IsClosing()) {
+        LOG(WARNING) << "Rejecting ascend_shm: client is closing";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 #ifdef USE_ASCEND_DIRECT
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -2584,6 +2659,10 @@ tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
     uint64_t dummy_base_addr, size_t mem_size, bool is_local_buffer,
     const std::string &ipc_key_bytes, int32_t device_id,
     const UUID &client_id) {
+    if (IsClosing()) {
+        LOG(WARNING) << "Rejecting ascend_ipc_shm: client is closing";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 #ifdef USE_ASCEND_DIRECT
     constexpr size_t kIPCKeyLen = 65;
     if (!client_) {

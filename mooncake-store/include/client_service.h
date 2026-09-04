@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
+#include "deadline_scheduler.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -36,6 +37,14 @@ class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
+
+// Client-side schedule used to confirm that the master released a gracefully
+// unmounting segment: a first check one interval after the announced grace
+// period, then up to kGracefulUnmountConfirmRetries further checks one interval
+// apart. Exposed so callers that need to bound a graceful wait can derive a
+// deadline from the same numbers instead of duplicating them.
+constexpr std::chrono::seconds kGracefulUnmountConfirmInterval{10};
+constexpr int kGracefulUnmountConfirmRetries = 3;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -383,6 +392,35 @@ class Client {
     tl::expected<void, ErrorCode> UnmountSegmentById(
         const UUID& segment_id, uint64_t grace_period_ms = 0,
         std::function<void(const UUID&)> cleanup_callback = {});
+
+    /**
+     * @brief Requests graceful unmount for all currently mounted segments.
+     *
+     * The master stops allocating on these segments but keeps the replicas
+     * readable, so remote reads keep working as long as this process stays
+     * alive and its memory registrations are held. This only initiates the
+     * operation; use WaitForGracefulUnmountAll() to await completion.
+     *
+     * @param grace_period_ms grace period announced to the master.
+     * @return number of segments for which graceful unmount was accepted.
+     *         Segments that failed stay mounted and are unmounted immediately
+     *         by ~Client() as the fallback path.
+     */
+    size_t GracefulUnmountAll(uint64_t grace_period_ms);
+
+    /**
+     * @brief Waits until every gracefully unmounting segment has been released.
+     *
+     * Event-driven: blocks on a condition variable that is notified whenever a
+     * segment is erased from the gracefully-unmounting set, so it returns as
+     * soon as the last one completes. The caller owns the timeout policy.
+     *
+     * @param deadline absolute deadline supplied by the caller.
+     * @return true if all segments were released, false on deadline expiry
+     *         (leftovers are handled by ~Client() and master-side expiry).
+     */
+    bool WaitForGracefulUnmountAll(
+        std::chrono::steady_clock::time_point deadline);
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -940,6 +978,10 @@ class Client {
     std::unordered_map<UUID, std::function<void(const UUID&)>,
                        boost::hash<UUID>>
         graceful_unmount_cleanup_callbacks_;
+    // Notified (under mounted_segments_mutex_) whenever a segment leaves
+    // gracefully_unmounting_segments_, so WaitForGracefulUnmountAll() can
+    // return as soon as the set drains instead of polling.
+    std::condition_variable gracefully_unmounting_done_cv_;
 
     /**
      * @brief Internal helper to unmount a segment by iterator.
@@ -948,13 +990,26 @@ class Client {
     tl::expected<void, ErrorCode> UnmountSegmentImpl(
         std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
 
+    // One pending confirmation. The scheduler owns the deadline, so this only
+    // carries the retry budget.
+    struct GracefulUnmountCheck {
+        UUID segment_id;
+        int retry_left;
+    };
+
+    // Schedules the first confirmation check for a gracefully unmounting
+    // segment. Deliberately does not occupy one task_thread_pool_ worker per
+    // segment: that pool has a small, fixed worker count, and a blocking timer
+    // per segment would serialize the deadlines of a bulk unmount and make the
+    // caller's timeout budget unpredictable.
     void StartGracefulUnmountTimer(const UUID& segment_id,
                                    uint64_t grace_period_ms);
-    void OnGracefulUnmountTimer(const UUID& segment_id, int retry_left);
-    bool WaitForGracefulUnmountDelay(std::chrono::milliseconds delay);
-    std::mutex graceful_unmount_timer_mutex_;
-    std::condition_variable graceful_unmount_timer_cv_;
-    bool graceful_unmount_timer_stopping_{false};
+
+    // Confirmation callback driven by graceful_unmount_scheduler_. Asks the
+    // master whether the segment is gone; on success unregisters its MR and
+    // completes the local bookkeeping, otherwise reschedules itself while
+    // retries remain.
+    void OnGracefulUnmountTimer(const GracefulUnmountCheck& check);
 
     // Configuration
     const std::string local_hostname_;
@@ -962,6 +1017,13 @@ class Client {
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
+
+    // Single timer thread with a deadline heap, so every segment's confirmation
+    // schedule progresses concurrently regardless of how many are unmounting.
+    // Callbacks run with the scheduler mutex released, so they may take
+    // mounted_segments_mutex_. Declared after the members its callback reads so
+    // that ~Client() can Stop() it before they are destroyed.
+    DeadlineScheduler<GracefulUnmountCheck> graceful_unmount_scheduler_;
 
     // Client persistent thread pool for async operations
     // Pinned host memory pool for GPU D2H staging (must outlive

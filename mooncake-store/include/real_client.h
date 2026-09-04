@@ -43,6 +43,15 @@ class ResourceTracker {
     // Get the singleton instance
     static ResourceTracker &getInstance();
 
+    // Opt out of the built-in sigwait consumer for SIGINT/SIGTERM/SIGHUP.
+    //
+    // Must be called before the first getInstance(). Processes that install
+    // their own handlers for these signals have to call this: POSIX leaves the
+    // behaviour unspecified when the same signal is consumed by a sigaction
+    // handler and by sigwait at the same time, so exactly one owner may exist.
+    // The atexit fallback is unaffected.
+    static void DisableSignalHandling();
+
     // Register a DistributedObjectStore instance for cleanup
     void registerInstance(const std::shared_ptr<PyClient> &instance);
 
@@ -345,6 +354,21 @@ class RealClient : public PyClient {
                                  bool force = false);
 
     int tearDownAll();
+
+    /**
+     * @brief Shuts the client down, running the whole transition exactly once.
+     *
+     * This is the single shutdown implementation shared by every frontend: it
+     * atomically enters the closing state, initiates graceful unmount for the
+     * mounted segments when a grace period is requested, waits for all pending
+     * unmounts (including any started earlier through UnmountSegmentById),
+     * falls back to the regular teardown on timeout, and then tears everything
+     * down.
+     *
+     * A default-constructed CloseOptions shuts down immediately, which is what
+     * destructors and the C API want; tearDownAll() is exactly that case.
+     */
+    tl::expected<void, ErrorCode> Close(const CloseOptions &options);
 
     int health_check() override;
 
@@ -1034,8 +1058,20 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::string> &keys, const UUID &client_id) const;
 
-    // Ensure cleanup executes at most once across multiple entry points
+    // Ensure cleanup executes at most once across multiple entry points, and
+    // marks the client as closing so that operations which would create new
+    // resources are rejected instead of racing the teardown.
     std::atomic<bool> closed_{false};
+
+    // True once Close()/tearDownAll() has entered the shutdown transition.
+    // Segment-creating entry points check this: a segment mounted after
+    // GracefulUnmountAll() took its snapshot would never be unmounted
+    // gracefully, and any resource created here can outlive client_.reset().
+    //
+    // Still needed even when a frontend stops its RPC server first: the IPC
+    // channel is only torn down by stop_ipc_server(), which runs after the
+    // graceful wait, so it stays reachable for the whole grace period.
+    bool IsClosing() const { return closed_.load(std::memory_order_acquire); }
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
