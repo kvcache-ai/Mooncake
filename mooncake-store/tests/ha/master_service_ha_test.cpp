@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -329,6 +330,13 @@ class MasterServiceHATest : public ::testing::Test {
 
     static bool HasBatchOpLogStorage(const MasterService& service) {
         return service.batch_oplog_storage_ != nullptr;
+    }
+
+    static std::optional<OrderedOpLogWriterTerminalState>
+    GetWriterTerminalStateForTesting(const MasterService& service) {
+        return service.ordered_oplog_writer_
+                   ? service.ordered_oplog_writer_->GetTerminalState()
+                   : std::nullopt;
     }
 
     Segment MakeSegment(std::string name = "test_segment",
@@ -991,6 +999,120 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.buffer_address_, address);
     EXPECT_EQ(restored.protocol_, "tcp");
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
+}
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_replica_id_segment";
+    PrepareSimpleSegment(service, endpoint);
+    auto object = MakeStandbyObject("standby_replica_id_key", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+    object.metadata.replicas.front().id = 41;
+    auto removed = MakeStandbyMemoryReplica(endpoint);
+    removed.id = 42;
+    removed.status = ReplicaStatus::REMOVED;
+    object.metadata.replicas.push_back(std::move(removed));
+
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_replica_id_key");
+    ASSERT_EQ(replicas.size(), 2);
+    EXPECT_EQ(replicas[0].id, 41);
+    EXPECT_EQ(replicas[1].id, 42);
+
+    const UUID client_id = generate_uuid();
+    const std::string new_key = "standby_replica_id_new_key";
+    PutObjectOnSegment(service, client_id, new_key, endpoint);
+    auto new_replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, new_key);
+    ASSERT_EQ(new_replicas.size(), 1);
+    EXPECT_GE(new_replicas.front().id, 43);
+}
+
+TEST_F(MasterServiceHATest, RestoreRejectsInvalidReplicaIds) {
+    const std::string endpoint = "standby_invalid_replica_id_segment";
+    for (const ReplicaID id :
+         {ReplicaID{0}, std::numeric_limits<ReplicaID>::max()}) {
+        MasterService service(
+            MasterServiceConfig::builder().set_enable_ha(false).build());
+        auto object = MakeStandbyObject("standby_invalid_replica_id", endpoint);
+        object.metadata.replicas.front().id = id;
+
+        auto result = service.RestoreFromStandbySnapshot(
+            {object}, 7, {MakeStandbyMemorySegment(endpoint)});
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto object = MakeStandbyObject("standby_duplicate_replica_id", endpoint);
+    auto duplicate = MakeStandbyMemoryReplica(endpoint);
+    duplicate.id = object.metadata.replicas.front().id;
+    duplicate.status = ReplicaStatus::REMOVED;
+    object.metadata.replicas.push_back(std::move(duplicate));
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {object}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+
+    auto first = MakeStandbyObject("standby_cross_object_id_first", endpoint);
+    auto second = MakeStandbyObject("standby_cross_object_id_second", endpoint);
+    first.metadata.replicas.front().id = 73;
+    second.metadata.replicas.front().id = 73;
+    second.metadata.replicas.front().status = ReplicaStatus::REMOVED;
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({first, second}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+}
+
+TEST_F(MasterServiceHATest, FailedRestoreDoesNotAdvanceReplicaIdCounter) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    PrepareSimpleSegment(service, "replica_id_counter");
+    const UUID first_client = generate_uuid();
+    const std::string first_key = "replica_id_counter_first";
+    PutObjectOnSegment(service, first_client, first_key, "replica_id_counter");
+    const auto first =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, first_key);
+    ASSERT_EQ(first.size(), 1);
+
+    auto valid =
+        MakeStandbyObject("replica_id_counter_valid", "replica_id_counter");
+    valid.metadata.replicas.front().id = first.front().id + 1000;
+    valid.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+    auto invalid = MakeStandbyObject("replica_id_counter_invalid",
+                                     "unknown_replica_id_endpoint");
+    invalid.metadata.replicas.front().id = first.front().id + 2000;
+    auto result = service.RestoreFromStandbySnapshot(
+        {valid, invalid}, 7, {MakeStandbyMemorySegment("replica_id_counter")});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "replica_id_counter_valid"),
+              0);
+
+    const UUID second_client = generate_uuid();
+    const std::string second_key = "replica_id_counter_second";
+    PutObjectOnSegment(service, second_client, second_key,
+                       "replica_id_counter");
+    const auto second =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, second_key);
+    ASSERT_EQ(second.size(), 1);
+    EXPECT_EQ(second.front().id, first.front().id + 1);
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesHardPinned) {
@@ -1901,6 +2023,74 @@ TEST_F(MasterServiceHATest, OplogExplicitEnableCreatesWriter) {
     EXPECT_TRUE(IsOpLogEnabled(service));
     EXPECT_TRUE(HasOpLogWriter(service));
     EXPECT_TRUE(HasBatchOpLogStorage(service));
+    std::string producer_view;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+              backend->Get(BuildProducerViewKey("oplog_explicit_enable"),
+                           producer_view));
+}
+
+TEST_F(MasterServiceHATest, FencedWriterClaimsConfiguredProducerView) {
+    constexpr ViewVersionId kProducerView = 7;
+    const std::string cluster_id = "fenced_writer_claim";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_view_version(kProducerView)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+
+    MasterService service(config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    std::string producer_view;
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Get(BuildProducerViewKey(cluster_id), producer_view));
+    EXPECT_EQ(std::to_string(kProducerView), producer_view);
+
+    ASSERT_TRUE(AppendVisibleForTesting(service, OpType::PUT_END, "default",
+                                        "fenced_writer_key", {})
+                    .has_value());
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildProducerViewKey(cluster_id), "8"));
+    ASSERT_TRUE(AppendVisibleForTesting(service, OpType::PUT_END, "default",
+                                        "stale_writer_key", {})
+                    .has_value());
+    std::optional<OrderedOpLogWriterTerminalState> terminal_state;
+    for (int i = 0; i < 100; ++i) {
+        terminal_state = GetWriterTerminalStateForTesting(service);
+        if (terminal_state.has_value()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(terminal_state.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, terminal_state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kFenced,
+              terminal_state->reason);
+}
+
+TEST_F(MasterServiceHATest, FencedWriterRejectsContendedProducerViewClaim) {
+    const std::string cluster_id = "fenced_writer_contention";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildProducerViewKey(cluster_id), "8"));
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_view_version(7)
+                      .set_cluster_id(cluster_id)
+                      .build();
+
+    MasterService service(config);
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
+              service.SetBatchOpLogBackendForTesting(backend));
+    EXPECT_FALSE(HasOpLogWriter(service));
 }
 
 TEST_F(MasterServiceHATest, OplogDoesNotStartWithUnsupportedHABackend) {

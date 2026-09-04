@@ -381,6 +381,7 @@ jobs:
           -DUSE_ETCD=ON \
           -DUSE_CUDA=ON \
           -DWITH_P2P_STORE=ON \
+          -DWITH_CONDUCTOR=ON \
           -DSTORE_USE_ETCD=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=ON \

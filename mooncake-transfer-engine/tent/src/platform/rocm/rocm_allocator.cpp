@@ -56,8 +56,19 @@ Status RocmPlatform::free(void* ptr, size_t size) {
 }
 
 Status RocmPlatform::copy(void* dst, void* src, size_t length) {
+    // hipMemcpyAsync routes the copy through its stream's device context, so
+    // the stream must live on the device owning the device-side buffer.
+    // Control-plane RPC worker threads sit on device 0 while a registered
+    // buffer may live on device R; taking the stream from the buffer's device
+    // routes the copy correctly without mutating the calling thread's current
+    // device. Host-only copies keep the current device.
+    int device_id = getPointerDeviceId(dst);
+    if (device_id == HIPStreamPool::kCurrentDevice) {
+        device_id = getPointerDeviceId(src);
+    }
+
     HIPStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream));
+    CHECK_STATUS(getStreamFromPool(stream, device_id));
     CHECK_HIP(hipMemcpyAsync(dst, src, length, hipMemcpyDefault, stream.get()));
     CHECK_HIP(hipStreamSynchronize(stream.get()));
     return Status::OK();

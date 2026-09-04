@@ -121,6 +121,9 @@ class RocmPlatform : public Platform {
                              int deviceId = HIPStreamPool::kCurrentDevice);
 
    private:
+    // Device owning `addr`, or kCurrentDevice when `addr` is not device memory.
+    int getPointerDeviceId(void* addr);
+
     std::shared_ptr<Config> conf;
     HIPStreamPool stream_pool_;
 };

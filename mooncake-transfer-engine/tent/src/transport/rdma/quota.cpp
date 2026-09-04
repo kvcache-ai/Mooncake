@@ -96,9 +96,14 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                                 uint64_t slice_bytes,
                                 const std::string& location,
                                 std::vector<int>& slice_dev_ids, int priority,
-                                uint64_t device_mask) {
+                                uint64_t device_mask,
+                                std::vector<uint64_t>* slice_charged_bytes) {
     slice_dev_ids.clear();
     slice_dev_ids.reserve(num_slices);
+    if (slice_charged_bytes) {
+        slice_charged_bytes->clear();
+        slice_charged_bytes->reserve(num_slices);
+    }
     auto entry = local_topology_->getMemEntry(location);
     if (!entry) return Status::InvalidArgument("Unknown location" LOC_MARK);
 
@@ -129,6 +134,7 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
             for (int dev_id : entry->device_list[rank]) {
                 if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
+                if (!isNumaEligible(entry, dev_id)) continue;
                 tl_eligible.push_back(dev_id);
             }
             if (tl_eligible.empty()) continue;
@@ -144,10 +150,12 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                 offset += this_slice_bytes;
                 devices_[dev_id].total_bytes.fetch_add(
                     this_slice_bytes, std::memory_order_relaxed);
+                // Baseline mode does not track inflight, so nothing is charged.
+                if (slice_charged_bytes) slice_charged_bytes->push_back(0);
             }
             return Status::OK();
         }
-        return Status::DeviceNotFound("no eligible devices");
+        return Status::DeviceNotFound(noEligibleDeviceReason());
     }
 
     std::vector<DeviceSelector::Candidate> tl_candidates;
@@ -155,17 +163,50 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                                     tl_candidates, priority);
     if (!status.ok()) return status;
     if (num_slices == 1) {
-        selectSinglePath(tl_candidates, num_slices, total_length,
-                         slice_dev_ids);
+        selectSinglePath(tl_candidates, num_slices, total_length, slice_dev_ids,
+                         slice_charged_bytes);
     } else {
         // Probe mode: every 100th call uses round-robin distribution
         // to ensure all devices are sampled for EWMA updates
         thread_local uint64_t tl_call_count = 0;
         bool probe_mode = ((++tl_call_count % 100) == 0);
         selectMultiPath(tl_candidates, num_slices, total_length, slice_dev_ids,
-                        probe_mode);
+                        probe_mode, slice_charged_bytes);
     }
     return Status::OK();
+}
+
+void DeviceSelector::auditStrictLocalNuma() const {
+    if (!sched_params_.strict_local_numa || !local_topology_) return;
+
+    size_t excludable = 0;
+    for (const auto& mem : local_topology_->mem_list_) {
+        bool has_nic = false, has_local_nic = false;
+        for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+            for (int dev_id : mem.device_list[rank]) {
+                if (devices_.find(dev_id) == devices_.end()) continue;
+                has_nic = true;
+                if (local_topology_->isCrossNuma(mem, dev_id))
+                    excludable++;
+                else
+                    has_local_nic = true;
+            }
+        }
+        if (has_nic && !has_local_nic) {
+            LOG(WARNING) << "strict_local_numa: location " << mem.name
+                         << " (NUMA " << mem.numa_node
+                         << ") has no same-NUMA RDMA NIC; transfers from it "
+                            "will fail with DeviceNotFound";
+        }
+    }
+
+    if (excludable == 0) {
+        LOG(WARNING) << "strict_local_numa is enabled but no NIC can be "
+                        "classified as cross-NUMA on this host (custom "
+                        "priority matrix, VM, or sysfs without NUMA info), so "
+                        "the flag has no effect and cross-NUMA NICs keep the "
+                        "numa_penalties soft penalty";
+    }
 }
 
 int DeviceSelector::getDeviceRank(const std::string& location,
@@ -211,6 +252,7 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         for (int dev_id : entry->device_list[rank]) {
             if (!usable(dev_id)) continue;
             if ((device_mask & (1ULL << dev_id)) == 0) continue;
+            if (!isNumaEligible(entry, dev_id)) continue;
             // QoS: Get device's current priority slot (local, per-process)
             // Device accepts request if dev_priority >= request_priority
             int dev_priority = PRIO_LOW;  // Default: accept all
@@ -222,20 +264,20 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         }
     }
 
-    // If no devices after priority filtering, fall back to every usable
-    // device. Availability is not a QoS filter and is never relaxed here.
+    // Retry without QoS filtering; availability and NUMA exclusion stay.
     if (candidates.empty()) {
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             for (int dev_id : entry->device_list[rank]) {
                 if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
+                if (!isNumaEligible(entry, dev_id)) continue;
                 add_candidate(dev_id, rank);
             }
         }
     }
 
     if (candidates.empty()) {
-        return Status::DeviceNotFound("no eligible devices");
+        return Status::DeviceNotFound(noEligibleDeviceReason());
     }
 
     std::sort(
@@ -248,10 +290,10 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
     return Status::OK();
 }
 
-void DeviceSelector::selectSinglePath(const std::vector<Candidate>& candidates,
-                                      uint32_t num_slices,
-                                      uint64_t total_length,
-                                      std::vector<int>& slice_dev_ids) {
+void DeviceSelector::selectSinglePath(
+    const std::vector<Candidate>& candidates, uint32_t num_slices,
+    uint64_t total_length, std::vector<int>& slice_dev_ids,
+    std::vector<uint64_t>* slice_charged_bytes) {
     if (candidates.empty()) return;
 
     const Candidate& best = candidates[0];
@@ -261,23 +303,30 @@ void DeviceSelector::selectSinglePath(const std::vector<Candidate>& candidates,
     dev.addInflight(total_length);
     dev.total_bytes.fetch_add(total_length, std::memory_order_relaxed);
 
+    // Single path is only used for num_slices == 1, so the whole request's
+    // inflight charge belongs to that one slice.
     for (uint32_t i = 0; i < num_slices; ++i) {
         slice_dev_ids.push_back(dev_id);
+        if (slice_charged_bytes) slice_charged_bytes->push_back(total_length);
     }
 }
 
-void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
-                                     uint32_t num_slices, uint64_t total_length,
-                                     std::vector<int>& slice_dev_ids,
-                                     bool probe_mode) {
+void DeviceSelector::selectMultiPath(
+    const std::vector<Candidate>& candidates, uint32_t num_slices,
+    uint64_t total_length, std::vector<int>& slice_dev_ids, bool probe_mode,
+    std::vector<uint64_t>* slice_charged_bytes) {
     if (candidates.empty()) return;
     uint64_t slice_bytes = (total_length + num_slices - 1) / num_slices;
+    // Each slice is charged `slice_bytes` of inflight, so record that per slice
+    // for a precise release later.
     if (probe_mode) {
         // Probe mode: round-robin distribution to ensure all devices are
         // sampled Activates every 100th call to prevent EWMA starvation
         for (uint32_t i = 0; i < num_slices; ++i) {
             const Candidate& c = candidates[i % candidates.size()];
             slice_dev_ids.push_back(c.dev_id);
+            if (slice_charged_bytes)
+                slice_charged_bytes->push_back(slice_bytes);
             devices_[c.dev_id].addInflight(slice_bytes);
             devices_[c.dev_id].total_bytes.fetch_add(slice_bytes,
                                                      std::memory_order_relaxed);
@@ -311,6 +360,8 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
                 const Candidate& c = candidates[i];
                 for (uint32_t s = 0; s < assigned; ++s) {
                     slice_dev_ids.push_back(c.dev_id);
+                    if (slice_charged_bytes)
+                        slice_charged_bytes->push_back(slice_bytes);
                 }
                 uint64_t total_assigned_bytes =
                     static_cast<uint64_t>(slice_bytes) * assigned;
@@ -323,6 +374,8 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
             const Candidate& c = candidates[best_dev_idx];
             for (uint32_t s = 0; s < remaining_slices; ++s) {
                 slice_dev_ids.push_back(c.dev_id);
+                if (slice_charged_bytes)
+                    slice_charged_bytes->push_back(slice_bytes);
             }
             uint64_t total_assigned_bytes =
                 static_cast<uint64_t>(slice_bytes) * remaining_slices;
@@ -352,13 +405,29 @@ Status DeviceSelector::allocate(uint64_t length, const std::string& location,
     return Status::OK();
 }
 
+Status DeviceSelector::chargeDevice(int dev_id, uint64_t length) {
+    // Baseline mode does not track inflight, so a charge here would never be
+    // matched by a release -- skip it to keep the inflight counter consistent.
+    if (!smart_selection_enabled_) return Status::OK();
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end())
+        return Status::InvalidArgument("device not found");
+    // Only inflight is (re)charged here. total_bytes is cumulative traffic and
+    // is already counted once at allocation time; re-adding it on a fallback
+    // re-route or retry would double-count.
+    it->second.addInflight(length);
+    return Status::OK();
+}
+
 Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     auto it = devices_.find(dev_id);
     if (it == devices_.end())
         return Status::InvalidArgument("device not found");
 
     auto& dev = it->second;
-    dev.releaseInflight(length);
+    // Inflight is only ever charged in smart mode; releasing in baseline mode
+    // would drive the unsigned counter below zero.
+    if (smart_selection_enabled_) dev.releaseInflight(length);
 
     // Cancellation of an unposted slice must release its inflight charge but
     // has no latency sample from which to learn bandwidth.

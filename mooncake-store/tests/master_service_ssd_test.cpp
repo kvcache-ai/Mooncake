@@ -28,6 +28,19 @@ class MasterServiceSSDTest : public ::testing::Test {
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    // PushOffloadingQueue AND its ObjectIdentity parameter type are both
+    // private to MasterService; this fixture is a friend, but friendship is not
+    // inherited by the per-test subclass TEST_F generates. So both naming
+    // ObjectIdentity and calling PushOffloadingQueue must happen inside a
+    // member of this class, not in the TEST_F body. Take plain tenant/key args
+    // and build the private identity here. See issue #2997.
+    static tl::expected<void, ErrorCode> CallPushOffloadingQueue(
+        MasterService& service, const TenantId& tenant, const std::string& key,
+        Replica& replica) {
+        const MasterService::ObjectIdentity id{tenant, key};
+        return service.PushOffloadingQueue(id, replica);
+    }
 };
 
 std::unique_ptr<MasterService> CreateSsdAwareOffloadService() {
@@ -1181,6 +1194,61 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     ASSERT_TRUE(late_replicas.has_value());
     ASSERT_EQ(1u, late_replicas.value().replicas.size());
     EXPECT_TRUE(late_replicas.value().replicas[0].is_local_disk_replica());
+}
+
+// Regression test for issue #2997.
+//
+// PushOffloadingQueue has two no-op paths that used to return a silent success
+// ({}) without enqueuing anything:
+//
+//   1. get_segment_names() is empty   — the replica carries no source segment
+//      metadata (e.g. a DISK/LOCAL_DISK/DFS replica).
+//   2. every segment name is nullopt  — a MEMORY/NOF replica whose backing
+//      buffer is absent or has an invalid allocator, so get_segment_names()
+//      yields a single nullopt entry and the loop body is skipped for it.
+//
+// In both cases the caller's `if (result)` branch fired and executed
+// inc_refcnt() + offloading_tasks.emplace() for work that was never submitted,
+// leaking the source replica's refcount until the 600s TTL reaper cleared the
+// phantom task. The fix returns UNABLE_OFFLOADING from both paths.
+//
+// These two states cannot arise from the public PutStart/PutEnd path — that
+// path always produces a MEMORY replica with a valid buffer, whose
+// segment_names is a single real name, so PushOffloadingQueue reaches
+// EnqueueOffload and (pre-fix as well as post-fix) already returned
+// UNABLE_OFFLOADING via SEGMENT_NOT_FOUND. To actually guard the two lines this
+// PR changed, the test constructs the degenerate replicas directly and calls
+// PushOffloadingQueue through the test-friend seam, asserting the no-op is
+// reported as a failure rather than a silent success.
+TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
+    auto service = CreateSsdAwareOffloadService();
+    // ObjectIdentity is private to MasterService, so it is constructed inside
+    // the friend helper from these plain args rather than named here (see
+    // helper).
+    const TenantId tenant = TenantId::Default();
+    const std::string key = "noop_offload_key";
+
+    // Path 2: MEMORY replica with a null buffer -> get_segment_names() is
+    // [nullopt] -> the loop enqueues nothing -> the !any_enqueued guard fires.
+    Replica all_nullopt_replica(/*buffer=*/nullptr, ReplicaStatus::COMPLETE);
+    ASSERT_FALSE(all_nullopt_replica.get_segment_names().empty());
+    auto r2 =
+        CallPushOffloadingQueue(*service, tenant, key, all_nullopt_replica);
+    ASSERT_FALSE(r2.has_value())
+        << "all-nullopt segment names must not report a silent success "
+           "(issue #2997)";
+    EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r2.error());
+
+    // Path 1: a non-MEMORY/non-NOF replica -> get_segment_names() is empty ->
+    // the empty-source guard fires before the loop.
+    Replica empty_names_replica(/*file_path=*/"/tmp/nonexistent_offload_src",
+                                /*object_size=*/1024, ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(empty_names_replica.get_segment_names().empty());
+    auto r1 =
+        CallPushOffloadingQueue(*service, tenant, key, empty_names_replica);
+    ASSERT_FALSE(r1.has_value())
+        << "empty segment names must not report a silent success (issue #2997)";
+    EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r1.error());
 }
 
 }  // namespace mooncake::test

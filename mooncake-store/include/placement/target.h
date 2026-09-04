@@ -8,6 +8,14 @@
 
 namespace mooncake {
 
+enum class PlacementTargetKind {
+    NATIVE = 0,
+    CXL,
+};
+
+inline constexpr size_t kPlacementTargetKindCount =
+    static_cast<size_t>(PlacementTargetKind::CXL) + 1;
+
 // A stable allocation endpoint published to PlacementIndex. RegionResource
 // owns the target and must outlive every placement reference to it.
 class PlacementTarget {
@@ -15,6 +23,7 @@ class PlacementTarget {
     virtual ~PlacementTarget() = default;
 
     virtual std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const = 0;
+    virtual PlacementTargetKind Kind() const noexcept = 0;
 
     size_t Capacity() const { return allocator_->capacity(); }
     size_t Used() const { return allocator_->size(); }
