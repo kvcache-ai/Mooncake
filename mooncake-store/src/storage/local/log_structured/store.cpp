@@ -779,11 +779,14 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         for (const auto& source : sources) {
             if (bounded_sources.size() == options.max_source_segments) break;
             if (!bounded_sources.empty() &&
-                source.valid_bytes > options.max_input_bytes - selected_bytes) {
+                (selected_bytes >= options.max_input_bytes ||
+                 source.valid_bytes >
+                     options.max_input_bytes - selected_bytes)) {
                 break;
             }
-            if (source.live_bytes >
-                options.max_temporary_bytes - selected_live_bytes) {
+            if (selected_live_bytes > options.max_temporary_bytes ||
+                source.live_bytes >
+                    options.max_temporary_bytes - selected_live_bytes) {
                 continue;
             }
             bounded_sources.push_back(source);

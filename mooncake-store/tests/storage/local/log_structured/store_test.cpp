@@ -631,6 +631,40 @@ TEST(LogStructuredStoreTest,
     EXPECT_TRUE(std::filesystem::is_empty(temporary_path));
 }
 
+TEST(LogStructuredStoreTest,
+     CompactionInputBudgetAllowsOnlyOneOversizedSource) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 128));
+    ASSERT_TRUE(store.has_value());
+
+    for (int i = 0; i < 3; ++i) {
+        const auto old_identity = StoreIdentity("key-" + std::to_string(i), 1);
+        auto old_write =
+            (*store)->PreparePut(old_identity, std::string(96, 'a' + i));
+        ASSERT_TRUE(old_write.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(old_identity, old_write->sequence).has_value());
+
+        const auto new_identity = StoreIdentity("key-" + std::to_string(i), 2);
+        auto new_write =
+            (*store)->PreparePut(new_identity, std::string(96, 'd' + i));
+        ASSERT_TRUE(new_write.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(new_identity, new_write->sequence).has_value());
+    }
+    ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+
+    auto compacted = (*store)->CompactOnce({.max_source_segments = 3,
+                                            .max_input_bytes = 1,
+                                            .max_target_bytes = 1024,
+                                            .fanout = 2,
+                                            .max_levels = 2,
+                                            .min_reclaim_ratio = 0.0,
+                                            .stop_token = {}});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{1});
+}
+
 TEST(LogStructuredStoreTest, TieredCompactionMergesCleanSegments) {
     StoreTempDirectory temp;
     auto store = LogStructuredStore::Open(Config(temp, 256));
@@ -679,8 +713,7 @@ TEST(LogStructuredStoreTest, AppendFailurePreservesCommittedValueAfterRestart) {
 
         std::atomic<size_t> writes{0};
         SegmentWriter::SetWriteFailurePredicateForTest(
-            [&](std::string_view path, uint64_t, size_t) {
-                if (path.find("/tmp/") != std::string_view::npos) return false;
+            [&](std::string_view, uint64_t, size_t) {
                 return writes.fetch_add(1, std::memory_order_relaxed) == 1;
             });
         auto failed = (*store)->PreparePut(new_identity, "new-value");
@@ -715,10 +748,10 @@ TEST(LogStructuredStoreTest,
         (*store)->CommitPut(new_identity, new_write->sequence).has_value());
     ASSERT_TRUE((*store)->SealActiveSegment().has_value());
 
-    SegmentWriter::SetWriteFailurePredicateForTest(
-        [](std::string_view path, uint64_t, size_t) {
-            return path.find("/tmp/") != std::string_view::npos;
-        });
+    SegmentWriter::SetWriteFailurePredicateForTest([](std::string_view path,
+                                                      uint64_t, size_t) {
+        return std::filesystem::path(path).parent_path().filename() == "tmp";
+    });
     auto failed = (*store)->CompactOnce({.max_source_segments = 1,
                                          .max_input_bytes = 4096,
                                          .max_target_bytes = 4096,
@@ -792,13 +825,18 @@ TEST(LogStructuredStoreTest, RecoversAcrossCompactionPublicationCrashPoints) {
             EXPECT_EQ(interrupted.error(), StoreError::kIoError);
         }
 
-        auto recovered = LogStructuredStore::Open(Config(temp, 1024));
-        ASSERT_TRUE(recovered.has_value());
-        EXPECT_EQ((*recovered)->GetLatest("tenant-a", "key").value(),
-                  std::string(96, 'b'));
-        EXPECT_EQ((*recovered)->Get(old_identity).error(),
-                  StoreError::kNotFound);
-        EXPECT_TRUE(std::filesystem::is_empty(temp.path() / "tmp"));
+        for (int restart = 0; restart < 3; ++restart) {
+            auto recovered = LogStructuredStore::Open(Config(temp, 1024));
+            ASSERT_TRUE(recovered.has_value()) << "restart=" << restart;
+            EXPECT_EQ((*recovered)->GetLatest("tenant-a", "key").value(),
+                      std::string(96, 'b'))
+                << "restart=" << restart;
+            EXPECT_EQ((*recovered)->Get(old_identity).error(),
+                      StoreError::kNotFound)
+                << "restart=" << restart;
+            EXPECT_TRUE(std::filesystem::is_empty(temp.path() / "tmp"))
+                << "restart=" << restart;
+        }
     }
 }
 

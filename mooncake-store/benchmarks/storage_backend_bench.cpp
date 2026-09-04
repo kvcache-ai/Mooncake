@@ -875,6 +875,9 @@ void PrintBackendStorageStats(
     std::cout << "  Compaction bytes: " << stats->compaction_input_bytes
               << " input, " << stats->compaction_output_bytes << " output, "
               << stats->compaction_reclaimed_bytes << " reclaimed\n";
+    std::cout << "  Compaction C/C/E: " << stats->compaction_conflicts << "/"
+              << stats->compaction_cancellations << "/"
+              << stats->compaction_errors << "\n";
     std::cout << "  WAL/checkpoint:   " << stats->wal_sequence << "/"
               << stats->checkpoint_sequence << "\n";
 }

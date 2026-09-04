@@ -386,12 +386,11 @@ LogStructuredStorageBackend::RunCompaction(
     if (!result) {
         if (result.error() == logstructured::StoreError::kCancelled) {
             compaction_cancellations_.fetch_add(1, std::memory_order_relaxed);
+        } else if (result.error() ==
+                   logstructured::StoreError::kInvalidTransition) {
+            compaction_conflicts_.fetch_add(1, std::memory_order_relaxed);
         } else {
             compaction_errors_.fetch_add(1, std::memory_order_relaxed);
-            if (result.error() ==
-                logstructured::StoreError::kInvalidTransition) {
-                compaction_conflicts_.fetch_add(1, std::memory_order_relaxed);
-            }
         }
         return result;
     }
@@ -418,7 +417,9 @@ void LogStructuredStorageBackend::CompactionLoop(std::stop_token stop_token) {
         if (stop_token.stop_requested()) break;
         auto compacted = RunCompaction(MakeCompactionOptions(stop_token));
         if (!compacted &&
-            compacted.error() != logstructured::StoreError::kCancelled) {
+            compacted.error() != logstructured::StoreError::kCancelled &&
+            compacted.error() !=
+                logstructured::StoreError::kInvalidTransition) {
             LOG(ERROR) << "Log-structured compaction failed";
         }
     }
