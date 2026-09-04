@@ -3270,34 +3270,64 @@ RealClient::batch_get_buffer_internal(
     }
 
     // 3. Execute batch get for memory/disk replicas
-    if (!valid_ops.empty()) {
+    //
+    // Client::BatchGet routes each transfer's destination through a
+    // std::unordered_map keyed by object key (slices.find(key)). If the same
+    // key appears more than once in a single call, those entries collapse onto
+    // one destination: every occurrence transfers into the last op's buffer,
+    // while the other occurrences' separately-allocated buffers are never
+    // written yet still reported successful (their contents are uninitialized /
+    // recycled allocator memory). To keep each occurrence's own buffer filled,
+    // process the ops in rounds where each round contains at most one
+    // occurrence of any key. The common, duplicate-free case runs in a single
+    // round and behaves exactly as before.
+    std::vector<size_t> pending_ops;
+    pending_ops.reserve(valid_ops.size());
+    for (size_t i = 0; i < valid_ops.size(); ++i) {
+        pending_ops.push_back(i);
+    }
+
+    while (!pending_ops.empty()) {
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-        batch_keys.reserve(valid_ops.size());
-        batch_query_results.reserve(valid_ops.size());
+        std::vector<size_t> round_ops;      // valid_ops indices in this round
+        std::vector<size_t> deferred_ops;   // duplicate keys for a later round
+        batch_keys.reserve(pending_ops.size());
+        batch_query_results.reserve(pending_ops.size());
+        round_ops.reserve(pending_ops.size());
 
-        for (auto &op : valid_ops) {
-            batch_keys.push_back(op.key);
-            batch_query_results.push_back(op.query_result);
-            batch_slices[op.key] = op.slices;
+        for (size_t idx : pending_ops) {
+            auto &op = valid_ops[idx];
+            // batch_slices is keyed by key, so a key already claimed this round
+            // must wait for the next round to get its own destination.
+            if (batch_slices.find(op.key) == batch_slices.end()) {
+                batch_keys.push_back(op.key);
+                batch_query_results.push_back(op.query_result);
+                batch_slices[op.key] = op.slices;
+                round_ops.push_back(idx);
+            } else {
+                deferred_ops.push_back(idx);
+            }
         }
 
         auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
 
         // 4. Process results and create BufferHandles
-        for (size_t i = 0; i < valid_ops.size(); ++i) {
-            if (batch_get_results[i]) {
-                auto &op = valid_ops[i];
+        for (size_t j = 0; j < round_ops.size(); ++j) {
+            auto &op = valid_ops[round_ops[j]];
+            if (batch_get_results[j]) {
                 final_results[op.original_index] =
                     std::make_shared<BufferHandle>(
                         std::move(*op.buffer_handle));
             } else {
-                LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
-                           << "': " << toString(batch_get_results[i].error());
+                LOG(ERROR) << "BatchGet failed for key '" << op.key
+                           << "': " << toString(batch_get_results[j].error());
             }
         }
+
+        pending_ops.swap(deferred_ops);
     }
 
     // 5. Execute batch get for LOCAL_DISK replicas via SSD RPC
