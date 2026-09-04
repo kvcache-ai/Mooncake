@@ -96,6 +96,19 @@ class RdmaTransportTestPeer {
         workers.worker_context_[worker_id].inflight_slices.fetch_add(delta);
     }
 
+    static void setGpuToGpu(RdmaTransport& transport, bool enabled) {
+        transport.caps.gpu_to_gpu = enabled;
+    }
+
+    static void setFlushGpuDirectWrites(RdmaTransport& transport,
+                                        bool enabled) {
+        if (!transport.conf_) {
+            transport.conf_ = std::make_shared<Config>();
+        }
+        transport.conf_->set("transports/rdma/flush_gpu_direct_rdma_writes",
+                             enabled);
+    }
+
     using NotifyAction = RdmaTransport::NotifyCompletionAction;
 
     static NotifyAction classifyNotifyCompletion(ibv_wc_status status,
@@ -986,6 +999,71 @@ TEST(RdmaQuiesceTest, DrainTimeoutLeavesInflight) {
               std::chrono::milliseconds(500));
 
     ASSERT_TRUE(workers->stop().ok());
+}
+
+TEST(RdmaNotifyFlushTest, ReceiveNotificationEmptyUninstalledIsOk) {
+    RdmaTransport transport;
+    std::vector<Notification> list;
+    EXPECT_TRUE(transport.receiveNotification(list).ok());
+    EXPECT_TRUE(list.empty());
+}
+
+TEST(RdmaNotifyFlushTest, ReceiveNotificationDrainsQueue) {
+    auto topology = std::make_shared<Topology>();
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    transport.addNotificationToQueue("peer", "done");
+
+    std::vector<Notification> list;
+    EXPECT_TRUE(transport.receiveNotification(list).ok());
+    ASSERT_EQ(list.size(), 1u);
+    EXPECT_EQ(list[0].name, "peer");
+    EXPECT_EQ(list[0].msg, "done");
+
+    list.clear();
+    EXPECT_TRUE(transport.receiveNotification(list).ok());
+    EXPECT_TRUE(list.empty());
+}
+
+TEST(RdmaNotifyFlushTest, DestFlushOnGpuToGpuNotifyIsOk) {
+    auto topology = std::make_shared<Topology>();
+    Topology::MemEntry memory;
+    memory.name = "cuda:0";
+    memory.type = Topology::MEM_CUDA;
+    memory.numa_node = 0;
+    topology->mem_list_.push_back(std::move(memory));
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    RdmaTransportTestPeer::setGpuToGpu(transport, true);
+    transport.addNotificationToQueue("peer", "done");
+
+    std::vector<Notification> list;
+    EXPECT_TRUE(transport.receiveNotification(list).ok());
+    ASSERT_EQ(list.size(), 1u);
+    EXPECT_EQ(list[0].name, "peer");
+}
+
+TEST(RdmaNotifyFlushTest, FlushDisabledStillDrainsQueue) {
+    auto topology = std::make_shared<Topology>();
+    Topology::MemEntry memory;
+    memory.name = "cuda:0";
+    memory.type = Topology::MEM_CUDA;
+    memory.numa_node = 0;
+    topology->mem_list_.push_back(std::move(memory));
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    RdmaTransportTestPeer::setGpuToGpu(transport, true);
+    RdmaTransportTestPeer::setFlushGpuDirectWrites(transport, false);
+    transport.addNotificationToQueue("peer", "done");
+
+    std::vector<Notification> list;
+    EXPECT_TRUE(transport.receiveNotification(list).ok());
+    ASSERT_EQ(list.size(), 1u);
+    list.clear();
+    EXPECT_TRUE(transport.receiveNotification(list).ok());
+    EXPECT_TRUE(list.empty());
 }
 
 }  // namespace

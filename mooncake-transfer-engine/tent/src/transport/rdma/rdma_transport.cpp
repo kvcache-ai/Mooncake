@@ -87,12 +87,14 @@ uint16_t getRdmaBindDefaultPort(const Config& config) {
     return 0;
 }
 
-// Dest-GPU visibility for GPUDirect writes is not implied by a successful
-// local CQ. Synchronize only CUDA devices named in this engine's topology so
-// teardown does not create primary contexts on unused GPUs.
-Status synchronizeDestCudaDevices(const Topology* topology) {
 #ifdef USE_CUDA
-    if (!topology) return Status::OK();
+// Walk only CUDA devices named in this engine's topology so dest visibility
+// work does not create primary contexts on unused GPUs. Restores the caller's
+// current device. `op` is a log tag (e.g. "quiesce", "gdr-flush").
+template <typename Fn>
+void forEachTopologyCudaDevice(const Topology* topology, const char* op,
+                               Fn&& on_device) {
+    if (!topology) return;
 
     const size_t mem_count = topology->getMemCount();
     bool any_cuda = false;
@@ -104,17 +106,17 @@ Status synchronizeDestCudaDevices(const Topology* topology) {
             break;
         }
     }
-    if (!any_cuda) return Status::OK();
+    if (!any_cuda) return;
 
     int device_count = 0;
     cudaError_t err = cudaGetDeviceCount(&device_count);
     if (err != cudaSuccess || device_count <= 0) {
         if (err != cudaSuccess) {
-            LOG(WARNING) << "RDMA quiesce cudaGetDeviceCount failed: "
+            LOG(WARNING) << "RDMA " << op << " cudaGetDeviceCount failed: "
                          << cudaGetErrorString(err);
             (void)cudaGetLastError();
         }
-        return Status::OK();
+        return;
     }
 
     int saved = 0;
@@ -130,26 +132,79 @@ Status synchronizeDestCudaDevices(const Topology* topology) {
         if (device < 0 || device >= device_count) continue;
         err = cudaSetDevice(device);
         if (err != cudaSuccess) {
-            LOG(WARNING) << "RDMA quiesce cudaSetDevice(" << device
+            LOG(WARNING) << "RDMA " << op << " cudaSetDevice(" << device
                          << ") failed: " << cudaGetErrorString(err);
             (void)cudaGetLastError();
             continue;
         }
-        err = cudaDeviceSynchronize();
+        on_device(device);
+    }
+    if (have_saved) {
+        err = cudaSetDevice(saved);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA " << op << " restore cudaSetDevice(" << saved
+                         << ") failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+    }
+}
+#endif
+
+// Dest-GPU visibility for GPUDirect writes is not implied by a successful
+// local CQ. Used at teardown after workers drain.
+Status synchronizeDestCudaDevices(const Topology* topology) {
+#ifdef USE_CUDA
+    forEachTopologyCudaDevice(topology, "quiesce", [](int device) {
+        const cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             LOG(WARNING) << "RDMA quiesce cudaDeviceSynchronize device "
                          << device << " failed: " << cudaGetErrorString(err);
             (void)cudaGetLastError();
         }
-    }
-    if (have_saved) {
-        err = cudaSetDevice(saved);
+    });
+#else
+    (void)topology;
+#endif
+    return Status::OK();
+}
+
+// After a transfer-done notify, make GPUDirect RDMA writes visible to the dest
+// GPU owner before the caller consumes the buffer. Host-side flush, not a
+// full device synchronize. Empty topology / unsupported devices are no-ops.
+Status flushDestGpuDirectWrites(const Topology* topology) {
+#ifdef USE_CUDA
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11030
+    forEachTopologyCudaDevice(topology, "gdr-flush", [](int device) {
+        int options = 0;
+        cudaError_t err = cudaDeviceGetAttribute(
+            &options, cudaDevAttrGPUDirectRDMAFlushWritesOptions, device);
         if (err != cudaSuccess) {
-            LOG(WARNING) << "RDMA quiesce restore cudaSetDevice(" << saved
-                         << ") failed: " << cudaGetErrorString(err);
+            LOG(WARNING) << "RDMA gdr-flush cudaDeviceGetAttribute device "
+                         << device << " failed: " << cudaGetErrorString(err);
             (void)cudaGetLastError();
+            return;
         }
-    }
+        if ((options & cudaFlushGPUDirectRDMAWritesOptionHost) == 0) {
+            LOG_FIRST_N(WARNING, 8)
+                << "RDMA gdr-flush host option unsupported on device "
+                << device;
+            return;
+        }
+        err = cudaDeviceFlushGPUDirectRDMAWrites(
+            cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+            cudaFlushGPUDirectRDMAWritesToOwner);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA gdr-flush device " << device
+                         << " failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            return;
+        }
+        LOG_FIRST_N(INFO, 1)
+            << "RDMA dest GPUDirect write flush enabled on device " << device;
+    });
+#else
+    (void)topology;
+#endif
 #else
     (void)topology;
 #endif
@@ -906,12 +961,26 @@ Status RdmaTransport::sendNotification(SegmentID target_id,
 
 Status RdmaTransport::receiveNotification(
     std::vector<Notification>& notify_list) {
-    std::lock_guard<std::mutex> lock(notify_mutex_);
-    if (notify_list_.empty()) {
-        return Status::OK();
+    {
+        std::lock_guard<std::mutex> lock(notify_mutex_);
+        if (notify_list_.empty()) {
+            return Status::OK();
+        }
+        notify_list = std::move(notify_list_);
+        notify_list_.clear();
     }
-    notify_list = std::move(notify_list_);
-    notify_list_.clear();
+    // Empty polls are the hot path. Flush only after a real transfer-done
+    // notify, and never while holding notify_mutex_ (this thread may enter
+    // CUDA; the notify worker is a different path).
+    bool flush = caps.gpu_to_gpu;
+    if (conf_) {
+        flush =
+            flush &&
+            conf_->get("transports/rdma/flush_gpu_direct_rdma_writes", true);
+    }
+    if (flush) {
+        (void)flushDestGpuDirectWrites(local_topology_.get());
+    }
     return Status::OK();
 }
 

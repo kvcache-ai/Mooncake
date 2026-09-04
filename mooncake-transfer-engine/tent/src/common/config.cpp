@@ -176,6 +176,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/workers/max_retry_count");
     setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
               "transports/rdma/disable_gpu_direct_rdma");
+    setBoolConfig(config, "MC_FLUSH_GPU_DIRECT_RDMA_WRITES",
+                  "transports/rdma/flush_gpu_direct_rdma_writes");
     setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
               "transports/rdma/log_slice_affinity");
     setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
