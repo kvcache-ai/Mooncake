@@ -21,8 +21,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <thread>
 
 #include "tent/transport/rdma/bw_arbitration.h"
 #include "tent/transport/rdma/endpoint_store.h"
@@ -61,6 +64,7 @@ Workers::Workers(RdmaTransport* transport)
     : transport_(transport),
       num_workers_(0),
       running_(false),
+      accepting_submits_(true),
       worker_context_(nullptr) {
     device_selector_ = std::make_unique<DeviceSelector>();
     device_selector_->loadTopology(transport_->local_topology_);
@@ -240,6 +244,7 @@ Workers::~Workers() {
 Status Workers::start() {
     const static uint64_t kDefaultMaxTimeoutNs = 10000000000ull;
     if (!running_) {
+        accepting_submits_.store(true, std::memory_order_release);
         running_ = true;
         monitor_ = std::thread([this] { monitorThread(); });
         num_workers_ = transport_->params_->workers.num_workers;
@@ -256,6 +261,7 @@ Status Workers::start() {
 
 Status Workers::stop() {
     if (!running_) return Status::OK();
+    accepting_submits_.store(false, std::memory_order_release);
     running_ = false;
     for (size_t id = 0; id < num_workers_; ++id) {
         auto& worker = worker_context_[id];
@@ -271,7 +277,45 @@ Status Workers::stop() {
     return Status::OK();
 }
 
+Status Workers::quiesce(uint64_t timeout_ns) {
+    accepting_submits_.store(false, std::memory_order_release);
+    if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
+        num_workers_ == 0) {
+        return Status::OK();
+    }
+
+    for (size_t id = 0; id < num_workers_; ++id) {
+        auto& worker = worker_context_[id];
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        if (worker.in_suspend) worker.cv.notify_all();
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
+    while (true) {
+        int64_t inflight = 0;
+        for (size_t id = 0; id < num_workers_; ++id) {
+            inflight += worker_context_[id].inflight_slices.load(
+                std::memory_order_acquire);
+        }
+        if (inflight == 0) return Status::OK();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::InternalError("RDMA quiesce timed out with " +
+                                         std::to_string(inflight) +
+                                         " inflight slices" LOC_MARK);
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+
 Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
+    if (!accepting_submits_.load(std::memory_order_acquire)) {
+        return Status::InternalError("RDMA transport is quiescing" LOC_MARK);
+    }
+    if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
+        num_workers_ == 0) {
+        return Status::InternalError("RDMA workers are not running" LOC_MARK);
+    }
     if (worker_id < 0 || worker_id >= (int)num_workers_) {
         // If caller didn't specify the worker, find the least loaded one
         long min_inflight = INT64_MAX;

@@ -20,6 +20,10 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
@@ -53,6 +57,8 @@ namespace tent {
 
 namespace {
 
+constexpr uint64_t kDefaultRdmaQuiesceTimeoutNs = 10000000000ull;
+
 uint16_t getRdmaBindDefaultPort(const Config& config) {
     constexpr const char* kKey = "rpc_server_port";
     if (!config.contains(kKey)) return 0;
@@ -79,6 +85,75 @@ uint16_t getRdmaBindDefaultPort(const Config& config) {
     }
 
     return 0;
+}
+
+// Dest-GPU visibility for GPUDirect writes is not implied by a successful
+// local CQ. Synchronize only CUDA devices named in this engine's topology so
+// teardown does not create primary contexts on unused GPUs.
+Status synchronizeDestCudaDevices(const Topology* topology) {
+#ifdef USE_CUDA
+    if (!topology) return Status::OK();
+
+    const size_t mem_count = topology->getMemCount();
+    bool any_cuda = false;
+    for (size_t i = 0; i < mem_count; ++i) {
+        const auto* mem =
+            topology->getMemEntry(static_cast<Topology::MemID>(i));
+        if (mem && mem->type == Topology::MEM_CUDA) {
+            any_cuda = true;
+            break;
+        }
+    }
+    if (!any_cuda) return Status::OK();
+
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count <= 0) {
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA quiesce cudaGetDeviceCount failed: "
+                         << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+        return Status::OK();
+    }
+
+    int saved = 0;
+    const bool have_saved = cudaGetDevice(&saved) == cudaSuccess;
+    if (!have_saved) (void)cudaGetLastError();
+
+    for (size_t i = 0; i < mem_count; ++i) {
+        const auto* mem =
+            topology->getMemEntry(static_cast<Topology::MemID>(i));
+        if (!mem || mem->type != Topology::MEM_CUDA) continue;
+        LocationParser parser(mem->name);
+        const int device = parser.index();
+        if (device < 0 || device >= device_count) continue;
+        err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA quiesce cudaSetDevice(" << device
+                         << ") failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            continue;
+        }
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA quiesce cudaDeviceSynchronize device "
+                         << device << " failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+    }
+    if (have_saved) {
+        err = cudaSetDevice(saved);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA quiesce restore cudaSetDevice(" << saved
+                         << ") failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+    }
+#else
+    (void)topology;
+#endif
+    return Status::OK();
 }
 
 }  // namespace
@@ -377,12 +452,36 @@ Status RdmaTransport::install(std::string& local_segment_name,
     return Status::OK();
 }
 
+Status RdmaTransport::quiesce() {
+    uint64_t timeout_ns = kDefaultRdmaQuiesceTimeoutNs;
+    if (conf_) {
+        timeout_ns = conf_->get("transports/rdma/max_timeout_ns", timeout_ns);
+    }
+    Status drain = Status::OK();
+    if (workers_) {
+        drain = workers_->quiesce(timeout_ns);
+        if (!drain.ok()) {
+            LOG(ERROR) << "RDMA workers quiesce failed: " << drain.ToString();
+        }
+    }
+    const Status sync = synchronizeDestCudaDevices(local_topology_.get());
+    if (!sync.ok()) {
+        LOG(WARNING) << "RDMA dest-GPU sync during quiesce failed: "
+                     << sync.ToString();
+    }
+    return drain;
+}
+
 Status RdmaTransport::uninstall() {
     // ControlService may still receive BootstrapRdma RPCs while uninstall is
     // running. Unregister and drain the callback before destroying workers,
     // contexts, and other state used by onSetupRdmaConnections(). Keep this
     // outside installed_ so partially-installed transports are covered too.
     if (metadata_) metadata_->setBootstrapRdmaCallback(nullptr);
+
+    // Drain CQ and dest-GPU visibility while MRs and QPs are still alive.
+    // Idempotent when deconstruct() already called quiesce().
+    (void)quiesce();
 
     if (installed_) {
         // Stop notification worker thread
