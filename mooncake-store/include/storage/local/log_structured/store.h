@@ -2,12 +2,15 @@
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 
 #include "storage/local/log_structured/index.h"
+#include "storage/local/log_structured/metadata.h"
 #include "storage/local/log_structured/segment.h"
+#include "storage/local/log_structured/storage_directory.h"
 #include "storage/local/log_structured/wal.h"
 #include "ylt/util/tl/expected.hpp"
 
@@ -17,6 +20,8 @@ enum class StoreError {
     kInvalidArgument,
     kIoError,
     kCorruptData,
+    kAlreadyMounted,
+    kUnrecognizedFormat,
     kNotFound,
     kInvalidTransition,
 };
@@ -46,6 +51,7 @@ class LogStructuredStore {
     tl::expected<void, StoreError> AbortPut(const RecordIdentity& identity,
                                             uint64_t sequence);
     tl::expected<void, StoreError> Delete(const RecordIdentity& identity);
+    tl::expected<void, StoreError> Checkpoint();
     tl::expected<std::string, StoreError> Get(
         const RecordIdentity& identity) const;
 
@@ -57,6 +63,13 @@ class LogStructuredStore {
     explicit LogStructuredStore(LogStructuredStoreConfig config);
 
     tl::expected<void, StoreError> Recover();
+    tl::expected<void, StoreError> RecoverSegments(
+        const std::vector<SegmentMetadata>& expected_segments,
+        uint64_t active_segment_id);
+    tl::expected<void, StoreError> ValidateIndexRecords(
+        const std::unordered_map<uint64_t, std::vector<ScannedRecord>>&
+            scanned_segments) const;
+    void RefreshSegmentLiveBytes();
     tl::expected<void, StoreError> RotateSegmentIfNeeded(
         uint64_t next_record_bytes);
     std::string SegmentPath(uint64_t segment_id) const;
@@ -65,12 +78,18 @@ class LogStructuredStore {
     std::string segments_path_;
     std::string wal_path_;
     mutable std::mutex mutex_;
+    std::unique_ptr<StorageDirectory> directory_;
     VersionIndex index_;
     std::unordered_map<uint64_t, std::string> segment_paths_;
+    std::map<uint64_t, SegmentMetadata> segments_;
     std::unique_ptr<SegmentWriter> active_segment_;
     std::unique_ptr<WalWriter> wal_;
     uint64_t next_sequence_{1};
     uint64_t next_segment_id_{1};
+    uint64_t manifest_generation_{0};
+    uint64_t wal_generation_{1};
+    uint64_t checkpoint_sequence_{0};
+    uint64_t applied_delete_watermark_{0};
 };
 
 }  // namespace mooncake::logstructured

@@ -226,6 +226,36 @@ std::vector<IndexSnapshotEntry> VersionIndex::Snapshot() const {
     return snapshot;
 }
 
+tl::expected<void, IndexError> VersionIndex::Restore(
+    const std::vector<IndexSnapshotEntry>& snapshot) {
+    std::unique_lock lock(mutex_);
+    std::unordered_map<RecordIdentity, VersionEntry, IdentityHash> versions;
+    std::unordered_map<LogicalKey, RecordIdentity, LogicalKeyHash> current;
+    for (const auto& item : snapshot) {
+        if (!versions.emplace(item.identity, item.version).second) {
+            return tl::unexpected(IndexError::kInvalidTransition);
+        }
+        if (item.version.state != VersionState::kCommitted) continue;
+        const auto logical_key = ToLogicalKey(item.identity);
+        auto current_it = current.find(logical_key);
+        if (current_it == current.end()) {
+            current.emplace(logical_key, item.identity);
+            continue;
+        }
+        const auto old = versions.find(current_it->second);
+        if (old == versions.end() ||
+            old->second.sequence == item.version.sequence) {
+            return tl::unexpected(IndexError::kInvalidTransition);
+        }
+        if (old->second.sequence < item.version.sequence) {
+            current_it->second = item.identity;
+        }
+    }
+    versions_ = std::move(versions);
+    current_ = std::move(current);
+    return {};
+}
+
 size_t VersionIndex::size() const {
     std::shared_lock lock(mutex_);
     return versions_.size();

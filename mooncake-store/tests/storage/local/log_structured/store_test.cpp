@@ -126,6 +126,68 @@ TEST(LogStructuredStoreTest, RotatesSegmentsWithoutChangingLookup) {
     EXPECT_EQ((*store)->Get(second).value(), std::string(128, 'b'));
 }
 
+TEST(LogStructuredStoreTest, CheckpointPublishesManifestAndRotatesWal) {
+    StoreTempDirectory temp;
+    const auto before_checkpoint = StoreIdentity("before", 1);
+    const auto after_checkpoint = StoreIdentity("after", 1);
+    {
+        auto store = LogStructuredStore::Open(Config(temp));
+        ASSERT_TRUE(store.has_value());
+        auto first = (*store)->PreparePut(before_checkpoint, "first");
+        ASSERT_TRUE(first.has_value());
+        ASSERT_TRUE((*store)
+                        ->CommitPut(before_checkpoint, first->sequence)
+                        .has_value());
+        ASSERT_TRUE((*store)->Checkpoint().has_value());
+        EXPECT_TRUE(std::filesystem::exists(temp.path() / "CURRENT"));
+        EXPECT_FALSE(
+            std::filesystem::exists(temp.path() / "WAL-00000000000000000001"));
+        EXPECT_TRUE(
+            std::filesystem::exists(temp.path() / "WAL-00000000000000000002"));
+
+        auto second = (*store)->PreparePut(after_checkpoint, "second");
+        ASSERT_TRUE(second.has_value());
+        ASSERT_TRUE((*store)
+                        ->CommitPut(after_checkpoint, second->sequence)
+                        .has_value());
+    }
+
+    auto recovered = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ((*recovered)->Get(before_checkpoint).value(), "first");
+    EXPECT_EQ((*recovered)->Get(after_checkpoint).value(), "second");
+}
+
+TEST(LogStructuredStoreTest, RecoversSegmentCreatedAfterCheckpoint) {
+    StoreTempDirectory temp;
+    const auto first_identity = StoreIdentity("first", 1);
+    const auto second_identity = StoreIdentity("second", 1);
+    {
+        auto store = LogStructuredStore::Open(Config(temp, 256));
+        ASSERT_TRUE(store.has_value());
+        auto first =
+            (*store)->PreparePut(first_identity, std::string(128, 'a'));
+        ASSERT_TRUE(first.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(first_identity, first->sequence).has_value());
+        ASSERT_TRUE((*store)->Checkpoint().has_value());
+
+        auto second =
+            (*store)->PreparePut(second_identity, std::string(128, 'b'));
+        ASSERT_TRUE(second.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(second_identity, second->sequence).has_value());
+        EXPECT_EQ((*store)->active_segment_id(), uint64_t{2});
+    }
+
+    auto recovered = LogStructuredStore::Open(Config(temp, 256));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ((*recovered)->active_segment_id(), uint64_t{2});
+    EXPECT_EQ((*recovered)->Get(first_identity).value(), std::string(128, 'a'));
+    EXPECT_EQ((*recovered)->Get(second_identity).value(),
+              std::string(128, 'b'));
+}
+
 TEST(LogStructuredStoreTest, RepairsTornWalAndSegmentTailsOnRestart) {
     StoreTempDirectory temp;
     const auto identity = StoreIdentity("key", 1);
@@ -145,7 +207,7 @@ TEST(LogStructuredStoreTest, RepairsTornWalAndSegmentTailsOnRestart) {
     {
         std::ofstream segment(segment_path, std::ios::binary | std::ios::app);
         segment << "torn-segment";
-        std::ofstream wal(temp.path() / "WAL-000001",
+        std::ofstream wal(temp.path() / "WAL-00000000000000000001",
                           std::ios::binary | std::ios::app);
         wal << "torn-wal";
     }

@@ -181,6 +181,19 @@ target_link_libraries(log_structured_wal_test
                       PRIVATE mooncake_log_structured_storage gtest gtest_main)
 add_test(NAME log_structured_wal_test COMMAND log_structured_wal_test)
 
+add_executable(log_structured_metadata_test
+               storage/local/log_structured/metadata_test.cpp)
+target_link_libraries(log_structured_metadata_test
+                      PRIVATE mooncake_log_structured_storage gtest gtest_main)
+add_test(NAME log_structured_metadata_test COMMAND log_structured_metadata_test)
+
+add_executable(log_structured_storage_directory_test
+               storage/local/log_structured/storage_directory_test.cpp)
+target_link_libraries(log_structured_storage_directory_test
+                      PRIVATE mooncake_log_structured_storage gtest gtest_main)
+add_test(NAME log_structured_storage_directory_test
+         COMMAND log_structured_storage_directory_test)
+
 add_executable(log_structured_store_test
                storage/local/log_structured/store_test.cpp)
 target_link_libraries(log_structured_store_test
@@ -192,6 +205,19 @@ add_executable(log_structured_wal_test
 target_link_libraries(log_structured_wal_test
                       PRIVATE mooncake_log_structured_storage gtest gtest_main)
 add_test(NAME log_structured_wal_test COMMAND log_structured_wal_test)
+
+add_executable(log_structured_metadata_test
+               storage/local/log_structured/metadata_test.cpp)
+target_link_libraries(log_structured_metadata_test
+                      PRIVATE mooncake_log_structured_storage gtest gtest_main)
+add_test(NAME log_structured_metadata_test COMMAND log_structured_metadata_test)
+
+add_executable(log_structured_storage_directory_test
+               storage/local/log_structured/storage_directory_test.cpp)
+target_link_libraries(log_structured_storage_directory_test
+                      PRIVATE mooncake_log_structured_storage gtest gtest_main)
+add_test(NAME log_structured_storage_directory_test
+         COMMAND log_structured_storage_directory_test)
 add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)

@@ -1,5 +1,5 @@
 add_library(mooncake_log_structured_storage STATIC record_format.cpp segment.cpp
-                                                     index.cpp wal.cpp store.cpp)
+                                                     index.cpp wal.cpp metadata.cpp storage_directory.cpp store.cpp)
 
 target_include_directories(
   mooncake_log_structured_storage
