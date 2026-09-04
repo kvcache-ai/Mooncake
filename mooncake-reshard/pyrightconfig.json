@@ -17,7 +17,8 @@
     "python/mooncake/reshard/kv_cache/binding.py",
     "python/mooncake/reshard/kv_cache/serde.py",
     "python/mooncake/reshard/kv_cache/planner.py",
-    "python/mooncake/reshard/kv_cache/plan_serde.py"
+    "python/mooncake/reshard/kv_cache/plan_serde.py",
+    "python/mooncake/reshard/weight/_planner"
   ],
   "extraPaths": ["python"],
   "pythonVersion": "3.10",

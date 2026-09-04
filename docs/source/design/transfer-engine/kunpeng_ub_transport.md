@@ -58,15 +58,6 @@ sudo apt-get install -y \
     libyaml-cpp-dev \
     pybind11-dev \
     python3-dev
-
-# Install yalantinglibs (required)
-cd /tmp
-git clone https://github.com/alibaba/yalantinglibs.git
-cd yalantinglibs
-mkdir build && cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local
-make -j$(nproc)
-sudo make install
 ```
 
 ## Building Mooncake with UB Support

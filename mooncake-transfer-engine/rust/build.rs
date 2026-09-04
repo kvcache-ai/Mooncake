@@ -55,6 +55,14 @@ fn has_library(search_dirs: &[PathBuf], name: &str) -> bool {
             })
 }
 
+fn has_static_library(search_dirs: &[PathBuf], name: &str) -> bool {
+    let file_name = format!("lib{name}.a");
+    search_dirs.iter().any(|dir| dir.join(&file_name).exists())
+        || ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/local/lib"]
+            .into_iter()
+            .any(|dir| Path::new(dir).join(&file_name).exists())
+}
+
 fn is_tent_archive(lib: &str) -> bool {
     lib == "tent"
         || lib.starts_with("tent_")
@@ -125,6 +133,18 @@ fn compiler_print_file_name(file_name: &str) -> Option<PathBuf> {
     None
 }
 
+fn emit_compiler_runtime_search(file_name: &str) -> bool {
+    let Some(path) = compiler_print_file_name(file_name) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    println!("cargo:rustc-link-search=native={}", parent.display());
+    true
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=MOONCAKE_TE_LIB_DIR");
@@ -156,6 +176,11 @@ fn main() {
             build_dir.join("mooncake-common/src"),
             build_dir.join("mooncake-common/etcd"),
             build_dir.join("mooncake-transfer-engine/tent/src"),
+            // libtent_metrics.so is a SHARED lib built under tent/src/metrics.
+            // collect_tent_archives skips it (only .a), and has_library's
+            // /usr/local/lib fallback only gates the -l emit, not the -L search
+            // path — so the linker still needs this directory explicitly.
+            build_dir.join("mooncake-transfer-engine/tent/src/metrics"),
             build_dir.join("src"),
             build_dir.join("src/common/base"),
         ] {
@@ -180,6 +205,7 @@ fn main() {
         manifest_dir.join("../../build/mooncake-common"),
         manifest_dir.join("../../build/mooncake-common/etcd"),
         manifest_dir.join("../../build/mooncake-transfer-engine/tent/src"),
+        manifest_dir.join("../../build/mooncake-transfer-engine/tent/src/metrics"),
         manifest_dir.join("../tent/build/src"),
     ] {
         push_dir(&mut search_dirs, dir);
@@ -248,6 +274,9 @@ fn main() {
         }
         if has_mooncake_common {
             println!("cargo:rustc-link-arg=-lmooncake_common");
+        }
+        if has_library(&search_dirs, "tent_metrics") {
+            println!("cargo:rustc-link-arg=-ltent_metrics");
         }
         println!("cargo:rustc-link-arg=-Wl,--end-group");
         println!("cargo:rustc-link-lib=dl");
@@ -327,6 +356,19 @@ fn main() {
     for name in ["hiredis", "mlx5"] {
         if has_library(&search_dirs, name) {
             println!("cargo:rustc-link-lib={name}");
+        }
+    }
+
+    // Coverage-instrumented C++ archives reference __gcov_* symbols. Cargo
+    // links the Rust test binary directly, so add GCC's static gcov runtime
+    // when it is available. Keep this last: libgcov.a must follow the
+    // instrumented archives on the link line. Non-coverage builds have no
+    // __gcov_* references, so the static archive contributes no objects.
+    if emit_compiler_runtime_search("libgcov.a") || has_static_library(&search_dirs, "gcov") {
+        if link_tent {
+            println!("cargo:rustc-link-arg=-lgcov");
+        } else {
+            println!("cargo:rustc-link-lib=gcov");
         }
     }
 

@@ -1880,6 +1880,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     // Start put operation
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    if (!start_result &&
+        start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
+        healDanglingLocalDiskReplica(key)) {
+        start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    }
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -1991,6 +1996,61 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     return {};
+}
+
+namespace {
+
+// Every COMPLETE replica in the list is a LOCAL_DISK replica owned by this
+// client, so nothing else can serve reads for the key.
+bool HasOnlyClientLocalDiskReplicas(
+    const std::vector<Replica::Descriptor>& replicas, const UUID& client_id) {
+    bool has_local_disk = false;
+    for (const auto& replica : replicas) {
+        if (replica.status != ReplicaStatus::COMPLETE) {
+            continue;
+        }
+        if (replica.is_local_disk_replica() &&
+            replica.get_local_disk_descriptor().client_id == client_id) {
+            has_local_disk = true;
+            continue;
+        }
+        // A completed replica owned elsewhere (memory, remote disk, DFS) can
+        // still serve reads, so there is nothing for this client to heal.
+        return false;
+    }
+    return has_local_disk;
+}
+
+}  // namespace
+
+bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
+    auto replicas = master_client_.GetReplicaList(key);
+    if (!replicas ||
+        !HasOnlyClientLocalDiskReplicas(replicas->replicas, client_id_) ||
+        !local_disk_probe_fn_) {
+        return false;
+    }
+    // RemoveAll wipes client SSD files while master keeps the metadata
+    // (issue #3709), leaving a completed entry whose backing file is gone.
+    // Reporting success for a Put on top of it would store nothing. Ask the
+    // installed probe (the offload file storage owned by RealClient) whether
+    // the file is still there. Only a proven-gone answer evicts; present or
+    // unknown (transport/config trouble) keeps the old idempotent path, so a
+    // healthy replica can never be evicted by mistake.
+    const std::optional<bool> file_gone = local_disk_probe_fn_(key);
+    if (file_gone != true) {
+        return false;
+    }
+    auto evicted =
+        master_client_.EvictDiskReplica(key, ReplicaType::LOCAL_DISK);
+    if (!evicted) {
+        LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for key="
+                     << key << ": " << toString(evicted.error());
+        return false;
+    }
+    LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key=" << key
+                 << " (backing file already gone)";
+    return true;
 }
 
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
@@ -2325,6 +2385,99 @@ void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
     }
 }
 
+void Client::healDanglingLocalDiskBatchStarts(
+    std::vector<PutOperation>& ops, const std::vector<size_t>& active_indices,
+    const std::vector<size_t>& already_exists,
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<uint64_t>>& slice_lengths,
+    const ReplicateConfig& config) {
+    if (already_exists.empty() || !local_disk_probe_fn_) {
+        return;
+    }
+    std::vector<std::string> candidate_keys;
+    candidate_keys.reserve(already_exists.size());
+    for (size_t i : already_exists) {
+        candidate_keys.emplace_back(keys[i]);
+    }
+    // One round trip for the whole subset: a healthy idempotent batch pays a
+    // single batched query and no evictions, and the per-key work left over
+    // is a local filesystem probe.
+    auto replica_lists = master_client_.BatchGetReplicaList(candidate_keys);
+    if (replica_lists.size() != candidate_keys.size()) {
+        return;
+    }
+    std::vector<std::string> evict_keys;
+    std::vector<size_t> evict_positions;
+    for (size_t j = 0; j < candidate_keys.size(); ++j) {
+        if (!replica_lists[j] || !HasOnlyClientLocalDiskReplicas(
+                                     replica_lists[j]->replicas, client_id_)) {
+            continue;
+        }
+        const std::optional<bool> file_gone =
+            local_disk_probe_fn_(candidate_keys[j]);
+        if (file_gone != true) {
+            continue;
+        }
+        evict_keys.emplace_back(candidate_keys[j]);
+        evict_positions.emplace_back(j);
+    }
+    if (evict_keys.empty()) {
+        return;
+    }
+    auto evicted = master_client_.BatchEvictDiskReplica(
+        evict_keys, ReplicaType::LOCAL_DISK);
+    if (evicted.size() != evict_keys.size()) {
+        return;
+    }
+    std::vector<std::string> retry_keys;
+    std::vector<std::vector<uint64_t>> retry_slices;
+    std::vector<size_t> retry_positions;
+    for (size_t j = 0; j < evict_keys.size(); ++j) {
+        if (!evicted[j]) {
+            LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for "
+                         << "key=" << evict_keys[j] << ": "
+                         << toString(evicted[j].error());
+            continue;
+        }
+        LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key="
+                     << evict_keys[j] << " (backing file already gone)";
+        retry_positions.emplace_back(evict_positions[j]);
+        retry_keys.emplace_back(keys[already_exists[evict_positions[j]]]);
+        retry_slices.emplace_back(
+            slice_lengths[already_exists[evict_positions[j]]]);
+    }
+    if (retry_keys.empty()) {
+        return;
+    }
+    auto retry_responses =
+        master_client_.BatchPutStart(retry_keys, retry_slices, config);
+    if (retry_responses.size() != retry_keys.size()) {
+        return;
+    }
+    for (size_t r = 0; r < retry_keys.size(); ++r) {
+        auto& op = ops[active_indices[already_exists[retry_positions[r]]]];
+        if (!retry_responses[r]) {
+            // OBJECT_ALREADY_EXISTS again means another writer won the race;
+            // the idempotent skip applies. Any other error is reported as is.
+            if (retry_responses[r].error() !=
+                ErrorCode::OBJECT_ALREADY_EXISTS) {
+                op.SetTerminalError(retry_responses[r].error(),
+                                    PutOperationState::MASTER_FAILED,
+                                    "Master failed to start put operation");
+            }
+            continue;
+        }
+        op.replicas = retry_responses[r].value();
+        op.RecordAllocatedReplicas();
+        if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+            op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
+                                PutOperationState::MASTER_FAILED,
+                                "Allocated replicas do not satisfy "
+                                "requested replica policy");
+        }
+    }
+}
+
 void Client::StartBatchPut(std::vector<PutOperation>& ops,
                            const ReplicateConfig& config) {
     std::vector<std::string> keys;
@@ -2379,10 +2532,19 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     }
 
     // Process individual responses with robust error handling
+    std::vector<size_t> already_exists;
     for (size_t i = 0; i < active_indices.size(); ++i) {
         auto& op = ops[active_indices[i]];
         op.InitializeRequestedReplicas(config);
         if (!start_responses[i]) {
+            if (start_responses[i].error() ==
+                ErrorCode::OBJECT_ALREADY_EXISTS) {
+                // Decided after the heal pass below: retried when the
+                // replica proves dangling, or the idempotent skip that
+                // CollectResults already grants.
+                already_exists.emplace_back(i);
+                continue;
+            }
             op.SetTerminalError(start_responses[i].error(),
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start put operation");
@@ -2400,6 +2562,17 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
             // until fully successful
             VLOG(1) << "Successfully started put for key " << op.key << " with "
                     << op.replicas.size() << " replicas";
+        }
+    }
+
+    healDanglingLocalDiskBatchStarts(ops, active_indices, already_exists, keys,
+                                     slice_lengths, config);
+    for (size_t i : already_exists) {
+        auto& op = ops[active_indices[i]];
+        if (!op.IsResolved() && op.replicas.empty()) {
+            op.SetTerminalError(ErrorCode::OBJECT_ALREADY_EXISTS,
+                                PutOperationState::MASTER_FAILED,
+                                "Master failed to start put operation");
         }
     }
 }
@@ -4975,60 +5148,6 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
     return replica_list[0];
 }
 
-size_t Client::GetLocalHotCacheSizeFromEnv() {
-    if (const char* ev_size = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE")) {
-        std::string ev_size_str(ev_size);
-        std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_CACHE_SIZE='" +
-                                ev_size_str + "', disable local hot cache";
-        // Check for negative values
-        if (!ev_size_str.empty() && ev_size_str[0] == '-') {
-            LOG(WARNING) << error_msg;
-            return 0;
-        }
-        try {
-            unsigned long long v = std::stoull(ev_size_str, nullptr, 10);
-            if (v > 0) {
-                return static_cast<size_t>(v);
-            } else {
-                LOG(WARNING) << error_msg;
-                return 0;
-            }
-        } catch (const std::exception&) {
-            LOG(WARNING) << error_msg;
-            return 0;
-        }
-    }
-    return 0;
-}
-
-size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
-    if (const char* ev_block_size =
-            std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE")) {
-        std::string ev_block_size_str(ev_block_size);
-        std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_BLOCK_SIZE='" +
-                                ev_block_size_str +
-                                "', using default block size";
-        // Check for negative values
-        if (!ev_block_size_str.empty() && ev_block_size_str[0] == '-') {
-            LOG(WARNING) << error_msg;
-            return default_value;
-        }
-        try {
-            unsigned long long v = std::stoull(ev_block_size_str, nullptr, 10);
-            if (v > 0) {
-                return static_cast<size_t>(v);
-            } else {
-                LOG(WARNING) << error_msg;
-                return default_value;
-            }
-        } catch (const std::exception&) {
-            LOG(WARNING) << error_msg;
-            return default_value;
-        }
-    }
-    return default_value;
-}
-
 ErrorCode Client::InitLocalHotCache() {
     hot_cache_handler_.reset();
     UnregisterLocalHotCacheMemory();
@@ -5039,38 +5158,22 @@ ErrorCode Client::InitLocalHotCache() {
         return ErrorCode::OK;
     }
 
-    // Defaults: hot cache is disabled unless MC_STORE_LOCAL_HOT_CACHE_SIZE is
-    // set to a positive value; when enabled, default block size is 16MB and
-    // thread_num is 2.
-    size_t block_size = 16 * 1024 * 1024;  // 16MB default block size
-    size_t thread_num = 2;
-
-    // Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment
-    size_t total_cache = GetLocalHotCacheSizeFromEnv();
-    if (total_cache == 0) {
-        // Environment variable not set or invalid, disable cache
+    const auto config = LocalHotCacheConfig::FromEnvironment();
+    if (config.total_size_bytes == 0) {
         return ErrorCode::OK;
     }
 
-    // Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment
-    block_size = GetLocalHotBlockSizeFromEnv(block_size);
-
-    // MC_STORE_LOCAL_HOT_CACHE_USE_SHM: "1" enables memfd-backed shm (default
-    // off). When enabled, hot cache is shareable with dummy clients via IPC.
-    bool use_shm = false;
-    if (const char* ev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM")) {
-        use_shm = (std::string(ev) == "1");
-    }
+    size_t thread_num = 2;
 
     // Enable hot cache
     {
-        hot_cache_ =
-            std::make_shared<LocalHotCache>(total_cache, block_size, use_shm);
+        hot_cache_ = std::make_shared<LocalHotCache>(
+            config.total_size_bytes, config.block_size_bytes, config.use_shm);
         // Check if cache initialization was successful
         if (hot_cache_->GetCacheSize() == 0) {
             LOG(ERROR)
                 << "Local hot cache creation failed: no blocks allocated. "
-                << "total_cache=" << total_cache;
+                << "total_cache=" << config.total_size_bytes;
             hot_cache_.reset();
             hot_cache_handler_.reset();
             admission_sketch_.reset();
@@ -5094,35 +5197,17 @@ ErrorCode Client::InitLocalHotCache() {
         }
         hot_cache_memory_registered_ = true;
 
-        LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache
-                  << ", block size=" << block_size
+        LOG(INFO) << "Local hot cache enabled with cache size="
+                  << config.total_size_bytes
+                  << ", block size=" << config.block_size_bytes
                   << ", block amount=" << hot_cache_->GetCacheSize()
-                  << ", shm=" << (use_shm ? "on" : "off")
+                  << ", shm=" << (config.use_shm ? "on" : "off")
                   << ", transfer engine registered=on";
         // Create async handler with 2 worker threads
         hot_cache_handler_ =
             std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
         admission_sketch_ = std::make_unique<CountMinSketch>();
-
-        // MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD: minimum CMS count before a
-        // key is admitted to hot cache (default 2).
-        if (const char* ev =
-                std::getenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD")) {
-            std::string ev_str(ev);
-            std::string error_msg =
-                "Invalid MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD='" + ev_str +
-                "', using default";
-            try {
-                unsigned long long v = std::stoull(ev_str, nullptr, 10);
-                if (v > 0 && v <= 255) {
-                    admission_threshold_ = static_cast<uint8_t>(v);
-                } else {
-                    LOG(WARNING) << error_msg;
-                }
-            } catch (const std::exception&) {
-                LOG(WARNING) << error_msg;
-            }
-        }
+        admission_threshold_ = config.admission_threshold;
     }
     return ErrorCode::OK;
 }

@@ -30,11 +30,6 @@
 namespace mooncake {
 namespace tent {
 
-// Bandwidth constants (Gbps)
-static constexpr double kDefaultBwGbps = 400.0;
-static constexpr double kMinBwGbps = 10.0;
-static constexpr double kMaxBwGbps = 800.0;
-
 class SharedSlotManager;
 
 /**
@@ -68,8 +63,17 @@ class DeviceSelector {
 
     struct DeviceInfo {
         int dev_id;
-        double bw_gbps;
+        // Negotiated link speed in Gbps. setDeviceBandwidth() may rewrite it
+        // after traffic has started while workers read it in release(), so
+        // it is atomic.
+        std::atomic<double> bw_gbps{0.0};
         int numa_id;
+        // False for a NIC that cannot carry traffic: context never
+        // constructed, or port down. Excluded from candidate construction
+        // and from every aggregate; the bandwidth fields are meaningless
+        // while false. Fits the alignment hole after numa_id, so the padding
+        // below still puts inflight_bytes on its own cache line.
+        std::atomic<bool> available{true};
         uint64_t padding0[5];
         std::atomic<uint64_t> inflight_bytes{0};
         uint64_t padding1[7];
@@ -93,12 +97,6 @@ class DeviceSelector {
         double getEwmaBandwidth() const {
             return ewma_bandwidth_bps.load(std::memory_order_relaxed);
         }
-
-        double getTheoreticalBandwidth() const {
-            if (bw_gbps >= kMinBwGbps && bw_gbps <= kMaxBwGbps)
-                return bw_gbps * 1e9 / 8.0;
-            return kDefaultBwGbps * 1e9 / 8.0;
-        }
     };
 
    public:
@@ -109,6 +107,22 @@ class DeviceSelector {
     DeviceSelector &operator=(const DeviceSelector &) = delete;
 
     Status loadTopology(std::shared_ptr<Topology> &local_topology);
+
+    // Record the link speed ibv_query_port reported for dev_id and re-seed
+    // its EWMA from it, replacing whatever was learned and re-deriving the
+    // clamp. A value outside [min, max]_bandwidth_gbps (including 0 =
+    // unknown) falls back to default_bandwidth_gbps. Call after
+    // setSchedulingParams; may be called again at runtime when the link
+    // renegotiates.
+    Status setDeviceBandwidth(int dev_id, double gbps);
+
+    // Mark dev_id able (or unable) to carry traffic. Unavailable devices are
+    // never selected and do not count toward the aggregate bandwidth. May be
+    // called from the monitor thread while workers allocate; readers see the
+    // flag on their next allocate/aggregate.
+    Status setDeviceAvailable(int dev_id, bool available);
+    // False for an unknown device.
+    bool isDeviceAvailable(int dev_id) const;
 
     std::shared_ptr<Topology> getTopology() const { return local_topology_; }
 
@@ -121,15 +135,34 @@ class DeviceSelector {
     // Allocate devices for a request (new API)
     // slice_bytes: pre-calculated slice size from rdma_transport to ensure
     // consistency
+    // slice_charged_bytes (optional): filled, in lockstep with slice_dev_ids,
+    // with the exact inflight bytes charged for each slice so the caller can
+    // release precisely what was added (0 entries in baseline mode, which does
+    // not track inflight).
     Status allocate(uint64_t total_length, uint32_t num_slices,
                     uint64_t slice_bytes, const std::string &location,
                     std::vector<int> &slice_dev_ids, int priority = PRIO_HIGH,
-                    uint64_t device_mask = ~0ULL);
+                    uint64_t device_mask = ~0ULL,
+                    std::vector<uint64_t> *slice_charged_bytes = nullptr);
 
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id);
 
+    // Allocate one device for the per-slice path. Small requests do not go
+    // through the aggregate allocator, but must still honor the request
+    // priority and transport policy's device mask. Keep the three-argument
+    // overload above for source and binary compatibility.
+    Status allocate(uint64_t length, const std::string &location,
+                    int &chosen_dev_id, int priority, uint64_t device_mask);
+
     Status release(int dev_id, uint64_t length, double latency);
+
+    // Charge inflight bytes against a specific device without running device
+    // selection. Used when the routing NIC changes after the original charge
+    // (fallback re-route) or when a retry has to re-enter the inflight view, so
+    // that the charged device stays symmetric with the device release()
+    // unwinds.
+    Status chargeDevice(int dev_id, uint64_t length);
 
     Status getNicLoadStats(std::vector<NicLoadStats> &stats) const;
 
@@ -161,6 +194,10 @@ class DeviceSelector {
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};
 
+        // Hard-exclude known cross-NUMA NICs; unknown NUMA keeps
+        // numa_tier_weights.
+        bool strict_local_numa = false;
+
         // EWMA bandwidth learning rate (0.0 = full adaptation, 1.0 = no
         // learning)
         double bandwidth_learning_rate = 0.01;
@@ -181,10 +218,11 @@ class DeviceSelector {
         double ewma_min_multiplier = 0.1;   // 10% of theoretical
         double ewma_max_multiplier = 10.0;  // 1000% of theoretical
 
-        // Default bandwidth (Gbps) when topology info unavailable
-        double default_bandwidth_gbps = 400.0;  // Default NIC bandwidth
-        double min_bandwidth_gbps = 10.0;       // Minimum valid NIC bandwidth
-        double max_bandwidth_gbps = 800.0;      // Maximum valid NIC bandwidth
+        // Bandwidth (Gbps) assumed for a device whose link speed is unknown
+        // or outside [min, max]
+        double default_bandwidth_gbps = 400.0;
+        double min_bandwidth_gbps = 10.0;   // Minimum valid NIC bandwidth
+        double max_bandwidth_gbps = 800.0;  // Maximum valid NIC bandwidth
 
         // Shared slot rotation interval (milliseconds)
         int slot_rotation_interval_ms = 2;
@@ -200,12 +238,39 @@ class DeviceSelector {
         return sched_params_;
     }
 
+    // Startup warning if the flag excludes every NIC or classifies none.
+    void auditStrictLocalNuma() const;
+
    private:
     std::shared_ptr<Topology> local_topology_;
     std::unordered_map<int, DeviceInfo> devices_;
     std::shared_ptr<SharedSlotManager> slot_manager_;
     bool smart_selection_enabled_ = true;
     SchedulingParams sched_params_;
+
+    // Bytes/s the device is rated for: bw_gbps when it is inside the
+    // configured [min, max], default_bandwidth_gbps otherwise.
+    double theoreticalBandwidth(const DeviceInfo &dev) const;
+
+    // Known to the selector and currently able to carry traffic.
+    bool usable(int dev_id) const {
+        auto it = devices_.find(dev_id);
+        return it != devices_.end() &&
+               it->second.available.load(std::memory_order_relaxed);
+    }
+
+    const char *noEligibleDeviceReason() const {
+        return sched_params_.strict_local_numa
+                   ? "no eligible devices (strict_local_numa excludes "
+                     "cross-NUMA NICs)"
+                   : "no eligible devices";
+    }
+
+    bool isNumaEligible(const Topology::MemEntry *entry, int dev_id) const {
+        if (!sched_params_.strict_local_numa) return true;
+        if (!entry || !local_topology_) return true;
+        return !local_topology_->isCrossNuma(*entry, dev_id);
+    }
 
     Status buildCandidates(const Topology::MemEntry *entry,
                            uint64_t slice_bytes, uint64_t device_mask,
@@ -214,12 +279,14 @@ class DeviceSelector {
 
     void selectSinglePath(const std::vector<Candidate> &candidates,
                           uint32_t num_slices, uint64_t total_length,
-                          std::vector<int> &slice_dev_ids);
+                          std::vector<int> &slice_dev_ids,
+                          std::vector<uint64_t> *slice_charged_bytes = nullptr);
 
     void selectMultiPath(const std::vector<Candidate> &candidates,
                          uint32_t num_slices, uint64_t total_length,
                          std::vector<int> &slice_dev_ids,
-                         bool probe_mode = false);
+                         bool probe_mode = false,
+                         std::vector<uint64_t> *slice_charged_bytes = nullptr);
 };
 
 }  // namespace tent

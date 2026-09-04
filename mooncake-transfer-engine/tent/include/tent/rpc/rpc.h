@@ -47,6 +47,8 @@ enum RpcFuncID {
     Unpin,
     SubscribeSegmentUpdate,
     NotifySegmentUpdated,
+    // Appended to preserve the numeric values of the existing RPCs.
+    BootstrapUb,
 };
 
 class ClientPool;
@@ -78,9 +80,10 @@ class CoroRpcAgent {
                             bool offload = false);
 
     // threads: number of io_context worker threads (default 1, the
-    // historical behavior). The TCP data-path handlers do full-payload
-    // blocking copies inline, so a single thread caps TCP throughput;
-    // sourced from the rpc_server_threads config key.
+    // historical RDMA-only behavior). TCP SendData/RecvData copies are
+    // offloaded off this pool, but attachments are still read here; when
+    // TCP is enabled the engine defaults rpc_server_threads higher so
+    // concurrent bulk transfers are not serialized on one io_context.
     Status start(uint16_t &port, bool ipv6 = false, size_t threads = 1);
 
     Status stop();

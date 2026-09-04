@@ -19,18 +19,22 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
-#include <sstream>
+#include <cstdint>
+#include <cstring>
 #include <iomanip>
-#include <queue>
 #include <mutex>
+#include <queue>
+#include <sstream>
+#include <string_view>
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
-#include "tent/transport/rdma/context.h"
-#include "tent/transport/rdma/endpoint_store.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/runtime/control_plane.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/rdma/context.h"
+#include "tent/transport/rdma/endpoint_store.h"
 
 namespace mooncake {
 namespace tent {
@@ -58,6 +62,18 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    uint16_t pkey_index,
                                    uint8_t service_level = 0,
                                    uint8_t traffic_class = 0);
+
+// A peer that reused the same nic path after restarting retires the stale
+// endpoint on the first bootstrap and expects a retry. Older peers also
+// returned success with an empty GID for that case.
+static bool isStaleEndpointBootstrapError(const Status& status) {
+    if (status.ok()) return false;
+    const std::string_view msg = status.message();
+    return msg.find("retired for reconnection") != std::string_view::npos ||
+           msg.find("Missing peer GID") != std::string_view::npos ||
+           msg.find("Endpoint not in handshaking state") !=
+               std::string_view::npos;
+}
 
 RdmaEndPoint::RdmaEndPoint()
     : status_(EP_UNINIT),
@@ -163,9 +179,18 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         return -1;
     }
 
-    // Pre-post recv buffers for notification
-    notify_recv_buffers_.resize(kNotifyMaxPendingSends);
-    notify_recv_mrs_.resize(kNotifyMaxPendingSends);
+    // Allocate one contiguous recv buffer, logically split into
+    // kNotifyMaxPendingSends slots. One MR covers every slot so high
+    // endpoint counts do not explode ibv_reg_mr.
+    notify_recv_buffer_.resize(kNotifyBufferSize * kNotifyMaxPendingSends);
+    notify_recv_mr_ = context_->verbs_.ibv_reg_mr_default(
+        context_->nativePD(), notify_recv_buffer_.data(),
+        notify_recv_buffer_.size(), IBV_ACCESS_LOCAL_WRITE);
+    if (!notify_recv_mr_) {
+        PLOG(ERROR) << "Failed to register notification recv buffer";
+        deconstruct();
+        return -1;
+    }
 
     // Allocate one contiguous send buffer, logically split into
     // kNotifyMaxPendingSends slots to avoid DMA-vs-overwrite races.
@@ -177,20 +202,6 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         PLOG(ERROR) << "Failed to register notification send buffer";
         deconstruct();
         return -1;
-    }
-
-    for (size_t i = 0; i < kNotifyMaxPendingSends; ++i) {
-        notify_recv_buffers_[i].resize(kNotifyBufferSize);
-
-        // Register memory for recv buffer
-        notify_recv_mrs_[i] = context_->verbs_.ibv_reg_mr_default(
-            context_->nativePD(), notify_recv_buffers_[i].data(),
-            kNotifyBufferSize, IBV_ACCESS_LOCAL_WRITE);
-        if (!notify_recv_mrs_[i]) {
-            PLOG(ERROR) << "Failed to register notification recv buffer";
-            deconstruct();
-            return -1;
-        }
     }
 
     return 0;
@@ -240,20 +251,15 @@ int RdmaEndPoint::deconstructUnlocked() {
         // A live QP may still reference the notification MRs. Keep both MRs
         // and backing buffers intact until QP destruction succeeds.
         if (!notify_qp_) {
-            for (auto& mr : notify_recv_mrs_) {
-                if (!mr) continue;
-                if (context_->verbs_.ibv_dereg_mr(mr)) {
+            if (notify_recv_mr_) {
+                if (context_->verbs_.ibv_dereg_mr(notify_recv_mr_)) {
                     PLOG(ERROR) << "Failed to deregister notification recv MR";
                     result = -1;
                 } else {
-                    mr = nullptr;
+                    notify_recv_mr_ = nullptr;
                 }
             }
-            if (std::all_of(notify_recv_mrs_.begin(), notify_recv_mrs_.end(),
-                            [](ibv_mr* mr) { return mr == nullptr; })) {
-                notify_recv_mrs_.clear();
-                notify_recv_buffers_.clear();
-            }
+            if (!notify_recv_mr_) notify_recv_buffer_.clear();
 
             if (notify_send_mr_) {
                 if (context_->verbs_.ibv_dereg_mr(notify_send_mr_)) {
@@ -292,8 +298,8 @@ int RdmaEndPoint::deconstructUnlocked() {
         wr_depth_list_ = nullptr;
     }
 
-    if (result == 0 && !notify_qp_ && notify_recv_mrs_.empty() &&
-        !notify_send_mr_ && qp_list_.empty()) {
+    if (result == 0 && !notify_qp_ && !notify_recv_mr_ && !notify_send_mr_ &&
+        qp_list_.empty()) {
         peer_server_name_.clear();
         peer_nic_name_.clear();
         status_.store(EP_DESTROYED, std::memory_order_release);
@@ -470,25 +476,53 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         }
         auto bootstrap_status =
             ControlClient::bootstrap(rpc_server_addr, local_desc, peer_desc);
+        auto simultaneousOpenReady = [&]() {
+            RWSpinlock::WriteGuard guard(lock_);
+            const bool same_peer = peer_server_name_ == peer_server_name &&
+                                   peer_nic_name_ == peer_nic_name;
+            const bool same_local_qps = qpNum() == local_desc.qp_num;
+            return status_.load(std::memory_order_relaxed) == EP_READY &&
+                   same_peer && same_local_qps;
+        };
         if (!bootstrap_status.ok()) {
             // With simultaneous open, the peer's bootstrap request may finish
             // our passive setup while this outbound RPC is still in flight.
             // A timeout therefore does not necessarily mean that connection
             // establishment failed. Reuse only the exact endpoint generation
             // that issued this RPC; EP_READY alone is not sufficient.
-            RWSpinlock::WriteGuard guard(lock_);
-            const bool same_peer = peer_server_name_ == peer_server_name &&
-                                   peer_nic_name_ == peer_nic_name;
-            const bool same_local_qps = qpNum() == local_desc.qp_num;
-            if (status_.load(std::memory_order_relaxed) == EP_READY &&
-                same_peer && same_local_qps) {
+            if (simultaneousOpenReady()) {
                 LOG(WARNING)
                     << "Bootstrap RPC failed after simultaneous-open passive "
                        "setup completed; reusing the established endpoint "
                     << endpoint_name_ << ": " << bootstrap_status.ToString();
                 return mooncake::tent::Status::OK();
             }
-            return bootstrap_status;
+            // Target retired a leftover endpoint from a previous peer process.
+            // The first RPC drops it; a second bootstrap creates a new one.
+            // Fixed targets also retry inside the same RPC, so this is the
+            // mixed-version / race fallback.
+            if (isStaleEndpointBootstrapError(bootstrap_status)) {
+                LOG(INFO)
+                    << "Retrying RDMA bootstrap after stale peer endpoint: "
+                    << bootstrap_status.ToString();
+                peer_desc = BootstrapDesc();
+                bootstrap_status = ControlClient::bootstrap(
+                    rpc_server_addr, local_desc, peer_desc);
+                if (!bootstrap_status.ok()) {
+                    if (simultaneousOpenReady()) {
+                        LOG(WARNING)
+                            << "Bootstrap retry failed after simultaneous-open "
+                               "passive setup completed; reusing the "
+                               "established endpoint "
+                            << endpoint_name_ << ": "
+                            << bootstrap_status.ToString();
+                        return mooncake::tent::Status::OK();
+                    }
+                    return bootstrap_status;
+                }
+            } else {
+                return bootstrap_status;
+            }
         }
         qp_num = peer_desc.qp_num;
         peer_gid = peer_desc.local_gid;
@@ -994,14 +1028,57 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     return 0;
 }
 
+char* RdmaEndPoint::notifySlotPtr(char* base, size_t idx) {
+    return base + idx * kNotifyBufferSize;
+}
+
+bool RdmaEndPoint::encodeNotifyPayload(char* slot, const std::string& name,
+                                       const std::string& msg,
+                                       uint32_t* out_len) {
+    if (!slot || !out_len) return false;
+    if (name.size() > UINT32_MAX || msg.size() > UINT32_MAX) return false;
+    uint32_t name_len = static_cast<uint32_t>(name.size());
+    uint32_t msg_len = static_cast<uint32_t>(msg.size());
+    const size_t total_size =
+        sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
+    if (total_size > kNotifyBufferSize) return false;
+
+    auto* ptr = slot;
+    std::memcpy(ptr, &name_len, sizeof(name_len));
+    ptr += sizeof(name_len);
+    std::memcpy(ptr, name.data(), name_len);
+    ptr += name_len;
+    std::memcpy(ptr, &msg_len, sizeof(msg_len));
+    ptr += sizeof(msg_len);
+    std::memcpy(ptr, msg.data(), msg_len);
+    *out_len = static_cast<uint32_t>(total_size);
+    return true;
+}
+
+bool RdmaEndPoint::decodeNotifyPayload(const char* data, size_t byte_len,
+                                       std::string* name, std::string* msg) {
+    if (!data || !name || !msg || byte_len < 8) return false;
+    uint32_t name_len = 0;
+    std::memcpy(&name_len, data, sizeof(name_len));
+    if (name_len > byte_len - 8) return false;
+    uint32_t msg_len = 0;
+    std::memcpy(&msg_len, data + 4 + name_len, sizeof(msg_len));
+    if (msg_len > byte_len - 8 - name_len) return false;
+    name->assign(data + 4, name_len);
+    msg->assign(data + 4 + name_len + 4, msg_len);
+    return true;
+}
+
 void RdmaEndPoint::postNotifyRecv(size_t idx) {
-    if (idx >= notify_recv_buffers_.size() || idx >= notify_recv_mrs_.size())
+    if (!notify_qp_ || !notify_recv_mr_ || idx >= kNotifyMaxPendingSends ||
+        notify_recv_buffer_.size() < (idx + 1) * kNotifyBufferSize)
         return;
 
     ibv_sge sge = {};
-    sge.addr = reinterpret_cast<uint64_t>(notify_recv_buffers_[idx].data());
-    sge.length = notify_recv_buffers_[idx].size();
-    sge.lkey = notify_recv_mrs_[idx]->lkey;
+    sge.addr = reinterpret_cast<uint64_t>(
+        notifySlotPtr(notify_recv_buffer_.data(), idx));
+    sge.length = kNotifyBufferSize;
+    sge.lkey = notify_recv_mr_->lkey;
 
     ibv_recv_wr wr = {};
     wr.wr_id = idx;
@@ -1127,29 +1204,12 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     // Pick the next send slot — flow control guarantees this slot's previous
     // DMA has completed (at most kNotifyMaxPendingSends-1 in-flight).
     size_t slot = notify_send_wr_id_ % kNotifyMaxPendingSends;
-    char* slot_ptr = notify_send_buffer_.data() + slot * kNotifyBufferSize;
-
-    // Serialize: [name_len(4)][name][msg_len(4)][msg]
-    if (name.size() > UINT32_MAX || msg.size() > UINT32_MAX) {
-        LOG(ERROR) << "Notification field exceeds uint32 limit";
+    char* slot_ptr = notifySlotPtr(notify_send_buffer_.data(), slot);
+    uint32_t total_size = 0;
+    if (!encodeNotifyPayload(slot_ptr, name, msg, &total_size)) {
+        LOG(ERROR) << "Failed to encode notification payload";
         return false;
     }
-    uint32_t name_len = static_cast<uint32_t>(name.size());
-    uint32_t msg_len = static_cast<uint32_t>(msg.size());
-    size_t total_size = sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
-    if (total_size > kNotifyBufferSize) {
-        LOG(ERROR) << "Notification message too large: " << total_size;
-        return false;
-    }
-
-    auto* ptr = slot_ptr;
-    std::memcpy(ptr, &name_len, sizeof(name_len));
-    ptr += sizeof(name_len);
-    std::memcpy(ptr, name.data(), name_len);
-    ptr += name_len;
-    std::memcpy(ptr, &msg_len, sizeof(msg_len));
-    ptr += sizeof(msg_len);
-    std::memcpy(ptr, msg.data(), msg_len);
 
     // Post send
     ibv_sge sge = {};
@@ -1181,7 +1241,8 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
 
 bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
-    if (buffer_idx >= notify_recv_buffers_.size()) {
+    if (!notify_recv_mr_ || buffer_idx >= kNotifyMaxPendingSends ||
+        notify_recv_buffer_.size() < (buffer_idx + 1) * kNotifyBufferSize) {
         LOG(ERROR) << "Invalid recv buffer index: " << buffer_idx;
         return false;
     }
@@ -1192,32 +1253,15 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
         return false;
     }
 
-    char* data = notify_recv_buffers_[buffer_idx].data();
-    size_t len = byte_len;
-
-    // Deserialize: [name_len(4)][name][msg_len(4)][msg]
-    if (len < 8) {
-        LOG(ERROR) << "Invalid notification message size: " << len;
+    char* data = notifySlotPtr(notify_recv_buffer_.data(), buffer_idx);
+    std::string name;
+    std::string msg;
+    if (!decodeNotifyPayload(data, byte_len, &name, &msg)) {
+        LOG(ERROR) << "Invalid notification message size or format: "
+                   << byte_len;
         postNotifyRecv(buffer_idx);
         return false;
     }
-
-    uint32_t name_len = *reinterpret_cast<uint32_t*>(data);
-    if (name_len > len - 8) {
-        LOG(ERROR) << "Invalid notification message format (name too long)";
-        postNotifyRecv(buffer_idx);
-        return false;
-    }
-
-    std::string name(data + 4, name_len);
-    uint32_t msg_len = *reinterpret_cast<uint32_t*>(data + 4 + name_len);
-    if (msg_len > len - 8 - name_len) {
-        LOG(ERROR) << "Invalid notification message format (msg too long)";
-        postNotifyRecv(buffer_idx);
-        return false;
-    }
-
-    std::string msg(data + 4 + name_len + 4, msg_len);
 
     // Add directly to transport queue (skip endpoint queue for lower latency)
     context_->transport_.addNotificationToQueue(name, msg);
@@ -1232,6 +1276,24 @@ void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
     if (notify_pending_count_ > 0) {
         notify_pending_count_--;
         notify_send_cv_.notify_one();
+    }
+}
+
+void RdmaEndPoint::disableNotification(const std::string& reason) {
+    {
+        std::lock_guard<std::mutex> send_guard(notify_send_mutex_);
+        // A second failing completion on the same QP must not report again.
+        if (!notify_connected_.exchange(false)) return;
+        notify_send_cv_.notify_all();
+    }
+    LOG(WARNING) << "Notifications disabled on endpoint " << endpoint_name_
+                 << ", data path kept alive: " << reason;
+
+    // Unpublish so the WRs still posted on the dead QP flush silently instead
+    // of re-reporting the same fault once per WR.
+    std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
+    if (notify_qp_) {
+        context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
     }
 }
 }  // namespace tent

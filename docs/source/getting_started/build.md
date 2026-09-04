@@ -13,7 +13,7 @@ This document describes how to build Mooncake.
 
 Install common build dependencies first. A stable Internet connection is
 required because the script installs system packages, initializes submodules,
-installs Go, and builds/installs yalantinglibs.
+and installs Go.
 
 ```bash
 sudo bash dependencies.sh
@@ -74,6 +74,38 @@ sudo make install
 
 `-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
 `-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
+
+### RISC-V Build
+
+Mooncake supports native 64-bit RISC-V Linux builds with `USE_RISCV` enabled.
+The option keeps regular Release optimizations but disables interprocedural
+optimization for the Python extensions, avoiding the excessive memory use of
+full GNU LTO on RISC-V build hosts. The build also detects whether 16-byte
+atomic operations require `libatomic` and links it automatically.
+
+The following configuration builds the C++, Python, and Rust components while
+disabling every component that requires Go:
+
+```bash
+mkdir build-riscv
+cd build-riscv
+cmake -G Ninja .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_RISCV=ON \
+  -DWITH_STORE_GO=OFF \
+  -DWITH_P2P_STORE=OFF \
+  -DUSE_ETCD=OFF \
+  -DSTORE_USE_ETCD=OFF \
+  -DSTORE_USE_K8S_LEASE=OFF \
+  -DBUILD_UNIT_TESTS=OFF \
+  -DBUILD_EXAMPLES=OFF \
+  -DBUILD_BENCHMARK=OFF
+cmake --build . --parallel 4
+```
+
+Adjust the parallel job count for the available memory. The example uses four
+jobs because optimized C++ and Python binding translation units can each need
+several gigabytes of memory on RISC-V.
 
 ### Hardware Backend Setup
 
@@ -206,6 +238,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_HYGON=ON/OFF` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
+| `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
 | `-DUSE_UBSHMEM=ON/OFF` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |
 | `-DUSE_INTRA_NVLINK=ON/OFF` | `OFF` | Enable intranode NVLink transport. |
@@ -252,6 +285,7 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_TE=ON/OFF` | `ON` | Build the Mooncake Transfer Engine component and sample code. |
 | `-DWITH_STORE=ON/OFF` | `ON` | Build the Mooncake Store component. |
 | `-DWITH_STORE_GO=ON/OFF` | `OFF` | Build Go bindings for Mooncake Store when `-DWITH_STORE=ON`. |
+| `-DWITH_CONDUCTOR=ON/OFF` | `OFF` | Build the Mooncake Conductor service. |
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust library (`transfer_engine_rust`), tests, and sample benchmark. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |

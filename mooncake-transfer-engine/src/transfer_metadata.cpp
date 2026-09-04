@@ -375,6 +375,9 @@ static int encodeMultiProtocolSegmentDesc(
     }
     segmentJSON["buffers"] = buffersJSON;
     segmentJSON["protocol"] = protocolJSON;
+    if (!desc.tcp_data_host.empty()) {
+        segmentJSON["tcp_data_host"] = desc.tcp_data_host;
+    }
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
     segmentJSON["timestamp"] = getCurrentDateTime();
@@ -418,6 +421,9 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
 
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
+    if (!desc.tcp_data_host.empty()) {
+        segmentJSON["tcp_data_host"] = desc.tcp_data_host;
+    }
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
     segmentJSON["timestamp"] = getCurrentDateTime();
@@ -477,7 +483,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         }
         segmentJSON["buffers"] = buffersJSON;
         segmentJSON["priority_matrix"] = desc.topology.toJson();
-    } else if (segmentJSON["protocol"] == "tcp") {
+    } else if (segmentJSON["protocol"] == "tcp" ||
+               segmentJSON["protocol"] == "flagcx") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -487,6 +494,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+        segmentJSON["rdma_server_name"] = desc.rdma_server_name;
     } else if (segmentJSON["protocol"] == "nccl") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
@@ -628,6 +636,10 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                                const std::string &segment_name) {
     auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
     desc->name = segmentJSON["name"].asString();
+    if (segmentJSON.isMember("tcp_data_host") &&
+        segmentJSON["tcp_data_host"].isString()) {
+        desc->tcp_data_host = segmentJSON["tcp_data_host"].asString();
+    }
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
                                   ? segmentJSON["tcp_proto_version"].asInt()
@@ -793,6 +805,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     auto desc = std::make_shared<SegmentDesc>();
     desc->name = segmentJSON["name"].asString();
     desc->protocol = segmentJSON["protocol"].asString();
+    if (segmentJSON.isMember("tcp_data_host") &&
+        segmentJSON["tcp_data_host"].isString()) {
+        desc->tcp_data_host = segmentJSON["tcp_data_host"].asString();
+    }
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
                                   ? segmentJSON["tcp_proto_version"].asInt()
@@ -901,7 +917,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             LOG(WARNING) << "Corrupted segment descriptor, name "
                          << segment_name << " protocol " << desc->protocol;
         }
-    } else if (desc->protocol == "tcp") {
+    } else if (desc->protocol == "tcp" || desc->protocol == "flagcx") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
@@ -914,6 +930,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
+        desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
     } else if (desc->protocol == "nccl") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
@@ -1062,6 +1079,12 @@ int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
 
 std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     const std::string &segment_name) {
+    return getSegmentDescInternal(segment_name, false);
+}
+
+std::shared_ptr<TransferMetadata::SegmentDesc>
+TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
+                                         bool force_rpc_update) {
     Json::Value peer_json;
 
     if (p2p_handshake_mode_) {
@@ -1097,6 +1120,21 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
 
     auto result = decodeSegmentDesc(peer_json, segment_name);
 
+    // Compatibility for descriptors published before tcp_data_host was part
+    // of SegmentDesc. Freeze the legacy RPC location into this descriptor
+    // before it enters the segment cache, so startTransfer() still consumes a
+    // single local snapshot. New publishers carry host and port atomically in
+    // the descriptor and do not take this fallback path.
+    if (result && result->tcp_data_host.empty() && result->tcp_data_port > 0) {
+        RpcMetaDesc rpc_meta;
+        if (getRpcMetaEntryInternal(segment_name, rpc_meta, force_rpc_update)) {
+            LOG(ERROR) << "Failed to resolve legacy TCP data host for segment "
+                       << segment_name;
+            return nullptr;
+        }
+        result->tcp_data_host = rpc_meta.ip_or_host_name;
+    }
+
     // In P2P mode with dual-NIC setups (MC_RDMA_BIND_ADDRESS), the peer's
     // segment descriptor may contain an rdma_server_name that differs from
     // the TCP-routable segment_name. Cache the mapping so subsequent
@@ -1129,6 +1167,7 @@ bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
            buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&
            cxl_name == other.cxl_name && cxl_base_addr == other.cxl_base_addr &&
            rank_info == other.rank_info &&
+           tcp_data_host == other.tcp_data_host &&
            tcp_data_port == other.tcp_data_port &&
            rdma_server_name == other.rdma_server_name;
 }
@@ -1157,13 +1196,26 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     // Fetch updates without holding lock (may involve network I/O)
     std::vector<std::pair<std::string, std::shared_ptr<SegmentDesc>>> updates;
     for (const auto &name : names_to_sync) {
-        auto segment_desc = getSegmentDesc(name);
+        auto segment_desc = getSegmentDescInternal(name, true);
         if (segment_desc) {
             updates.emplace_back(name, segment_desc);
             ++fetched_count;
         } else {
             ++failed_count;
             LOG(WARNING) << "segment " << name << " is now invalid";
+        }
+    }
+
+    // RPC locations are cached independently from segment descriptors under
+    // the same logical segment name. Invalidate only successfully refreshed
+    // names before publishing their new descriptors so a subsequent lookup
+    // reloads the authoritative RPC host instead of pairing new segment
+    // metadata with a stale cached location.
+    {
+        RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+        for (const auto &[name, desc] : updates) {
+            (void)desc;
+            rpc_meta_map_.erase(name);
         }
     }
 
@@ -1460,7 +1512,13 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
 
 int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
                                       RpcMetaDesc &desc) {
-    {
+    return getRpcMetaEntryInternal(server_name, desc, false);
+}
+
+int TransferMetadata::getRpcMetaEntryInternal(const std::string &server_name,
+                                              RpcMetaDesc &desc,
+                                              bool force_update) {
+    if (!force_update) {
         RWSpinlock::ReadGuard guard(rpc_meta_lock_);
         if (rpc_meta_map_.count(server_name)) {
             desc = rpc_meta_map_[server_name];

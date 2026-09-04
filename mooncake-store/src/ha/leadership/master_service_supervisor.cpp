@@ -14,6 +14,8 @@
 
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/leader_label_reconciler.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
@@ -197,6 +199,22 @@ void ApplyCurrentView(MasterAdminServer& admin_server,
                          wait_result.current_view);
 }
 
+ErrorCode ClaimProducerViewForServing(
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
+    ViewVersionId view_version) {
+    if (!config.enable_oplog || spec.type != HABackendType::ETCD ||
+        config.cluster_id.empty()) {
+        return ErrorCode::OK;
+    }
+    if (view_version == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    EtcdHaKvBackend backend;
+    OpLogBatchStorage storage(config.cluster_id, backend);
+    return storage.ClaimProducerView(view_version);
+}
+
 void EnterStandbyMode(MasterAdminServer& admin_server,
                       StandbyController& standby_controller,
                       std::atomic<bool>& accept_runtime_updates,
@@ -330,14 +348,31 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
+        auto claim_error = ClaimProducerViewForServing(
+            spec, config, leadership_session->view.view_version);
+        if (claim_error != ErrorCode::OK) {
+            EnterStandbyMode(admin_server, *standby_controller,
+                             accept_standby_runtime_updates,
+                             leadership_session->view);
+            if (HandleLeadershipPhaseError(
+                    "producer view claim failure", "claim producer view",
+                    leader_coordinator, *leadership_session, claim_error,
+                    spec.type)) {
+                return -1;
+            }
+            continue;
+        }
+
         accept_standby_runtime_updates.store(false, std::memory_order_release);
         auto promotion_ctx = standby_controller->PromoteStandbyAndExport();
         if (!promotion_ctx) {
             EnterStandbyMode(admin_server, *standby_controller,
                              accept_standby_runtime_updates,
                              leadership_session->view);
-            if (HandleSupervisorError("promote standby for serve",
-                                      promotion_ctx.error(), spec.type)) {
+            if (HandleLeadershipPhaseError(
+                    "standby promotion failure", "promote standby for serve",
+                    leader_coordinator, *leadership_session,
+                    promotion_ctx.error(), spec.type)) {
                 return -1;
             }
             continue;
@@ -390,18 +425,30 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);
 
-        // Restore from standby if we have context
-        if (promotion_ctx->applied_seq_id > 0 ||
-            !promotion_ctx->objects.empty() ||
-            !promotion_ctx->segments.empty()) {
-            auto restore_result = wrapped_master_service->RestoreFromStandby(
-                promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                promotion_ctx->segments);
-            if (!restore_result) {
-                LOG(ERROR) << "Standby restore failed: "
-                           << toString(restore_result.error());
+        // Restore is the serving gate: do not register or expose a candidate
+        // service until the complete promotion context has been applied.
+        SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
+        auto restore_result = wrapped_master_service->RestoreFromStandby(
+            promotion_ctx->objects, promotion_ctx->applied_seq_id,
+            promotion_ctx->segments);
+        if (!restore_result) {
+            LOG(ERROR) << "Standby restore failed: "
+                       << toString(restore_result.error());
+            wrapped_master_service.reset();
+            DeactivateServingState(admin_server, label_reconciler);
+            EnterStandbyMode(admin_server, *standby_controller,
+                             accept_standby_runtime_updates,
+                             leadership_session->view);
+            SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
+            if (HandleLeadershipPhaseError(
+                    "standby restore failure", "restore standby state",
+                    leader_coordinator, *leadership_session,
+                    restore_result.error(), spec.type)) {
+                return -1;
             }
+            continue;
         }
+        SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 

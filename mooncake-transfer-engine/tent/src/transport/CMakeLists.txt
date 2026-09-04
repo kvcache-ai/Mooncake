@@ -1,4 +1,5 @@
 add_subdirectory(tcp)
+add_subdirectory(hp_tcp)
 add_subdirectory(rdma)
 add_subdirectory(shm)
 add_subdirectory(nvlink)
@@ -23,6 +24,7 @@ foreach(
   tent_xport_rdma
   tent_xport_shm
   tent_xport_tcp
+  tent_xport_hp_tcp
   tent_xport_ub
   tent_xport_ascend_direct
   tent_xport_sunrise_link

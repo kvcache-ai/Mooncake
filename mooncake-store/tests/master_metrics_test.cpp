@@ -18,6 +18,7 @@
 #include "types.h"
 #include "master_config.h"
 #include "master_metric_manager.h"
+#include "version.h"
 
 namespace mooncake::test {
 
@@ -51,7 +52,6 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     // Mem Storage Metrics
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
 
     // File Storage Metrics
     ASSERT_EQ(metrics.get_allocated_file_size(), 0);
@@ -166,11 +166,9 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_TRUE(mount_result.has_value());
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), kSegmentSize);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               kSegmentSize);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
     ASSERT_EQ(metrics.get_mount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_mount_segment_failures(), 0);
 
@@ -263,9 +261,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_unmount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_unmount_segment_failures(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
 
     // Unmount removes the segment capacity synchronously, but invalid replica
     // metadata and its allocation metrics are reclaimed by the background
@@ -281,10 +277,6 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
-
-    // check segment mem used ratio for non-existent segment
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(""), 0.0);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
 }
 
 TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
@@ -335,6 +327,16 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               static_cast<int64_t>(segment.size));
 
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+    std::shared_ptr<BufferAllocatorBase> source_allocator;
+    {
+        auto access = source_manager.getSegmentAccess();
+        source_allocator = access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(source_allocator, nullptr);
+    auto source_buffer = source_allocator->allocate(kAllocationSize);
+    ASSERT_NE(source_buffer, nullptr);
+
     auto snapshot =
         SegmentSerializer(&source_manager).Serialize(LocalSsdPersistedState{});
     ASSERT_TRUE(snapshot.has_value());
@@ -348,12 +350,28 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
         SegmentSerializer reader_serializer(&reader);
         ASSERT_TRUE(
             reader_serializer.Deserialize(snapshot.value()).has_value());
+        const auto restored_usage = reader.GetMemoryUsageSnapshot();
+        const auto restored_aggregate = reader.GetMemoryUsage();
+        EXPECT_EQ(restored_usage.used_bytes, kAllocationSize);
+        EXPECT_EQ(restored_usage.capacity_bytes, segment.size);
+        EXPECT_DOUBLE_EQ(restored_usage.used_ratio(), 0.25);
+        EXPECT_EQ(restored_aggregate.used_bytes, kAllocationSize);
+        EXPECT_EQ(restored_aggregate.capacity_bytes, segment.size);
+        EXPECT_DOUBLE_EQ(restored_aggregate.used_ratio(), 0.25);
+        ASSERT_EQ(restored_usage.segments.size(), 1u);
+        EXPECT_EQ(restored_usage.segments.at(segment.name).used_bytes,
+                  kAllocationSize);
+
+        reader_serializer.Reset();
+        EXPECT_EQ(reader.GetMemoryUsage().used_bytes, 0u);
+        EXPECT_EQ(reader.GetMemoryUsage().capacity_bytes, 0u);
     }
     ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_after_mount);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               static_cast<int64_t>(segment.size));
 
     // Unmount to restore the gauges for the other tests.
+    source_buffer.reset();
     {
         auto access = source_manager.getSegmentAccess();
         size_t dec_capacity = 0;
@@ -500,6 +518,14 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 }
 
 TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
+    TieredStorageUsageSnapshot stale_storage;
+    stale_storage.memory.used_bytes = 4096;
+    stale_storage.memory.capacity_bytes = 8192;
+    stale_storage.memory.segments["stale_leader_segment"] = {4096, 8192};
+    auto& metrics = MasterMetricManager::instance();
+    metrics.project_storage_usage(stale_storage);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 4096);
+
     const int http_port = getFreeTcpPort();
     MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
                                    /*enable_metric_reporting=*/false);
@@ -517,6 +543,17 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
     auto status_resp = FetchUrl(http_port, "/ha_status");
     EXPECT_EQ(status_resp.http_status, 200);
     EXPECT_EQ(status_resp.body, "standby");
+
+    auto metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size("stale_leader_segment"),
+              0);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity("stale_leader_segment"),
+              0);
+    EXPECT_EQ(metrics_resp.body.find("stale_leader_segment"),
+              std::string::npos);
 
     auto leader_resp = FetchUrl(http_port, "/leader");
     EXPECT_EQ(leader_resp.http_status, 200);
@@ -537,6 +574,36 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
     admin_server.Stop();
 }
 
+TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
+    auto& metrics = MasterMetricManager::instance();
+    const std::string mem_segment = "projected_removed_mem_segment";
+    const std::string nof_segment = "projected_removed_nof_segment";
+
+    TieredStorageUsageSnapshot snapshot;
+    snapshot.memory.used_bytes = 4096;
+    snapshot.memory.capacity_bytes = 8192;
+    snapshot.memory.segments[mem_segment] = {4096, 8192};
+    snapshot.nof.used_bytes = 1024;
+    snapshot.nof.capacity_bytes = 4096;
+    snapshot.nof.segments[nof_segment] = {1024, 4096};
+    metrics.project_storage_usage(snapshot);
+
+    const std::string with_labels = metrics.serialize_metrics();
+    EXPECT_NE(with_labels.find("segment=\"" + mem_segment + "\""),
+              std::string::npos);
+    EXPECT_NE(with_labels.find("segment=\"" + nof_segment + "\""),
+              std::string::npos);
+
+    metrics.project_storage_usage({});
+    const std::string after = metrics.serialize_metrics();
+    EXPECT_EQ(after.find("segment=\"" + mem_segment + "\""), std::string::npos);
+    EXPECT_EQ(after.find("segment=\"" + nof_segment + "\""), std::string::npos);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_allocated_nof_size(), 0);
+    EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
+}
+
 TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = 100;
@@ -550,6 +617,13 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     segment.size = 8 * 1024 * 1024;
     UUID client_id = generate_uuid();
     ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    constexpr size_t kAllocationSize = 4096;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "admin_metrics_projection_key",
+                               kAllocationSize, config)
+                    .has_value());
 
     const int http_port = getFreeTcpPort();
     MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
@@ -558,6 +632,55 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     admin_server.SetRuntimeState(ha::MasterRuntimeState::kServing);
     admin_server.SetServiceDelegate(service);
     admin_server.SetServiceAvailable(true);
+
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_mem_size();
+    metrics.reset_total_mem_capacity();
+    metrics.reset_segment_allocated_mem_size(segment.name);
+    metrics.reset_segment_total_mem_capacity(segment.name);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
+
+    auto metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_NE(metrics_resp.body.find("master_allocated_bytes 4096"),
+              std::string::npos);
+    EXPECT_NE(metrics_resp.body.find("master_total_capacity_bytes 8388608"),
+              std::string::npos);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), kAllocationSize);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), segment.size);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
+              kAllocationSize);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+              segment.size);
+
+    // Losing service availability must clear the old leader projection even
+    // while the delegate remains installed. A concurrent refresh is
+    // serialized with this transition and cannot restore stale values.
+    admin_server.SetServiceAvailable(false);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    {
+        const std::string serialized = metrics.serialize_metrics();
+        EXPECT_EQ(serialized.find("segment=\"" + segment.name + "\""),
+                  std::string::npos);
+    }
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+
+    metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_NE(metrics_resp.body.find("master_allocated_bytes 0"),
+              std::string::npos);
+    EXPECT_NE(metrics_resp.body.find("master_total_capacity_bytes 0"),
+              std::string::npos);
+    EXPECT_EQ(metrics_resp.body.find("segment=\"" + segment.name + "\""),
+              std::string::npos);
+    admin_server.SetServiceAvailable(true);
+    metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), kAllocationSize);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), segment.size);
 
     auto segments_resp = FetchUrl(http_port, "/get_all_segments");
     EXPECT_EQ(segments_resp.http_status, 200);
@@ -578,6 +701,12 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
               std::string::npos);
     EXPECT_NE(detail_resp.body.find("\"allocator_capacity_bytes\""),
               std::string::npos);
+
+    ASSERT_TRUE(service
+                    ->PutRevoke(client_id, "admin_metrics_projection_key",
+                                ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
 
     admin_server.Stop();
 }
@@ -1032,6 +1161,42 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     // Clean up.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     service_.Remove(ssd_only_key, "default");
+}
+
+// Build info is an "info"-style metric: the value is always 1 and the version
+// strings are carried by labels, so serialization must emit a single series
+// containing both version labels.
+TEST_F(MasterMetricsTest, BuildInfoMetricIsSerialized) {
+    auto& metrics = MasterMetricManager::instance();
+
+    const std::string serialized = metrics.serialize_metrics();
+
+    ASSERT_NE(serialized.find("mooncake_build_info"), std::string::npos)
+        << "build info metric missing from serialized output";
+    // Label order inside the series is not asserted: only the presence of both
+    // labels with the compiled-in values matters for scraping and grouping.
+    EXPECT_NE(serialized.find("version=\"" + GetMooncakeStoreVersion() + "\""),
+              std::string::npos)
+        << "RPC handshake version missing from build info labels";
+    EXPECT_NE(serialized.find("display_version=\"" +
+                              std::string(MOONCAKE_DISPLAY_VERSION) + "\""),
+              std::string::npos)
+        << "display version missing from build info labels";
+
+    // The series value is fixed at 1; extract the number after the closing
+    // brace of the build info series to confirm it is exposed as such.
+    const auto metric_pos = serialized.find("mooncake_build_info{");
+    ASSERT_NE(metric_pos, std::string::npos)
+        << "build info metric has no labelled series";
+    const auto brace_end = serialized.find('}', metric_pos);
+    ASSERT_NE(brace_end, std::string::npos);
+    const auto line_end = serialized.find('\n', brace_end);
+    const std::string value_part =
+        serialized.substr(brace_end + 1, line_end == std::string::npos
+                                             ? std::string::npos
+                                             : line_end - brace_end - 1);
+    EXPECT_NE(value_part.find('1'), std::string::npos)
+        << "build info value should be 1, got:" << value_part;
 }
 
 }  // namespace mooncake::test

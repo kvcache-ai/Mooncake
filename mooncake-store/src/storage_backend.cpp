@@ -27,7 +27,6 @@
 #include "nvme_kv_backend.h"
 #include "utils.h"
 #include "crc32c.h"
-#include "ascii_string.h"
 #include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
@@ -57,31 +56,6 @@ struct FdGuard {
 #endif
 
 namespace mooncake {
-
-namespace {
-
-struct OffsetAllocatorBackendEnvironmentVariables {
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetEvictionPolicy{"MOONCAKE_OFFSET_EVICTION_POLICY"};
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetHighRatio{"MOONCAKE_OFFSET_HIGH_RATIO"};
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetLowRatio{"MOONCAKE_OFFSET_LOW_RATIO"};
-    inline static constexpr EnvironmentVariable<int64_t>
-        kMooncakeOffsetMaxCapacityNodes{"MOONCAKE_OFFSET_MAX_CAPACITY_NODES"};
-    inline static constexpr EnvironmentVariable<int64_t>
-        kMooncakeOffsetMaxEvictPerOffload{
-            "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD"};
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetPersistMode{"MOONCAKE_OFFSET_PERSIST_MODE"};
-    inline static constexpr EnvironmentVariable<int64_t>
-        kMooncakeOffsetPersistIntervalSeconds{
-            "MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS"};
-    inline static constexpr EnvironmentVariable<bool> kMooncakeOffsetRecordCrc{
-        "MOONCAKE_OFFSET_RECORD_CRC"};
-};
-
-}  // namespace
 
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
@@ -149,127 +123,6 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     }
 
     return config;
-}
-
-bool OffsetAllocatorBackendConfig::Validate() const {
-    if (persist_mode == OffsetPersistMode::kRelaxed) {
-        if (persist_interval_seconds < 5) {
-            LOG(ERROR) << "OffsetAllocatorBackendConfig: "
-                          "persist_interval_seconds must be >= 5 for "
-                          "kRelaxed mode";
-            return false;
-        }
-    }
-    if (high_ratio <= 0.0 || high_ratio > 1.0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: high_ratio must be in (0,1]";
-        return false;
-    }
-    if (low_ratio <= 0.0 || low_ratio >= high_ratio) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: low_ratio must be in (0, "
-                      "high_ratio)";
-        return false;
-    }
-    if (keys_high_ratio <= 0.0 || keys_high_ratio > 1.0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: keys_high_ratio must be in (0,1]";
-        return false;
-    }
-    if (keys_low_ratio <= 0.0 || keys_low_ratio >= keys_high_ratio) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: keys_low_ratio must be in "
-                      "(0, keys_high_ratio)";
-        return false;
-    }
-    if (max_evict_per_offload == 0) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: max_evict_per_offload "
-                      "must be > 0";
-        return false;
-    }
-    if (fallback_evict_batch == 0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: fallback_evict_batch must be > 0";
-        return false;
-    }
-    if (max_capacity_nodes < 0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: max_capacity_nodes must be >= 0";
-        return false;
-    }
-    return true;
-}
-
-OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
-    OffsetAllocatorBackendConfig cfg;
-    using Variables = OffsetAllocatorBackendEnvironmentVariables;
-
-    const auto policy = Environ::Read(Variables::kMooncakeOffsetEvictionPolicy);
-    if (policy.has_value()) {
-        if (AsciiCaseInsensitiveEquals(*policy, "fifo")) {
-            cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
-        }
-        // NONE is default; LRU reserved for phase 2
-    }
-
-    constexpr EnvironmentDoubleParseOptions kLegacyRatioParsing{
-        .allow_trailing_characters = true,
-        .allow_non_finite = true,
-    };
-    if (const auto value = Environ::Read(Variables::kMooncakeOffsetHighRatio)) {
-        cfg.high_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
-                             .value_or(cfg.high_ratio);
-    }
-    if (const auto value = Environ::Read(Variables::kMooncakeOffsetLowRatio)) {
-        cfg.low_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
-                            .value_or(cfg.low_ratio);
-    }
-    // Both byte and key watermarks derive from the same ratio pair.
-    cfg.keys_high_ratio = cfg.high_ratio;
-    cfg.keys_low_ratio = cfg.low_ratio;
-
-    cfg.max_capacity_nodes = Environ::ReadOr(
-        Variables::kMooncakeOffsetMaxCapacityNodes, cfg.max_capacity_nodes);
-
-    // Read eviction cap as int64_t to guard against negative env values
-    // which would wrap to SIZE_MAX with an unsigned parser.
-    auto max_evict_raw =
-        Environ::ReadOr(Variables::kMooncakeOffsetMaxEvictPerOffload,
-                        static_cast<int64_t>(cfg.max_evict_per_offload));
-    if (max_evict_raw > 0) {
-        cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
-    } else if (max_evict_raw <= 0) {
-        LOG(WARNING) << "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD="
-                     << max_evict_raw << " is non-positive; using default "
-                     << cfg.max_evict_per_offload;
-    }
-
-    // Persistence mode
-    const auto persist = Environ::Read(Variables::kMooncakeOffsetPersistMode);
-    if (persist.has_value()) {
-        const std::string& s = *persist;
-        if (AsciiCaseInsensitiveEquals(s, "disabled")) {
-            cfg.persist_mode = OffsetPersistMode::kDisabled;
-        } else if (AsciiCaseInsensitiveEquals(s, "relaxed")) {
-            cfg.persist_mode = OffsetPersistMode::kRelaxed;
-        } else if (AsciiCaseInsensitiveEquals(s, "strict")) {
-            cfg.persist_mode = OffsetPersistMode::kStrict;
-        } else {
-            LOG(WARNING) << "Unknown MOONCAKE_OFFSET_PERSIST_MODE=" << s
-                         << "; using default (disabled)";
-        }
-    }
-
-    cfg.persist_interval_seconds =
-        Environ::ReadOr(Variables::kMooncakeOffsetPersistIntervalSeconds,
-                        cfg.persist_interval_seconds);
-
-    // Record CRC-32C: "0"/"false"/"off" disables per-record checksums.
-    if (const auto record_crc =
-            Environ::Read(Variables::kMooncakeOffsetRecordCrc);
-        record_crc.has_value() && !*record_crc) {
-        cfg.enable_record_crc = false;
-    }
-
-    return cfg;
 }
 
 std::string StorageBackend::GetActualFsdir() const {
@@ -684,14 +537,9 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
 
 void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
-    // TODO: attention: this function is not thread-safe, need to add lock if
-    // used in multi-thread environment Check if the file exists before
-    // attempting to remove it
-    // TODO: add a sleep to ensure the write thread has time to create the
-    // corresponding file it will be fixed in the next version
-    std::this_thread::sleep_for(
-        std::chrono::microseconds(50));  // sleep for 50 us
-
+    // StoreObject holds the same striped path lock across file creation, write,
+    // and queue insertion. Acquiring it here serializes deletion with those
+    // operations without relying on a timing delay.
     MutexLocker path_locker(&GetFilePathMutex(path));
 
     // Eviction disabled, use simple delete (no queue tracking)
@@ -2661,21 +2509,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     } else
 #endif
     {
@@ -2693,13 +2526,32 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     }
+
+    // Flush bucket data to stable storage before writing metadata.
+    // This prevents a crash from leaving valid metadata pointing at
+    // incomplete data (write-ordering durability guarantee).
+    // StorageFile declares a virtual datasync() overridden by both PosixFile
+    // (fdatasync) and UringFile, so a single call covers both write paths and
+    // the branches above only keep their own write logic.
+    auto sync_result = file->datasync();
+    // Test-only: override sync result to exercise the same !sync_result
+    // cleanup path as a real fdatasync() failure.
+    if (test_datasync_failure_.load(std::memory_order_relaxed)) {
+        sync_result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (!sync_result) {
+        LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+        CleanupOrphanedBucket(bucket_id);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    // Invalidate cache for this file since content changed
+    {
+        MutexLocker cache_locker(&file_cache_mutex_);
+        file_cache_.erase(bucket_data_path);
+    }
+
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
