@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
@@ -742,6 +743,114 @@ TEST(LogStructuredStoreTest,
                                             .stop_token = {}});
     ASSERT_TRUE(compacted.has_value());
     EXPECT_EQ(compacted->source_segments, size_t{1});
+    EXPECT_EQ((*store)->GetLatest("tenant-a", "key").value(),
+              std::string(96, 'b'));
+}
+
+TEST(LogStructuredStoreTest, RecoversAcrossCompactionPublicationCrashPoints) {
+    constexpr std::array crash_points{
+        CompactionCrashPoint::kBeforeTargetSync,
+        CompactionCrashPoint::kAfterTargetSync,
+        CompactionCrashPoint::kAfterTargetRename,
+        CompactionCrashPoint::kAfterManifestPublication,
+    };
+
+    for (const auto crash_point : crash_points) {
+        StoreTempDirectory temp;
+        const auto old_identity = StoreIdentity("key", 1);
+        const auto new_identity = StoreIdentity("key", 2);
+        {
+            auto store = LogStructuredStore::Open(Config(temp, 1024));
+            ASSERT_TRUE(store.has_value());
+            auto old_write =
+                (*store)->PreparePut(old_identity, std::string(96, 'a'));
+            ASSERT_TRUE(old_write.has_value());
+            ASSERT_TRUE((*store)
+                            ->CommitPut(old_identity, old_write->sequence)
+                            .has_value());
+            auto new_write =
+                (*store)->PreparePut(new_identity, std::string(96, 'b'));
+            ASSERT_TRUE(new_write.has_value());
+            ASSERT_TRUE((*store)
+                            ->CommitPut(new_identity, new_write->sequence)
+                            .has_value());
+            ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+
+            LogStructuredStore::SetCompactionCrashPredicateForTest(
+                [crash_point](CompactionCrashPoint point) {
+                    return point == crash_point;
+                });
+            auto interrupted = (*store)->CompactOnce({.max_source_segments = 1,
+                                                      .max_input_bytes = 4096,
+                                                      .max_target_bytes = 4096,
+                                                      .fanout = 1,
+                                                      .max_levels = 2,
+                                                      .min_reclaim_ratio = 0.0,
+                                                      .stop_token = {}});
+            LogStructuredStore::SetCompactionCrashPredicateForTest({});
+            ASSERT_FALSE(interrupted.has_value());
+            EXPECT_EQ(interrupted.error(), StoreError::kIoError);
+        }
+
+        auto recovered = LogStructuredStore::Open(Config(temp, 1024));
+        ASSERT_TRUE(recovered.has_value());
+        EXPECT_EQ((*recovered)->GetLatest("tenant-a", "key").value(),
+                  std::string(96, 'b'));
+        EXPECT_EQ((*recovered)->Get(old_identity).error(),
+                  StoreError::kNotFound);
+        EXPECT_TRUE(std::filesystem::is_empty(temp.path() / "tmp"));
+    }
+}
+
+TEST(LogStructuredStoreTest, GetCompletesWhileCompactionWaitsToPublish) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 1024));
+    ASSERT_TRUE(store.has_value());
+    const auto old_identity = StoreIdentity("key", 1);
+    const auto new_identity = StoreIdentity("key", 2);
+
+    auto old_write = (*store)->PreparePut(old_identity, std::string(96, 'a'));
+    ASSERT_TRUE(old_write.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(old_identity, old_write->sequence).has_value());
+    auto new_write = (*store)->PreparePut(new_identity, std::string(96, 'b'));
+    ASSERT_TRUE(new_write.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(new_identity, new_write->sequence).has_value());
+    ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+
+    std::promise<void> reached_publish;
+    std::promise<void> allow_publish;
+    auto allow_publish_future = allow_publish.get_future().share();
+    LogStructuredStore::SetCompactionCrashPredicateForTest(
+        [&](CompactionCrashPoint point) {
+            if (point != CompactionCrashPoint::kAfterTargetRename) return false;
+            reached_publish.set_value();
+            allow_publish_future.wait();
+            return false;
+        });
+    auto compaction = std::async(std::launch::async, [&]() {
+        return (*store)->CompactOnce({.max_source_segments = 1,
+                                      .max_input_bytes = 4096,
+                                      .max_target_bytes = 4096,
+                                      .fanout = 1,
+                                      .max_levels = 2,
+                                      .min_reclaim_ratio = 0.0,
+                                      .stop_token = {}});
+    });
+    ASSERT_EQ(reached_publish.get_future().wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+
+    auto read = std::async(std::launch::async,
+                           [&]() { return (*store)->Get(new_identity); });
+    ASSERT_EQ(read.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    ASSERT_TRUE(read.get().has_value());
+
+    allow_publish.set_value();
+    auto compacted = compaction.get();
+    LogStructuredStore::SetCompactionCrashPredicateForTest({});
+    ASSERT_TRUE(compacted.has_value());
     EXPECT_EQ((*store)->GetLatest("tenant-a", "key").value(),
               std::string(96, 'b'));
 }

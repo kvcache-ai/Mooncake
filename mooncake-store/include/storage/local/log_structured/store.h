@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <limits>
 #include <map>
@@ -76,6 +77,13 @@ struct CompactionResult {
     uint64_t reclaimed_bytes{0};
 };
 
+enum class CompactionCrashPoint {
+    kBeforeTargetSync,
+    kAfterTargetSync,
+    kAfterTargetRename,
+    kAfterManifestPublication,
+};
+
 class LogStructuredStore {
    public:
     static tl::expected<std::unique_ptr<LogStructuredStore>, StoreError> Open(
@@ -108,6 +116,9 @@ class LogStructuredStore {
     StoreStats SnapshotStats() const;
     uint64_t active_segment_id() const;
     uint64_t next_sequence() const;
+
+    static void SetCompactionCrashPredicateForTest(
+        std::function<bool(CompactionCrashPoint)> predicate);
 
    private:
     explicit LogStructuredStore(LogStructuredStoreConfig config);

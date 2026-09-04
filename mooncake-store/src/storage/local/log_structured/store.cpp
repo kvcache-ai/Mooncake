@@ -19,6 +19,14 @@ constexpr std::string_view kSegmentPrefix = "segment-";
 constexpr std::string_view kSegmentSuffix = ".log";
 constexpr std::string_view kInitialWalFile = "WAL-00000000000000000001";
 
+std::mutex compaction_crash_mutex;
+std::function<bool(CompactionCrashPoint)> compaction_crash_predicate;
+
+bool HitCompactionCrashPoint(CompactionCrashPoint point) {
+    std::lock_guard lock(compaction_crash_mutex);
+    return compaction_crash_predicate && compaction_crash_predicate(point);
+}
+
 std::optional<uint64_t> ParseSegmentId(std::string_view name) {
     if (!name.starts_with(kSegmentPrefix) || !name.ends_with(kSegmentSuffix)) {
         return std::nullopt;
@@ -91,6 +99,12 @@ LogStructuredStore::LogStructuredStore(LogStructuredStoreConfig config)
     : config_(std::move(config)),
       segments_path_(config_.root_path + "/segments"),
       wal_path_(config_.root_path + "/" + std::string(kInitialWalFile)) {}
+
+void LogStructuredStore::SetCompactionCrashPredicateForTest(
+    std::function<bool(CompactionCrashPoint)> predicate) {
+    std::lock_guard lock(compaction_crash_mutex);
+    compaction_crash_predicate = std::move(predicate);
+}
 
 tl::expected<std::unique_ptr<LogStructuredStore>, StoreError>
 LogStructuredStore::Open(LogStructuredStoreConfig config) {
@@ -934,9 +948,15 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         reset_sources();
         return tl::unexpected(StoreError::kCancelled);
     }
+    if (HitCompactionCrashPoint(CompactionCrashPoint::kBeforeTargetSync)) {
+        return tl::unexpected(StoreError::kIoError);
+    }
     if (writer && !writer->Sync()) {
         cleanup_targets();
         reset_sources();
+        return tl::unexpected(StoreError::kIoError);
+    }
+    if (HitCompactionCrashPoint(CompactionCrashPoint::kAfterTargetSync)) {
         return tl::unexpected(StoreError::kIoError);
     }
     if (options.stop_token.stop_requested()) {
@@ -957,6 +977,9 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
     if (!targets.empty() && !SyncDirectory(segments_path_)) {
         cleanup_targets();
         reset_sources();
+        return tl::unexpected(StoreError::kIoError);
+    }
+    if (HitCompactionCrashPoint(CompactionCrashPoint::kAfterTargetRename)) {
         return tl::unexpected(StoreError::kIoError);
     }
 
@@ -1012,6 +1035,10 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
             }
             cleanup_targets();
             return tl::unexpected(checkpointed.error());
+        }
+        if (HitCompactionCrashPoint(
+                CompactionCrashPoint::kAfterManifestPublication)) {
+            return tl::unexpected(StoreError::kIoError);
         }
         CleanupRetiredSegmentsLocked();
         RefreshSegmentLiveBytes();
