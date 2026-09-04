@@ -26,6 +26,16 @@ struct MetadataStoragePlugin {
     virtual ~MetadataStoragePlugin() {}
 
     virtual bool get(const std::string &key, Json::Value &value) = 0;
+    // Error-aware lookup: same contract as get() but reports whether a
+    // non-found result is an authoritative key absence (kNotFound) or a
+    // transient backend failure (kUnavailable). Plugins that can tell the
+    // two apart (Redis nil reply, HTTP 404 vs 5xx) should override this;
+    // the default delegates to get() and maps false->kNotFound, preserving
+    // the pre-existing behavior for plugins that do not distinguish.
+    virtual GetResult getWithStatus(const std::string &key,
+                                    Json::Value &value) {
+        return get(key, value) ? GetResult::kFound : GetResult::kNotFound;
+    }
     virtual bool set(const std::string &key, const Json::Value &value) = 0;
     virtual bool remove(const std::string &key) = 0;
 };
