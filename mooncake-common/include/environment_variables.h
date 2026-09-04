@@ -100,6 +100,13 @@ struct ReplicaSelectionEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
 };
 
+struct RpcTimeoutEnvironmentVariables {
+    // Preserve atoll parsing: empty/nonnumeric values become zero, and numeric
+    // prefixes are accepted, unlike the shared typed integer parser.
+    MC_DEFINE_ENV_VAR(std::string, MC_RPC_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_RPC_CONNECT_TIMEOUT_MS);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake
