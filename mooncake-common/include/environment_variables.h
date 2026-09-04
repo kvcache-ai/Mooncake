@@ -100,6 +100,10 @@ struct ReplicaSelectionEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
 };
 
+struct LocalFileSnapshotEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_SNAPSHOT_LOCAL_PATH);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake
