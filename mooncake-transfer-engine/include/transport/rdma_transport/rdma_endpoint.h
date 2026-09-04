@@ -178,15 +178,19 @@ class RdmaEndPoint {
 
     std::vector<uint32_t> qpNum() const;
 
+    // `peer_mtu_bytes` is the path MTU advertised by the peer handshake; 0
+    // when the peer does not advertise one. See negotiatePathMtu().
     int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
+                          uint32_t peer_mtu_bytes = 0,
                           Status connected_status = CONNECTED,
                           std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 
     int doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                           uint16_t peer_lid, uint32_t peer_qp_num,
-                          int local_gid_index, std::string *reply_msg = nullptr,
+                          int local_gid_index, ibv_mtu path_mtu,
+                          std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 
    private:

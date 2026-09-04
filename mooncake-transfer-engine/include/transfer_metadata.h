@@ -166,6 +166,10 @@ class TransferMetadata {
         std::string local_nic_path;
         uint16_t local_lid = 0;
         std::string local_gid;
+        // Path MTU the sender can use, in bytes. RC requires both ends to be
+        // programmed with the same path MTU, so each side advertises its own
+        // and both keep the smaller. 0 = not advertised (older peer).
+        uint32_t local_mtu_bytes = 0;
         std::string peer_nic_path;
 #ifdef USE_UB
         std::vector<uint32_t> jetty_num;  // for ub/urma

@@ -151,6 +151,9 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
                   [](const TransferMetadata::HandShakeDesc& peer,
                      TransferMetadata::HandShakeDesc& local) {
                       local.payload = "reply:" + peer.payload;
+                      // Echo the advertised path MTU so the test can check it
+                      // survives both directions of the wire encoding.
+                      local.local_mtu_bytes = peer.local_mtu_bytes;
                       return 0;
                   },
                   port, sockfd),
@@ -179,9 +182,20 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
 
     TransferMetadata::HandShakeDesc request;
     request.payload = "bootstrap";
+    request.local_mtu_bytes = 1024;
     TransferMetadata::HandShakeDesc response;
     ASSERT_EQ(client.sendHandshake(server_name, request, response), 0);
     EXPECT_EQ(response.payload, "reply:bootstrap");
+    EXPECT_EQ(response.local_mtu_bytes, 1024u);
+
+    // A peer that does not advertise a path MTU leaves the field at 0, which
+    // tells the receiver to keep its own.
+    TransferMetadata::HandShakeDesc legacy_request;
+    legacy_request.payload = "legacy";
+    TransferMetadata::HandShakeDesc legacy_response;
+    ASSERT_EQ(
+        client.sendHandshake(server_name, legacy_request, legacy_response), 0);
+    EXPECT_EQ(legacy_response.local_mtu_bytes, 0u);
 }
 
 // add, get and remove RPCMetaEntryMeta

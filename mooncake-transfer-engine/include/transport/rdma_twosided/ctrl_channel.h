@@ -96,7 +96,7 @@ class CtrlChannel {
     int postRecv(size_t idx);
     int repostAllRecvs();
     int connectQp(const std::string &peer_gid, uint16_t peer_lid,
-                  uint32_t peer_qp_num);
+                  uint32_t peer_qp_num, uint32_t peer_mtu_bytes);
     void dispatchRecvPayload(const uint8_t *data, size_t byte_len);
     void handleSendComplete();
     void handleRecvComplete(const ibv_wc &wc);

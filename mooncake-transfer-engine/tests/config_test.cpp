@@ -914,5 +914,51 @@ TEST_F(MtuEnvTest, InvalidIsIgnored) {
     EXPECT_EQ(config.mtu_length, IBV_MTU_4096);
 }
 
+// --- Path MTU negotiation (issue #3868) ---
+
+class MtuLengthScope {
+   public:
+    explicit MtuLengthScope(ibv_mtu value)
+        : previous_(globalConfig().mtu_length) {
+        globalConfig().mtu_length = value;
+    }
+
+    ~MtuLengthScope() { globalConfig().mtu_length = previous_; }
+
+   private:
+    ibv_mtu previous_;
+};
+
+TEST(PathMtuTest, MtuLengthToBytesCoversEveryEnumerant) {
+    EXPECT_EQ(mtuLengthToBytes(IBV_MTU_256), 256u);
+    EXPECT_EQ(mtuLengthToBytes(IBV_MTU_512), 512u);
+    EXPECT_EQ(mtuLengthToBytes(IBV_MTU_1024), 1024u);
+    EXPECT_EQ(mtuLengthToBytes(IBV_MTU_2048), 2048u);
+    EXPECT_EQ(mtuLengthToBytes(IBV_MTU_4096), 4096u);
+    EXPECT_EQ(mtuLengthToBytes(static_cast<ibv_mtu>(0)), 0u);
+}
+
+TEST(PathMtuTest, LocalPathMtuIsCappedByConfiguredMtu) {
+    MtuLengthScope scope(IBV_MTU_1024);
+    EXPECT_EQ(localPathMtu(IBV_MTU_4096), IBV_MTU_1024);
+    // A port slower than MC_MTU still wins: the hardware cannot do more.
+    EXPECT_EQ(localPathMtu(IBV_MTU_512), IBV_MTU_512);
+}
+
+// The regression: a 4096-MTU port talking to a 1024-MTU peer must program the
+// RC QP with the peer's smaller MTU, otherwise its READ/WRITE packets exceed
+// what the peer accepts.
+TEST(PathMtuTest, NegotiateTakesTheSmallerOfBothPeers) {
+    EXPECT_EQ(negotiatePathMtu(IBV_MTU_4096, 1024), IBV_MTU_1024);
+    EXPECT_EQ(negotiatePathMtu(IBV_MTU_1024, 4096), IBV_MTU_1024);
+    EXPECT_EQ(negotiatePathMtu(IBV_MTU_2048, 2048), IBV_MTU_2048);
+}
+
+TEST(PathMtuTest, NegotiateKeepsLocalMtuWhenPeerDoesNotAdvertise) {
+    // Older peers omit the field; unknown lengths are treated the same way.
+    EXPECT_EQ(negotiatePathMtu(IBV_MTU_2048, 0), IBV_MTU_2048);
+    EXPECT_EQ(negotiatePathMtu(IBV_MTU_2048, 1500), IBV_MTU_2048);
+}
+
 }  // namespace
 }  // namespace mooncake
