@@ -1,5 +1,6 @@
 #include "storage/local/log_structured/store.h"
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -53,6 +54,14 @@ LogStructuredStoreConfig Config(const StoreTempDirectory& temp,
                                     .max_segment_bytes = max_segment_bytes,
                                     .sync_data = true,
                                     .sync_wal = true};
+}
+
+std::filesystem::path SegmentFile(const StoreTempDirectory& temp,
+                                  uint64_t segment_id) {
+    std::ostringstream name;
+    name << "segment-" << std::setw(20) << std::setfill('0') << segment_id
+         << ".log";
+    return temp.path() / "segments" / name.str();
 }
 
 TEST(LogStructuredStoreTest, PutIsInvisibleUntilMasterCommit) {
@@ -326,6 +335,107 @@ TEST(LogStructuredStoreTest, CompactsLiveRecordsAndRecoversAfterRestart) {
               std::string(160, 'c'));
 }
 
+TEST(LogStructuredStoreTest, PreparedValueRemainsInvisibleAfterRestart) {
+    StoreTempDirectory temp;
+    const auto identity = StoreIdentity("prepared", 1);
+    {
+        auto store = LogStructuredStore::Open(Config(temp));
+        ASSERT_TRUE(store.has_value());
+        ASSERT_TRUE((*store)->PreparePut(identity, "uncommitted").has_value());
+    }
+
+    auto recovered = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ((*recovered)->Get(identity).error(), StoreError::kNotFound);
+    const auto snapshot = (*recovered)->SnapshotIndex();
+    ASSERT_EQ(snapshot.size(), size_t{1});
+    EXPECT_EQ(snapshot[0].identity, identity);
+    EXPECT_EQ(snapshot[0].version.state, VersionState::kPrepared);
+}
+
+TEST(LogStructuredStoreTest, MissingCommittedCompactionTargetFailsClosed) {
+    StoreTempDirectory temp;
+    const auto first = StoreIdentity("first", 1);
+    const auto second = StoreIdentity("second", 1);
+    uint64_t target_segment = 0;
+    {
+        auto store = LogStructuredStore::Open(Config(temp, 512));
+        ASSERT_TRUE(store.has_value());
+        auto first_write = (*store)->PreparePut(first, std::string(80, 'a'));
+        auto second_write = (*store)->PreparePut(second, std::string(80, 'b'));
+        ASSERT_TRUE(first_write.has_value());
+        ASSERT_TRUE(second_write.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(first, first_write->sequence).has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(second, second_write->sequence).has_value());
+        ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+        auto compacted = (*store)->CompactOnce({.max_source_segments = 1,
+                                                .max_input_bytes = 4096,
+                                                .max_target_bytes = 4096,
+                                                .fanout = 1,
+                                                .max_levels = 2,
+                                                .min_reclaim_ratio = 1.0,
+                                                .enable_tiering = true,
+                                                .stop_token = {}});
+        ASSERT_TRUE(compacted.has_value());
+        ASSERT_EQ(compacted->target_segments, size_t{1});
+        for (const auto& entry : (*store)->SnapshotCurrentIndex()) {
+            if (entry.identity == first) {
+                target_segment = entry.version.physical.segment_id;
+            }
+        }
+        ASSERT_NE(target_segment, uint64_t{0});
+    }
+
+    ASSERT_TRUE(std::filesystem::remove(SegmentFile(temp, target_segment)));
+    auto recovered = LogStructuredStore::Open(Config(temp, 512));
+    ASSERT_FALSE(recovered.has_value());
+    EXPECT_EQ(recovered.error(), StoreError::kCorruptData);
+}
+
+TEST(LogStructuredStoreTest, CorruptCommittedCompactionTargetFailsClosed) {
+    StoreTempDirectory temp;
+    const auto identity = StoreIdentity("key", 1);
+    uint64_t target_segment = 0;
+    PhysicalRecord target_record;
+    {
+        auto store = LogStructuredStore::Open(Config(temp, 128));
+        ASSERT_TRUE(store.has_value());
+        auto write = (*store)->PreparePut(identity, std::string(96, 'a'));
+        ASSERT_TRUE(write.has_value());
+        ASSERT_TRUE((*store)->CommitPut(identity, write->sequence).has_value());
+        ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+        auto compacted = (*store)->CompactOnce({.max_source_segments = 1,
+                                                .max_input_bytes = 4096,
+                                                .max_target_bytes = 4096,
+                                                .fanout = 1,
+                                                .max_levels = 2,
+                                                .min_reclaim_ratio = 1.0,
+                                                .enable_tiering = true,
+                                                .stop_token = {}});
+        ASSERT_TRUE(compacted.has_value());
+        ASSERT_EQ(compacted->target_segments, size_t{1});
+        const auto snapshot = (*store)->SnapshotCurrentIndex();
+        ASSERT_EQ(snapshot.size(), size_t{1});
+        target_record = snapshot[0].version.physical;
+        target_segment = target_record.segment_id;
+    }
+
+    const int fd =
+        open(SegmentFile(temp, target_segment).c_str(), O_RDWR | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    char byte = 0;
+    ASSERT_EQ(pread(fd, &byte, 1, target_record.value_offset), 1);
+    byte ^= 0x40;
+    ASSERT_EQ(pwrite(fd, &byte, 1, target_record.value_offset), 1);
+    ASSERT_EQ(close(fd), 0);
+
+    auto recovered = LogStructuredStore::Open(Config(temp, 128));
+    ASSERT_FALSE(recovered.has_value());
+    EXPECT_EQ(recovered.error(), StoreError::kCorruptData);
+}
+
 TEST(LogStructuredStoreTest, RemovesUnpublishedCompactionTargetOnRecovery) {
     StoreTempDirectory temp;
     const auto identity = StoreIdentity("key", 1);
@@ -340,10 +450,7 @@ TEST(LogStructuredStoreTest, RemovesUnpublishedCompactionTargetOnRecovery) {
         orphan_segment = (*store)->active_segment_id() + 1;
     }
 
-    std::ostringstream name;
-    name << "segment-" << std::setw(20) << std::setfill('0') << orphan_segment
-         << ".log";
-    const auto orphan_path = temp.path() / "segments" / name.str();
+    const auto orphan_path = SegmentFile(temp, orphan_segment);
     auto writer = SegmentWriter::Create(orphan_path.string(), orphan_segment);
     ASSERT_TRUE(writer.has_value());
     ASSERT_TRUE(
