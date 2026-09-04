@@ -139,6 +139,10 @@ class LogStructuredStore {
         const std::unordered_map<uint64_t, std::vector<ScannedRecord>>&
             scanned_segments) const;
     void RefreshSegmentLiveBytes();
+    tl::expected<void, StoreError> AddLiveRecordLocked(
+        const PhysicalRecord& physical);
+    tl::expected<void, StoreError> RemoveLiveRecordLocked(
+        const PhysicalRecord& physical);
     uint64_t PhysicalBytesLocked() const;
     tl::expected<void, StoreError> RotateSegmentIfNeeded(
         uint64_t next_record_bytes);

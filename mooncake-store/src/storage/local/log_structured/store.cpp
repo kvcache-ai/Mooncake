@@ -547,6 +547,31 @@ void LogStructuredStore::RefreshSegmentLiveBytes() {
     }
 }
 
+tl::expected<void, StoreError> LogStructuredStore::AddLiveRecordLocked(
+    const PhysicalRecord& physical) {
+    auto segment = segments_.find(physical.segment_id);
+    if (physical.total_length == 0 || segment == segments_.end() ||
+        segment->second.live_bytes >
+            std::numeric_limits<uint64_t>::max() - physical.total_length) {
+        recovery_required_ = true;
+        return tl::unexpected(StoreError::kCorruptData);
+    }
+    segment->second.live_bytes += physical.total_length;
+    return {};
+}
+
+tl::expected<void, StoreError> LogStructuredStore::RemoveLiveRecordLocked(
+    const PhysicalRecord& physical) {
+    auto segment = segments_.find(physical.segment_id);
+    if (physical.total_length == 0 || segment == segments_.end() ||
+        segment->second.live_bytes < physical.total_length) {
+        recovery_required_ = true;
+        return tl::unexpected(StoreError::kCorruptData);
+    }
+    segment->second.live_bytes -= physical.total_length;
+    return {};
+}
+
 tl::expected<void, StoreError> LogStructuredStore::RotateSegmentIfNeeded(
     uint64_t next_record_bytes) {
     if (active_segment_->tail() == 0 ||
@@ -611,6 +636,9 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
         identity.object_key.size() > kMaxKeyLength) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
+    if (index_.Lookup(identity)) {
+        return tl::unexpected(StoreError::kInvalidTransition);
+    }
     const uint64_t record_bytes = AlignedRecordSize(
         static_cast<uint32_t>(identity.tenant_id.size()),
         static_cast<uint32_t>(identity.object_key.size()), value.size());
@@ -634,6 +662,10 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
     auto appended = active_segment_->Append(identity, value, RecordKind::kValue,
                                             sequence, config_.sync_data);
     if (!appended) return tl::unexpected(StoreError::kIoError);
+    auto& segment = segments_.at(active_segment_->segment_id());
+    segment.valid_bytes = active_segment_->tail();
+    ++segment.record_count;
+    ++segment.mutation_epoch;
     WalRecord transition{.type = WalRecordType::kPrepareValue,
                          .sequence = sequence,
                          .identity = identity,
@@ -642,10 +674,8 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
     if (!wal_result) return tl::unexpected(StoreError::kIoError);
     auto prepared = index_.Prepare(identity, appended.value(), sequence);
     if (!prepared) return tl::unexpected(MapIndexError(prepared.error()));
-    auto& segment = segments_.at(active_segment_->segment_id());
-    segment.valid_bytes = active_segment_->tail();
-    ++segment.record_count;
-    ++segment.mutation_epoch;
+    auto live = AddLiveRecordLocked(appended.value());
+    if (!live) return tl::unexpected(live.error());
     return PreparedWrite{.identity = identity,
                          .sequence = sequence,
                          .physical = appended.value()};
@@ -667,6 +697,8 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPut(
         current->sequence != sequence) {
         return tl::unexpected(StoreError::kInvalidTransition);
     }
+    auto previous_current =
+        index_.LookupCurrent(identity.tenant_id, identity.object_key);
     auto persisted = wal_->Append(WalRecord{.type = WalRecordType::kCommitValue,
                                             .sequence = sequence,
                                             .identity = identity,
@@ -675,7 +707,11 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPut(
     if (!persisted) return tl::unexpected(StoreError::kIoError);
     auto committed = index_.Commit(identity, sequence);
     if (!committed) return tl::unexpected(MapIndexError(committed.error()));
-    RefreshSegmentLiveBytes();
+    if (previous_current && previous_current->identity != identity) {
+        auto removed =
+            RemoveLiveRecordLocked(previous_current->version.physical);
+        if (!removed) return tl::unexpected(removed.error());
+    }
     return {};
 }
 
@@ -703,6 +739,8 @@ tl::expected<void, StoreError> LogStructuredStore::AbortPut(
     if (!persisted) return tl::unexpected(StoreError::kIoError);
     auto aborted = index_.Abort(identity, sequence);
     if (!aborted) return tl::unexpected(MapIndexError(aborted.error()));
+    auto removed = RemoveLiveRecordLocked(current->physical);
+    if (!removed) return tl::unexpected(removed.error());
     return {};
 }
 
@@ -716,6 +754,7 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
         identity.object_key.size() > kMaxKeyLength) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
+    const auto existing = index_.Lookup(identity);
     const uint64_t record_bytes =
         AlignedRecordSize(static_cast<uint32_t>(identity.tenant_id.size()),
                           static_cast<uint32_t>(identity.object_key.size()), 0);
@@ -734,6 +773,10 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
     auto appended = active_segment_->Append(
         identity, "", RecordKind::kTombstone, sequence, config_.sync_data);
     if (!appended) return tl::unexpected(StoreError::kIoError);
+    auto& segment = segments_.at(active_segment_->segment_id());
+    segment.valid_bytes = active_segment_->tail();
+    ++segment.record_count;
+    ++segment.mutation_epoch;
     auto persisted =
         wal_->Append(WalRecord{.type = WalRecordType::kApplyTombstone,
                                .sequence = sequence,
@@ -745,12 +788,12 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
     if (!tombstoned) {
         return tl::unexpected(MapIndexError(tombstoned.error()));
     }
-    auto& segment = segments_.at(active_segment_->segment_id());
-    segment.valid_bytes = active_segment_->tail();
-    ++segment.record_count;
-    ++segment.mutation_epoch;
+    if (existing && (existing->state == VersionState::kPrepared ||
+                     existing->state == VersionState::kCommitted)) {
+        auto removed = RemoveLiveRecordLocked(existing->physical);
+        if (!removed) return tl::unexpected(removed.error());
+    }
     applied_delete_watermark_ = sequence;
-    RefreshSegmentLiveBytes();
     return {};
 }
 
@@ -786,7 +829,6 @@ tl::expected<void, StoreError> LogStructuredStore::CheckpointLocked() {
     if (!active_segment_->Sync() || !wal_->Sync()) {
         return tl::unexpected(StoreError::kIoError);
     }
-    RefreshSegmentLiveBytes();
     const uint64_t generation = manifest_generation_ + 1;
     const uint64_t checkpoint_sequence = next_sequence_ - 1;
     std::vector<SegmentMetadata> segment_snapshot;
@@ -916,7 +958,6 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
             return tl::unexpected(StoreError::kRecoveryRequired);
         }
         CleanupRetiredSegmentsLocked();
-        RefreshSegmentLiveBytes();
         std::unordered_set<uint64_t> prepared_segments;
         for (const auto& entry : index_.Snapshot()) {
             if (entry.version.state == VersionState::kPrepared &&
@@ -1213,6 +1254,7 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
                 auto current = segments_.find(source.segment_id);
                 if (current != segments_.end()) {
                     current->second.state = SegmentLifecycle::kSealed;
+                    current->second.live_bytes = source.live_bytes;
                     ++current->second.mutation_epoch;
                 }
             }
@@ -1236,9 +1278,9 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         for (const auto& source : sources) {
             auto& current = segments_.at(source.segment_id);
             current.state = SegmentLifecycle::kRetired;
+            current.live_bytes = 0;
             ++current.mutation_epoch;
         }
-        RefreshSegmentLiveBytes();
         auto checkpointed = CheckpointLocked();
         if (!checkpointed) {
             if (checkpointed.error() == StoreError::kRecoveryRequired) {
@@ -1253,6 +1295,7 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
                 auto current = segments_.find(source.segment_id);
                 if (current != segments_.end()) {
                     current->second.state = SegmentLifecycle::kSealed;
+                    current->second.live_bytes = source.live_bytes;
                     ++current->second.mutation_epoch;
                 }
             }
@@ -1264,7 +1307,6 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
             return tl::unexpected(StoreError::kIoError);
         }
         CleanupRetiredSegmentsLocked();
-        RefreshSegmentLiveBytes();
         if (HitCompactionCrashPoint(CompactionCrashPoint::kAfterSourceUnlink)) {
             return tl::unexpected(StoreError::kIoError);
         }

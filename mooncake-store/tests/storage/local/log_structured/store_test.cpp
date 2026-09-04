@@ -78,6 +78,43 @@ TEST(LogStructuredStoreTest, PutIsInvisibleUntilMasterCommit) {
     EXPECT_EQ((*store)->Get(identity).value(), "value");
 }
 
+TEST(LogStructuredStoreTest, MaintainsLiveBytesAcrossVersionTransitions) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(store.has_value());
+
+    const auto aborted_identity = StoreIdentity("aborted", 1);
+    auto aborted = (*store)->PreparePut(aborted_identity, "aborted-value");
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ((*store)->SnapshotStats().live_record_bytes,
+              aborted->physical.total_length);
+    ASSERT_TRUE(
+        (*store)->AbortPut(aborted_identity, aborted->sequence).has_value());
+    EXPECT_EQ((*store)->SnapshotStats().live_record_bytes, uint64_t{0});
+
+    const auto old_identity = StoreIdentity("key", 1);
+    auto old_write = (*store)->PreparePut(old_identity, "old-value");
+    ASSERT_TRUE(old_write.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(old_identity, old_write->sequence).has_value());
+    EXPECT_EQ((*store)->SnapshotStats().live_record_bytes,
+              old_write->physical.total_length);
+
+    const auto new_identity = StoreIdentity("key", 2);
+    auto new_write = (*store)->PreparePut(new_identity, "new-value");
+    ASSERT_TRUE(new_write.has_value());
+    EXPECT_EQ(
+        (*store)->SnapshotStats().live_record_bytes,
+        old_write->physical.total_length + new_write->physical.total_length);
+    ASSERT_TRUE(
+        (*store)->CommitPut(new_identity, new_write->sequence).has_value());
+    EXPECT_EQ((*store)->SnapshotStats().live_record_bytes,
+              new_write->physical.total_length);
+
+    ASSERT_TRUE((*store)->Delete(new_identity).has_value());
+    EXPECT_EQ((*store)->SnapshotStats().live_record_bytes, uint64_t{0});
+}
+
 TEST(LogStructuredStoreTest, GeneratesIncarnationsForLatestLookup) {
     StoreTempDirectory temp;
     auto store = LogStructuredStore::Open(Config(temp));
