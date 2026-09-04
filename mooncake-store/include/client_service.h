@@ -633,6 +633,24 @@ class Client {
         }
     }
 
+    /**
+     * @brief Record the per-stage latency breakdown of a batch get.
+     * @param metadata_us Time spent querying object metadata from the master
+     * @param data_us Time spent on the actual data transfer (RDMA / disk)
+     *
+     * The two stages are reported separately so that a slow batch get can be
+     * attributed to master RPC latency or to the data path without having to
+     * correlate several mixed metrics.
+     */
+    void ObserveBatchGetBreakdown(uint64_t metadata_us, uint64_t data_us) {
+        if (metrics_ != nullptr) {
+            metrics_->transfer_metric.batch_get_metadata_latency_us.observe(
+                metadata_us);
+            metrics_->transfer_metric.batch_get_data_latency_us.observe(
+                data_us);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
