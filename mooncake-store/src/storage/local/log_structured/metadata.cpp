@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <filesystem>
@@ -86,6 +87,15 @@ tl::expected<void, MetadataError> SyncDirectory(const std::string& path) {
 bool IsSafeFilename(std::string_view filename) {
     return !filename.empty() && filename != "." && filename != ".." &&
            filename.find('/') == std::string_view::npos;
+}
+
+bool IsNumberedArtifact(std::string_view filename, std::string_view prefix) {
+    if (!filename.starts_with(prefix) || filename.size() == prefix.size()) {
+        return false;
+    }
+    filename.remove_prefix(prefix.size());
+    return std::all_of(filename.begin(), filename.end(),
+                       [](char value) { return value >= '0' && value <= '9'; });
 }
 
 std::string NumberedFilename(std::string_view prefix, uint64_t generation) {
@@ -229,7 +239,8 @@ tl::expected<CheckpointState, MetadataError> LoadCheckpoint(
 }
 
 tl::expected<void, MetadataError> PublishManifest(
-    const std::string& root_path, const ManifestState& manifest) {
+    const std::string& root_path, const ManifestState& manifest,
+    std::function<bool()> fail_before_current) {
     if (manifest.format_version != 1 || manifest.generation == 0 ||
         !IsSafeFilename(manifest.checkpoint_file) ||
         !IsSafeFilename(manifest.wal_file)) {
@@ -241,6 +252,9 @@ tl::expected<void, MetadataError> PublishManifest(
         AtomicWrite(root_path, manifest_file,
                     EncodeArtifact(ArtifactKind::kManifest, manifest));
     if (!written) return written;
+    if (fail_before_current && fail_before_current()) {
+        return tl::unexpected(MetadataError::kIoError);
+    }
     return AtomicWrite(root_path, "CURRENT", manifest_file + "\n");
 }
 
@@ -265,6 +279,52 @@ tl::expected<ManifestState, MetadataError> LoadCurrentManifest(
         return tl::unexpected(MetadataError::kCorruptData);
     }
     return manifest.value();
+}
+
+tl::expected<void, MetadataError> CleanupMetadataArtifacts(
+    const std::string& root_path, uint64_t current_generation,
+    const std::string& current_wal_file) {
+    if (!IsSafeFilename(current_wal_file)) {
+        return tl::unexpected(MetadataError::kInvalidArgument);
+    }
+    const std::string current_manifest =
+        current_generation == 0
+            ? std::string{}
+            : NumberedFilename("MANIFEST", current_generation);
+    const std::string current_checkpoint =
+        current_generation == 0
+            ? std::string{}
+            : NumberedFilename("CHECKPOINT", current_generation);
+    std::error_code error;
+    bool removed_any = false;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(root_path, error)) {
+        if (error) return tl::unexpected(MetadataError::kIoError);
+        if (!entry.is_regular_file(error)) {
+            error.clear();
+            continue;
+        }
+        const std::string filename = entry.path().filename().string();
+        const bool temporary = filename.ends_with(".tmp");
+        std::string_view stable_name = filename;
+        if (temporary && stable_name.ends_with(".tmp")) {
+            stable_name.remove_suffix(4);
+        }
+        const bool managed = IsNumberedArtifact(stable_name, "MANIFEST-") ||
+                             IsNumberedArtifact(stable_name, "CHECKPOINT-") ||
+                             IsNumberedArtifact(stable_name, "WAL-") ||
+                             filename == "CURRENT.tmp";
+        if (!managed || filename == "CURRENT" || filename == current_manifest ||
+            filename == current_checkpoint || filename == current_wal_file) {
+            continue;
+        }
+        if (unlink(entry.path().c_str()) != 0 && errno != ENOENT) {
+            return tl::unexpected(MetadataError::kIoError);
+        }
+        removed_any = true;
+    }
+    if (!removed_any) return {};
+    return SyncDirectory(root_path);
 }
 
 tl::expected<void, MetadataError> RemoveFileDurably(

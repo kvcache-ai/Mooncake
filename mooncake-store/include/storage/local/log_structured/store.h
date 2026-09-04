@@ -83,7 +83,10 @@ enum class CompactionCrashPoint {
     kBeforeTargetSync,
     kAfterTargetSync,
     kAfterTargetRename,
+    kBeforeManifestWrite,
+    kAfterManifestWrite,
     kAfterManifestPublication,
+    kAfterSourceUnlink,
 };
 
 class LogStructuredStore {

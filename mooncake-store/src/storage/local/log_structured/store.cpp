@@ -215,6 +215,11 @@ tl::expected<void, StoreError> LogStructuredStore::Recover() {
     if (!recovered_segments) return recovered_segments;
     next_sequence_ = std::max(next_sequence_, max_sequence + 1);
     RefreshSegmentLiveBytes();
+    const std::string wal_file =
+        std::filesystem::path(wal_path_).filename().string();
+    auto cleaned = CleanupMetadataArtifacts(config_.root_path,
+                                            manifest_generation_, wal_file);
+    if (!cleaned) return tl::unexpected(StoreError::kIoError);
     return {};
 }
 
@@ -670,7 +675,13 @@ tl::expected<void, StoreError> LogStructuredStore::CheckpointLocked() {
                            .checkpoint_file = *checkpoint_file,
                            .wal_file = next_wal_file,
                            .segments = segment_snapshot};
-    auto published = PublishManifest(config_.root_path, manifest);
+    if (HitCompactionCrashPoint(CompactionCrashPoint::kBeforeManifestWrite)) {
+        return tl::unexpected(StoreError::kIoError);
+    }
+    auto published = PublishManifest(config_.root_path, manifest, [] {
+        return HitCompactionCrashPoint(
+            CompactionCrashPoint::kAfterManifestWrite);
+    });
     if (!published) {
         RemoveFileDurably(config_.root_path, next_wal_file);
         return tl::unexpected(StoreError::kIoError);
@@ -686,6 +697,8 @@ tl::expected<void, StoreError> LogStructuredStore::CheckpointLocked() {
     if (old_wal_file != next_wal_file) {
         static_cast<void>(RemoveFileDurably(config_.root_path, old_wal_file));
     }
+    static_cast<void>(
+        CleanupMetadataArtifacts(config_.root_path, generation, next_wal_file));
     return {};
 }
 
@@ -1056,6 +1069,9 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         }
         CleanupRetiredSegmentsLocked();
         RefreshSegmentLiveBytes();
+        if (HitCompactionCrashPoint(CompactionCrashPoint::kAfterSourceUnlink)) {
+            return tl::unexpected(StoreError::kIoError);
+        }
     }
 
     uint64_t output_bytes = 0;

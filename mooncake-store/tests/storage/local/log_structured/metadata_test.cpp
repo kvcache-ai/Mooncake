@@ -121,6 +121,83 @@ TEST(LogStructuredMetadataTest, CurrentIgnoresUnpublishedManifest) {
     EXPECT_EQ(loaded->generation, uint64_t{1});
 }
 
+TEST(LogStructuredMetadataTest, CleansUnreferencedMetadataArtifacts) {
+    MetadataTempDirectory temp;
+    auto first_checkpoint =
+        WriteCheckpoint(temp.path().string(), 1, Checkpoint());
+    ASSERT_TRUE(first_checkpoint.has_value());
+    ManifestState first_manifest{
+        .format_version = 1,
+        .generation = 1,
+        .checkpoint_sequence = 7,
+        .next_sequence = 8,
+        .next_segment_id = 3,
+        .active_segment_id = 1,
+        .checkpoint_file = *first_checkpoint,
+        .wal_file = "WAL-00000000000000000001",
+        .segments = Checkpoint().segments,
+    };
+    ASSERT_TRUE(
+        PublishManifest(temp.path().string(), first_manifest).has_value());
+
+    auto second_checkpoint =
+        WriteCheckpoint(temp.path().string(), 2, Checkpoint());
+    ASSERT_TRUE(second_checkpoint.has_value());
+    ManifestState second_manifest = first_manifest;
+    second_manifest.generation = 2;
+    second_manifest.checkpoint_file = *second_checkpoint;
+    second_manifest.wal_file = "WAL-00000000000000000002";
+    ASSERT_TRUE(
+        PublishManifest(temp.path().string(), second_manifest).has_value());
+
+    std::ofstream(temp.path() / first_manifest.wal_file) << "old";
+    std::ofstream(temp.path() / second_manifest.wal_file) << "current";
+    std::ofstream(temp.path() / "MANIFEST-00000000000000000003.tmp")
+        << "partial";
+    std::ofstream(temp.path() / "user.tmp") << "unmanaged";
+
+    ASSERT_TRUE(CleanupMetadataArtifacts(temp.path().string(), 2,
+                                         second_manifest.wal_file)
+                    .has_value());
+    EXPECT_FALSE(std::filesystem::exists(temp.path() / *first_checkpoint));
+    EXPECT_FALSE(
+        std::filesystem::exists(temp.path() / "MANIFEST-00000000000000000001"));
+    EXPECT_FALSE(
+        std::filesystem::exists(temp.path() / first_manifest.wal_file));
+    EXPECT_FALSE(std::filesystem::exists(temp.path() /
+                                         "MANIFEST-00000000000000000003.tmp"));
+    EXPECT_TRUE(std::filesystem::exists(temp.path() / *second_checkpoint));
+    EXPECT_TRUE(
+        std::filesystem::exists(temp.path() / "MANIFEST-00000000000000000002"));
+    EXPECT_TRUE(
+        std::filesystem::exists(temp.path() / second_manifest.wal_file));
+    EXPECT_TRUE(std::filesystem::exists(temp.path() / "user.tmp"));
+
+    auto loaded = LoadCurrentManifest(temp.path().string());
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->generation, uint64_t{2});
+}
+
+TEST(LogStructuredMetadataTest, CleansArtifactsBeforeFirstPublication) {
+    MetadataTempDirectory temp;
+    std::ofstream(temp.path() / "WAL-00000000000000000000") << "current";
+    std::ofstream(temp.path() / "WAL-00000000000000000001") << "orphan";
+    std::ofstream(temp.path() / "CHECKPOINT-00000000000000000001") << "orphan";
+    std::ofstream(temp.path() / "MANIFEST-00000000000000000001") << "orphan";
+
+    ASSERT_TRUE(CleanupMetadataArtifacts(temp.path().string(), 0,
+                                         "WAL-00000000000000000000")
+                    .has_value());
+    EXPECT_TRUE(
+        std::filesystem::exists(temp.path() / "WAL-00000000000000000000"));
+    EXPECT_FALSE(
+        std::filesystem::exists(temp.path() / "WAL-00000000000000000001"));
+    EXPECT_FALSE(std::filesystem::exists(temp.path() /
+                                         "CHECKPOINT-00000000000000000001"));
+    EXPECT_FALSE(
+        std::filesystem::exists(temp.path() / "MANIFEST-00000000000000000001"));
+}
+
 TEST(LogStructuredMetadataTest, RejectsCorruptCheckpoint) {
     MetadataTempDirectory temp;
     auto checkpoint_file =

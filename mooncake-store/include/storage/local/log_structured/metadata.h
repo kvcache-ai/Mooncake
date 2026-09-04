@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -65,10 +66,14 @@ tl::expected<std::string, MetadataError> WriteCheckpoint(
 tl::expected<CheckpointState, MetadataError> LoadCheckpoint(
     const std::string& root_path, const std::string& checkpoint_file);
 tl::expected<void, MetadataError> PublishManifest(
-    const std::string& root_path, const ManifestState& manifest);
+    const std::string& root_path, const ManifestState& manifest,
+    std::function<bool()> fail_before_current = {});
 tl::expected<ManifestState, MetadataError> LoadCurrentManifest(
     const std::string& root_path);
 tl::expected<void, MetadataError> RemoveFileDurably(
     const std::string& root_path, const std::string& filename);
+tl::expected<void, MetadataError> CleanupMetadataArtifacts(
+    const std::string& root_path, uint64_t current_generation,
+    const std::string& current_wal_file);
 
 }  // namespace mooncake::logstructured

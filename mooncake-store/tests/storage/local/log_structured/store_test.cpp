@@ -564,6 +564,43 @@ TEST(LogStructuredStoreTest, CancelledCompactionLeavesSourcesReadable) {
               std::string(96, 'b'));
 }
 
+TEST(LogStructuredStoreTest, CompactionHonorsBandwidthLimit) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 64 * 1024));
+    ASSERT_TRUE(store.has_value());
+
+    const auto live = StoreIdentity("live", 1);
+    const auto stale = StoreIdentity("stale", 1);
+    const auto replacement = StoreIdentity("stale", 2);
+    for (const auto& identity : {live, stale}) {
+        auto write = (*store)->PreparePut(identity, std::string(8 * 1024, 'a'));
+        ASSERT_TRUE(write.has_value());
+        ASSERT_TRUE((*store)->CommitPut(identity, write->sequence).has_value());
+    }
+    ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+    auto replacement_write =
+        (*store)->PreparePut(replacement, std::string(8 * 1024, 'b'));
+    ASSERT_TRUE(replacement_write.has_value());
+    ASSERT_TRUE((*store)
+                    ->CommitPut(replacement, replacement_write->sequence)
+                    .has_value());
+
+    const auto started = std::chrono::steady_clock::now();
+    auto compacted = (*store)->CompactOnce({.max_source_segments = 1,
+                                            .max_input_bytes = 64 * 1024,
+                                            .max_target_bytes = 64 * 1024,
+                                            .fanout = 2,
+                                            .max_levels = 2,
+                                            .min_reclaim_ratio = 0.0,
+                                            .max_bytes_per_second = 32 * 1024,
+                                            .stop_token = {}});
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{1});
+    EXPECT_GE(elapsed, std::chrono::milliseconds(200));
+    EXPECT_EQ((*store)->Get(live).value(), std::string(8 * 1024, 'a'));
+}
+
 TEST(LogStructuredStoreTest,
      ConcurrentMutationRejectsStaleCompactionPublication) {
     StoreTempDirectory temp;
@@ -785,7 +822,10 @@ TEST(LogStructuredStoreTest, RecoversAcrossCompactionPublicationCrashPoints) {
         CompactionCrashPoint::kBeforeTargetSync,
         CompactionCrashPoint::kAfterTargetSync,
         CompactionCrashPoint::kAfterTargetRename,
+        CompactionCrashPoint::kBeforeManifestWrite,
+        CompactionCrashPoint::kAfterManifestWrite,
         CompactionCrashPoint::kAfterManifestPublication,
+        CompactionCrashPoint::kAfterSourceUnlink,
     };
 
     for (const auto crash_point : crash_points) {
