@@ -121,6 +121,9 @@ ErrorCode LogStructuredStorageBackend::ToWriteError(
     if (error == logstructured::StoreError::kNotFound) {
         return ErrorCode::OBJECT_NOT_FOUND;
     }
+    if (error == logstructured::StoreError::kNoSpace) {
+        return ErrorCode::KEYS_ULTRA_LIMIT;
+    }
     return ErrorCode::FILE_WRITE_FAIL;
 }
 
@@ -161,12 +164,23 @@ tl::expected<void, ErrorCode> LogStructuredStorageBackend::Init() {
     if (!backend_config_.Validate()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    uint64_t max_physical_bytes = std::numeric_limits<uint64_t>::max();
+    if (file_storage_config_.total_size_limit > 0) {
+        const uint64_t capacity =
+            static_cast<uint64_t>(file_storage_config_.total_size_limit);
+        if (backend_config_.compaction_reserve_bytes >= capacity) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        max_physical_bytes =
+            capacity - backend_config_.compaction_reserve_bytes;
+    }
     const std::filesystem::path root =
         std::filesystem::path(file_storage_config_.storage_filepath) /
         "log_structured";
     auto store = logstructured::LogStructuredStore::Open(
         {.root_path = root.string(),
          .max_segment_bytes = backend_config_.segment_size_bytes,
+         .max_physical_bytes = max_physical_bytes,
          .sync_data =
              backend_config_.sync_policy == LogStructuredSyncPolicy::kRecord,
          .sync_wal =
@@ -200,19 +214,29 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
     }
 
     std::vector<logstructured::PreparedWrite> prepared;
+    std::optional<ErrorCode> first_prepare_error;
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
     prepared.reserve(batch_object.size());
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
     for (const auto& [key, slices] : batch_object) {
-        if (test_failure_predicate_ && test_failure_predicate_(key)) continue;
+        if (test_failure_predicate_ && test_failure_predicate_(key)) {
+            first_prepare_error = ErrorCode::FILE_WRITE_FAIL;
+            continue;
+        }
         auto value = ConcatSlices(slices);
-        if (!value) continue;
+        if (!value) {
+            first_prepare_error = value.error();
+            continue;
+        }
         auto [tenant_id, object_key] = SplitStorageKey(key);
         auto write = store_->PreparePut(std::move(tenant_id),
                                         std::move(object_key), *value);
-        if (!write) continue;
+        if (!write) {
+            first_prepare_error = ToWriteError(write.error());
+            continue;
+        }
         metadatas.push_back(StorageObjectMetadata{
             -1, 0, static_cast<int64_t>(key.size()),
             static_cast<int64_t>(write->physical.value_length), ""});
@@ -220,7 +244,8 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
         prepared.push_back(std::move(write.value()));
     }
     if (prepared.empty()) {
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return tl::make_unexpected(
+            first_prepare_error.value_or(ErrorCode::FILE_WRITE_FAIL));
     }
     if (backend_config_.sync_policy == LogStructuredSyncPolicy::kBatch &&
         !store_->Sync()) {

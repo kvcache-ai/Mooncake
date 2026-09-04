@@ -488,6 +488,17 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
     if (record_bytes == 0) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
+    uint64_t physical_bytes = 0;
+    for (const auto& [segment_id, segment] : segments_) {
+        static_cast<void>(segment_id);
+        if (segment.valid_bytes > config_.max_physical_bytes - physical_bytes) {
+            return tl::unexpected(StoreError::kNoSpace);
+        }
+        physical_bytes += segment.valid_bytes;
+    }
+    if (record_bytes > config_.max_physical_bytes - physical_bytes) {
+        return tl::unexpected(StoreError::kNoSpace);
+    }
     auto rotated = RotateSegmentIfNeeded(record_bytes);
     if (!rotated) return tl::unexpected(rotated.error());
 

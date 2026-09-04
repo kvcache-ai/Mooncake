@@ -271,14 +271,51 @@ TEST(LogStructuredStorageBackendTest, BackgroundTieringKeepsObjectsReadable) {
 }
 
 TEST(LogStructuredStorageBackendTest,
+     CapacityLimitRejectsAppendAndPreservesCommittedValue) {
+    BackendTempDirectory temp;
+    auto config = BackendConfig(temp);
+    config.total_size_limit = 256;
+    LogStructuredBackendConfig backend_config;
+    backend_config.segment_size_bytes = 1024;
+    backend_config.compaction_policy = LogStructuredCompactionPolicy::kNone;
+
+    LogStructuredStorageBackend backend(config, backend_config);
+    ASSERT_TRUE(backend.Init().has_value());
+    const std::string storage_key =
+        TenantId("tenant-a").MakeScopedKey("capacity-key");
+    std::string old_value(96, 'a');
+    ASSERT_TRUE(backend
+                    .BatchOffload(SingleValueBatch(storage_key, old_value),
+                                  [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+                                      return ErrorCode::OK;
+                                  })
+                    .has_value());
+
+    std::string new_value(96, 'b');
+    auto rejected = backend.BatchOffload(
+        SingleValueBatch(storage_key, new_value),
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+
+    std::string loaded(old_value.size(), '\0');
+    std::unordered_map<std::string, Slice> slices{
+        {storage_key, Slice{loaded.data(), loaded.size()}}};
+    ASSERT_TRUE(backend.BatchLoad(slices).has_value());
+    EXPECT_EQ(loaded, old_value);
+}
+
+TEST(LogStructuredStorageBackendTest,
      DiskWatermarkCompactsGarbageWithoutEvictingLiveKeys) {
     BackendTempDirectory temp;
     auto config = BackendConfig(temp);
-    config.total_size_limit = 512;
+    config.total_size_limit = 1024;
     LogStructuredBackendConfig backend_config;
     backend_config.segment_size_bytes = 128;
     backend_config.compaction_policy = LogStructuredCompactionPolicy::kNone;
-    backend_config.compaction_reserve_bytes = 128;
+    backend_config.compaction_reserve_bytes = 256;
     backend_config.compaction_max_sources = 8;
     backend_config.compaction_max_bytes_per_round = 4096;
     backend_config.compaction_max_target_bytes = 4096;
@@ -297,7 +334,7 @@ TEST(LogStructuredStorageBackendTest,
                                       })
                         .has_value());
     }
-    EXPECT_FALSE(backend.IsEnableOffloading().value());
+    EXPECT_TRUE(backend.IsEnableOffloading().value());
 
     const auto segments_path = temp.path() / "log_structured" / "segments";
     const auto disk_bytes = [&]() {
@@ -310,7 +347,7 @@ TEST(LogStructuredStorageBackendTest,
     };
     const uint64_t before = disk_bytes();
 
-    auto evicted = backend.EvictAboveDiskWatermark(0.90, 0.75);
+    auto evicted = backend.EvictAboveDiskWatermark(0.70, 0.30);
     ASSERT_TRUE(evicted.has_value());
     EXPECT_TRUE(evicted->empty());
     EXPECT_LT(disk_bytes(), before);

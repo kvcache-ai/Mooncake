@@ -28,12 +28,14 @@ enum class StoreError {
     kUnrecognizedFormat,
     kNotFound,
     kInvalidTransition,
+    kNoSpace,
     kCancelled,
 };
 
 struct LogStructuredStoreConfig {
     std::string root_path;
     uint64_t max_segment_bytes{256ULL * 1024 * 1024};
+    uint64_t max_physical_bytes{std::numeric_limits<uint64_t>::max()};
     bool sync_data{true};
     bool sync_wal{true};
 };
