@@ -169,42 +169,49 @@ class BatchEvictBench {
         const auto base_expiration = now - std::chrono::hours(1);
         size_t ordinal = 0;
 
-        for (size_t shard_idx = 0; shard_idx < MasterService::kNumShards;
-             ++shard_idx) {
-            MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
-            for (auto& [tenant_id, tenant_state] : shard->tenants) {
+        // Objects live in the default tenant's per-tenant route. Walk it via
+        // the ownership registry; per-object access is under the metadata lock.
+        service.tenant_directory_.Visit(
+            [&](const TenantId& tenant_id,
+                const std::shared_ptr<MasterService::TenantState>& handle) {
                 if (tenant_id != TenantId::Default()) {
-                    continue;
+                    return;
                 }
-                for (auto& [key, metadata] : tenant_state.metadata) {
-                    {
-                        SpinLocker locker(&metadata.lock);
-                        metadata.lease_->SetDeadline(
-                            base_expiration +
-                            std::chrono::nanoseconds(ordinal++));
-                    }
-
-                    ++stats.object_count;
-                    if (!metadata.IsLeaseExpired(now)) {
-                        ++stats.unexpired_leases;
-                    }
-                    for (const auto& replica : metadata.GetAllReplicas()) {
-                        if (replica.is_memory_replica()) {
-                            if (replica.is_completed()) {
-                                ++stats.completed_memory_replicas;
-                            } else {
-                                ++stats.incomplete_replicas;
-                            }
-                            if (replica.get_refcnt() != 0) {
-                                ++stats.busy_memory_replicas;
-                            }
-                        } else {
-                            ++stats.non_memory_replicas;
+                auto& tenant_state = *handle;
+                tenant_state.VisitObjects(
+                    [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
+                            entry) {
+                        if (!entry->has_metadata()) {
+                            return;
                         }
-                    }
-                }
-            }
-        }
+                        auto& metadata = *entry->metadata();
+                        {
+                            SpinLocker locker(&metadata.lock);
+                            metadata.lease_->SetDeadline(
+                                base_expiration +
+                                std::chrono::nanoseconds(ordinal++));
+                        }
+
+                        ++stats.object_count;
+                        if (!metadata.IsLeaseExpired(now)) {
+                            ++stats.unexpired_leases;
+                        }
+                        for (const auto& replica : metadata.GetAllReplicas()) {
+                            if (replica.is_memory_replica()) {
+                                if (replica.is_completed()) {
+                                    ++stats.completed_memory_replicas;
+                                } else {
+                                    ++stats.incomplete_replicas;
+                                }
+                                if (replica.get_refcnt() != 0) {
+                                    ++stats.busy_memory_replicas;
+                                }
+                            } else {
+                                ++stats.non_memory_replicas;
+                            }
+                        }
+                    });
+            });
 
         return stats;
     }

@@ -228,10 +228,10 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     TenantQuotaHandle GetOrCreateTenantStateHandleForTest(
         MasterService& service, size_t shard_idx, const TenantId& tenant_id) {
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
-        auto& tenant_state =
-            service.GetOrCreateTenantState(shard.get(), tenant_id);
-        return service.GetBoundTenantQuotaHandle(tenant_state);
+        (void)shard_idx;
+        auto tenant_state_handle =
+            service.GetOrCreateTenantStateHandle(tenant_id);
+        return service.GetBoundTenantQuotaHandle(*tenant_state_handle);
     }
 
     tl::expected<void, ErrorCode> ChargeBoundTenantQuotaForTest(
@@ -248,8 +248,12 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void DiscardExpiredProcessingForTest(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        const size_t shard_idx = service.getShardIndex(tenant_id, key);
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        (void)key;
+        auto tenant_handle = service.tenant_directory_.Lookup(tenant_id);
+        if (tenant_handle == nullptr) {
+            return;
+        }
+        MasterService::TenantStateAccessorRW shard(tenant_handle.get());
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::time_point::max());
     }
