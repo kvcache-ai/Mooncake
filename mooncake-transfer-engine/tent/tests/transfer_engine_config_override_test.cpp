@@ -321,6 +321,23 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
 }
 
+TEST(TransferEngineConfigOverrideTest, FlushGpuDirectWritesEnvLoadsAsBool) {
+    {
+        EnvVarGuard guard("MC_FLUSH_GPU_DIRECT_RDMA_WRITES", "0");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_FALSE(
+            config.get("transports/rdma/flush_gpu_direct_rdma_writes", true));
+    }
+    {
+        EnvVarGuard guard("MC_FLUSH_GPU_DIRECT_RDMA_WRITES", "true");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_TRUE(
+            config.get("transports/rdma/flush_gpu_direct_rdma_writes", false));
+    }
+}
+
 TEST(TransferEngineConfigOverrideTest, FilterNicEnvLoadsRdmaWhitelist) {
     EnvVarGuard guard("MC_TE_FILTERS", "mlx5_0,mlx5_1");
 
