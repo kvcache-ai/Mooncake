@@ -14,6 +14,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
+#include <limits>
+#include <numeric>
 
 #include "dummy_client.h"
 #include "environ.h"
@@ -45,6 +48,7 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::get_into_range_shm_helper>(&rc);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
+    server.register_handler<&RealClient::allocate_buffer_dummy>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::release_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&rc);
@@ -428,6 +432,40 @@ TEST_F(DummyClientGetBufferTest, BatchQueryPreservesObjectChecksum) {
     ASSERT_TRUE(dummy_results[0].has_value());
     EXPECT_EQ(dummy_results[0]->object_checksum,
               real_results[0]->object_checksum);
+}
+
+TEST_F(DummyClientGetBufferTest, ExternalHostRegistrationLifecycle) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    constexpr size_t kSize = 4096;
+    std::vector<char> source(kSize);
+    std::vector<char> destination(kSize, 0);
+    std::iota(source.begin(), source.end(), 0);
+
+    ASSERT_EQ(dummy_client_->register_buffer(source.data(), kSize), 0);
+    ASSERT_EQ(dummy_client_->register_buffer(destination.data(), kSize), 0);
+    EXPECT_EQ(dummy_client_->register_buffer(source.data(), kSize), 0)
+        << "same range registration should be reference counted";
+    EXPECT_NE(dummy_client_->register_buffer(source.data(), kSize - 1), 0);
+    EXPECT_NE(dummy_client_->register_buffer(source.data() + 1, kSize - 1), 0);
+    EXPECT_NE(
+        dummy_client_->register_buffer(
+            reinterpret_cast<void *>(std::numeric_limits<uintptr_t>::max() - 3),
+            8),
+        0);
+
+    const std::string key = "dummy_external_host_lifecycle";
+    ASSERT_EQ(dummy_client_->put_from(key, source.data() + 128, 512), 0);
+    ASSERT_EQ(dummy_client_->get_into(key, destination.data() + 256, 512), 512);
+    EXPECT_TRUE(std::equal(source.begin() + 128, source.begin() + 640,
+                           destination.begin() + 256));
+
+    ASSERT_EQ(dummy_client_->unregister_buffer(source.data()), 0);
+    ASSERT_EQ(dummy_client_->put_from(key, source.data() + 128, 512), 0)
+        << "one duplicate unregister must keep registration alive";
+    ASSERT_EQ(dummy_client_->unregister_buffer(source.data()), 0);
+    EXPECT_NE(dummy_client_->unregister_buffer(source.data()), 0);
+    ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
 }
 
 // ---- Test: get_buffer via hot cache shm zero-copy path ----
