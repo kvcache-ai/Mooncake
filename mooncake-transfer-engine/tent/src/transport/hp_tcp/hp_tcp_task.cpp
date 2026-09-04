@@ -5,6 +5,37 @@
 
 namespace mooncake::tent {
 
+bool HighPerformanceTcpTaskState::completeSlice(
+    TransferStatusEnum terminal,
+    std::optional<HighPerformanceTcpStatus> remote_status) noexcept {
+    if (terminal == INITIAL || terminal == PENDING || terminal == INVALID) {
+        terminal = FAILED;
+    }
+    if (terminal != COMPLETED) {
+        TransferStatusEnum aggregate =
+            slice_status_.load(std::memory_order_relaxed);
+        while (transferStatusSeverity(terminal) >
+                   transferStatusSeverity(aggregate) &&
+               !slice_status_.compare_exchange_weak(
+                   aggregate, terminal, std::memory_order_relaxed)) {
+        }
+    }
+
+    if (remote_status.has_value() &&
+        *remote_status != HighPerformanceTcpStatus::kOk) {
+        HighPerformanceTcpStatus expected = HighPerformanceTcpStatus::kOk;
+        (void)remote_status_.compare_exchange_strong(expected, *remote_status,
+                                                     std::memory_order_relaxed);
+    }
+
+    if (remaining_slices_.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return false;
+    }
+
+    terminal = slice_status_.load(std::memory_order_acquire);
+    return completeOnce(terminal, terminal == COMPLETED ? reserved_bytes_ : 0);
+}
+
 bool HighPerformanceTcpTaskState::completeOnce(
     TransferStatusEnum terminal, size_t bytes,
     std::optional<HighPerformanceTcpStatus> remote_status) noexcept {
