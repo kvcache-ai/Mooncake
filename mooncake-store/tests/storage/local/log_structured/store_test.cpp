@@ -662,7 +662,7 @@ TEST(LogStructuredStoreTest, ReportsPhysicalAndReclaimableBytes) {
     EXPECT_GE(stats.sealed_segments, size_t{1});
 }
 
-TEST(LogStructuredStoreTest, DeleteHonorsTotalCapacity) {
+TEST(LogStructuredStoreTest, DeleteNeedsNoAdditionalPayloadCapacity) {
     StoreTempDirectory temp;
     const auto identity = StoreIdentity("key", 1);
     const std::string value(96, 'a');
@@ -678,10 +678,12 @@ TEST(LogStructuredStoreTest, DeleteHonorsTotalCapacity) {
     ASSERT_TRUE(write.has_value());
     ASSERT_TRUE((*store)->CommitPut(identity, write->sequence).has_value());
 
-    auto deleted = (*store)->Delete(identity);
-    ASSERT_FALSE(deleted.has_value());
-    EXPECT_EQ(deleted.error(), StoreError::kNoSpace);
-    EXPECT_EQ((*store)->Get(identity).value(), value);
+    ASSERT_TRUE((*store)->Delete(identity).has_value());
+    EXPECT_EQ((*store)->Get(identity).error(), StoreError::kNotFound);
+    const auto stats = (*store)->SnapshotStats();
+    EXPECT_EQ(stats.physical_bytes, value_record_bytes);
+    EXPECT_EQ(stats.live_record_bytes, uint64_t{0});
+    EXPECT_EQ(stats.reclaimable_bytes, value_record_bytes);
 }
 
 TEST(LogStructuredStoreTest, CompactionHonorsTemporarySpaceBudget) {
@@ -1287,6 +1289,44 @@ TEST(LogStructuredStoreTest, GetCompletesWhileCompactionWaitsToPublish) {
     ASSERT_TRUE(compacted.has_value());
     EXPECT_EQ((*store)->GetLatest("tenant-a", "key").value(),
               std::string(96, 'b'));
+}
+
+TEST(LogStructuredStoreTest, PreparesBatchAcrossSegmentsAndRecovers) {
+    StoreTempDirectory temp;
+    auto config = Config(temp, 24 * 1024);
+    config.payload_write_parallelism = 4;
+    auto store = LogStructuredStore::Open(config);
+    ASSERT_TRUE(store.has_value());
+
+    std::vector<std::string> values;
+    std::vector<PutRequest> requests;
+    values.reserve(12);
+    requests.reserve(12);
+    for (size_t index = 0; index < 12; ++index) {
+        values.push_back(std::string(8 * 1024, static_cast<char>('a' + index)));
+    }
+    for (size_t index = 0; index < values.size(); ++index) {
+        requests.push_back({.tenant_id = "tenant-a",
+                            .object_key = "batch-" + std::to_string(index),
+                            .value = values[index]});
+    }
+
+    auto prepared = (*store)->PreparePutBatch(requests);
+    ASSERT_TRUE(prepared.has_value());
+    ASSERT_EQ(prepared->size(), requests.size());
+    ASSERT_TRUE((*store)->CommitPuts(*prepared).has_value());
+    ASSERT_TRUE((*store)->Checkpoint().has_value());
+    store.value().reset();
+
+    auto reopened = LogStructuredStore::Open(config);
+    ASSERT_TRUE(reopened.has_value());
+    for (size_t index = 0; index < values.size(); ++index) {
+        auto value =
+            (*reopened)->GetLatest("tenant-a", requests[index].object_key);
+        ASSERT_TRUE(value.has_value());
+        EXPECT_EQ(*value, values[index]);
+    }
+    EXPECT_GT((*reopened)->SnapshotStats().sealed_segments, size_t{0});
 }
 
 }  // namespace

@@ -43,6 +43,8 @@ LogStructuredBackendConfig LogStructuredBackendConfig::FromEnvironment() {
     LogStructuredBackendConfig config;
     config.segment_size_bytes = Environ::GetUInt64(
         "MOONCAKE_LOG_SEGMENT_SIZE_BYTES", config.segment_size_bytes);
+    config.payload_write_parallelism = static_cast<size_t>(Environ::GetUInt64(
+        "MOONCAKE_LOG_WRITE_PARALLELISM", config.payload_write_parallelism));
     config.checkpoint_interval_records = Environ::GetUInt64(
         "MOONCAKE_LOG_CHECKPOINT_INTERVAL", config.checkpoint_interval_records);
     config.compaction_interval_ms = Environ::GetUInt64(
@@ -92,9 +94,10 @@ LogStructuredBackendConfig LogStructuredBackendConfig::FromEnvironment() {
 }
 
 bool LogStructuredBackendConfig::Validate() const {
-    return segment_size_bytes > 0 && compaction_interval_ms > 0 &&
-           compaction_fanout >= 2 && compaction_max_levels > 0 &&
-           compaction_max_sources > 0 && compaction_max_input_bytes > 0 &&
+    return segment_size_bytes > 0 && payload_write_parallelism > 0 &&
+           compaction_interval_ms > 0 && compaction_fanout >= 2 &&
+           compaction_max_levels > 0 && compaction_max_sources > 0 &&
+           compaction_max_input_bytes > 0 &&
            compaction_max_target_bytes >= segment_size_bytes &&
            compaction_min_reclaim_ratio >= 0.0 &&
            compaction_min_reclaim_ratio <= 1.0;
@@ -188,7 +191,9 @@ tl::expected<void, ErrorCode> LogStructuredStorageBackend::Init() {
          .sync_data =
              backend_config_.sync_policy == LogStructuredSyncPolicy::kRecord,
          .sync_wal =
-             backend_config_.sync_policy == LogStructuredSyncPolicy::kRecord});
+             backend_config_.sync_policy == LogStructuredSyncPolicy::kRecord,
+         .payload_write_parallelism =
+             backend_config_.payload_write_parallelism});
     if (!store) {
         LOG(ERROR) << "Failed to initialize log-structured backend at " << root;
         return tl::make_unexpected(ToWriteError(store.error()));
@@ -220,9 +225,10 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
     std::vector<logstructured::PreparedWrite> prepared;
     std::optional<ErrorCode> first_prepare_error;
     std::vector<std::string> keys;
+    std::vector<std::string> values;
     std::vector<StorageObjectMetadata> metadatas;
-    prepared.reserve(batch_object.size());
     keys.reserve(batch_object.size());
+    values.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
     for (const auto& [key, slices] : batch_object) {
         if (test_failure_predicate_ && test_failure_predicate_(key)) {
@@ -234,45 +240,48 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
             first_prepare_error = value.error();
             continue;
         }
-        auto [tenant_id, object_key] = SplitStorageKey(key);
-        auto write = store_->PreparePut(std::move(tenant_id),
-                                        std::move(object_key), *value);
-        if (!write) {
-            first_prepare_error = ToWriteError(write.error());
-            continue;
-        }
-        metadatas.push_back(StorageObjectMetadata{
-            -1, 0, static_cast<int64_t>(key.size()),
-            static_cast<int64_t>(write->physical.value_length), ""});
         keys.push_back(key);
-        prepared.push_back(std::move(write.value()));
+        values.push_back(std::move(value.value()));
     }
-    if (prepared.empty()) {
+    if (keys.empty()) {
         return tl::make_unexpected(
             first_prepare_error.value_or(ErrorCode::FILE_WRITE_FAIL));
     }
+
+    std::vector<logstructured::PutRequest> requests;
+    requests.reserve(keys.size());
+    for (size_t index = 0; index < keys.size(); ++index) {
+        auto [tenant_id, object_key] = SplitStorageKey(keys[index]);
+        requests.push_back({.tenant_id = std::move(tenant_id),
+                            .object_key = std::move(object_key),
+                            .value = values[index]});
+    }
+    auto batch = store_->PreparePutBatch(requests);
+    if (!batch) {
+        return tl::make_unexpected(ToWriteError(batch.error()));
+    }
+    prepared = std::move(batch.value());
+    for (size_t index = 0; index < prepared.size(); ++index) {
+        metadatas.push_back(StorageObjectMetadata{
+            -1, 0, static_cast<int64_t>(keys[index].size()),
+            static_cast<int64_t>(prepared[index].physical.value_length), ""});
+    }
     if (backend_config_.sync_policy == LogStructuredSyncPolicy::kBatch &&
         !store_->Sync()) {
-        for (const auto& write : prepared) {
-            static_cast<void>(store_->AbortPut(write.identity, write.sequence));
-        }
+        static_cast<void>(store_->AbortPuts(prepared));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
     if (complete_handler) {
         const auto result = complete_handler(keys, metadatas);
         if (result != ErrorCode::OK) {
-            for (const auto& write : prepared) {
-                store_->AbortPut(write.identity, write.sequence);
-            }
+            static_cast<void>(store_->AbortPuts(prepared));
             return tl::make_unexpected(result);
         }
     }
-    for (const auto& write : prepared) {
-        auto committed = store_->CommitPut(write.identity, write.sequence);
-        if (!committed) {
-            return tl::make_unexpected(ToWriteError(committed.error()));
-        }
+    auto committed = store_->CommitPuts(prepared);
+    if (!committed) {
+        return tl::make_unexpected(ToWriteError(committed.error()));
     }
     if (backend_config_.sync_policy == LogStructuredSyncPolicy::kBatch &&
         !store_->Sync()) {

@@ -207,5 +207,27 @@ TEST(LogStructuredWalTest, ReplayedAbortPreservesPreviousIncarnation) {
     EXPECT_FALSE(index.LookupCommitted(new_identity).has_value());
 }
 
+TEST(LogStructuredWalTest, AppendsBatchWithSingleDurabilityBoundary) {
+    WalTempDirectory temp;
+    const auto path = temp.File("WAL-batch");
+    auto writer = WalWriter::Create(path.string());
+    ASSERT_TRUE(writer.has_value());
+
+    const auto first = WalIdentity("first", 1);
+    const auto second = WalIdentity("second", 2);
+    std::vector<WalRecord> records = {
+        Transition(WalRecordType::kPrepareValue, first, 1, WalPhysical(1, 0)),
+        Transition(WalRecordType::kPrepareValue, second, 2,
+                   WalPhysical(1, 160)),
+    };
+    ASSERT_TRUE((*writer)->AppendBatch(records, true).has_value());
+    writer.value().reset();
+
+    auto scan = ScanWal(path.string());
+    ASSERT_TRUE(scan.has_value());
+    EXPECT_EQ(scan->termination, WalScanTermination::kCleanEof);
+    EXPECT_EQ(scan->records, records);
+}
+
 }  // namespace
 }  // namespace mooncake::logstructured

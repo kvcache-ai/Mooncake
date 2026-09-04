@@ -281,5 +281,69 @@ TEST(LogStructuredSegmentTest, InjectedWriteFailureLeavesRecoverableTail) {
     EXPECT_EQ(final_scan->records[0].identity, Identity("recovered", 2));
 }
 
+TEST(LogStructuredSegmentTest, AppendsBatchWithParallelPayloadWrites) {
+    TempDirectory temp;
+    const auto path = temp.File("segment-batch.log");
+    auto writer = SegmentWriter::Create(path.string(), 5);
+    ASSERT_TRUE(writer.has_value());
+
+    std::vector<std::string> values;
+    std::vector<SegmentAppendRequest> requests;
+    values.reserve(16);
+    requests.reserve(16);
+    for (uint64_t index = 0; index < 16; ++index) {
+        values.push_back(
+            std::string(32 * 1024, static_cast<char>('a' + index)));
+    }
+    for (uint64_t index = 0; index < values.size(); ++index) {
+        requests.push_back(
+            {.identity = Identity("batch-" + std::to_string(index), index + 1),
+             .value = values[index],
+             .kind = RecordKind::kValue,
+             .sequence = index + 1});
+    }
+
+    auto appended = (*writer)->AppendBatch(requests, true, 4);
+    ASSERT_TRUE(appended.has_value());
+    ASSERT_EQ(appended->size(), requests.size());
+    writer.value().reset();
+
+    auto scan = ScanSegment(path.string(), 5);
+    ASSERT_TRUE(scan.has_value());
+    EXPECT_EQ(scan->termination, ScanTermination::kCleanEof);
+    ASSERT_EQ(scan->records.size(), requests.size());
+    for (size_t index = 0; index < requests.size(); ++index) {
+        EXPECT_EQ(scan->records[index].identity, requests[index].identity);
+        EXPECT_EQ(scan->records[index].physical, (*appended)[index]);
+    }
+}
+
+TEST(LogStructuredSegmentTest, FailedBatchTruncatesWholeReservation) {
+    TempDirectory temp;
+    const auto path = temp.File("segment-batch-failure.log");
+    auto writer = SegmentWriter::Create(path.string(), 6);
+    ASSERT_TRUE(writer.has_value());
+
+    std::vector<std::string> values(8, std::string(16 * 1024, 'x'));
+    std::vector<SegmentAppendRequest> requests;
+    requests.reserve(values.size());
+    for (uint64_t index = 0; index < values.size(); ++index) {
+        requests.push_back(
+            {.identity = Identity("failed-" + std::to_string(index), index + 1),
+             .value = values[index],
+             .kind = RecordKind::kValue,
+             .sequence = index + 1});
+    }
+
+    SegmentWriter::SetWriteFailurePredicateForTest(
+        [](std::string_view, uint64_t offset, size_t) { return offset != 0; });
+    auto appended = (*writer)->AppendBatch(requests, true, 4);
+    SegmentWriter::SetWriteFailurePredicateForTest({});
+    ASSERT_FALSE(appended.has_value());
+    EXPECT_EQ(appended.error(), SegmentError::kIoError);
+    EXPECT_EQ((*writer)->tail(), uint64_t{0});
+    EXPECT_EQ(std::filesystem::file_size(path), uint64_t{0});
+}
+
 }  // namespace
 }  // namespace mooncake::logstructured

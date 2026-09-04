@@ -61,6 +61,8 @@ class WalWriter {
     WalWriter& operator=(const WalWriter&) = delete;
 
     tl::expected<void, WalError> Append(const WalRecord& record, bool sync);
+    tl::expected<void, WalError> AppendBatch(
+        const std::vector<WalRecord>& records, bool sync);
     tl::expected<void, WalError> Sync();
 
     uint64_t tail() const { return tail_; }

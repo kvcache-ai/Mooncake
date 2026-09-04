@@ -619,12 +619,134 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePut(
 
 tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePut(
     std::string tenant_id, std::string object_key, std::string_view value) {
+    std::vector<PutRequest> requests;
+    requests.push_back({.tenant_id = std::move(tenant_id),
+                        .object_key = std::move(object_key),
+                        .value = value});
+    auto prepared = PreparePutBatch(requests);
+    if (!prepared) return tl::unexpected(prepared.error());
+    return std::move(prepared->front());
+}
+
+tl::expected<std::vector<PreparedWrite>, StoreError>
+LogStructuredStore::PreparePutBatch(const std::vector<PutRequest>& requests) {
     std::lock_guard lock(mutex_);
-    RecordIdentity identity{.tenant_id = std::move(tenant_id),
-                            .object_key = std::move(object_key),
-                            .incarnation = {.high = directory_->identity().high,
-                                            .low = next_sequence_}};
-    return PreparePutLocked(identity, value);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    if (requests.empty()) {
+        return tl::unexpected(StoreError::kInvalidArgument);
+    }
+
+    uint64_t total_record_bytes = 0;
+    std::vector<uint64_t> record_sizes;
+    record_sizes.reserve(requests.size());
+    for (const auto& request : requests) {
+        if (request.tenant_id.size() > kMaxTenantLength ||
+            request.object_key.size() > kMaxKeyLength) {
+            return tl::unexpected(StoreError::kInvalidArgument);
+        }
+        const uint64_t record_bytes =
+            AlignedRecordSize(static_cast<uint32_t>(request.tenant_id.size()),
+                              static_cast<uint32_t>(request.object_key.size()),
+                              request.value.size());
+        if (record_bytes == 0 ||
+            total_record_bytes >
+                std::numeric_limits<uint64_t>::max() - record_bytes) {
+            return tl::unexpected(StoreError::kInvalidArgument);
+        }
+        total_record_bytes += record_bytes;
+        record_sizes.push_back(record_bytes);
+    }
+
+    const uint64_t physical_bytes = PhysicalBytesLocked();
+    if (physical_bytes > config_.max_physical_bytes ||
+        total_record_bytes > config_.max_physical_bytes - physical_bytes ||
+        physical_bytes > config_.max_total_physical_bytes ||
+        compaction_reserved_bytes_ >
+            config_.max_total_physical_bytes - physical_bytes ||
+        total_record_bytes > config_.max_total_physical_bytes - physical_bytes -
+                                 compaction_reserved_bytes_) {
+        return tl::unexpected(StoreError::kNoSpace);
+    }
+
+    std::vector<PreparedWrite> prepared;
+    prepared.reserve(requests.size());
+    size_t begin = 0;
+    while (begin < requests.size()) {
+        auto rotated = RotateSegmentIfNeeded(record_sizes[begin]);
+        if (!rotated) return tl::unexpected(rotated.error());
+
+        const uint64_t segment_tail = active_segment_->tail();
+        uint64_t chunk_bytes = 0;
+        size_t end = begin;
+        while (end < requests.size()) {
+            const uint64_t next_bytes = record_sizes[end];
+            if (end != begin &&
+                (chunk_bytes > config_.max_segment_bytes - segment_tail ||
+                 next_bytes >
+                     config_.max_segment_bytes - segment_tail - chunk_bytes)) {
+                break;
+            }
+            chunk_bytes += next_bytes;
+            ++end;
+            if (segment_tail + chunk_bytes >= config_.max_segment_bytes) break;
+        }
+
+        std::vector<SegmentAppendRequest> appends;
+        std::vector<WalRecord> wal_records;
+        appends.reserve(end - begin);
+        wal_records.reserve(end - begin);
+        for (size_t index = begin; index < end; ++index) {
+            const uint64_t sequence = next_sequence_++;
+            RecordIdentity identity{
+                .tenant_id = requests[index].tenant_id,
+                .object_key = requests[index].object_key,
+                .incarnation = {.high = directory_->identity().high,
+                                .low = sequence}};
+            appends.push_back({.identity = std::move(identity),
+                               .value = requests[index].value,
+                               .kind = RecordKind::kValue,
+                               .sequence = sequence});
+        }
+
+        auto physical_records = active_segment_->AppendBatch(
+            appends, config_.sync_data, config_.payload_write_parallelism);
+        if (!physical_records) {
+            return tl::unexpected(StoreError::kIoError);
+        }
+        auto& segment = segments_.at(active_segment_->segment_id());
+        segment.valid_bytes = active_segment_->tail();
+        segment.record_count += appends.size();
+        ++segment.mutation_epoch;
+
+        for (size_t index = 0; index < appends.size(); ++index) {
+            wal_records.push_back({.type = WalRecordType::kPrepareValue,
+                                   .sequence = appends[index].sequence,
+                                   .identity = appends[index].identity,
+                                   .physical = (*physical_records)[index]});
+        }
+        if (!wal_->AppendBatch(wal_records, config_.sync_wal)) {
+            return tl::unexpected(StoreError::kIoError);
+        }
+
+        for (size_t index = 0; index < appends.size(); ++index) {
+            auto indexed = index_.Prepare(appends[index].identity,
+                                          (*physical_records)[index],
+                                          appends[index].sequence);
+            if (!indexed) {
+                recovery_required_ = true;
+                return tl::unexpected(StoreError::kRecoveryRequired);
+            }
+            auto live = AddLiveRecordLocked((*physical_records)[index]);
+            if (!live) return tl::unexpected(live.error());
+            prepared.push_back({.identity = appends[index].identity,
+                                .sequence = appends[index].sequence,
+                                .physical = (*physical_records)[index]});
+        }
+        begin = end;
+    }
+    return prepared;
 }
 
 tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
@@ -715,6 +837,48 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPut(
     return {};
 }
 
+tl::expected<void, StoreError> LogStructuredStore::CommitPuts(
+    const std::vector<PreparedWrite>& writes) {
+    std::lock_guard lock(mutex_);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    if (writes.empty()) return {};
+
+    std::vector<WalRecord> records;
+    records.reserve(writes.size());
+    for (const auto& write : writes) {
+        auto current = index_.Lookup(write.identity);
+        if (!current || current->state != VersionState::kPrepared ||
+            current->sequence != write.sequence) {
+            return tl::unexpected(current ? StoreError::kInvalidTransition
+                                          : StoreError::kNotFound);
+        }
+        records.push_back({.type = WalRecordType::kCommitValue,
+                           .sequence = write.sequence,
+                           .identity = write.identity,
+                           .physical = {}});
+    }
+    if (!wal_->AppendBatch(records, config_.sync_wal)) {
+        return tl::unexpected(StoreError::kIoError);
+    }
+    for (const auto& write : writes) {
+        auto previous_current = index_.LookupCurrent(write.identity.tenant_id,
+                                                     write.identity.object_key);
+        auto committed = index_.Commit(write.identity, write.sequence);
+        if (!committed) {
+            recovery_required_ = true;
+            return tl::unexpected(StoreError::kRecoveryRequired);
+        }
+        if (previous_current && previous_current->identity != write.identity) {
+            auto removed =
+                RemoveLiveRecordLocked(previous_current->version.physical);
+            if (!removed) return tl::unexpected(removed.error());
+        }
+    }
+    return {};
+}
+
 tl::expected<void, StoreError> LogStructuredStore::AbortPut(
     const RecordIdentity& identity, uint64_t sequence) {
     std::lock_guard lock(mutex_);
@@ -744,6 +908,44 @@ tl::expected<void, StoreError> LogStructuredStore::AbortPut(
     return {};
 }
 
+tl::expected<void, StoreError> LogStructuredStore::AbortPuts(
+    const std::vector<PreparedWrite>& writes) {
+    std::lock_guard lock(mutex_);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    if (writes.empty()) return {};
+
+    std::vector<WalRecord> records;
+    records.reserve(writes.size());
+    for (const auto& write : writes) {
+        auto current = index_.Lookup(write.identity);
+        if (!current || current->state != VersionState::kPrepared ||
+            current->sequence != write.sequence) {
+            return tl::unexpected(current ? StoreError::kInvalidTransition
+                                          : StoreError::kNotFound);
+        }
+        records.push_back({.type = WalRecordType::kAbortValue,
+                           .sequence = write.sequence,
+                           .identity = write.identity,
+                           .physical = {}});
+    }
+    if (!wal_->AppendBatch(records, config_.sync_wal)) {
+        return tl::unexpected(StoreError::kIoError);
+    }
+    for (const auto& write : writes) {
+        auto current = index_.Lookup(write.identity);
+        auto aborted = index_.Abort(write.identity, write.sequence);
+        if (!aborted) {
+            recovery_required_ = true;
+            return tl::unexpected(StoreError::kRecoveryRequired);
+        }
+        auto removed = RemoveLiveRecordLocked(current->physical);
+        if (!removed) return tl::unexpected(removed.error());
+    }
+    return {};
+}
+
 tl::expected<void, StoreError> LogStructuredStore::Delete(
     const RecordIdentity& identity) {
     std::lock_guard lock(mutex_);
@@ -755,28 +957,7 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
         return tl::unexpected(StoreError::kInvalidArgument);
     }
     const auto existing = index_.Lookup(identity);
-    const uint64_t record_bytes =
-        AlignedRecordSize(static_cast<uint32_t>(identity.tenant_id.size()),
-                          static_cast<uint32_t>(identity.object_key.size()), 0);
-    const uint64_t physical_bytes = PhysicalBytesLocked();
-    if (record_bytes == 0 ||
-        physical_bytes > config_.max_total_physical_bytes ||
-        compaction_reserved_bytes_ >
-            config_.max_total_physical_bytes - physical_bytes ||
-        record_bytes > config_.max_total_physical_bytes - physical_bytes -
-                           compaction_reserved_bytes_) {
-        return tl::unexpected(StoreError::kNoSpace);
-    }
-    auto rotated = RotateSegmentIfNeeded(record_bytes);
-    if (!rotated) return tl::unexpected(rotated.error());
     const uint64_t sequence = next_sequence_++;
-    auto appended = active_segment_->Append(
-        identity, "", RecordKind::kTombstone, sequence, config_.sync_data);
-    if (!appended) return tl::unexpected(StoreError::kIoError);
-    auto& segment = segments_.at(active_segment_->segment_id());
-    segment.valid_bytes = active_segment_->tail();
-    ++segment.record_count;
-    ++segment.mutation_epoch;
     auto persisted =
         wal_->Append(WalRecord{.type = WalRecordType::kApplyTombstone,
                                .sequence = sequence,

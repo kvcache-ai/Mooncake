@@ -173,6 +173,7 @@ TEST(LogStructuredStorageBackendTest, PartialFailureReportsOnlyStoredKeys) {
 
 TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
     setenv("MOONCAKE_LOG_SEGMENT_SIZE_BYTES", "4096", 1);
+    setenv("MOONCAKE_LOG_WRITE_PARALLELISM", "7", 1);
     setenv("MOONCAKE_LOG_SYNC_POLICY", "batch", 1);
     setenv("MOONCAKE_LOG_CHECKPOINT_INTERVAL", "17", 1);
     setenv("MOONCAKE_LOG_COMPACTION_POLICY", "tiered", 1);
@@ -189,6 +190,7 @@ TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
     const auto config = LogStructuredBackendConfig::FromEnvironment();
 
     unsetenv("MOONCAKE_LOG_SEGMENT_SIZE_BYTES");
+    unsetenv("MOONCAKE_LOG_WRITE_PARALLELISM");
     unsetenv("MOONCAKE_LOG_SYNC_POLICY");
     unsetenv("MOONCAKE_LOG_CHECKPOINT_INTERVAL");
     unsetenv("MOONCAKE_LOG_COMPACTION_POLICY");
@@ -204,6 +206,7 @@ TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
 
     EXPECT_TRUE(config.Validate());
     EXPECT_EQ(config.segment_size_bytes, uint64_t{4096});
+    EXPECT_EQ(config.payload_write_parallelism, size_t{7});
     EXPECT_EQ(config.sync_policy, LogStructuredSyncPolicy::kBatch);
     EXPECT_EQ(config.checkpoint_interval_records, uint64_t{17});
     EXPECT_EQ(config.compaction_policy, LogStructuredCompactionPolicy::kTiered);

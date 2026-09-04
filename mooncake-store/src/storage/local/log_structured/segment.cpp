@@ -5,10 +5,12 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <type_traits>
@@ -141,6 +143,7 @@ SegmentWriter::OpenForAppend(std::string path, uint64_t segment_id,
 tl::expected<PhysicalRecord, SegmentError> SegmentWriter::Append(
     const RecordIdentity& identity, std::string_view value, RecordKind kind,
     uint64_t sequence, bool sync) {
+    std::lock_guard lock(append_mutex_);
     auto envelope = EncodeRecordEnvelope(identity, value, kind, sequence);
     if (!envelope) {
         return tl::unexpected(SegmentError::kInvalidArgument);
@@ -192,11 +195,99 @@ tl::expected<PhysicalRecord, SegmentError> SegmentWriter::Append(
     return physical;
 }
 
+tl::expected<std::vector<PhysicalRecord>, SegmentError>
+SegmentWriter::AppendBatch(const std::vector<SegmentAppendRequest>& requests,
+                           bool sync, size_t parallelism) {
+    std::lock_guard lock(append_mutex_);
+    if (requests.empty() || parallelism == 0) {
+        return tl::unexpected(SegmentError::kInvalidArgument);
+    }
+
+    std::vector<PhysicalRecord> physical_records;
+    physical_records.reserve(requests.size());
+    uint64_t next_offset = tail_;
+    for (const auto& request : requests) {
+        const uint64_t record_size = AlignedRecordSize(
+            static_cast<uint32_t>(request.identity.tenant_id.size()),
+            static_cast<uint32_t>(request.identity.object_key.size()),
+            request.value.size());
+        if (record_size == 0 ||
+            next_offset >
+                static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
+                    record_size) {
+            return tl::unexpected(SegmentError::kInvalidArgument);
+        }
+        physical_records.push_back(
+            {.segment_id = segment_id_,
+             .record_offset = next_offset,
+             .value_offset = next_offset + kRecordHeaderSize +
+                             request.identity.tenant_id.size() +
+                             request.identity.object_key.size(),
+             .value_length = request.value.size(),
+             .total_length = record_size});
+        next_offset += record_size;
+    }
+
+    std::atomic<size_t> next_index{0};
+    std::atomic<int> failure{0};
+    const size_t worker_count = std::min(parallelism, requests.size());
+    auto write_records = [&] {
+        while (failure.load(std::memory_order_relaxed) == 0) {
+            const size_t index =
+                next_index.fetch_add(1, std::memory_order_relaxed);
+            if (index >= requests.size()) break;
+            const auto& request = requests[index];
+            auto encoded = EncodeRecord(request.identity, request.value,
+                                        request.kind, request.sequence);
+            if (!encoded) {
+                failure.store(1, std::memory_order_relaxed);
+                break;
+            }
+            const uint64_t offset = physical_records[index].record_offset;
+            if (ShouldFailWrite(path_, offset, encoded->size()) ||
+                !PwriteAll(fd_, encoded->data(), encoded->size(), offset)) {
+                failure.store(2, std::memory_order_relaxed);
+                break;
+            }
+        }
+    };
+    if (worker_count == 1) {
+        write_records();
+    } else {
+        std::vector<std::future<void>> workers;
+        workers.reserve(worker_count);
+        for (size_t worker = 0; worker < worker_count; ++worker) {
+            workers.push_back(std::async(std::launch::async, write_records));
+        }
+        for (auto& worker : workers) worker.get();
+    }
+
+    const int failure_code = failure.load(std::memory_order_relaxed);
+    if (failure_code != 0) {
+        if (ftruncate(fd_, static_cast<off_t>(tail_)) != 0) {
+            return tl::unexpected(SegmentError::kTruncateFailed);
+        }
+        return tl::unexpected(failure_code == 1 ? SegmentError::kInvalidArgument
+                                                : SegmentError::kIoError);
+    }
+    if (sync && fdatasync(fd_) != 0) {
+        return tl::unexpected(SegmentError::kSyncFailed);
+    }
+    tail_ = next_offset;
+    return physical_records;
+}
+
 tl::expected<void, SegmentError> SegmentWriter::Sync() {
+    std::lock_guard lock(append_mutex_);
     if (fdatasync(fd_) != 0) {
         return tl::unexpected(SegmentError::kSyncFailed);
     }
     return {};
+}
+
+uint64_t SegmentWriter::tail() const {
+    std::lock_guard lock(append_mutex_);
+    return tail_;
 }
 
 tl::expected<SegmentScanResult, SegmentError> ScanSegment(

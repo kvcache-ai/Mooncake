@@ -17,6 +17,7 @@ enum class LogStructuredCompactionPolicy { kNone, kReclaimOnly, kTiered };
 
 struct LogStructuredBackendConfig {
     uint64_t segment_size_bytes{256ULL * 1024 * 1024};
+    size_t payload_write_parallelism{4};
     LogStructuredSyncPolicy sync_policy{LogStructuredSyncPolicy::kRecord};
     uint64_t checkpoint_interval_records{10000};
     LogStructuredCompactionPolicy compaction_policy{

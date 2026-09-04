@@ -40,6 +40,13 @@ struct LogStructuredStoreConfig {
     uint64_t max_total_physical_bytes{std::numeric_limits<uint64_t>::max()};
     bool sync_data{true};
     bool sync_wal{true};
+    size_t payload_write_parallelism{4};
+};
+
+struct PutRequest {
+    std::string tenant_id;
+    std::string object_key;
+    std::string_view value;
 };
 
 struct PreparedWrite {
@@ -102,10 +109,16 @@ class LogStructuredStore {
     tl::expected<PreparedWrite, StoreError> PreparePut(std::string tenant_id,
                                                        std::string object_key,
                                                        std::string_view value);
+    tl::expected<std::vector<PreparedWrite>, StoreError> PreparePutBatch(
+        const std::vector<PutRequest>& requests);
     tl::expected<void, StoreError> CommitPut(const RecordIdentity& identity,
                                              uint64_t sequence);
+    tl::expected<void, StoreError> CommitPuts(
+        const std::vector<PreparedWrite>& writes);
     tl::expected<void, StoreError> AbortPut(const RecordIdentity& identity,
                                             uint64_t sequence);
+    tl::expected<void, StoreError> AbortPuts(
+        const std::vector<PreparedWrite>& writes);
     tl::expected<void, StoreError> Delete(const RecordIdentity& identity);
     tl::expected<void, StoreError> Sync();
     tl::expected<void, StoreError> SealActiveSegment();

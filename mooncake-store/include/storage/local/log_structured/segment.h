@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -50,6 +51,13 @@ struct SegmentScanResult {
     DecodeError decode_error{DecodeError::kNeedMoreData};
 };
 
+struct SegmentAppendRequest {
+    RecordIdentity identity;
+    std::string_view value;
+    RecordKind kind{RecordKind::kValue};
+    uint64_t sequence{0};
+};
+
 class SegmentWriter {
    public:
     static tl::expected<std::unique_ptr<SegmentWriter>, SegmentError> Create(
@@ -66,6 +74,9 @@ class SegmentWriter {
     tl::expected<PhysicalRecord, SegmentError> Append(
         const RecordIdentity& identity, std::string_view value, RecordKind kind,
         uint64_t sequence, bool sync);
+    tl::expected<std::vector<PhysicalRecord>, SegmentError> AppendBatch(
+        const std::vector<SegmentAppendRequest>& requests, bool sync,
+        size_t parallelism);
 
     tl::expected<void, SegmentError> Sync();
 
@@ -74,7 +85,7 @@ class SegmentWriter {
                            size_t length)>
             predicate);
 
-    uint64_t tail() const { return tail_; }
+    uint64_t tail() const;
     uint64_t segment_id() const { return segment_id_; }
     const std::string& path() const { return path_; }
 
@@ -87,6 +98,7 @@ class SegmentWriter {
     std::string path_;
     uint64_t segment_id_;
     int fd_;
+    mutable std::mutex append_mutex_;
     uint64_t tail_;
 };
 

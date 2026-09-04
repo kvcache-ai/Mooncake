@@ -314,6 +314,35 @@ tl::expected<void, WalError> WalWriter::Append(const WalRecord& record,
     return {};
 }
 
+tl::expected<void, WalError> WalWriter::AppendBatch(
+    const std::vector<WalRecord>& records, bool sync) {
+    if (records.empty()) return {};
+    const uint64_t original_tail = tail_;
+    uint64_t next_tail = tail_;
+    for (const auto& record : records) {
+        auto encoded = EncodeWalRecord(record);
+        if (!encoded ||
+            next_tail >
+                static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
+                    encoded->size() ||
+            !PwriteAll(fd_, encoded->data(), encoded->size(), next_tail)) {
+            if (ftruncate(fd_, static_cast<off_t>(original_tail)) != 0) {
+                return tl::unexpected(WalError::kTruncateFailed);
+            }
+            return tl::unexpected(WalError::kIoError);
+        }
+        next_tail += encoded->size();
+    }
+    if (sync && fdatasync(fd_) != 0) {
+        if (ftruncate(fd_, static_cast<off_t>(original_tail)) != 0) {
+            return tl::unexpected(WalError::kTruncateFailed);
+        }
+        return tl::unexpected(WalError::kSyncFailed);
+    }
+    tail_ = next_tail;
+    return {};
+}
+
 tl::expected<void, WalError> WalWriter::Sync() {
     if (fdatasync(fd_) != 0) return tl::unexpected(WalError::kSyncFailed);
     return {};
