@@ -663,5 +663,88 @@ TEST(LogStructuredStoreTest, TieredCompactionMergesCleanSegments) {
     }
 }
 
+TEST(LogStructuredStoreTest, AppendFailurePreservesCommittedValueAfterRestart) {
+    StoreTempDirectory temp;
+    const auto old_identity = StoreIdentity("key", 1);
+    const auto new_identity = StoreIdentity("key", 2);
+
+    {
+        auto store = LogStructuredStore::Open(Config(temp));
+        ASSERT_TRUE(store.has_value());
+        auto old_write = (*store)->PreparePut(old_identity, "old-value");
+        ASSERT_TRUE(old_write.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(old_identity, old_write->sequence).has_value());
+
+        std::atomic<size_t> writes{0};
+        SegmentWriter::SetWriteFailurePredicateForTest(
+            [&](std::string_view path, uint64_t, size_t) {
+                if (path.find("/tmp/") != std::string_view::npos) return false;
+                return writes.fetch_add(1, std::memory_order_relaxed) == 1;
+            });
+        auto failed = (*store)->PreparePut(new_identity, "new-value");
+        SegmentWriter::SetWriteFailurePredicateForTest({});
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error(), StoreError::kIoError);
+        EXPECT_EQ((*store)->Get(old_identity).value(), "old-value");
+        EXPECT_EQ((*store)->Get(new_identity).error(), StoreError::kNotFound);
+    }
+
+    auto recovered = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ((*recovered)->Get(old_identity).value(), "old-value");
+    EXPECT_EQ((*recovered)->Get(new_identity).error(), StoreError::kNotFound);
+}
+
+TEST(LogStructuredStoreTest,
+     CompactionTargetWriteFailurePreservesSourcesAndLatestValue) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 1024));
+    ASSERT_TRUE(store.has_value());
+    const auto old_identity = StoreIdentity("key", 1);
+    const auto new_identity = StoreIdentity("key", 2);
+
+    auto old_write = (*store)->PreparePut(old_identity, std::string(96, 'a'));
+    ASSERT_TRUE(old_write.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(old_identity, old_write->sequence).has_value());
+    auto new_write = (*store)->PreparePut(new_identity, std::string(96, 'b'));
+    ASSERT_TRUE(new_write.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(new_identity, new_write->sequence).has_value());
+    ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+
+    SegmentWriter::SetWriteFailurePredicateForTest(
+        [](std::string_view path, uint64_t, size_t) {
+            return path.find("/tmp/") != std::string_view::npos;
+        });
+    auto failed = (*store)->CompactOnce({.max_source_segments = 1,
+                                         .max_input_bytes = 4096,
+                                         .max_target_bytes = 4096,
+                                         .fanout = 1,
+                                         .max_levels = 2,
+                                         .min_reclaim_ratio = 0.0,
+                                         .stop_token = {}});
+    SegmentWriter::SetWriteFailurePredicateForTest({});
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), StoreError::kIoError);
+    EXPECT_EQ((*store)->GetLatest("tenant-a", "key").value(),
+              std::string(96, 'b'));
+    EXPECT_TRUE(std::filesystem::is_empty(temp.path() / "tmp"));
+    EXPECT_EQ((*store)->SnapshotStats().sealed_segments, size_t{1});
+
+    auto compacted = (*store)->CompactOnce({.max_source_segments = 1,
+                                            .max_input_bytes = 4096,
+                                            .max_target_bytes = 4096,
+                                            .fanout = 1,
+                                            .max_levels = 2,
+                                            .min_reclaim_ratio = 0.0,
+                                            .stop_token = {}});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{1});
+    EXPECT_EQ((*store)->GetLatest("tenant-a", "key").value(),
+              std::string(96, 'b'));
+}
+
 }  // namespace
 }  // namespace mooncake::logstructured

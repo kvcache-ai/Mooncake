@@ -231,5 +231,44 @@ TEST(LogStructuredSegmentTest, StopsAtCorruptedRecordWithoutTruncating) {
               first->total_length + second->total_length);
 }
 
+TEST(LogStructuredSegmentTest, InjectedWriteFailureLeavesRecoverableTail) {
+    TempDirectory temp;
+    const auto path = temp.File("segment-4.log");
+    auto writer = SegmentWriter::Create(path.string(), 4);
+    ASSERT_TRUE(writer.has_value());
+
+    std::atomic<size_t> writes{0};
+    SegmentWriter::SetWriteFailurePredicateForTest(
+        [&](std::string_view, uint64_t, size_t) {
+            return writes.fetch_add(1, std::memory_order_relaxed) == 1;
+        });
+    auto failed = (*writer)->Append(Identity("partial", 1), "value",
+                                    RecordKind::kValue, 1, true);
+    SegmentWriter::SetWriteFailurePredicateForTest({});
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), SegmentError::kIoError);
+    writer.value().reset();
+
+    auto scan = ScanSegment(path.string(), 4);
+    ASSERT_TRUE(scan.has_value());
+    EXPECT_EQ(scan->termination, ScanTermination::kIncompleteTail);
+    EXPECT_EQ(scan->valid_bytes, uint64_t{0});
+    EXPECT_TRUE(scan->records.empty());
+
+    auto recovered = SegmentWriter::OpenForAppend(path.string(), 4, 0);
+    ASSERT_TRUE(recovered.has_value());
+    ASSERT_TRUE((*recovered)
+                    ->Append(Identity("recovered", 2), "value",
+                             RecordKind::kValue, 2, true)
+                    .has_value());
+    recovered.value().reset();
+
+    auto final_scan = ScanSegment(path.string(), 4);
+    ASSERT_TRUE(final_scan.has_value());
+    EXPECT_EQ(final_scan->termination, ScanTermination::kCleanEof);
+    ASSERT_EQ(final_scan->records.size(), size_t{1});
+    EXPECT_EQ(final_scan->records[0].identity, Identity("recovered", 2));
+}
+
 }  // namespace
 }  // namespace mooncake::logstructured

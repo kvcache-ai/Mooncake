@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <type_traits>
 
 #include "crc32c.h"
@@ -22,6 +24,15 @@ constexpr size_t kFooterPayloadChecksumOffset = 8;
 constexpr size_t kFooterChecksumOffset = 12;
 constexpr size_t kFooterMagicOffset = 16;
 constexpr size_t kFooterChecksumInputSize = kFooterChecksumOffset;
+
+std::mutex write_failure_mutex;
+std::function<bool(std::string_view, uint64_t, size_t)> write_failure_predicate;
+
+bool ShouldFailWrite(std::string_view path, uint64_t offset, size_t length) {
+    std::lock_guard lock(write_failure_mutex);
+    return write_failure_predicate &&
+           write_failure_predicate(path, offset, length);
+}
 
 template <typename T>
 T ReadLittleEndian(const char* input) {
@@ -84,6 +95,12 @@ SegmentWriter::~SegmentWriter() {
     }
 }
 
+void SegmentWriter::SetWriteFailurePredicateForTest(
+    std::function<bool(std::string_view, uint64_t, size_t)> predicate) {
+    std::lock_guard lock(write_failure_mutex);
+    write_failure_predicate = std::move(predicate);
+}
+
 tl::expected<std::unique_ptr<SegmentWriter>, SegmentError>
 SegmentWriter::Create(std::string path, uint64_t segment_id) {
     return Open(std::move(path), segment_id,
@@ -139,20 +156,23 @@ tl::expected<PhysicalRecord, SegmentError> SegmentWriter::Append(
         identity.tenant_id, identity.object_key, value};
     for (const auto part : payload_parts) {
         if (!part.empty() &&
-            !PwriteAll(fd_, part.data(), part.size(), cursor)) {
+            (ShouldFailWrite(path_, cursor, part.size()) ||
+             !PwriteAll(fd_, part.data(), part.size(), cursor))) {
             return tl::unexpected(SegmentError::kIoError);
         }
         cursor += part.size();
     }
     if (envelope->padding_length > 0) {
         static constexpr std::array<char, kRecordAlignment> kZeroPadding{};
-        if (!PwriteAll(fd_, kZeroPadding.data(), envelope->padding_length,
+        if (ShouldFailWrite(path_, cursor, envelope->padding_length) ||
+            !PwriteAll(fd_, kZeroPadding.data(), envelope->padding_length,
                        cursor)) {
             return tl::unexpected(SegmentError::kIoError);
         }
         cursor += envelope->padding_length;
     }
-    if (!PwriteAll(fd_, envelope->footer.data(), envelope->footer.size(),
+    if (ShouldFailWrite(path_, cursor, envelope->footer.size()) ||
+        !PwriteAll(fd_, envelope->footer.data(), envelope->footer.size(),
                    cursor)) {
         return tl::unexpected(SegmentError::kIoError);
     }

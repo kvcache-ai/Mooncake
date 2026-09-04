@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -67,6 +68,11 @@ class SegmentWriter {
         uint64_t sequence, bool sync);
 
     tl::expected<void, SegmentError> Sync();
+
+    static void SetWriteFailurePredicateForTest(
+        std::function<bool(std::string_view path, uint64_t offset,
+                           size_t length)>
+            predicate);
 
     uint64_t tail() const { return tail_; }
     uint64_t segment_id() const { return segment_id_; }
