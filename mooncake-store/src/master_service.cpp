@@ -3548,8 +3548,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                                            desc.status));
             } else {
                 LOG(ERROR) << "RestoreFromStandbySnapshot: unsupported replica "
-                           << "descriptor, tenant=" << tenant_id.value()
-                           << ", key=" << user_key;
+                           << "descriptor, tenant="
+                           << accepted_entry.tenant_id.value()
+                           << ", key=" << accepted_entry.user_key;
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
