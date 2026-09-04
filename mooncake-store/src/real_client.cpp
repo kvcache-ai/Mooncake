@@ -1458,8 +1458,8 @@ void RealClient::RetryQuarantinedShmsLocked() {
         // A quarantined segment still has a live SPDK registration: only
         // munmap once the translation is actually released.
         if (it->spdk_registered) {
-            if (SpdkWrapper::GetInstance().UnregisterMemory(it->shm_buffer,
-                                                            it->shm_size) != 0) {
+            if (SpdkWrapper::GetInstance().UnregisterMemory(
+                    it->shm_buffer, it->shm_size) != 0) {
                 ++it;
                 continue;
             }
@@ -2591,9 +2591,10 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
             if (shm.spdk_registered) {
                 if (SpdkWrapper::GetInstance().UnregisterMemory(
                         shm.shm_buffer, shm.shm_size) != 0) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK: "
-                               << shm.shm_buffer
-                               << "; quarantining mapping (never munmap)";
+                    LOG(ERROR)
+                        << "Failed to unregister received shm from SPDK: "
+                        << shm.shm_buffer
+                        << "; quarantining mapping (never munmap)";
                     quarantine_shms_.push_back(std::move(shm));
                     shm.shm_buffer = nullptr;
                     failed = true;
@@ -2986,8 +2987,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
                     shm_it->spdk_registered = false;
                 }
                 if (!rc) {
-                    LOG(ERROR) << "Failed to unregister memory: "
-                               << shm_it->shm_name;
+                    LOG(ERROR)
+                        << "Failed to unregister memory: " << shm_it->shm_name;
                     unregister_failed = true;
                 }
                 // munmap and erase even after an unregisterLocalMemory failure
@@ -2996,13 +2997,13 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
                 // issuing NoF against a buffer whose SPDK translation is gone.
                 // Mirrors unmap_shm_internal.
                 if (munmap(shm_it->shm_buffer, shm_it->shm_size) != 0) {
-                    LOG(ERROR) << "Failed to munmap shared memory: "
-                               << shm_it->shm_name
-                               << ", error: " << strerror(errno);
+                    LOG(ERROR)
+                        << "Failed to munmap shared memory: "
+                        << shm_it->shm_name << ", error: " << strerror(errno);
                 } else {
-                    LOG(INFO) << "Unmapped and cleaned up shared memory: "
-                              << shm_it->shm_name
-                              << ", size: " << shm_it->shm_size;
+                    LOG(INFO)
+                        << "Unmapped and cleaned up shared memory: "
+                        << shm_it->shm_name << ", size: " << shm_it->shm_size;
                 }
             }
 #else
@@ -3017,8 +3018,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
                            << ", error: " << strerror(errno);
             } else {
                 LOG(INFO) << "Unmapped and cleaned up shared memory: "
-                          << shm_it->shm_name
-                          << ", size: " << shm_it->shm_size;
+                          << shm_it->shm_name << ", size: " << shm_it->shm_size;
             }
 #endif
         }
