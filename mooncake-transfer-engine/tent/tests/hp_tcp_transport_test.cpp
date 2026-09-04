@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -41,17 +40,6 @@ class HighPerformanceTcpTransportTestPeer {
     static uint64_t connectionsCreated(
         const HighPerformanceTcpTransport& transport) {
         return transport.client_->connectionsCreatedForTest();
-    }
-
-    static void blockLane(HighPerformanceTcpTransport& transport,
-                          SegmentID peer, uint32_t lane,
-                          std::atomic<bool>& entered,
-                          std::atomic<bool>& release) {
-        const size_t owner = transport.workers_->affinityOwner(peer, lane);
-        asio::post(transport.workers_->ioContext(owner), [&entered, &release] {
-            entered.store(true);
-            while (!release.load()) std::this_thread::yield();
-        });
     }
 };
 
@@ -344,17 +332,17 @@ TEST(HighPerformanceTcpTransportTest, SlicesSingleLargeReadAcrossTwoRails) {
 TEST(HighPerformanceTcpTransportTest,
      SlicedStaleRegistrationCancelsAndRetries) {
     constexpr size_t kLength = 4ULL << 20;
-    std::atomic<bool> blocker_entered{false};
-    std::atomic<bool> release_blocker{false};
     auto params = MakeParams();
     params.bind_address.clear();
     params.rail_addresses = {"127.0.0.1", "127.0.0.2"};
     params.max_outstanding_bytes = 8ULL << 20;
     params.max_transfer_bytes = 8ULL << 20;
+    params.worker_count = 1;
     params.progress_timeout_ms = 5000;
-    asio::io_context stalled_io;
-    asio::ip::tcp::acceptor stalled_peer(
-        stalled_io, {asio::ip::make_address("127.0.0.1"), 0});
+    asio::io_context peer_io;
+    asio::ip::tcp::acceptor peer(peer_io,
+                                 {asio::ip::make_address("127.0.0.1"), 0});
+    peer.non_blocking(true);
 
     auto server_metadata = MakeLocalMetadata();
     uint16_t rpc_port = 0;
@@ -421,8 +409,9 @@ TEST(HighPerformanceTcpTransportTest,
         DecodeHighPerformanceTcpEndpointAttr(encoded_endpoint, &mixed_endpoint)
             .ok());
     ASSERT_EQ(mixed_endpoint.endpoints.size(), 2U);
-    mixed_endpoint.endpoints[1] = {"127.0.0.1",
-                                   stalled_peer.local_endpoint().port()};
+    for (auto& endpoint : mixed_endpoint.endpoints) {
+        endpoint = {"127.0.0.1", peer.local_endpoint().port()};
+    }
     ASSERT_TRUE(
         EncodeHighPerformanceTcpEndpointAttr(mixed_endpoint, &encoded_endpoint)
             .ok());
@@ -461,26 +450,47 @@ TEST(HighPerformanceTcpTransportTest,
     request.length = registration_b.length;
     request.transport_hint = HP_TCP;
 
-    HighPerformanceTcpTransportTestPeer::blockLane(
-        client, target, 0, blocker_entered, release_blocker);
-    const bool entered = WaitUntil([&] { return blocker_entered.load(); });
-    if (!entered) release_blocker.store(true);
-    ASSERT_TRUE(entered);
-
     const Status submitted = client.submitTransferTasks(batch, {request});
-    if (!submitted.ok()) release_blocker.store(true);
     ASSERT_TRUE(submitted.ok()) << submitted.ToString();
-    const bool sibling_active = WaitUntil([&] {
-        return HighPerformanceTcpTransportTestPeer::connectionsCreated(
-                   client) == 1;
-    });
-    release_blocker.store(true);
-    ASSERT_TRUE(sibling_active);
+    std::error_code error;
+    const auto accept = [&](asio::ip::tcp::socket& socket) {
+        return WaitUntil([&] {
+            if (socket.is_open()) return true;
+            peer.accept(socket, error);
+            return !error;
+        });
+    };
+    asio::ip::tcp::socket stale_socket(peer_io);
+    asio::ip::tcp::socket stalled_socket(peer_io);
+    ASSERT_TRUE(accept(stale_socket));
+    ASSERT_TRUE(accept(stalled_socket));
 
-    TransferStatus transfer_status;
+    std::array<uint8_t, kHighPerformanceTcpRequestSize> stale_request{};
+    asio::read(stale_socket, asio::buffer(stale_request), error);
+    ASSERT_FALSE(error);
+    std::array<uint8_t, kHighPerformanceTcpRequestSize> stalled_request{};
+    asio::read(stalled_socket, asio::buffer(stalled_request), error);
+    ASSERT_FALSE(error);
+
+    HighPerformanceTcpRequestFrame frame;
+    ASSERT_TRUE(DecodeHighPerformanceTcpRequest(stale_request.data(),
+                                                stale_request.size(), &frame)
+                    .ok());
+    const auto response = EncodeHighPerformanceTcpResponse(
+        {HighPerformanceTcpStatus::kStaleRegistration, frame.request_id, 0});
+    asio::write(stale_socket, asio::buffer(response), error);
+    ASSERT_FALSE(error);
+
+    TransferStatus transfer_status{PENDING, 0};
     Status first_result =
         WaitForTransportResult(client, batch, transfer_status);
-    EXPECT_EQ(transfer_status.s, FAILED);
+    if (transfer_status.s == PENDING) {
+        (void)client.quiesce();
+    }
+    uint8_t unexpected = 0;
+    (void)stalled_socket.read_some(asio::buffer(&unexpected, 1), error);
+    EXPECT_TRUE(error);
+    ASSERT_EQ(transfer_status.s, FAILED);
     EXPECT_TRUE(first_result.IsNeedsRefreshCache()) << first_result.ToString();
 
     ASSERT_TRUE(
