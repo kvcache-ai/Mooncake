@@ -311,8 +311,14 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         // Expose per-tier metrics before mounting so an early metrics read
         // already sees this tier.
         if (tier_metric_) {
-            tier_metric_->RegisterTier(id, MakeTierSegmentName(id), tiers_[id],
-                                       priority);
+            // Borrowed, not owned: TieredBackend outlives the metric object it
+            // was handed, so capturing the tier by weak/shared pointer would
+            // only complicate shutdown without making anything safer.
+            CacheTier* tier = tiers_[id].get();
+            tier_metric_->RegisterTier(
+                id, MakeTierSegmentName(id), tier->GetMemoryType(), priority,
+                tier->GetCapacity(),
+                [tier]() -> size_t { return tier->GetUsage(); });
         }
 
         auto mount_result =

@@ -5,9 +5,9 @@
 // methods that have a real production caller, so that an alternative local
 // data plane can be dropped in without touching any of those callers.
 //
-// The only implementation today is DataManagerV1, the TieredBackend-based
-// data plane this interface was extracted from
-// (p2p/client/v1/data_manager_v1.h).
+// Two implementations live behind it:
+//   - DataManagerV1 (p2p/client/v1/data_manager_v1.h)  — TieredBackend based
+//   - DataManagerV2 (p2p/client/v2/data_manager_v2.h)  — Tiler/Block based
 //
 // Deliberately NOT on this interface:
 //   - ReadRemoteData / WriteRemoteData / TransferData: the synchronous

@@ -180,6 +180,11 @@ struct P2PClientConfig : RealClientConfigBase {
     // pending-write/pinned-key lease shards). Higher values reduce contention.
     size_t lock_shard_count = 1024;
 
+    // Which DataManager implementation to build: "v1" (TieredBackend based) or
+    // "v2" (Tiler/Block based). Defaults to v1 until V2 clears the acceptance
+    // criteria; see remake_kvbm/new_data_manager.md section 11.
+    std::string data_manager_version = "v1";
+
     // RouteCache configuration
     // each size of route entry is about 240B:
     // Aligned Node(64B) + hash_bucket(8B) + Key(assume 64B)
@@ -403,6 +408,16 @@ class ClientConfigBuilder {
                 "via tiered_backend_config_json parameter.");
         }
         config.tiered_backend_config = tiered_config;
+
+        // The implementation selector lives in the same JSON document as
+        // `tiers`, so a deployment switches versions by editing one file and
+        // no client wiring changes. Unknown/absent -> keep the v1 default;
+        // CreateDataManager rejects an unparseable value loudly.
+        if (tiered_config.isMember("data_manager_version") &&
+            tiered_config["data_manager_version"].isString()) {
+            config.data_manager_version =
+                tiered_config["data_manager_version"].asString();
+        }
 
         if (p2p_key_lease_duration_ms > 0) {
             config.p2p_key_lease_duration_ms = p2p_key_lease_duration_ms;
