@@ -181,6 +181,8 @@ TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
     setenv("MOONCAKE_LOG_COMPACTION_MAX_SOURCES", "6", 1);
     setenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_ROUND", "8192", 1);
     setenv("MOONCAKE_LOG_COMPACTION_MAX_TARGET_BYTES", "16384", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_SEC", "32768", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_RESERVE_BYTES", "2048", 1);
     setenv("MOONCAKE_LOG_COMPACTION_MIN_RECLAIM_RATIO", "0.35", 1);
 
     const auto config = LogStructuredBackendConfig::FromEnvironment();
@@ -195,6 +197,8 @@ TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
     unsetenv("MOONCAKE_LOG_COMPACTION_MAX_SOURCES");
     unsetenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_ROUND");
     unsetenv("MOONCAKE_LOG_COMPACTION_MAX_TARGET_BYTES");
+    unsetenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_SEC");
+    unsetenv("MOONCAKE_LOG_COMPACTION_RESERVE_BYTES");
     unsetenv("MOONCAKE_LOG_COMPACTION_MIN_RECLAIM_RATIO");
 
     EXPECT_TRUE(config.Validate());
@@ -208,6 +212,8 @@ TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
     EXPECT_EQ(config.compaction_max_sources, size_t{6});
     EXPECT_EQ(config.compaction_max_bytes_per_round, uint64_t{8192});
     EXPECT_EQ(config.compaction_max_target_bytes, uint64_t{16384});
+    EXPECT_EQ(config.compaction_max_bytes_per_second, uint64_t{32768});
+    EXPECT_EQ(config.compaction_reserve_bytes, uint64_t{2048});
     EXPECT_DOUBLE_EQ(config.compaction_min_reclaim_ratio, 0.35);
 }
 
@@ -262,6 +268,59 @@ TEST(LogStructuredStorageBackendTest, BackgroundTieringKeepsObjectsReadable) {
         ASSERT_TRUE(backend.BatchLoad(slices).has_value());
         EXPECT_EQ(loaded, values[i]);
     }
+}
+
+TEST(LogStructuredStorageBackendTest,
+     DiskWatermarkCompactsGarbageWithoutEvictingLiveKeys) {
+    BackendTempDirectory temp;
+    auto config = BackendConfig(temp);
+    config.total_size_limit = 512;
+    LogStructuredBackendConfig backend_config;
+    backend_config.segment_size_bytes = 128;
+    backend_config.compaction_policy = LogStructuredCompactionPolicy::kNone;
+    backend_config.compaction_reserve_bytes = 128;
+    backend_config.compaction_max_sources = 8;
+    backend_config.compaction_max_bytes_per_round = 4096;
+    backend_config.compaction_max_target_bytes = 4096;
+
+    LogStructuredStorageBackend backend(config, backend_config);
+    ASSERT_TRUE(backend.Init().has_value());
+    const std::string storage_key =
+        TenantId("tenant-a").MakeScopedKey("replaced-key");
+    for (char fill : {'a', 'b', 'c'}) {
+        std::string value(96, fill);
+        ASSERT_TRUE(backend
+                        .BatchOffload(SingleValueBatch(storage_key, value),
+                                      [](const std::vector<std::string>&,
+                                         std::vector<StorageObjectMetadata>&) {
+                                          return ErrorCode::OK;
+                                      })
+                        .has_value());
+    }
+    EXPECT_FALSE(backend.IsEnableOffloading().value());
+
+    const auto segments_path = temp.path() / "log_structured" / "segments";
+    const auto disk_bytes = [&]() {
+        uint64_t bytes = 0;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(segments_path)) {
+            if (entry.is_regular_file()) bytes += entry.file_size();
+        }
+        return bytes;
+    };
+    const uint64_t before = disk_bytes();
+
+    auto evicted = backend.EvictAboveDiskWatermark(0.90, 0.75);
+    ASSERT_TRUE(evicted.has_value());
+    EXPECT_TRUE(evicted->empty());
+    EXPECT_LT(disk_bytes(), before);
+    EXPECT_TRUE(backend.IsEnableOffloading().value());
+
+    std::string loaded(96, '\0');
+    std::unordered_map<std::string, Slice> slices{
+        {storage_key, Slice{loaded.data(), loaded.size()}}};
+    ASSERT_TRUE(backend.BatchLoad(slices).has_value());
+    EXPECT_EQ(loaded, std::string(96, 'c'));
 }
 
 TEST(LogStructuredStorageBackendTest, RemoveAllSurvivesRestart) {

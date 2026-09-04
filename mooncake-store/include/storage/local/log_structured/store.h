@@ -4,6 +4,7 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,6 +26,7 @@ enum class StoreError {
     kUnrecognizedFormat,
     kNotFound,
     kInvalidTransition,
+    kCancelled,
 };
 
 struct LogStructuredStoreConfig {
@@ -47,7 +49,19 @@ struct CompactionOptions {
     size_t fanout{4};
     uint32_t max_levels{4};
     double min_reclaim_ratio{0.20};
+    uint64_t max_bytes_per_second{0};
     bool enable_tiering{false};
+    std::stop_token stop_token;
+};
+
+struct StoreStats {
+    uint64_t physical_bytes{0};
+    uint64_t live_record_bytes{0};
+    uint64_t logical_value_bytes{0};
+    uint64_t reclaimable_bytes{0};
+    size_t active_segments{0};
+    size_t sealed_segments{0};
+    size_t retired_segments{0};
 };
 
 struct CompactionResult {
@@ -87,6 +101,7 @@ class LogStructuredStore {
 
     std::vector<IndexSnapshotEntry> SnapshotIndex() const;
     std::vector<IndexSnapshotEntry> SnapshotCurrentIndex() const;
+    StoreStats SnapshotStats() const;
     uint64_t active_segment_id() const;
     uint64_t next_sequence() const;
 

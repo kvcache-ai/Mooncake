@@ -1,6 +1,7 @@
 #include "storage/local/log_structured/store.h"
 
 #include <algorithm>
+#include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -8,6 +9,7 @@
 #include <limits>
 #include <map>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 
 namespace mooncake::logstructured {
@@ -688,6 +690,9 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         options.min_reclaim_ratio < 0.0 || options.min_reclaim_ratio > 1.0) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
+    if (options.stop_token.stop_requested()) {
+        return tl::unexpected(StoreError::kCancelled);
+    }
 
     std::lock_guard compaction_lock(compaction_mutex_);
     std::vector<SegmentMetadata> sources;
@@ -842,7 +847,14 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         }
     };
 
+    const auto copy_started = std::chrono::steady_clock::now();
+    uint64_t copied_bytes = 0;
     for (const auto& entry : live_entries) {
+        if (options.stop_token.stop_requested()) {
+            cleanup_targets();
+            reset_sources();
+            return tl::unexpected(StoreError::kCancelled);
+        }
         const auto path = source_paths.find(entry.version.physical.segment_id);
         if (path == source_paths.end()) {
             cleanup_targets();
@@ -895,11 +907,37 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
             .expected_source = entry.version.physical,
             .expected_epoch = entry.version.mutation_epoch,
             .target = *appended});
+        copied_bytes += record_bytes;
+        if (options.max_bytes_per_second != 0) {
+            const auto target_elapsed = std::chrono::duration<double>(
+                static_cast<double>(copied_bytes) /
+                options.max_bytes_per_second);
+            while (!options.stop_token.stop_requested() &&
+                   std::chrono::steady_clock::now() - copy_started <
+                       target_elapsed) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (options.stop_token.stop_requested()) {
+                cleanup_targets();
+                reset_sources();
+                return tl::unexpected(StoreError::kCancelled);
+            }
+        }
+    }
+    if (options.stop_token.stop_requested()) {
+        cleanup_targets();
+        reset_sources();
+        return tl::unexpected(StoreError::kCancelled);
     }
     if (writer && !writer->Sync()) {
         cleanup_targets();
         reset_sources();
         return tl::unexpected(StoreError::kIoError);
+    }
+    if (options.stop_token.stop_requested()) {
+        cleanup_targets();
+        reset_sources();
+        return tl::unexpected(StoreError::kCancelled);
     }
     writer.reset();
 
@@ -1029,6 +1067,28 @@ std::vector<IndexSnapshotEntry> LogStructuredStore::SnapshotCurrentIndex()
     const {
     std::lock_guard lock(mutex_);
     return index_.CurrentSnapshot();
+}
+
+StoreStats LogStructuredStore::SnapshotStats() const {
+    std::lock_guard lock(mutex_);
+    StoreStats stats;
+    for (const auto& [segment_id, segment] : segments_) {
+        static_cast<void>(segment_id);
+        stats.physical_bytes += segment.valid_bytes;
+        stats.live_record_bytes += segment.live_bytes;
+        if (segment.state == SegmentLifecycle::kActive) {
+            ++stats.active_segments;
+        } else if (segment.state == SegmentLifecycle::kRetired) {
+            ++stats.retired_segments;
+        } else {
+            ++stats.sealed_segments;
+        }
+    }
+    for (const auto& entry : index_.CurrentSnapshot()) {
+        stats.logical_value_bytes += entry.version.physical.value_length;
+    }
+    stats.reclaimable_bytes = stats.physical_bytes - stats.live_record_bytes;
+    return stats;
 }
 
 uint64_t LogStructuredStore::active_segment_id() const {

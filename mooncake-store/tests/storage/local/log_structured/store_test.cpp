@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <stop_token>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -262,7 +263,8 @@ TEST(LogStructuredStoreTest, ReclaimsFullyDeadSealedSegment) {
 
     auto compacted = (*store)->CompactOnce({.max_source_segments = 1,
                                             .max_input_bytes = 1024 * 1024,
-                                            .min_reclaim_ratio = 0.0});
+                                            .min_reclaim_ratio = 0.0,
+                                            .stop_token = {}});
     ASSERT_TRUE(compacted.has_value());
     EXPECT_EQ(compacted->source_segments, size_t{1});
     EXPECT_EQ(compacted->target_segments, size_t{0});
@@ -305,7 +307,8 @@ TEST(LogStructuredStoreTest, CompactsLiveRecordsAndRecoversAfterRestart) {
 
         auto compacted = (*store)->CompactOnce({.max_source_segments = 1,
                                                 .max_input_bytes = 1024 * 1024,
-                                                .min_reclaim_ratio = 0.0});
+                                                .min_reclaim_ratio = 0.0,
+                                                .stop_token = {}});
         ASSERT_TRUE(compacted.has_value());
         EXPECT_EQ(compacted->source_segments, size_t{1});
         EXPECT_EQ(compacted->target_segments, size_t{1});
@@ -354,6 +357,58 @@ TEST(LogStructuredStoreTest, RemovesUnpublishedCompactionTargetOnRecovery) {
     EXPECT_FALSE(std::filesystem::exists(orphan_path));
 }
 
+TEST(LogStructuredStoreTest, ReportsPhysicalAndReclaimableBytes) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 128));
+    ASSERT_TRUE(store.has_value());
+
+    auto first = (*store)->PreparePut("tenant-a", "key", std::string(96, 'a'));
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(first->identity, first->sequence).has_value());
+    auto second = (*store)->PreparePut("tenant-a", "key", std::string(96, 'b'));
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(second->identity, second->sequence).has_value());
+
+    const auto stats = (*store)->SnapshotStats();
+    EXPECT_GT(stats.physical_bytes, stats.live_record_bytes);
+    EXPECT_EQ(stats.reclaimable_bytes,
+              stats.physical_bytes - stats.live_record_bytes);
+    EXPECT_EQ(stats.logical_value_bytes, uint64_t{96});
+    EXPECT_EQ(stats.active_segments, size_t{1});
+    EXPECT_GE(stats.sealed_segments, size_t{1});
+}
+
+TEST(LogStructuredStoreTest, CancelledCompactionLeavesSourcesReadable) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 128));
+    ASSERT_TRUE(store.has_value());
+
+    auto first = (*store)->PreparePut("tenant-a", "key", std::string(96, 'a'));
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(first->identity, first->sequence).has_value());
+    auto second = (*store)->PreparePut("tenant-a", "key", std::string(96, 'b'));
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(second->identity, second->sequence).has_value());
+    ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+
+    std::stop_source stop_source;
+    stop_source.request_stop();
+    auto compacted =
+        (*store)->CompactOnce({.max_source_segments = 8,
+                               .max_input_bytes = 4096,
+                               .max_target_bytes = 4096,
+                               .min_reclaim_ratio = 0.0,
+                               .stop_token = stop_source.get_token()});
+    ASSERT_FALSE(compacted.has_value());
+    EXPECT_EQ(compacted.error(), StoreError::kCancelled);
+    EXPECT_EQ((*store)->GetLatest("tenant-a", "key").value(),
+              std::string(96, 'b'));
+}
+
 TEST(LogStructuredStoreTest, TieredCompactionMergesCleanSegments) {
     StoreTempDirectory temp;
     auto store = LogStructuredStore::Open(Config(temp, 256));
@@ -375,7 +430,8 @@ TEST(LogStructuredStoreTest, TieredCompactionMergesCleanSegments) {
                                             .fanout = 4,
                                             .max_levels = 4,
                                             .min_reclaim_ratio = 1.0,
-                                            .enable_tiering = true});
+                                            .enable_tiering = true,
+                                            .stop_token = {}});
     ASSERT_TRUE(compacted.has_value());
     EXPECT_EQ(compacted->source_segments, size_t{4});
     EXPECT_EQ(compacted->target_segments, size_t{1});

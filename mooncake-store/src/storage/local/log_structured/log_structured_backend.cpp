@@ -59,6 +59,12 @@ LogStructuredBackendConfig LogStructuredBackendConfig::FromEnvironment() {
     config.compaction_max_target_bytes =
         Environ::GetUInt64("MOONCAKE_LOG_COMPACTION_MAX_TARGET_BYTES",
                            config.compaction_max_target_bytes);
+    config.compaction_max_bytes_per_second =
+        Environ::GetUInt64("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_SEC",
+                           config.compaction_max_bytes_per_second);
+    config.compaction_reserve_bytes =
+        Environ::GetUInt64("MOONCAKE_LOG_COMPACTION_RESERVE_BYTES",
+                           config.compaction_reserve_bytes);
     config.compaction_min_reclaim_ratio = ParseRatio(
         Environ::GetString("MOONCAKE_LOG_COMPACTION_MIN_RECLAIM_RATIO", ""),
         config.compaction_min_reclaim_ratio);
@@ -294,15 +300,20 @@ LogStructuredStorageBackend::IsEnableOffloading() {
     if (!initialized_.load(std::memory_order_acquire) || !store_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    const auto entries = store_->SnapshotCurrentIndex();
-    uint64_t total_size = 0;
-    for (const auto& entry : entries) {
-        total_size += entry.version.physical.value_length;
+    if (file_storage_config_.total_keys_limit <= 0 ||
+        file_storage_config_.total_size_limit <= 0) {
+        return false;
     }
+    const auto entries = store_->SnapshotCurrentIndex();
+    const auto stats = store_->SnapshotStats();
+    const uint64_t capacity =
+        static_cast<uint64_t>(file_storage_config_.total_size_limit);
+    if (backend_config_.compaction_reserve_bytes >= capacity) return false;
+    const uint64_t usable_capacity =
+        capacity - backend_config_.compaction_reserve_bytes;
     return entries.size() <
                static_cast<size_t>(file_storage_config_.total_keys_limit) &&
-           total_size <
-               static_cast<uint64_t>(file_storage_config_.total_size_limit);
+           stats.physical_bytes < usable_capacity;
 }
 
 tl::expected<void, ErrorCode> LogStructuredStorageBackend::ScanMeta(
@@ -336,6 +347,22 @@ tl::expected<void, ErrorCode> LogStructuredStorageBackend::ScanMeta(
     return {};
 }
 
+logstructured::CompactionOptions
+LogStructuredStorageBackend::MakeCompactionOptions(
+    std::stop_token stop_token) const {
+    return {
+        .max_source_segments = backend_config_.compaction_max_sources,
+        .max_input_bytes = backend_config_.compaction_max_bytes_per_round,
+        .max_target_bytes = backend_config_.compaction_max_target_bytes,
+        .fanout = backend_config_.compaction_fanout,
+        .max_levels = backend_config_.compaction_max_levels,
+        .min_reclaim_ratio = backend_config_.compaction_min_reclaim_ratio,
+        .max_bytes_per_second = backend_config_.compaction_max_bytes_per_second,
+        .enable_tiering = backend_config_.compaction_policy ==
+                          LogStructuredCompactionPolicy::kTiered,
+        .stop_token = stop_token};
+}
+
 void LogStructuredStorageBackend::CompactionLoop(std::stop_token stop_token) {
     std::mutex wait_mutex;
     std::unique_lock wait_lock(wait_mutex);
@@ -345,19 +372,70 @@ void LogStructuredStorageBackend::CompactionLoop(std::stop_token stop_token) {
             std::chrono::milliseconds(backend_config_.compaction_interval_ms),
             [] { return false; });
         if (stop_token.stop_requested()) break;
-        auto compacted = store_->CompactOnce(
-            {.max_source_segments = backend_config_.compaction_max_sources,
-             .max_input_bytes = backend_config_.compaction_max_bytes_per_round,
-             .max_target_bytes = backend_config_.compaction_max_target_bytes,
-             .fanout = backend_config_.compaction_fanout,
-             .max_levels = backend_config_.compaction_max_levels,
-             .min_reclaim_ratio = backend_config_.compaction_min_reclaim_ratio,
-             .enable_tiering = backend_config_.compaction_policy ==
-                               LogStructuredCompactionPolicy::kTiered});
-        if (!compacted) {
+        auto compacted = store_->CompactOnce(MakeCompactionOptions(stop_token));
+        if (!compacted &&
+            compacted.error() != logstructured::StoreError::kCancelled) {
             LOG(ERROR) << "Log-structured compaction failed";
         }
     }
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+LogStructuredStorageBackend::EvictAboveDiskWatermark(
+    double high_watermark_ratio, double low_watermark_ratio,
+    EvictionHandler eviction_handler) {
+    static_cast<void>(eviction_handler);
+    if (!std::isfinite(high_watermark_ratio) ||
+        !std::isfinite(low_watermark_ratio) || low_watermark_ratio < 0.0 ||
+        high_watermark_ratio > 1.0 ||
+        low_watermark_ratio > high_watermark_ratio) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!initialized_.load(std::memory_order_acquire) || !store_) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (file_storage_config_.total_size_limit <= 0) {
+        return std::vector<std::string>{};
+    }
+
+    const uint64_t capacity =
+        static_cast<uint64_t>(file_storage_config_.total_size_limit);
+    if (backend_config_.compaction_reserve_bytes >= capacity) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const uint64_t usable_capacity =
+        capacity - backend_config_.compaction_reserve_bytes;
+    const uint64_t high_watermark_bytes = static_cast<uint64_t>(
+        static_cast<double>(usable_capacity) * high_watermark_ratio);
+    const uint64_t low_watermark_bytes = static_cast<uint64_t>(
+        static_cast<double>(usable_capacity) * low_watermark_ratio);
+
+    auto stats = store_->SnapshotStats();
+    if (stats.physical_bytes <= high_watermark_bytes) {
+        return std::vector<std::string>{};
+    }
+    if (stats.reclaimable_bytes == 0) {
+        return std::vector<std::string>{};
+    }
+    auto sealed = store_->SealActiveSegment();
+    if (!sealed) return tl::make_unexpected(ToWriteError(sealed.error()));
+
+    auto options = MakeCompactionOptions();
+    options.min_reclaim_ratio = 0.0;
+    options.enable_tiering = false;
+    while (stats.physical_bytes > low_watermark_bytes &&
+           stats.reclaimable_bytes != 0) {
+        auto compacted = store_->CompactOnce(options);
+        if (!compacted) {
+            return tl::make_unexpected(ToWriteError(compacted.error()));
+        }
+        if (compacted->source_segments == 0 ||
+            compacted->reclaimed_bytes == 0) {
+            break;
+        }
+        stats = store_->SnapshotStats();
+    }
+    return std::vector<std::string>{};
 }
 
 void LogStructuredStorageBackend::RemoveAll() {
@@ -384,7 +462,8 @@ void LogStructuredStorageBackend::RemoveAll() {
         .fanout = backend_config_.compaction_fanout,
         .max_levels = backend_config_.compaction_max_levels,
         .min_reclaim_ratio = 0.0,
-        .enable_tiering = false};
+        .enable_tiering = false,
+        .stop_token = {}};
     while (true) {
         auto compacted = store_->CompactOnce(options);
         if (!compacted) {

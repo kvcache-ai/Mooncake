@@ -27,6 +27,8 @@ struct LogStructuredBackendConfig {
     size_t compaction_max_sources{8};
     uint64_t compaction_max_bytes_per_round{1024ULL * 1024 * 1024};
     uint64_t compaction_max_target_bytes{4ULL * 1024 * 1024 * 1024};
+    uint64_t compaction_max_bytes_per_second{0};
+    uint64_t compaction_reserve_bytes{0};
     double compaction_min_reclaim_ratio{0.20};
 
     static LogStructuredBackendConfig FromEnvironment();
@@ -59,6 +61,9 @@ class LogStructuredStorageBackend final : public StorageBackendInterface {
     void SetTestFailurePredicate(
         std::function<bool(const std::string& key)> predicate) override;
     void RemoveAll() override;
+    tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
+        double high_watermark_ratio, double low_watermark_ratio,
+        EvictionHandler eviction_handler = nullptr) override;
 
    private:
     static ErrorCode ToWriteError(logstructured::StoreError error);
@@ -66,6 +71,8 @@ class LogStructuredStorageBackend final : public StorageBackendInterface {
     static tl::expected<std::string, ErrorCode> ConcatSlices(
         const std::vector<Slice>& slices);
     void CompactionLoop(std::stop_token stop_token);
+    logstructured::CompactionOptions MakeCompactionOptions(
+        std::stop_token stop_token = {}) const;
 
     LogStructuredBackendConfig backend_config_;
     mutable std::mutex mutex_;
