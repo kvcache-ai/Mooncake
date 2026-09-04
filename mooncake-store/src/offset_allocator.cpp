@@ -50,10 +50,10 @@ inline uint32 tzcnt_nonzero(uint32 v) {
 }
 
 namespace SmallFloat {
-static constexpr uint32 MANTISSA_BITS = 3;
 static constexpr uint32 MANTISSA_VALUE = 1 << MANTISSA_BITS;
 static constexpr uint32 MANTISSA_MASK = MANTISSA_VALUE - 1;
-static constexpr uint64_t MAX_BIN_SIZE = 4026531840ull;  // 3.75GB
+static constexpr uint64_t MAX_BIN_SIZE =
+    (uint64_t{1} << 32) - (uint64_t{1} << (31 - MANTISSA_BITS));
 
 // Bin sizes follow floating point (exponent + mantissa) distribution (piecewise
 // linear log approx) This ensures that for each size class, the average
@@ -145,7 +145,7 @@ __Allocator::__Allocator(__Allocator&& other)
       m_nodes(std::move(other.m_nodes)),
       m_freeNodes(std::move(other.m_freeNodes)),
       m_freeOffset(other.m_freeOffset) {
-    memcpy(m_usedBins, other.m_usedBins, sizeof(uint8) * NUM_TOP_BINS);
+    memcpy(m_usedBins, other.m_usedBins, sizeof(m_usedBins));
     memcpy(m_binIndices, other.m_binIndices, sizeof(NodeIndex) * NUM_LEAF_BINS);
 
     other.m_nodes.clear();
@@ -256,7 +256,7 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
     // Bin empty?
     if (m_binIndices[binIndex] == Node::unused) {
         // Remove a leaf bin mask bit
-        m_usedBins[topBinIndex] &= ~(1 << leafBinIndex);
+        m_usedBins[topBinIndex] &= ~(uint32{1} << leafBinIndex);
 
         // All leaf bins empty?
         if (m_usedBins[topBinIndex] == 0) {
@@ -362,7 +362,7 @@ uint32 __Allocator::insertNodeIntoBin(uint32 size, uint32 dataOffset) {
     // Bin was empty before?
     if (m_binIndices[binIndex] == Node::unused) {
         // Set bin mask bits
-        m_usedBins[topBinIndex] |= 1 << leafBinIndex;
+        m_usedBins[topBinIndex] |= uint32{1} << leafBinIndex;
         m_usedBinsTop |= 1 << topBinIndex;
     }
 
@@ -386,6 +386,47 @@ uint32 __Allocator::insertNodeIntoBin(uint32 size, uint32 dataOffset) {
 #endif
 
     return nodeIndex;
+}
+
+bool __Allocator::rebuildFreeBins(const NodeIndex* bin_indices,
+                                  uint32 bin_count) {
+    m_usedBinsTop = 0;
+    std::fill(std::begin(m_usedBins), std::end(m_usedBins), 0);
+    std::fill(std::begin(m_binIndices), std::end(m_binIndices), Node::unused);
+
+    std::vector<bool> visited(m_current_capacity, false);
+    for (uint32 bin = 0; bin < bin_count; ++bin) {
+        NodeIndex node_index = bin_indices[bin];
+        while (node_index != Node::unused) {
+            if (node_index >= m_current_capacity || visited[node_index]) {
+                return false;
+            }
+            visited[node_index] = true;
+
+            Node& node = m_nodes[node_index];
+            const NodeIndex next = node.binListNext;
+            const uint32 new_bin =
+                SmallFloat::uintToFloatRoundDown(node.dataSize);
+            if (new_bin >= NUM_LEAF_BINS) {
+                return false;
+            }
+
+            const uint32 top_bin = new_bin >> TOP_BINS_INDEX_SHIFT;
+            const uint32 leaf_bin = new_bin & LEAF_BINS_INDEX_MASK;
+            const NodeIndex current_head = m_binIndices[new_bin];
+            node.binListPrev = Node::unused;
+            node.binListNext = current_head;
+            if (current_head != Node::unused) {
+                m_nodes[current_head].binListPrev = node_index;
+            }
+            m_binIndices[new_bin] = node_index;
+            m_usedBins[top_bin] |= uint32{1} << leaf_bin;
+            m_usedBinsTop |= uint32{1} << top_bin;
+
+            node_index = next;
+        }
+    }
+    return true;
 }
 
 void __Allocator::removeNodeFromBin(uint32 nodeIndex) {
@@ -413,7 +454,7 @@ void __Allocator::removeNodeFromBin(uint32 nodeIndex) {
         // Bin empty?
         if (m_binIndices[binIndex] == Node::unused) {
             // Remove a leaf bin mask bit
-            m_usedBins[topBinIndex] &= ~(1 << leafBinIndex);
+            m_usedBins[topBinIndex] &= ~(uint32{1} << leafBinIndex);
 
             // All leaf bins empty?
             if (m_usedBins[topBinIndex] == 0) {

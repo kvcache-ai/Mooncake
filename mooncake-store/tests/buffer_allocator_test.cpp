@@ -205,8 +205,20 @@ TEST_F(BufferAllocatorTest, ImportOffsetAllocationsValidatesRangesAndOrder) {
                                              endpoint, overlapping)
                      .has_value());
 
+    auto normalization_probe =
+        offset_allocator::OffsetAllocator::create(0, kCapacity);
+    size_t rounded_request = 0;
+    for (size_t request = kCapacity / 2; request < kCapacity; ++request) {
+        const size_t normalized =
+            normalization_probe->normalizedAllocationSize(request);
+        if (normalized > request && normalized <= kCapacity) {
+            rounded_request = request;
+            break;
+        }
+    }
+    ASSERT_NE(rounded_request, 0);
     std::vector<LiveAllocation> normalized_past_end = {
-        allocation(kBase + kCapacity - 100, 100)};
+        allocation(kBase + kCapacity - rounded_request, rounded_request)};
     EXPECT_FALSE(ImportOffsetBufferAllocator(segment, kBase, kCapacity,
                                              endpoint, normalized_past_end)
                      .has_value());
