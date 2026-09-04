@@ -1350,6 +1350,44 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterWithDeviceLocation) {
     EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
 }
 
+TEST_F(AscendDirectTransportTest, Memory_FabricMemRejectsUnregisteredPointer) {
+    globalConfig().ascend_agent_mode = false;
+    globalConfig().ascend_store_te_init = true;
+    globalConfig().ascend_use_fabric_mem = true;
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    mock_acl::set_pointer_location(test_buffer_src_,
+                                   ACL_MEM_LOCATION_TYPE_UNREGISTERED, 0);
+    EXPECT_NE(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "*", true, true),
+              0);
+    EXPECT_NE(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    mock_acl::set_pointer_location(test_buffer_src_,
+                                   ACL_MEM_LOCATION_TYPE_HOST_NUMA, 0);
+    EXPECT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "*", true, true),
+              0);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+
+    globalConfig().ascend_use_fabric_mem = false;
+    globalConfig().ascend_store_te_init = false;
+}
+
+TEST_F(AscendDirectTransportTest, Memory_NonFabricUnregisteredFallsBackToHost) {
+    mock_acl::set_pointer_location(test_buffer_src_,
+                                   ACL_MEM_LOCATION_TYPE_UNREGISTERED, 0);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    EXPECT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "*", true, true),
+              0);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
 TEST_F(AscendDirectTransportTest, Memory_registerLocalMemoryBatch_Success) {
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
