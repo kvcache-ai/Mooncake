@@ -176,23 +176,53 @@ tl::expected<void, IndexError> VersionIndex::MarkReclaimable(
 tl::expected<void, IndexError> VersionIndex::InstallCompactionCopy(
     const RecordIdentity& identity, const PhysicalRecord& expected_source,
     uint64_t expected_epoch, const PhysicalRecord& target) {
+    return InstallCompactionCopies(
+        {CompactionIndexUpdate{.identity = identity,
+                               .expected_source = expected_source,
+                               .expected_epoch = expected_epoch,
+                               .target = target}});
+}
+
+tl::expected<void, IndexError> VersionIndex::InstallCompactionCopies(
+    const std::vector<CompactionIndexUpdate>& updates) {
     std::unique_lock lock(mutex_);
-    auto it = versions_.find(identity);
-    if (it == versions_.end()) {
-        return tl::unexpected(IndexError::kNotFound);
+    for (const auto& update : updates) {
+        auto it = versions_.find(update.identity);
+        if (it == versions_.end()) {
+            return tl::unexpected(IndexError::kNotFound);
+        }
+        if (it->second.state != VersionState::kCommitted) {
+            return tl::unexpected(IndexError::kInvalidTransition);
+        }
+        if (it->second.mutation_epoch != update.expected_epoch) {
+            return tl::unexpected(IndexError::kStaleSequence);
+        }
+        if (it->second.physical != update.expected_source) {
+            return tl::unexpected(IndexError::kPhysicalMismatch);
+        }
     }
-    if (it->second.state != VersionState::kCommitted) {
-        return tl::unexpected(IndexError::kInvalidTransition);
+    for (const auto& update : updates) {
+        auto& version = versions_.at(update.identity);
+        version.physical = update.target;
+        ++version.mutation_epoch;
     }
-    if (it->second.mutation_epoch != expected_epoch) {
-        return tl::unexpected(IndexError::kStaleSequence);
-    }
-    if (it->second.physical != expected_source) {
-        return tl::unexpected(IndexError::kPhysicalMismatch);
-    }
-    it->second.physical = target;
-    ++it->second.mutation_epoch;
     return {};
+}
+
+void VersionIndex::ReclaimNonCurrentVersionsInSegments(
+    const std::unordered_set<uint64_t>& segment_ids) {
+    std::unique_lock lock(mutex_);
+    for (auto& [identity, version] : versions_) {
+        static_cast<void>(identity);
+        if (version.physical.total_length == 0 ||
+            !segment_ids.contains(version.physical.segment_id) ||
+            version.state == VersionState::kCommitted) {
+            continue;
+        }
+        version.physical = {};
+        version.state = VersionState::kReclaimable;
+        ++version.mutation_epoch;
+    }
 }
 
 std::optional<VersionEntry> VersionIndex::LookupCommitted(

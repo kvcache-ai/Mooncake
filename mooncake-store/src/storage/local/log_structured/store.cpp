@@ -1,10 +1,14 @@
 #include "storage/local/log_structured/store.h"
 
 #include <algorithm>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <filesystem>
 #include <limits>
 #include <map>
 #include <string_view>
+#include <unordered_set>
 
 namespace mooncake::logstructured {
 namespace {
@@ -63,6 +67,22 @@ StoreError MapIndexError(IndexError error) {
     return StoreError::kInvalidTransition;
 }
 
+bool SyncDirectory(const std::string& path) {
+    const int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool synced = fsync(fd) == 0;
+    const bool closed = close(fd) == 0;
+    return synced && closed;
+}
+
+bool IsCompactionOnly(const SegmentScanResult& scan) {
+    return !scan.records.empty() &&
+           std::all_of(scan.records.begin(), scan.records.end(),
+                       [](const ScannedRecord& record) {
+                           return record.kind == RecordKind::kCompactionCopy;
+                       });
+}
+
 }  // namespace
 
 LogStructuredStore::LogStructuredStore(LogStructuredStoreConfig config)
@@ -105,6 +125,14 @@ tl::expected<void, StoreError> LogStructuredStore::Recover() {
     std::error_code error;
     fs::create_directories(segments_path_, error);
     if (error) return tl::unexpected(StoreError::kIoError);
+    fs::create_directories(config_.root_path + "/tmp", error);
+    if (error) return tl::unexpected(StoreError::kIoError);
+    for (const auto& entry :
+         fs::directory_iterator(config_.root_path + "/tmp", error)) {
+        if (error) return tl::unexpected(StoreError::kIoError);
+        fs::remove_all(entry.path(), error);
+        if (error) return tl::unexpected(StoreError::kIoError);
+    }
 
     std::vector<SegmentMetadata> expected_segments;
     uint64_t expected_active_segment = 0;
@@ -193,8 +221,11 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
 
     for (const auto& segment : expected_segments) {
         if (segment.segment_id == 0 ||
-            !segments_.emplace(segment.segment_id, segment).second ||
-            !ordered_segments.contains(segment.segment_id)) {
+            !segments_.emplace(segment.segment_id, segment).second) {
+            return tl::unexpected(StoreError::kCorruptData);
+        }
+        if (!ordered_segments.contains(segment.segment_id) &&
+            segment.state != SegmentLifecycle::kRetired) {
             return tl::unexpected(StoreError::kCorruptData);
         }
     }
@@ -206,13 +237,35 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
         }
     }
 
-    uint64_t active_segment_id = checkpoint_active_segment_id;
-    if (!ordered_segments.empty() &&
-        ordered_segments.rbegin()->first > active_segment_id) {
-        active_segment_id = ordered_segments.rbegin()->first;
+    for (auto it = ordered_segments.begin(); it != ordered_segments.end();) {
+        if (segments_.contains(it->first) ||
+            it->first < post_checkpoint_segment_floor) {
+            ++it;
+            continue;
+        }
+        auto scan = ScanSegment(it->second, it->first);
+        if (!scan) return tl::unexpected(StoreError::kCorruptData);
+        if (scan->termination != ScanTermination::kCleanEof ||
+            !IsCompactionOnly(*scan)) {
+            ++it;
+            continue;
+        }
+        const auto filename = fs::path(it->second).filename().string();
+        auto removed = RemoveFileDurably(segments_path_, filename);
+        if (!removed) return tl::unexpected(StoreError::kIoError);
+        it = ordered_segments.erase(it);
     }
+
+    uint64_t active_segment_id = checkpoint_active_segment_id;
     if (expected_segments.empty() && !ordered_segments.empty()) {
         active_segment_id = ordered_segments.rbegin()->first;
+    } else {
+        for (const auto& [segment_id, path] : ordered_segments) {
+            static_cast<void>(path);
+            if (!segments_.contains(segment_id)) {
+                active_segment_id = std::max(active_segment_id, segment_id);
+            }
+        }
     }
 
     std::unordered_map<uint64_t, std::vector<ScannedRecord>> scanned_segments;
@@ -268,6 +321,21 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
 
     auto validated = ValidateIndexRecords(scanned_segments);
     if (!validated) return validated;
+
+    for (auto it = segments_.begin(); it != segments_.end();) {
+        if (it->second.state != SegmentLifecycle::kRetired) {
+            ++it;
+            continue;
+        }
+        auto path = segment_paths_.find(it->first);
+        if (path != segment_paths_.end()) {
+            const auto filename = fs::path(path->second).filename().string();
+            auto removed = RemoveFileDurably(segments_path_, filename);
+            if (!removed) return tl::unexpected(StoreError::kIoError);
+            segment_paths_.erase(path);
+        }
+        it = segments_.erase(it);
+    }
 
     if (active_segment_id == 0) {
         const uint64_t segment_id = next_segment_id_++;
@@ -511,6 +579,10 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
 
 tl::expected<void, StoreError> LogStructuredStore::Checkpoint() {
     std::lock_guard lock(mutex_);
+    return CheckpointLocked();
+}
+
+tl::expected<void, StoreError> LogStructuredStore::CheckpointLocked() {
     if (!active_segment_->Sync() || !wal_->Sync()) {
         return tl::unexpected(StoreError::kIoError);
     }
@@ -567,10 +639,298 @@ tl::expected<void, StoreError> LogStructuredStore::Checkpoint() {
     manifest_generation_ = generation;
     checkpoint_sequence_ = checkpoint_sequence;
     if (old_wal_file != next_wal_file) {
-        auto removed = RemoveFileDurably(config_.root_path, old_wal_file);
-        if (!removed) return tl::unexpected(StoreError::kIoError);
+        static_cast<void>(RemoveFileDurably(config_.root_path, old_wal_file));
     }
     return {};
+}
+
+void LogStructuredStore::CleanupRetiredSegmentsLocked() {
+    namespace fs = std::filesystem;
+    for (auto it = segments_.begin(); it != segments_.end();) {
+        if (it->second.state != SegmentLifecycle::kRetired) {
+            ++it;
+            continue;
+        }
+        auto path = segment_paths_.find(it->first);
+        if (path != segment_paths_.end()) {
+            const auto filename = fs::path(path->second).filename().string();
+            if (!RemoveFileDurably(segments_path_, filename)) {
+                ++it;
+                continue;
+            }
+            segment_paths_.erase(path);
+        }
+        it = segments_.erase(it);
+    }
+}
+
+tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
+    const CompactionOptions& options) {
+    if (options.max_source_segments == 0 || options.max_input_bytes == 0 ||
+        options.min_reclaim_ratio < 0.0 || options.min_reclaim_ratio > 1.0) {
+        return tl::unexpected(StoreError::kInvalidArgument);
+    }
+
+    std::lock_guard compaction_lock(compaction_mutex_);
+    std::vector<SegmentMetadata> sources;
+    std::unordered_map<uint64_t, std::string> source_paths;
+    std::vector<IndexSnapshotEntry> live_entries;
+    std::vector<uint64_t> reserved_target_ids;
+    uint32_t target_level = 1;
+    uint64_t input_bytes = 0;
+
+    {
+        std::lock_guard lock(mutex_);
+        CleanupRetiredSegmentsLocked();
+        RefreshSegmentLiveBytes();
+        for (const auto& [segment_id, segment] : segments_) {
+            static_cast<void>(segment_id);
+            if (segment.state != SegmentLifecycle::kSealed ||
+                segment.valid_bytes == 0 ||
+                segment.live_bytes > segment.valid_bytes) {
+                continue;
+            }
+            const uint64_t reclaimable =
+                segment.valid_bytes - segment.live_bytes;
+            const double reclaim_ratio =
+                static_cast<double>(reclaimable) / segment.valid_bytes;
+            if (reclaimable == 0 ||
+                (segment.live_bytes != 0 &&
+                 reclaim_ratio < options.min_reclaim_ratio)) {
+                continue;
+            }
+            sources.push_back(segment);
+        }
+        std::sort(
+            sources.begin(), sources.end(),
+            [](const SegmentMetadata& left, const SegmentMetadata& right) {
+                const uint64_t left_reclaim =
+                    left.valid_bytes - left.live_bytes;
+                const uint64_t right_reclaim =
+                    right.valid_bytes - right.live_bytes;
+                if (left_reclaim != right_reclaim) {
+                    return left_reclaim > right_reclaim;
+                }
+                return left.segment_id < right.segment_id;
+            });
+        if (sources.size() > options.max_source_segments) {
+            sources.resize(options.max_source_segments);
+        }
+        uint64_t selected_bytes = 0;
+        size_t selected_count = 0;
+        for (; selected_count < sources.size(); ++selected_count) {
+            const auto bytes = sources[selected_count].valid_bytes;
+            if (selected_count != 0 &&
+                bytes > options.max_input_bytes - selected_bytes) {
+                break;
+            }
+            selected_bytes += bytes;
+            if (selected_bytes >= options.max_input_bytes) {
+                ++selected_count;
+                break;
+            }
+        }
+        sources.resize(selected_count);
+        if (sources.empty()) return CompactionResult{};
+
+        std::unordered_set<uint64_t> source_ids;
+        for (auto& source : sources) {
+            source_ids.insert(source.segment_id);
+            input_bytes += source.valid_bytes;
+            target_level = std::max(target_level, source.level + 1);
+            auto path = segment_paths_.find(source.segment_id);
+            if (path == segment_paths_.end()) {
+                return tl::unexpected(StoreError::kCorruptData);
+            }
+            source_paths.emplace(source.segment_id, path->second);
+            auto& current = segments_.at(source.segment_id);
+            current.state = SegmentLifecycle::kCompacting;
+            ++current.mutation_epoch;
+            source = current;
+        }
+        for (const auto& entry : index_.CurrentSnapshot()) {
+            if (source_ids.contains(entry.version.physical.segment_id)) {
+                live_entries.push_back(entry);
+            }
+        }
+        reserved_target_ids.reserve(std::max<size_t>(1, live_entries.size()));
+        for (size_t i = 0; i < std::max<size_t>(1, live_entries.size()); ++i) {
+            reserved_target_ids.push_back(next_segment_id_++);
+        }
+    }
+
+    struct TargetOutput {
+        uint64_t segment_id{0};
+        std::string temporary_path;
+        std::string final_path;
+        uint64_t valid_bytes{0};
+        uint64_t record_count{0};
+    };
+    std::vector<TargetOutput> targets;
+    std::vector<CompactionIndexUpdate> updates;
+    std::unique_ptr<SegmentWriter> writer;
+
+    const auto cleanup_targets = [&]() {
+        writer.reset();
+        std::error_code error;
+        for (const auto& target : targets) {
+            std::filesystem::remove(target.temporary_path, error);
+            error.clear();
+            std::filesystem::remove(target.final_path, error);
+            error.clear();
+        }
+    };
+    const auto reset_sources = [&]() {
+        std::lock_guard lock(mutex_);
+        for (const auto& source : sources) {
+            auto current = segments_.find(source.segment_id);
+            if (current != segments_.end() &&
+                current->second.state == SegmentLifecycle::kCompacting) {
+                current->second.state = SegmentLifecycle::kSealed;
+                ++current->second.mutation_epoch;
+            }
+        }
+    };
+
+    for (const auto& entry : live_entries) {
+        const auto path = source_paths.find(entry.version.physical.segment_id);
+        if (path == source_paths.end()) {
+            cleanup_targets();
+            reset_sources();
+            return tl::unexpected(StoreError::kCorruptData);
+        }
+        auto record = ReadRecord(path->second, entry.version.physical);
+        if (!record || record->identity != entry.identity ||
+            record->kind == RecordKind::kTombstone) {
+            cleanup_targets();
+            reset_sources();
+            return tl::unexpected(StoreError::kCorruptData);
+        }
+        const uint64_t record_bytes = entry.version.physical.total_length;
+        if (!writer || (writer->tail() != 0 && writer->tail() + record_bytes >
+                                                   config_.max_segment_bytes)) {
+            if (writer && !writer->Sync()) {
+                cleanup_targets();
+                reset_sources();
+                return tl::unexpected(StoreError::kIoError);
+            }
+            writer.reset();
+            const uint64_t segment_id = reserved_target_ids[targets.size()];
+            const std::string temporary_path =
+                config_.root_path + "/tmp/" + FormatSegmentName(segment_id);
+            const std::string final_path = SegmentPath(segment_id);
+            auto created = SegmentWriter::Create(temporary_path, segment_id);
+            if (!created) {
+                cleanup_targets();
+                reset_sources();
+                return tl::unexpected(StoreError::kIoError);
+            }
+            writer = std::move(created.value());
+            targets.push_back(TargetOutput{.segment_id = segment_id,
+                                           .temporary_path = temporary_path,
+                                           .final_path = final_path});
+        }
+        auto appended = writer->Append(entry.identity, record->value,
+                                       RecordKind::kCompactionCopy,
+                                       entry.version.sequence, false);
+        if (!appended) {
+            cleanup_targets();
+            reset_sources();
+            return tl::unexpected(StoreError::kIoError);
+        }
+        targets.back().valid_bytes = writer->tail();
+        ++targets.back().record_count;
+        updates.push_back(CompactionIndexUpdate{
+            .identity = entry.identity,
+            .expected_source = entry.version.physical,
+            .expected_epoch = entry.version.mutation_epoch,
+            .target = *appended});
+    }
+    if (writer && !writer->Sync()) {
+        cleanup_targets();
+        reset_sources();
+        return tl::unexpected(StoreError::kIoError);
+    }
+    writer.reset();
+
+    for (const auto& target : targets) {
+        if (rename(target.temporary_path.c_str(), target.final_path.c_str()) !=
+            0) {
+            cleanup_targets();
+            reset_sources();
+            return tl::unexpected(StoreError::kIoError);
+        }
+    }
+    if (!targets.empty() && !SyncDirectory(segments_path_)) {
+        cleanup_targets();
+        reset_sources();
+        return tl::unexpected(StoreError::kIoError);
+    }
+
+    {
+        std::lock_guard lock(mutex_);
+        const auto index_before = index_.Snapshot();
+        auto installed = index_.InstallCompactionCopies(updates);
+        if (!installed) {
+            cleanup_targets();
+            for (const auto& source : sources) {
+                auto current = segments_.find(source.segment_id);
+                if (current != segments_.end()) {
+                    current->second.state = SegmentLifecycle::kSealed;
+                    ++current->second.mutation_epoch;
+                }
+            }
+            return tl::unexpected(MapIndexError(installed.error()));
+        }
+        std::unordered_set<uint64_t> source_ids;
+        for (const auto& source : sources) source_ids.insert(source.segment_id);
+        index_.ReclaimNonCurrentVersionsInSegments(source_ids);
+        for (const auto& target : targets) {
+            segment_paths_.emplace(target.segment_id, target.final_path);
+            segments_.emplace(
+                target.segment_id,
+                SegmentMetadata{.segment_id = target.segment_id,
+                                .level = target_level,
+                                .state = SegmentLifecycle::kSealed,
+                                .valid_bytes = target.valid_bytes,
+                                .live_bytes = target.valid_bytes,
+                                .record_count = target.record_count,
+                                .mutation_epoch = 1});
+        }
+        for (const auto& source : sources) {
+            auto& current = segments_.at(source.segment_id);
+            current.state = SegmentLifecycle::kRetired;
+            ++current.mutation_epoch;
+        }
+        RefreshSegmentLiveBytes();
+        auto checkpointed = CheckpointLocked();
+        if (!checkpointed) {
+            static_cast<void>(index_.Restore(index_before));
+            for (const auto& target : targets) {
+                segment_paths_.erase(target.segment_id);
+                segments_.erase(target.segment_id);
+            }
+            for (const auto& source : sources) {
+                auto current = segments_.find(source.segment_id);
+                if (current != segments_.end()) {
+                    current->second.state = SegmentLifecycle::kSealed;
+                    ++current->second.mutation_epoch;
+                }
+            }
+            cleanup_targets();
+            return tl::unexpected(checkpointed.error());
+        }
+        CleanupRetiredSegmentsLocked();
+        RefreshSegmentLiveBytes();
+    }
+
+    uint64_t output_bytes = 0;
+    for (const auto& target : targets) output_bytes += target.valid_bytes;
+    return CompactionResult{.source_segments = sources.size(),
+                            .target_segments = targets.size(),
+                            .input_bytes = input_bytes,
+                            .output_bytes = output_bytes,
+                            .reclaimed_bytes = input_bytes - output_bytes};
 }
 
 tl::expected<std::string, StoreError> LogStructuredStore::ReadEntryLocked(

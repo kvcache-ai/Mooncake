@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "storage/local/log_structured/index.h"
 #include "storage/local/log_structured/metadata.h"
@@ -39,6 +40,20 @@ struct PreparedWrite {
     PhysicalRecord physical;
 };
 
+struct CompactionOptions {
+    size_t max_source_segments{8};
+    uint64_t max_input_bytes{1024ULL * 1024 * 1024};
+    double min_reclaim_ratio{0.20};
+};
+
+struct CompactionResult {
+    size_t source_segments{0};
+    size_t target_segments{0};
+    uint64_t input_bytes{0};
+    uint64_t output_bytes{0};
+    uint64_t reclaimed_bytes{0};
+};
+
 class LogStructuredStore {
    public:
     static tl::expected<std::unique_ptr<LogStructuredStore>, StoreError> Open(
@@ -55,6 +70,8 @@ class LogStructuredStore {
                                             uint64_t sequence);
     tl::expected<void, StoreError> Delete(const RecordIdentity& identity);
     tl::expected<void, StoreError> Checkpoint();
+    tl::expected<CompactionResult, StoreError> CompactOnce(
+        const CompactionOptions& options = {});
     tl::expected<std::string, StoreError> Get(
         const RecordIdentity& identity) const;
     tl::expected<std::string, StoreError> GetLatest(
@@ -84,12 +101,15 @@ class LogStructuredStore {
         const RecordIdentity& identity, std::string_view value);
     tl::expected<std::string, StoreError> ReadEntryLocked(
         const IndexSnapshotEntry& entry) const;
+    tl::expected<void, StoreError> CheckpointLocked();
+    void CleanupRetiredSegmentsLocked();
     std::string SegmentPath(uint64_t segment_id) const;
 
     LogStructuredStoreConfig config_;
     std::string segments_path_;
     std::string wal_path_;
     mutable std::mutex mutex_;
+    std::mutex compaction_mutex_;
     std::unique_ptr<StorageDirectory> directory_;
     VersionIndex index_;
     std::unordered_map<uint64_t, std::string> segment_paths_;

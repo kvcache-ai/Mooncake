@@ -5,6 +5,7 @@
 #include <shared_mutex>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -44,6 +45,13 @@ struct IndexSnapshotEntry {
     VersionEntry version;
 };
 
+struct CompactionIndexUpdate {
+    RecordIdentity identity;
+    PhysicalRecord expected_source;
+    uint64_t expected_epoch{0};
+    PhysicalRecord target;
+};
+
 class VersionIndex {
    public:
     tl::expected<void, IndexError> Prepare(const RecordIdentity& identity,
@@ -61,6 +69,10 @@ class VersionIndex {
     tl::expected<void, IndexError> InstallCompactionCopy(
         const RecordIdentity& identity, const PhysicalRecord& expected_source,
         uint64_t expected_epoch, const PhysicalRecord& target);
+    tl::expected<void, IndexError> InstallCompactionCopies(
+        const std::vector<CompactionIndexUpdate>& updates);
+    void ReclaimNonCurrentVersionsInSegments(
+        const std::unordered_set<uint64_t>& segment_ids);
 
     std::optional<VersionEntry> LookupCommitted(
         const RecordIdentity& identity) const;

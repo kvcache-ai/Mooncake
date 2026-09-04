@@ -129,5 +129,50 @@ TEST(LogStructuredIndexTest, ReplayOperationsAreIdempotent) {
     ASSERT_TRUE(index.ApplyTombstone(identity, 20).has_value());
 }
 
+TEST(LogStructuredIndexTest, CompactionBatchIsAllOrNothing) {
+    VersionIndex index;
+    const auto first = Identity("first", 1);
+    const auto second = Identity("second", 1);
+    const auto first_source = Physical(1, 0);
+    const auto second_source = Physical(1, 128);
+    ASSERT_TRUE(index.Prepare(first, first_source, 10).has_value());
+    ASSERT_TRUE(index.Commit(first, 10).has_value());
+    ASSERT_TRUE(index.Prepare(second, second_source, 20).has_value());
+    ASSERT_TRUE(index.Commit(second, 20).has_value());
+    const auto first_epoch = index.LookupCommitted(first)->mutation_epoch;
+    const auto second_epoch = index.LookupCommitted(second)->mutation_epoch;
+
+    auto result =
+        index.InstallCompactionCopies({{.identity = first,
+                                        .expected_source = first_source,
+                                        .expected_epoch = first_epoch,
+                                        .target = Physical(2, 0)},
+                                       {.identity = second,
+                                        .expected_source = Physical(9, 0),
+                                        .expected_epoch = second_epoch,
+                                        .target = Physical(2, 128)}});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(index.LookupCommitted(first)->physical, first_source);
+    EXPECT_EQ(index.LookupCommitted(second)->physical, second_source);
+}
+
+TEST(LogStructuredIndexTest, ReclaimClearsOnlyDeadPhysicalMappings) {
+    VersionIndex index;
+    const auto old_identity = Identity("key", 1);
+    const auto current_identity = Identity("key", 2);
+    ASSERT_TRUE(index.Prepare(old_identity, Physical(1, 0), 10).has_value());
+    ASSERT_TRUE(index.Commit(old_identity, 10).has_value());
+    ASSERT_TRUE(
+        index.Prepare(current_identity, Physical(2, 0), 20).has_value());
+    ASSERT_TRUE(index.Commit(current_identity, 20).has_value());
+
+    index.ReclaimNonCurrentVersionsInSegments({1});
+    auto old = index.Lookup(old_identity);
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(old->state, VersionState::kReclaimable);
+    EXPECT_EQ(old->physical, PhysicalRecord{});
+    EXPECT_TRUE(index.LookupCommitted(current_identity).has_value());
+}
+
 }  // namespace
 }  // namespace mooncake::logstructured
