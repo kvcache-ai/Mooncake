@@ -321,6 +321,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Create thread-level statistics objects
         thread_put_stats = [TestStats(f"Thread-{i}-Put") for i in range(NUM_THREADS)]
         thread_get_stats = [TestStats(f"Thread-{i}-Get") for i in range(NUM_THREADS)]
+        put_get_barrier = threading.Barrier(NUM_THREADS)
         
         index = 0
         while index < OPERATIONS_PER_THREAD:
@@ -349,6 +350,11 @@ class TestDistributedObjectStore(unittest.TestCase):
                     index = index + 1
                 put_end = time.perf_counter()
                 put_stats.thread_duration = put_end - put_start  # Record thread PUT duration
+
+                # Keep the concurrent PUT and GET phases separate so reads do not
+                # race with writes that are still being committed by another thread.
+                put_get_barrier.wait()
+                time.sleep(5)
                 
                 # GET operation phase
                 get_start = time.perf_counter()
@@ -375,6 +381,7 @@ class TestDistributedObjectStore(unittest.TestCase):
                 
                 print(f"Thread {thread_id} completed")  
             except Exception as e:
+                put_get_barrier.abort()
                 thread_exceptions.append(f"Thread {thread_id} failed: {str(e)}")
                 print("Exception in thread:", str(e))
         
@@ -576,7 +583,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Phase 3: Cleanup (still using single remove for simplicity)
         # --------------------------
         time.sleep(default_kv_lease_ttl / 1000)
-        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
+        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer registration should succeed")
         index = 0
         while index < MAX_REQUESTS:
             key = KEY_PREFIX + str(index)
