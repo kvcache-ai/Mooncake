@@ -47,6 +47,7 @@ class RdmaTransport;
 class RdmaContextTestPeer;
 class WorkerPool;
 class EndpointStore;
+class MsgChannel;
 
 // Enum to represent the network state of the GID found
 enum class GidNetworkState {
@@ -283,6 +284,13 @@ class RdmaContext {
 
     int socketId();
 
+    // Two-sided MsgChannel CQ registration (polled by WorkerPool). Held
+    // weakly: a rail may be replaced while the poller holds a reference.
+    void registerMsgChannel(std::shared_ptr<MsgChannel> channel);
+    void unregisterMsgChannel(MsgChannel *channel);
+    int pollMsgChannels(int max_per_channel = 16);
+    bool hasMsgChannels() const;
+
    private:
     int openRdmaDevice(const std::string &device_name, uint8_t port,
                        int gid_index);
@@ -347,6 +355,9 @@ class RdmaContext {
     std::shared_ptr<WorkerPool> worker_pool_;
 
     std::atomic<bool> active_;
+
+    mutable std::mutex msg_channels_mutex_;
+    std::vector<std::weak_ptr<MsgChannel>> msg_channels_;
 };
 
 }  // namespace mooncake

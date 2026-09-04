@@ -633,6 +633,126 @@ void loadGlobalConfig(GlobalConfig& config) {
             LOG(WARNING) << "Ignore value from environment variable "
                             "MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS";
     }
+    const char* rdma_credit_enabled_env = std::getenv("MC_RDMA_CREDIT_ENABLED");
+    if (rdma_credit_enabled_env) {
+        parseBoolConfigEnv(rdma_credit_enabled_env, "MC_RDMA_CREDIT_ENABLED",
+                           config.rdma_credit_enabled);
+    }
+    const char* rdma_credit_window_bytes_env =
+        std::getenv("MC_RDMA_CREDIT_WINDOW_BYTES");
+    if (rdma_credit_window_bytes_env) {
+        config.rdma_credit_window_bytes =
+            std::strtoull(rdma_credit_window_bytes_env, nullptr, 10);
+    }
+    const char* rdma_credit_window_requests_env =
+        std::getenv("MC_RDMA_CREDIT_WINDOW_REQUESTS");
+    if (rdma_credit_window_requests_env) {
+        config.rdma_credit_window_requests =
+            std::strtoull(rdma_credit_window_requests_env, nullptr, 10);
+    }
+    const char* rdma_credit_queue_timeout_ms_env =
+        std::getenv("MC_RDMA_CREDIT_QUEUE_TIMEOUT_MS");
+    if (rdma_credit_queue_timeout_ms_env) {
+        config.rdma_credit_queue_timeout_ms =
+            std::strtoull(rdma_credit_queue_timeout_ms_env, nullptr, 10);
+    }
+    const char* rdma_msg_enabled_env = std::getenv("MC_RDMA_MSG_ENABLED");
+    if (rdma_msg_enabled_env) {
+        parseBoolConfigEnv(rdma_msg_enabled_env, "MC_RDMA_MSG_ENABLED",
+                           config.rdma_msg_enabled);
+    }
+    const char* rdma_msg_default_env = std::getenv("MC_RDMA_MSG_DEFAULT");
+    if (rdma_msg_default_env) {
+        parseBoolConfigEnv(rdma_msg_default_env, "MC_RDMA_MSG_DEFAULT",
+                           config.rdma_msg_default);
+    }
+    const char* rdma_msg_slot_size_env = std::getenv("MC_RDMA_MSG_SLOT_SIZE");
+    if (rdma_msg_slot_size_env) {
+        int val = atoi(rdma_msg_slot_size_env);
+        if (val >= 1024 && val <= (1 << 20))
+            config.rdma_msg_slot_size = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_SLOT_SIZE";
+    }
+    const char* rdma_msg_pool_base_env = std::getenv("MC_RDMA_MSG_POOL_BASE");
+    if (rdma_msg_pool_base_env) {
+        int val = atoi(rdma_msg_pool_base_env);
+        if (val > 0 && val <= 65536)
+            config.rdma_msg_pool_base = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_POOL_BASE";
+    }
+    const char* rdma_msg_pool_max_env = std::getenv("MC_RDMA_MSG_POOL_MAX");
+    if (rdma_msg_pool_max_env) {
+        int val = atoi(rdma_msg_pool_max_env);
+        if (val > 0 && val <= 65536)
+            config.rdma_msg_pool_max = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_POOL_MAX";
+    }
+    if (config.rdma_msg_pool_max < config.rdma_msg_pool_base)
+        config.rdma_msg_pool_max = config.rdma_msg_pool_base;
+
+    const char* expand_step_env = std::getenv("MC_RDMA_MSG_EXPAND_STEP");
+    if (expand_step_env) {
+        int val = atoi(expand_step_env);
+        if (val > 0 && val <= 65536)
+            config.rdma_msg_expand_step = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_EXPAND_STEP";
+    }
+    const char* low_wm_env = std::getenv("MC_RDMA_MSG_EXPAND_LOW_WM_PCT");
+    if (low_wm_env) {
+        int val = atoi(low_wm_env);
+        if (val >= 0 && val <= 100)
+            config.rdma_msg_expand_low_watermark_pct = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_EXPAND_LOW_WM_PCT";
+    }
+    const char* high_wm_env = std::getenv("MC_RDMA_MSG_SHRINK_HIGH_WM_PCT");
+    if (high_wm_env) {
+        int val = atoi(high_wm_env);
+        if (val >= 0 && val <= 100)
+            config.rdma_msg_shrink_high_watermark_pct =
+                static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_SHRINK_HIGH_WM_PCT";
+    }
+    const char* pending_exp_env =
+        std::getenv("MC_RDMA_MSG_PENDING_EXPAND_THRESHOLD");
+    if (pending_exp_env) {
+        int val = atoi(pending_exp_env);
+        if (val >= 0 && val <= 65536)
+            config.rdma_msg_pending_expand_threshold = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_PENDING_EXPAND_THRESHOLD";
+    }
+    const char* shrink_idle_env = std::getenv("MC_RDMA_MSG_SHRINK_IDLE_MS");
+    if (shrink_idle_env) {
+        int val = atoi(shrink_idle_env);
+        if (val >= 0)
+            config.rdma_msg_shrink_idle_ms = static_cast<uint64_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_SHRINK_IDLE_MS";
+    }
+    const char* bounce_tick_env =
+        std::getenv("MC_RDMA_MSG_BOUNCE_MANAGER_TICK_MS");
+    if (bounce_tick_env) {
+        int val = atoi(bounce_tick_env);
+        if (val > 0 && val <= 60000)
+            config.rdma_msg_bounce_manager_tick_ms = static_cast<uint64_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_BOUNCE_MANAGER_TICK_MS";
+    }
 
     const char* enable_parallel_reg_mr =
         std::getenv("MC_ENABLE_PARALLEL_REG_MR");
